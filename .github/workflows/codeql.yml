@@ -120,7 +120,7 @@ jobs:
       security-events: write   # github/codeql-action/analyze SARIF upload
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -178,8 +178,8 @@ jobs:
             # [self-hosted, Windows, X64] set matches BOTH pools; pinning routes
             # the daily trace to the proven Wee Tam fleet (shared vcpkg binary
             # cache, meets the 45 GB disk floor). Wee Tam runners are CCD-pinned
-            # to 16 threads, so the Build step passes -j $YUZU_BUILD_JOBS (set by
-            # the pin wrapper) — without it ninja sizes -j from the 64-CPU host
+            # to 16 threads, so the Build step passes the job-level
+            # -j $YUZU_BUILD_JOBS cap — without it ninja sizes -j from the 64-CPU host
             # and thrashes the 32 MB L3 (the 98-min-timeout failure mode), which
             # CCACHE_RECACHE's forced full recompile makes acute.
             runner: [self-hosted, Windows, X64, yuzu-weetam-windows]
@@ -208,9 +208,13 @@ jobs:
         # Per-leg shell override — see the matrix `shell:` values above
         # for why Windows can't use the default `bash` keyword.
         shell: ${{ matrix.shell }}
+    env:
+      # Both matrix legs run on one-CCD self-hosted runners (Big Tam Linux or
+      # Wee Tam Windows), each with 16 logical CPUs.
+      YUZU_BUILD_JOBS: "16"
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -470,11 +474,9 @@ jobs:
         # the cache update and degrade subsequent CI builds.
         env:
           CCACHE_RECACHE: "true"
-        # -j is capped to the runner's pinned CCD width via $YUZU_BUILD_JOBS on
-        # Wee Tam (unset elsewhere → ninja default, so the Linux leg is
-        # unaffected). Essential here because CCACHE_RECACHE forces every TU to
-        # actually compile, so an uncapped ninja oversubscribes the pinned CCD.
-        run: meson compile -C ${{ matrix.build_dir }} ${YUZU_BUILD_JOBS:+-j $YUZU_BUILD_JOBS}
+        # Essential because CCACHE_RECACHE forces every TU to compile. Both
+        # hosts are one-CCD-per-runner, so cap Ninja to that 16-thread domain.
+        run: meson compile -C ${{ matrix.build_dir }} -j "$YUZU_BUILD_JOBS"
 
       - name: ccache stats
         if: always()

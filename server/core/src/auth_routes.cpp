@@ -685,7 +685,17 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         return true;
     }
 
-    if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
+    // #1717 (ADR-0017 ship-now HIGH): gate on `rbac_enforcement_in_effect`, NOT
+    // raw `is_rbac_enabled`. A corrupt/load-failed rbac.db (`is_open()==false`)
+    // then ENTERS this branch and fails CLOSED via `check_permission` on the dead
+    // handle (`db_==nullptr` → false → 403), instead of skipping RBAC and falling
+    // through to the legacy Read-allow below — a full-fleet fail-OPEN disclosure to
+    // any authenticated principal. Behaviour-neutral for fresh installs (open db +
+    // enabled=false → `rbac_enforcement_in_effect` false → legacy preserved) and for
+    // a wholly unwired store (`rbac_store_==nullptr` → short-circuits to legacy).
+    // This is the SAME predicate the ADR-0017 per-row scope filters key on, so the
+    // gate and the filter can never disagree on a corrupt store.
+    if (rbac_store_ && rbac_enforcement_in_effect(rbac_store_)) {
         if (!rbac_store_->check_permission(session->username, securable_type, operation)) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "RBAC denied " + securable_type + ":" + operation);
@@ -863,7 +873,12 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
         return true;
     }
 
-    if (rbac_store_ && rbac_store_->is_rbac_enabled()) {
+    // #1717 (ADR-0017 ship-now HIGH): gate on `rbac_enforcement_in_effect`, NOT
+    // raw `is_rbac_enabled` — same fail-closed-on-corrupt reasoning as
+    // `require_permission` above. A corrupt rbac.db enters here and denies via
+    // `check_scoped_permission` on the dead handle rather than falling through to
+    // the legacy Read-allow.
+    if (rbac_store_ && rbac_enforcement_in_effect(rbac_store_)) {
         if (!rbac_store_->check_scoped_permission(session->username, securable_type, operation,
                                                   agent_id, mgmt_group_store_)) {
             audit_log(req, "auth.scoped_permission_required", "denied", agent_id,

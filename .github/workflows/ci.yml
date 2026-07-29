@@ -125,7 +125,7 @@ jobs:
       # Always true for non-PR events (push / workflow_dispatch build always).
       code_changed: ${{ steps.codegate.outputs.code_changed }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Probe runner health
@@ -192,7 +192,7 @@ jobs:
   #   name: "Lint (clang-format)"
   #   runs-on: ubuntu-24.04
   #   steps:
-  #     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
   #     - name: Install clang-format
   #       run: |
   #         sudo apt-get update
@@ -216,7 +216,7 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Need history so buf can compare against the merge base
           fetch-depth: 0
@@ -249,6 +249,10 @@ jobs:
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 90
     env:
+      # Each Big Tam runner is confined to one 8C/16T L3 domain. Keep Ninja's
+      # process fan-out inside that boundary; affinity alone still leaves
+      # Ninja seeing the host-wide 64 logical CPUs.
+      YUZU_BUILD_JOBS: "16"
       # Big Tam runs 4 runners on one host. A gateway eunit test that boots the
       # app can transiently bring up Erlang distribution and trip the #659
       # insecure-default-cookie boot guard (observed flaking 1/4 legs). This is
@@ -293,7 +297,7 @@ jobs:
             fi
           fi
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           # clean:false — persist build-linux-{compiler}-{buildtype}/ +
@@ -465,7 +469,7 @@ jobs:
             ${{ matrix.build_type == 'release' && matrix.compiler == 'gcc-15' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: meson compile -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+        run: meson compile -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -j "$YUZU_BUILD_JOBS"
 
       # Link-provenance assertion (#1331 review HIGH-2): prove the canary linked
       # vcpkg's static libpq archive, not a system/dynamic libpq. Per ADR-0008
@@ -595,6 +599,10 @@ jobs:
     # optimization target. See issue #374 for the full migration rationale.
     runs-on: [self-hosted, Windows, X64, yuzu-weetam-windows]
     timeout-minutes: 120
+    env:
+      # Belt-and-suspenders with Start-PinnedRunner.ps1: every Wee Tam job
+      # explicitly carries the 16-thread width of its assigned CCD.
+      YUZU_BUILD_JOBS: "16"
     defaults:
       run:
         # The default `bash` keyword on a self-hosted Windows runner
@@ -649,7 +657,7 @@ jobs:
             rm -rf "$GITHUB_WORKSPACE/build-windows"
           fi
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           # clean:false — persist build-windows-{debug,release}/ +
@@ -792,12 +800,9 @@ jobs:
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        # -j is capped to the runner's pinned CCD width via $YUZU_BUILD_JOBS,
-        # exported only by the Wee Tam pin-wrapper (Shulgi is unpinned and omits
-        # it, keeping ninja's default). Without the cap, ninja sizes -j from the
-        # 64-CPU system count and oversubscribes the 16-thread CCD, thrashing the
-        # very L3 the pinning exists to keep hot.
-        run: meson compile -C build-windows-${{ matrix.build_type }} ${YUZU_BUILD_JOBS:+-j $YUZU_BUILD_JOBS}
+        # Affinity controls placement, not Ninja's processor-count discovery;
+        # pass the runner's 16-thread CCD width unconditionally.
+        run: meson compile -C build-windows-${{ matrix.build_type }} -j "$YUZU_BUILD_JOBS"
 
       # Link-provenance assertion (#1331 review HIGH-2): on Windows libpq is
       # DELIBERATELY dynamic (triplet static override = grpc stack only; the
@@ -937,7 +942,7 @@ jobs:
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
@@ -1244,7 +1249,7 @@ jobs:
     outputs:
       workflows_changed: ${{ steps.detect.outputs.changed }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -1291,7 +1296,7 @@ jobs:
     # margin; warm runs still finish in ~6 min.
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false

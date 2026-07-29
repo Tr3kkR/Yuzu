@@ -52,10 +52,14 @@ foreach($t in $m.tools){
 Write-Host "`n-- env (machine) --"
 foreach($k in $m.env.PSObject.Properties.Name){
   $live = [Environment]::GetEnvironmentVariable($k,'Machine')
-  if($live){
+  $expected = [string]$m.env.$k
+  if($live -and [string]::Equals($live, $expected, [StringComparison]::Ordinal)){
     Write-Host ("  [OK]   {0,-22} {1}" -f $k, $live) -ForegroundColor Green
+  } elseif($live){
+    Write-Host ("  [MISS] {0,-22} actual {1}; expected {2}" -f $k, $live, $expected) -ForegroundColor Red
+    $fail++
   } else {
-    Write-Host ("  [MISS] {0,-22} (expected {1})" -f $k, $m.env.$k) -ForegroundColor Red
+    Write-Host ("  [MISS] {0,-22} (expected {1})" -f $k, $expected) -ForegroundColor Red
     $fail++
   }
 }

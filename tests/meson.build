@@ -434,6 +434,7 @@ if build_server
       'unit/server/test_schedule_routes.cpp',
       'unit/server/test_schedule_runner.cpp',
       'unit/server/test_rbac_store.cpp',
+      'unit/server/test_list_read_confinement.cpp',
       'unit/server/test_oidc_principal_key.cpp',
       'unit/server/test_oidc_provider.cpp',
       'unit/server/test_oidc_routes.cpp',
@@ -513,6 +514,9 @@ if build_server
       'unit/server/test_ca_store.cpp',
       'unit/server/test_ca_routes.cpp',
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
+      'unit/server/test_kek_op_lock_holder.cpp', # #2530 B6 — advisory-lock holder query
+      'unit/server/test_kek_rotate_control.cpp', # #2530 B3/B4 — rotate control-flow ordering + half-commit classification
+      'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',
@@ -765,6 +769,16 @@ test('close automation logic',
 test('flake-retry selftest',
   _python3_test,
   args: [files('../scripts/ci/flake-retry.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# End-to-end fake-Meson contract. In particular, an expired/malformed flake
+# registry must fail before the real test runner could be invoked. The script
+# uses POSIX executable fakes and returns a clean platform skip on Windows.
+test('flake-retry integration selftest',
+  _python3_test,
+  args: [files('../scripts/ci/test_flake_retry.py')],
   suite: 'docs',
   timeout: 30,
 )

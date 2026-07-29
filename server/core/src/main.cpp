@@ -7,6 +7,7 @@
 #include <yuzu/version.hpp>
 
 #include "insecure_tls_gate.hpp"
+#include "kek_rotate_control.hpp" // detail::kKekMaxLiveVersionsDefault / kek_ceiling_is_risk_acceptance
 #include "key_provider.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/secret_codec.hpp"
@@ -490,6 +491,55 @@ int main(int argc, char* argv[]) {
                  "when enabled.")
         ->envname("YUZU_ALLOW_UNSIGNED_DEFINITIONS");
 
+    // KEK rotation runaway control (#2530 B5). See kek_routes.hpp.
+    //
+    // This is a RUNAWAY/ABUSE GUARD, not a rotation-schedule knob — it exists
+    // to stop a looping caller (buggy automation, a compromised token) from
+    // hammering /rotate, not to express how often you intend to rotate. The
+    // default of 1h is sized for that job and most operators should never
+    // touch this flag.
+    //
+    // Raising it has a real, sharp cost the operator must see BEFORE they
+    // change it: it directly delays emergency re-rotation after a suspected
+    // KEK compromise — the single most time-critical operation this surface
+    // exists to support — and there is NO bypass. `/rewrap` only resumes a
+    // half-committed rotation; it does not mint a new version. If this is
+    // set to (say) 90 days to "match" a quarterly rotation cadence, a
+    // routine rotation followed by a compromise the next day leaves the
+    // operator refused with a 429 for the next three months, with no escape
+    // short of a restart with a lower value — mid-incident. Do NOT set this
+    // to your rotation cadence; leave it at the default unless you have a
+    // specific, understood reason to raise it.
+    //
+    // Upper bound 31536000s (365d) is a sanity ceiling that rejects a
+    // fat-fingered value, not an endorsement of setting the flag that high.
+    // `cooldown_retry_after_ms` is a uint32 millisecond count;
+    // evaluate_rotate_preconditions() (kek_rotate_control.hpp) saturates
+    // rather than wraps on overflow, so this bound is defence-in-depth on
+    // top of that, not the only thing keeping the retry hint honest.
+    app.add_option("--kek-min-rotate-interval", cfg.kek_min_rotate_interval_secs,
+                   "Durable rate limit (seconds) between KEK rotation attempts — a runaway/abuse "
+                   "guard against looping automation, NOT a rotation-schedule setting (default: "
+                   "3600 = 1h; most operators should never change this). Raising it delays "
+                   "emergency re-rotation after a suspected key compromise, with no bypass short "
+                   "of a restart. Read from the database server's own clock so it holds "
+                   "cluster-wide, not just per process (max: 31536000 = 365d, a sanity ceiling — "
+                   "not a suggestion to match your rotation cadence). A rotate request inside the "
+                   "window is refused with a 429 carrying an honest retry_after_ms.")
+        ->default_val(3600)
+        ->check(CLI::Range(1, 31536000))
+        ->envname("YUZU_KEK_MIN_ROTATE_INTERVAL");
+    app.add_option("--kek-max-live-versions", cfg.kek_max_live_versions,
+                   "Backstop ceiling on the number of non-retired KEK versions (default: 32). "
+                   "A rotate request at or above the ceiling is refused with a 409. There is no "
+                   "retire route (#2525), so raising this above the default is the supported "
+                   "escape hatch that keeps rotation usable once an install hits it — doing so "
+                   "is an explicit, logged and audited temporary risk acceptance pending #2525, "
+                   "not a routine tuning knob.")
+        ->default_val(yuzu::server::detail::kKekMaxLiveVersionsDefault)
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_KEK_MAX_LIVE_VERSIONS");
+
     // Batch token generation mode (runs and exits, no server startup)
     int generate_tokens = 0;
     std::string gen_label;
@@ -755,6 +805,22 @@ int main(int argc, char* argv[]) {
             "rows (`mfa.step_up.required`) will not be emitted. Set to a positive value "
             "(default 300) to re-enable.",
             cfg.mfa_step_up_window_secs);
+    }
+
+    // KEK rotation runaway control posture (#2530 B5). --kek-max-live-versions
+    // above the shipped default of 32 is a deliberate, temporary risk
+    // acceptance pending #2525 (no retire route exists yet, so raising the
+    // ceiling is the only way to keep rotation usable once an install hits
+    // it) — surface it loudly here; the matching `server.kek_ceiling_raised`
+    // audit event fires in server.cpp once audit_store_ exists (mirrors the
+    // --allow-unsigned-packs log+audit pattern above).
+    if (yuzu::server::detail::kek_ceiling_is_risk_acceptance(cfg.kek_max_live_versions)) {
+        spdlog::warn("--kek-max-live-versions={} is ABOVE the default of {} — this is a "
+                     "deliberate, temporary risk acceptance: there is no KEK retire route "
+                     "(#2525), so raising the ceiling is the supported way to keep rotation "
+                     "usable once an install hits it. This will be audited as "
+                     "`server.kek_ceiling_raised`.",
+                     cfg.kek_max_live_versions, yuzu::server::detail::kKekMaxLiveVersionsDefault);
     }
 
     // ── Validate operator-supplied CSP extras (SOC2-C1, gov UP-1/UP-2) ──
