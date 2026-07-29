@@ -2,9 +2,12 @@
  * tar_db.cpp -- SQLite-backed Timeline Activity Record database
  *
  * Tables:
- *   tar_events(id, timestamp, event_type, event_action, detail_json, snapshot_id)
  *   tar_state(collector PRIMARY KEY, state_json, updated_at)
  *   tar_config(key PRIMARY KEY, value)
+ *   plus every typed warehouse tier the schema registry declares.
+ *
+ * The legacy tar_events log was retired by schema v3 and is no longer created;
+ * see kCreateSchema below.
  *
  * All queries use parameterized SQL to prevent injection.
  * A std::mutex guards all sqlite3* access for thread safety (Darwin pitfall).
@@ -114,23 +117,19 @@ int tar_query_authorizer(void* /*ctx*/, int action, const char* arg1, const char
 }
 
 /// Schema DDL for all TAR tables.
+///
+/// `tar_events` is deliberately ABSENT. Schema v3 retired it, and the migration
+/// in open() still drops it from any pre-v3 database that carries one. Creating
+/// it here only to drop it a few statements later cost every fresh open one
+/// table plus three indexes, and — worse — left it PRESENT on any database
+/// whose schema_version had already reached 3+, because the v3 branch is then
+/// skipped. `is_queryable_table()` excludes tar_events specifically so that its
+/// "no such table" error cannot become an existence oracle (#760 UP-8); that
+/// reasoning holds only while the table really is absent. Dropping it here
+/// covers new databases; the v5 migration in open() covers the installed base,
+/// which had already resurrected it. Do NOT reintroduce it here — a new capture
+/// source goes through the schema registry.
 constexpr const char* kCreateSchema = R"(
-    CREATE TABLE IF NOT EXISTS tar_events (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp    INTEGER NOT NULL,
-        event_type   TEXT    NOT NULL,
-        event_action TEXT    NOT NULL,
-        detail_json  TEXT    NOT NULL DEFAULT '{}',
-        snapshot_id  INTEGER NOT NULL DEFAULT 0
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_tar_events_ts
-        ON tar_events(timestamp);
-    CREATE INDEX IF NOT EXISTS idx_tar_events_type_ts
-        ON tar_events(event_type, timestamp);
-    CREATE INDEX IF NOT EXISTS idx_tar_events_snapshot
-        ON tar_events(snapshot_id);
-
     CREATE TABLE IF NOT EXISTS tar_state (
         collector   TEXT PRIMARY KEY,
         state_json  TEXT NOT NULL DEFAULT '{}',
@@ -212,6 +211,98 @@ quarantine_corrupt_db(const std::filesystem::path& path) {
         }
     }
     return dest;
+}
+
+/// Execute a multi-statement DDL batch inside ONE transaction.
+///
+/// SQLite gives every bare statement its own implicit transaction, and WAL
+/// defaults to `synchronous=FULL` — so handing `sqlite3_exec` a ~75-statement
+/// schema batch costs ~75 separate commits, each with its own fsync. Measured
+/// on the Windows CI runner (91 iterations, best of 3, #2093): 72.4 ms per
+/// `TarDatabase::open()` unwrapped against 11.0 ms for the identical DDL in a
+/// single transaction. Every agent pays this at boot, on every endpoint.
+///
+/// It is also the atomicity fix. Unwrapped, a batch that fails partway through
+/// leaves a half-built schema on disk and `open()` returns an error, so the
+/// next open inherits the debris; wrapped, the database is left exactly as it
+/// was found.
+///
+/// Returns SQLITE_OK, or the first failing rc with `*err_msg` set — ownership
+/// of which passes to the caller, as with `sqlite3_exec` itself.
+/// True if the legacy `tar_events` table (or one of its indexes) is still on
+/// disk. One indexed sqlite_master read; no write.
+bool tar_events_present(sqlite3* db) {
+    const char* sql = "SELECT 1 FROM sqlite_master WHERE name = 'tar_events' OR name LIKE "
+                      "'idx_tar_events%' LIMIT 1";
+    sqlite3_stmt* raw = nullptr;
+    if (sqlite3_prepare_v2(db, sql, -1, &raw, nullptr) != SQLITE_OK) {
+        return false; // can't tell — treat as absent; the next open retries
+    }
+    StmtPtr stmt(raw);
+    return sqlite3_step(stmt.get()) == SQLITE_ROW;
+}
+
+int exec_ddl_batch(sqlite3* db, const char* ddl, char** err_msg) {
+    // A caller may already hold a transaction — create_warehouse_tables() is
+    // public. Detect that EXPLICITLY rather than inferring it from a failed
+    // BEGIN: SQLITE_BUSY, a read-only handle and OOM all fail BEGIN too, and
+    // treating those as "nested, carry on unwrapped" would silently restore
+    // both the per-statement fsync cost and the non-atomicity with no trace.
+    if (sqlite3_get_autocommit(db) == 0) {
+        return sqlite3_exec(db, ddl, nullptr, nullptr, err_msg);
+    }
+
+    // IMMEDIATE, not DEFERRED. A deferred BEGIN takes its write lock at the
+    // first writing statement, and in WAL a concurrent committer between the
+    // read snapshot and that upgrade yields SQLITE_BUSY_SNAPSHOT — for which
+    // SQLite does NOT invoke the busy handler, so the 5000 ms busy_timeout set
+    // in open() would not help. IMMEDIATE takes the lock up front, where the
+    // busy handler does apply. This matches purge_source() and
+    // execute_atomic_batch() elsewhere in this file.
+    char* begin_err = nullptr;
+    int rc = sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, &begin_err);
+    if (rc == SQLITE_BUSY || rc == SQLITE_BUSY_SNAPSHOT) {
+        // Another connection holds the write lock and outlasted the busy
+        // timeout. Do NOT fall back to unwrapped: each of the ~75 statements
+        // would then wait out its own busy timeout under mu_, stalling every
+        // collector for minutes. Fail and let the caller retry on the next open.
+        if (err_msg) {
+            *err_msg = begin_err;
+        } else {
+            sqlite3_free(begin_err);
+        }
+        return rc;
+    }
+    if (rc != SQLITE_OK) {
+        spdlog::warn("TarDatabase: could not open a transaction for the schema batch ({}) — "
+                     "running it unwrapped; this is slower and not atomic",
+                     begin_err ? begin_err : "unknown");
+        sqlite3_free(begin_err);
+        return sqlite3_exec(db, ddl, nullptr, nullptr, err_msg);
+    }
+    sqlite3_free(begin_err);
+
+    rc = sqlite3_exec(db, ddl, nullptr, nullptr, err_msg);
+    if (rc != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        return rc;
+    }
+
+    rc = sqlite3_exec(db, "COMMIT", nullptr, nullptr, err_msg);
+    if (rc != SQLITE_OK) {
+        // A failed COMMIT leaves the transaction open. Drop it, or every later
+        // write on this connection silently joins a transaction that is never
+        // committed and is discarded at close.
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        if (sqlite3_get_autocommit(db) == 0) {
+            // ROLLBACK failed too — the connection is wedged. Say so loudly:
+            // every subsequent write on it will be lost at close.
+            spdlog::error("TarDatabase: schema transaction could neither commit nor roll back — "
+                          "this connection is wedged and its writes will be discarded. Restart "
+                          "the agent.");
+        }
+    }
+    return rc;
 }
 
 } // namespace
@@ -345,9 +436,10 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
     }
     sqlite3_free(err_msg);
 
-    // Create schema
+    // Create schema — one transaction, not one per statement (see
+    // exec_ddl_batch: ~75 fsync'd commits otherwise, #2093).
     err_msg = nullptr;
-    rc = sqlite3_exec(raw_db, kCreateSchema, nullptr, nullptr, &err_msg);
+    rc = exec_ddl_batch(raw_db, kCreateSchema, &err_msg);
     if (rc != SQLITE_OK) {
         std::string err = err_msg ? err_msg : "unknown error";
         sqlite3_free(err_msg);
@@ -385,6 +477,18 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
             spdlog::info("TarDatabase: migrated to schema version 2 (typed warehouse tables)");
         }
     } else {
+        // A failed batch that could neither commit nor roll back leaves this
+        // connection inside a transaction. Publishing that handle would mean
+        // every collector write silently joins a transaction that is never
+        // committed and is discarded at close — data loss reported as success.
+        // Fail closed instead; the next open starts from a clean connection.
+        if (sqlite3_get_autocommit(raw_db) == 0) {
+            // `db` owns raw_db by now — returning destroys it, which closes both
+            // connections. Do NOT sqlite3_close(raw_db) here as well.
+            return std::unexpected(
+                std::string{"tar.db schema transaction could neither commit nor roll back; "
+                            "refusing to open on a wedged connection"});
+        }
         spdlog::warn("TarDatabase: warehouse table creation failed{}",
                      db.schema_version() < 2 ? ", continuing in legacy mode" : "");
     }
@@ -473,6 +577,64 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
             sqlite3_exec(raw_db, "ROLLBACK TO v4_migration", nullptr, nullptr, nullptr);
             sqlite3_exec(raw_db, "RELEASE v4_migration", nullptr, nullptr, nullptr);
         }
+    }
+
+    // Version 5: retire tar_events for real, on the INSTALLED BASE.
+    //
+    // v3 already dropped it — but `kCreateSchema` used to recreate it on every
+    // open, and the v3 branch is gated on `schema_version() == 2`, so every
+    // database that had already reached v3 resurrected the table on each open
+    // with nothing left to remove it. Dropping the DDL (above) stops the
+    // resurrection for good, yet every agent already in the field sits at v3/v4
+    // WITH the table present. Without this bump a fresh install and an upgraded
+    // endpoint would carry permanently divergent schemas, and the #760 UP-8
+    // argument — that `is_queryable_table()` may exclude tar_events because it
+    // is genuinely absent — would hold for fresh installs only.
+    //
+    // Gated on PRESENCE, not on a version number. A version gate (`== 4`) is
+    // armed exactly once and then never again: roll an endpoint back to a
+    // pre-fix binary and its kCreateSchema recreates the table while the stored
+    // version stays 5, so rolling forward would find the gate false and strand
+    // the table forever — reinstating the very divergence this fixes. Agent
+    // rollback is supported, so the gate has to be the fact on disk. It is also
+    // the only gate that reaches a database stranded at v3 by a failed v4 ALTER.
+    // Cost is one sqlite_master read per open; the DROP still happens at most
+    // once per resurrection, so no endpoint takes a write on every boot (and
+    // with secure_delete=ON a populated table is never re-zeroed at each start).
+    if (tar_events_present(raw_db)) {
+        std::lock_guard lock(db.mu_);
+        char* emsg = nullptr;
+        sqlite3_exec(raw_db, "SAVEPOINT v5_migration", nullptr, nullptr, nullptr);
+        int mrc = sqlite3_exec(raw_db, "DROP TABLE IF EXISTS tar_events", nullptr, nullptr, &emsg);
+        if (mrc == SQLITE_OK) {
+            sqlite3_free(emsg);
+            // The indexes go with the table; these cover a database that somehow
+            // kept an index without it.
+            for (const char* idx :
+                 {"idx_tar_events_ts", "idx_tar_events_type_ts", "idx_tar_events_snapshot"}) {
+                const auto drop = std::format("DROP INDEX IF EXISTS {}", idx);
+                sqlite3_exec(raw_db, drop.c_str(), nullptr, nullptr, nullptr);
+            }
+            sqlite3_exec(raw_db, "RELEASE v5_migration", nullptr, nullptr, nullptr);
+            spdlog::info("TarDatabase: retired the legacy tar_events table");
+        } else {
+            // WARN, not ERROR: nothing reads or writes tar_events, so the cost of
+            // failing here is a residual empty table. The next open retries.
+            spdlog::warn("TarDatabase: could not drop the legacy tar_events table: {} — it will be "
+                         "retried on the next open; to clear it by hand, stop the agent and run "
+                         "`DROP TABLE tar_events;` against the tar.db",
+                         emsg ? emsg : "unknown");
+            sqlite3_free(emsg);
+            sqlite3_exec(raw_db, "ROLLBACK TO v5_migration", nullptr, nullptr, nullptr);
+            sqlite3_exec(raw_db, "RELEASE v5_migration", nullptr, nullptr, nullptr);
+        }
+    }
+    // The version marker is independent of the drop above: it records that this
+    // binary's schema contract has been applied, for in-band auditability.
+    if (db.schema_version() == 4) {
+        std::lock_guard lock(db.mu_);
+        db.set_config_locked("schema_version", "5");
+        spdlog::info("TarDatabase: migrated to schema version 5 (legacy tar_events retired)");
     }
 
     // Open a dedicated read-only, authorizer-sandboxed connection for untrusted
@@ -746,7 +908,9 @@ bool TarDatabase::create_warehouse_tables() {
 
     auto ddl = generate_warehouse_ddl();
     char* err_msg = nullptr;
-    int rc = sqlite3_exec(db_, ddl.c_str(), nullptr, nullptr, &err_msg);
+    // One transaction for the whole registry DDL — the dominant cost of an
+    // open, and the larger of the two batches (#2093). See exec_ddl_batch.
+    int rc = exec_ddl_batch(db_, ddl.c_str(), &err_msg);
     if (rc != SQLITE_OK) {
         spdlog::error("TarDatabase::create_warehouse_tables failed: {}",
                       err_msg ? err_msg : "unknown");
