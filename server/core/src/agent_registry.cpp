@@ -1134,29 +1134,33 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
     // cannot target another operator's set by id (review finding B1). Aliases
     // are not resolved here; callers that accept aliases pre-resolve them.
     std::unordered_map<std::string, std::unordered_set<std::string>> rs_members;
-    if (rs_store) {
+    {
+        // B2 fail-closed (2026-07-26 hardening round; widened per governance
+        // H1, 2026-07-29): a scope that references from_result_set: can only
+        // be evaluated when BOTH a store and a principal are available to
+        // owner-resolve against. Missing either one is the SAME fail-open
+        // shape as a degraded preload: an unresolvable from_result_set: atom
+        // would otherwise resolve "" (no match) for every agent, and under a
+        // NOT combinator that INVERTS to "matches every agent" — a
+        // fleet-wide match reachable without any DB error at all. The
+        // original guard lived inside `if (rs_store)`, so the callers that
+        // pass NO store (e.g. the Guardian push paths) skipped it entirely
+        // and silently evaluated the atom false — exactly the inversion
+        // hazard, and for a Guardian rule that arms an enforcing guard, a
+        // fleet-wide arm. Abort rather than silently no-match. NARROW by
+        // construction: a scope with no from_result_set: atom is completely
+        // unaffected.
         std::vector<std::string> refs;
         collect_result_set_ids(expr, refs);
-        if (!refs.empty() && principal.empty()) {
-            // B2 fail-closed (2026-07-26 hardening round): a real rs_store is
-            // wired but there is no principal to owner-resolve against — e.g.
-            // the tracked/MCP dispatch paths recover `principal` from an
-            // execution row's `dispatched_by` and that lookup missed/was
-            // empty, or a dispatch closure never threads a principal at all.
-            // This is the SAME fail-open shape as a degraded preload: an
-            // unresolvable from_result_set: atom would otherwise resolve ""
-            // (no match) for every agent, and under a NOT combinator that
-            // INVERTS to "matches every agent" — a fleet-wide command
-            // dispatch reachable without any DB error at all, purely from a
-            // missing principal. Abort rather than silently no-match. NARROW
-            // by construction: a scope with no from_result_set: atom takes
-            // the `refs.empty()` branch and is completely unaffected.
+        if (!refs.empty() && (rs_store == nullptr || principal.empty())) {
             spdlog::error("AgentRegistry::evaluate_scope: scope references from_result_set: but "
-                          "no principal was supplied to owner-resolve against — aborting scope "
-                          "evaluation");
+                          "{} — aborting scope evaluation",
+                          rs_store == nullptr ? "no ResultSetStore is wired to resolve it"
+                                              : "no principal was supplied to owner-resolve "
+                                                "against");
             return std::nullopt;
         }
-        if (!principal.empty()) {
+        if (rs_store && !principal.empty()) {
             const std::string owner(principal);
             for (const auto& rsid : refs) {
                 if (rs_members.contains(rsid))

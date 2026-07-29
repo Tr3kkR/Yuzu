@@ -1,5 +1,7 @@
 #include "result_set_store.hpp"
 
+#include "audit_retention_rules.hpp"
+
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -16,6 +18,7 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cerrno>
 #include <cstdlib>
 #include <format>
 #include <limits>
@@ -175,7 +178,18 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE TABLE sqlite_backfill ("
          "  id           SMALLINT PRIMARY KEY,"
          "  completed_at BIGINT NOT NULL,"
-         "  CHECK (id = 1));"},
+         "  CHECK (id = 1));"
+         // Durable state for the gc_sweep retention clock guard (#2360 class;
+         // routed-concern "Clock-guarded retention"). SHARED rows rather than
+         // process-local members: on Postgres N server replicas each run the
+         // sweep, so the persisted reading and the anomaly-dedup fact set
+         // must be one shared truth under the sweep's advisory lock — a
+         // process-local copy paces at N x cap and one skewed replica would
+         // put every replica into independent decline (the ladder's AuditStore
+         // row records the same requirement for its own migration).
+         "CREATE TABLE gc_meta ("
+         "  key   TEXT PRIMARY KEY,"
+         "  value TEXT NOT NULL);"},
     };
     return kMigrations;
 }
@@ -388,7 +402,8 @@ bool ResultSetStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
                 sqlite3_errmsg(legacy.get()));
             return false;
         }
-        while (sqlite3_step(s.get()) == SQLITE_ROW) {
+        int step_rc = SQLITE_OK;
+        while ((step_rc = sqlite3_step(s.get())) == SQLITE_ROW) {
             ResultSet r;
             r.id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0)));
             r.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1)));
@@ -411,6 +426,19 @@ bool ResultSetStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
             r.device_count = sqlite3_column_int64(s.get(), 13);
             legacy_sets.push_back(std::move(r));
         }
+        // H2 (governance): the loop above exits on ANY non-ROW code. Require
+        // the terminal code to be SQLITE_DONE — a corrupt page or I/O error
+        // mid-scan (SQLITE_CORRUPT/SQLITE_IOERR/...) otherwise truncates the
+        // legacy set silently, and the marker below would stamp the backfill
+        // complete over a partial copy, permanently (the marker short-circuits
+        // every later boot). ADR-0009: fail closed on ANY error — including
+        // read-side errors, not just insert-side ones.
+        if (step_rc != SQLITE_DONE) {
+            spdlog::error("ResultSetStore::migrate_from_sqlite: legacy result_sets scan aborted "
+                          "mid-read (rc={} {}): refusing to stamp a partial backfill",
+                          step_rc, sqlite3_errmsg(legacy.get()));
+            return false;
+        }
         // s finalizes here (end of scope), before the next SqliteStmt opens.
     }
 
@@ -424,10 +452,18 @@ bool ResultSetStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
                 sqlite3_errmsg(legacy.get()));
             return false;
         }
-        while (sqlite3_step(s.get()) == SQLITE_ROW) {
+        int step_rc = SQLITE_OK;
+        while ((step_rc = sqlite3_step(s.get())) == SQLITE_ROW) {
             legacy_members.emplace_back(
                 safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0))),
                 safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1))));
+        }
+        // H2: same terminal-code discipline as the result_sets scan above.
+        if (step_rc != SQLITE_DONE) {
+            spdlog::error("ResultSetStore::migrate_from_sqlite: legacy result_set_members scan "
+                          "aborted mid-read (rc={} {}): refusing to stamp a partial backfill",
+                          step_rc, sqlite3_errmsg(legacy.get()));
+            return false;
         }
     }
     // `legacy` closes here (end of function scope) via SqliteConnGuard's
@@ -948,49 +984,77 @@ ResultSetStore::Counts ResultSetStore::counts() {
 std::expected<ResultSet, ResultSetError> ResultSetStore::pin(const std::string& id) {
     if (!open_)
         return std::unexpected(ResultSetError::DbError);
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
-    if (!lease) {
-        spdlog::error("ResultSetStore::pin: no connection ({})", pool_.last_error());
-        return std::unexpected(ResultSetError::DbError);
-    }
+    // Whole check-count-update sequence under ONE transaction (governance
+    // M3): autocommit statements on a lease are not atomic, so the
+    // kMaxPinsPerOwner check was racy (two concurrent pins by one owner both
+    // count cap-1 and both commit) and the target row could be deleted
+    // between read and update. FOR UPDATE locks the target row; the
+    // per-owner advisory xact lock serialises the CAP check against
+    // concurrent pins of the owner's OTHER sets (a row lock on one set
+    // cannot do that). Both locks are transaction-scoped — pool-safe (the
+    // session-level variants would poison the shared connection; see
+    // docs/postgres-store-playbook.md).
+    std::expected<ResultSet, ResultSetError> out = std::unexpected(ResultSetError::DbError);
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        std::string sel_sql = std::string("SELECT ") + kRowCols +
+                              " FROM result_set_store.result_sets WHERE id = $1 FOR UPDATE";
+        pg::PgResult get_res = pg::exec_params(conn, sel_sql.c_str(), std::vector<std::string>{id});
+        if (get_res.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::pin: read failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        if (PQntuples(get_res.get()) == 0) {
+            out = std::unexpected(ResultSetError::NotFound);
+            return true; // commit the no-op
+        }
+        ResultSet row = read_row(get_res.get(), 0);
+        if (row.pinned) {
+            out = row; // idempotent — no ttl_at renewal, matches the SQLite behavior
+            return true;
+        }
 
-    std::string sel_sql = std::string("SELECT ") + kRowCols +
-                          " FROM result_set_store.result_sets WHERE id = $1 LIMIT 1";
-    pg::PgResult get_res =
-        pg::exec_params(lease.get(), sel_sql.c_str(), std::vector<std::string>{id});
-    if (get_res.status() != PGRES_TUPLES_OK) {
-        spdlog::error("ResultSetStore::pin: read failed: {}", PQerrorMessage(lease.get()));
-        return std::unexpected(ResultSetError::DbError);
-    }
-    if (PQntuples(get_res.get()) == 0)
-        return std::unexpected(ResultSetError::NotFound);
-    ResultSet row = read_row(get_res.get(), 0);
-    if (row.pinned)
-        return row; // idempotent — no ttl_at renewal, matches the SQLite behavior
+        // CROSS-STORE NAMESPACE prefix, matching the sibling stores'
+        // hashtextextended('<store>:' || key) convention.
+        pg::PgResult lk = pg::exec_params(
+            conn, "SELECT pg_advisory_xact_lock(hashtextextended('result_set_store:pin:' || $1, 0))",
+            std::vector<std::string>{row.owner_principal});
+        if (lk.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::pin: owner lock failed: {}", PQerrorMessage(conn));
+            return false;
+        }
 
-    // Pin-storm guard (design §3.3): per-operator cap.
-    int pinned_count = count_pinned_on(lease.get(), row.owner_principal);
-    if (pinned_count < 0) {
-        spdlog::error("ResultSetStore::pin: pin-count check failed: {}",
-                      PQerrorMessage(lease.get()));
-        return std::unexpected(ResultSetError::DbError);
-    }
-    if (pinned_count >= kMaxPinsPerOwner)
-        return std::unexpected(ResultSetError::PinLimit);
+        // Pin-storm guard (design §3.3): per-operator cap — now race-free
+        // under the owner lock above.
+        int pinned_count = count_pinned_on(conn, row.owner_principal);
+        if (pinned_count < 0) {
+            spdlog::error("ResultSetStore::pin: pin-count check failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        if (pinned_count >= kMaxPinsPerOwner) {
+            out = std::unexpected(ResultSetError::PinLimit);
+            return true;
+        }
 
-    std::string upd_sql = std::string("UPDATE result_set_store.result_sets SET pinned = true, "
-                                      "ttl_at = $1::bigint WHERE id = $2 RETURNING ") +
-                          kRowCols;
-    pg::PgResult upd = pg::exec_params(
-        lease.get(), upd_sql.c_str(),
-        std::vector<std::string>{std::to_string(std::numeric_limits<int64_t>::max()), id});
-    if (upd.status() != PGRES_TUPLES_OK) {
-        spdlog::error("ResultSetStore::pin: update failed: {}", PQerrorMessage(lease.get()));
+        std::string upd_sql = std::string("UPDATE result_set_store.result_sets SET pinned = true, "
+                                          "ttl_at = $1::bigint WHERE id = $2 RETURNING ") +
+                              kRowCols;
+        pg::PgResult upd = pg::exec_params(
+            conn, upd_sql.c_str(),
+            std::vector<std::string>{std::to_string(std::numeric_limits<int64_t>::max()), id});
+        if (upd.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::pin: update failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        if (PQntuples(upd.get()) == 0) {
+            out = std::unexpected(ResultSetError::NotFound); // deleted concurrently
+            return true;
+        }
+        out = read_row(upd.get(), 0);
+        return true;
+    });
+    if (!ok)
         return std::unexpected(ResultSetError::DbError);
-    }
-    if (PQntuples(upd.get()) == 0)
-        return std::unexpected(ResultSetError::NotFound); // deleted concurrently
-    return read_row(upd.get(), 0);
+    return out;
 }
 
 std::expected<ResultSet, ResultSetError> ResultSetStore::unpin(const std::string& id) {
@@ -1047,28 +1111,33 @@ std::expected<void, ResultSetError> ResultSetStore::delete_set(const std::string
         spdlog::error("ResultSetStore::delete_set: no connection ({})", pool_.last_error());
         return std::unexpected(ResultSetError::DbError);
     }
-    pg::PgResult get_res = pg::exec_params(
-        lease.get(), "SELECT pinned FROM result_set_store.result_sets WHERE id = $1 LIMIT 1",
-        std::vector<std::string>{id});
-    if (get_res.status() != PGRES_TUPLES_OK) {
-        spdlog::error("ResultSetStore::delete_set: read failed: {}", PQerrorMessage(lease.get()));
-        return std::unexpected(ResultSetError::DbError);
-    }
-    if (PQntuples(get_res.get()) == 0)
-        return std::unexpected(ResultSetError::NotFound);
-    if (to_bool(PQgetvalue(get_res.get(), 0, 0)))
-        return std::unexpected(ResultSetError::Pinned); // must unpin first (design §6)
-
+    // ONE conditional statement (governance M3): the base SQLite impl held a
+    // mutex across check+DELETE; two autocommit statements on one lease are
+    // NOT atomic (a lease serialises access to a connection, not a pair of
+    // statements), so a pin landing between them deleted a set the operator
+    // was told was pinned. The predicate makes the pinned-check and the
+    // delete one atomic statement; the follow-up read only CLASSIFIES a miss
+    // (NotFound vs Pinned) and can no longer delete anything.
     pg::PgResult del = pg::exec_params(
-        lease.get(), "DELETE FROM result_set_store.result_sets WHERE id = $1 RETURNING id",
+        lease.get(),
+        "DELETE FROM result_set_store.result_sets WHERE id = $1 AND pinned = false RETURNING id",
         std::vector<std::string>{id});
     if (del.status() != PGRES_TUPLES_OK) {
         spdlog::error("ResultSetStore::delete_set: delete failed: {}", PQerrorMessage(lease.get()));
         return std::unexpected(ResultSetError::DbError);
     }
-    if (PQntuples(del.get()) == 0)
-        return std::unexpected(ResultSetError::NotFound);
-    return {};
+    if (PQntuples(del.get()) == 1)
+        return {};
+    pg::PgResult probe = pg::exec_params(
+        lease.get(), "SELECT pinned FROM result_set_store.result_sets WHERE id = $1 LIMIT 1",
+        std::vector<std::string>{id});
+    if (probe.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore::delete_set: probe failed: {}", PQerrorMessage(lease.get()));
+        return std::unexpected(ResultSetError::DbError);
+    }
+    if (PQntuples(probe.get()) == 1 && to_bool(PQgetvalue(probe.get(), 0, 0)))
+        return std::unexpected(ResultSetError::Pinned); // must unpin first (design §6)
+    return std::unexpected(ResultSetError::NotFound);
 }
 
 // ── Async materialisation ────────────────────────────────────────────────────
@@ -1207,28 +1276,200 @@ void ResultSetStore::mark_failed(const std::string& id, const std::string& reaso
 
 // ── GC ───────────────────────────────────────────────────────────────────────
 
+// Clock-guarded retention (routed-concern invariant; #2360 class). The
+// cutoff comes from a wall clock, so a bare `DELETE ... WHERE ttl_at < now`
+// is banned: a forward-skewed clock mass-expires sets that are not stale.
+// The guard follows the reference SHAPE (audit_retention_rules.hpp classify
+// + AuditStore::cleanup_once fact-set dedup) with substrate-tuned constants
+// — result sets are 1-hour-TTL operator scratch state, pinned sets are
+// protected by pinned=false regardless of ttl_at.
+//
+// Postgres adaptation (this store is the first PG implementation of the
+// guard; AuditStore's own migration row records the same requirement): the
+// persisted reading + the anomaly-dedup fact set live in SHARED
+// `gc_meta` rows, and one sweep runs fleet-wide at a time under a
+// try-advisory xact lock — process-local state would pace at N x cap across
+// replicas and one skewed replica could put every replica into permanent
+// independent decline.
+//
+// Part-6 anchor decision (recorded, per the invariant): a MISSING stored
+// reading is ordinary — the fresh-store / first-pass-after-migration case —
+// and says nothing by itself; it is reported only when the pass would ALSO
+// expire every datable row (the AuditStore choice, not the TAR choice,
+// because unlike TAR this table is legitimately empty/short-lived in normal
+// operation and a first pass against it deletes at most 1-hour-old scratch).
+namespace {
+constexpr int64_t kGcSweepCapPerPass = 5000;      // part 5: unconditional
+constexpr int64_t kGcBigStepSecs = 86'400;        // part 7: absolute, ~1 day
+constexpr int64_t kGcImplausiblyAheadSecs = 604'800; // part 1: probe excludes
+} // namespace
+
 int ResultSetStore::gc_sweep() {
     if (!open_)
         return 0;
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
-    if (!lease) {
-        spdlog::error("ResultSetStore::gc_sweep: no connection ({})", pool_.last_error());
+    int deleted = 0;
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // One sweeping replica at a time. try-variant: a busy lock means a
+        // sibling replica is already sweeping this pass — skip quietly.
+        pg::PgResult lk = pg::exec_params(
+            conn,
+            "SELECT pg_try_advisory_xact_lock(hashtextextended('result_set_store:gc_sweep', 0))",
+            std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::gc_sweep: lock probe failed: {}",
+                          PQerrorMessage(conn));
+            return false;
+        }
+        if (!to_bool(PQgetvalue(lk.get(), 0, 0)))
+            return true; // another replica holds the sweep
+
+        const int64_t now = now_epoch();
+
+        // Load the persisted reading + last-reported anomaly fact set.
+        pg::PgResult meta = pg::exec_params(
+            conn, "SELECT key, value FROM result_set_store.gc_meta WHERE key IN "
+                  "('last_pass_now','last_anomaly_facts')",
+            std::vector<std::string>{});
+        if (meta.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::gc_sweep: meta read failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        std::optional<int64_t> prev;
+        bool prev_unusable = false;
+        std::string last_facts;
+        for (int i = 0; i < PQntuples(meta.get()); ++i) {
+            std::string key = safe(PQgetvalue(meta.get(), i, 0));
+            std::string val = safe(PQgetvalue(meta.get(), i, 1));
+            if (key == "last_pass_now") {
+                errno = 0;
+                char* end = nullptr;
+                long long v = std::strtoll(val.c_str(), &end, 10);
+                if (errno != 0 || end == val.c_str() || *end != '\0') {
+                    prev_unusable = true; // part 3: unparseable = anomaly, never a quiet reset
+                } else {
+                    prev = static_cast<int64_t>(v);
+                }
+            } else if (key == "last_anomaly_facts") {
+                last_facts = val;
+            }
+        }
+        // part 3: sanitise BEFORE arithmetic — ahead-of-now or negative is an
+        // anomaly carrier, and `now - prev` on either would be meaningless
+        // (or UB-adjacent on INT64_MIN).
+        if (prev && (*prev < 0 || *prev > now)) {
+            prev_unusable = true;
+            prev.reset();
+        }
+
+        // Stamp the new reading FIRST — an honest observation of the clock
+        // whatever this pass decides (reference behaviour; it is what makes
+        // the guard work when the clock was already wrong before boot).
+        pg::PgResult stamp = pg::exec_params(
+            conn,
+            "INSERT INTO result_set_store.gc_meta (key, value) VALUES ('last_pass_now', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            std::vector<std::string>{std::to_string(now)});
+        if (stamp.status() != PGRES_COMMAND_OK) {
+            spdlog::error("ResultSetStore::gc_sweep: meta stamp failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+
+        // part 1: probe by OUTCOME. Rows stamped implausibly far ahead are
+        // excluded from the datable denominator so one forward-skewed row
+        // cannot disarm the wipe detector forever. pinned rows (ttl_at =
+        // INT64_MAX) are outside the sweep entirely via pinned = false.
+        pg::PgResult probe = pg::exec_params(
+            conn,
+            "SELECT count(*) FILTER (WHERE ttl_at < $1::bigint) AS expiring, "
+            "count(*) FILTER (WHERE ttl_at <= $2::bigint) AS datable "
+            "FROM result_set_store.result_sets WHERE pinned = false",
+            std::vector<std::string>{std::to_string(now),
+                                     std::to_string(now + kGcImplausiblyAheadSecs)});
+        if (probe.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::gc_sweep: probe failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        const int64_t expiring = to_i64(PQgetvalue(probe.get(), 0, 0));
+        const int64_t datable = to_i64(PQgetvalue(probe.get(), 0, 1));
+
+        audit_retention::Facts facts{
+            .has_expired = expiring > 0,
+            .would_wipe = expiring > 0 && expiring >= datable,
+            // part 7: absolute threshold, never scaled to the (1 h) TTL.
+            .big_step = prev.has_value() && expiring > 0 &&
+                        audit_retention::moved_at_least(*prev, now, kGcBigStepSecs) && now > *prev,
+            .prev_unusable = prev_unusable,
+        };
+        const auto anomaly = audit_retention::classify(facts);
+        const std::string facts_ser = std::string(facts.has_expired ? "e" : "-") +
+                                      (facts.would_wipe ? "w" : "-") +
+                                      (facts.big_step ? "s" : "-") +
+                                      (facts.prev_unusable ? "u" : "-");
+        if (anomaly != audit_retention::Anomaly::None) {
+            if (facts_ser != last_facts) {
+                // part 4: report + decline ONCE per distinct fact set. The
+                // FULL fact set is the dedup key (never a latch bool / the
+                // classified enum) — a different anomaly arriving under a
+                // reported one must report again, and a repeat of the same
+                // one must NOT hold the drain forever: the next pass with
+                // equal facts proceeds, paced by the cap, so a legitimately
+                // all-expired table still ages out.
+                spdlog::warn("ResultSetStore::gc_sweep: retention clock anomaly ({} facts={}) — "
+                             "declining this pass; an identical next pass will drain, capped",
+                             static_cast<int>(anomaly), facts_ser);
+                pg::PgResult rec = pg::exec_params(
+                    conn,
+                    "INSERT INTO result_set_store.gc_meta (key, value) VALUES "
+                    "('last_anomaly_facts', $1) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    std::vector<std::string>{facts_ser});
+                if (rec.status() != PGRES_COMMAND_OK) {
+                    spdlog::error("ResultSetStore::gc_sweep: anomaly record failed: {}",
+                                  PQerrorMessage(conn));
+                    return false;
+                }
+                return true; // decline: no delete this pass
+            }
+            // Suppressed repeat of the SAME fact set: condition already
+            // reported; get on with the drain (capped below).
+        } else if (!last_facts.empty()) {
+            // Consumed: a clean pass clears the dedup key so the NEXT
+            // anomaly reports fresh.
+            pg::PgResult clr = pg::exec_params(
+                conn, "DELETE FROM result_set_store.gc_meta WHERE key = 'last_anomaly_facts'",
+                std::vector<std::string>{});
+            if (clr.status() != PGRES_COMMAND_OK) {
+                spdlog::error("ResultSetStore::gc_sweep: anomaly clear failed: {}",
+                              PQerrorMessage(conn));
+                return false;
+            }
+        }
+        if (expiring == 0)
+            return true; // nothing to drain
+
+        // part 5: cap every accepted pass UNCONDITIONALLY — the detectors
+        // above are best-effort, the cap always applies. DELETE ... RETURNING
+        // counts what the statement actually removed (the #1033-banning
+        // idiom). Cascades to result_set_members via the FK.
+        pg::PgResult res = pg::exec_params(
+            conn,
+            "DELETE FROM result_set_store.result_sets WHERE id IN ("
+            "SELECT id FROM result_set_store.result_sets "
+            "WHERE pinned = false AND ttl_at < $1::bigint "
+            "ORDER BY ttl_at ASC LIMIT $2) RETURNING id",
+            std::vector<std::string>{std::to_string(now), std::to_string(kGcSweepCapPerPass)});
+        if (res.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::gc_sweep: delete failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        deleted = PQntuples(res.get());
+        return true;
+    });
+    if (!ok) {
+        spdlog::error("ResultSetStore::gc_sweep: pass aborted ({})", pool_.last_error());
         return 0;
     }
-    // Single DELETE ... RETURNING: count the rows the statement actually
-    // removed (the #1033-banning idiom), rather than a pre-count we assume
-    // succeeds. Cascades to result_set_members via the FK.
-    int64_t now = now_epoch();
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "DELETE FROM result_set_store.result_sets WHERE pinned = false AND ttl_at < $1::bigint "
-        "RETURNING id",
-        std::vector<std::string>{std::to_string(now)});
-    if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::error("ResultSetStore::gc_sweep: delete failed: {}", PQerrorMessage(lease.get()));
-        return 0;
-    }
-    return PQntuples(res.get());
+    return deleted;
 }
 
 } // namespace yuzu::server

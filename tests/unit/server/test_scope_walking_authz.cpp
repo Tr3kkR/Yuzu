@@ -355,3 +355,60 @@ TEST_CASE("evaluate_scope: an empty principal ABORTS — never expands a NOT-inv
         REQUIRE(matched.has_value()); // no from_result_set: atom -> never aborts
     }
 }
+
+// ── H1 fail-closed regression (2026-07-29 governance round): a NULL store ──
+// ── must ABORT a from_result_set: scope, never silently evaluate it false. ──
+//
+// The concrete vulnerability: the B2 guard above was written INSIDE
+// `if (rs_store)`, so the callers that pass NO store at all (the Guardian
+// push paths — server.cpp threads neither store nor principal there) skipped
+// every guard. A `from_result_set:<id>` atom then resolved "no match" for
+// every agent, and `NOT` inverted that to "matches every agent" — for a
+// Guardian rule arming an enforcing guard, a fleet-wide arm, reachable with
+// no DB and no error anywhere. The header contract even asserted the
+// null/null combination "can never degrade". Post-H1 the guard runs for the
+// null-store case too: an atom nobody can resolve aborts.
+//
+// Deliberately NOT [pg]-tagged: no store is constructed — this is the
+// null-store arm, and it must hold with no database in the picture at all.
+TEST_CASE("evaluate_scope: a NULL result-set store ABORTS a from_result_set scope — "
+          "never a silent false-match (H1, no store at all)",
+          "[scope][result_set][authz][failclosed]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.register_agent(info("agent-win"));
+    registry.register_agent(info("agent-lin"));
+
+    SECTION("NOT from_result_set:<id> with a null store aborts rather than matching "
+            "every agent") {
+        auto expr = yuzu::scope::parse("NOT from_result_set:rs_anything");
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, nullptr, "");
+        REQUIRE_FALSE(matched.has_value());
+    }
+
+    SECTION("the plain (non-NOT) form also aborts") {
+        auto expr = yuzu::scope::parse("from_result_set:rs_anything");
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, nullptr, "");
+        REQUIRE_FALSE(matched.has_value());
+    }
+
+    SECTION("an atom buried under a combinator still aborts (the collector walks "
+            "the whole AST, not just the root)") {
+        auto expr = yuzu::scope::parse("hostname == \"agent-win.local\" AND NOT from_result_set:rs_x");
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, nullptr, "");
+        REQUIRE_FALSE(matched.has_value());
+    }
+
+    SECTION("a scope with NO from_result_set atom is unaffected — null store stays "
+            "legal for plain scopes") {
+        auto expr = yuzu::scope::parse("hostname == \"agent-win.local\"");
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, nullptr, "");
+        REQUIRE(matched.has_value());
+        CHECK(matched->size() == 1); // agent-win only
+    }
+}

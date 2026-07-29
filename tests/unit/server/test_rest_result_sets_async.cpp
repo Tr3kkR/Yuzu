@@ -304,7 +304,14 @@ TEST_CASE("from-tar-query: missing sql is 400, no dispatch", "[pg][result_set][a
 }
 
 TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not widened",
-          "[result_set][async][tar][targeting][security]") {
+          "[pg][result_set][async][tar][targeting][security]") {
+    // PG-port note (merge of #2500's dev-side case into the ADR-0036 branch):
+    // the harness is now Postgres-backed, so the fixture preamble matches the
+    // sibling cases and the case carries [pg] (shard-partition invariant —
+    // it SKIPs without a DSN via YUZU_REQUIRE_PG_DB_TPL).
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
     // parent_id IS the targeting argument on this route: present and non-empty
     // scopes the dispatch to that set's members via `from_result_set:`, absent
     // broadcasts to every connected agent. The guard used to be
@@ -317,7 +324,7 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
     // `h.calls.empty()` is the assertion that matters: a 400 that still
     // dispatched would leave the widening intact behind a better status code.
     SECTION("numeric parent_id") {
-        AsyncHarness h;
+        AsyncHarness h(pool);
         int status = 0;
         h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","parent_id":123})",
                status);
@@ -325,7 +332,7 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
         REQUIRE(h.calls.empty());
     }
     SECTION("empty-string parent_id") {
-        AsyncHarness h;
+        AsyncHarness h(pool);
         int status = 0;
         h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","parent_id":""})",
                status);
@@ -336,7 +343,7 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
         // Rejected rather than read as "absent". A client that serialises an
         // unset field as null and one whose parent lookup returned nothing are
         // indistinguishable here, and only one of them wants the entire fleet.
-        AsyncHarness h;
+        AsyncHarness h(pool);
         int status = 0;
         h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","parent_id":null})",
                status);
@@ -349,7 +356,7 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
         // the alert the change ships. The reason label names the field that was
         // actually wrong: an earlier version reused `scope_empty`, which put a
         // field the caller never sent into the audit trail.
-        AsyncHarness h;
+        AsyncHarness h(pool);
         int status = 0;
         h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","parent_id":123})",
                status);
@@ -364,7 +371,7 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
         // parent_id block and was missed by the first round of the fix. It is
         // synchronous, so the consequence was a READ across every device rather
         // than a dispatch — narrower blast radius, same defect.
-        AsyncHarness h;
+        AsyncHarness h(pool);
         int status = 0;
         h.post("/api/v1/result-sets/from-inventory-query", R"({"query":"os=linux","parent_id":""})",
                status);
@@ -375,14 +382,14 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
                   .value() == 1.0);
     }
     SECTION("a non-object body is refused, not read as an absent parent_id") {
-        AsyncHarness h;
+        AsyncHarness h(pool);
         int status = 0;
         h.post("/api/v1/result-sets/from-tar-query", R"(["sql"])", status);
         REQUIRE(status == 400);
         CHECK(h.calls.empty());
     }
     SECTION("omitting parent_id still broadcasts — the over-broadness guard") {
-        AsyncHarness h;
+        AsyncHarness h(pool);
         int status = 0;
         h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
         REQUIRE(status == 202);

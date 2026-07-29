@@ -2809,10 +2809,16 @@ public:
                                 return cached->second;
                             bool member = false;
                             if (auto parsed = yuzu::scope::parse(expr)) {
-                                // No rs_store/principal passed here — the
-                                // from_result_set: preload never runs, so
-                                // evaluate_scope cannot degrade (nullopt) for
-                                // this call; value_or({}) is a no-op fallback.
+                                // No rs_store/principal passed here. If this
+                                // rule's scope references from_result_set:,
+                                // evaluate_scope now ABORTS (nullopt, H1)
+                                // rather than silently evaluating the atom
+                                // false — value_or({}) then collapses to "not
+                                // a member", i.e. the rule is NOT pushed to
+                                // this agent. Arming nothing is the safe
+                                // direction here; the old comment's "cannot
+                                // degrade" claim was wrong for exactly the
+                                // NOT-combinator case.
                                 for (const auto& id : registry_.evaluate_scope(
                                          *parsed, tag_store_.get(),
                                          custom_properties_store_.get())
@@ -8756,7 +8762,15 @@ private:
                                                    "db_degraded");
                 } else {
                     // Forensic row when a referenced set is absent/expired/unowned
-                    // (design §7 rule 3); does not abort dispatch.
+                    // (design §7 rule 3) — and, per governance M1 (2026-07-29),
+                    // the check is BINDING: a failing ref ABORTS dispatch. The
+                    // prior audit-then-dispatch-anyway behaviour let
+                    // `NOT from_result_set:<absent-or-unowned-id>` proceed with
+                    // the atom resolving no-match for every agent — which NOT
+                    // inverts to match-ALL: an operator-intent inversion (the
+                    // successful-empty read from member_set_owned is
+                    // deliberately absent/unowned-indistinguishable, so the
+                    // owner check here is the only seam that can refuse).
                     auto failing_refs = scope_refs_failing_owner_check(*resolved_scope, principal,
                                                                        result_set_store_.get());
                     if (!failing_refs) {
@@ -8765,10 +8779,13 @@ private:
                                       to_string(failing_refs.error()));
                         audit_scope_evaluation_aborted(principal, principal_role, command_id,
                                                        "db_degraded");
-                    } else {
+                    } else if (!failing_refs->empty()) {
                         for (const auto& ref : *failing_refs)
                             audit_scope_resolution_failed(principal, principal_role, command_id,
                                                           ref);
+                        audit_scope_evaluation_aborted(principal, principal_role, command_id,
+                                                       "owner_check_failed");
+                    } else {
                         auto parsed = yuzu::scope::parse(*resolved_scope);
                         if (!parsed) {
                             res.status = 400;
@@ -11517,9 +11534,15 @@ private:
                                       to_string(failing_refs.error()));
                         audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,
                                                        "db_degraded");
-                    } else {
+                    } else if (!failing_refs->empty()) {
+                        // Governance M1: BINDING owner check — a failing ref
+                        // aborts dispatch (see the REST raw-dispatch site's
+                        // comment for the NOT-inversion rationale).
                         for (const auto& ref : *failing_refs)
                             audit_scope_resolution_failed(principal, /*role=*/"", command_id, ref);
+                        audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,
+                                                       "owner_check_failed");
+                    } else {
                         auto parsed = yuzu::scope::parse(*resolved_scope);
                         if (parsed) {
                             if (auto matched = registry_.evaluate_scope(
@@ -13787,9 +13810,12 @@ private:
                     auto parsed = yuzu::scope::parse(scope);
                     if (!parsed)
                         return -1;
-                    // No rs_store/principal passed — the from_result_set: preload
-                    // never runs, so this call cannot degrade (nullopt);
-                    // value_or({}) is a no-op fallback (ADR-0036).
+                    // No rs_store/principal passed. A scope referencing
+                    // from_result_set: now ABORTS (nullopt, H1) instead of
+                    // silently evaluating the atom false (which a NOT
+                    // combinator inverted to a fleet-wide arm);
+                    // value_or({}) collapses the abort to zero targets —
+                    // arm nothing, the safe direction on the push path.
                     targets = registry_.evaluate_scope(*parsed, tag_store_.get(),
                                                        custom_properties_store_.get())
                                   .value_or(std::vector<std::string>{});
@@ -13805,7 +13831,9 @@ private:
                     if (it == scope_cache.end()) {
                         std::unordered_set<std::string> ids;
                         if (auto parsed = yuzu::scope::parse(expr)) {
-                            // Same no-degrade-possible reasoning as above.
+                            // Same H1 semantics as above: a from_result_set:
+                            // atom aborts to nullopt; value_or({}) => this
+                            // agent is treated as out-of-scope (arm nothing).
                             auto v = registry_.evaluate_scope(*parsed, tag_store_.get(),
                                                               custom_properties_store_.get())
                                         .value_or(std::vector<std::string>{});
@@ -14100,10 +14128,16 @@ private:
                                               to_string(failing_refs.error()));
                                 audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,
                                                                "db_degraded");
-                            } else {
+                            } else if (!failing_refs->empty()) {
+                                // Governance M1: BINDING owner check — a
+                                // failing ref aborts dispatch (see the REST
+                                // raw-dispatch site's comment).
                                 for (const auto& ref : *failing_refs)
                                     audit_scope_resolution_failed(principal, /*role=*/"",
                                                                   command_id, ref);
+                                audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,
+                                                               "owner_check_failed");
+                            } else {
                                 auto parsed = yuzu::scope::parse(*resolved_scope);
                                 if (parsed) {
                                     if (auto matched = registry_.evaluate_scope(
