@@ -121,6 +121,11 @@ PRESERVED=0
 UPHELD=0
 LOST=0
 SKIPPED=0
+# Fixtures that actually carry DATA across the upgrade. readyz and login are
+# infrastructure checks: they pass whenever the server is reachable, so counting
+# them in the guarantee-inversion backstop below let a run where every
+# data-bearing fixture was skipped still report PASS (Gate 3 F-A).
+DATA_OK=0
 COOKIES="$(mktemp -t yuzu-test-verify.XXXXXX)"
 trap 'rm -f "$COOKIES"' EXIT
 
@@ -207,6 +212,7 @@ except: print(0)" 2>/dev/null || echo "0")
     if (( AUDIT_NOW >= AUDIT_BASELINE )); then
         ok "audit log $AUDIT_BASELINE → $AUDIT_NOW entries (preserved + grew)"
         set_result "audit_log" "preserved ($AUDIT_BASELINE → $AUDIT_NOW)"
+        DATA_OK=$((DATA_OK + 1))
     else
         fl "audit log shrank: $AUDIT_BASELINE → $AUDIT_NOW (data loss)"
         set_result "audit_log" "shrank ($AUDIT_BASELINE → $AUDIT_NOW)"
@@ -233,6 +239,7 @@ if [[ "$ENROLL_PRESENT_BEFORE" == "True" ]]; then
     if (( ENROLL_COUNT >= 1 )); then
         ok "enrollment tokens preserved ($ENROLL_COUNT present)"
         set_result "enrollment_tokens" "preserved ($ENROLL_COUNT)"
+        DATA_OK=$((DATA_OK + 1))
     else
         fl "enrollment tokens lost (had >= 1, now 0)"
         set_result "enrollment_tokens" "lost"
@@ -278,16 +285,7 @@ if [[ "$API_PRESENT_BEFORE" == "True" ]]; then
         # non-list `data` is treated the same way: unreadable, not empty.
         # Verified by mutation: restore the old `except: print(0)` and both a
         # 502 HTML body and a `{"meta":{}}` envelope score as a clean PASS.
-        API_COUNT=$(echo "$API_LIST" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print(-1); raise SystemExit(0)
-if not isinstance(d, dict) or not isinstance(d.get('data'), list):
-    print(-1)
-else:
-    print(len(d['data']))" 2>/dev/null || echo "-1")
+        API_COUNT=$(printf '%s' "$API_LIST" | python3 "$HERE/api_token_count.py" 2>/dev/null || echo "-1")
         # An EMPTY API_COUNT would satisfy `(( API_COUNT == 0 ))` — bash treats
         # the empty string as 0 in an arithmetic context, which silently routes
         # a python that exited 0 with no stdout into the PASS branch and defeats
@@ -302,6 +300,7 @@ else:
             if (( API_COUNT == 0 )); then
                 okx "API tokens invalidated as designed (ADR-0030 — 0 present, operators must re-mint)"
                 set_result "api_tokens" "invalidated as designed (ADR-0030)"
+                DATA_OK=$((DATA_OK + 1))
             else
                 fl "API tokens SURVIVED an upgrade that crossed the ADR-0030 cutover ($API_COUNT present) — a legacy store is still being read"
                 set_result "api_tokens" "survived ($API_COUNT) — cutover did not happen"
@@ -312,6 +311,7 @@ else:
             if (( API_COUNT >= 1 )); then
                 ok "API tokens preserved ($API_COUNT present)"
                 set_result "api_tokens" "preserved ($API_COUNT)"
+                DATA_OK=$((DATA_OK + 1))
             else
                 fl "API tokens lost (had >= 1, now 0) on an edge that does not cross the ADR-0030 cutover"
                 set_result "api_tokens" "lost"
@@ -334,8 +334,8 @@ fi
 # run. We hard-fail it here so the upgrade test cannot silently pass.
 WROTE_COUNT=$(read_state wrote_count)
 WROTE_COUNT=${WROTE_COUNT:-0}
-if [[ $WROTE_COUNT -gt 0 && $((PRESERVED + UPHELD)) -eq 0 ]]; then
-    fl "guarantee inversion: writer recorded $WROTE_COUNT fixtures, verifier upheld 0 — every check skipped or failed"
+if [[ $WROTE_COUNT -gt 0 && $DATA_OK -eq 0 ]]; then
+    fl "guarantee inversion: writer recorded $WROTE_COUNT fixtures, verifier upheld 0 DATA-BEARING fixtures — every data check skipped or failed (readyz/login passing proves only that the server is up)"
     set_result "guarantee_inversion" "writer wrote $WROTE_COUNT, verify preserved 0"
 fi
 
@@ -348,6 +348,8 @@ mkdir -p "$(dirname "$REPORT_FILE")"
     echo "  \"wrote_count\": $WROTE_COUNT,"
     echo "  \"preserved_count\": $PRESERVED,"
     echo "  \"upheld_count\": $UPHELD,"
+    echo "  \"data_bearing_ok\": $DATA_OK,"
+    echo "  \"api_tokens_expect\": \"$API_TOKENS_EXPECT\","
     echo "  \"lost_count\": $LOST,"
     echo "  \"skipped_count\": $SKIPPED,"
     echo "  \"fixtures\": {"
@@ -364,7 +366,7 @@ mkdir -p "$(dirname "$REPORT_FILE")"
 
 echo ""
 TOTAL=$((PRESERVED + UPHELD + LOST + SKIPPED))
-if [[ $LOST -eq 0 && ! ( $WROTE_COUNT -gt 0 && $((PRESERVED + UPHELD)) -eq 0 ) ]]; then
+if [[ $LOST -eq 0 && ! ( $WROTE_COUNT -gt 0 && $DATA_OK -eq 0 ) ]]; then
     echo -e "${G}fixtures verify: $PRESERVED preserved, $UPHELD upheld-by-contract, of $TOTAL${N} ($SKIPPED skipped)"
     exit 0
 else
@@ -372,7 +374,7 @@ else
     echo -e "${R}Read the per-fixture lines above for the cause. NOT every failure is data loss:${N}"
     echo -e "${R}api_tokens fails when tokens SURVIVE an ADR-0030 cutover edge — that is a stale${N}"
     echo -e "${R}legacy store still being read, not lost data, and needs the opposite fix.${N}"
-    if [[ $WROTE_COUNT -gt 0 && $PRESERVED -eq 0 ]]; then
+    if [[ $WROTE_COUNT -gt 0 && $DATA_OK -eq 0 ]]; then
         echo -e "${R}GUARANTEE INVERSION: writer recorded $WROTE_COUNT fixtures but zero were verified.${N}"
         echo -e "${R}This may indicate (a) silent data loss, (b) endpoint moved to a different path,${N}"
         echo -e "${R}or (c) the fixture API surface changed. Investigate the gate log immediately.${N}"

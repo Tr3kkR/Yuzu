@@ -97,6 +97,18 @@ fi
 # shellcheck source=scripts/test/_portable.sh
 . "$HERE/_portable.sh"
 
+# The api_token_count helper decides whether a token list is EMPTY or UNREADABLE,
+# and fixtures-verify reads "empty" as a PASS on a cutover edge. If that helper is
+# wrong, this whole phase's verdict is meaningless — so prove it before standing
+# anything up. <1s, no docker. (Only tests/test_changelog_order.py is wired into a
+# workflow today, by explicit name in docs-lint.yml; proper CI wiring for this one
+# is filed separately.)
+if ! python3 "$YUZU_ROOT/tests/test_api_token_count.py" >/dev/null 2>&1; then
+    echo "test-upgrade-stack: api_token_count table test FAILED — refusing to run Phase 2" >&2
+    python3 "$YUZU_ROOT/tests/test_api_token_count.py" >&2
+    exit 1
+fi
+
 # Phase 2 fundamentally needs a working dockerd — every step is docker
 # compose. If docker is missing/down, soft-skip with a SKIP gate row so
 # the rest of /test continues. The skill prompt warns operators on macOS
@@ -411,7 +423,7 @@ phase "step: count MigrationRunner events in server log"
 # measured at 0 here, and 13 with the prefix restored against the same stack.
 MIGR_COUNT=$(YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
     docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
-    --project-name "$PROJECT_NAME" logs server 2>/dev/null \
+    --project-name "$PROJECT_NAME" logs server \
     | grep -c "MigrationRunner: .* migrated to v" || true)
 if (( MIGR_COUNT > 0 )); then
     ok "MigrationRunner events: $MIGR_COUNT (expected ~30)"
@@ -451,14 +463,23 @@ API_TOKENS_EXPECT="preserved"
 # line is reliably present minutes later and intermittently absent at the moment
 # this step runs. A log grep here is a race; the file either exists in the
 # preserved data volume or it does not.
-if YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+PROBE_ERR=$(YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
     docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
     --project-name "$PROJECT_NAME" exec -T server \
-    test -f /var/lib/yuzu/api-tokens.db 2>/dev/null; then
+    test -f /var/lib/yuzu/api-tokens.db 2>&1)
+PROBE_RC=$?
+if (( PROBE_RC == 0 )); then
     API_TOKENS_EXPECT="invalidated"
     ok "edge CROSSES the ADR-0030 cutover — API tokens must be invalidated"
-else
+elif (( PROBE_RC == 1 )) && [[ -z "$PROBE_ERR" ]]; then
+    # `test -f` writes nothing and exits 1 for a genuinely absent file. Anything
+    # else — 125/126/127, or any stderr — is the PROBE failing, not an answer.
     ok "edge does NOT cross the ADR-0030 cutover — API tokens must be preserved"
+else
+    # Distinguished deliberately: falling through to `preserved` here is still the
+    # safe direction, but reporting it as "the edge does not cross the cutover"
+    # would be a confident wrong diagnosis — the #2581 defect in miniature.
+    warn "cutover probe FAILED (rc=$PROBE_RC): ${PROBE_ERR:-no stderr} — assuming 'preserved' (safe direction); a red api_tokens below may be this probe, not the data"
 fi
 
 # --- Step 7: fixtures-verify ----------------------------------------------
@@ -510,7 +531,7 @@ GATE_DURATION=$((($(now_ms) - GATE_START) / 1000))
 if [[ $FIXTURE_VERIFY_OK -eq 1 && $UAT_OK -eq 1 ]]; then
     ok "Phase 2 PASS"
     record_gate "PASS" "$GATE_DURATION" \
-        "fixtures preserved, /readyz green, ${MIGR_COUNT} migrations stamped"
+        "fixtures upheld (api_tokens=${API_TOKENS_EXPECT}), /readyz green, ${MIGR_COUNT} migrations stamped"
     exit 0
 else
     fl "Phase 2 FAIL (fixture_verify=$FIXTURE_VERIFY_OK uat=$UAT_OK)"
