@@ -69,3 +69,15 @@ nothing needs cleaning up.
 `.claude/skills/governance/SKILL.md`. Deliberately not restated here — an earlier draft of
 this README listed the fields and had already dropped `classification`, which is exactly the
 second-copy drift the governance rule itself forbids.
+
+## Reading the first fragment as a template
+
+`2619-ledger-provenance-prose-ownership.sW31cX.jsonl` is the first ledger written and will
+be copied. Two things in it are worth not copying.
+
+Every row carries `policy_floor: null` — no finding in that run hit a floor, so the fragment
+never exercises the floor-inheritance rule. And three rows are wrong as written and correct
+only after supersession: one recorded a human recorder in `reporter` with
+`source: "governance-agent"`, and two joined several reporters into one string. They are
+left in place because superseding is the rule and rewriting is not, but the merged view is
+the artefact — read it through the merge, not row by row.
