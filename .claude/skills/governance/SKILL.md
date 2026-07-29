@@ -1096,6 +1096,57 @@ Strategy:
 1. **Fold compatible fixes into one commit.** If sec flags H1, docs flags B3, QA flags B5, and they all touch related files, fix as a single "hardening round" commit rather than three small ones.
 2. **Re-run Gate 2 security on the hardening round.** Prior runs have caught HIGH regressions introduced by the fix commit itself. Always re-review.
 
+### Deciding fix-now vs defer — two tests, not a quota
+
+Every finding needs a disposition: fold it into this change, split it into its
+own, drop it, or file it. Two questions decide, and they compose. Neither is a
+count — the right number of deferrals for a run is whatever these two produce,
+which is sometimes all of them, sometimes none.
+
+**1. Is it a CORRECTION, or does it add a MECHANISM?**
+A correction to code already under review gets reviewed in the same pass and
+costs almost nothing to fold. Anything that adds a probe, a gate, a fixture, a
+dependency, or a new call path re-opens the review surface, and that is where the
+cost actually is.
+
+**2. Would this change still be worth merging without the fix?**
+If no, the fix is part of the deliverable and belongs in it. If yes, the finding
+is separable by definition — which is the whole argument for splitting it out.
+
+|  | Load-bearing for this change | Not load-bearing |
+|---|---|---|
+| **Correction** | Fold | Fold if trivial and in a file already touched; otherwise its own small change. Rarely worth an issue |
+| **New mechanism** | **RE-CUT** — the scope was drawn wrong. Redraw around the mechanism, with the rest as a prerequisite change ahead of it | **Split** |
+
+The bottom-right is the expensive mistake, and it is measured rather than
+theorised. On #2581 a bearer probe was folded into a 41-line assertion fix that
+did not need it: six further blocking findings across two more review rounds,
+**none of them in the original change**, and the branch had to be re-cut anyway.
+The bottom-left is not a split but a re-cut — if the mechanism IS the
+deliverable, the boundary was drawn in the wrong place to begin with.
+
+This is also *why* the familiar splits are right, which makes the reasoning
+transferable to cases no list enumerates:
+
+- behaviour change + its observability → two changes, behaviour first
+  (observability is mechanism)
+- behaviour change + the refactor that makes it testable → two changes, refactor
+  **first** (the refactor is mechanism the behaviour depends on)
+- a new REST route, MCP tool, store, proto change, schema migration or plugin ABI
+  change → alone, always (mechanism at its largest)
+
+**Deferral is not the safe default.** Filing is a real disposition only when the
+work is separable, has a plausible owner, and you can state what done looks like.
+Otherwise the honest options are fix it or drop it. A DROP recorded with its
+reason — in the PR body, and as `disposition: rejected` plus a rationale in the
+ledger — is legitimate evidence that the finding was considered and judged. That
+is what a change-management control asks for. It does not ask that every finding
+became a ticket, and a ticket nobody will own is worse than a recorded drop,
+because it looks like tracking while being none of it.
+
+One issue carrying ten acceptance criteria is usually the same information as ten
+issues, in a form somebody can actually finish.
+
 ## Gate 8 — Iterate And Ledger
 
 1. **Re-run every gate whose DOMAIN THE FIX DIFF TOUCHES** — not only those whose
@@ -1228,7 +1279,23 @@ Skipping Gate 4 or Gate 5 to save time is rarely worth it. **Do NOT skip Gate 3 
 
 ## Post-run follow-ups — file deferred findings per the issue standard
 
-After the run passes and the commits push, governance typically produces 8-15 deferred follow-up items (SHOULD findings scoped out of the PR). Governance is the repo's largest issue-inflow source, so filing follows `docs/agents/issue-standard.md` exactly; the binding procedure:
+After the run passes and the commits push, file whatever survived the Gate 7
+disposition tests as genuinely separable work with a plausible owner.
+
+**There is no expected number, and the previous version of this sentence gave
+one.** It said a run "typically produces 8-15 deferred follow-up items", which
+functioned as a quota: it made filing the default disposition and made a run that
+filed nothing look incomplete. A run that folds every correction and defers one
+mechanism is a good run. So is a run that files nothing at all.
+
+The cost of getting this wrong is measured. Governance is the repo's largest
+issue-inflow source, and in the five days to 2026-07-27 the tracker took 183 new
+issues against 17 closed, with 509 of the open set never commented on. At that
+ratio an issue nobody will own is not tracking — it is a write-only log that
+buries the findings that mattered. Prefer a recorded drop, or one issue carrying
+several acceptance criteria, over a spray of tickets that each look small.
+
+Filing follows `docs/agents/issue-standard.md` exactly; the binding procedure:
 
 1. **Draft the candidate list** — one actionable outcome per candidate; split multi-finding bundles; type each honestly (`bug` / `task` / `decision` / `spike` — a choice-to-be-made is a `decision`, not a code task).
 2. **Dedupe every candidate (mandatory — dedupe is the only inflow filter):**
