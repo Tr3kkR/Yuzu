@@ -3418,7 +3418,10 @@ public:
                 auto inv_db = cfg_.db_dir() / "inventory.db";
                 if (!inventory_store_->migrate_from_sqlite(inv_db)) {
                     spdlog::error("[PG] Refusing to start: generic inventory store backfill from "
-                                  "legacy {} failed (ADR-0009 fail-closed)",
+                                  "legacy {} failed (ADR-0009 fail-closed; see prior log lines). "
+                                  "Operator remediation: repair the file or move it aside to skip "
+                                  "the backfill — live agents re-push on their next report; "
+                                  "decommissioned agents' blobs need manual re-import (ADR-0037)",
                                   inv_db.string());
                     startup_failed_ = true;
                 } else {
