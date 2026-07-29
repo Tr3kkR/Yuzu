@@ -1124,11 +1124,34 @@ Strategy:
 
 2. **Don't commit until governance passes.** Per CLAUDE.md.
 
-3. **Record every finding in the run ledger.** Write a JSONL file at
-   `<run-log-dir>/governance-findings.jsonl` — one object per finding. There is **no
-   database and no shared store yet**; this is a per-run file, and making it durable
-   shared change-control evidence is tracked separately. Do not describe it as more
-   than it is.
+3. **Record every finding in the run ledger.** One JSONL object per finding, in a
+   **repo-committed fragment** on the `changelog.d` model (#2618):
+
+   ```bash
+   # Default: a fragment in the repo, committed with the work it reviews.
+   # Override to a scratch dir for a throwaway local run you will not commit.
+   GOV_DIR="${YUZU_GOV_LOG_DIR:-governance.d}"
+   mkdir -p "$GOV_DIR"
+   LEDGER="$(mktemp "$GOV_DIR/<PR-or-issue-number>-<short-slug>.XXXXXX")" \
+     && mv "$LEDGER" "$LEDGER.jsonl" && LEDGER="$LEDGER.jsonl"
+   ```
+
+   `mktemp` creates with `O_EXCL`, so two runs in the same second on the same PR
+   cannot collide — uniqueness is enforced by the filesystem rather than assumed
+   from a timestamp. One file per RUN, not per PR: Gate 8 iterates, `pass_ordinal`
+   distinguishes rounds inside a file, and a fresh run gets a fresh fragment.
+
+   **Why in the repo.** The record is evidence for whoever reviews the PR — which
+   findings were raised, which fixed, which deferred and by whom. A path under
+   `$HOME` is unreadable by the reviewer by construction, and SOC 2 CC8.1 evidence
+   has to be retrievable by someone other than whoever produced it. The cost is
+   accepted deliberately: fragments appear in diffs, and an uncommitted one is
+   destroyed by `git clean` — the same window a changelog fragment already lives in.
+
+   There is still **no database and no shared store**; this is a per-run file that
+   happens to be version-controlled. Retention — whether old fragments are pruned,
+   assembled, or kept indefinitely as the access-review campaigns are — is a
+   separate decision and is NOT made here. Do not describe it as more than it is.
 
    Fields, all required unless marked:
 
