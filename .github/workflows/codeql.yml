@@ -79,8 +79,38 @@ name: "CodeQL"
 # the OpenSSF Scorecard SAST check measures (it scored 7/10 with the
 # nightly-only cadence: "0 of 21 commits checked"). Do not "simplify"
 # by folding the PR leg into the heavy matrix or vice versa.
+#
+# STANDING INVARIANT — never workflow_dispatch this on a non-default
+# branch. A dispatch uploads SARIF attributed to whatever ref it ran on,
+# which plants a durable code-scanning *configuration* on that branch.
+# GitHub's PR code-scanning check then compares the base branch's
+# configurations against the ones the PR produced — and PRs only ever
+# produce `/language:actions-pr` (the fast-path above), never the c-cpp
+# pair. Result: every PR into that branch gets a permanent
+# "N configurations not found" neutral check. It does NOT self-heal;
+# nothing re-runs c-cpp on a non-default branch (no `push:` trigger, and
+# `schedule:` fires only on the default branch), so the planted config
+# is orphaned the moment the dispatch finishes. Re-dispatching makes it
+# worse, not better — the only cure is deleting every stale analysis on
+# that ref via `DELETE /repos/{o}/{r}/code-scanning/analyses/{id}`
+# (newest-first per category; `?confirm_delete` on the last of a chain).
+#
+# To iterate on this workflow, open a PR and let the fast-path run, or
+# dispatch from the default branch. If you must dispatch from a topic
+# branch, plan to delete the analyses it leaves behind.
+#
+# History:
+#   2026-05-04 + 2026-05-19: workflow_dispatch runs on `dev` while
+#     debugging the SARIF filter planted 28 c-cpp analyses there.
+#   2026-07-04 (c5072788): the PR fast-path leg started posting a CodeQL
+#     check on every PR, which surfaced the orphans as a neutral
+#     "2 configurations not found" on every PR into dev for ~3 weeks.
+#   2026-07-29: all 28 stale `dev` analyses deleted; check went green.
 
 on:
+  # See the STANDING INVARIANT above: default branch only. Dispatching
+  # from a topic branch plants an orphaned code-scanning configuration
+  # that red-flags every subsequent PR into that branch.
   workflow_dispatch:
   pull_request:
     branches: [dev, main]
