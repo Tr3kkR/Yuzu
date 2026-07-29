@@ -1,3 +1,15 @@
+# SAMPLE RULES - NOT WIRED UP BY ANYTHING THIS REPO SHIPS.
+#
+# `deploy/prometheus/prometheus.yml` reads `/etc/prometheus/rules/*.yml`, but no
+# compose file under `deploy/docker/` mounts this file there, and the repo ships
+# no Alertmanager configuration at all. Until an operator does both, every
+# `severity:` label below routes nowhere.
+#
+# That matters most for the audit-retention rules later in this file. The clock
+# guard bounds how fast the SOC 2 evidence chain can drain; it does NOT prevent
+# draining. The alert is the actual control and the guard is only the seatbelt,
+# so counting these rules as a detective control before wiring them up would be
+# self-deception. See docs/ops-runbooks/audit-store-clock-guard.md.
 groups:
   - name: yuzu-fleet
     rules:
@@ -148,6 +160,10 @@ groups:
             Functional (clients that poll are unaffected) but live progress is
             unavailable. Check for a client holding many warm sessions with
             never-terminating executions, or raise capacity when 3b lands.
+            Distinguish transient load from a PERMANENT strand via
+            yuzu_mcp_bridge_teardown_incomplete_total: if that is non-zero the
+            occupancy will not recede on its own and only a restart clears it.
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpStreamTerminalPublishFailures
         expr: |
           rate(yuzu_mcp_stream_terminal_publish_failures_total[15m]) > 0
@@ -162,7 +178,73 @@ groups:
             failure poisons that session's stream). Results remain durably
             fetchable by execution_id, but the streaming surface is degraded;
             this is an allocation-pressure or stream-state signal worth paging.
-
+      - alert: YuzuMcpBridgeTeardownIncomplete
+        expr: |
+          sum by (reason) (yuzu_mcp_bridge_teardown_incomplete_total) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP progress-bridge teardown could not complete (resource retained)"
+          description: >-
+            reason={{ $labels.reason }}. A claimed teardown could not finish on the
+            maintenance thread. The sweep's claim is one-way, so the record is
+            NEVER retried: whatever it still owns is held until the server
+            restarts - unsubscribe = its event-bus subscription (which also
+            blocks that execution's channel and replay buffer from being
+            collected), release_charge = a per-session admission slot,
+            erase = the correlation record and a global slot. A retained record
+            also pins that session's whole stream state and any pinned finals.
+            Client results stay durably fetchable by execution_id. NOTE this is a
+            defence-in-depth counter: on current code only a mutex failure can
+            reach these steps, so for allocation pressure watch
+            yuzu_mcp_stream_terminal_publish_failures_total instead.
+            DELIBERATELY a raw counter test, not increase() over a window: the
+            retention lasts until the process restarts, so an alert that cleared
+            after 15 minutes would contradict the contract it exists to report.
+            Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
+      - alert: YuzuMcpMaintenanceTickFailing
+        expr: |
+          sum by (tick) (increase(yuzu_mcp_maintenance_tick_failures_total[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP maintenance tick is throwing (work skipped every cycle)"
+          description: >-
+            tick={{ $labels.tick }}. bridge_sweep = pin-ack, session-death and
+            memory-pressure teardown are all stalled, so bridge records and their
+            pins accumulate. session_gc = expired sessions keep their streams and
+            pinned finals. The two are guarded separately, so this names exactly
+            which one is failing. Before this containment existed the same
+            exception aborted the whole process, so a firing here is strictly
+            better than the alternative - but a sustained rate means that class of
+            maintenance is not running at all. Correlate with host memory pressure.
+            DELIBERATELY increase() over a window, unlike the teardown-incomplete
+            rule next to it: a skipped tick is retried on the next cycle, so this
+            condition is self-healing and the alert must clear when it stops. The
+            raw-counter form is correct ONLY where the retention it reports is
+            permanent until restart, which is true of teardown_incomplete and not
+            of this.
+            Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
+      - alert: YuzuMcpBridgeRecordsNearCap
+        expr: |
+          yuzu_mcp_bridge_records_active >= 205
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP progress bridge is near its correlation-record cap"
+          description: >-
+            yuzu_mcp_bridge_records_active has been at or above 80% of the 256
+            record cap for 10 minutes. At the cap every execute_instruction call
+            carrying a progressToken silently degrades to the plain (poll) path -
+            functional, but live progress stops fleet-wide. This is the LEADING
+            indicator for the teardown-strand failure mode: if
+            yuzu_mcp_bridge_teardown_incomplete_total is also non-zero the
+            occupancy is permanent and only a restart clears it, whereas ordinary
+            load recedes on its own. Check both before restarting.
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpBodyTooLargeRejecting
         expr: |
           sum by (reason) (increase(yuzu_mcp_body_too_large_total[15m])) > 20
@@ -206,6 +288,33 @@ groups:
             check whether it read tools/list - or someone is probing the limits.
             Denials are audited as mcp.<tool>|denied with detail
             "input bound exceeded: <reason>"; correlate there for the principal.
+
+  - name: yuzu-dispatch
+    rules:
+      - alert: YuzuDispatchTargetRejected
+        expr: |
+          sum by (route, reason) (increase(yuzu_server_dispatch_target_rejected_total[15m])) > 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "A REST caller named a device target that resolved to nothing"
+          description: >-
+            yuzu_server_dispatch_target_rejected_total is non-zero on
+            {{ $labels.route }} (reason={{ $labels.reason }}). A client supplied
+            agent_ids, scope or parent_id that names no device - it believes it is
+            targeting specific machines and is not. Before #2500 these calls
+            dispatched to the ENTIRE FLEET and returned success, so any non-zero
+            rate here is a near-miss worth reading, not just a validation
+            failure - hence >3/15m rather than the MCP twin's >20. It is
+            deliberately NOT >0: a single malformed curl would page, the rule
+            would be silenced within a week, and the genuine near-miss it exists
+            for would be silenced with it. The AUDIT row is the durable
+            per-event evidence; this alert is for a client looping. Most often a
+            client emitting numeric device ids, or a device filter that matched
+            nothing. Denials are audited as
+            command.dispatch|denied, instruction.execute|denied or
+            result_set.create|denied with detail "reason=<reason>"; correlate
+            there for the principal.
 
   - name: yuzu-tls
     rules:
@@ -285,33 +394,156 @@ groups:
   #       annotations:
   #         summary: "Response store write failure rate exceeds 1%"
 
-  # ── yuzu-secrets (DISABLED until the first secret-bearing store ships) ──
-  # The SecretCodec (ADR-0010, #1320 PR 4) counts decrypt failures per
-  # store + failure class; the wiring PR exports them as
-  # yuzu_server_secret_decrypt_failures_total. Uncomment when live.
-  #
-  # - name: yuzu-secrets
-  #   rules:
-  #     - alert: YuzuSecretDecryptKekUnresolvable
-  #       # Sustained kek_unresolvable = backup skew / wrong keys dir —
-  #       # retries will NOT self-heal; restore the paired keys directory.
-  #       expr: |
-  #         rate(yuzu_server_secret_decrypt_failures_total{failure_class="kek_unresolvable"}[5m]) > 0
-  #       for: 2m
-  #       labels:
-  #         severity: critical
-  #       annotations:
-  #         summary: "Secret decrypts failing: KEK unresolvable (backup skew?)"
-  #
-  #     - alert: YuzuSecretDecryptTamperSignal
-  #       # A single tag_mismatch is the tamper signal — investigate via the
-  #       # secret.decrypt_failure audit trail; never retry-and-ignore.
-  #       expr: |
-  #         increase(yuzu_server_secret_decrypt_failures_total{failure_class="tag_mismatch"}[1h]) > 0
-  #       labels:
-  #         severity: critical
-  #       annotations:
-  #         summary: "Secret blob failed GCM authentication (tamper signal)"
+  # ── yuzu-secrets — LIVE as of the auth store's Postgres migration ──────
+  # The SecretCodec (ADR-0010, #1320 PR 4) counts decrypt failures per store
+  # + failure class. These rules were parked "uncomment when live"; the auth
+  # store (`auth.users.mfa_totp_secret`) is the first secret-bearing store to
+  # ship, and its migration PR wired both the audit hook and the metric
+  # export, so they are now active. `store="auth"` is the only value today.
+  - name: yuzu-secrets
+    rules:
+      - alert: YuzuSecretDecryptKekUnresolvable
+        # Sustained kek_unresolvable = backup skew / wrong keys dir —
+        # retries will NOT self-heal; restore the paired keys directory.
+        expr: |
+          rate(yuzu_server_secret_decrypt_failures_total{failure_class="kek_unresolvable"}[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Secret decrypts failing: KEK unresolvable (backup skew?)"
+
+      - alert: YuzuSecretDecryptTamperSignal
+        # A single tag_mismatch is the tamper signal — investigate via the
+        # secret.decrypt_failure audit trail; never retry-and-ignore.
+        expr: |
+          increase(yuzu_server_secret_decrypt_failures_total{failure_class="tag_mismatch"}[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Secret blob failed GCM authentication (tamper signal)"
+
+      # ── #2530 KEK rotation-runaway hardening ────────────────────────────
+      # yuzu_server_kek_op_lock_held is sampled every 15s off
+      # health_recompute_thread_ (server.cpp), filtered to THIS server's own
+      # database (current_database()) -- not cluster-wide; a same-named
+      # advisory lock held by an unrelated tenant database on the same
+      # Postgres instance never sets this gauge. A healthy long re-wrap and a
+      # genuinely wedged backend look IDENTICAL on this gauge alone — do NOT
+      # page this as "kill the pid". Corroborate via lock_holder_pid
+      # (GET /api/v1/secrets/kek/status) against pg_stat_activity before any
+      # DBA action; see docs/user-manual/server-admin.md "Diagnosing a stuck
+      # KEK op lock" for the full procedure. `for: 30m` is deliberately
+      # conservative (~120 samples at the 15s sampling cadence) — this is the
+      # only rotation-shaped condition worth paging on; the ceiling/cooldown/
+      # clock-anomaly/query-canceled failures are all self-diagnosing from
+      # the REST/MCP error body an operator already has in hand, not a
+      # background condition to detect.
+      - alert: YuzuKekOpLockHeldPersistently
+        expr: |
+          yuzu_server_kek_op_lock_held == 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "secrets_kek_op advisory lock has been held for 30+ minutes"
+          description: >-
+            THIS MAY BE A HEALTHY YUZU SERVER MID-ROTATION, NOT A WEDGE -- a
+            large re-wrap legitimately holds this lock for its whole
+            duration, and 30+ minutes is expected on a big secrets table.
+            Terminating the holder mid-rotate produces a HALF-COMMITTED
+            rotation (new KEK version already active, re-wrap incomplete),
+            whose only recovery is POST /api/v1/secrets/kek/rewrap -- a
+            retried /rotate on top of that state mints a second, spurious,
+            never-retirable version and does not fix anything. Read "Diagnosing
+            a stuck KEK op lock" in docs/user-manual/server-admin.md in full
+            before touching pg_terminate_backend. Scoped to this server's own
+            database (current_database()), not cluster-wide. A healthy,
+            long-running rewrap is indistinguishable from a wedged backend by
+            this gauge alone -- corroborate via lock_holder_pid and
+            lock_holder_captured_at (GET /api/v1/secrets/kek/status) against
+            pg_stat_activity before concluding anything, and RE-CONFIRM the
+            pid is still the granted holder in pg_locks at the moment of
+            termination (Postgres pids are reused, and the /status reading
+            you are looking at is already stale by the time you act on it).
+            Only a DBA terminates a backend, deliberately, after that
+            re-confirmation, and only after checking whether the backend
+            belongs to a Yuzu server (pg_stat_activity.client_addr /
+            application_name where set) -- prefer stopping that server
+            cleanly over killing its backend. This gauge HOLDS its prior
+            value rather than publishing a fabricated 0 on a database-read
+            degrade, so a firing alert during a database outage may reflect
+            stale last-known state rather than a currently-held lock -- check
+            the yuzu-postgres alerts first.
+
+      # #2530 G7-S6: sibling of YuzuInventoryStaleCountUnavailable above —
+      # same freeze-detector shape, different gauge family. The KEK gauges
+      # (yuzu_server_kek_{op_lock_held,live_versions,active_version}) HOLD
+      # their prior published value on a database-read degrade rather than
+      # publish a fabricated 0/false, so a healthy-looking reading during a
+      # sustained increase here may just be stale, not genuine. Fleet-size-
+      # independent, so it ships ACTIVE.
+      - alert: YuzuKekMetricsUnavailable
+        expr: |
+          rate(yuzu_server_kek_metrics_unavailable_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KEK cluster-state gauges may be frozen or absent"
+          description: >-
+            yuzu_server_kek_metrics_unavailable_total is rising. THREE
+            distinct causes, all counted here: (1) the 15s KEK-metrics
+            sampling sweep (health_recompute_thread_) failed to acquire a
+            pooled connection, or (2) hit its bounded statement_timeout mid
+            read -- in either case yuzu_server_kek_op_lock_held /
+            yuzu_server_kek_live_versions are HELD at their last published
+            value and may read healthy during an actual outage or a
+            genuinely wedged secrets_kek_op lock; OR (3) the KEK substrate
+            itself (the secrets codec / Postgres pool) is not wired up at
+            all, in which case EVERY KEK gauge in this sweep -- including
+            yuzu_server_kek_active_version, which needs no DB round trip --
+            is never published and reads as ABSENT, not merely stale.
+            Distinguish (1)/(2) from (3) via yuzu_pg_pool_waiters /
+            yuzu_pg_acquire_wait_seconds and whether the KEK gauges exist in
+            /metrics at all; investigate Postgres pool saturation for (1)/(2)
+            before trusting the KEK gauges above, or server boot/config for
+            (3) if they are missing entirely.
+          # #2530 G8-S11: the heading is "Diagnosing a stuck KEK op lock
+          # (#2530)" — GitHub-slug anchoring strips the `(`/`)`/`#` but keeps
+          # the digits, so the real anchor carries a trailing `-2530` that a
+          # bare "...-lock" URL silently drops.
+          runbook_url: "https://docs.yuzu.io/user-manual/server-admin#diagnosing-a-stuck-kek-op-lock-2530"
+
+      # #2530 G8-S12 — architect-requested: because #2525 makes retirement
+      # impossible, --kek-max-live-versions is a LIFETIME cap, not a rolling
+      # one, and without this alert the first signal an operator gets is a
+      # 409 VersionCeiling at the exact moment a rotation is needed. Alerts
+      # on the RATIO of live versions to the CONFIGURED ceiling (not a
+      # hardcoded 32) so it keeps working for an operator who has already
+      # exercised the #2530 B5 escape hatch and raised the flag. Both
+      # gauges HOLD their prior published value on a sampling degrade
+      # (see YuzuKekMetricsUnavailable above) — a stale ratio can under- or
+      # over-report during an outage; corroborate against
+      # yuzu_server_kek_metrics_unavailable_total before acting.
+      - alert: YuzuKekCeilingApproaching
+        expr: |
+          yuzu_server_kek_live_versions / yuzu_server_kek_max_live_versions > 0.8
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KEK live-version count is approaching --kek-max-live-versions"
+          description: >-
+            yuzu_server_kek_live_versions has crossed 80% of
+            yuzu_server_kek_max_live_versions. There is no retire route
+            (#2525), so this trend does not self-correct: rotation will
+            start returning 409 VersionCeiling once the ceiling is reached.
+            Plan ahead of that point -- raising --kek-max-live-versions is a
+            deliberate, logged and audited risk acceptance (see
+            server.kek_ceiling_raised in the audit log), not something to do
+            reactively at the moment rotation is blocked.
+          runbook_url: "https://docs.yuzu.io/user-manual/server-admin#diagnosing-a-stuck-kek-op-lock-2530"
 
   # ── yuzu-postgres — server storage substrate (#1320 PR 3) ──────────────
   # The server fails closed without PostgreSQL, so substrate health is
@@ -435,7 +667,146 @@ groups:
             throw in the audit pipeline fails closed the same way but does NOT bump this
             counter (it is catch-logged only) — correlate with a spike in 503s on the
             behavioural routes.
-          runbook_url: "https://docs.yuzu.io/runbooks/audit-store-degraded"
+          runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
+
+      # #2360 retention clock guard. The guard declines a cleanup pass that would
+      # expire every datable audit row, so the evidence table survives a forward
+      # clock jump. A decline is not itself an outage, but it means this server's
+      # clock moved in a way that WOULD have wiped audit evidence -- an
+      # unattended host whose time sync is broken is one guard away from losing
+      # its SOC 2 trail.
+      - alert: YuzuAuditRetentionClockAnomaly
+        expr: |
+          increase(yuzu_server_audit_clock_anomaly_skips_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit retention declined a pass - clock, outage, or a retention change"
+          description: >-
+            An audit retention pass declined and deleted NOTHING. This is the guard acting,
+            not evidence lost. It is NOT exclusively a clock signal: a reduced
+            audit_retention_days, or an outage longer than 7 days, both produce it by design.
+            Work the runbook - it gives the expected-cause checklist first, then how to tell a
+            normal one-off decline from a genuinely stalled drain. Do NOT use this alert's
+            firing state as that test; it can resolve and re-fire on its own either way.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
+
+      # The counterpart signal. Both a declined pass and a broken pass leave rows
+      # undeleted, so an audit table that never shrinks looks identical either
+      # way - only the pair separates "the guard is working" from "cleanup is
+      # broken". Without this alert an unbounded audit.db reads as a healthy guard.
+      - alert: YuzuAuditRetentionFailing
+        expr: |
+          increase(yuzu_server_audit_cleanup_failed_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit retention passes are failing on a database error"
+          description: >-
+            yuzu_server_audit_cleanup_failed_total is rising: a retention pass did not
+            fully do its job. Seven sites feed it - an unreadable probe, a failed delete
+            prepare or step, a refused implausible caller clock, a closed store, an
+            exception caught at the thread boundary, and an unreadable POST-delete backlog
+            probe. That last one fires AFTER a successful delete, so a rising counter does
+            NOT prove nothing was deleted; read it as "retention is not fully healthy".
+            This is NOT the clock guard (that is
+            yuzu_server_audit_clock_anomaly_skips_total). Check audit.db
+            free disk and the server log. The seven sites do NOT share one message - grep
+            for any of: "retention probe failed", "cleanup error", "the post-delete backlog
+            probe failed", "retention pass called with an implausible clock reading",
+            "retention pass threw". Note a store closed by a failed migration runs ZERO
+            passes (start_cleanup early-returns), so this rule cannot fire in that state -
+            YuzuAuditRetentionNotRunning is the one that does. NOTE /healthz stores.audit will report healthy
+            in this state - it reflects only whether the database is OPEN, and a pass
+            failing on a SQLite fault leaves it open. Surfacing retention health there
+            is tracked in #2509.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
+
+      # The per-pass delete cap is what turns an allowed wipe into a paced drain,
+      # but it introduces its own failure: if it binds on every pass, expiry is
+      # outrunning the drain and audit.db grows without bound. Neither counter
+      # above moves in that state, so this is the only signal for it.
+      #
+      # ASSUMES the default 60-minute cleanup interval: the threshold is "every
+      # pass in the window hit the cap", i.e. 6 passes in 6h. A server started with
+      # a different cleanup_interval_min needs this number adjusted -- PromQL
+      # cannot read the server's own interval, so it cannot be derived here.
+      - alert: YuzuAuditRetentionCapBinding
+        expr: |
+          increase(yuzu_server_audit_retention_cap_reached_total[6h]) >= 6
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit retention is not keeping up with expiry"
+          description: >-
+            Every audit retention pass in the last 6 hours hit the per-pass delete cap, so
+            a backlog is carried forward each hour and audit.db is growing. Note the
+            counter is incremented on an OBSERVED backlog or, when the post-delete probe
+            could not be read, a conservatively ASSUMED one - an "AuditStore: the post-delete
+            backlog probe failed" warning in the log means the remainder was assumed, not
+            measured. (Do NOT look for "retention probe failed": that is the PRE-delete
+            probe, on which the pass skips entirely and this counter cannot have moved.) Check
+            yuzu_server_audit_rows_deleted_total to see whether the backlog is moving at
+            all. Sustained firing means the fixed drain rate (25,000 rows per cleanup
+            pass) is below this fleet's audit volume, so audit.db grows without bound;
+            the cap is a compile-time constant today, so this needs an engineering
+            escalation rather than a config change.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#capacity"
+
+      # THE ABSENCE ALERT. Every other COUNTER-driven rule in this group fires on
+      # a counter RISING, so none of those fires when the cleanup thread never
+      # runs. No rule detects a reaper that never ran
+      # (never started because the store was closed at boot, died, or was
+      # stopped and not restarted). In that state all six other series sit flat
+      # at 0 -- indistinguishable from a quiet, healthy store -- while audit.db
+      # grows without bound and rows are retained past the stated window. This
+      # is the only rule that catches it.
+      #
+      # Threshold assumes the default 60-minute cleanup interval: no pass in 3h
+      # is unambiguously broken. A deployment that lengthens cleanup_interval_min
+      # must widen this window; PromQL cannot read the server's own interval.
+      - alert: YuzuAuditRetentionNotRunning
+        expr: |
+          increase(yuzu_server_audit_retention_passes_total[3h]) == 0
+          and on(instance) yuzu_server_uptime_seconds > 10800
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit retention has not run for 3 hours"
+          description: >-
+            No audit retention pass has been attempted in 3 hours, so audit.db is not
+            being drained and rows are being retained past the configured window. Note the
+            other five retention COUNTERS cannot move in this state - they all key on a
+            counter rising, and nothing is running to raise one. The
+            uptime guard on this rule exists because run_cleanup sleeps BEFORE its first
+            pass, so a freshly started server legitimately has no pass for one interval.
+            Check the server log for
+            "AuditStore: retention pass threw", confirm the store opened at boot
+            (a failed migration closes it and start_cleanup() then early-returns), and
+            check yuzu_server_audit_retention_last_pass_unixtime for when it last ran.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
+
+      # The durable clock reading is what makes anomaly detection survive a
+      # restart. If it cannot be written, that half of the guard silently
+      # degrades to nothing on the next boot.
+      - alert: YuzuAuditRetentionStateNotPersisting
+        expr: |
+          increase(yuzu_server_audit_retention_persist_failed_total[1h]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit retention cannot persist its clock reading"
+          description: >-
+            The retention pass could not write its clock reading to audit_retention_meta.
+            Detection still works within this process, but will not survive a restart --
+            a server that reboots with a wrong clock would then see no elapsed-time step.
+            Usually a disk or permissions problem on the audit database.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
   - name: yuzu-bundles
     # Live-query bundle surface (ADR-0011). The manifest map is in-memory + bounded
@@ -1063,13 +1434,17 @@ groups:
   #       annotations:
   #         summary: "A Guardian journal replay worker has not completed a page pass in >5m"
   #         description: >-
-  #           The worst endpoint's time since its last successful replay page pass
-  #           exceeds 10x the 30 s cadence. The worker there is dead, hung, or throwing
-  #           on every pass (climbing maint_exceptions alongside means throwing NOW; a
-  #           flat value means hung, OR the loop died earlier - loop death increments
-  #           the counter exactly once and logs a `critical` line, so check the agent
-  #           log): journalled lifecycle records are not being replayed to the server
-  #           from that endpoint.
+  #           The worst endpoint's time since its last replay page pass that made
+  #           progress or verified a clean idle backlog exceeds 10x the 30 s cadence
+  #           (#2452). The worker there is dead/hung/throwing (climbing maint_exceptions
+  #           means throwing NOW; a flat value means hung, OR the loop died earlier -
+  #           loop death increments that counter once and logs a `critical` line, check
+  #           the agent log) - OR its passes are stalling short of progress:
+  #           token-starved, read-failing, boot-barrier-stalled, window-blocked
+  #           (headroom), or quarantining every candidate. Correlate with
+  #           page_read_failures / headroom_blocked_seconds / quarantined to tell which;
+  #           either way journalled lifecycle records are not being replayed from that
+  #           endpoint.
   #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-worker-stale"
   #     - alert: YuzuGuardianJournalPruneStale
   #       expr: |
@@ -1080,10 +1455,15 @@ groups:
   #       annotations:
   #         summary: "A Guardian journal retention prune has not completed in >20m"
   #         description: >-
-  #           The worst endpoint's time since its last successful retention prune
-  #           exceeds 10x the 120 s cadence. Retention is not running there: the
-  #           journal grows toward its write ceiling, where new audit batches start
-  #           being refused (write_capacity_rejected).
+  #           The worst endpoint's time since a prune pass that actually ran retention
+  #           (applied the delete or verified nothing eligible) exceeds 10x the 120 s
+  #           cadence (#2452). The worker is dead/hung/throwing, its prune scan is
+  #           failing every pass, its retention DELETE is failing every pass (disk-full
+  #           / perms - also visible on prune_failures), or a stop keeps aborting it.
+  #           Retention is not running: the journal grows toward its write ceiling,
+  #           where new audit batches start being refused (write_capacity_rejected). A
+  #           forward-clock-jump wipe is the one case that still reads fresh (the delete
+  #           did succeed) - the clock guard, not this gauge, owns that.
   #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-worker-stale"
   #     # ---- Loss / fault counters (rising edge; NOT sufficient - see REASON 2) -----
   #     - alert: YuzuGuardianJournalIntegrityGap

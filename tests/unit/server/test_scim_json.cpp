@@ -128,6 +128,32 @@ TEST_CASE("scim_json: parse_user accepts externalId at exactly the max length", 
     CHECK(result->external_id.size() == kMaxExternalIdLength);
 }
 
+// Quality SHOULD (governance hardening round): the Groups displayName
+// embedded-NUL guard has an integration test (test_scim_routes.cpp,
+// UP-3/#2018), but the identical userName/externalId guards in parse_user
+// were untested — lock them in at the parse-boundary layer, same rationale
+// (PostgreSQL `text` cannot round-trip an embedded NUL; silently truncating
+// "victim\0decoy" to "victim" would collide with a shorter legitimate
+// username/externalId).
+TEST_CASE("scim_json: parse_user rejects an embedded-NUL userName", "[scim][json][embedded-nul]") {
+    std::string nul_name = std::string("victim") + std::string(1, '\0') + std::string("decoy");
+    nlohmann::json body = {{"userName", nul_name}};
+    auto result = parse_user(body);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().status == 400);
+    CHECK(result.error().scim_type == "invalidValue");
+}
+
+TEST_CASE("scim_json: parse_user rejects an embedded-NUL externalId",
+         "[scim][json][embedded-nul]") {
+    std::string nul_ext = std::string("ext") + std::string(1, '\0') + std::string("decoy");
+    nlohmann::json body = {{"userName", "jdoe"}, {"externalId", nul_ext}};
+    auto result = parse_user(body);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().status == 400);
+    CHECK(result.error().scim_type == "invalidValue");
+}
+
 // ── parse_patch ──────────────────────────────────────────────────────────
 
 TEST_CASE("scim_json: parse_patch pathless value-object active:false", "[scim][json]") {
@@ -430,6 +456,23 @@ TEST_CASE("scim_json: parse_group members array of bare string entries",
 
 TEST_CASE("scim_json: parse_group rejects a non-array members", "[scim][json][group]") {
     nlohmann::json body = {{"displayName", "Admins"}, {"members", "not-an-array"}};
+    auto result = parse_group(body);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().status == 400);
+    CHECK(result.error().scim_type == "invalidValue");
+}
+
+// Quality SHOULD (governance hardening round): the displayName embedded-NUL
+// guard has an integration test (test_scim_routes.cpp, UP-3/#2018); the
+// identical guard on a members[].value entry (`extract_member_values`) was
+// untested. Same rationale — a truncated member scim_id could silently
+// resolve to a DIFFERENT, shorter existing user id, adding the wrong
+// principal to the group.
+TEST_CASE("scim_json: parse_group rejects an embedded-NUL members[].value",
+         "[scim][json][group][embedded-nul]") {
+    std::string nul_value = std::string("u1") + std::string(1, '\0') + std::string("decoy");
+    nlohmann::json body = {{"displayName", "Admins"},
+                           {"members", nlohmann::json::array({{{"value", nul_value}}})}};
     auto result = parse_group(body);
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().status == 400);

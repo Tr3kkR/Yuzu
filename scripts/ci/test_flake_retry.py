@@ -37,6 +37,9 @@ THIS_OS = _fr.detect_os()
 FAKE_MESON = r"""#!/usr/bin/env python3
 import os, sys, json
 a = sys.argv[1:]
+marker = os.environ.get("FAKE_MESON_CALLED")
+if marker:
+    open(marker, "w").write("called")
 if a and a[0] == "introspect":
     builddir = a[1]
     if os.environ.get("FAKE_NONCATCH2") == "1":
@@ -130,12 +133,51 @@ def run_scenario(label, env_extra, known_flaky, expect_zero):
         return ok
 
 
+def run_validation_failure(label, known_flaky):
+    """An invalid registry must fail before it invokes the Meson executable."""
+    with tempfile.TemporaryDirectory() as d:
+        binroot = os.path.join(d, "bin"); os.makedirs(binroot)
+        meson = os.path.join(binroot, "meson")
+        catch2 = os.path.join(binroot, "yuzu_fake_tests")
+        _write_exe(meson, FAKE_MESON)
+        _write_exe(catch2, FAKE_CATCH2)
+        builddir = os.path.join(d, "build"); os.makedirs(builddir)
+        kf = os.path.join(d, "known-flaky.json")
+        with open(kf, "w") as f:
+            json.dump(known_flaky, f)
+        marker = os.path.join(d, "meson-called")
+        env = dict(os.environ)
+        env.pop("GITHUB_STEP_SUMMARY", None)
+        env["PATH"] = binroot + os.pathsep + env["PATH"]
+        env["FAKE_CATCH2_BIN"] = catch2
+        env["FAKE_MESON_CALLED"] = marker
+        r = subprocess.run(
+            [sys.executable, WRAPPER, "--builddir", builddir, "--known-flaky", kf],
+            env=env, capture_output=True, text=True,
+        )
+        ok = r.returncode == 2 and not os.path.exists(marker) and "known-flaky list invalid" in r.stdout
+        status = "PASS" if ok else "FAIL"
+        print(f"[{status}] {label}: exit={r.returncode} (expected 2; meson not invoked)")
+        if not ok:
+            print("  stdout:", r.stdout.strip().replace("\n", "\n  "))
+            print("  stderr:", r.stderr.strip().replace("\n", "\n  "))
+        return ok
+
+
 def main():
     if platform.system() == "Windows":
         print("test_flake_retry: skipped on Windows (POSIX fakes); real CI covers it")
         return 0
 
-    listed = [{"case": "FlakeA", "platforms": [THIS_OS], "reason": "test flake", "added": "2026-06-23"}]
+    listed = [{
+        "case": "FlakeA",
+        "platforms": [THIS_OS],
+        "reason": "test flake",
+        "issue": "#test",
+        "owner": "ci",
+        "added": "2026-06-23",
+        "expires": "2099-12-31",
+    }]
     results = [
         run_scenario("green pass", {"FAKE_MESON_TEST_PASS": "1"}, listed, True),
         run_scenario("green pass survives unavailable retry-report path",
@@ -156,6 +198,8 @@ def main():
         # masked-green hole governance UP-1 closed.
         run_scenario("suite fails, enumeration reproduces nothing -> block",
                      {"FAKE_FAIL_CASES": ""}, listed, False),
+        run_validation_failure("expired registry entry blocks before Meson",
+                               [{**listed[0], "added": "1999-01-01", "expires": "2000-01-01"}]),
     ]
     if all(results):
         print(f"\nflake-retry integration test: OK ({len(results)} scenarios)")

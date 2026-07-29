@@ -26,6 +26,7 @@
 #include "web_utils.hpp"                // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "bundle_orchestrator.hpp"      // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"           // validate_bundle_steps / aggregate_to_json
+#include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "mcp_input_bounds.hpp"        // kExecInstr* / check_exec_instruction_shape (#2437)
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
 #include "access_review_store.hpp"      // Periodic Access Reviews — campaign persistence
@@ -245,9 +246,11 @@ std::string tool_result(std::string_view payload, const char* output_schema_json
     return result.str();
 }
 
-std::string utc_now_iso() {
-    const auto now = std::chrono::system_clock::now();
-    const auto tt = std::chrono::system_clock::to_time_t(now);
+// #2530 H1: arbitrary-instant twin of utc_now_iso() below, for formatting a
+// PAST captured instant (e.g. KekOpResult::lock_holder_captured_at) rather
+// than "now".
+std::string utc_iso_at(std::chrono::system_clock::time_point tp) {
+    const auto tt = std::chrono::system_clock::to_time_t(tp);
     std::tm tm{};
 #if defined(_WIN32)
     gmtime_s(&tm, &tt);
@@ -257,6 +260,10 @@ std::string utc_now_iso() {
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
     return std::string(buf);
+}
+
+std::string utc_now_iso() {
+    return utc_iso_at(std::chrono::system_clock::now());
 }
 
 // Epoch seconds, caller-supplied (not read internally by the stores) so
@@ -606,8 +613,8 @@ static const ToolDef kTools[] = {
      R"j("plugin":{"type":"string","maxLength":128,"description":"Plugin name (e.g. os_info, hardware)"},)j"
      R"j("action":{"type":"string","maxLength":128,"description":"Action name (e.g. version, list)"},)j"
      R"j("params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"Key-value parameters"},)j"
-     R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. If omitted and agent_ids is empty, defaults to __all__."},)j"
-     R"j("agent_ids":{"type":"array","maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target (alternative to scope)"})j"
+     R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. Omit BOTH this and agent_ids to target all agents; supplying either one empty is rejected rather than widened to __all__."},)j"
+     R"j("agent_ids":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target. EXCLUSIVE with scope - supplying both is rejected, because the old precedence discarded this list in favour of the broader scope. Omit entirely to target all agents; an EMPTY array is rejected, because a target list that resolves to nothing must not silently widen to the whole fleet."})j"
      R"j(},"required":["plugin","action"]})j"},
 
     // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
@@ -1063,6 +1070,59 @@ static const ToolDef kTools[] = {
      R"j("campaign_id":{"type":"string"})j"
      R"j(},"required":["campaign_id"]})j",
      R"j({"type":"object","properties":{"closed":{"type":"boolean"}},"required":["closed"]})j"},
+
+    // ── KEK (key-encryption-key) rotation tools (#2395 track C) — MCP twins
+    // of POST/GET /api/v1/secrets/kek/* (kek_routes.hpp/.cpp), sharing the
+    // SAME KekOps seam (injected via set_kek_ops) so REST and MCP cannot
+    // drift on failure classification or remediation wording. Appended at
+    // the VERY END of kTools[] per the standing governance note above (A2
+    // discovery tools) — minimizes rebase conflict with any concurrent PR
+    // inserting tools earlier in this array. There is deliberately NO
+    // retire/decommission tool here (or on the REST side): blocked by #2525
+    // (a write race in the secrets codec that can permanently destroy
+    // secrets) — do not add one back without closing #2525 first.
+    {"rotate_kek",
+     "Mint a new KEK (key-encryption-key) version and re-wrap every registered secret row "
+     "under it. Additive — mints a new version, destroys nothing. Mirrors POST "
+     "/api/v1/secrets/kek/rotate. If this fails half-committed (the new version is already "
+     "active but re-wrapping did not finish every row), call rewrap_secrets to resume — do "
+     "NOT call rotate_kek again, which would mint a spurious extra version. Requires "
+     "Security:Write (supervised MCP tier; approval-gated like every other Security:Write "
+     "MCP op).",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"new_version":{"type":"integer"},"rotation_complete":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"present and false only when the audit row could not be persisted"}},"required":["new_version","rotation_complete"]})j"},
+
+    {"rewrap_secrets",
+     "Idempotent resume of a KEK rotation that advanced the active version but did not "
+     "finish re-wrapping every secret row — re-wraps every row still on a non-active "
+     "version under the current active version. Safe to call repeatedly, including when "
+     "there is nothing left to do (rows_rewrapped==0 is a normal outcome, not an error). "
+     "Mirrors POST /api/v1/secrets/kek/rewrap. Requires Security:Write (supervised MCP "
+     "tier; approval-gated like every other Security:Write MCP op).",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"rows_rewrapped":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"present and false only when the audit row could not be persisted"}},"required":["rows_rewrapped"]})j"},
+
+    {"get_kek_status",
+     "Current KEK rotation status: the active version, the oldest version still "
+     "referenced by a live secret row (null when no secret rows exist), whether "
+     "rotation is complete (every row is on the active version), plus three "
+     "diagnostic snapshots added by #2530 hardening — live_versions (count of "
+     "non-retired KEK versions), lock_held / lock_holder_pid (whether the "
+     "secrets_kek_op advisory lock currently has a granted holder). The three "
+     "snapshots are read lock-free at possibly-different instants — never derive "
+     "a \"safe to retire\" conclusion from them (#2525). live_versions and "
+     "lock_held are null when the underlying query could not be determined "
+     "(never a fabricated 0/false) — a null lock_held MUST NOT be read as "
+     "\"no lock is held\"; it means the lock state is unknown, so corroborate "
+     "via pg_stat_activity before concluding anything. lock_holder_captured_at "
+     "(#2530 H1) is the ISO-8601 UTC instant the lock_held/lock_holder_pid "
+     "snapshot was taken -- null in lockstep with them when undetermined; a "
+     "pid without a visible capture instant can look current when it is "
+     "actually stale (Postgres backend pids are reused), so always re-confirm "
+     "a pid in pg_locks before acting on it, never trust one captured earlier. "
+     "Read-only. Mirrors GET /api/v1/secrets/kek/status. Requires Security:Read.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"active_version":{"type":"integer"},"oldest_in_use":{"type":["integer","null"],"description":"null when no secret rows exist"},"rotation_complete":{"type":"boolean"},"live_versions":{"type":["integer","null"],"description":"count of non-retired KEK versions; lock-free snapshot; null when it could not be determined (query failure) -- never a fabricated 0"},"lock_held":{"type":["boolean","null"],"description":"true iff the secrets_kek_op advisory lock has a granted holder; lock-free snapshot; null when it could not be determined (query failure) -- NEVER read null as \"not held\", it means unknown -- never a fabricated false"},"lock_holder_pid":{"type":["integer","null"],"description":"the lock holder's backend pid; null when unheld OR when lock_held itself is null (undetermined)"},"lock_holder_captured_at":{"type":["string","null"],"description":"ISO-8601 UTC instant the lock_held/lock_holder_pid snapshot was taken; null when undetermined; re-confirm the pid in pg_locks before acting on it, never trust one captured earlier"}},"required":["active_version","rotation_complete","live_versions","lock_held"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -1094,6 +1154,9 @@ static const char* const kWriteToolsRaw[] = {
     // lifecycle transition); export/get/list are read-only and deliberately
     // absent from this set.
     "open_access_review", "record_attestation", "close_access_review",
+    // KEK rotation (#2395 track C) — rotate/rewrap mutate; get_kek_status is
+    // read-only and deliberately absent from this set.
+    "rotate_kek", "rewrap_secrets",
 };
 
 // Lookup set DERIVED from the raw sequence; collapse here is safe because the
@@ -1234,6 +1297,11 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"get_access_review", {"AccessReview", "Read"}},
     {"list_access_reviews", {"AccessReview", "Read"}},
     {"close_access_review", {"AccessReview", "Attest"}},
+    // KEK rotation (#2395 track C) — parity with the REST twins'
+    // Security:Write (rotate/rewrap) and Security:Read (status) gates.
+    {"rotate_kek", {"Security", "Write"}},
+    {"rewrap_secrets", {"Security", "Write"}},
+    {"get_kek_status", {"Security", "Read"}},
 };
 
 // Lookup map DERIVED from the raw sequence; first-wins collapse here is safe
@@ -1586,6 +1654,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"export_access_review", {ToolEffect::ReadOnly, true, "Export access review evidence"}},
     {"get_access_review", {ToolEffect::ReadOnly, true, "Get access review campaign"}},
     {"list_access_reviews", {ToolEffect::ReadOnly, true, "List access review campaigns"}},
+    {"get_kek_status", {ToolEffect::ReadOnly, true, "Get KEK rotation status"}},
 
     // ── Mutating tools (effect Additive/Destructive) ──────────────────────────
     // set_tag: INSERT OR REPLACE overwrites an existing tag value → Destructive,
@@ -1634,6 +1703,16 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"record_attestation", {ToolEffect::Destructive, false, "Record access review attestation"}},
     // close_access_review: one-way open→closed lifecycle (no reopen path) → Destructive.
     {"close_access_review", {ToolEffect::Destructive, false, "Close access review campaign"}},
+    // rotate_kek: mints a NEW KEK version and re-wraps existing rows under it,
+    // nothing existing is overwritten/removed → Additive. Each call mints a
+    // distinct new version → not idempotent.
+    {"rotate_kek", {ToolEffect::Additive, false, "Rotate KEK"}},
+    // rewrap_secrets: re-wraps rows still on a non-active version under the
+    // active one — additive convergence toward one target state, never
+    // destroys a secret. Safe to call repeatedly (a no-op once every row is
+    // on the active version) → idempotent, per kek_routes.cpp's own doc
+    // comment on the REST twin.
+    {"rewrap_secrets", {ToolEffect::Additive, true, "Resume KEK re-wrap"}},
 };
 
 // Generate a tool's served MCP `annotations` object from its classification.
@@ -1792,6 +1871,175 @@ int mcp_error_for_access_review_msg(const std::string& msg) {
     return msg.starts_with("not_found:") ? kInvalidParams : kInternalError;
 }
 
+// KekOpResult::Failure → JSON-RPC error (#2395 track C). Reuses
+// kek_routes.hpp's `KekOpResult::Failure` classification directly (no
+// re-derivation) so REST and MCP answer identically for the same failure.
+// JSON-RPC has no HTTP-status vocabulary, so this is the JSON-RPC analogue of
+// kek_routes.cpp's write_failure(): Unavailable is the one retryable
+// (transient) class alongside Conflict — both carry an honest retry_after_ms,
+// because a caller that backs off and retries is doing the right thing in both
+// cases; HalfCommitted and Internal are
+// genuine server-side conditions, not client errors, so both stay
+// kInternalError. Rule B (kek_routes.hpp): Internal's message is generic
+// only — never a seam-supplied string.
+struct KekFailureInfo {
+    int code;
+    // #2530 G7-B6: std::string, not const char* — the ClockAnomaly branch
+    // interpolates the observed skew magnitude, so this can no longer be a
+    // static literal in every arm.
+    std::string message;
+    const char* remediation; // nullptr only for the unreachable None fallthrough
+    long retry_after_ms;     // -1 => no retry hint (not blindly retryable)
+};
+
+// #2530 B2/G7-B2: takes the whole `KekOpResult`, not just the `Failure` enum,
+// because `Cooldown`'s retry hint must be the honest value carried on the
+// result (`cooldown_retry_after_ms`, sourced from the durable rate-limit
+// clock) — mirrors kek_routes.cpp's write_failure() signature change. A
+// hardcoded 300000 here would tell an agentic caller to retry in 5 minutes
+// against a durable cooldown that can be up to `--kek-min-rotate-interval`
+// (1h default) — a guaranteed retry storm against the very endpoint this
+// change exists to rate-limit, each retry writing a failure audit row.
+KekFailureInfo kek_failure_info(const KekOpResult& result) {
+    switch (result.failure) {
+    case KekOpResult::Failure::Unavailable:
+        return {kInternalError, "KEK service unavailable",
+                "the Postgres substrate or secrets codec is not available; retry once the "
+                "server reports it is ready",
+                5000};
+    case KekOpResult::Failure::Conflict:
+        // A conflict is RETRYABLE and is not the caller's fault: another KEK
+        // operation holds the cluster-wide advisory lock. kInvalidParams would
+        // tell an agentic caller "your input was wrong, do not retry" — the
+        // opposite of the truth, and an agentic-first A5 violation (honest
+        // retry semantics). This file already has a retryable-contention
+        // precedent in kMcpSessionCap/kMcpStreamCap (both -> HTTP 429); the
+        // closest available shape here is a retryable server condition with an
+        // honest retry_after_ms, matching the Unavailable branch above.
+        return {kInternalError, "another KEK operation is in progress",
+                "another rotation or re-wrap holds the KEK operation lock; retry once it "
+                "completes",
+                5000};
+    case KekOpResult::Failure::Cooldown: {
+        // Mirrors the REST 429. Retryable with a real wait, and the remediation
+        // must point at rewrap_secrets: an agentic caller recovering a
+        // half-committed rotation would otherwise sit in a retry loop against
+        // the one tool that is rate-limited. #2530 D: retry_after_ms is now
+        // the honest durable-clock value; fall back to the old fixed 5-minute
+        // hint only if the seam left the field unset (0).
+        const long retry_after_ms = result.cooldown_retry_after_ms > 0
+                                         ? static_cast<long>(result.cooldown_retry_after_ms)
+                                         : 300000;
+        return {kInternalError, "KEK rotation is in its cooldown window",
+                "rotation attempts are rate-limited; if you are finishing a half-committed "
+                "rotation call rewrap_secrets instead — it is not rate-limited",
+                retry_after_ms};
+    }
+    case KekOpResult::Failure::VersionCeiling:
+        // #2530 G7-B1: waiting never resolves a ceiling refusal — it needs an
+        // operator config change. Name the escape hatch explicitly so an
+        // agentic caller doesn't retry-loop against a permanent condition.
+        // kInternalError, not kInvalidParams: this tool takes no parameters,
+        // so a "your input was wrong" code would be as dishonest here as the
+        // Conflict branch's doc comment above already explains it would be —
+        // this is a server-side/operator-config condition, not a client
+        // mistake.
+        return {kInternalError, "the live KEK version ceiling has been reached",
+                "rotation is blocked because the number of live KEK versions has reached "
+                "--kek-max-live-versions; there is no retire route (#2525), so waiting will "
+                "never clear this — an operator must explicitly raise the ceiling, which is a "
+                "deliberate, logged and audited risk acceptance",
+                -1};
+    case KekOpResult::Failure::QueryCanceled:
+        // #2530 G7-B1: mirrors kek_routes.cpp's QueryCanceled branch. NOT
+        // necessarily transient (may fail identically forever at scale, or
+        // was an admin pg_cancel_backend) — no retry_after_ms.
+        return {kInternalError, "a KEK query was canceled or exceeded its statement timeout",
+                "this is not necessarily transient: check statement_timeout, current database "
+                "load, whether an administrator issued pg_cancel_backend, and the size of the "
+                "registered-column rewrap scan before retrying",
+                -1};
+    case KekOpResult::Failure::ClockAnomaly:
+        // #2530 G7-B1/B6: the timestamp the cooldown math would use is the
+        // very thing proven untrustworthy — no retry_after_ms, and NOT the
+        // same remediation as Cooldown. The message interpolates the
+        // observed skew MAGNITUDE (mirrors kek_routes.cpp's REST twin) so an
+        // agentic caller (or the human reading its logs) can tell "a few
+        // seconds of NTP jitter" from "this row is dated next year" — a
+        // forward skew does NOT self-clear the way a backward one does, and
+        // there is no configuration escape for this refusal at all.
+        return {kInternalError,
+                "the KEK rotation clock is untrustworthy: the newest kek_meta row is dated " +
+                    std::to_string(result.clock_skew_secs) +
+                    "s in the future relative to the database server's own clock",
+                "the newest kek_meta row is timestamped in the future relative to the database "
+                "server's own clock, so the durable rotation rate limit cannot be computed "
+                "safely; investigate the database server's clock (NTP sync, VM restore, "
+                "failover to a host that is ahead) before retrying. A forward skew like this "
+                "does NOT self-clear on its own — it persists until real time catches up to the "
+                "stored timestamp, and there is no configuration flag to bypass this refusal",
+                -1};
+    case KekOpResult::Failure::HalfCommitted:
+        // Rule A (kek_routes.hpp): this instruction is the single most
+        // important string in this handler family — MUST tell the caller to
+        // call rewrap_secrets to resume and MUST NOT invite a rotate_kek
+        // retry (which would mint a spurious extra version on top of an
+        // already-half-rotated state). Kept byte-identical in spirit to
+        // kek_routes.cpp's write_failure() HalfCommitted branch.
+        return {kInternalError, "KEK rotation did not finish re-wrapping every secret",
+                "the new KEK version was registered but re-wrapping did not finish; call "
+                "rewrap_secrets to resume — do NOT retry rotate_kek, which would mint a "
+                "spurious extra version",
+                -1};
+    case KekOpResult::Failure::Internal:
+        return {kInternalError, "internal error", nullptr, -1};
+    case KekOpResult::Failure::None: // unreachable on the failure-mapping path
+        return {kInternalError, "internal error", nullptr, -1};
+    }
+    return {kInternalError, "internal error", nullptr, -1};
+}
+
+// Short, static audit-detail tag for a KEK operation failure — mirrors
+// kek_routes.cpp's failure_tag() (REST twin) so both surfaces log the same
+// detail vocabulary for the same failure classification. Rule B applies here
+// too: never a codec-internal error string, only this static tag.
+//
+// #2530 G8-S5 (corrected — an earlier version of this comment, and the
+// commit message that landed it, wrongly credited splitting `None` from
+// `Internal` with keeping `-Wswitch` armed here; `-Wswitch` fires on ANY
+// unhandled enumerator with no `default:` label regardless of which
+// existing cases fall through together, so combining them would have been
+// just as safe). What actually arms the warning is enumerating every
+// `Failure` value explicitly and never adding a `default:` — that is what
+// makes a future `Failure` enum addition trip `-Wswitch` here even though
+// `werror=false` only warns — the compiler still flags it in the build log,
+// and a reviewer catches it, instead of the new value silently defaulting
+// to "failure=internal" the way VersionCeiling/
+// QueryCanceled/ClockAnomaly did before this fix.
+const char* kek_failure_tag(KekOpResult::Failure failure) {
+    switch (failure) {
+    case KekOpResult::Failure::Unavailable:
+        return "failure=unavailable";
+    case KekOpResult::Failure::Conflict:
+        return "failure=conflict";
+    case KekOpResult::Failure::Cooldown:
+        return "failure=cooldown";
+    case KekOpResult::Failure::VersionCeiling:
+        return "failure=ceiling";
+    case KekOpResult::Failure::QueryCanceled:
+        return "failure=query_canceled";
+    case KekOpResult::Failure::ClockAnomaly:
+        return "failure=clock_anomaly";
+    case KekOpResult::Failure::HalfCommitted:
+        return "failure=half_committed";
+    case KekOpResult::Failure::Internal:
+        return "failure=internal";
+    case KekOpResult::Failure::None:
+        return "failure=internal";
+    }
+    return "failure=internal";
+}
+
 } // anonymous namespace
 
 // ── C8 fail-closed boot validator (#2383) ────────────────────────────────
@@ -1875,6 +2123,12 @@ bool reject_unsupported_protocol_version(const httplib::Request& req, httplib::R
 }
 
 } // namespace
+
+namespace detail {
+std::string_view kek_mcp_failure_tag(KekOpResult::Failure failure) {
+    return kek_failure_tag(failure);
+}
+} // namespace detail
 
 McpServer::HandlerFn McpServer::build_handler(
     AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn, AgentsJsonFn agents_fn, RbacStore* rbac_store,
@@ -5264,12 +5518,6 @@ McpServer::HandlerFn McpServer::build_handler(
                                [](unsigned char c) { return std::tolower(c); });
                 std::transform(action.begin(), action.end(), action.begin(),
                                [](unsigned char c) { return std::tolower(c); });
-                if (plugin.empty() || action.empty()) {
-                    res.set_content(
-                        error_response(id, kInvalidParams, "plugin and action are required"),
-                        "application/json");
-                    return;
-                }
                 // ── Server-side input bounds (#2437) ──────────────────────────
                 // These mirror this tool's SERVED inputSchema exactly. Until now
                 // the schema's maxLength/maxItems were enforced only on the
@@ -5383,11 +5631,15 @@ McpServer::HandlerFn McpServer::build_handler(
                             return;
                         }
                         for (const auto& v : a) {
-                            // is_string() guard is load-bearing: get_ref throws
-                            // a type_error on a non-string. (A non-string entry
-                            // is silently DROPPED by the extraction loop below,
-                            // which is a separate hazard - it lands with the
-                            // targeting-safety change, not here.)
+                            // The type IS guaranteed by check_exec_instruction_shape
+                            // above (and pre-mint in the C8 block), so this guard is
+                            // dead code today. It is kept deliberately: it costs
+                            // nothing, it stays correct under refactoring, and
+                            // without it a non-string reaching here would throw
+                            // type_error out of get_ref and become a 500 instead of
+                            // a clean -32602 the moment that 89-line-distant
+                            // invariant is disturbed. Removing it in this PR was a
+                            // false economy (#2492 review).
                             if (v.is_string() &&
                                 v.get_ref<const std::string&>().size() > kExecInstrIdentMaxLen) {
                                 too_large("agent_id_len", std::format("an agent_ids entry exceeds {} bytes", kExecInstrIdentMaxLen));
@@ -5415,9 +5667,32 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                 }
 
-                // Default scope to __all__ if neither scope nor agent_ids provided
-                if (scope.empty() && agent_ids.empty())
-                    scope = "__all__";
+                // Default scope to __all__ ONLY when the caller named no target at
+                // all. A targeting argument that was SUPPLIED but resolved to
+                // nothing must never widen to the whole fleet - that is the #2437
+                // defect, and `{"agent_ids": []}` from a device filter matching
+                // nothing is its likelier shape than a type-confused list.
+                //
+                // check_exec_instruction_shape already rejects those shapes ~90
+                // lines above, so this branch is UNREACHABLE today and is second
+                // line of defence, not the fix. It is here because the sink is the
+                // one place where a bypass or a reorder turns a specific-looking
+                // target list into the entire fleet, and a single point of failure
+                // is exactly what this series argues against. Falsifiable on its
+                // own terms: neuter the shape check and this still refuses.
+                const bool supplied_target = args.contains("agent_ids") || args.contains("scope");
+                if (scope.empty() && agent_ids.empty()) {
+                    if (supplied_target) {
+                        const bool by_ids = args.contains("agent_ids");
+                        too_large(by_ids ? "agent_ids_empty" : "scope_empty",
+                                  by_ids ? "agent_ids was supplied but resolved to no target; "
+                                           "omit it entirely to target all agents"
+                                         : "scope was supplied but resolved to no target; "
+                                           "omit it entirely to target all agents");
+                        return;
+                    }
+                    scope = std::string(yuzu::server::kBroadcastScope);
+                }
 
                 // ── Progress bridge, GET-only mode (2f PR 3a, S1') ────────────
                 // A request carrying _meta.progressToken opts into live progress
@@ -6581,6 +6856,179 @@ McpServer::HandlerFn McpServer::build_handler(
                 // MCP usage correlates with the ca.* domain events in the audit store.
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            // ── KEK (key-encryption-key) rotation tools (#2395 track C) ──────
+            // MCP twins of POST/GET /api/v1/secrets/kek/* (kek_routes.cpp), reusing
+            // the SAME KekOps seam (injected via set_kek_ops) and emitting the SAME
+            // kek.rotate / kek.rewrap audit verbs so both surfaces are
+            // indistinguishable in the audit log. Security:Write is tier-checked +
+            // approval-gated by the generic C8 gate above exactly like
+            // revoke_certificate; the tier_allows/perm_fn calls below are the same
+            // redundant defense-in-depth check every other handler in this file
+            // repeats. There is deliberately NO retire/decommission tool here (or
+            // on the REST side): blocked by #2525 — do not add one back without
+            // closing #2525 first.
+            if (tool_name == "rotate_kek") {
+                if (!tier_allows(tier, "Security", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Write"))
+                    return;
+                if (!kek_ops_.rotate) {
+                    res.set_content(a4_error(kInternalError, "KEK service unavailable",
+                                             "the Postgres substrate or secrets codec is not "
+                                             "available; retry once the server reports it is ready",
+                                             /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const KekOpResult result = kek_ops_.rotate();
+                if (result.failure != KekOpResult::Failure::None) {
+                    (void)audit_fn(req, "kek.rotate", "failure", "Secret", "kek",
+                                   kek_failure_tag(result.failure));
+                    const auto info = kek_failure_info(result);
+                    res.set_content(a4_error(info.code, info.message,
+                                             info.remediation ? std::string_view(info.remediation)
+                                                               : std::string_view{},
+                                             info.retry_after_ms),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, "kek.rotate", "success", "Secret", "kek",
+                            "new_version=" + std::to_string(result.new_version));
+                // NO rows_rewrapped here, matching the REST twin: rotate_kek()
+                // discards its internal rewrap_all() count, so any number we
+                // printed would be a guess — and a confidently-wrong 0 in the
+                // audit trail is worse than an absent field. rotation_complete
+                // is the honest signal (ADR-0010 3's completion criterion);
+                // call rewrap_secrets for a real count.
+                JObj payload;
+                payload.add("new_version", static_cast<int64_t>(result.new_version))
+                    .add("rotation_complete", result.rotation_complete);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "rewrap_secrets") {
+                if (!tier_allows(tier, "Security", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Write"))
+                    return;
+                if (!kek_ops_.rewrap) {
+                    res.set_content(a4_error(kInternalError, "KEK service unavailable",
+                                             "the Postgres substrate or secrets codec is not "
+                                             "available; retry once the server reports it is ready",
+                                             /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const KekOpResult result = kek_ops_.rewrap();
+                if (result.failure != KekOpResult::Failure::None) {
+                    (void)audit_fn(req, "kek.rewrap", "failure", "Secret", "kek",
+                                   kek_failure_tag(result.failure));
+                    const auto info = kek_failure_info(result);
+                    res.set_content(a4_error(info.code, info.message,
+                                             info.remediation ? std::string_view(info.remediation)
+                                                               : std::string_view{},
+                                             info.retry_after_ms),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, "kek.rewrap", "success", "Secret", "kek",
+                            "rows_rewrapped=" + std::to_string(result.rows_rewrapped));
+                JObj payload;
+                payload.add("rows_rewrapped", static_cast<int64_t>(result.rows_rewrapped));
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "get_kek_status") {
+                if (!tier_allows(tier, "Security", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Read"))
+                    return;
+                if (!kek_ops_.status) {
+                    res.set_content(a4_error(kInternalError, "KEK service unavailable",
+                                             "the Postgres substrate or secrets codec is not "
+                                             "available; retry once the server reports it is ready",
+                                             /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const KekOpResult result = kek_ops_.status();
+                if (result.failure != KekOpResult::Failure::None) {
+                    // Read-only, not audited — matches kek_routes.cpp's GET
+                    // /api/v1/secrets/kek/status (mirrors the CA read routes,
+                    // which don't audit either).
+                    const auto info = kek_failure_info(result);
+                    res.set_content(a4_error(info.code, info.message,
+                                             info.remediation ? std::string_view(info.remediation)
+                                                               : std::string_view{},
+                                             info.retry_after_ms),
+                                    "application/json");
+                    return;
+                }
+                JObj payload;
+                payload.add("active_version", static_cast<int64_t>(result.active_version));
+                if (result.oldest_in_use.has_value())
+                    payload.add("oldest_in_use", static_cast<int64_t>(*result.oldest_in_use));
+                else
+                    payload.raw("oldest_in_use", "null");
+                payload.add("rotation_complete", result.rotation_complete);
+                // #2530 C1/T5: MCP twin of REST /status's three diagnostic
+                // snapshots — see KekOpResult::live_versions/lock_held/
+                // lock_holder_pid (kek_routes.hpp) for the lock-free,
+                // possibly-different-instant caveat. Twin parity is an
+                // ADR-1005 invariant; do not land one of these on REST only.
+                // live_versions/lock_held serialise as JSON null (never a
+                // fabricated 0/false) when the seam could not determine
+                // them — matching kek_routes.cpp exactly.
+                if (result.live_versions.has_value())
+                    payload.add("live_versions", static_cast<int64_t>(*result.live_versions));
+                else
+                    payload.raw("live_versions", "null");
+                if (result.lock_held.has_value())
+                    payload.add("lock_held", *result.lock_held);
+                else
+                    payload.raw("lock_held", "null");
+                if (result.lock_holder_pid.has_value())
+                    payload.add("lock_holder_pid", static_cast<int64_t>(*result.lock_holder_pid));
+                else
+                    payload.raw("lock_holder_pid", "null");
+                // #2530 H1: when the lock_held/lock_holder_pid snapshot
+                // above was taken — null in lockstep with them when
+                // undetermined. Mirrors kek_routes.cpp's REST twin exactly
+                // (ADR-1005 parity).
+                if (result.lock_holder_captured_at.has_value())
+                    payload.add("lock_holder_captured_at", utc_iso_at(*result.lock_holder_captured_at));
+                else
+                    payload.raw("lock_holder_captured_at", "null");
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 

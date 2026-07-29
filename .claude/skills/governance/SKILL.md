@@ -31,8 +31,9 @@ Gate 3 — domain-triggered agents                   (parallel, decision matrix 
 Gate 4 — happy-path + unhappy-path + consistency   (parallel, mandatory)
 Gate 5 — chaos-injector                            (conditional on Gate 4)
 Gate 6 — compliance + sre + enterprise-readiness   (parallel, mandatory)
+Gate 6b — synthesis pass (presentation only, workflow-orchestrator)
 Gate 7 — address BLOCKING findings
-Gate 8 — re-review affected gates, ledger, final decision
+Gate 8 — re-review gates whose DOMAIN THE FIX TOUCHED, ledger, final decision
 ```
 
 Per CLAUDE.md: CRITICAL/HIGH are blocking, MEDIUM should be fixed, LOW addressed. Iterate until the team gives a clean bill. No commit until governance passes.
@@ -41,7 +42,65 @@ Per CLAUDE.md: CRITICAL/HIGH are blocking, MEDIUM should be fixed, LOW addressed
 
 ## Step 0 — Before you launch anything
 
-Run these in parallel to size the change and pick domain agents:
+### First: confirm you are running the current pipeline
+
+This skill and the routed-concern table are read **from your working tree**, so a branch
+that predates a change to either silently runs the old pipeline. At the time #2604
+merged, 81 of 81 local branches predated it.
+
+```bash
+git fetch origin dev -q || echo "WARNING: fetch failed - origin/dev may itself be stale"
+for f in .claude/skills/governance/SKILL.md .claude/routed-concerns.md CLAUDE.md; do
+  git diff --quiet origin/dev -- "$f" \
+    && echo "  ok       $f" \
+    || echo "  DIFFERS  $f   ($(git diff --shortstat origin/dev -- "$f" | sed 's/^ *//'))"
+done
+```
+
+Three things about that loop are load-bearing.
+
+**It compares the WORKING TREE, because that is what gets read.** The skill is loaded from
+your checkout, not from a commit, so the commit is the wrong object to test. An earlier
+version of this check compared `HEAD...origin/dev` - commit against commit - which reports
+**current** for a tree whose branch is up to date but which has an older skill checked into
+it (`git checkout <old-sha> -- .claude/skills/governance/`), and reports **stale** for a
+tree like the one this paragraph was written from, whose branch is months behind but whose
+files were copied across and are byte-identical to `origin/dev`. Both answers were wrong,
+and the dangerous one was the first.
+
+**It reports per path, and shows the size of the difference**, so the output is evidence
+rather than a verdict. A bare boolean over three aggregated paths tells you nothing you can
+act on.
+
+**It does not try to tell you WHY a file differs.** Whether you edited it or checked out an
+older copy is not knowable from git - both produce a working tree that differs from
+`origin/dev` - so the check reports the fact and leaves the judgement to you. If you are
+deliberately editing one of these files, `DIFFERS` on that path is expected and the diff it
+names is your own. Claiming to distinguish the two would be asserting something unverifiable,
+which is the failure mode a previous revision of this section shipped.
+
+**The fetch guard.** A bare `git fetch` whose exit status is discarded fails silently
+offline or on expired auth, and the comparison then runs against a stale cached
+`origin/dev` and reports **current** while your tree holds the old pipeline. That is the
+one direction this check exists to prevent.
+
+**`CLAUDE.md` is included** because it is loaded into every session, so a stale summary
+there outranks a correct skill in practice.
+
+If a path you are not editing reports `DIFFERS`, reconcile before running: rebase or merge
+`origin/dev`, or copy the current files across (`git checkout origin/dev -- <path>`), which
+is enough on its own - the check passes on content, so the files do not have to be committed
+to be current. Do not proceed on the assumption that your copy is current: the same failure
+mode produces confident false claims about which agents a change routes to.
+
+**The same rule applies to any claim that a file, row or invariant is ABSENT.** Check
+`git show origin/dev:<path>`, never `ls` or a working-tree grep. Staleness inverts absence
+claims, and an external reviewer pointed at your tree inherits the error rather than
+catching it.
+
+### Then: size the change and pick domain agents
+
+Run these in parallel:
 
 ```bash
 git log --oneline <range>
@@ -55,6 +114,92 @@ Check existing memory that might apply — at minimum:
 - `feedback_governance_run.md` — prior-run learnings
 - `feedback_test_quality.md` — fixture leaks, test code standards
 - `feedback_claude_md_scope.md` — which areas are cipher to you / still churning
+
+### Load and MATCH the routed-concern table — do not rely on memory
+
+```bash
+# Every changed path, against every routed-concern row.
+git diff --name-only <range>
+```
+
+Open `.claude/routed-concerns.md` and walk it row by row against that path list.
+Each row names the files/change-types it covers and the agents that MUST load on
+them. Those agents are selected **unconditionally** — see the standing rule under
+the Gate 3 decision matrix. Write the matched rows into your Gate 1 summary so the
+selection is auditable, and repeat this match at **Gate 8** against the fix diff.
+
+Do this by reading the table, not from recall: it is amended often, and a row you
+remember may have been rewritten. (The clock-guarded-retention row alone has been
+rewritten twice since it landed.) Rows are also the reason a one-line change can
+require `sre` and `compliance-officer` — size never gates a routed concern.
+
+---
+
+## Shared preamble — inject this into EVERY agent prompt
+
+Twelve agents asked for "BLOCKING / SHOULD / NICE" with no definition invent twelve
+different bars, and the operator normalises by hand. Paste this block verbatim into
+every Gate 2/3/4/6 prompt, in addition to that agent's own focus.
+
+```
+## Severity — report in YOUR OWN vocabulary, against these shared thresholds
+
+Keep the severity vocabulary your own brief specifies (security-guardian:
+CRITICAL/HIGH/MEDIUM/LOW/INFO; docs-writer: BLOCKING/SHOULD-FIX/NICE-TO-HAVE;
+most others: BLOCKING/SHOULD/NICE). Do NOT switch vocabularies — the operator
+normalises with the map below, and a renamed band loses information.
+
+What is calibrated is the THRESHOLD, not the label:
+
+GATING  — would cause incorrect behaviour, data loss, a security regression, or
+  misleading operator guidance in production. You must be able to name the failing
+  input or state. If you cannot, it is not gating.
+  Maps from: CRITICAL, HIGH, BLOCKING.
+SHOULD  — a real defect with bounded blast radius, or a missing test for a
+  behaviour that has one.
+  Maps from: MEDIUM, SHOULD, SHOULD-FIX.
+NICE    — everything else. Maps from: LOW, INFO, NICE, NICE-TO-HAVE.
+
+Where your vocabulary does not map cleanly, say so and treat it as GATING. That
+default is deliberate: an unmappable finding must not be silently downgraded.
+
+## Prose: docs-writer owns WORDING, the domain agent owns TRUTH
+
+Two different questions, two different owners:
+
+- Is this text WELL WRITTEN (clear, accurate to convention, not stale)? ->
+  `docs-writer`, including in-code comments and log/error-message text.
+- Is this text TRUE? -> the domain agent. Ordinary C++ comments: `cpp-expert`.
+  Lifetime / ownership / thread / callback / syscall claims: `cpp-safety`.
+  Auth, authz, crypto, control claims: `security-guardian`. Erlang:
+  `gateway-erlang`. CI / build / release: `build-ci` or `release-deploy`.
+  Normative architecture text — ADRs, invariants documents, routed-concern rows:
+  `architect`, plus `security-guardian` where the text states a security posture.
+
+So: report a comment or doc when it CONTRADICTS the code — that is a truth finding,
+at your own native severity, and it is yours to raise whatever agent you are. A
+WORDING-ONLY observation is capped at NICE; report it if you think it matters,
+never above.
+
+Exception, and it is load-bearing: a factually false comment adjacent to a security
+or control-flow branch IS a contradiction, not wording. #2202 shipped a comment
+asserting the opposite of what its function did, next to an authz branch.
+
+(Capping wording rather than banning it is deliberate: deciding whether prose is
+descriptive or normative is exactly the disputed question, so a mis-classification
+should cost a line of noise, not a lost finding.)
+
+## Verify what you can, read-only
+
+Where a claim can be tested cheaply — a query, a compile, a one-case test — TEST IT
+and report the output. An empirically verified finding outranks a reasoned one, and
+a reasoned finding about observable behaviour should say it was not verified. The
+highest-value finding of the #2580 run came from an agent running a real query
+against a live Postgres rather than reasoning about the SQL.
+
+READ-ONLY, against disposable state only. Never mutate a live store, and never run a
+destructive statement to raise a finding's standing.
+```
 
 ---
 
@@ -88,7 +233,7 @@ Launch both agents in a **single message with two tool calls** so they run in pa
 
 ```
 Full governance Gate 2 review of <N> commits on branch <branch> at
-/mnt/c/Users/natha/Yuzu: <sha1>, <sha2>, ...
+<repo-root>: <sha1>, <sha2>, ...
 
 Use `git show <sha>` to view each commit. The working tree is clean;
 what you see in <range> is the full scope.
@@ -281,7 +426,7 @@ Report in under 800 words.
 
 ```
 Full governance Gate 2 docs review of <N> commits on branch <branch>
-at /mnt/c/Users/natha/Yuzu: <sha1>, <sha2>, ...
+at <repo-root>: <sha1>, <sha2>, ...
 
 Use `git show <sha>` and `git diff <range>` to see the full scope.
 
@@ -297,8 +442,10 @@ Specifically verify:
    request/response body, error paths, permissions
 2. User manual feature sections (`docs/user-manual/*.md`) — operator
    workflow changes, new CLI flags, new env vars, upgrade notes
-3. CHANGELOG.md — the `[Unreleased]` section for Fixed/Added/Changed/
-   Breaking entries; reverse-chronological order invariant
+3. Changelog — a `changelog.d/<PR#>-<slug>.<section>.md` FRAGMENT.
+   `CHANGELOG.md` itself is FROZEN: never edited directly, enforced by a
+   hook and the `Changelog fragments` CI job. Flag any direct edit to
+   `CHANGELOG.md` as BLOCKING. (See `changelog.d/README.md`.)
 4. CLAUDE.md — new architectural invariants, new stores, new ABI
    patterns, new release gates
 5. Any audit action table, permission table, or error-code table
@@ -346,6 +493,30 @@ Use the decision matrix below to pick agents. Launch **all picked agents in a si
 | Packaging, systemd units, Dockerfiles, installer scripts | **release-deploy** |
 | New/changed REST route, MCP tool, dashboard fragment/page, or any other capability-adding operator surface | **architect**, **security-guardian** — both apply the ADR-1005 standing question (below) |
 
+### Standing rule — routed triggers are UNCONDITIONAL
+
+Do not gate any routed-concern trigger, or any "always include" rule below, on diff
+size or a materiality threshold. `.claude/routed-concerns.md` keys on **file identity
+and change type**, because those files carry catastrophic-if-violated invariants
+regardless of line count. Any roster trimming may only choose among agents those rules
+did **not** already select.
+
+A 2026-07 proposal to run a "core four" on small diffs was BLOCKed by two independent
+adversarial reviews, which produced these kill shapes — all "single-file, small, no
+public surface":
+
+- **10 lines of `gateway/config/sys.config`** weakening management-listener client-cert
+  verification. `gateway-erlang` dropped; `cpp-safety` is useless on Erlang config; the
+  PKI route calls a plaintext gateway a fleet-RCE edge.
+- **A retention/prune tweak.** The clock-guard row mandates `cpp-safety` + `sre` +
+  `compliance-officer` (#2360/#2361) — two of the three would have been dropped.
+- **A one-line `.github/workflows` `if:` guard.** The failure-path-guard invariant went
+  silently dead for two months (#1038); that is `build-ci`'s domain.
+- **Any small C++ diff**, because a "core four" contains no portability reviewer — the
+  exact gap that shipped #2580's macOS break.
+
+Rationale and the full review record: `docs/governance-skill-tuning-2026-07.md`.
+
 **Always include architect** when any public store contract or REST API surface changes — the duplicate-validation and error-mapping drift patterns recur.
 
 **Always apply the ADR-1005 standing question** on any capability-adding diff: is every behavior of this capability reachable by an authenticated external principal via versioned REST *and* MCP, or a recorded exception in ADR-1005's exception ledger; is it discoverable (A2/A3 — enumerable via `/api/v1/openapi.json` / MCP `tools/list`); does it carry the A4 error envelope; is there no in-process-only behavior; are RBAC and audit enforced at the API layer (not only in the UI)? A dashboard fragment is not an API twin. (Policy: `docs/adr/1005-headless-platform-use-case-engines.md`; current phase status: `docs/adr-1005-execution-plan.md` — both land with PRs #1918/#1926; do not merge this wiring before them.)
@@ -373,7 +544,7 @@ Each Gate 3 agent gets the same structural preamble, varying in the "Your job" s
 
 ```
 Full governance Gate 3 <agent-type> review of <N> commits on branch
-<branch> at /mnt/c/Users/natha/Yuzu: <sha1>, <sha2>, ...
+<branch> at <repo-root>: <sha1>, <sha2>, ...
 
 Read `git show <range>` for the full diff.
 
@@ -412,7 +583,7 @@ These three are the highest-value reviewers in the Yuzu pipeline. Prior runs con
 
 ```
 Full governance Gate 4 happy-path review. <N> commits on branch <branch>
-at /mnt/c/Users/natha/Yuzu: <sha1>..<shaN>.
+at <repo-root>: <sha1>..<shaN>.
 
 `git show <range>` covers the full scope.
 
@@ -540,7 +711,9 @@ state, schema, and contract consistency. Check:
    existing `unique_temp_path` helper or equivalent; shared hardcoded
    paths are a parallel-test race.
 
-7. **CHANGELOG reverse-chronological order invariant** preserved?
+7. **Changelog fragment** present and well-formed — `changelog.d/<PR#>-<slug>.<section>.md`,
+   valid section, `CHANGELOG.md` untouched. (The old `[Unreleased]`/reverse-chronological
+   invariant is ABOLISHED — the file is assembled at release from fragments.)
 
 8. **ADR-1005 headless-platform parity** — for any capability this PR
    adds or changes: is every behavior reachable by an authenticated
@@ -663,7 +836,44 @@ Use the same structural preamble as Gate 4 agents, vary the "Your job" stanza to
 
 **Watch for:** sre routinely catches pre-existing readiness-probe gaps that become BLOCKING because the PR makes an existing store more load-bearing. The HC-1 pattern (store missing from `/readyz`) reappears — always verify the new store(s) in scope are in the probe conjunction.
 
-**Watch for:** enterprise-readiness flags breaking-changes-without-upgrade-note more reliably than other agents. If the PR changes non-admin behavior, a CHANGELOG "Breaking" section + `docs/user-manual/server-admin.md` upgrade note is almost always required.
+**Watch for:** enterprise-readiness flags breaking-changes-without-upgrade-note more reliably than other agents. If the PR changes non-admin behavior, a changelog FRAGMENT carrying the Breaking entry (`changelog.d/<PR#>-<slug>.changed.md` or `.security.md`, body led with `**Breaking —**`) plus a `docs/user-manual/server-admin.md` upgrade note is almost always required. Do NOT ask for a `CHANGELOG.md` section — that file is frozen and edited only at release.
+
+---
+
+## Gate 6b — Synthesis pass (presentation only)
+
+A full run produces on the order of 45 non-blocking findings, each as its own block of
+prose, with the same defect frequently reported by two or three agents at full length.
+On #2580, four of six round-1 BLOCKINGs arrived 2–3 times over. All of the triage
+landed on the operator, and `workflow-orchestrator` — which exists for exactly this —
+was never invoked.
+
+Run it now, over the raw reports:
+
+```
+Agent (workflow-orchestrator): Synthesise the attached Gate 2/3/4/6 reports into a
+single severity-ordered table for the operator. Preserve EVERY source report verbatim
+as an appendix — you are changing presentation, not content.
+
+Cluster two findings ONLY when they share the same file:line AND the same defect.
+Anything else stays separate. For each cluster: list its reporting agents, take the
+MAXIMUM severity of its members, and do NOT re-adjudicate severity or dismiss a
+finding. Mark every cluster PROVISIONAL.
+```
+
+Three rules, all load-bearing:
+
+- **Same `file:line` AND same defect.** Never "same theme". On #2580, the BLOCKING for
+  the incomplete REST classifier and the BLOCKING for the hardcoded MCP retry hint
+  summarise almost identically and needed **separate fixes and separate tests** — a
+  synthesiser merging on theme would have hidden one of them.
+- **Max severity, never re-adjudicated.** The synthesiser has not read the code.
+- **Clusters are provisional; the operator confirms equivalence.** The synthesiser is
+  not the authority on whether two findings are the same finding.
+
+Convergence is the strongest confidence signal this pipeline produces — "found
+independently by three agents" is why a finding gets acted on without re-derivation.
+This pass keeps that signal and drops the re-reading; it must not launder it.
 
 ---
 
@@ -677,8 +887,74 @@ Strategy:
 
 ## Gate 8 — Iterate And Ledger
 
-1. **After re-review passes**, proceed to Gate 4 + Gate 5 + Gate 6 on the final baseline (only re-run the gates whose findings would be affected by the fix — if the fix was docs-only, Gate 4 happy-path doesn't need a re-run).
+1. **Re-run every gate whose DOMAIN THE FIX DIFF TOUCHES** — not only those whose
+   findings prompted the fix. A fix that adds a language feature, a dependency, a
+   thread, or a platform-specific call re-triggers the corresponding agent **even if
+   that agent raised nothing in round 1**.
+
+   Concretely, against the **fix diff** (not the original):
+   - **Gate 3** — re-run the decision matrix, including the routed-concern table.
+   - **Gate 2** — `security-guardian` always; `docs-writer` whenever the fix touches
+     a doc, a changelog fragment, a user-facing string, or in-code prose.
+   - **Gates 4 and 6** — re-run an agent when the fix changes behaviour in its
+     domain: `happy-path`/`unhappy-path` on any logic or error-path change,
+     `consistency-auditor` on any cross-surface or contract change, `sre` on any
+     metric, alert, probe or thread change, `compliance-officer` on any audit or
+     evidence change, `enterprise-readiness` on any operator-visible behaviour or
+     upgrade-note change.
+   - When in doubt, re-run it. A skipped re-review is how the fix round ships its
+     own defect.
+
+   This rule exists because the old one ("only the gates whose findings would be
+   affected") shipped a broken macOS leg on #2580. Gate 8 ran the four agents whose
+   findings had been fixed; `cpp-expert`, the portability reviewer, had only ever seen
+   commit 1. `std::jthread` was introduced in commit 3 **as a fix for a Gate 8
+   finding** and broke Apple Clang, whose libc++ has no `std::jthread` — every other
+   use in this codebase sits behind `#ifdef __cpp_lib_jthread`. No agent was ever
+   asked whether the fix was portable.
+
 2. **Don't commit until governance passes.** Per CLAUDE.md.
+
+3. **Record every finding in the run ledger.** Write a JSONL file at
+   `<run-log-dir>/governance-findings.jsonl` — one object per finding. There is **no
+   database and no shared store yet**; this is a per-run file, and making it durable
+   shared change-control evidence is tracked separately. Do not describe it as more
+   than it is.
+
+   Fields, all required unless marked:
+
+   | field | why |
+   |---|---|
+   | `run_id`, `commit_range`, `agent` | which run, which diff, who found it |
+   | `pass_ordinal` | **which round.** Without it the final pass is indistinguishable from the first, and `caused_by` below presupposes a round identity the schema would otherwise lack |
+   | `finding_id` | stable across rounds — `caused_by` is uncomputable without a join key |
+   | `severity_native` | the agent's OWN vocabulary, unmodified |
+   | `severity_mapped` | GATING / SHOULD / NICE per the shared threshold map |
+   | `provenance` | `introduced` / `newly-reachable` / `pre-existing`. **Adjudicated, not inferred from prose.** Default to `introduced` when contested |
+   | `file`, `line`, `summary` | where and what |
+   | `classification` + rationale | truth-contradiction vs wording, and why |
+   | `disposition` | `fixed` / `deferred-to-issue #N` / `rejected` |
+   | `adjudicated_by` (nullable) | who approved a departure, and that they were not the change's author |
+   | `caused_by` (nullable) | did round N's fix create this round N+1 finding |
+   | `waiver_rationale` (nullable) | *why* an unresolved gating finding was allowed to pass. A signature with no reasoning is content-free exception evidence |
+
+   The four nullable fields exist so the schema is stable when the process that
+   produces them lands. **Recording an `adjudicated_by` or `waiver_rationale` does
+   NOT establish that a signed waiver may release a gating finding** — no such
+   merge contract is adopted here. Today's rule is unchanged: gating findings are
+   resolved before the gate passes. The columns are there so a future decision
+   about waivers has somewhere to write, not because one has been made.
+
+   **Known gap, unsolved:** the absence of a finding row cannot distinguish "the
+   reviewer passed" from "the reviewer never ran". A clean-result record needs its
+   own design.
+
+   Why this exists at all: governance is the repo's largest issue-inflow source, and
+   nothing has ever recorded what it found. CI outcomes, durations and flakes are
+   persisted and queryable (`docs/ci-architecture.md`); governance findings are not.
+   Without a record, "governance is too noisy" and "governance caught the thing that
+   mattered" are both unfalsifiable, and no roster change can be argued from evidence.
+   See `docs/governance-skill-tuning-2026-07.md`.
 
 ## Known patterns from prior runs
 
@@ -696,7 +972,7 @@ Strategy:
 
 One full governance run on a non-trivial commit range is ~6-9 parallel agent calls plus the consolidation writeup. On the #222/#224 hardening round (5 commits, 2 hardening rounds), it caught 3 BLOCKING items I introduced myself, 2 of which would have shipped a worse vulnerability than the one I was fixing. The run takes 30-60 min of wall clock and produces a permanent artifact trail in commit messages + CHANGELOG that satisfies SOC 2 Workstream F change-management evidence.
 
-Skipping Gate 4 or Gate 5 to save time is rarely worth it. Skipping Gate 3 domain agents is sometimes fine if the change is genuinely small in scope (one file, no public API change); use the decision matrix to judge.
+Skipping Gate 4 or Gate 5 to save time is rarely worth it. **Do NOT skip Gate 3 domain agents on the grounds that a change is small** — that guidance predates the unconditional routed-trigger floor above and contradicts it. Diff size does not gate a routed concern: `.claude/routed-concerns.md` keys on file identity and change type precisely because those files carry catastrophic-if-violated invariants at any line count. Use the decision matrix to decide WHICH agents, never WHETHER.
 
 ## Post-run follow-ups — file deferred findings per the issue standard
 

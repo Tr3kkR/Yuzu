@@ -46,6 +46,8 @@ env:
   VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
   CCACHE_MAXSIZE: "500M"
   CCACHE_COMPRESS: "true"
+  # Big Tam allocates one 8C/16T L3 domain to each runner.
+  YUZU_BUILD_JOBS: "16"
 
 jobs:
   # ── Preflight: Big Tam runner-health gate ─────────────────────────────
@@ -63,7 +65,7 @@ jobs:
     outputs:
       bigtam_pool_healthy: ${{ steps.health.outputs.bigtam_pool_healthy }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Probe runner health
@@ -98,7 +100,7 @@ jobs:
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
@@ -217,7 +219,7 @@ jobs:
             -Db_sanitize=address,undefined
 
       - name: Build (ASan+UBSan)
-        run: meson compile -C build-linux-asan 2>&1 | tee sanitizer-asan-build.log
+        run: meson compile -C build-linux-asan -j "$YUZU_BUILD_JOBS" 2>&1 | tee sanitizer-asan-build.log
 
       - name: Test (ASan+UBSan)
         # Capture both stdout and the meson testlog as artifacts so the
@@ -265,7 +267,7 @@ jobs:
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
@@ -365,7 +367,7 @@ jobs:
             -Db_sanitize=thread
 
       - name: Build (TSan)
-        run: meson compile -C build-linux-tsan 2>&1 | tee sanitizer-tsan-build.log
+        run: meson compile -C build-linux-tsan -j "$YUZU_BUILD_JOBS" 2>&1 | tee sanitizer-tsan-build.log
 
       - name: Build gai_sync_shim (TSan + glibc getaddrinfo_a workaround)
         # Same shim as nightly.yml's TSan job (#438): cpp-httplib's non-blocking

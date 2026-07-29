@@ -29,9 +29,30 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    **included**: `WidgetStore` → `widget_store`, `ApiTokenStore` → `api_token_store`. Acronyms
    are one word (`RbacStore` → `rbac_store`); do not give a store class an all-caps acronym.
 3. **Secrets?** (ADR-0010) — if any column holds secret material, it is verify-only hash or
-   `SecretCodec` envelope-encrypted blob, never plaintext. `SecretCodec::init(conn)` runs
-   **before** the store opens. `api_token`/`ca` are hash-/key_ref-only; `auth`, `webhooks`,
-   `offload_targets`, `runtime_config` require the codec.
+   `SecretCodec` envelope-encrypted blob, never plaintext. `api_token`/`ca`/`scim_store` are
+   hash-/key_ref-only; `webhooks`, `offload_targets`, `runtime_config` are queued as
+   codec-requiring. **`auth` (`auth_db.{hpp,cpp}`) shipped as `SecretCodec`'s first production
+   consumer (2026-07-16)** — read it as the worked example. Its actual construction order is
+   the opposite of a naive "`init()` before the store opens" reading: `SecretCodec` is
+   *constructed* first, but `AuthDB`'s own constructor is what **registers**
+   `mfa_totp_secret` as a secret column (schema+table+column+PK-column tuple), and
+   `SecretCodec::init(conn)` runs **after** that — `init()` verifies/generates the KEK-wrapped
+   DEK for whatever is registered at that point.
+
+   **Instance model — one `SecretCodec` per consuming store, not a shared/fleet-wide
+   instance.** `server.cpp`'s construction order is `FileKeyProvider → SecretCodec
+   (`auth_secret_codec_`, ctor only) → AuthDB (ctor registers `mfa_totp_secret`) →
+   SecretCodec::init() → ScimStore`. `ScimStore` is constructed *after* but takes **no
+   `SecretCodec` reference** — it has no secret columns (SCIM tokens stay verify-only hashes),
+   so it is never a registrant. A new store with its own secret column(s) should give itself
+   its **own** `SecretCodec` instance and follow the same three-step shape end-to-end: construct
+   the codec → your store's constructor registers its column(s) → your store's own `init()`
+   call runs immediately after (register-before-init, scoped to that one store). Sharing a
+   single codec instance across multiple stores is possible in principle, but it requires
+   sequencing *every* registrant's construction ahead of one deferred `init()` call — don't
+   reach for it without a specific reason; the per-store model is the one this ADR/playbook
+   actually prescribes and the one `AuthDB` demonstrates. See ADR-0010's "Instance model" note
+   for the full rationale.
 
 ---
 
@@ -94,6 +115,17 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    database, or pg-substrate behaviour itself (pg_pool/pg_raii/pg_hardening need no
    migrations, so a template buys them nothing). Full contract: the `PgTestTemplate` doc
    comment in `tests/unit/test_helpers.hpp`.
+
+   High-volume store-behaviour files may instead keep one template clone and pool for the
+   file, then completely reset its rows with `TRUNCATE … RESTART IDENTITY CASCADE` before
+   each case. The fixture owns the pool in `std::optional<PgPool>` and passes a non-throwing
+   reset callback to `PostgresTestDb::keep_until_run_end()`; the Catch2 run-end listener
+   drains that pool before dropping the clone while libpq is still alive. Use this only when
+   the reset names every mutable table and no state escapes through a lease or background
+   thread. Tests that alter DDL or `public.schema_meta`, retain session/advisory-lock state,
+   or otherwise cannot be restored by `TRUNCATE` remain on their own per-test clone. Filtered
+   and randomized runs must pass, and the lifecycle regression in
+   `test_pg_template_cleanup.cpp` must continue to prove drain-before-drop ordering.
 
 8. **`meson.build`** — add the new `.cpp` to the server target (and the test). `libpq_dep` is
    already gated on `build_server`.

@@ -396,3 +396,167 @@ TEST_CASE("execution_event_bus - subscribe_and_replay closes the replay->subscri
         CHECK(received[i] == i + 1); // contiguous 1..kTotal - no gap at the subscribe boundary
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C5 (#2409) - first_terminal_id marker + unsubscribe_and_visit_terminal
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+using TV = ExecutionEventBus::TerminalVisit;
+using VS = ExecutionEventBus::VisitStatus;
+
+/// Run the visitor with a recording callback. `claim` is what f returns (the
+/// erase trigger). Captures the verdict + a copy of the buffered event's
+/// identity (the pointer is valid only during the call).
+struct VisitProbe {
+    bool f_ran = false;
+    TV verdict = TV::kNeverTerminal;
+    bool had_ev = false;
+    std::uint64_t ev_id = 0;
+    std::string ev_type;
+    VS status = VS::kInternalError;
+};
+VisitProbe visit(ExecutionEventBus& bus, const std::string& exec, std::size_t sub,
+                 bool claim) {
+    VisitProbe p;
+    p.status = bus.unsubscribe_and_visit_terminal(
+        exec, sub, [&](TV v, const ExecutionEvent* ev) noexcept -> bool {
+            p.f_ran = true;
+            p.verdict = v;
+            p.had_ev = ev != nullptr;
+            if (ev != nullptr) {
+                p.ev_id = ev->id;
+                p.ev_type = ev->event_type;
+            }
+            return claim;
+        });
+    return p;
+}
+}  // namespace
+
+TEST_CASE("visit_terminal - verdict is kNeverTerminal when no terminal was published",
+          "[execution_event_bus][2f][2409]") {
+    ExecutionEventBus bus;
+    auto sub = bus.subscribe("exec-nt", [](const ExecutionEvent&) {});
+    bus.publish("exec-nt", "execution-progress", "{}");  // non-terminal
+    auto p = visit(bus, "exec-nt", sub, /*claim=*/false);
+    CHECK(p.status == VS::kVisited);
+    CHECK(p.f_ran);
+    CHECK(p.verdict == TV::kNeverTerminal);
+    CHECK_FALSE(p.had_ev);
+    CHECK(bus.subscriber_count("exec-nt") == 1);  // defer (claim=false) KEEPS the listener
+}
+
+TEST_CASE("visit_terminal - kTerminalBuffered names the FIRST terminal event, not completed",
+          "[execution_event_bus][2f][2409]") {
+    // The refresh_counts split: a terminal-flagged execution-progress is published
+    // FIRST, then execution-completed. The marker must name the PROGRESS event (id
+    // 1) - an event-type scan for "execution-completed" would misclassify, which is
+    // the exact bug the marker exists to prevent.
+    ExecutionEventBus bus;
+    auto sub = bus.subscribe("exec-split", [](const ExecutionEvent&) {});
+    bus.publish("exec-split", "execution-progress",
+                R"({"status":"succeeded","agents_success":3,"agents_failure":0})",
+                /*is_terminal=*/true);  // id 1 - the FIRST terminal-flagged event
+    bus.publish("exec-split", "execution-completed",
+                R"({"status":"succeeded","agents_success":3,"agents_failure":0})",
+                /*is_terminal=*/true);  // id 2
+    auto p = visit(bus, "exec-split", sub, /*claim=*/false);
+    CHECK(p.verdict == TV::kTerminalBuffered);
+    REQUIRE(p.had_ev);
+    CHECK(p.ev_id == 1);
+    CHECK(p.ev_type == "execution-progress");  // the marker, not the completed event
+}
+
+TEST_CASE("visit_terminal - first terminal marker is stable across later terminals",
+          "[execution_event_bus][2f][2409]") {
+    ExecutionEventBus bus;
+    auto sub = bus.subscribe("exec-stable", [](const ExecutionEvent&) {});
+    bus.publish("exec-stable", "execution-completed", "{}", /*is_terminal=*/true);  // id 1
+    bus.publish("exec-stable", "execution-completed", "{}", /*is_terminal=*/true);  // id 2 (dup)
+    auto p = visit(bus, "exec-stable", sub, /*claim=*/false);
+    CHECK(p.verdict == TV::kTerminalBuffered);
+    REQUIRE(p.had_ev);
+    CHECK(p.ev_id == 1);  // still the first terminal, not the duplicate
+}
+
+TEST_CASE("visit_terminal - kTerminalKnownLost when the marker aged out of the buffer",
+          "[execution_event_bus][2f][2409]") {
+    ExecutionEventBus bus;
+    auto sub = bus.subscribe("exec-lost", [](const ExecutionEvent&) {});
+    bus.publish("exec-lost", "execution-completed",
+                R"({"status":"succeeded"})", /*is_terminal=*/true);  // id 1
+    // Flood past kBufferCap (1000) so the terminal (and every completed event) is
+    // evicted FIFO; the channel stays flagged terminal.
+    for (int i = 0; i < static_cast<int>(ExecutionEventBus::kBufferCap) + 50; ++i) {
+        bus.publish("exec-lost", "execution-progress", "{}");
+    }
+    auto p = visit(bus, "exec-lost", sub, /*claim=*/false);
+    CHECK(p.verdict == TV::kTerminalKnownLost);
+    CHECK_FALSE(p.had_ev);  // benign: caller maps this to a success-shaped fallback
+}
+
+TEST_CASE("visit_terminal - a completed buffered AFTER the marker aged out is NOT recovered (#2409 UP-1)",
+          "[execution_event_bus][2f][2409]") {
+    // The marker (terminal-progress at id 1) is evicted; a LATER execution-completed
+    // is still buffered. We deliberately do NOT recover it: a completed present after
+    // the marker evicted is more likely a spurious later terminal (e.g. a
+    // mark_cancelled on the same id) than the real one, and building a final from it
+    // would emit a WRONG result. The verdict is kTerminalKnownLost -> the caller's
+    // safe success-shaped fallback ("fetch by execution_id").
+    ExecutionEventBus bus;
+    auto sub = bus.subscribe("exec-norecover", [](const ExecutionEvent&) {});
+    bus.publish("exec-norecover", "execution-progress", "{}", /*is_terminal=*/true);  // id 1 (marker)
+    for (int i = 0; i < static_cast<int>(ExecutionEventBus::kBufferCap) - 1; ++i) {
+        bus.publish("exec-norecover", "execution-progress", "{}");
+    }
+    // Publishing this completed pushes the marker (id 1) out of the 1000-cap ring.
+    bus.publish("exec-norecover", "execution-completed", R"({"status":"cancelled"})",
+                /*is_terminal=*/true);
+    auto p = visit(bus, "exec-norecover", sub, /*claim=*/false);
+    CHECK(p.verdict == TV::kTerminalKnownLost);  // NOT recovered as buffered
+    CHECK_FALSE(p.had_ev);
+}
+
+TEST_CASE("visit_terminal - erases the listener ONLY on a committed claim",
+          "[execution_event_bus][2f][2409]") {
+    ExecutionEventBus bus;
+    SECTION("defer (f returns false) keeps the listener") {
+        auto sub = bus.subscribe("exec-keep", [](const ExecutionEvent&) {});
+        bus.publish("exec-keep", "execution-completed", "{}", /*is_terminal=*/true);
+        auto p = visit(bus, "exec-keep", sub, /*claim=*/false);
+        CHECK(p.f_ran);
+        CHECK(bus.subscriber_count("exec-keep") == 1);
+    }
+    SECTION("claim (f returns true) erases the listener") {
+        auto sub = bus.subscribe("exec-erase", [](const ExecutionEvent&) {});
+        bus.publish("exec-erase", "execution-completed", "{}", /*is_terminal=*/true);
+        auto p = visit(bus, "exec-erase", sub, /*claim=*/true);
+        CHECK(p.f_ran);
+        CHECK(bus.subscriber_count("exec-erase") == 0);
+    }
+}
+
+TEST_CASE("visit_terminal - fails closed on an absent channel, runs f on a stale sub",
+          "[execution_event_bus][2f][2409]") {
+    ExecutionEventBus bus;
+    SECTION("absent channel: f NOT run, status kAbsentChannel (never kNeverTerminal)") {
+        bool ran = false;
+        auto st = bus.unsubscribe_and_visit_terminal(
+            "exec-none", 1, [&](TV, const ExecutionEvent*) noexcept {
+                ran = true;
+                return false;
+            });
+        CHECK(st == VS::kAbsentChannel);
+        CHECK_FALSE(ran);
+    }
+    SECTION("stale sub on a live channel: f STILL runs, status kStaleSub") {
+        auto sub = bus.subscribe("exec-live", [](const ExecutionEvent&) {});
+        bus.unsubscribe("exec-live", sub);  // token now stale
+        bus.publish("exec-live", "execution-completed", "{}", /*is_terminal=*/true);
+        auto p = visit(bus, "exec-live", sub, /*claim=*/false);
+        CHECK(p.status == VS::kStaleSub);
+        CHECK(p.f_ran);  // the barrier still holds; f's record-state checks make it idempotent
+        CHECK(p.verdict == TV::kTerminalBuffered);
+    }
+}

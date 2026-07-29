@@ -574,16 +574,19 @@ confirming no ticket was created or consumed. Two strictness notes: `integer`
 parameters must be JSON integers (an integral float like `1.0` is rejected),
 and `maxLength` limits are byte counts.
 
-`execute_instruction` goes further: it enforces its published `maxLength` /
-`maxItems` bounds **in the handler, on every tier** — including `operator`,
-which executes with no approval gate and was therefore previously bounded by
-nothing (#2437). A violation answers `-32602`, is audited as
-`mcp.execute_instruction|denied` with detail `input bound exceeded: <reason>`
-carrying the same `correlation_id` as the error you receive, and increments
-`yuzu_mcp_tool_args_too_large_total{tool,reason}`. Two of its bounds — at most 32 `params` keys, and each key at most 256 bytes —
-cannot be expressed in the published schema subset, so they are not visible in
-`tools/list`. They are checked **before any approval ticket is minted
-or consumed**, so violating one never costs you a ticket.
+Targeting arguments are **type-checked and never coerced**, and an empty target
+set is an error rather than a widening:
+
+- a non-string entry in `agent_ids`, or a non-string `scope`, is rejected;
+- a **supplied but empty** `agent_ids` (now `minItems: 1` in the published
+  schema) or an empty `scope` string is rejected.
+
+Omitting both is still the documented way to target every agent. The reason
+for the strictness: entries the server could not use were previously dropped,
+and a target set that emptied out fell through to the "nothing specified"
+default — which means the whole fleet. So a client whose device filter matched
+nothing, or which emitted numeric ids, could dispatch fleet-wide and be told it
+succeeded. You now get `-32602` instead.
 
 **Examples of key parameters:**
 
@@ -1041,6 +1044,35 @@ The real result was never lost - only its *streamed* copy was dropped.
 (`get_execution_status` / `query_responses`). This code cannot occur for
 `execute_instruction` progress in the current release (the parked-result path activates
 with the later SSE-on-`POST` rung); it is documented here for forward compatibility.
+
+### A streamed final can be dropped entirely
+
+**Symptom**: A parked streamed request produces **no terminal frame and no close
+frame** - the stream simply goes quiet.
+
+**Cause**: Under allocation failure the server can fail to build or publish the terminal
+frame at all. When that happens it deliberately does **not** poison the stream (poisoning
+is reserved for a double publish failure and 410s every later attach on that session), so
+there is nothing for the client to observe. The server records the outcome honestly in its
+own audit log and metrics, but it has no way to tell the client.
+
+**Fix**: Never wait indefinitely on a streamed terminal. Always keep a client-side
+timeout and the `execution_id` you were given at dispatch, and fall back to
+`get_execution_status` / `query_responses` when the timeout fires. That fallback is the
+supported recovery path for every streamed-result failure mode on this surface, not just
+this one.
+
+Like the `-32014` case above, this cannot occur for `execute_instruction` progress in the
+current release - the parked-result path it arises from activates with the later
+SSE-on-`POST` rung. It is documented here for forward compatibility.
+
+**A related case**: if the failure happens while the server is publishing rather than
+building the frame, the session may additionally be left *poisoned* - every later attach
+returns 410 and the client must re-initialize rather than resume. A currently-connected
+stream may not even receive a close frame in that case, so it will sit heart-beating
+until your own timeout fires. The server records the poison state in its own audit trail,
+but nothing tells the client, so the same timeout-plus-`execution_id` recovery applies -
+and a 410 on a subsequent attach means re-initialize, not retry.
 
 ### -32004: MCP tier does not allow this operation
 

@@ -130,7 +130,7 @@ so the push hits BuildKit's own solver cache and rebuilds nothing.
 
 | Runner | Host | Jobs |
 |---|---|---|
-| `yuzu-bigtam-linux-{0..3}` | Big Tam Threadripper 9970X, native Ubuntu **26.04** (gcc-15/clang-21) | **all self-hosted Linux** (shared label `yuzu-bigtam-linux`): ci.yml `linux` matrix, `proto-compat`, sanitizer-tests (asan/tsan), nightly (asan/tsan/coverage), codeql Linux leg, **release.yml** (build-linux, build-gateway, docker-publish\*), cache-prune-linux. 4 runners on one host. |
+| `yuzu-bigtam-linux-{0..3}` | Big Tam Threadripper 9970X, native Ubuntu **26.04** (gcc-15/clang-21) — 4 L3/CCD-pinned runners (`0-7,32-39`; `8-15,40-47`; `16-23,48-55`; `24-31,56-63`), Ninja capped at `-j16` | **all self-hosted Linux** (shared label `yuzu-bigtam-linux`): ci.yml `linux` matrix, `proto-compat`, sanitizer-tests (asan/tsan), nightly (asan/tsan/coverage), codeql Linux leg, **release.yml** (build-linux, build-gateway, docker-publish\*), cache-prune-linux. 4 runners on one host. Provisioned from [`deploy/linux/`](../deploy/linux/README.md). |
 | `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, nightly `windows-asan`, codeql Windows leg, release `build-windows`, instructions-windows-validate, cache-prune-windows. Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
 | `macos-15` | GitHub-hosted | macos matrix |
 
@@ -165,6 +165,15 @@ runs 4 runners on one host, so every apt step is `flock`-serialized on
 (`scripts/ci/ensure-postgres.sh`), and meson is installed per-job via
 `pip --user` (it is not a host default). Full history + per-file detail:
 **`docs/ci-ubuntu-2604-cutover.md`**.
+
+Each Big Tam runner is bounded to one kernel-reported L3 domain via a systemd
+drop-in (`CPUAffinity` plus cgroup `AllowedCPUs`) and exports
+`YUZU_BUILD_JOBS=16`. Linux's SMT numbering is split: L3 0 is
+`0-7,32-39`, not the contiguous Windows `0-15`. CI passes that cap explicitly
+to `meson compile -j`; a process affinity mask does not make Ninja's default
+processor detection affinity-aware, while `-j16` alone is not an L3 pin. The
+versioned source and verification commands are in
+[`deploy/linux/`](../deploy/linux/README.md).
 
 ### Build speed (Big Tam)
 
@@ -276,15 +285,29 @@ the `push:` trigger keeps its docs `paths-ignore`.
 
 ## Postgres for server tests (`YUZU_TEST_POSTGRES_DSN`)
 
-ADR-0006 decision 8: every tier that runs server tests gets a real
-PostgreSQL and exports `YUZU_TEST_POSTGRES_DSN`. The shipped substrate is
-**PostgreSQL 18** (`deploy/docker/Dockerfile.postgres`), and the Linux/docker
-+ GHA-macOS legs test against it; the server SQL is version-agnostic (13+), so
-a runner-native cluster on an older major still exercises the suites
-correctly. One script implements it everywhere —
-`scripts/ci/ensure-postgres.sh`, inserted as an `Ensure Postgres (server
-tests)` step between Build and Test in ci.yml (linux / windows / macos) and
-nightly.yml (asan / tsan / coverage).
+ADR-0006 decision 8: every tier that runs the server **`[pg]`** suite gets a
+real PostgreSQL and exports `YUZU_TEST_POSTGRES_DSN`. The shipped substrate is
+**PostgreSQL 18** (`deploy/docker/Dockerfile.postgres`), and the Linux/docker +
+Windows legs test against it; the server SQL is version-agnostic (13+), so a
+runner-native cluster on an older major still exercises the suites correctly.
+One script implements it everywhere — `scripts/ci/ensure-postgres.sh`, inserted
+as an `Ensure Postgres (server tests)` step between Build and Test in ci.yml
+(linux / windows) and nightly.yml (asan / tsan / coverage).
+
+**macOS does NOT run the server `[pg]` suite (ADR-0035; #2394).** The Yuzu
+server is a Linux-only component (macOS/Windows are agent-only platforms), and
+GHA-hosted macos-15 runs a *single* brew Postgres cluster. After the
+auth→Postgres migration (ADR-0006) roughly doubled the `[pg]` population to
+~660 clone-bound cases (`CREATE DATABASE … TEMPLATE` + `DROP … FORCE` per
+case), one slow cluster cannot service that within the per-suite meson budget,
+and sharding does not help — parallel shards contend on the one cluster (both
+hit their timeout). So the macOS leg deliberately **does not provision Postgres
+/ export the DSN**: every `[pg]` server test then SKIPS (env-unset → skip, the
+same contract the Catch2 PG fixtures use), completing in milliseconds, while
+the non-PG server suite (`~[pg]`), the agent suite, and the Apple-Clang compile
+still run. Linux + Windows keep full `[pg]` coverage. Re-enabling it requires
+first solving the single-cluster capacity problem (per-shard clusters or a
+cheaper per-test isolation model than database-per-test).
 Resolution order inside the script:
 
 1. **Pre-set `YUZU_TEST_POSTGRES_DSN`** (runner-level env) — the escape
@@ -378,11 +401,16 @@ Big Tam cutover the legacy shared `yuzu-ci-postgres` container on
 `:15432` is unused there and can be `docker rm -f`'d.
 
 **Test-database lifecycle (PR #2091).** Ephemeral per-case databases
-(`yuzu_test_<epoch>_<salt>_<n>`, created/dropped by `PostgresTestDb`)
-coexist with per-process **template** databases
+(`yuzu_test_<epoch>_<salt>_<n>`, created/dropped by `PostgresTestDb`) coexist
+with run-lifetime shared clones (one clone and persistent pool for each
+instantiated eligible high-volume test file) and per-process **template** databases
 (`yuzu_test_tpl_<epoch>_<salt>_<key>`, built once by `PgTestTemplate` and
-dropped at `testRunEnded`) — during a run, each of a box's 4 runner agents
-legitimately holds up to ~a dozen template databases. A pile-up is NOT
+dropped at `testRunEnded`). At run end the listener invokes one ordered shared
+cleanup primitive: it drains every persistent pool first, drops those clones,
+then drops the templates, all before libpq/OpenSSL teardown. The active footprint
+is therefore the per-case databases currently in flight, one clone per
+instantiated shared-fixture file, and up to ~a dozen templates for each of the
+box's 4 runner agents. A pile-up is NOT
 automatically "teardown is failing": names embed their creation epoch, and
 every suite start sweeps names older than 6 h (`kTestDbStaleAfterSeconds`),
 so leaks from killed runs self-heal within that window; the sweep prints a
@@ -478,12 +506,17 @@ junit reporter, since meson's junit is only suite-level — then:
   **fails** (a regression *inside* a flaky test is caught too).
 
 `tests/known-flaky.json` is the static, in-repo, PR-curated source of truth —
-one entry per case with `platforms` (OS-scoped; `["all"]` = cross-platform and
-**must** carry an `issue`), `reason`, and `added`. Cross-platform flakes emit a
-loud `::warning` (they signal a genuinely nondeterministic test, not an env
-quirk); OS-scoped ones a `::notice`. Entries older than 90 days get a soft
-`::warning` nag (never a hard fail). The wrapper validates the list up front and
-fails fast on a malformed one.
+one entry per case with `platforms` (OS-scoped; `["all"]` = cross-platform),
+`reason`, tracking `issue`, accountable `owner`, and ISO-8601 `added` and
+`expires` dates. Every field is required for every entry, including entries for
+another OS. An entry expires at the end of its stated date; an expired or
+malformed list fails before `meson test` starts, so stale exemptions cannot
+silently mask a red build. Cross-platform flakes emit a loud `::warning` (they
+signal a genuinely nondeterministic test, not an env quirk); OS-scoped ones a
+`::notice`. Entries older than 90 days still get a soft `::warning` before their
+hard expiry. Case names and platform values are unique, and `all` cannot be
+combined with an OS. Expiry uses the UTC calendar date; the validator's clock is
+injectable for hermetic tests.
 
 The job summary + annotations remain the immediate signal. In addition,
 `flake-retry.py` writes `meson-logs/flake-retry.json`; the job finalizer imports
@@ -491,6 +524,21 @@ recovered listed cases into the runner's `ci_flake_events` table alongside the
 suite timings. `tests/known-flaky.json` remains the reviewed source of truth —
 the database is observation history, never an implicit allowlist. This is
 reversible test tooling — no ADR (rationale in the wrapper header).
+
+**Triage note — shared-fixture files fail as a cluster on a PG blip.** The
+shared-DB + TRUNCATE fixture files (#2362, #2603: `test_software_inventory_store`,
+`test_software_licensing_*`, `test_product_registry_store`,
+`test_rest_access_review`, `test_engine_principal_{lifecycle,integration}`, and
+later conversions) hold one clone + one pool for the whole file. A Postgres
+blip mid-file therefore reds out *several unrelated-looking CRUD cases in one
+file* — and flake-retry's isolated re-run (fresh process, fresh clone) will
+often recover them, so the incident can masquerade as N independent "recovered
+known flakes". Before treating such a cluster as N regressions (or adding them
+to `known-flaky.json`), grep the junit failure text for
+`PGRES_COMMAND_OK`, `REQUIRE( lease )`, `is_open()`, or the bundle/reset tags
+(`[ApiTokenStorePgShared]`, `[AuthDbPgShared]`, `[EpLcShared]`,
+`[EpIntegShared]`, `[AccRevShared]`, `acc_rev_reset`) — a cluster of those in
+one file is one PG-instance event, not a test bug.
 
 ## Workflow-PR canary
 

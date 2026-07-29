@@ -46,7 +46,7 @@ struct TestTarDb {
 };
 
 static TestTarDb make_test_db() {
-    auto tmp = yuzu::test::unique_temp_path("tar_");
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_");
     auto result = TarDatabase::open(tmp);
     REQUIRE(result.has_value());
     return TestTarDb{std::move(*result), tmp};
@@ -1215,7 +1215,7 @@ TEST_CASE("TarDatabase: missing warehouse tables are re-created on reopen (upgra
     // tar.db — inserts then failed every 30 s. The fix runs the idempotent
     // IF-NOT-EXISTS DDL on EVERY open. Simulate the upgrade by dropping a
     // "new" table from a closed v3 DB, then reopening.
-    auto tmp = yuzu::test::unique_temp_path("tar_upg_");
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_upg_");
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
@@ -1246,6 +1246,153 @@ TEST_CASE("TarDatabase: missing warehouse tables are re-created on reopen (upgra
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
 }
 
+TEST_CASE("TarDatabase: a fresh open creates no tar_events table (#760 UP-8)",
+          "[tar][store][lifecycle][tar-events]") {
+    // is_queryable_table() excludes tar_events specifically so that its "no such
+    // table" error cannot become an existence oracle distinct from the generic
+    // authorizer denial. That reasoning only holds while the table is genuinely
+    // absent, so pin it: kCreateSchema must never create it again. It used to,
+    // and the v3 migration dropped it a few statements later — which left it
+    // PRESENT on any database already at schema_version>=3, since that branch is
+    // then skipped.
+    const char* count_sql = "SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' OR name "
+                            "LIKE 'idx_tar_events%'";
+    auto t = make_test_db();
+    auto q = t.db.execute_query(count_sql);
+    REQUIRE(q.has_value());
+    REQUIRE(q->rows.size() == 1);
+    CHECK(q->rows[0][0] == "0");
+
+    // The case that actually bit: a REOPEN. kCreateSchema runs on every open,
+    // but the v3 DROP is gated on schema_version()==2 — so once a database has
+    // reached v3+, re-running the create resurrected the table with nothing left
+    // to remove it. Every agent restart did this.
+    { TarDatabase discard = std::move(t.db); }
+    auto reopened = TarDatabase::open(t.path);
+    REQUIRE(reopened.has_value());
+    CHECK(reopened->schema_version() == 5);
+    auto q2 = reopened->execute_query(count_sql);
+    REQUIRE(q2.has_value());
+    CHECK(q2->rows[0][0] == "0");
+    t.db = std::move(*reopened); // hand back so TestTarDb's destructor cleans up
+}
+
+TEST_CASE("TarDatabase: a pre-v3 database still has tar_events dropped on open",
+          "[tar][store][lifecycle][tar-events]") {
+    // The other half of the same invariant: field databases created before v3
+    // DO carry the table, and the migration must still retire it. Seed the exact
+    // pre-v3 shape by hand (same technique as the v4 ALTER test below).
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v2_");
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(tmp.string().c_str(), &raw) == SQLITE_OK);
+        const char* seed = R"(
+            CREATE TABLE tar_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
+            INSERT INTO tar_config (key, value) VALUES ('schema_version', '2');
+            CREATE TABLE tar_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL,
+                event_type TEXT NOT NULL, event_action TEXT NOT NULL,
+                detail_json TEXT NOT NULL DEFAULT '{}', snapshot_id INTEGER NOT NULL DEFAULT 0);
+            CREATE INDEX idx_tar_events_ts ON tar_events(timestamp);
+            INSERT INTO tar_events (timestamp, event_type, event_action)
+                VALUES (1000, 'process', 'started');
+        )";
+        REQUIRE(sqlite3_exec(raw, seed, nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 5); // the 2→3→4→5 walk ran
+        auto q =
+            db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' OR "
+                              "name LIKE 'idx_tar_events%'");
+        REQUIRE(q.has_value());
+        CHECK(q->rows[0][0] == "0");
+    }
+
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    fs::remove(fs::path{tmp.string() + "-wal"}, ec);
+    fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+}
+
+TEST_CASE("TarDatabase: schema v5 drops tar_events from an ALREADY-MIGRATED database",
+          "[tar][store][lifecycle][tar-events]") {
+    // The installed-base case, and the reason removing the DDL is not enough on
+    // its own. Every agent in the field reached v3/v4 while kCreateSchema was
+    // still recreating tar_events on each open, so those databases carry it
+    // NOW. The v3 drop is gated on schema_version()==2 and will never fire for
+    // them again — only the v5 bump reaches them. Without it a fresh install and
+    // an upgraded endpoint would hold permanently divergent schemas.
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v5_");
+    {
+        // A v4 database that already carries the resurrected table, exactly as a
+        // pre-fix binary would have left it.
+        auto seeded = TarDatabase::open(tmp);
+        REQUIRE(seeded.has_value());
+        REQUIRE(seeded
+                    ->execute_query("CREATE TABLE tar_events (id INTEGER PRIMARY KEY "
+                                    "AUTOINCREMENT, timestamp INTEGER NOT NULL)")
+                    .has_value());
+        REQUIRE(seeded->execute_query("CREATE INDEX idx_tar_events_ts ON tar_events(timestamp)")
+                    .has_value());
+        REQUIRE(seeded->set_config("schema_version", "4"));
+    }
+
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 5);
+        auto q = db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' "
+                                   "OR name LIKE 'idx_tar_events%'");
+        REQUIRE(q.has_value());
+        CHECK(q->rows[0][0] == "0");
+    }
+
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    fs::remove(fs::path{tmp.string() + "-wal"}, ec);
+    fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+}
+
+TEST_CASE("TarDatabase: create_warehouse_tables joins a transaction the caller already holds",
+          "[tar][store][lifecycle][ddl-batch]") {
+    // exec_ddl_batch wraps the DDL in its own transaction for cost and
+    // atomicity, but create_warehouse_tables() is public and a caller may
+    // already hold one. It must then run the batch unwrapped and JOIN that
+    // transaction rather than failing or nesting, and must leave the
+    // connection's autocommit state undisturbed either way.
+    auto t = make_test_db();
+    auto process_live_tables = [&] {
+        auto r = t.db.execute_query(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_live'");
+        REQUIRE(r.has_value());
+        return r->rows[0][0];
+    };
+
+    // Drop a table so the nested call has real work to do, then roll the
+    // CALLER's transaction back. Had create_warehouse_tables opened and
+    // committed a transaction of its own, the re-created table would SURVIVE
+    // that rollback; joining the caller's transaction means it must not. This is
+    // what makes the test discriminating rather than merely green.
+    REQUIRE(t.db.execute_query("DROP TABLE process_live").has_value());
+    REQUIRE(process_live_tables() == "0");
+
+    REQUIRE(t.db.execute_sql("BEGIN IMMEDIATE"));
+    CHECK(t.db.create_warehouse_tables());
+    CHECK(process_live_tables() == "1"); // recreated inside the caller's txn
+    REQUIRE(t.db.execute_sql("ROLLBACK"));
+    CHECK(process_live_tables() == "0"); // ...and discarded with it
+
+    // The ordinary un-nested path commits on its own and leaves a usable handle.
+    CHECK(t.db.create_warehouse_tables());
+    CHECK(process_live_tables() == "1");
+    auto q = t.db.execute_query("SELECT COUNT(*) FROM process_live");
+    REQUIRE(q.has_value());
+}
+
 TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf tier (upgrade path)",
           "[tar][store][lifecycle][procperf]") {
     // The deployment-critical path the fresh-DB tests never exercise: an
@@ -1253,7 +1400,7 @@ TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf ti
     // schema_version=3, so create_warehouse_tables' IF-NOT-EXISTS leaves them
     // alone and the v4 block's ALTER TABLE ADD COLUMN must run. Seed that exact
     // pre-v4 shape by hand, then open and prove the ALTER fired.
-    auto tmp = yuzu::test::unique_temp_path("tar_v4_");
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v4_");
     {
         sqlite3* raw = nullptr;
         REQUIRE(sqlite3_open(tmp.string().c_str(), &raw) == SQLITE_OK);
@@ -1274,7 +1421,7 @@ TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf ti
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 4); // the v3→v4 walk ran
+        CHECK(db->schema_version() == 5); // the v3→v4→v5 walk ran
 
         // Both tiers now carry `version` (added by the ALTER, not the DDL).
         for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
@@ -1358,7 +1505,7 @@ TEST_CASE("TarDatabase: insert and query dns events (ADR-0015)", "[tar][store][c
 
 TEST_CASE("TarDatabase: a corrupt tar.db is quarantined and re-initialised fresh (#559)",
           "[tar][store][lifecycle][corruption]") {
-    auto tmp = yuzu::test::unique_temp_path("tar_corrupt_");
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_corrupt_");
 
     // 1. Create a real DB and persist a deliberately-paused source. This is the
     //    forensic-preservation state a corrupt read must NOT silently undo.
@@ -1414,7 +1561,7 @@ TEST_CASE("TarDatabase: a second corruption never overwrites the first quarantin
     // that would shred preserved forensic evidence. Drive two corrupt-open
     // cycles back-to-back (same second) and assert TWO distinct `.corrupt-*`
     // files survive.
-    auto tmp = yuzu::test::unique_temp_path("tar_collide_");
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_collide_");
     const std::string prefix = tmp.filename().string() + ".corrupt-";
 
     auto corrupt_then_open = [&]() {
@@ -1454,7 +1601,7 @@ TEST_CASE("TarDatabase: a valid DB opens cleanly with no quarantine and preserve
     // The happy path: integrity_ok returns true, so a previously-written DB is
     // re-opened in place with its data intact and NO `.corrupt-*` sidecar minted
     // (guards against an integrity_ok that wrongly fails every open).
-    auto tmp = yuzu::test::unique_temp_path("tar_valid_");
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_valid_");
     {
         auto opened = TarDatabase::open(tmp);
         REQUIRE(opened.has_value());
@@ -1491,7 +1638,7 @@ TEST_CASE("TarDatabase: a corrupt-and-unmovable tar.db fails closed (#559 primar
         SKIP("root bypasses directory permissions; cannot make the rename fail");
     }
 
-    auto dir = yuzu::test::unique_temp_path("tar_unmovable_");
+    auto dir = yuzu::test::unique_temp_path("yuzu_test_tar_unmovable_");
     REQUIRE(fs::create_directory(dir));
     // RAII: re-add write perms and remove the dir even if an assertion throws,
     // so a read-only temp dir never leaks onto a CI box that reuses workspaces.

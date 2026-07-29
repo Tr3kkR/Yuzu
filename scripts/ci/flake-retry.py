@@ -16,8 +16,9 @@ Outcome contract:
                                                        flaky test still blocks).
   - Every failed case is a listed flake that recovers within --retries -> PASS.
 
-Cross-platform entries (`"platforms": ["all"]`) are still retried but emit a
-loud ::warning (and MUST carry an `issue`); OS-scoped entries emit a ::notice.
+Each entry must carry a tracking `issue`, accountable `owner`, `added` date,
+and expiry date; cross-platform entries (`"platforms": ["all"]`) are still
+retried but emit a loud ::warning, while OS-scoped entries emit a ::notice.
 
 Design was grilled 2026-06-22 (mechanism "C": case-level retry + static in-repo
 list). Visibility is the job summary + annotations; recovered cases are also
@@ -38,13 +39,19 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 CATCH2_EXE = re.compile(r"yuzu_\w+_tests(\.exe)?$", re.IGNORECASE)
-# A positional Catch2 tag-filter spec as used by sharded meson entries (#2092):
-# '[pg]', '~[pg]', '[a][b]', '~[a][b]'. Name specs / comma lists are not used
-# in tests/meson.build (its comment holds that line), so they are not matched.
-CATCH2_TAG_SPEC = re.compile(r"^~?(\[[^\[\]]+\])+$")
+# A positional Catch2 tag-filter spec as used by sharded meson entries (#2092).
+# Grammar: one or more comma-OR'd AND-groups, each group a run of ~?[tag].
+# Examples: '[pg]', '~[pg]', '[a][b]', '~[a][b]', '[pg]~[routes]~[store]'
+# (a single AND-group with mid-spec negations), and '[pg][routes],[pg][store]'
+# (a comma-OR of AND-groups — the auth->PG [pg] rebalance split, #2394). Bare
+# case-name specs still never match (no leading '['), so a case name is never
+# mistaken for a strippable spec — the invariant _cmd_without_test_specs and
+# the isolated retry rely on (a recognised spec is always stripped, so it can
+# never OR with the retried case name).
+CATCH2_TAG_SPEC = re.compile(r"^(~?\[[^\[\]]+\])+(,(~?\[[^\[\]]+\])+)*$")
 VALID_PLATFORMS = {"windows", "linux", "macos", "all"}
 
 
@@ -70,12 +77,27 @@ def summary(md):
 
 
 # ── known-flaky.json ──────────────────────────────────────────────────────────
-def load_known_flaky(path, this_os, stale_days):
+def _parse_flake_date(value, field, where, case):
+    """Return a strict YYYY-MM-DD date or raise a list-validation error."""
+    if not isinstance(value, str):
+        raise ValueError(f"{where} ({case}): missing/invalid '{field}' date")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as ex:
+        raise ValueError(f"{where} ({case}): invalid '{field}' date {value!r}; expected YYYY-MM-DD") from ex
+    if parsed.isoformat() != value:
+        raise ValueError(f"{where} ({case}): invalid '{field}' date {value!r}; expected YYYY-MM-DD")
+    return parsed
+
+
+def load_known_flaky(path, this_os, stale_days, today=None):
     """Parse + validate the list; return {case_name: entry} applicable to this_os.
 
     Fail-fast (raise ValueError) on a malformed list so a structural typo can't
-    silently disable protection. Emit a ::warning for entries older than
-    stale_days (soft nag — never a hard failure).
+    silently disable protection. Every entry names its tracking issue and
+    owner, plus its added and expiry dates. Expired entries are hard failures.
+    `today` is injectable for deterministic tests; production callers omit it.
+    Entries older than stale_days still emit a soft warning before expiry.
     """
     if not os.path.exists(path):
         return {}
@@ -87,7 +109,11 @@ def load_known_flaky(path, this_os, stale_days):
         raise ValueError(f"{path}: top level must be a JSON array")
 
     applicable = {}
-    today = date.today()
+    seen_cases = set()
+    if today is None:
+        today = datetime.now(timezone.utc).date()
+    if not isinstance(today, date):
+        raise TypeError("today must be a datetime.date")
     for i, e in enumerate(data):
         where = f"{path}[{i}]"
         if not isinstance(e, dict):
@@ -98,20 +124,28 @@ def load_known_flaky(path, this_os, stale_days):
             raise ValueError(f"{where}: missing/empty 'case'")
         if not isinstance(plats, list) or not plats or any(p not in VALID_PLATFORMS for p in plats):
             raise ValueError(f"{where} ({case}): 'platforms' must be a non-empty subset of {sorted(VALID_PLATFORMS)}")
-        if not e.get("reason"):
-            raise ValueError(f"{where} ({case}): missing 'reason'")
+        if len(set(plats)) != len(plats) or ("all" in plats and len(plats) != 1):
+            raise ValueError(f"{where} ({case}): 'platforms' must be unique and 'all' must stand alone")
+        if case in seen_cases:
+            raise ValueError(f"{where} ({case}): duplicate 'case' entry")
+        seen_cases.add(case)
+        for field in ("reason", "issue", "owner"):
+            value = e.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{where} ({case}): missing/empty '{field}'")
+        added = _parse_flake_date(e.get("added"), "added", where, case)
+        expires = _parse_flake_date(e.get("expires"), "expires", where, case)
+        if expires < added:
+            raise ValueError(f"{where} ({case}): 'expires' precedes 'added'")
+        if added > today:
+            raise ValueError(f"{where} ({case}): 'added' date is in the future ({added.isoformat()})")
+        if expires < today:
+            raise ValueError(f"{where} ({case}): expired on {expires.isoformat()}")
         cross_platform = "all" in plats
-        if cross_platform and not e.get("issue"):
-            raise ValueError(f"{where} ({case}): cross-platform ('all') entries must carry an 'issue'")
         # Soft staleness nag (by added-date age).
-        added = e.get("added")
-        if isinstance(added, str):
-            try:
-                age = (today - datetime.strptime(added, "%Y-%m-%d").date()).days
-                if age > stale_days:
-                    gh("warning", f"known-flaky entry is {age}d old (>{stale_days}) — re-evaluate or fix: {case}")
-            except ValueError:
-                gh("warning", f"known-flaky entry has unparseable 'added' ({added!r}): {case}")
+        age = (today - added).days
+        if age > stale_days:
+            gh("warning", f"known-flaky entry is {age}d old (>{stale_days}) — re-evaluate or fix: {case}")
         if cross_platform or this_os in plats:
             applicable[case] = e
     return applicable
@@ -455,36 +489,86 @@ def _selftest():
         if not cond:
             failures.append(label)
 
-    # OS-scoping + cross-platform validation via a temp list file.
+    # OS-scoping + metadata/date validation via a temp list file. `today` is
+    # explicit so expiry checks are deterministic rather than calendar-dependent.
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "kf.json")
+        today = date(2026, 7, 1)
+        valid = {
+            "case": "Win Only",
+            "platforms": ["windows"],
+            "reason": "r",
+            "issue": "#1",
+            "owner": "ci",
+            "added": "2026-06-01",
+            "expires": "2026-07-31",
+        }
         with open(p, "w") as f:
             json.dump([
-                {"case": "Win Only", "platforms": ["windows"], "reason": "r"},
-                {"case": "Everywhere", "platforms": ["all"], "reason": "r", "issue": "#1"},
+                valid,
+                {**valid, "case": "Everywhere", "platforms": ["all"]},
             ], f)
-        win = load_known_flaky(p, "windows", 90)
-        lin = load_known_flaky(p, "linux", 90)
+        win = load_known_flaky(p, "windows", 90, today=today)
+        lin = load_known_flaky(p, "linux", 90, today=today)
         check("Win Only" in win and "Everywhere" in win, "windows sees both")
         check("Win Only" not in lin and "Everywhere" in lin, "linux sees only cross-platform")
 
-        # cross-platform without issue must fail-fast.
-        with open(p, "w") as f:
-            json.dump([{"case": "X", "platforms": ["all"], "reason": "r"}], f)
-        try:
-            load_known_flaky(p, "linux", 90)
-            check(False, "missing-issue cross-platform should raise")
-        except ValueError:
-            pass
+        # Every accountability/date field is mandatory, including for an OS
+        # that does not apply to this run: malformed entries never hide there.
+        for field in ("reason", "issue", "owner", "added", "expires"):
+            malformed = dict(valid)
+            del malformed[field]
+            malformed["platforms"] = ["windows"]
+            with open(p, "w") as f:
+                json.dump([malformed], f)
+            try:
+                load_known_flaky(p, "linux", 90, today=today)
+                check(False, f"missing-{field} should raise")
+            except ValueError:
+                pass
 
-        # malformed (missing reason) must fail-fast.
+        for field in ("added", "expires"):
+            malformed = dict(valid)
+            malformed[field] = "2026-7-1"
+            with open(p, "w") as f:
+                json.dump([malformed], f)
+            try:
+                load_known_flaky(p, "windows", 90, today=today)
+                check(False, f"non-ISO-{field} should raise")
+            except ValueError:
+                pass
+
+        for label, malformed_entries in (
+            ("duplicate case", [valid, dict(valid)]),
+            ("ambiguous all platform", [{**valid, "platforms": ["all", "windows"]}]),
+            ("duplicate platform", [{**valid, "platforms": ["windows", "windows"]}]),
+        ):
+            with open(p, "w") as f:
+                json.dump(malformed_entries, f)
+            try:
+                load_known_flaky(p, "windows", 90, today=today)
+                check(False, f"{label} should raise")
+            except ValueError:
+                pass
+
+        for label, malformed in (
+            ("expiry before added", {**valid, "expires": "2026-05-31"}),
+            ("expired entry", {**valid, "expires": "2026-06-30"}),
+            ("future added date", {**valid, "added": "2026-07-02"}),
+        ):
+            with open(p, "w") as f:
+                json.dump([malformed], f)
+            try:
+                load_known_flaky(p, "windows", 90, today=today)
+                check(False, f"{label} should raise")
+            except ValueError:
+                pass
+
+        # The expiry date remains valid through that calendar day.
         with open(p, "w") as f:
-            json.dump([{"case": "X", "platforms": ["windows"]}], f)
-        try:
-            load_known_flaky(p, "windows", 90)
-            check(False, "missing-reason should raise")
-        except ValueError:
-            pass
+            json.dump([{**valid, "expires": "2026-07-01"}], f)
+        check("Win Only" in load_known_flaky(p, "windows", 90, today=today),
+              "entry is valid on its expiry date")
 
     # junit parsing.
     with tempfile.TemporaryDirectory() as d:
@@ -597,6 +681,13 @@ def _selftest():
     check(_cmd_without_test_specs(["~[pg]", "[pg]"]) == ["~[pg]"],
           "argv[0] untouched even when spec-shaped")
     check(_cmd_without_test_specs(["x", "~[a][b]"]) == ["x"], "strips tilde compound spec")
+    check(_cmd_without_test_specs(["x", "[pg]~[routes]~[store]~[token]"]) == ["x"],
+          "strips mid-spec-negation shard filter (#2394)")
+    check(_cmd_without_test_specs(["x", "[pg][routes],[pg][store],[pg][token]"]) == ["x"],
+          "strips comma-OR shard filter (#2394)")
+    check(_cmd_without_test_specs(["x", "a normal, prose case name"])
+          == ["x", "a normal, prose case name"],
+          "prose case name with a comma is NOT a spec (kept)")
     check(_cmd_without_test_specs(["x", "[.]"]) == ["x"], "strips hidden-tag spec")
     check(_cmd_without_test_specs(["x", ""]) == ["x", ""], "empty arg kept (not a spec)")
 
@@ -616,7 +707,7 @@ def _selftest():
     # or the guard fails loudly instead of silently inspecting half the
     # surface.
     _entries = re.findall(r"test\(\s*'[^']*',\s*server_test_exe\b(.*?)\)", _src, re.S)
-    check(len(_entries) >= 2, "meson.build: both server shard entries located")
+    check(len(_entries) >= 4, "meson.build: all four server shard entries located")
     _shard_specs = []
     for _body in _entries:
         # Quote-aware list match: a naive [(.*?)] truncates at the tag spec's
@@ -632,11 +723,18 @@ def _selftest():
             check(CATCH2_TAG_SPEC.match(_arg) is not None,
                   f"meson.build server test arg {_arg!r} is not a tag-filter spec")
         _shard_specs.append(tuple(_args))
-    # Positive pin so hollow extraction can never pass again: the two shard
-    # filters must come back verbatim. A third shard or a rebalance updates
-    # this line consciously.
-    check(("~[pg]",) in _shard_specs and ("[pg]",) in _shard_specs,
-          "meson.build: both shard tag filters extracted verbatim")
+    # Positive pin so hollow extraction can never pass again: the shard filters
+    # must come back verbatim. A shard add or rebalance updates this line
+    # consciously. #2394 split the single '[pg]' entry into two balanced halves
+    # (the auth->PG cutover ~doubled the [pg] population). #2395 then split the
+    # non-PG '~[pg]' entry the same way, after it reached 603/600s (101%) on
+    # Windows; the partition is [auth]+[mcp] vs the rest, balanced by measured
+    # time rather than case count ([auth] alone is ~40% of the non-PG runtime).
+    check(("~[pg][auth],~[pg][mcp]",) in _shard_specs
+          and ("~[pg]~[auth]~[mcp]",) in _shard_specs
+          and ("[pg][routes],[pg][store],[pg][token]",) in _shard_specs
+          and ("[pg]~[routes]~[store]~[token]",) in _shard_specs,
+          "meson.build: all four shard tag filters extracted verbatim")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")
