@@ -233,67 +233,86 @@ retained and strengthened here.
 
 ## 8. Severity derivation (follow-up, PR #2623)
 
-§3.1 calibrated the merge **threshold** — GATING / SHOULD / NICE, with native labels
-mapping onto it. That fixed the gate and left the bands undefined. CRITICAL and HIGH
-both map to GATING with no criterion separating them; LOW and INFO both map to NICE.
-Exactly one clause in the shipped block is falsifiable — *"you must be able to name the
-failing input or state"* — and the rest are adjectives: "misleading operator guidance",
-"bounded blast radius", "everything else".
+§3.1 calibrated the merge **threshold** — one gating tier, with native labels mapping onto
+it. That fixed the gate and left the bands undefined: CRITICAL and HIGH both mapped to the
+gating tier with no criterion separating them, LOW and INFO both to the bottom tier.
+Exactly one clause was falsifiable — *"you must be able to name the failing input or
+state"* — and the rest were adjectives.
 
-That matters because the pipeline both **records** the native band (`severity_native` in
-the ledger) and **acts** on it (CLAUDE.md: "CRITICAL/HIGH are blocking, MEDIUM should be
-fixed, LOW addressed"). It is also the input FortitudeEtc's deferred triage design assumes
-— his table keys on *"the reviewer's own severity, exactly as today"*, and his own text
-says #2604's shared severity definitions are what make that mapping reliable rather than
-reconstructed per run.
+It matters because the pipeline both **records** the native band (`severity_native`) and
+**acts** on it, and because FortitudeEtc's deferred triage design keys on *"the reviewer's
+own severity, exactly as today"*, naming §3.1 as what makes that mapping reliable.
 
-### The change
+### The model
 
-Severity becomes a **function of three stated facts** rather than a label a reviewer
-picks: a TRIGGER, a CONSEQUENCE from a closed list of seven, and a REACHABILITY from a
-closed list of six. Consequence gives a base band; reachability modifies it; `BLOCKING`
-is defined as a derived band of CRITICAL or HIGH. The three facts are recorded in the
-ledger next to `severity_native`.
+Four **independent** fields per finding — TRIGGER, IMPACT (`I1`–`I9`, base band), EXPOSURE
+(**all** applicable `E1`–`E6`, strongest modifier wins), EPISTEMIC STATUS — plus a separate
+set of **policy floors** that gate as contract violations without running through the
+derivation. `BLOCKING` = derived band CRITICAL or HIGH.
 
-Three decisions worth arguing rather than assuming:
+### What the first draft got wrong, and why it is recorded here
 
-- **`R4` (non-default configuration) is not a downgrade.** In Yuzu the default is
-  frequently the *less* hardened setting — RBAC off is the default, `--auth-mode=sso-only`
-  is opt-in — so "only with the flag on" often means "only for the customers who care
-  most". Importing a CVSS-shaped assumption here would invert the intended posture.
-- **`C4` folds "absent" in with "misleading".** A shipped behaviour change documented
-  nowhere is a truth finding, not a wording one. This resolves the unclassified
-  missing-doc case (#2620) inside the severity rule rather than beside it.
-- **Two absences point in opposite directions on purpose.** An unnameable trigger is
-  the *reviewer's* evidence failing, so it is not gating. An unmappable vocabulary is the
-  *schema* failing, so it gates. They look contradictory sitting next to each other and
-  are not.
+The first cut of this PR used a single-choice `CONSEQUENCE` + `REACHABILITY` pair. Two
+independent adversarial reviews (Fable, Sol, both at maximum effort) returned BLOCK, and
+between them established that the shape — not the wording — was the defect:
 
-### What makes it testable, and what does not
+- **A single reachability enum forced four independent dimensions into one choice** — actor
+  privilege, configuration, rarity, production liveness. A race-based authorisation escape
+  under a non-default flag truthfully satisfied three values that derived different bands.
+  Severity was still being chosen, just with more ceremony. Hence independent fields and
+  "list all that apply".
+- **`R6` said "floor at LOW" where a cap was meant** — mechanically it *raised* an
+  unreachable INFO to LOW and left a dead-code HIGH gating. Both reviewers also found that
+  the obvious one-word fix was wrong too: "no production caller" is not "no production
+  consequence". That distinction is now `I6` (shipped-incomplete) versus `E6` (the wrong
+  outcome provably cannot occur).
+- **The closed list was not closed.** Four classes the pipeline blocks on today derived to
+  INFO: Resource Ledger omission, a direct `CHANGELOG.md` edit, a broken platform build
+  leg, and a missing test. They have no production trigger and no wrong outcome, so an
+  honest derivation floors them. They are contract violations, and are now policy floors.
+- **The unknown-exposure default was inverted** against this document's own stated
+  principle. Defaulting to "no change" silently downgrades a possible `E1`. Unresolved
+  exposure now gates pending adjudication.
+- **Weak evidence was being expressed as low impact**, which meant recording something
+  false — observed corruption with an unisolated trigger became "no observable
+  consequence". Confidence is now its own field. (`happy-path.md` already carried an
+  `epistemic_status`; this aligns with it rather than inventing it.)
 
-No prose makes an LLM's severity assignment deterministic, and this does not claim to.
-What the three fields buy is **auditability**: a wrong band becomes a visible mismatch
-between the stated facts and the assigned label, checkable after the fact. Today a wrong
-band is indistinguishable from a right one because nothing is stated.
+### Calibration against the corpus
 
-The validation step, not yet built: a calibration corpus of findings whose bands the team
-already agrees on — #2202's four HIGH auth findings, #2580's nine BLOCKING plus the three
-Gate 8 fix-round defects, #222's UP-11 round, #2360's clock-guard rounds. The rule is
-validated iff applying it reproduces the agreed bands.
+Applied to findings whose bands the team already agreed on. Six of eight reproduce:
 
-**One result to expect, flagged rather than absorbed:** this table appears to promote
-parts of #2202 from HIGH to CRITICAL (`C1` security-control bypass + `R2` lower-privilege
-actor). Either the table is too aggressive or those findings were under-labelled. That
-disagreement is the useful output and should be argued.
+| finding | derives | historical | |
+|---|---|---|---|
+| #2202 B2 — namespace scan boots clean on corrupt `rbac.db` | I1 + E5 → HIGH | HIGH | match |
+| #2202 B3 — engine actions stamped `principal_class=agent` | I1 + E3 → HIGH | HIGH | match |
+| #2202 B4 — RBAC resolver with no production grant author | I6→HIGH + E3 | HIGH | match (via the I6 escalator) |
+| #2580 — `pg_locks` runbook terminates another tenant's backend | I4 + E3 → HIGH | BLOCKING | match |
+| #2580 — parity test cannot observe the field it asserts on | I3 + E3 → HIGH | BLOCKING | match |
+| #2580 — `std::jthread` breaks the macOS leg | policy floor | BLOCKING | match |
+| #2202 B1 — engine credential gains fleet-wide Read, RBAC off | I1 + E2 → **CRITICAL** | HIGH | **promotion, gate-neutral** |
+| #2580 — 15s sampler unbatched full-column scan | I5 + E3 → **MEDIUM** | BLOCKING | **demotion, GATE-CHANGING** |
 
-### Open for the team
+**Both mismatches are left in rather than tuned away.** Fitting the table to the corpus
+after seeing it would be overfitting, and the disagreements are the useful output:
 
-1. Is `C4` at base HIGH right? It makes a wrong runbook line gate. The #2580 `pg_locks`
-   case says yes — the shipped runbook walked a DBA toward terminating another tenant's
-   backend. A stale flag name in a doc says no. The trigger requirement may already be
-   doing that work.
-2. Should `R5` (race / rare condition) raise rather than hold? The worst recent defects —
-   the clock-guard family, the swallowed anomaly — are all `R5`.
-3. Does CRITICAL earn its existence? It is reachable only via `C1`/`C2` + `R1`/`R2`, and
-   the gate is identical to HIGH. Fine if it is reporting signal rather than control flow,
-   but worth saying out loud.
+1. **#2202 B1.** A credential holding zero grants reads the whole fleet in the default
+   configuration. Fable holds the promotion survives on merit and the historical HIGH was
+   under-banded; Sol holds that read-only privilege expansion is not admin/RCE and HIGH was
+   right. Gate-identical either way, so this is reporting signal, not merge control — but
+   the team should decide, because it sets whether every cross-scope read is CRITICAL.
+2. **#2580 sampler.** This one *changes the gate*, so it is the more serious of the two.
+   The finding blocked because it put unbounded, growing cost on the serial thread shared
+   with agent-revocation teardown — the harm is a security operation delayed at scale,
+   which is a chain of reasoning rather than a stated impact. Either `I5` needs an
+   escalator for shared security-critical paths, or this class genuinely is MEDIUM and the
+   original BLOCKING was severity inflation. **Do not adopt the derivation as binding on
+   this class until it is settled.**
+
+### What this does and does not claim
+
+It does not make an LLM's assignment deterministic. It makes the assignment **auditable**:
+the facts are recorded next to the label, so a wrong band is a visible mismatch. That claim
+is weaker than "derived rather than chosen" and is the honest one — judgement moved into
+field *selection* (I5-vs-I2 for a corrupting crash, I8-vs-I3 for stale-served-as-fresh)
+rather than disappearing.

@@ -36,7 +36,7 @@ Gate 7 — address BLOCKING findings
 Gate 8 — re-review gates whose DOMAIN THE FIX TOUCHED, ledger, final decision
 ```
 
-Per CLAUDE.md: CRITICAL/HIGH are blocking, MEDIUM should be fixed, LOW addressed. Iterate until the team gives a clean bill. No commit until governance passes.
+Per CLAUDE.md standing rule 2: a finding BLOCKS when its **derived** band is CRITICAL or HIGH (see the shared preamble below), plus the policy floors listed there. Iterate until the team gives a clean bill. No commit until governance passes.
 
 ---
 
@@ -140,10 +140,23 @@ require `sre` and `compliance-officer` — size never gates a routed concern.
 Twelve agents asked for "BLOCKING / SHOULD / NICE" with no definition invent twelve
 different bars, and the operator normalises by hand. #2604 calibrated the merge
 THRESHOLD, which fixed the gate but left the bands undefined — CRITICAL and HIGH
-both map to GATING with no criterion separating them, while the ledger records the
-native band and CLAUDE.md acts on it. The block below closes that: the band is
-derived from stated facts, so a wrong band shows up as a mismatch between the facts
-and the label rather than as an unfalsifiable judgement.
+both mapped to the same tier with no criterion separating them, while the ledger
+records the native band and CLAUDE.md acts on it.
+
+The block below closes that: the band is derived from stated facts, so a wrong
+band shows up as a mismatch between the facts and the label rather than as an
+unfalsifiable judgement. Two structural points, both learned the hard way in
+review (#2623):
+
+- **The facts are independent fields, not one choice.** An earlier draft collapsed
+  actor privilege, configuration, rarity and production-reachability into a single
+  enum. A race-based authorisation escape under a non-default flag truthfully
+  satisfied three values that derived different bands, so severity was still being
+  chosen. List every value that applies; the strongest modifier wins.
+- **Contract violations are not operational severity.** A missing Resource Ledger
+  or a broken platform build has no production trigger and no wrong outcome, so an
+  honest derivation lands it at INFO. Those are policy floors and bypass the
+  derivation entirely.
 
 Paste this block verbatim into every Gate 2/3/4/6 prompt, in addition to that
 agent's own focus.
@@ -151,75 +164,115 @@ agent's own focus.
 ```
 ## Severity — DERIVE it, do not choose it
 
-Report in the severity vocabulary your own brief specifies (security-guardian:
-CRITICAL/HIGH/MEDIUM/LOW/INFO; docs-writer: BLOCKING/SHOULD-FIX/NICE-TO-HAVE;
-most others: BLOCKING/SHOULD/NICE). Do NOT switch vocabularies — a renamed band
-loses information. But do NOT pick a band by feel either: state three facts, and
-the band follows from them.
+Report in the severity vocabulary your own brief specifies. Do NOT switch
+vocabularies — a renamed band loses information. But do NOT pick a band by feel
+either. State the facts below; the band follows from them. Where your brief's own
+severity criteria disagree with the derived band, **the derived band governs the
+GATE**; record your brief's label as `severity_native` and say they disagreed.
 
-Every finding MUST carry:
+Every finding MUST carry, as separate fields — they are independent, and collapsing
+them into one choice is what let severity be chosen:
 
-1. TRIGGER — the concrete input, state, or configuration that produces it.
-   Name it. "Under load" and "in some cases" are not triggers.
-2. CONSEQUENCE — the observable wrong outcome, from the closed list below.
-3. REACHABILITY — who can reach the trigger, from the closed list below.
+1. TRIGGER — the concrete input, state, or configuration that produces it. Name
+   it. "Under load" and "in some cases" are not triggers. If you cannot isolate
+   one, write `unresolved` — do NOT downgrade IMPACT to compensate.
+2. IMPACT — what goes wrong if this ships. Closed list. Gives the base band.
+3. EXPOSURE — what is required for it to happen. Closed list. **List EVERY value
+   that applies**; the strongest modifier is the one that counts.
+4. EPISTEMIC STATUS — `verified` (you ran something and observed it), `likely`
+   (reasoned from code you read), or `speculative`.
 
-### Consequence — gives the base band
+### IMPACT — gives the base band
 
-  C1  security-control bypass — an authn, authz, confinement, crypto, or
+  I1  security-control failure — an authn, authz, confinement, crypto, or
       audit control does not hold                                     base HIGH
-  C2  silent data loss or corruption — data destroyed or wrong, with
-      no error surfaced to anyone                                     base HIGH
-  C3  wrong result returned as correct — the caller cannot tell       base HIGH
-  C4  misleading OR absent operator guidance — a doc, runbook, or
-      error message directs an operator to a harmful or ineffective
-      action; or a shipped behaviour change an operator must know
-      about is documented nowhere                                     base HIGH
-  C5  unavailability — crash, hang, deadlock, wedge, unbounded growth  base MEDIUM
-  C6  degraded but correct — slow, wasteful, noisy; output still right base LOW
-  C7  no observable consequence yet — latent, stylistic, or
-      defence-in-depth only                                           base INFO
+  I2  data loss or corruption — data destroyed or wrong. Whether an
+      error was surfaced changes EXPOSURE, not this                   base HIGH
+  I3  wrong result presented as correct — the caller cannot tell      base HIGH
+  I4  harmful operator guidance — a doc, runbook, or error message
+      directs an operator to a NAMED action that damages or fails     base HIGH
+                                                                      (caps at HIGH)
+  I5  unavailability — crash, hang, deadlock, wedge, unbounded growth base MEDIUM
+  I6  capability absent or unreachable — a deliverable the change
+      presents is not actually reachable in production (shipped-
+      incomplete), or a required call site is missing                 base MEDIUM
+  I7  required documentation absent for a shipped behaviour change    base MEDIUM
+                                                                      (caps at HIGH)
+  I8  degraded but correct — slow, wasteful, noisy; output still right base LOW
+  I9  no operational impact — latent, stylistic, defence-in-depth only base INFO
 
-### Reachability — modifies the base band
+I6 raises to HIGH when the absent capability is a security or data-integrity
+control — the change presents a control that is not in fact enforced. #2202
+Blocker 4 is the reference case: an RBAC resolver consuming a grant no production
+route could author.
 
-  R1  unauthenticated, in the DEFAULT configuration                   raise one band
-  R2  an authenticated actor reaching data or actions above its own
-      privilege (escalation, confinement escape)                      raise one band
-  R3  operator-privileged, default configuration                      no change
-  R4  requires a non-default configuration                            no change
-  R5  requires a race, or a rare environmental condition (clock skew,
+I7 raises to HIGH when the omission conceals a breaking change, a security-
+relevant behaviour, a data-loss risk, a migration step, or an irreversible
+operation. Otherwise it stays MEDIUM. I4 and I7 never exceed HIGH: a document
+is not reached by an attacker, so EXPOSURE cannot promote it to CRITICAL.
+
+### EXPOSURE — list all that apply; strongest modifier wins
+
+  E1  unauthenticated, in the DEFAULT configuration                   raise one band
+  E2  an actor operating BEYOND the privilege it starts with
+      (escalation, confinement escape). Judge by the privilege
+      REQUIRED to begin, never the privilege gained                   raise one band
+  E3  any authenticated actor within its own privilege, default
+      configuration — including the ordinary operator                 no change
+  E4  requires a non-default configuration                            no change
+  E5  requires a race or a rare environmental condition (clock skew,
       disk full, concurrent writer, partial failure)                  no change
-  R6  not reachable in production — test-only, dead branch, or
-      unreachable by construction                                     floor at LOW;
-                                                                      say which
+  E6  the WRONG OUTCOME — not merely the code branch — is proven
+      unable to occur in production                                   cap at LOW
 
 Bands, ordered:  INFO < LOW < MEDIUM < HIGH < CRITICAL
 
-R4 is deliberately NOT a downgrade. In Yuzu the default is frequently the LESS
+E4 is deliberately NOT a downgrade. In Yuzu the default is frequently the LESS
 hardened setting — RBAC off is the default, `--auth-mode=sso-only` is opt-in — so
 "only with the flag on" often means "only for the customers who care most".
 
+E6 is about the OUTCOME, not the branch. A branch with no production caller is
+usually I6 (shipped-incomplete), not E6 — E6 requires proving the wrong outcome
+cannot occur, which a missing caller does not establish. If both a security
+control failed AND the actor ends up beyond its privilege, that is I1 with E2;
+do not report the escalation as though it were the only fact.
+
 ### The gate
 
-BLOCKING = the derived band is CRITICAL or HIGH. That is the whole definition,
-and it is the gate CLAUDE.md already states.
+BLOCKING = the derived band is CRITICAL or HIGH.
 
-For briefs using BLOCKING/SHOULD/NICE, or docs-writer's BLOCKING/SHOULD-FIX/
-NICE-TO-HAVE:  BLOCKING = CRITICAL or HIGH,  SHOULD(-FIX) = MEDIUM,
-NICE(-TO-HAVE) = LOW or INFO. The mapping is DERIVED from the table above, not
-asserted alongside it.
+Vocabulary map, derived from the bands above, not asserted alongside them:
+  BLOCKING / SHOULD / NICE     → BLOCKING = CRITICAL|HIGH, SHOULD = MEDIUM,
+                                  NICE = LOW|INFO
+  BLOCKING / SHOULD-FIX / NICE-TO-HAVE  → the same three
+  low / medium / high / critical        → already bands; INFO absent, use LOW
 
-### Three absences that look alike and are not
+### Policy floors — gate regardless of the derived band
 
-- You cannot name a TRIGGER → the finding is not substantiated, so it is not
-  gating. Report at C7/INFO and say what you would need to confirm it.
-- You cannot determine REACHABILITY → default to R3 and mark it unknown. Do not
-  guess R1 (inflates) or R6 (hides). The unknown must appear in the finding.
-- Your vocabulary does not map → gate it, and say so. A schema failure is the
-  operator's to resolve, never a reason to silently downgrade.
+These are contract violations, not operational severity. They do not run through
+IMPACT/EXPOSURE and they always gate:
 
-The first is about YOUR evidence and points down. The others are about the
-SCHEMA and point up. That is deliberate, not a contradiction.
+  - a Resource Ledger omission on a C++ diff
+  - a direct edit to `CHANGELOG.md`, or a missing mandated `changelog.d/` fragment
+  - a broken build or test leg on any supported platform
+  - manual resource cleanup in new or touched C++ that is not RAII-wrapped, absent
+    a documented impossibility
+
+A missing test for a behaviour that has a bounded blast radius is SHOULD, not a
+floor.
+
+### Absences — and which way each one points
+
+- TRIGGER unresolved → keep IMPACT honest, set EPISTEMIC STATUS `speculative`.
+  A speculative finding does not gate on its own. Never record a lower IMPACT
+  than you actually observed in order to express low confidence.
+- EXPOSURE undeterminable → record `unresolved`. It does NOT default to E3, and
+  it GATES pending adjudication. Defaulting an unknown to "no change" is a silent
+  downgrade of a possible E1.
+- Your vocabulary does not map → gate it, and say so.
+
+Your evidence being weak points DOWN, via EPISTEMIC STATUS. The schema failing
+points UP. Those are different things and they are deliberately not symmetric.
 
 ## Prose: docs-writer owns WORDING, the domain agent owns TRUTH
 
@@ -937,7 +990,7 @@ This pass keeps that signal and drops the re-reading; it must not launder it.
 
 ## Gate 7 — Findings Resolution
 
-**BLOCKING** = CRITICAL / HIGH security, BLOCKING from any Gate 4-6 agent, or any finding that explicitly says "blocks merge".
+**BLOCKING** = the derived band is CRITICAL or HIGH (shared preamble), or a policy floor was hit, or the finding explicitly says "blocks merge". Resolve against the derived band, not the reporting agent's native label — record both.
 
 Strategy:
 1. **Fold compatible fixes into one commit.** If sec flags H1, docs flags B3, QA flags B5, and they all touch related files, fix as a single "hardening round" commit rather than three small ones.
@@ -987,10 +1040,12 @@ Strategy:
    | `pass_ordinal` | **which round.** Without it the final pass is indistinguishable from the first, and `caused_by` below presupposes a round identity the schema would otherwise lack |
    | `finding_id` | stable across rounds — `caused_by` is uncomputable without a join key |
    | `severity_native` | the agent's OWN vocabulary, unmodified |
-   | `severity_mapped` | GATING / SHOULD / NICE, derived per the severity rule |
-   | `trigger` | the concrete input/state/config. Free text, but naming one is what makes the finding substantiated |
-   | `consequence` | `C1`…`C7` from the closed list |
-   | `reachability` | `R1`…`R6` from the closed list; suffix `?` when defaulted to R3 as unknown |
+   | `severity_mapped` | BLOCKING / SHOULD / NICE, derived per the severity rule |
+   | `trigger` | the concrete input/state/config, or `unresolved` |
+   | `impact` | `I1`…`I9` from the closed list |
+   | `exposure` | every applicable `E1`…`E6`, or `unresolved` — a list, not one value |
+   | `epistemic_status` | `verified` / `likely` / `speculative` |
+   | `policy_floor` | the floor hit, if the finding gates as a contract violation rather than by derivation |
    | `provenance` | `introduced` / `newly-reachable` / `pre-existing`. **Adjudicated, not inferred from prose.** Default to `introduced` when contested |
    | `file`, `line`, `summary` | where and what |
    | `classification` + rationale | truth-contradiction vs wording, and why |
