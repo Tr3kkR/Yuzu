@@ -230,4 +230,18 @@ scope_refs_failing_owner_check(std::string_view expr, const std::string& owner,
     return failing;
 }
 
+ScopeDispatchGate gate_scope_dispatch(std::string_view resolved_scope,
+                                      const std::string& principal, ResultSetStore* store,
+                                      std::vector<std::string>& failing_out) {
+    failing_out.clear();
+    auto failing = scope_refs_failing_owner_check(resolved_scope, principal, store);
+    if (!failing)
+        return ScopeDispatchGate::AbortDbDegraded;
+    if (!failing->empty()) {
+        failing_out = std::move(*failing);
+        return ScopeDispatchGate::AbortOwnerCheck;
+    }
+    return ScopeDispatchGate::Proceed;
+}
+
 } // namespace yuzu::server

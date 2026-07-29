@@ -100,4 +100,23 @@ std::expected<std::vector<std::string>, ResultSetError>
 scope_refs_failing_owner_check(std::string_view expr, const std::string& owner,
                                ResultSetStore* store);
 
+/// The single dispatch-gate decision for a resolved scope expression
+/// (governance M1, 2026-07-29). Consumes scope_refs_failing_owner_check and
+/// classifies the outcome:
+///   - AbortDbDegraded  — the owner-check scan itself failed (store degraded);
+///   - AbortOwnerCheck  — one or more referenced sets are absent, expired, or
+///                        not owned by `principal` (`failing_out` carries them
+///                        for per-ref forensic audit rows);
+///   - Proceed          — every from_result_set: reference is owner-valid (or
+///                        the expression has none).
+/// Extracted from the three dispatch sites (REST raw / tracked closure / MCP)
+/// so the abort-vs-proceed rule is ONE testable function: the pre-M1 bug was
+/// exactly a caller auditing the failing refs and then dispatching anyway,
+/// which a NOT combinator inverts into a fleet-wide match. Callers MUST NOT
+/// parse/evaluate/dispatch unless this returns Proceed.
+enum class ScopeDispatchGate { Proceed, AbortDbDegraded, AbortOwnerCheck };
+ScopeDispatchGate gate_scope_dispatch(std::string_view resolved_scope,
+                                      const std::string& principal, ResultSetStore* store,
+                                      std::vector<std::string>& failing_out);
+
 } // namespace yuzu::server

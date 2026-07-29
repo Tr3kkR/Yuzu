@@ -1009,7 +1009,7 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::pin(const std::string& 
         }
         ResultSet row = read_row(get_res.get(), 0);
         if (row.pinned) {
-            out = row; // idempotent — no ttl_at renewal, matches the SQLite behavior
+            out = std::move(row); // idempotent — no ttl_at renewal, matches the SQLite behavior
             return true;
         }
 
@@ -1466,7 +1466,7 @@ int ResultSetStore::gc_sweep() {
         return true;
     });
     if (!ok) {
-        spdlog::error("ResultSetStore::gc_sweep: pass aborted ({})", pool_.last_error());
+        spdlog::error("ResultSetStore::gc_sweep: pass aborted (statement failed or txn rolled back — see the preceding gc_sweep error line)");
         return 0;
     }
     return deleted;

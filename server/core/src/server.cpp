@@ -8771,16 +8771,15 @@ private:
                     // successful-empty read from member_set_owned is
                     // deliberately absent/unowned-indistinguishable, so the
                     // owner check here is the only seam that can refuse).
-                    auto failing_refs = scope_refs_failing_owner_check(*resolved_scope, principal,
-                                                                       result_set_store_.get());
-                    if (!failing_refs) {
-                        spdlog::error("scope dispatch: scope_refs_failing_owner_check degraded "
-                                      "({})",
-                                      to_string(failing_refs.error()));
+                    std::vector<std::string> failing_refs;
+                    const auto gate = gate_scope_dispatch(*resolved_scope, principal,
+                                                          result_set_store_.get(), failing_refs);
+                    if (gate == ScopeDispatchGate::AbortDbDegraded) {
+                        spdlog::error("scope dispatch: owner-check scan degraded");
                         audit_scope_evaluation_aborted(principal, principal_role, command_id,
                                                        "db_degraded");
-                    } else if (!failing_refs->empty()) {
-                        for (const auto& ref : *failing_refs)
+                    } else if (gate == ScopeDispatchGate::AbortOwnerCheck) {
+                        for (const auto& ref : failing_refs)
                             audit_scope_resolution_failed(principal, principal_role, command_id,
                                                           ref);
                         audit_scope_evaluation_aborted(principal, principal_role, command_id,
@@ -11526,19 +11525,18 @@ private:
                     // Role is not available on the tracked path (principal recovered
                     // from the execution row, no live session); principal + command
                     // id still identify the actor for the forensic chain.
-                    auto failing_refs = scope_refs_failing_owner_check(*resolved_scope, principal,
-                                                                       result_set_store_.get());
-                    if (!failing_refs) {
-                        spdlog::error("scope dispatch: scope_refs_failing_owner_check degraded "
-                                      "({})",
-                                      to_string(failing_refs.error()));
+                    std::vector<std::string> failing_refs;
+                    const auto gate = gate_scope_dispatch(*resolved_scope, principal,
+                                                          result_set_store_.get(), failing_refs);
+                    if (gate == ScopeDispatchGate::AbortDbDegraded) {
+                        spdlog::error("scope dispatch: owner-check scan degraded");
                         audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,
                                                        "db_degraded");
-                    } else if (!failing_refs->empty()) {
+                    } else if (gate == ScopeDispatchGate::AbortOwnerCheck) {
                         // Governance M1: BINDING owner check — a failing ref
                         // aborts dispatch (see the REST raw-dispatch site's
                         // comment for the NOT-inversion rationale).
-                        for (const auto& ref : *failing_refs)
+                        for (const auto& ref : failing_refs)
                             audit_scope_resolution_failed(principal, /*role=*/"", command_id, ref);
                         audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,
                                                        "owner_check_failed");
@@ -14120,19 +14118,18 @@ private:
                             // Role unavailable on the MCP path (principal recovered
                             // from the MCP-created execution row); principal + command
                             // id identify the actor for the forensic chain.
-                            auto failing_refs = scope_refs_failing_owner_check(
-                                *resolved_scope, principal, result_set_store_.get());
-                            if (!failing_refs) {
-                                spdlog::error("MCP scope dispatch: "
-                                              "scope_refs_failing_owner_check degraded ({})",
-                                              to_string(failing_refs.error()));
+                            std::vector<std::string> failing_refs;
+                            const auto gate = gate_scope_dispatch(
+                                *resolved_scope, principal, result_set_store_.get(), failing_refs);
+                            if (gate == ScopeDispatchGate::AbortDbDegraded) {
+                                spdlog::error("MCP scope dispatch: owner-check scan degraded");
                                 audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,
                                                                "db_degraded");
-                            } else if (!failing_refs->empty()) {
+                            } else if (gate == ScopeDispatchGate::AbortOwnerCheck) {
                                 // Governance M1: BINDING owner check — a
                                 // failing ref aborts dispatch (see the REST
                                 // raw-dispatch site's comment).
-                                for (const auto& ref : *failing_refs)
+                                for (const auto& ref : failing_refs)
                                     audit_scope_resolution_failed(principal, /*role=*/"",
                                                                   command_id, ref);
                                 audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,

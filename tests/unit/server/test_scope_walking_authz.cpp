@@ -403,6 +403,13 @@ TEST_CASE("evaluate_scope: a NULL result-set store ABORTS a from_result_set scop
         REQUIRE_FALSE(matched.has_value());
     }
 
+    SECTION("null store with a NON-empty principal still aborts (branch-message combo)") {
+        auto expr = yuzu::scope::parse("from_result_set:rs_anything");
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, nullptr, "alice");
+        REQUIRE_FALSE(matched.has_value());
+    }
+
     SECTION("a scope with NO from_result_set atom is unaffected — null store stays "
             "legal for plain scopes") {
         auto expr = yuzu::scope::parse("hostname == \"agent-win.local\"");
@@ -410,5 +417,81 @@ TEST_CASE("evaluate_scope: a NULL result-set store ABORTS a from_result_set scop
         auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, nullptr, "");
         REQUIRE(matched.has_value());
         CHECK(matched->size() == 1); // agent-win only
+    }
+}
+
+// ── M1 regression net (governance round 2, 2026-07-29): the dispatch GATE ──
+// ── itself. The pre-M1 bug was each dispatch site auditing the failing    ──
+// ── refs and then dispatching anyway; the rule now lives in ONE function  ──
+// ── (gate_scope_dispatch) consumed by all three sites, so pinning it here ──
+// ── pins the behavior a future edit could silently revert per-site.       ──
+TEST_CASE("gate_scope_dispatch: absent/foreign refs ABORT, owned refs proceed",
+          "[pg][scope][result_set][authz][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    CreateRequest cr;
+    cr.owner_principal = "alice";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto owned = store.create_materialized(cr, {"agent-win"});
+    REQUIRE(owned.has_value());
+
+    std::vector<std::string> failing;
+
+    SECTION("owned ref proceeds") {
+        CHECK(gate_scope_dispatch("from_result_set:" + owned->id, "alice", &store, failing) ==
+              ScopeDispatchGate::Proceed);
+        CHECK(failing.empty());
+    }
+    SECTION("absent ref aborts with the ref reported") {
+        CHECK(gate_scope_dispatch("from_result_set:rs_does_not_exist", "alice", &store, failing) ==
+              ScopeDispatchGate::AbortOwnerCheck);
+        REQUIRE(failing.size() == 1);
+        CHECK(failing[0] == "rs_does_not_exist");
+    }
+    SECTION("foreign (unowned) ref aborts — indistinguishable from absent by design") {
+        CHECK(gate_scope_dispatch("from_result_set:" + owned->id, "bob", &store, failing) ==
+              ScopeDispatchGate::AbortOwnerCheck);
+        REQUIRE(failing.size() == 1);
+    }
+    SECTION("NOT over an absent ref still aborts — the inversion the pre-M1 "
+            "audit-then-proceed behavior turned into a fleet-wide match") {
+        CHECK(gate_scope_dispatch("NOT from_result_set:rs_ghost", "alice", &store, failing) ==
+              ScopeDispatchGate::AbortOwnerCheck);
+    }
+    SECTION("NOT over a foreign ref aborts") {
+        CHECK(gate_scope_dispatch("NOT from_result_set:" + owned->id, "bob", &store, failing) ==
+              ScopeDispatchGate::AbortOwnerCheck);
+    }
+    SECTION("a mixed expression with one bad ref aborts the WHOLE gate — no "
+            "partial-dispatch semantics") {
+        CHECK(gate_scope_dispatch("from_result_set:" + owned->id +
+                                      " AND NOT from_result_set:rs_ghost",
+                                  "alice", &store, failing) ==
+              ScopeDispatchGate::AbortOwnerCheck);
+    }
+    SECTION("owned-but-EMPTY set proceeds — empty membership is a valid, owned answer") {
+        auto empty_owned = store.create_materialized(cr, {});
+        REQUIRE(empty_owned.has_value());
+        CHECK(gate_scope_dispatch("from_result_set:" + empty_owned->id, "alice", &store,
+                                  failing) == ScopeDispatchGate::Proceed);
+    }
+    SECTION("degraded store aborts as AbortDbDegraded, never OwnerCheck or Proceed") {
+        // The owner check probes the result_sets table itself (ownership
+        // rows), so THAT is the table to break — dropping only the members
+        // table degrades the membership preload (covered by the
+        // evaluate_scope degrade test above), not this gate.
+        {
+            PgConn conn{PQconnectdb(db.dsn().c_str())};
+            REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+            PgResult r{PQexec(conn.get(), "DROP TABLE result_set_store.result_sets CASCADE")};
+            REQUIRE(r.ok());
+        }
+        CHECK(gate_scope_dispatch("from_result_set:" + owned->id, "alice", &store, failing) ==
+              ScopeDispatchGate::AbortDbDegraded);
     }
 }
