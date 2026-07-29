@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>   // std::snprintf in detail::json_escape (was transitively included)
 #include <expected>
@@ -43,9 +44,94 @@ struct JsonRpcRequest {
 
 // ── Parsing ───────────────────────────────────────────────────────────────
 
+/// Aggregate cap on a `/mcp/` request body (#2437).
+///
+/// WHY IT EXISTS: httplib is not unbounded without a `set_payload_max_length`
+/// call — it falls back to CPPHTTPLIB_PAYLOAD_MAX_LENGTH (100 MB) and enforces
+/// it. But 100 MB is a default nobody chose, far above what any MCP tool
+/// needs, and it is buffered per connection before the parser below sees a
+/// byte. Enforced per-path in the pre-routing chokepoint (server.cpp), which
+/// httplib invokes BEFORE it reads the body; the server-global knob is
+/// deliberately untouched because it would also cap the multipart certificate
+/// upload and content distribution on the same httplib instance.
+///
+/// 4 MiB is a DELIBERATE CLAMP, not a ceiling derived from every tool: it sits
+/// well above a maximal `execute_instruction` but below what
+/// `execute_bundle`'s own step validator would accept, so a multi-MiB bundle
+/// the REST twin still admits is refused over MCP. Documented in
+/// docs/mcp-server.md as a stated clamp rather than a silent regression.
+inline constexpr std::size_t kMcpMaxRequestBodyBytes = 4 * 1024 * 1024;
+
+/// Maximum JSON nesting a request body may declare (#2437, governance Gate 5
+/// CH-1). The deepest LEGITIMATE MCP request is `execute_bundle` at roughly
+/// seven levels — envelope, params, arguments, steps, step, params, value — so
+/// 32 is generous headroom while staying four orders of magnitude below the
+/// depth that kills the process.
+inline constexpr int kMcpMaxJsonDepth = 32;
+
+/// True when `body` nests deeper than `max_depth`.
+///
+/// WHY THIS EXISTS, measured not assumed: `nlohmann::json::parse` handles very
+/// deep input fine and the destructor is iterative, but `dump()` is RECURSIVE.
+/// A 0.95 MiB body of `[[[[...]]]]` — a quarter of the 4 MiB transport cap —
+/// SIGSEGVs the process on `dump()`, and `execute_instruction`'s bound check
+/// calls `v.dump()` on any non-string `params` value. So the check meant to
+/// reject an oversized argument was itself the crash, reachable by any
+/// authenticated operator-tier caller, taking down the control plane.
+///
+/// Guarding at the individual `dump()` call site would be the wrong fix:
+/// `dump()` is not the only recursive traversal and `execute_instruction` is
+/// not the only tool. Rejecting here means the deep tree is never CONSTRUCTED,
+/// which closes every downstream traversal at once — including ones nobody has
+/// written yet.
+///
+/// Iterative by necessity: a recursive depth-checker would crash on exactly
+/// the input it exists to reject. Scans the raw text, so it runs before any
+/// allocation, and skips string literals (with escapes) so brackets inside a
+/// string value are not counted as structure.
+[[nodiscard]] inline bool json_exceeds_depth(std::string_view body, int max_depth) noexcept {
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (const char c : body) {
+        if (in_string) {
+            if (escaped)
+                escaped = false;
+            else if (c == '\\')
+                escaped = true;
+            else if (c == '"')
+                in_string = false;
+            continue;
+        }
+        switch (c) {
+        case '"':
+            in_string = true;
+            break;
+        case '[':
+        case '{':
+            if (++depth > max_depth)
+                return true;
+            break;
+        case ']':
+        case '}':
+            --depth;
+            break;
+        default:
+            break;
+        }
+    }
+    return false;
+}
+
 /// Parse a JSON-RPC 2.0 request from the raw HTTP body.
 /// Returns the parsed request, or an error-response string ready to send.
 inline std::expected<JsonRpcRequest, std::string> parse_request(std::string_view body) {
+    // Depth BEFORE parse: see json_exceeds_depth. A -32700 parse error is the
+    // honest answer - the body is not something this server will parse.
+    if (json_exceeds_depth(body, kMcpMaxJsonDepth)) {
+        return std::unexpected(
+            R"({"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error: input nests too deeply"},"id":null})");
+    }
     nlohmann::json doc;
     try {
         doc = nlohmann::json::parse(body);

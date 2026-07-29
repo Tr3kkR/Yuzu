@@ -7,6 +7,10 @@
 #include <yuzu/version.hpp>
 
 #include "insecure_tls_gate.hpp"
+#include "kek_rotate_control.hpp" // detail::kKekMaxLiveVersionsDefault / kek_ceiling_is_risk_acceptance
+#include "key_provider.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/secret_codec.hpp"
 #include "scim_routes.hpp"
 #include "security_headers.hpp"
 
@@ -38,6 +42,7 @@
 #include <format>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -486,6 +491,55 @@ int main(int argc, char* argv[]) {
                  "when enabled.")
         ->envname("YUZU_ALLOW_UNSIGNED_DEFINITIONS");
 
+    // KEK rotation runaway control (#2530 B5). See kek_routes.hpp.
+    //
+    // This is a RUNAWAY/ABUSE GUARD, not a rotation-schedule knob — it exists
+    // to stop a looping caller (buggy automation, a compromised token) from
+    // hammering /rotate, not to express how often you intend to rotate. The
+    // default of 1h is sized for that job and most operators should never
+    // touch this flag.
+    //
+    // Raising it has a real, sharp cost the operator must see BEFORE they
+    // change it: it directly delays emergency re-rotation after a suspected
+    // KEK compromise — the single most time-critical operation this surface
+    // exists to support — and there is NO bypass. `/rewrap` only resumes a
+    // half-committed rotation; it does not mint a new version. If this is
+    // set to (say) 90 days to "match" a quarterly rotation cadence, a
+    // routine rotation followed by a compromise the next day leaves the
+    // operator refused with a 429 for the next three months, with no escape
+    // short of a restart with a lower value — mid-incident. Do NOT set this
+    // to your rotation cadence; leave it at the default unless you have a
+    // specific, understood reason to raise it.
+    //
+    // Upper bound 31536000s (365d) is a sanity ceiling that rejects a
+    // fat-fingered value, not an endorsement of setting the flag that high.
+    // `cooldown_retry_after_ms` is a uint32 millisecond count;
+    // evaluate_rotate_preconditions() (kek_rotate_control.hpp) saturates
+    // rather than wraps on overflow, so this bound is defence-in-depth on
+    // top of that, not the only thing keeping the retry hint honest.
+    app.add_option("--kek-min-rotate-interval", cfg.kek_min_rotate_interval_secs,
+                   "Durable rate limit (seconds) between KEK rotation attempts — a runaway/abuse "
+                   "guard against looping automation, NOT a rotation-schedule setting (default: "
+                   "3600 = 1h; most operators should never change this). Raising it delays "
+                   "emergency re-rotation after a suspected key compromise, with no bypass short "
+                   "of a restart. Read from the database server's own clock so it holds "
+                   "cluster-wide, not just per process (max: 31536000 = 365d, a sanity ceiling — "
+                   "not a suggestion to match your rotation cadence). A rotate request inside the "
+                   "window is refused with a 429 carrying an honest retry_after_ms.")
+        ->default_val(3600)
+        ->check(CLI::Range(1, 31536000))
+        ->envname("YUZU_KEK_MIN_ROTATE_INTERVAL");
+    app.add_option("--kek-max-live-versions", cfg.kek_max_live_versions,
+                   "Backstop ceiling on the number of non-retired KEK versions (default: 32). "
+                   "A rotate request at or above the ceiling is refused with a 409. There is no "
+                   "retire route (#2525), so raising this above the default is the supported "
+                   "escape hatch that keeps rotation usable once an install hits it — doing so "
+                   "is an explicit, logged and audited temporary risk acceptance pending #2525, "
+                   "not a routine tuning knob.")
+        ->default_val(yuzu::server::detail::kKekMaxLiveVersionsDefault)
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_KEK_MAX_LIVE_VERSIONS");
+
     // Batch token generation mode (runs and exits, no server startup)
     int generate_tokens = 0;
     std::string gen_label;
@@ -692,18 +746,19 @@ int main(int argc, char* argv[]) {
     // deployments that pre-seed --break-glass-user are warned there too.
     // Account lockout posture (SOC 2 CC6.3 evidence). Surfaced once at boot
     // so an operator/auditor can confirm the deployment's brute-force
-    // protection from journald without scraping per-event logs. The posture
-    // is gated on the auth.db store actually being wired (--data-dir set):
-    // lockout state lives in auth.db, so in a config-file-only deployment
-    // (auth_db_ == nullptr, the legacy fallback) every lockout op no-ops.
-    // Claiming "active" there would overstate the deployed control
-    // (governance/adversarial C4) — fail honest instead.
+    // protection from journald without scraping per-event logs. The posture is
+    // gated on the Postgres auth store being wired (--postgres-dsn set):
+    // lockout state lives in Postgres (users.failed_login_count / locked_until,
+    // ADR-0006), not the legacy auth.db. Without --postgres-dsn there is no
+    // auth store at all (ADR-0006/0007 fail-closed, no SQLite fallback) and the
+    // server will refuse to start below — claiming "active" here would overstate
+    // a deployment that will not boot (governance/adversarial C4), so warn honest.
     if (cfg.auth_lockout_threshold > 0) {
-        if (cfg.data_dir.empty()) {
+        if (cfg.postgres_dsn.empty()) {
             spdlog::warn("Account lockout CONFIGURED (threshold={}) but INACTIVE: failed-login "
-                         "lockout requires the auth.db store, which is created only when "
-                         "--data-dir is set. This config-file-only deployment has NO account "
-                         "lockout. Set --data-dir to activate it.",
+                         "lockout requires the Postgres auth store, which needs --postgres-dsn "
+                         "(or YUZU_POSTGRES_DSN). This deployment has no auth store wired and "
+                         "will fail closed at boot.",
                          cfg.auth_lockout_threshold);
         } else {
             spdlog::info("Account lockout active: {} failed local-password attempts → locked "
@@ -750,6 +805,22 @@ int main(int argc, char* argv[]) {
             "rows (`mfa.step_up.required`) will not be emitted. Set to a positive value "
             "(default 300) to re-enable.",
             cfg.mfa_step_up_window_secs);
+    }
+
+    // KEK rotation runaway control posture (#2530 B5). --kek-max-live-versions
+    // above the shipped default of 32 is a deliberate, temporary risk
+    // acceptance pending #2525 (no retire route exists yet, so raising the
+    // ceiling is the only way to keep rotation usable once an install hits
+    // it) — surface it loudly here; the matching `server.kek_ceiling_raised`
+    // audit event fires in server.cpp once audit_store_ exists (mirrors the
+    // --allow-unsigned-packs log+audit pattern above).
+    if (yuzu::server::detail::kek_ceiling_is_risk_acceptance(cfg.kek_max_live_versions)) {
+        spdlog::warn("--kek-max-live-versions={} is ABOVE the default of {} — this is a "
+                     "deliberate, temporary risk acceptance: there is no KEK retire route "
+                     "(#2525), so raising the ceiling is the supported way to keep rotation "
+                     "usable once an install hits it. This will be audited as "
+                     "`server.kek_ceiling_raised`.",
+                     cfg.kek_max_live_versions, yuzu::server::detail::kKekMaxLiveVersionsDefault);
     }
 
     // ── Validate operator-supplied CSP extras (SOC2-C1, gov UP-1/UP-2) ──
@@ -930,18 +1001,125 @@ int main(int argc, char* argv[]) {
 
     cfg.auth_config_path = cfg_path;
 
-    // AuthDB lifetime — declared at function scope (NOT inside the
-    // --data-dir block) so the unique_ptr outlives Server::create() and
-    // server->run(). Storing &auth_db in AuthManager from inside the
-    // else block (the previous shape) destroyed the AuthDB at the close
-    // of the block, leaving AuthManager holding a dangling pointer for
-    // the rest of main() — every authenticate() / upsert_user /
-    // update_role / list_users call hit use-after-free in production
-    // deployments with --data-dir set (governance round arch-B1
-    // CRITICAL). Stays nullptr when no --data-dir is configured.
+    // AuthDB is now Postgres-backed (ADR-0006 substrate migration) and, for
+    // actual SERVING, is constructed + owned by ServerImpl off its own
+    // pg_pool_ (server.cpp) — main.cpp no longer builds the long-lived
+    // instance or calls auth_mgr.set_auth_db() (server.cpp does, inside
+    // Server::create()).
+    //
+    // main.cpp DOES still need its own short-lived AuthDB here, for two
+    // reasons that both run BEFORE Server::create() exists to ask:
+    //   1. Fresh-start admin seeding (below) — auth.users is empty on a
+    //      brand-new Postgres database, so the config-file admin (loaded
+    //      into auth_mgr above) must be persisted once via
+    //      seed_admin_if_empty(), which is TOCTOU-free against a second
+    //      server instance racing first boot.
+    //   2. The host-CLI one-shots (--mfa-reset / --break-glass-arm) and the
+    //      --auth-mode=sso-only break-glass validation, all of which run
+    //      (and may exit) before Server::create() is ever called.
+    // Constructing a second, independent PgPool/FileKeyProvider/SecretCodec/
+    // AuthDB stack here is safe: schema migration (PgMigrationRunner) and
+    // secret-column registration + first-boot KEK generation
+    // (SecretCodec::init) are both idempotent — ServerImpl's own stack,
+    // built moments later against the same database, just re-verifies an
+    // already-migrated schema and an already-generated KEK. Declared in the
+    // same dependency order server.cpp uses (pool → provider → codec →
+    // authdb) so destruction is safe, and torn down (out of scope) before
+    // Server::create() is invoked below — this process never holds two
+    // live AuthDB reaper threads at once.
+    std::optional<yuzu::server::pg::PgPool> auth_pg_pool;
+    std::optional<yuzu::server::FileKeyProvider> auth_key_provider;
+    std::optional<yuzu::server::pg::SecretCodec> auth_secret_codec;
     std::unique_ptr<yuzu::server::AuthDB> auth_db;
 
-    // If --data-dir was specified, ensure it exists and resolve to canonical path
+    if (cfg.postgres_dsn.empty()) {
+        // Server::create() will itself refuse to start (ADR-0006/0007 fail
+        // closed, no SQLite fallback) — nothing to seed or validate here.
+        spdlog::warn("--postgres-dsn is not set: no auth store is available. Server startup will "
+                     "fail closed; any --mfa-reset / --break-glass-arm one-shot will also fail.");
+    } else {
+        // Small, short-lived pool — this stack exists only to seed/validate
+        // before Server::create() builds the real, fully-sized pool.
+        auth_pg_pool.emplace(
+            yuzu::server::pg::PgPool::Options{.conninfo = cfg.postgres_dsn, .size = 2});
+        if (!auth_pg_pool->valid()) {
+            spdlog::error("Cannot connect to PostgreSQL for auth store bootstrap: {}",
+                          auth_pg_pool->last_error());
+            return EXIT_FAILURE;
+        }
+        const std::filesystem::path key_dir =
+            cfg.ca_dir.empty() ? yuzu::server::auth::default_cert_dir() : cfg.ca_dir;
+        auth_key_provider.emplace(key_dir);
+        auth_secret_codec.emplace(*auth_key_provider);
+        auth_db = std::make_unique<yuzu::server::AuthDB>(*auth_pg_pool, *auth_secret_codec);
+        if (!auth_db->is_open()) {
+            spdlog::error("Failed to open the Postgres auth store (auth.users migration failed)");
+            return EXIT_FAILURE;
+        }
+        {
+            auto lease = auth_pg_pool->acquire();
+            if (!lease) {
+                spdlog::error("Cannot acquire a connection to run SecretCodec::init() for the "
+                              "auth store bootstrap: {}",
+                              auth_pg_pool->last_error());
+                return EXIT_FAILURE;
+            }
+            auto init_res = auth_secret_codec->init(lease.get());
+            lease.reset();
+            if (!init_res) {
+                spdlog::error("SecretCodec::init() failed for the auth store bootstrap — {}: {}",
+                              yuzu::server::pg::SecretCodec::to_string(init_res.error().kind),
+                              init_res.error().message);
+                return EXIT_FAILURE;
+            }
+        }
+
+        // Fresh-start seed (ADR-0006 cutover): seed the configured admin
+        // (loaded into auth_mgr above via load_config()/first_run_setup())
+        // iff auth.users is genuinely empty. A seed ERROR is FATAL — never
+        // warning-only (a boot that silently fails to seed leaves an
+        // operator locked out of a brand-new deployment with no diagnosis).
+        const auto cfg_users = auth_mgr.list_users();
+        const yuzu::server::auth::UserEntry* seed_user = nullptr;
+        for (const auto& u : cfg_users) {
+            if (u.role == yuzu::server::auth::Role::admin) {
+                seed_user = &u;
+                break;
+            }
+        }
+        if (!seed_user && !cfg_users.empty()) {
+            seed_user = &cfg_users.front();
+        }
+        if (seed_user != nullptr) {
+            auto seeded = auth_db->seed_admin_if_empty(seed_user->username, seed_user->hash_hex,
+                                                        seed_user->salt_hex);
+            if (!seeded) {
+                spdlog::error(
+                    "Fatal: failed to seed the admin user into the Postgres auth store "
+                    "(error={}) — refusing to start rather than boot into an unusable auth "
+                    "store.",
+                    static_cast<int>(seeded.error()));
+                return EXIT_FAILURE;
+            }
+            if (*seeded) {
+                spdlog::warn(
+                    "AUTH DATA RESET ON POSTGRES CUTOVER — admin user '{}' was re-seeded into "
+                    "the Postgres auth store because it was empty. Any prior local accounts, "
+                    "roles, and MFA enrollments (from a legacy auth.db / a different Postgres "
+                    "database) are GONE. This warning is logged once, only when a seed actually "
+                    "occurs.",
+                    seed_user->username);
+                // Threaded into ServerImpl via Config (metrics_ doesn't exist
+                // yet at this point — Server::create() hasn't run) — see
+                // Config::auth_fresh_start_seeded doc comment.
+                cfg.auth_fresh_start_seeded = true;
+            }
+        }
+    }
+
+    // If --data-dir was specified, ensure it exists and resolve to canonical path.
+    // Unrelated to AuthDB (now Postgres-backed) — this still gates the
+    // legacy SQLite stores (audit.db, responses.db, ...).
     if (!cfg.data_dir.empty()) {
         std::error_code ec;
         std::filesystem::create_directories(cfg.data_dir, ec);
@@ -978,53 +1156,7 @@ int main(int argc, char* argv[]) {
         // location) because set_data_dir() hadn't been called yet.
         auth_mgr.reload_state();
 
-        // -- Auth DB: Initialize SQLite-backed auth persistence -----------------
-        // When --data-dir is specified, create and initialize the auth DB.
-        // This provides persistent user/session/token storage that survives
-        // container restarts (fixes GitHub issues #618, #388, #527, #391, #526).
-        //
-        // arch-B1 fix: assign through the function-scope unique_ptr declared
-        // above. Do NOT redeclare a local AuthDB inside this block — the
-        // pointer must outlive Server::create() and server->run() below.
-        spdlog::info("Initializing auth DB in data directory: {}", cfg.data_dir.string());
-        auth_db = std::make_unique<yuzu::server::AuthDB>(cfg.data_dir);
-        auto db_result = auth_db->initialize();
-        if (!db_result) {
-            spdlog::error("Failed to initialize auth DB: {}", static_cast<int>(db_result.error()));
-            return EXIT_FAILURE;
-        }
-        spdlog::info("Auth DB initialized successfully");
-
-        // First-boot seeding: if auth DB has no users, seed admin from config file.
-        // This ensures backwards compatibility — existing config-based users
-        // are automatically migrated to the DB on first start.
-        auto users_result = auth_db->list_users();
-        if (users_result && users_result->empty()) {
-            spdlog::info("Auth DB is empty — seeding admin user from config file");
-            // The admin user was already loaded into auth_mgr via load_config(),
-            // so we can read it back and persist to the DB.
-            for (const auto& user : auth_mgr.list_users()) {
-                auto seed_result =
-                    auth_db->upsert_user(user.username, user.hash_hex, user.salt_hex, user.role);
-                if (seed_result) {
-                    spdlog::info("Seeded user '{}' (role={}) into auth DB", user.username,
-                                 auth::role_to_string(user.role));
-                } else {
-                    spdlog::warn("Failed to seed user '{}' into auth DB", user.username);
-                }
-            }
-        }
-
         spdlog::info("Data directory: {}", cfg.data_dir.string());
-
-        // Wire AuthDB into AuthManager AFTER seeding is complete.
-        // This ensures auth_mgr.list_users() reads from in-memory (config file)
-        // during seeding, then delegates to AuthDB for all subsequent operations.
-        // The raw pointer is safe: auth_db (the unique_ptr) lives in the outer
-        // function scope and is destroyed only after server->run() returns
-        // and AuthManager has gone out of scope.
-        auth_mgr.set_auth_db(auth_db.get());
-        spdlog::info("AuthManager configured to use AuthDB for persistence");
     }
 
     // -- Break-glass MFA reset mode (exits without starting server) -----------
@@ -1035,9 +1167,8 @@ int main(int argc, char* argv[]) {
     // re-enrollment at their next login.
     if (!mfa_reset_user.empty()) {
         if (!auth_db) {
-            spdlog::error("--mfa-reset requires the persistent auth store (auth.db); none is "
-                          "configured for data dir '{}'",
-                          cfg.data_dir.string());
+            spdlog::error("--mfa-reset requires the Postgres auth store; --postgres-dsn is not "
+                          "configured (or could not be opened above).");
             return EXIT_FAILURE;
         }
         // Defence-in-depth: validate the CLI arg before it touches the store
@@ -1138,9 +1269,8 @@ int main(int argc, char* argv[]) {
             return EXIT_FAILURE;
         }
         if (!auth_db) {
-            spdlog::error("--break-glass-arm requires the persistent auth store (auth.db); none "
-                          "is configured for data dir '{}'",
-                          cfg.data_dir.string());
+            spdlog::error("--break-glass-arm requires the Postgres auth store; --postgres-dsn is "
+                          "not configured (or could not be opened above).");
             return EXIT_FAILURE;
         }
         // Same fail-closed validation the running server applies: the account
@@ -1288,7 +1418,7 @@ int main(int argc, char* argv[]) {
         if (!cfg.break_glass_user.empty()) {
             if (!auth_db) {
                 spdlog::error("--auth-mode=sso-only with --break-glass-user requires the "
-                              "persistent auth store (auth.db); set --data-dir.");
+                              "Postgres auth store; set --postgres-dsn.");
                 return EXIT_FAILURE;
             }
             std::string why;
@@ -1333,6 +1463,17 @@ int main(int argc, char* argv[]) {
                      "bearer-token-authenticated IdP push that can provision AND deprovision "
                      "operator accounts (read-only 'user' role only).");
     }
+
+    // Tear down the standalone auth-store bootstrap stack now — ServerImpl
+    // builds its own long-lived AuthDB (off its own pg_pool_) inside
+    // Server::create() below; this process must never hold two live AuthDB
+    // background-reaper threads / PgPool connections open at once. Reverse
+    // declaration order (authdb → codec → provider → pool) via the optional/
+    // unique_ptr destructors below is the same safe order server.cpp uses.
+    auth_db.reset();
+    auth_secret_codec.reset();
+    auth_key_provider.reset();
+    auth_pg_pool.reset();
 
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);

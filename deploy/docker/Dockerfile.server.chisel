@@ -26,6 +26,7 @@ FROM ${BUILDER_IMAGE} AS builder
 # so a single multi-arch `docker buildx build --platform amd64,arm64` works.
 ARG TARGETARCH
 ARG TRIPLET=
+ARG YUZU_BUILD_JOBS=
 
 COPY deploy/docker/requirements-meson.txt /tmp/requirements-meson.txt
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -70,13 +71,13 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
         -Dcmake_prefix_path=/src/vcpkg_installed/$T \
         -Dbuild_tests=false \
         -Dbuild_agent=false \
-    && meson compile -C builddir \
+    && meson compile -C builddir ${YUZU_BUILD_JOBS:+-j "${YUZU_BUILD_JOBS}"} \
     && ccache -s
 
 RUN echo "=== ldd yuzu-server ===" && ldd builddir/server/core/yuzu-server || true
 
 # ── Stage 2: chisel — cut Ubuntu 26.04 rootfs + lay down the server ───────
-FROM ubuntu:26.04@sha256:b7f48194d4d8b763a478a621cdc81c27be222ba2206ca3ca6bc42b49685f3d9e AS chisel
+FROM ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb AS chisel
 
 ARG TARGETARCH
 ARG CHISEL_VERSION=v1.4.1

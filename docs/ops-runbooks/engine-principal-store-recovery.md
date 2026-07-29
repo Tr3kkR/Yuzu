@@ -6,9 +6,9 @@ autonomous **engine principals** (`docs/auth-engine-principals-design.md`
 §3.1). Covers the `/readyz` probe, the client-visible 503-vs-401 split on
 `get_for_auth`, and the `engine:` namespace collision-scan boot failure.
 
-Unlike `auth.db` (per-node SQLite, `docs/ops-runbooks/auth-db-recovery.md`),
-this store lives in the shared Postgres substrate — recovery is Postgres
-recovery, not a local-file procedure. See `docs/postgres-store-playbook.md`
+Like the auth store (`docs/ops-runbooks/auth-db-recovery.md`), this store
+lives in the shared Postgres substrate — recovery is Postgres recovery, not a
+local-file procedure. See `docs/postgres-store-playbook.md`
 for the substrate-wide primitives (pool, migration runner, `/readyz`
 conjunction) this runbook assumes.
 
@@ -112,37 +112,41 @@ step, not a routine failure mode.
    normal user-management path — you cannot rename in place through the
    API (`is_valid_username` rejects `:` on write), so this is typically:
    ```bash
-   # Inspect first.
-   sqlite3 /var/lib/yuzu/auth.db \
-     "SELECT username, is_active, identity_source FROM users WHERE username LIKE 'engine:%';"
+   # Inspect first. The human-user store is Postgres — `find_reserved_prefix_users`
+   # scans auth.users over the pg pool, so this is the table the preflight reads.
+   psql "$YUZU_POSTGRES_DSN" -c \
+     "SELECT username, is_active, identity_source FROM auth.users WHERE username LIKE 'engine:%';"
 
-   # Stop the service and back up auth.db first (see
-   # docs/ops-runbooks/auth-db-recovery.md for the general auth.db surgery
-   # cautions). Then EITHER rename the colliding row out of the reserved
+   # Stop the service and take a Postgres dump first (see
+   # docs/ops-runbooks/auth-db-recovery.md for the backup rules, including
+   # the KEK pairing). Then EITHER rename the colliding row out of the reserved
    # namespace (preferred — preserves the account's audit history), OR
    # hard-delete it if it is genuinely stale and unwanted.
    #
    # Rename (preferred): move it to a non-reserved username. Do the same
    # rename in any table that carries the username as a foreign key if you
    # want to keep the account usable.
-   sqlite3 /var/lib/yuzu/auth.db \
-     "UPDATE users SET username = 'legacy_engine_reclaimed' WHERE username = 'engine:legacy';"
+   psql "$YUZU_POSTGRES_DSN" -c \
+     "UPDATE auth.users SET username = 'legacy_engine_reclaimed' WHERE username = 'engine:legacy';"
 
    # OR hard-delete (only if the row is stale and you do not need it):
-   sqlite3 /var/lib/yuzu/auth.db \
-     "DELETE FROM users WHERE username = 'engine:legacy';"
+   psql "$YUZU_POSTGRES_DSN" -c \
+     "DELETE FROM auth.users WHERE username = 'engine:legacy';"
    ```
    `find_reserved_prefix_users` intentionally includes soft-deleted rows
    too (it scans the `username` primary key, not active-user visibility) —
    a soft-deleted collision still occupies the reserved name, so
-   `UPDATE users SET is_active = 0` alone will NOT satisfy this preflight.
+   `UPDATE auth.users SET is_active = 0` alone will NOT satisfy this preflight.
    Only a rename (moving the name out of the `engine:` namespace) or a hard
    `DELETE` (removing the primary-key row) actually clears the collision.
 3. For each colliding **local RBAC group**: `RbacStore::create_group`
    already refuses new creates in this namespace, so a collision here is
    necessarily a pre-existing row. Inspect and delete it via
    `RbacStore::delete_group` (dashboard: Settings → RBAC → Groups) or
-   direct SQL against `rbac.db`:
+   direct SQL against `rbac.db`. Note the tool changes here: `RbacStore` has
+   **not** migrated — it is still SQLite, per-node, so this half of the
+   collision really is `sqlite3` against a file while the user half above is
+   `psql` against Postgres:
    ```bash
    sqlite3 /var/lib/yuzu/rbac.db \
      "SELECT name, source FROM groups WHERE name LIKE 'engine:%' AND source = 'local';"
@@ -212,5 +216,5 @@ capacity instead.
   integrity), §12 decision 1 (the StoreUnreachable/MissingOrRevoked split).
 - Substrate-wide Postgres store recovery (pool exhaustion, PG down at boot,
   migration drift): `docs/postgres-store-playbook.md`.
-- `auth.db` (SQLite, per-node) recovery for the human-principal side of
+- Auth store (`auth.*` in Postgres) recovery for the human-principal side of
   the namespace collision: `docs/ops-runbooks/auth-db-recovery.md`.

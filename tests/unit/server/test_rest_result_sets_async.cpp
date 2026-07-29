@@ -18,6 +18,7 @@
 
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
+#include "inventory_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "rest_api_v1.hpp"
 #include "result_set_store.hpp"
@@ -74,6 +75,13 @@ struct AsyncHarness {
     std::unique_ptr<ResultSetStore> store;
     std::unique_ptr<ExecutionTracker> tracker;
     std::unique_ptr<InstructionStore> instr;
+    /// #2500: from-inventory-query is the FOURTH instance of the targeting
+    /// widening and has its own code path. Its handler 503s before any input
+    /// validation when the store is unwired (dependency-before-validation is
+    /// the convention on these routes), so reaching its parent_id guard at all
+    /// requires a real store.
+    yuzu::test::TempDbFile inv_db{std::string_view("rs-async-inv-")};
+    std::unique_ptr<InventoryStore> inventory;
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
 
@@ -94,6 +102,9 @@ struct AsyncHarness {
 
         instr = std::make_unique<InstructionStore>(":memory:");
         REQUIRE(instr->is_open());
+
+        inventory = std::make_unique<InventoryStore>(inv_db.path);
+        REQUIRE(inventory->is_open());
 
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
@@ -128,7 +139,7 @@ struct AsyncHarness {
                             /*quarantine_store=*/nullptr, /*response_store=*/nullptr, instr.get(),
                             tracker.get(), /*schedule_engine=*/nullptr, /*approval_manager=*/nullptr,
                             /*tag_store=*/nullptr, /*audit_store=*/nullptr, /*service_group_fn=*/{},
-                            /*tag_push_fn=*/{}, /*inventory_store=*/nullptr,
+                            /*tag_push_fn=*/{}, inventory.get(),
                             /*product_pack_store=*/nullptr, /*sw_deploy_store=*/nullptr,
                             /*device_token_store=*/nullptr, /*license_store=*/nullptr,
                             /*guaranteed_state_store=*/nullptr, &metrics, /*session_revoke_fn=*/{},
@@ -198,11 +209,16 @@ TEST_CASE("from-tar-query: 202 pending, dispatch to __all__ when no parent",
     REQUIRE(data["source_kind"] == "tar_query");
     REQUIRE_FALSE(data["source_execution_id"].get<std::string>().empty());
 
-    // Dispatch happened with tar/sql, empty scope (=> broadcast), sql param.
+    // Dispatch happened with tar/sql, an EXPLICIT `__all__` scope, sql param.
+    // This case's name always said `__all__`; the assertion used to be
+    // `scope_expr.empty()`, because empty was the proxy for broadcast at the
+    // dispatch sink. #2500 inverted that default — empty now reaches nobody —
+    // so the producer names the broadcast and the assertion finally matches
+    // the name it has had all along.
     REQUIRE(h.calls.size() == 1);
     REQUIRE(h.calls[0].plugin == "tar");
     REQUIRE(h.calls[0].action == "sql");
-    REQUIRE(h.calls[0].scope_expr.empty());
+    REQUIRE(h.calls[0].scope_expr == "__all__");
     REQUIRE(h.calls[0].params.at("sql") == "SELECT pid FROM process_live");
     // execution_id was minted BEFORE dispatch (create-before-dispatch).
     REQUIRE(h.calls[0].execution_id == data["source_execution_id"].get<std::string>());
@@ -285,6 +301,94 @@ TEST_CASE("from-tar-query: missing sql is 400, no dispatch", "[pg][result_set][a
     h.post("/api/v1/result-sets/from-tar-query", R"({"name":"x"})", status);
     REQUIRE(status == 400);
     REQUIRE(h.calls.empty());
+}
+
+TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not widened",
+          "[result_set][async][tar][targeting][security]") {
+    // parent_id IS the targeting argument on this route: present and non-empty
+    // scopes the dispatch to that set's members via `from_result_set:`, absent
+    // broadcasts to every connected agent. The guard used to be
+    // `contains && is_string && !empty`, so a SUPPLIED parent_id that was
+    // numeric or empty fell through to the untargeted arm — a caller who
+    // believed it was narrowing to one result set dispatched to the whole
+    // fleet instead. Same shape as the agent_ids defect on the two routes
+    // #2500 names; found while auditing this call site for that fix.
+    //
+    // `h.calls.empty()` is the assertion that matters: a 400 that still
+    // dispatched would leave the widening intact behind a better status code.
+    SECTION("numeric parent_id") {
+        AsyncHarness h;
+        int status = 0;
+        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","parent_id":123})",
+               status);
+        REQUIRE(status == 400);
+        REQUIRE(h.calls.empty());
+    }
+    SECTION("empty-string parent_id") {
+        AsyncHarness h;
+        int status = 0;
+        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","parent_id":""})",
+               status);
+        REQUIRE(status == 400);
+        REQUIRE(h.calls.empty());
+    }
+    SECTION("explicit null parent_id") {
+        // Rejected rather than read as "absent". A client that serialises an
+        // unset field as null and one whose parent lookup returned nothing are
+        // indistinguishable here, and only one of them wants the entire fleet.
+        AsyncHarness h;
+        int status = 0;
+        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","parent_id":null})",
+               status);
+        REQUIRE(status == 400);
+        REQUIRE(h.calls.empty());
+    }
+    SECTION("the refusal is counted and audited, not just returned") {
+        // Governance found the first version of this guard emitted neither, so
+        // the third and fourth instances of the defect class were invisible to
+        // the alert the change ships. The reason label names the field that was
+        // actually wrong: an earlier version reused `scope_empty`, which put a
+        // field the caller never sent into the audit trail.
+        AsyncHarness h;
+        int status = 0;
+        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","parent_id":123})",
+               status);
+        REQUIRE(status == 400);
+        CHECK(h.metrics
+                  .counter("yuzu_server_dispatch_target_rejected_total",
+                           {{"route", "result_set_parent"}, {"reason", "parent_id_type"}})
+                  .value() == 1.0);
+    }
+    SECTION("from-inventory-query — the fourth instance, its own code path") {
+        // Not covered by the run_async guard: this producer has its own
+        // parent_id block and was missed by the first round of the fix. It is
+        // synchronous, so the consequence was a READ across every device rather
+        // than a dispatch — narrower blast radius, same defect.
+        AsyncHarness h;
+        int status = 0;
+        h.post("/api/v1/result-sets/from-inventory-query", R"({"query":"os=linux","parent_id":""})",
+               status);
+        REQUIRE(status == 400);
+        CHECK(h.metrics
+                  .counter("yuzu_server_dispatch_target_rejected_total",
+                           {{"route", "result_set_parent"}, {"reason", "parent_id_empty"}})
+                  .value() == 1.0);
+    }
+    SECTION("a non-object body is refused, not read as an absent parent_id") {
+        AsyncHarness h;
+        int status = 0;
+        h.post("/api/v1/result-sets/from-tar-query", R"(["sql"])", status);
+        REQUIRE(status == 400);
+        CHECK(h.calls.empty());
+    }
+    SECTION("omitting parent_id still broadcasts — the over-broadness guard") {
+        AsyncHarness h;
+        int status = 0;
+        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+        REQUIRE(status == 202);
+        REQUIRE(h.calls.size() == 1);
+        REQUIRE(h.calls[0].scope_expr == "__all__");
+    }
 }
 
 TEST_CASE("from-tar-query: zero agents reached is 503, execution cancelled, no pending row",

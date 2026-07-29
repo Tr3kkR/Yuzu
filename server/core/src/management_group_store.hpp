@@ -82,6 +82,35 @@ public:
                                                    const std::string& role_name);
     std::vector<GroupRoleAssignment> get_group_roles(const std::string& group_id) const;
 
+    /// Batched (ADR-0017 INV-10) role assignments applicable to a principal:
+    /// every `GroupRoleAssignment` whose principal is the user directly
+    /// (`principal_type='user' AND principal_id=user`) OR one of the user's
+    /// RBAC groups (`principal_type='group' AND principal_id IN rbac_groups`).
+    /// This is the union both `RbacStore::check_scoped_permission` and the
+    /// ADR-0017 list-read primitives resolve over, replacing the per-group
+    /// `get_group_roles` N+1 walk. Fail-closed (ADR-0017 INV-1/INV-5):
+    /// `unexpected(msg)` on a closed store, prepare failure, or a mid-scan step
+    /// error, so a read failure denies rather than silently narrowing to
+    /// nothing — which, for a principal carrying a DENY assignment, would fail
+    /// OPEN (an unseen deny → an un-suppressed agent). A value (possibly empty)
+    /// is a genuine, fully-read result.
+    std::expected<std::vector<GroupRoleAssignment>, std::string>
+    get_assignments_for_principal(const std::string& user,
+                                  const std::vector<std::string>& rbac_groups) const;
+
+    /// Distinct member agent_ids of `seed_groups` AND every descendant group,
+    /// resolved in ONE recursive-CTE query (ADR-0017 INV-4 descendant-ward,
+    /// INV-10 batched). A role grant on a group applies downward to its
+    /// descendants (the mirror of `check_scoped_permission`'s ancestor-ward
+    /// admit), so the visible/denied agent set for a set of perm-holding groups
+    /// is the union of their subtrees' members. Fail-closed (INV-1/INV-5):
+    /// `unexpected(msg)` on any failure, so a partial walk can never
+    /// under-compute a DENY set (which would over-disclose). Empty `seed_groups`
+    /// yields an empty result without a query. `UNION` (not `UNION ALL`) dedups,
+    /// so a cyclic `parent_id` chain terminates rather than looping.
+    std::expected<std::vector<std::string>, std::string>
+    get_member_agents_in_subtrees(const std::vector<std::string>& seed_groups) const;
+
     /// Which agents can a user see based on group-scoped role assignments?
     ///
     /// PRECONDITION: the caller must have already authenticated the session.

@@ -8,7 +8,7 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 
-#include "../test_helpers.hpp"
+#include "test_auth_db_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -178,55 +178,46 @@ TEST_CASE("remove_user returns false for nonexistent user", "[auth][user]") {
 // own `std::expected<bool, AuthDBError>` truth instead of the cache-erase
 // bool, with cache/session cleanup demoted to a best-effort side effect.
 TEST_CASE("remove_user returns true for a cold-cache DB hit (CC6.8 cold cache)",
-          "[auth][user][cold_cache]") {
-    yuzu::test::TempDir dir;
-    fs::create_directories(dir.path);
-    AuthDB auth_db(dir.path, /*cleanup_interval_secs=*/0);
-    REQUIRE(auth_db.initialize().has_value());
+          "[pg][auth][user][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
 
     // Seed the row directly through AuthDB, bypassing AuthManager entirely —
     // no AuthManager instance ever caches this username.
     auto salt = AuthManager::random_bytes(16);
     auto salt_hex = AuthManager::bytes_to_hex(salt);
     REQUIRE(auth_db
-                .upsert_user("cora", AuthManager::pbkdf2_sha256("password1234", salt, 1000),
-                             salt_hex, Role::user)
+                ->upsert_user("cora", AuthManager::pbkdf2_sha256("password1234", salt, 1000),
+                              salt_hex, Role::user)
                 .has_value());
 
     // A fresh AuthManager over the SAME AuthDB, modeling a cold-booted
     // process: its in-memory users_ map has never seen "cora".
     AuthManager cold_mgr;
-    cold_mgr.set_auth_db(&auth_db);
+    cold_mgr.set_auth_db(auth_db.get());
 
     REQUIRE(cold_mgr.remove_user("cora"));
 
-    // The DB row is now soft-deleted (is_active = 0) — get_user filters
-    // is_active = 1, so it now reports not-found.
-    REQUIRE_FALSE(auth_db.get_user("cora").has_value());
+    // The DB row is now soft-deleted (is_active = false) — get_user filters
+    // is_active, so it now reports not-found.
+    REQUIRE_FALSE(auth_db->get_user("cora").has_value());
 }
 
 TEST_CASE("remove_user returns false for a DB miss, no error (cold cache)",
-          "[auth][user][cold_cache]") {
-    yuzu::test::TempDir dir;
-    fs::create_directories(dir.path);
-    AuthDB auth_db(dir.path, /*cleanup_interval_secs=*/0);
-    REQUIRE(auth_db.initialize().has_value());
+          "[pg][auth][user][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
 
     AuthManager cold_mgr;
-    cold_mgr.set_auth_db(&auth_db);
+    cold_mgr.set_auth_db(auth_db.get());
 
     REQUIRE_FALSE(cold_mgr.remove_user("nonexistent"));
 }
 
 TEST_CASE("remove_user still succeeds and clears sessions on a warm cache",
-          "[auth][user][cold_cache]") {
-    yuzu::test::TempDir dir;
-    fs::create_directories(dir.path);
-    AuthDB auth_db(dir.path, /*cleanup_interval_secs=*/0);
-    REQUIRE(auth_db.initialize().has_value());
+          "[pg][auth][user][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
 
     AuthManager mgr;
-    mgr.set_auth_db(&auth_db);
+    mgr.set_auth_db(auth_db.get());
 
     // upsert_user goes through AuthManager, so it warms the cache too.
     REQUIRE(mgr.upsert_user("dana", "password1234", Role::user));
@@ -238,7 +229,7 @@ TEST_CASE("remove_user still succeeds and clears sessions on a warm cache",
 
     // Sessions belonging to the removed user are invalidated (CHAOS-T1-001).
     REQUIRE_FALSE(mgr.validate_session(*token).has_value());
-    REQUIRE_FALSE(auth_db.get_user("dana").has_value());
+    REQUIRE_FALSE(auth_db->get_user("dana").has_value());
 }
 
 // ── update_role: cold-cache DB truth (CC6.7, SCIM hardening round) ─────────
@@ -255,58 +246,49 @@ TEST_CASE("remove_user still succeeds and clears sessions on a warm cache",
 // AuthDB `std::expected<void, AuthDBError>` truth, with cache/session
 // cleanup demoted to a best-effort side effect (mirrors remove_user).
 TEST_CASE("update_role returns true for a cold-cache DB hit and the DB row reflects the change",
-          "[auth][user][cold_cache]") {
-    yuzu::test::TempDir dir;
-    fs::create_directories(dir.path);
-    AuthDB auth_db(dir.path, /*cleanup_interval_secs=*/0);
-    REQUIRE(auth_db.initialize().has_value());
+          "[pg][auth][user][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
 
     // Seed the row directly through AuthDB, bypassing AuthManager entirely —
     // no AuthManager instance ever caches this username.
     auto salt = AuthManager::random_bytes(16);
     auto salt_hex = AuthManager::bytes_to_hex(salt);
     REQUIRE(auth_db
-                .upsert_user("cora", AuthManager::pbkdf2_sha256("password1234", salt, 1000),
-                             salt_hex, Role::user)
+                ->upsert_user("cora", AuthManager::pbkdf2_sha256("password1234", salt, 1000),
+                              salt_hex, Role::user)
                 .has_value());
 
     // A fresh AuthManager over the SAME AuthDB, modeling a cold-booted
     // process: its in-memory users_ map has never seen "cora".
     AuthManager cold_mgr;
-    cold_mgr.set_auth_db(&auth_db);
+    cold_mgr.set_auth_db(auth_db.get());
 
     REQUIRE(cold_mgr.update_role("cora", Role::admin));
 
     // The DB row itself reflects the change — this is the assertion that
     // proves the fix (previously this would return false despite the DB
     // write above having already succeeded).
-    auto entry = auth_db.get_user("cora");
+    auto entry = auth_db->get_user("cora");
     REQUIRE(entry.has_value());
     REQUIRE(entry->role == Role::admin);
 }
 
 TEST_CASE("update_role returns false for a DB miss, no error (cold cache)",
-          "[auth][user][cold_cache]") {
-    yuzu::test::TempDir dir;
-    fs::create_directories(dir.path);
-    AuthDB auth_db(dir.path, /*cleanup_interval_secs=*/0);
-    REQUIRE(auth_db.initialize().has_value());
+          "[pg][auth][user][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
 
     AuthManager cold_mgr;
-    cold_mgr.set_auth_db(&auth_db);
+    cold_mgr.set_auth_db(auth_db.get());
 
     REQUIRE_FALSE(cold_mgr.update_role("nonexistent", Role::admin));
 }
 
 TEST_CASE("update_role still succeeds and clears sessions on a warm cache",
-          "[auth][user][cold_cache]") {
-    yuzu::test::TempDir dir;
-    fs::create_directories(dir.path);
-    AuthDB auth_db(dir.path, /*cleanup_interval_secs=*/0);
-    REQUIRE(auth_db.initialize().has_value());
+          "[pg][auth][user][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
 
     AuthManager mgr;
-    mgr.set_auth_db(&auth_db);
+    mgr.set_auth_db(auth_db.get());
 
     // upsert_user goes through AuthManager, so it warms the cache too.
     REQUIRE(mgr.upsert_user("dana", "password1234", Role::user));
@@ -320,7 +302,7 @@ TEST_CASE("update_role still succeeds and clears sessions on a warm cache",
     // stale session role can't grant old privileges.
     REQUIRE_FALSE(mgr.validate_session(*token).has_value());
     REQUIRE(mgr.get_user_role("dana") == Role::admin);
-    auto entry = auth_db.get_user("dana");
+    auto entry = auth_db->get_user("dana");
     REQUIRE(entry.has_value());
     REQUIRE(entry->role == Role::admin);
 }
@@ -428,23 +410,6 @@ TEST_CASE("idle timeout slides forward on activity (active session stays alive)"
     // can't dip the measured steady_clock gap below the eviction threshold.
     std::this_thread::sleep_for(std::chrono::milliseconds(2700));
     CHECK_FALSE(mgr->validate_session(*token).has_value());
-}
-
-TEST_CASE("AuthDB::touch_session_activity is a best-effort mirror", "[auth][session][authdb]") {
-    // TempDir = RAII cleanup, so a failed REQUIRE below cannot leak the temp dir
-    // (governance qe SHOULD-1).
-    yuzu::test::TempDir td;
-    fs::create_directories(td.path);
-    yuzu::server::AuthDB db(td.path, /*cleanup_interval_secs=*/0); // no reaper thread
-    REQUIRE(db.initialize().has_value());
-
-    auto token = db.create_session("alice", Role::admin);
-    REQUIRE(token.has_value());
-    // Touching an existing row succeeds.
-    CHECK(db.touch_session_activity(*token).has_value());
-    // Best-effort: a no-match UPDATE is still success (the in-memory map is the
-    // authoritative idle path; this durable mirror is fire-and-forget).
-    CHECK(db.touch_session_activity("deadbeefdeadbeef").has_value());
 }
 
 TEST_CASE("invalidate_user_sessions wipes every session for a user (multi-token)",
