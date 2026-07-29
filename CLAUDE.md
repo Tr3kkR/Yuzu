@@ -53,7 +53,7 @@ Four standing rules the skill enforces (#2604), all catastrophic-if-violated:
 
 Every finding is recorded to a run ledger with `pass_ordinal`, stable `finding_id`, `provenance` and `disposition`. It is not a database, and not a signed-waiver merge contract - gating findings are still resolved before the gate passes. Storage location is #2618; the call is repo-committed fragments on the `changelog.d` model, since governance runs locally and the record has to be readable by whoever reviews the PR.
 
-**The skill is read from your working tree.** A branch predating a change to it, or to `.claude/routed-concerns.md`, silently runs the old pipeline; Step 0 opens with a currency check against `origin/dev` covering all three files. The same rule governs any claim that a file or row is *absent* - verify with `git show origin/dev:<path>`, never a working-tree `ls`.
+**The skill is read from your working tree.** A branch predating a change to it, or to `.claude/routed-concerns.md`, silently runs the old pipeline; Step 0 opens with a per-file currency check comparing your **working tree** against `origin/dev` - the tree is what gets read, so a commit-to-commit comparison tests the wrong object. The same rule governs any claim that a file or row is *absent* - verify with `git show origin/dev:<path>`, never a working-tree `ls`.
 
 ## Darwin Compatibility
 
