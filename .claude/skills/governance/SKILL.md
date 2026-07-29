@@ -42,7 +42,32 @@ Per CLAUDE.md: CRITICAL/HIGH are blocking, MEDIUM should be fixed, LOW addressed
 
 ## Step 0 — Before you launch anything
 
-Run these in parallel to size the change and pick domain agents:
+### First: confirm you are running the current pipeline
+
+This skill and the routed-concern table are read **from your working tree**, so a branch
+that predates a change to either silently runs the old pipeline. At the time #2604
+merged, 81 of 81 local branches predated it.
+
+```bash
+git fetch origin dev -q
+git diff --quiet origin/dev -- .claude/skills/governance/ .claude/routed-concerns.md \
+  && echo "governance assets current" \
+  || echo "STALE - your copy differs from origin/dev; reconcile before running"
+```
+
+If it reports stale, reconcile before running: rebase or merge `origin/dev`, or read the
+two files from `origin/dev` directly (`git show origin/dev:<path>`) and use those. Do not
+proceed on the assumption that your copy is current - the same failure mode produces
+confident false claims about which agents a change routes to.
+
+**The same rule applies to any claim that a file, row or invariant is ABSENT.** Check
+`git show origin/dev:<path>`, never `ls` or a working-tree grep. Staleness inverts absence
+claims, and an external reviewer pointed at your tree inherits the error rather than
+catching it.
+
+### Then: size the change and pick domain agents
+
+Run these in parallel:
 
 ```bash
 git log --oneline <range>
@@ -857,11 +882,20 @@ Strategy:
 
 2. **Don't commit until governance passes.** Per CLAUDE.md.
 
-3. **Record every finding in the run ledger.** Write a JSONL file at
-   `<run-log-dir>/governance-findings.jsonl` — one object per finding. There is **no
-   database and no shared store yet**; this is a per-run file, and making it durable
-   shared change-control evidence is tracked separately. Do not describe it as more
-   than it is.
+3. **Record every finding in the run ledger.** Write one JSONL object per finding to:
+
+   ```
+   ${YUZU_GOV_LOG_DIR:-~/.local/share/yuzu/governance-runs}/<run_id>.jsonl
+   ```
+
+   `run_id` is `gov-<UTC date>-<short base sha>-<n>`, e.g. `gov-2026-07-29-01455cd1-1`.
+   Create the directory if absent. The path mirrors the `/test` skill's `test-runs.db`
+   convention deliberately: outside the repo, so it survives `git clean` and never lands
+   in a diff.
+
+   There is **no database and no shared store yet** - this is a per-run file, and making
+   it durable shared change-control evidence is tracked separately. Do not describe it as
+   more than it is.
 
    Fields, all required unless marked:
 

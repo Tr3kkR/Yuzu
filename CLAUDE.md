@@ -43,7 +43,17 @@ Context is the scarce resource. Keep this thread lean; spend file-reading budget
 
 Specialized agents live in `.claude/agents/` (each declares its role, triggers, reference docs). `workflow-orchestrator` owns the gate sequence; `/governance` is the entry point for the full pipeline on a commit range.
 
-Pipeline (8 gates, convention-enforced): Change Summary + Resource Ledger → security-guardian + docs-writer → domain-triggered (`cpp-expert` + `cpp-safety` on any C++) → happy-path + unhappy-path + consistency-auditor → chaos-injector (skipped if no findings) → compliance-officer + sre + enterprise-readiness → findings addressed (CRITICAL/HIGH block merge) → iterate. Use `/governance <range>`, not hand-running — waves 1–4 shipped 4 CRITICAL command-injection vulns without it.
+Pipeline (8 gates, convention-enforced): Change Summary + Resource Ledger → security-guardian + docs-writer → domain-triggered (`cpp-expert` + `cpp-safety` on any C++) → happy-path + unhappy-path + consistency-auditor → chaos-injector (skipped if no findings) → compliance-officer + sre + enterprise-readiness → findings addressed → iterate. Use `/governance <range>`, not hand-running - waves 1–4 shipped 4 CRITICAL command-injection vulns without it.
+
+Four standing rules the skill enforces (#2604), all catastrophic-if-violated:
+1. **Routed-concern triggers are UNCONDITIONAL.** Step 0 and Gate 8 must *open* `.claude/routed-concerns.md` and match it row by row against the changed paths - never work from recall. **Diff size never gates a routed concern**: the matrix decides WHICH agents, never WHETHER.
+2. **Agents report in their OWN severity vocabulary**; the skill calibrates the threshold. GATING maps from CRITICAL / HIGH / BLOCKING. **An unmappable severity defaults to GATING** - nothing is silently downgraded.
+3. **Prose: `docs-writer` owns WORDING** (including in-code comments and log/error strings); **the DOMAIN agent owns TRUTH**. A comment that *contradicts* the code is a truth finding at native severity and any agent may raise it; wording-only is capped at NICE.
+4. **Gate 8 re-runs every gate whose DOMAIN THE FIX DIFF TOUCHES**, not only those whose findings prompted the fix - the old rule shipped a broken macOS leg on #2580.
+
+Every finding is recorded to a per-run JSONL ledger (`${YUZU_GOV_LOG_DIR:-~/.local/share/yuzu/governance-runs}/<run_id>.jsonl`) with `pass_ordinal`, stable `finding_id`, `provenance` and `disposition`. It is a per-run file, not a database, and not a signed-waiver merge contract - gating findings are still resolved before the gate passes.
+
+**The skill is read from your working tree.** A branch predating a change to it, or to `.claude/routed-concerns.md`, silently runs the old pipeline; Step 0 opens with a currency check against `origin/dev`. The same rule governs any claim that a file or row is *absent* - verify with `git show origin/dev:<path>`, never a working-tree `ls`.
 
 ## Darwin Compatibility
 
