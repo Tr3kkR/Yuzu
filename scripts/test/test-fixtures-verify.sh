@@ -6,6 +6,24 @@
 # against the (now-upgraded) server. Each check produces a per-fixture
 # {name, status, expected, actual} entry in fixtures-verify.json.
 #
+# WHAT THIS DOES NOT PROVE (measured during review, deliberately not fixed here):
+#   * api_tokens uses an owner-scoped ROW COUNT, so a green means the owner sees
+#     no token, not that the token was invalidated — see the KNOWN LIMIT note at
+#     the api_tokens check for the full contract a real proof must satisfy.
+#   * user_admin passes whenever the credentials file is still mounted: it is
+#     bind-mounted into BOTH upgrade legs and the admin is re-seeded from it, so
+#     genuine user-table loss is invisible here despite the wording below.
+#   * the audit check parses with `except: print(0)` on both legs, so two
+#     unreadable bodies compare `0 >= 0` and pass; and both readings are capped
+#     by `?limit=`, so equal-at-the-cap proves nothing.
+#   * an unparseable state file yields empty strings that satisfy the numeric
+#     comparisons, greening a run that verified nothing.
+# None of these were introduced by the change that added this note — all are
+# pre-existing, and each was measured rather than reasoned about. They are
+# written down because an undocumented blind spot in the only automated
+# upgrade-data-loss gate is worse than a documented one, and because a green
+# from this script has been mistaken for broader assurance than it carries.
+#
 # NOT every fixture asserts SURVIVAL. `api_tokens` asserts whichever contract
 # the upgrade edge under test actually carries (see --api-tokens-expect): on an
 # edge that crosses the ADR-0030 SQLite->Postgres cutover, the CORRECT outcome
@@ -297,9 +315,42 @@ if [[ "$API_PRESENT_BEFORE" == "True" ]]; then
             set_result "api_tokens" "endpoint unreadable"
         elif [[ "$API_TOKENS_EXPECT" == "invalidated" ]]; then
             # This edge CROSSES the ADR-0030 cutover, so the tokens must be gone.
+            #
+            # KNOWN LIMIT — READ THIS BEFORE TRUSTING A GREEN HERE.
+            # A zero count proves the CALLER SEES no token. It does NOT prove the
+            # token was invalidated. `GET /api/v1/tokens` is owner-scoped
+            # (`list_tokens(session->username)` -> `WHERE principal_id = $1`,
+            # api_token_store.cpp), so a principal rename, an RBAC scoping change,
+            # or a token minted under a different principal_id each return zero
+            # exactly as a real cutover does. So this catches the REALISTIC
+            # regression — the cutover silently not happening, which leaves tokens
+            # present AND listed — and misses the narrower survive-but-invisible
+            # case.
+            #
+            # This is the pre-existing strength of the evidence, not something
+            # this change weakened: the check has always been a row count. It is
+            # written down so the next reader does not mistake a green for more
+            # than it is.
+            #
+            # Closing it needs a bearer probe, deliberately left to a SEPARATE
+            # change because an attempt at it here produced six blocking findings
+            # across two review rounds. What that change must get right — all of
+            # it measured, none of it obvious:
+            #   * probe `GET /api/v1/me` (auth_fn only), NOT `/api/v1/tokens`
+            #     (authorization-gated: a 403 there means AUTHENTICATED but not
+            #     authorized, i.e. a live credential);
+            #   * require EXACTLY 401 — 403 and 2xx are both invalidation-unproven;
+            #   * the WRITER must first prove the extracted string authenticates
+            #     pre-upgrade, or a later rejection proves nothing about the real
+            #     token;
+            #   * failing to arm that probe must FAIL, never downgrade to a skip;
+            #   * 401 also means TTL expiry and a dead ApiTokenStore, so widen the
+            #     fixture TTL and treat elapsed >= TTL as unproven;
+            #   * any selftest for it must be credential-VALUE-aware, or it passes
+            #     while the wrong token is presented.
             if (( API_COUNT == 0 )); then
-                okx "API tokens invalidated as designed (ADR-0030 — 0 present, operators must re-mint)"
-                set_result "api_tokens" "invalidated as designed (ADR-0030)"
+                okx "API tokens invalidated as designed (ADR-0030 — 0 listed; see KNOWN LIMIT above: this is owner-invisibility, not proof of invalidation)"
+                set_result "api_tokens" "invalidated as designed (ADR-0030; row-count evidence only)"
                 DATA_OK=$((DATA_OK + 1))
             else
                 fl "API tokens SURVIVED an upgrade that crossed the ADR-0030 cutover ($API_COUNT present) — a legacy store is still being read"
