@@ -186,11 +186,13 @@ them into one choice is what let severity be chosen:
 
   I1  security-control failure — an authn, authz, confinement, crypto, or
       audit control does not hold                                     base HIGH
-  I2  data loss or corruption — data destroyed or wrong. Whether an
-      error was surfaced changes EXPOSURE, not this                   base HIGH
+  I2  data loss or corruption — data destroyed or wrong. A surfaced
+      error does not lower this; silence is not a precondition                   base HIGH
   I3  wrong result presented as correct — the caller cannot tell      base HIGH
   I4  harmful operator guidance — a doc, runbook, or error message
-      directs an operator to a NAMED action that damages or fails     base HIGH
+      directs an operator to a NAMED action that causes damage, or
+      that fails in a way which conceals the real state. Guidance
+      that merely fails visibly and diagnosably is I7 or I8, not I4  base HIGH
                                                                       (caps at HIGH)
   I5  unavailability — crash, hang, deadlock, wedge, unbounded growth base MEDIUM
   I6  capability absent or unreachable — a deliverable the change
@@ -201,10 +203,21 @@ them into one choice is what let severity be chosen:
   I8  degraded but correct — slow, wasteful, noisy; output still right base LOW
   I9  no operational impact — latent, stylistic, defence-in-depth only base INFO
 
-I6 raises to HIGH when the absent capability is a security or data-integrity
-control — the change presents a control that is not in fact enforced. #2202
-Blocker 4 is the reference case: an RBAC resolver consuming a grant no production
-route could author.
+I6 raises to HIGH in exactly two cases:
+  (a) FALSE ASSURANCE — the change advertises a security or data-integrity
+      control as in force which is not in fact enforced; or
+  (b) DORMANT AUTHORISATION CODE — a new authz or enforcement branch ships with
+      no production caller or author, so it goes live later without re-review.
+      #2202 Blocker 4 is the reference case for (b): an RBAC resolver consuming
+      a grant no production route could author. It is (b), NOT (a) — that
+      resolver fails CLOSED, so nothing was under-enforced.
+
+I5 raises to HIGH when the unavailability is unbounded or persistent AND falls on
+a serialised path shared with a security or data-integrity operation (revocation,
+enforcement, audit, retention), or when it wedges a state machine. Delaying a
+security operation at scale is a security outcome, not a performance one. #2580's
+15s unbatched sampler on the agent-revocation thread is the reference case, and
+the class also covers #2284's state-machine wedges.
 
 I7 raises to HIGH when the omission conceals a breaking change, a security-
 relevant behaviour, a data-loss risk, a migration step, or an irreversible
@@ -226,6 +239,9 @@ is not reached by an attacker, so EXPOSURE cannot promote it to CRITICAL.
       unable to occur in production                                   cap at LOW
 
 Bands, ordered:  INFO < LOW < MEDIUM < HIGH < CRITICAL
+Order of operations: apply the strongest RAISE first, then any CAP. `E6` is
+applied LAST and dominates every raise — the same recorded facts must not derive
+CRITICAL or LOW depending on the order they are read in.
 
 E4 is deliberately NOT a downgrade. In Yuzu the default is frequently the LESS
 hardened setting — RBAC off is the default, `--auth-mode=sso-only` is opt-in — so
@@ -254,9 +270,21 @@ IMPACT/EXPOSURE and they always gate:
 
   - a Resource Ledger omission on a C++ diff
   - a direct edit to `CHANGELOG.md`, or a missing mandated `changelog.d/` fragment
-  - a broken build or test leg on any supported platform
-  - manual resource cleanup in new or touched C++ that is not RAII-wrapped, absent
-    a documented impossibility
+  - a broken build or test leg on any supported platform that this change
+    INTRODUCED or newly exposed — not a pre-existing or environmental failure
+  - manual resource cleanup in NEW C++ that is not RAII-wrapped, absent a
+    documented impossibility. Pre-existing cleanup in a file this change merely
+    touches is SHOULD, not a floor
+  - a violation of an explicit MUST / never / catastrophic-if-violated invariant
+    stated in CLAUDE.md, `.claude/routed-concerns.md`, or an accepted ADR — a
+    second copy of a single-chokepoint rule, a forked dangerous-op gate, an
+    approval gate outside the core primitive, a new server SQLite store with no
+    exception ADR. These have no wrong outcome TODAY, which is exactly why the
+    derivation cannot see them
+  - a FALSE-GREEN test offered as closure evidence for a blocking finding — a
+    test that cannot observe what it asserts. Ordinary missing coverage stays
+    SHOULD; this is a floor because it is evidence of resolution that is not
+    evidence of anything (#2580 parity test)
 
 A missing test for a behaviour that has a bounded blast radius is SHOULD, not a
 floor.
@@ -266,6 +294,8 @@ floor.
 - TRIGGER unresolved → keep IMPACT honest, set EPISTEMIC STATUS `speculative`.
   A speculative finding does not gate on its own. Never record a lower IMPACT
   than you actually observed in order to express low confidence.
+  If a finding is BOTH speculative AND has unresolved EXPOSURE, it GATES:
+  a schema failure outranks weak evidence, because the unknown may be `E1`.
 - EXPOSURE undeterminable → record `unresolved`. It does NOT default to E3, and
   it GATES pending adjudication. Defaulting an unknown to "no change" is a silent
   downgrade of a possible E1.
@@ -365,9 +395,10 @@ callback context, subprocess, mapped library, and temp path. Each
 resource must have exactly one owner, one release path, explicit
 transfer behavior, and checked failure cleanup.
 
-Manual cleanup in new or touched C++ code is BLOCKING unless it is
-wrapped in a small RAII owner/scope guard or the exception is documented
-as impossible to express safely. Check every early return between
+Manual cleanup in NEW C++ code is a policy floor (see the shared preamble)
+unless it is wrapped in a small RAII owner/scope guard or the exception is
+documented as impossible to express safely. Pre-existing cleanup in a file
+this change merely touches is SHOULD, not a floor. Check every early return between
 acquire and release.
 
 Shell-command surfaces are high risk: new `system()`, `popen()`, shell
@@ -544,9 +575,11 @@ Use `git show <sha>` and `git diff <range>` to see the full scope.
 ## Your job
 
 You are the mandatory docs reviewer for Gate 2. Read every modified
-file and the related user-facing documentation. Per CLAUDE.md
-"Documentation requirements": user-facing behavior changes without
-doc updates are BLOCKING.
+file and the related user-facing documentation. Per standing rule 2:
+a user-facing behaviour change with no doc is `I7` — SHOULD by default,
+BLOCKING when the omission conceals a breaking change, security-relevant
+behaviour, data-loss risk, migration step, or an irreversible operation.
+Do not assert a blanket BLOCKING.
 
 Specifically verify:
 1. REST API docs (`docs/user-manual/rest-api.md`) — endpoint signature,
@@ -919,7 +952,9 @@ Produce a chaos test design with these entries. For each scenario:
 5. **Trigger** — the action(s) that expose the fault
 6. **Success criteria** — observable post-conditions proving invariant
 7. **Rollback** — how to restore safe state (git reset? DB restore?)
-8. **Severity / phase** — P0 block-merge, P1 pre-release, P2 nightly
+8. **Severity / phase** — P0 block-merge, P1 pre-release, P2 nightly. P0 is a
+   scenario-planning label, NOT a gate: a chaos scenario blocks only if the
+   underlying finding derives CRITICAL/HIGH or hits a policy floor.
 
 Focus on scenarios where two or more unhappy-path risks compound —
 individual fault injection in isolation often misses the real
@@ -968,7 +1003,8 @@ as an appendix — you are changing presentation, not content.
 
 Cluster two findings ONLY when they share the same file:line AND the same defect.
 Anything else stays separate. For each cluster: list its reporting agents, take the
-MAXIMUM severity of its members, and do NOT re-adjudicate severity or dismiss a
+MAXIMUM **derived** severity of its members (record the native labels alongside),
+and do NOT re-adjudicate severity or dismiss a
 finding. Mark every cluster PROVISIONAL.
 ```
 
@@ -990,7 +1026,7 @@ This pass keeps that signal and drops the re-reading; it must not launder it.
 
 ## Gate 7 — Findings Resolution
 
-**BLOCKING** = the derived band is CRITICAL or HIGH (shared preamble), or a policy floor was hit, or the finding explicitly says "blocks merge". Resolve against the derived band, not the reporting agent's native label — record both.
+**BLOCKING** = the derived band is CRITICAL or HIGH (shared preamble), or a policy floor was hit. Resolve against the derived band, not the reporting agent's native label — record both. An agent brief that says its own CRITICAL/HIGH "blocks merge" does NOT self-certify: that text predates standing rule 2 and is superseded by the derived band. The only non-derived blocker is a policy floor or an explicit operator instruction.
 
 Strategy:
 1. **Fold compatible fixes into one commit.** If sec flags H1, docs flags B3, QA flags B5, and they all touch related files, fix as a single "hardening round" commit rather than three small ones.

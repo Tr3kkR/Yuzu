@@ -266,10 +266,15 @@ between them established that the shape — not the wording — was the defect:
   the obvious one-word fix was wrong too: "no production caller" is not "no production
   consequence". That distinction is now `I6` (shipped-incomplete) versus `E6` (the wrong
   outcome provably cannot occur).
-- **The closed list was not closed.** Four classes the pipeline blocks on today derived to
-  INFO: Resource Ledger omission, a direct `CHANGELOG.md` edit, a broken platform build
-  leg, and a missing test. They have no production trigger and no wrong outcome, so an
-  honest derivation floors them. They are contract violations, and are now policy floors.
+- **The closed list was not closed.** Classes the pipeline blocks on today derived to INFO:
+  Resource Ledger omission, a direct `CHANGELOG.md` edit, a broken platform build leg,
+  non-RAII manual cleanup in new C++, and — found in re-review — violation of any explicit
+  MUST / catastrophic-if-violated invariant in CLAUDE.md, the routed-concern table or an
+  accepted ADR (a second copy of a single-chokepoint rule has no wrong outcome *today*,
+  which is exactly why the derivation cannot see it). They have no production trigger and
+  no wrong outcome, so an honest derivation floors them. All are contract violations and
+  are now **policy floors**. A missing test is NOT a floor — it is SHOULD, restoring
+  §3.1's clause.
 - **The unknown-exposure default was inverted** against this document's own stated
   principle. Defaulting to "no change" silently downgrades a possible `E1`. Unresolved
   exposure now gates pending adjudication.
@@ -280,20 +285,39 @@ between them established that the shape — not the wording — was the defect:
 
 ### Calibration against the corpus
 
-Applied to findings whose bands the team already agreed on. Six of eight reproduce:
+Applied to findings whose bands the team already agreed on. Counted honestly, after two
+rounds of re-review forced the count down twice:
+
+- **Three reproduce unaided:** #2202 B2, #2202 B3, the `std::jthread` macOS break.
+- **One matches on band with incomplete facts:** the `pg_locks` runbook (`I3` and `I4` both
+  apply, and `E5` — a rare multi-database collision — belongs in the record).
+- **Three are CALIBRATED, not validated** — the model was changed after seeing them derive
+  the wrong band: #2202 B4 (`I6` escalator), the #2580 parity test (false-green floor), the
+  #2580 sampler (`I5` shared-path escalator). Each is marked in the table.
+- **One acknowledged mismatch remains:** #2202 B1.
+
+A calibrated row is not evidence the rule works; it is the rule being taught. The three of
+them are principled rather than ad hoc — each names a class, not an instance — but the
+distinction has to stay visible or the corpus becomes a mirror.
 
 | finding | derives | historical | |
 |---|---|---|---|
 | #2202 B2 — namespace scan boots clean on corrupt `rbac.db` | I1 + E5 → HIGH | HIGH | match |
 | #2202 B3 — engine actions stamped `principal_class=agent` | I1 + E3 → HIGH | HIGH | match |
-| #2202 B4 — RBAC resolver with no production grant author | I6→HIGH + E3 | HIGH | match (via the I6 escalator) |
+| #2202 B4 — RBAC resolver with no production grant author | I6→HIGH + E3 | HIGH | match **(calibrated: the escalator was added for this class after observing it derive MEDIUM)** |
 | #2580 — `pg_locks` runbook terminates another tenant's backend | I4 + E3 → HIGH | BLOCKING | match |
-| #2580 — parity test cannot observe the field it asserts on | I3 + E3 → HIGH | BLOCKING | match |
+| #2580 — parity test cannot observe the field it asserts on | policy floor (false-green closure evidence) | BLOCKING | match **(calibrated: floor added for this class)** |
 | #2580 — `std::jthread` breaks the macOS leg | policy floor | BLOCKING | match |
 | #2202 B1 — engine credential gains fleet-wide Read, RBAC off | I1 + E2 → **CRITICAL** | HIGH | **promotion, gate-neutral** |
-| #2580 — 15s sampler unbatched full-column scan | I5 + E3 → **MEDIUM** | BLOCKING | **demotion, GATE-CHANGING** |
+| #2580 — 15s sampler unbatched full-column scan | I5→HIGH via the shared-path escalator | BLOCKING | match **(calibrated: escalator added for this class)** |
 
-**Both mismatches are left in rather than tuned away.** Fitting the table to the corpus
+The B4 escalator is the one place the model was changed to fit the corpus. Re-review
+established that its first wording was also wrong — it claimed the absent capability was an
+under-enforced control, but that resolver fails CLOSED, so nothing was under-enforced. The
+escalator now names two distinct prongs, and B4 is the reference case for the second
+(dormant authorisation code that goes live later without re-review), not the first.
+
+**The remaining mismatch is left in rather than tuned away.** Fitting the table to the corpus
 after seeing it would be overfitting, and the disagreements are the useful output:
 
 1. **#2202 B1.** A credential holding zero grants reads the whole fleet in the default
@@ -301,13 +325,27 @@ after seeing it would be overfitting, and the disagreements are the useful outpu
    under-banded; Sol holds that read-only privilege expansion is not admin/RCE and HIGH was
    right. Gate-identical either way, so this is reporting signal, not merge control — but
    the team should decide, because it sets whether every cross-scope read is CRITICAL.
-2. **#2580 sampler.** This one *changes the gate*, so it is the more serious of the two.
-   The finding blocked because it put unbounded, growing cost on the serial thread shared
-   with agent-revocation teardown — the harm is a security operation delayed at scale,
-   which is a chain of reasoning rather than a stated impact. Either `I5` needs an
-   escalator for shared security-critical paths, or this class genuinely is MEDIUM and the
-   original BLOCKING was severity inflation. **Do not adopt the derivation as binding on
-   this class until it is settled.**
+2. **#2202 B4 — the two reviewers do not agree, and the disagreement is recorded rather
+   than resolved.** Fable holds that the `I6` escalator's second prong is principled:
+   dormant authorisation code ships and goes live later without re-review, which is a real
+   forward risk independent of today's behaviour. Sol holds that B4's missing route failed
+   *closed* — a denial of capability, not a bypass — so it derives `I6`/MEDIUM and should
+   be recorded as a third mismatch rather than escalated. Both agree the first wording was
+   wrong (it claimed an under-enforced control, and that resolver over-enforces). The
+   escalator ships with Fable's prong (b) and Sol's dissent noted here; if the team sides
+   with Sol, delete prong (b) and restore the row to a mismatch.
+
+### One deliberate gate change, named
+
+`I7` demotes the documentation gate. `docs-writer`'s standing rule — any user-visible
+change with no doc BLOCKS — becomes SHOULD unless the omission conceals a breaking change,
+security-relevant behaviour, a data-loss risk, a migration step or an irreversible
+operation. Since the derived band governs the gate, that is a real narrowing of a whole
+reviewer's mandate, and it is the intended answer to the original "governance is too noisy
+about prose" complaint. It is recorded here rather than left to be discovered. The
+`docs-writer` Gate 2 template previously asserted its blanket BLOCKING on the authority of
+a CLAUDE.md section that no longer exists (routed out in `c2e0b1c7`); that false citation
+is corrected in the same commit.
 
 ### What this does and does not claim
 
