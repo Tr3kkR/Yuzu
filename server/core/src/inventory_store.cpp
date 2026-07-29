@@ -312,8 +312,14 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
                 "INSERT INTO inventory_store.inventory_data "
                 "(agent_id, plugin, data_json, collected_at) "
                 "VALUES ($1, $2, $3, $4::bigint) ON CONFLICT (agent_id, plugin) DO NOTHING",
+                // Clamp the legacy timestamp too (governance round-2 LOW):
+                // a far-future-skewed row written by a pre-clamp deployment
+                // would otherwise survive the backfill and suppress honest
+                // upserts until wall-clock catches up — the same class the
+                // sibling store's #1685 migration v3 clamp closed for
+                // retrofitted rows.
                 std::vector<std::string>{r.agent_id, r.plugin, r.data_json,
-                                         std::to_string(r.collected_at)});
+                                         std::to_string(std::min(r.collected_at, now_secs()))});
             if (ins.status() == PGRES_COMMAND_OK) {
                 pg::PgResult rel_ok = pg::exec_params(c, "RELEASE SAVEPOINT legacy_row_backfill",
                                                       std::vector<std::string>{});

@@ -106,8 +106,11 @@ argument does not justify here).
 opens:
 
 - **Idempotency**: a single-row `backfill_state` table (`id = 1`, stamped with
-  `migrated_at` + a `legacy_rows` diagnostic count) makes every boot after the first a cheap
-  lookup — the legacy SQLite file is never re-read once stamped.
+  `migrated_at` + a `legacy_rows` diagnostic count, plus a `skipped_bad` diagnostic count —
+  governance H1, 2026-07-29: a completed stamp with `skipped_bad > 0` means N legacy rows
+  were filed as malformed on 22xxx/23xxx SQLSTATE only; genuine infrastructure errors abort
+  the backfill unstamped instead, so a retry is never lost silently) makes every boot after
+  the first a cheap lookup — the legacy SQLite file is never re-read once stamped.
 - **Never clobbers a live row**: every backfilled row is inserted
   `ON CONFLICT (agent_id, plugin) DO NOTHING` — if a live agent has already re-reported for
   that `(agent_id, plugin)` pair since this boot sequence started (a race the boot-time

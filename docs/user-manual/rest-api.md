@@ -3655,11 +3655,25 @@ List all inventory tables (one per plugin that reports inventory data).
 }
 ```
 
+`result_truncated_by_cap` (bool, optional) — present and `true` when the underlying
+inventory read hit the server row cap; absent devices may simply not have been
+read rather than not matching.
+
 **Errors:**
 
 | Status | Reason |
 |---|---|
 | 503 | Inventory store unavailable or degraded |
+
+#### `POST /api/v1/result-sets/from-inventory-query`
+
+Creates an owner-scoped result set from an inventory query (scope-walking
+producer; see `docs/scope-walking-design.md` for the full result-set surface).
+One behavior worth calling out here: when the underlying inventory read hits
+the server row cap, the route returns **503** ("inventory query truncated at
+the row cap - refusing to materialise a partial result set") rather than
+persisting a silently-incomplete set — a fleet-targeting set is never silently
+narrowed.
 
 #### `GET /api/v1/inventory/{plugin}/{agent_id}`
 
