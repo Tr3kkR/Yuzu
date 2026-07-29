@@ -215,6 +215,7 @@ POST /api/v1/instructions/execute
 The `status` action returns database health information:
 
 ```
+storage_state|ok
 record_count|15234
 oldest_timestamp|1710950000
 newest_timestamp|1711050423
@@ -252,6 +253,8 @@ config|dns_enabled|false
 config|dns_paused_at|0
 config|dns_live_rows|0
 config|dns_oldest_ts|0
+retention_guard_declines_total|0
+retention_guard_failures_total|0
 config|network_capture_method|polling
 config|network_capture_method_effective|polling
 config|software_interval_seconds|3600
@@ -290,6 +293,38 @@ config|process_enabled|errored
 `errored` means the stored value is not the literal `true`/`false` the agent
 ever writes (corruption or tampering); the source is fail-closed until it is
 re-`configure`d. See the tri-state description below.
+
+`retention_guard_declines_total` counts retention passes this agent declined
+(see [The retention clock guard](#the-retention-clock-guard) for the four
+triggers and which of them are benign), and
+`retention_guard_failures_total` counts tables that
+could not be retained at all -- whether the probes could not be read or the
+delete itself failed (see "The retention clock guard" below). Both
+are always emitted. **Read them together**: a zero declines total only means the
+clock is behaving if the failures total is also zero -- a table whose probes fail
+every pass has silently stopped being retained, and would otherwise report as
+healthy. When either is non-zero, one extra line per affected warehouse table
+names the table and its own count:
+
+```
+retention_guard|process_hourly|3
+retention_guard|tcp_hourly|3
+retention_guard_failed|module_hourly|2
+retention_guard_failed|__clock_state__|1
+retention_guard_declines_total|6
+retention_guard_failures_total|2
+```
+
+Only tables with a non-zero count appear, so a healthy agent emits just the two
+totals. `__clock_state__` is not a table: it reports that the agent could not
+persist its own clock reading, which leaves the guard without a comparison point
+after the next restart. The per-table counters are in-memory and reset when the agent restarts
+(the clock reading they compare against is persisted, so restarting does not
+blind the guard). Scrape this across the fleet to find endpoints whose clocks
+need attention -- the agent has no `/metrics` endpoint, so this action is the
+fleet-readable signal. **Not yet fleet-aggregated**: there is no shipped
+instruction or heartbeat tag that rolls these up server-side; surfacing them via
+the agent heartbeat is a tracked follow-up.
 
 The four `<source>_*` blocks are emitted per capture source. `<source>_enabled` is one of three values: `true` (collector active), `false` (disabled via `configure`), or `errored`. `errored` means the stored value is not a recognised boolean — `configure` only ever writes `true`/`false`, so an `errored` value indicates the agent's `tar.db` was tampered with or was corrupt and re-initialised (see "Corrupt-database quarantine" below). While an `errored` value persists the agent applies a **fail-closed policy**: the affected source stops collecting (it is treated as `false`, not enabled) and retention skips pruning that source's rows, so any forensic data already captured is preserved. The source stays paused until you re-issue an explicit `configure` for it on that device to clear the value. `<source>_paused_at` is `0` when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned `enabled → disabled`. The reverse transition resets it to `0` — and this includes recovery from `errored`: issuing `configure <source>_enabled=true` on a source whose stored value is `errored` clears `paused_at` to `0` in the same transition, so a recovered source never reports `enabled=true` alongside a stale paused timestamp. `<source>_live_rows` and `<source>_oldest_ts` are the count and minimum timestamp of the per-source `*_live` table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source `paused_at` / `live_rows` / `oldest_ts` lines. In the retention-paused list the dashboard renders a "schema older than server" badge for such an agent's disabled source (and sorts it as the oldest, at the top of the list) rather than hiding it behind a bare `—`; elsewhere a missing `live_rows` / `oldest_ts` still renders `—`.
 
@@ -384,7 +419,134 @@ TAR is designed for minimal performance overhead:
 - **Performance sampling**: a handful of kernel-counter reads every 30s; one row written per sample. The `$Perf_Live` 7-day window holds ~20,000 rows (~1-2 MB) per endpoint at the default cadence.
 - **Database size**: varies by system activity; a typical endpoint generates 1-5 MB per day (plus the ~1-2 MB perf window)
 - **CPU**: negligible between collection cycles; brief spike during snapshot + diff
-- **Automatic purge**: old events are removed hourly based on the retention setting
+- **Automatic purge**: old events are removed on the rollup tick (every 900 s).
+  Each tier's window comes from the schema registry's per-granularity default,
+  **not** from the `retention_days` configure key -- that key is stored and
+  reported by `status` but is not what the warehouse tiers prune against.
+
+### The retention clock guard
+
+Time-based retention deletes rows older than `now - <tier retention>`, where
+`now` is read from the **endpoint's own clock** -- the clock in a fleet most
+likely to be wrong. A dead CMOS battery, a long suspend, a cloned VM, or a boot
+before NTP converges all produce a reading that marks every row in a warehouse
+table expired at once, and an unguarded delete then takes the whole forensic
+window with it.
+
+A retention pass therefore refuses to act on that:
+
+- **A pass declines for a table, deletes nothing from it, and counts the
+  decline** when any of these holds:
+
+  1. it would delete **every** datable row of that table;
+  2. more than **a fixed 30 days** elapsed since the previous pass;
+  3. the stored reading is **ahead** of the current clock;
+  4. there is **no stored reading at all** -- the first pass after an agent
+     upgrade or a restore.
+
+  **Triggers 1-3 latch** per table, so a warehouse that is legitimately
+  all-expired still ages out at the cost of one rollup tick (900 s).
+  **Trigger 4 does not latch**, since a missing comparison point is not an
+  anomaly and spending the latch on it would let a real one on the very next
+  pass go undeclined.
+
+  **What to do:** for 4, nothing. The reading is a single `tar_config` key
+  shared by every source and table, so it is expected once per agent -- but note
+  EVERY enabled time-based table declines in that one pass, so the total jumps
+  by the table count, not by 1. It recurs only if the agent cannot WRITE that
+  key at all (read-only or full disk), which is the safe direction and is what
+  `retention_guard_failures_total` is for. For 2 and 3, check the endpoint's
+  clock and its uptime; see
+  [the runbook](../ops-runbooks/audit-store-clock-guard.md) for the audit twin
+  of this triage.
+
+  The 30 days is **absolute, not derived from the tier's retention window**: how
+  far the clock moved has nothing to do with how long that tier keeps rows, and
+  scaling it to the window put the threshold at a year on the monthly tier,
+  where it could never fire. Elapsed time cannot tell a jump from a dark laptop,
+  so the threshold sits past the point where an outage is itself remarkable -- a
+  laptop off over a long weekend reports nothing; one off for a month declines
+  one tick. The reading is persisted in `tar_config`, so trigger 2 still fires
+  on the first pass after an agent restart, including one that *booted* with a
+  wrong RTC.
+- **Every accepted pass deletes at most 5,000 rows per table**, oldest first
+  (~480k/day/table at the 900 s cadence, far above any endpoint's growth rate).
+  A wipe the guard chose to allow ages out at a paced rate rather than in one
+  statement.
+- Rows timestamped implausibly far in the future -- more than a day ahead, i.e.
+  written while the clock was already skewed forward -- are excluded from the
+  "would this delete everything?" question. Without that, one such row would
+  disarm the guard permanently.
+
+**Row-count retention is deliberately unguarded, but it is capped.** The tiers
+that trim to a fixed row ceiling do so with no clock involved, so no clock
+reading can make them delete more than they always would -- hence no guard and
+no decline. They ARE capped at the same 5,000 rows per table per pass, for a
+different reason: the whole retention batch runs under one held database lock,
+and an uncapped prune over a large excess would stall every collector on the
+endpoint. A big backlog now drains over a few rollup ticks instead.
+
+**A paused or errored source is skipped before the guard is consulted**, so it
+neither deletes nor records a decline -- an operator who paused a source for
+forensics never sees a clock-anomaly signal from it.
+
+**What this does and does not promise.** The cap is the half that always
+applies: it bounds every delete unconditionally. The detectors are best-effort,
+and the outcome test in particular is defeated by any row written after the
+clock moved -- which `do_rollup` reliably produces, since `run_aggregation` runs
+first and mints rows into the very tables retention then reads. That is why the
+elapsed-time check is persisted. Taken together the guard converts an
+instantaneous wipe of the device's forensic window into a paced one plus a
+counter; it does not guarantee every clock anomaly is detected, and a
+persistently wrong clock will still drain the window over several ticks.
+
+The operator surface is `retention_guard_declines_total` and
+`retention_guard_failures_total` (plus the per-table `retention_guard|<table>|<n>`
+and `retention_guard_failed|<table>|<n>` lines) in the `status` action, described
+above. A non-zero declines total has four possible causes, listed in
+[The retention clock guard](#the-retention-clock-guard). One of them is benign
+and expected after an agent upgrade; the rest mean the endpoint's clock moved,
+it was dark longer than the threshold, or the stored reading was ahead of the
+clock. Elapsed time cannot separate those, so check the host's time
+synchronisation *and* its uptime history. A non-zero failures total means retention has stopped for that table
+for a reason that is not the clock: either its probes could not be read, or its
+delete failed. What happens to the REST of the pass depends on the error. One
+that aborts the transaction itself (a disk-full, an I/O error) rolls the whole
+pass back, and every table queued in it is reported -- including row-count
+tables, which are otherwise outside the guard. An error that leaves the
+transaction intact -- one table with a corrupt index, say -- fails only that
+table, and the healthy tables in the same pass still have their deletions
+committed. That distinction exists because stopping on every error meant one
+permanently-broken table halted retention for the whole endpoint, for ever.
+
+If that rollback ITSELF fails and the database is left inside the transaction,
+the agent **closes the TAR database**. Every later write on a connection stuck in
+an uncommittable transaction would be reported durable and then lost at restart,
+so it fails all of them closed instead. `tar status` then returns non-zero and
+emits an `error|` line followed by `storage_state|offline`, and nothing else --
+every `config|` line is withheld. Collection and retention are both stopped on
+that endpoint until the agent restarts. **Historical data normally stays
+readable**: the close affects only the read-write connection, so `tar sql` can
+still query what was already collected. The error line says which of those two
+cases you are in -- the read-only connection is itself optional at open time, and
+on the rare endpoint where it never opened, `tar sql` cannot read the history
+either, so the line says that instead of promising a read path that is not there.
+This needs a disk-level fault to reach, but read `storage_state` before trusting
+any other line in that output.
+
+In the dashboard, the capture-sources frame surfaces that error line verbatim
+rather than a generic failure, so the reason and the recovery advice reach the
+operator on the frame they opened to ask why the device's data is missing.
+
+**Known dead band.** Because the threshold is a fixed 30 days, a forward clock
+error smaller than that trips neither detector on a table whose own window is
+shorter:
+the step check is below its floor, and the outcome test is separately defeated
+by the rollup minting fresh rows before retention runs. In that band the table
+drains at the capped rate with no decline and no counter. The cap still bounds
+the damage; the detection does not fire. This is the deliberate cost of not
+reporting every switched-off laptop as a clock anomaly. Retention resumes automatically, paced, once the
+condition clears.
 
 > **Upgrade note (device perf sampling; per-app sampling is opt-in).** On
 > upgrade to this release, every Windows agent continues **device** performance

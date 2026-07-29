@@ -725,7 +725,17 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             return;
         }
         if (st.failed || st.output.starts_with("error|")) {
-            note(res, "The device failed the status query.");
+            // Carry the agent's REASON, not just the fact of failure. The
+            // storage-offline line names why collection stopped and which read
+            // path still works (`tar sql`); a generic "failed" here discarded
+            // that sentence on the one frame an operator opens to ask why a
+            // device's data is missing. Same shape as the process query above --
+            // strip the `error|` prefix, cap, escape -- but a longer cap,
+            // because 200 bytes truncates that message mid-recovery-advice.
+            note(res, st.output.starts_with("error|")
+                          ? "The device failed the status query: " +
+                                html_escape(agent_error_display(st.output))
+                          : "The device failed the status query.");
             return;
         }
         const std::string compat = (!cp.failed && !cp.output.starts_with("error|")) ? cp.output : "";

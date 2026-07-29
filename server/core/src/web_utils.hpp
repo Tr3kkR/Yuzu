@@ -89,6 +89,51 @@ inline std::string json_escape(std::string_view in) {
     return out;
 }
 
+/// Render an agent's `error|...` reply as display text: the FIRST record only,
+/// prefix stripped, bounded, and never split mid-codepoint.
+///
+/// Agent replies are newline-separated records, so a byte-count truncation of
+/// the RAW output is wrong in both directions. Too small and it cuts the
+/// operator's recovery instruction mid-sentence; too large and it runs past the
+/// newline and renders the head of the NEXT record as debris -- `tar status`'s
+/// offline reply is `error|...` followed by `storage_state|offline`, and a
+/// 300-byte window ends in a trailing `storage_stat`. Bounding the FIRST LINE is
+/// the property that holds whatever the message length becomes.
+///
+/// `max_bytes` is a display bound, so it is walked back off a UTF-8
+/// continuation byte rather than splitting the sequence.
+inline std::string agent_error_display(const std::string& output, std::size_t max_bytes = 400) {
+    static constexpr std::string_view kPrefix = "error|";
+    std::string_view v{output};
+    if (v.starts_with(kPrefix))
+        v.remove_prefix(kPrefix.size());
+    // FIRST non-empty record. A leading newline (or a reply whose first record
+    // is blank) would otherwise render as an empty message -- a regression
+    // against the byte window this replaced, which at least showed the detail.
+    while (!v.empty() && (v.front() == '\n' || v.front() == '\r'))
+        v.remove_prefix(1);
+    v = v.substr(0, v.find('\n')); // npos-safe
+    while (!v.empty() && v.back() == '\r') // CRLF replies
+        v.remove_suffix(1);
+
+    if (v.size() > max_bytes) {
+        std::size_t cut = max_bytes;
+        // 10xxxxxx is a UTF-8 continuation byte; step back to its lead byte.
+        // Bounded to 3 steps: a longer run means the input was already malformed,
+        // and walking to 0 would erase the whole message rather than truncate it.
+        std::size_t steps = 0;
+        while (cut > 0 && steps < 3 && (static_cast<unsigned char>(v[cut]) & 0xC0) == 0x80) {
+            --cut;
+            ++steps;
+        }
+        if (steps == 3 && (static_cast<unsigned char>(v[cut]) & 0xC0) == 0x80)
+            cut = max_bytes; // not a real sequence; cut where asked
+        v = v.substr(0, cut);
+    }
+    // Only now materialise, so a multi-megabyte reply is not copied whole.
+    return std::string{v};
+}
+
 /// Escape HTML special characters for safe rendering.
 inline std::string html_escape(const std::string& s) {
     std::string out;
@@ -211,6 +256,122 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
     auto extracted =
         origin.empty() ? extract_host(std::string(referer)) : extract_host(std::string(origin));
     return extracted && *extracted == strip_default_port(std::string(host));
+}
+
+/// The MCP transport body-cap decision for the server's pre-routing handler
+/// (#2437) — extracted from `server.cpp`'s `set_pre_routing_handler` lambda
+/// for exactly the reason `is_login_exempt_path` below was: so the decision
+/// has direct unit coverage instead of being reachable only by booting a real
+/// server. Pure and httplib-free by design; the caller supplies the declared
+/// length (`Content-Length`, 0 when the header is absent) and the cap.
+///
+/// `content_length == 0` returns false ON PURPOSE: this predicate answers
+/// *size* only. A chunked or header-less body is not unsized-but-fine — it is
+/// refused separately by `mcp_body_unmeasurable` below (411). A caller MUST
+/// consult both; consulting only this one reopens the bypass.
+///
+/// The comparison is strictly greater-than: a request of EXACTLY `cap` bytes
+/// is admitted, matching the "<= cap" contract the docs publish.
+///
+/// Caller contract: consult this AFTER the rate limiter — an oversized-body
+/// flood should be throttled like any other traffic, and unlike the
+/// on-behalf-of guard there is no misconfiguration it would mask by answering
+/// first. It may sit before auth: it discloses only a documented transport
+/// limit, nothing argument-shaped.
+/// Path scoping for the MCP body cap. `/mcp/v1` (no trailing slash) is
+/// included deliberately: the auth chokepoint matches `/mcp/` so that form is
+/// authenticated and reaches httplib's body read before 404-ing, and a cap
+/// that missed it would be evaded by deleting one character (governance
+/// Gate 4 unhappy-path UP-5).
+[[nodiscard]] inline bool is_mcp_path(std::string_view path) noexcept {
+    // Deliberately `/mcp/` and not `/mcp/v1/`: the auth chokepoint and the
+    // engine quota gate both scope on `/mcp/`, so anything under it is
+    // authenticated and reaches httplib's body read. Scoping the cap more
+    // narrowly than the surface it protects means `/mcp/v1` or `/mcp/v1x` is
+    // authenticated-but-uncapped — the same one-character evasion this
+    // function exists to prevent (governance Gate 8 security LOW-4), and it
+    // would leave a future /mcp/v2/ uncapped by default rather than capped.
+    return path.starts_with("/mcp/");
+}
+
+[[nodiscard]] inline bool mcp_body_exceeds_cap(std::string_view path,
+                                               std::uint64_t content_length,
+                                               std::uint64_t cap) noexcept {
+    return is_mcp_path(path) && content_length > cap;
+}
+
+/// True when an MCP request carries a body this server cannot size before
+/// reading it, and must therefore refuse (411) rather than admit.
+///
+/// THE DESIGN RULE, learned the hard way: do NOT re-implement httplib's
+/// header parsing and hope the two agree. The first attempt tested
+/// `Transfer-Encoding` with a case-SENSITIVE `find("chunked")` while httplib
+/// decides with `case_ignore::equal(...)` (httplib.h:6967) — so
+/// `Transfer-Encoding: Chunked` passed this check as a measurable body and was
+/// then read as chunked, bounded only by the 100 MB global default. One
+/// capital letter defeated the whole cap. The substring test was also wrong in
+/// the other direction: httplib compares the value for EQUALITY, so
+/// `identity, chunked` is not chunked to httplib while `find` matched it.
+///
+/// So the rule is now "refuse anything whose framing or encoding we are not
+/// the sole interpreter of", which needs no agreement with the library:
+///
+///   * ANY non-empty `Transfer-Encoding`, on ANY method. Not just chunked and
+///     not just POST/PUT/PATCH — httplib's `expect_content` treats chunking
+///     independently of the method, so a chunked GET/DELETE/OPTIONS reaches
+///     the same reader.
+///   * ANY `Content-Encoding` other than `identity`. This build compiles with
+///     `CPPHTTPLIB_BROTLI_SUPPORT`, and httplib transparently decompresses and
+///     then enforces only its GLOBAL limit on the decompressed size — so a
+///     sub-cap compressed body expands to ~100 MB before the JSON parser sees
+///     it. `Content-Length` measures the compressed bytes and is therefore not
+///     a bound on what gets buffered.
+///   * a POST/PUT/PATCH with no `Content-Length` — `expect_content` is true for
+///     those regardless, so httplib reads to EOF.
+///
+/// DELETE is DELIBERATELY EXCLUDED from that last rule, and the reasoning is
+/// worth keeping because two reviewers disagreed on it. `expect_content`
+/// (httplib.h:8330) is true for DELETE too, so a DELETE carrying an UNDECLARED
+/// body is admitted here — today harmlessly, because with
+/// `CPPHTTPLIB_SSL_ENABLED` that path returns without reading, which is an
+/// accidental dependency on a build flag rather than a bound. Closing it by
+/// requiring `Content-Length` on DELETE would break MCP session teardown:
+/// `DELETE /mcp/v1/` carries no body and many clients (cpp-httplib's own
+/// included) omit `Content-Length: 0` entirely. A live compatibility break on
+/// a shipped route is the worse trade against a hazard that is presently
+/// unreachable and bounded at 100 MB if it were not. Tracked as a follow-up;
+/// a DELETE that carries actual framing (Transfer-Encoding / Content-Encoding)
+/// IS refused by the two rules above, which apply to every method.
+///
+/// JSON-RPC clients send an identity-encoded body with a Content-Length, so
+/// none of this costs a conforming client anything. It is NOT free in general:
+/// HTTP permits chunked request bodies, and a proxy or streaming stack that
+/// re-frames requests will now be refused. That is a deliberate trade.
+[[nodiscard]] inline bool mcp_body_unmeasurable(std::string_view path, std::string_view method,
+                                                bool has_content_length,
+                                                std::string_view transfer_encoding,
+                                                std::string_view content_encoding) noexcept {
+    if (!is_mcp_path(path))
+        return false;
+    // Any framing we do not solely control.
+    if (!transfer_encoding.empty())
+        return true;
+    // Any encoding that makes Content-Length measure something other than what
+    // gets buffered. Case-insensitive, because header VALUES are compared
+    // case-insensitively by every library that reads them, including ours now.
+    if (!content_encoding.empty()) {
+        const bool identity =
+            content_encoding.size() == 8 &&
+            std::equal(content_encoding.begin(), content_encoding.end(), "identity",
+                       [](char a, char b) {
+                           return (a | 0x20) == (b | 0x20);
+                       });
+        if (!identity)
+            return true;
+    }
+    if ((method == "POST" || method == "PUT" || method == "PATCH") && !has_content_length)
+        return true;
+    return false;
 }
 
 /// The unauthenticated-allowlist decision for the server's pre-routing

@@ -990,7 +990,14 @@ const std::unordered_map<std::string, TableRef>& table_ref_map() {
     return map;
 }
 
-// Get the timestamp column name for a granularity suffix
+} // namespace
+
+// ── Public API ──────────────────────────────────────────────────────────────
+
+// Get the timestamp column name for a granularity suffix. Public since #2361:
+// the retention clock guard in `run_retention` needs the same column the DDL
+// indexes and `retention_sql`'s time branch filters on, and a second copy of
+// this mapping in the aggregator would be a silent divergence waiting to happen.
 std::string_view ts_column_for_suffix(std::string_view suffix) {
     if (suffix == "live")    return "ts";
     if (suffix == "hourly")  return "hour_ts";
@@ -998,10 +1005,6 @@ std::string_view ts_column_for_suffix(std::string_view suffix) {
     if (suffix == "monthly") return "month_ts";
     return "ts";
 }
-
-} // namespace
-
-// ── Public API ──────────────────────────────────────────────────────────────
 
 const std::vector<CaptureSourceDef>& capture_sources() {
     return build_sources();
@@ -1428,7 +1431,18 @@ std::string retention_sql(const std::string& real_table_name, int64_t now_epoch)
             "(SELECT id FROM {} ORDER BY id DESC LIMIT 1 OFFSET {})",
             real_table_name, real_table_name, gran.retention_default);
     } else {
-        // Delete rows older than the retention window
+        // NEITHER BRANCH'S SQL RUNS IN PRODUCTION as of #2361. `run_retention`
+        // builds both the time-based and the row-count DELETE at the caller so it
+        // can bound them -- the time-based one because an unbounded age delete is
+        // the wipe the clock guard exists to prevent, the row-count one because
+        // the whole batch runs under one held database mutex. This function is
+        // now called ONLY as an `.empty()` probe for "is this a retention-bearing
+        // table?", plus the text these tests pin.
+        //
+        // Kept, and kept byte-identical, because `test_tar_warehouse.cpp` and
+        // `test_tar_perf.cpp` pin this exact SQL text. So a future author who
+        // "fixes" either formula HERE gets a green suite and no behaviour change
+        // whatsoever -- change `run_retention` instead.
         int64_t cutoff = now_epoch - gran.retention_default;
         auto ts_col = ts_column_for_suffix(gran.suffix);
         return std::format(

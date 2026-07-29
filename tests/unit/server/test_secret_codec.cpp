@@ -8,7 +8,10 @@
 
 #include "key_provider.hpp"
 #include "pg/pg_raii.hpp"
+#include "kek_op_lock.hpp"
 #include "pg/secret_codec.hpp"
+
+#include <yuzu/metrics.hpp>
 
 #include "../test_helpers.hpp"
 
@@ -18,6 +21,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -26,6 +31,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -176,6 +182,44 @@ TEST_CASE("SecretCodec: register_secret_column validates identifiers", "[secrets
     REQUIRE_FALSE(codec.register_secret_column({"Bad-Schema", "things", "secret", "id"}));
     REQUIRE_FALSE(codec.register_secret_column({"tstore", "things; DROP TABLE x", "secret", "id"}));
     REQUIRE_FALSE(codec.register_secret_column({"public", "things", "secret", "id"}));
+}
+
+// #2530 A3: a duplicate (store, table, column) registration is rejected —
+// duplicates would multiply the rewrap_all scan and distort the
+// registered-column trip-wire.
+TEST_CASE("SecretCodec: register_secret_column rejects a duplicate (store, table, column)",
+          "[secrets]") {
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
+    // Exact duplicate.
+    REQUIRE_FALSE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
+    // Same (store, table, column) but a different pk_column is still a
+    // duplicate registration of the same scan target — rejected too.
+    REQUIRE_FALSE(codec.register_secret_column({"tstore", "things", "secret", "other_pk"}));
+    // A genuinely different column registers fine.
+    REQUIRE(codec.register_secret_column({"tstore", "things", "other_secret", "id"}));
+    REQUIRE(codec.registered_columns().size() == 2);
+}
+
+// #2530 A2: registered_columns() is a snapshot in registration order.
+TEST_CASE("SecretCodec: registered_columns() returns a snapshot in registration order",
+          "[secrets]") {
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    REQUIRE(codec.registered_columns().empty());
+
+    REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
+    REQUIRE(codec.register_secret_column({"tstore", "other", "secret", "id"}));
+    REQUIRE(codec.register_secret_column({"tstore", "cfg", "secret", "key"}));
+
+    const auto cols = codec.registered_columns();
+    REQUIRE(cols.size() == 3);
+    REQUIRE(cols[0].table == "things");
+    REQUIRE(cols[1].table == "other");
+    REQUIRE(cols[2].table == "cfg");
 }
 
 TEST_CASE("SecretCodec init: first boot generates v1; re-init verifies", "[pg][secrets]") {
@@ -434,7 +478,7 @@ TEST_CASE("SecretCodec: KEK rotation — the fjarvis #1333 reproduction", "[pg][
 
     // Rotate: mint v2, re-wrap ONLY (payload untouched).
     auto rotated = codec.rotate_kek(conn.get());
-    INFO((rotated ? std::string{} : rotated.error()));
+    INFO((rotated ? std::string{} : rotated.error().internal_message));
     REQUIRE(rotated.has_value());
     REQUIRE(*rotated == 2);
     REQUIRE(codec.active_kek_version() == 2);
@@ -504,7 +548,7 @@ TEST_CASE("SecretCodec: KEK rotation — the fjarvis #1333 reproduction", "[pg][
         // the key file is gone, and a v1 blob now reads as unresolvable.
         REQUIRE(codec.rewrap_all(conn.get()).has_value());
         auto retired = codec.retire_kek(conn.get(), 1);
-        INFO((retired ? std::string{} : retired.error()));
+        INFO((retired ? std::string{} : retired.error().internal_message));
         REQUIRE(retired.has_value());
         REQUIRE(std::count(audit_verbs.begin(), audit_verbs.end(), "kek.retired") == 1);
         REQUIRE_FALSE(provider.resolve_kek("secrets-kek-v1"));
@@ -565,7 +609,7 @@ TEST_CASE("SecretCodec: TEXT primary keys rotate and decrypt (uniform binary-pk 
     }
 
     auto rotated = codec.rotate_kek(conn.get());
-    INFO((rotated ? std::string{} : rotated.error()));
+    INFO((rotated ? std::string{} : rotated.error().internal_message));
     REQUIRE(rotated.has_value());
 
     const char* values[] = {id.row_pk.c_str()};
@@ -723,6 +767,59 @@ TEST_CASE("SecretCodec: audit detail structure and failure-counter classes", "[p
     REQUIRE(uninitialized.decrypt_failure_counts().empty());
 }
 
+// ── ADR-0010 §Decision 3 metric exposition ─────────────────────────────────
+//
+// server.cpp exports decrypt_failure_counts() at scrape time as
+// `yuzu_server_secret_decrypt_failures_total{store,failure_class}`. That
+// export carries a subtlety worth pinning: the value lives in the GAUGE
+// family (it is a `set()` of a total the codec owns, not an increment), so
+// without an explicit `describe(..., "counter")` the scrape would emit
+// `# TYPE ... gauge` under a `_total` name — a silent violation of
+// docs/observability-conventions.md that a reader of server.cpp cannot see.
+// This asserts the exposition, so a future edit that drops the describe or
+// switches families is caught here rather than in a Grafana query.
+TEST_CASE("SecretCodec decrypt-failure counts export as a Prometheus counter", "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(codec.init(conn.get()).has_value());
+    create_test_table(conn.get());
+    REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
+
+    const auto id = test_id();
+    auto blob = codec.encrypt(id, bytes_of("x"));
+    REQUIRE(blob.has_value());
+    auto tampered = *blob;
+    set_blob_kek_version(tampered, 99);
+    REQUIRE_FALSE(codec.decrypt(id, tampered).has_value());
+
+    // Mirror server.cpp's describe + scrape-time export exactly.
+    yuzu::MetricsRegistry metrics;
+    metrics.describe("yuzu_server_secret_decrypt_failures_total",
+                     "Envelope-encrypted secret decrypt failures by store and failure class "
+                     "(tamper, unresolvable KEK, malformed blob)",
+                     "counter");
+    for (const auto& [key, count] : codec.decrypt_failure_counts()) {
+        const auto& [store, cls] = key;
+        metrics
+            .gauge("yuzu_server_secret_decrypt_failures_total",
+                   {{"store", store}, {"failure_class", std::string(SecretCodec::to_string(cls))}})
+            .set(static_cast<double>(count));
+    }
+
+    const std::string out = metrics.serialize();
+    INFO(out);
+    // Declared type wins over the gauge family's default.
+    CHECK(out.find("# TYPE yuzu_server_secret_decrypt_failures_total counter") !=
+          std::string::npos);
+    CHECK(out.find("# TYPE yuzu_server_secret_decrypt_failures_total gauge") == std::string::npos);
+    // The labelled sample the yuzu-secrets alert rules match on.
+    CHECK(out.find(R"(store="tstore")") != std::string::npos);
+    CHECK(out.find(R"(failure_class="kek_unresolvable")") != std::string::npos);
+}
+
 TEST_CASE("SecretCodec init: orphaned kek_version (deleted registration) fails closed",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
@@ -825,4 +922,325 @@ TEST_CASE("SecretCodec: retire with failed key deletion records no false destruc
 // TODO(S11): exercise the GcmResult::error → FailureClass::crypto_failure
 // decrypt path; needs an OpenSSL/EVP fault-injection seam (not yet available).
 
+// #2395 track D: the KEK rotation REST/MCP seam's HalfCommitted detection
+// (server.cpp kek_ops.rotate) compares active_kek_version() before vs. after
+// one rotate_kek() call and classifies `after > before` as HalfCommitted vs.
+// Internal. That heuristic is only trustworthy if a single successful
+// rotate_kek() call ALWAYS advances the active version by exactly one — never
+// zero (a caller could then misdiagnose a successful rotate as a failure) and
+// never more than one (a caller could then miss an intermediate version and
+// under-count how far rotation actually progressed). No existing case called
+// rotate_kek() more than once in a row to pin this.
+TEST_CASE("SecretCodec: active_kek_version() advances by exactly one per successful "
+          "rotate_kek call (the REST/MCP seam's half-committed detection depends on this)",
+          "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(codec.init(conn.get()).has_value());
+    create_test_table(conn.get());
+    REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
+
+    upsert_secret(conn.get(), 42, *codec.encrypt(test_id(42), bytes_of("seed")));
+    REQUIRE(codec.active_kek_version() == 1);
+
+    for (std::uint32_t expected = 2; expected <= 4; ++expected) {
+        const std::uint32_t before = codec.active_kek_version();
+        auto rotated = codec.rotate_kek(conn.get());
+        INFO((rotated ? std::string{} : rotated.error().internal_message));
+        REQUIRE(rotated.has_value());
+        const std::uint32_t after = codec.active_kek_version();
+        REQUIRE(*rotated == expected);
+        REQUIRE(after == expected);
+        REQUIRE(after == before + 1); // exactly one, never zero, never more than one
+    }
+
+    // Every row landed on the final version — rotate_kek's internal
+    // rewrap_all() left nothing on a superseded version after any of the
+    // three rotations above.
+    auto oldest = codec.oldest_kek_version_in_use(conn.get());
+    REQUIRE(oldest.has_value());
+    REQUIRE(*oldest == 4);
+}
+
+// #2530 A4: live_kek_version_count() counts only non-retired kek_meta rows.
+TEST_CASE("SecretCodec: live_kek_version_count reflects retirement", "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(codec.init(conn.get()).has_value());
+    create_test_table(conn.get());
+    REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
+
+    auto count1 = codec.live_kek_version_count(conn.get());
+    REQUIRE(count1.has_value());
+    REQUIRE(*count1 == 1);
+
+    REQUIRE(codec.rotate_kek(conn.get()).has_value()); // mints v2, both live
+    auto count2 = codec.live_kek_version_count(conn.get());
+    REQUIRE(count2.has_value());
+    REQUIRE(*count2 == 2);
+
+    REQUIRE(codec.retire_kek(conn.get(), 1).has_value()); // v1 now retired
+    auto count3 = codec.live_kek_version_count(conn.get());
+    REQUIRE(count3.has_value());
+    REQUIRE(*count3 == 1);
+}
+
+// #2530 A5: rotate_clock() — no rows, then a fresh row, then a future-dated
+// (clock-anomalous) row, each read via the single two-timestamp statement.
+TEST_CASE("SecretCodec: rotate_clock reports any_rows=false against an empty kek_meta",
+          "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    // init() deliberately NOT run: the pre-migrated template's kek_meta is
+    // empty (secrets_tpl resets it), so the `secrets` schema exists but no
+    // row does — exactly the any_rows=false case.
+    auto clock = codec.rotate_clock(conn.get());
+    REQUIRE(clock.has_value());
+    REQUIRE_FALSE(clock->any_rows);
+    REQUIRE_FALSE(clock->clock_anomaly);
+}
+
+TEST_CASE("SecretCodec: rotate_clock reports a small age and no anomaly for a fresh row",
+          "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(codec.init(conn.get()).has_value()); // mints v1 with created_at = now()
+
+    auto clock = codec.rotate_clock(conn.get());
+    REQUIRE(clock.has_value());
+    REQUIRE(clock->any_rows);
+    REQUIRE_FALSE(clock->clock_anomaly);
+    REQUIRE(clock->since_newest < std::chrono::minutes{1});
+}
+
+TEST_CASE("SecretCodec: rotate_clock flags a future-dated newest row as a clock anomaly",
+          "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(codec.init(conn.get()).has_value());
+
+    // Construct the anomaly directly: the newest kek_meta row is future-dated.
+    PgResult upd{PQexec(conn.get(), "UPDATE secrets.kek_meta SET created_at = now() + "
+                                    "interval '1 hour' WHERE kek_version = 1")};
+    REQUIRE(upd.ok());
+
+    auto clock = codec.rotate_clock(conn.get());
+    REQUIRE(clock.has_value());
+    REQUIRE(clock->any_rows);
+    REQUIRE(clock->clock_anomaly);
+    // #2530 G7-B6: the skew MAGNITUDE must be captured, not just the
+    // boolean fact of the anomaly — this is what lets an operator tell "a
+    // few seconds of jitter" from "dated a year out". Allow a few seconds
+    // of slack for the time elapsed between the UPDATE above and this read.
+    REQUIRE(clock->future_skew_secs > 3590);
+    REQUIRE(clock->future_skew_secs <= 3600);
+}
+
+// #2530 A1: SQLSTATE 57014 (query canceled — including a genuine
+// pg_cancel_backend, not just a statement_timeout) maps to
+// LifecycleError::Kind::query_canceled, and the raw SQLSTATE never leaves
+// the codec (only the Kind discriminant does). Constructed deterministically
+// via a real PQcancel against a query that is genuinely blocked (an ACCESS
+// EXCLUSIVE lock held by a second connection) rather than a
+// statement_timeout race, which would be flaky on a fast local database.
+TEST_CASE("SecretCodec: a canceled query maps to LifecycleError::Kind::query_canceled",
+          "[pg][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    REQUIRE(codec.init(conn.get()).has_value());
+
+    PgConn blocker = connect(db.dsn());
+    REQUIRE(PgResult{PQexec(blocker.get(), "BEGIN")}.ok());
+    REQUIRE(PgResult{PQexec(blocker.get(),
+                            "LOCK TABLE secrets.kek_meta IN ACCESS EXCLUSIVE MODE")}
+                .ok());
+
+    // #2530 G8-S8: capture the backend pid BEFORE acquiring the PGcancel
+    // handle, not after. With the pid REQUIRE between PQgetCancel and
+    // PQfreeCancel, a failed REQUIRE here (pid <= 0) would throw and unwind
+    // past the still-open `cancel` with no PQfreeCancel ever reached —
+    // reordering means a failure here never opened a PGcancel to leak.
+    const int conn_pid = PQbackendPID(conn.get());
+    REQUIRE(conn_pid > 0);
+    PGcancel* cancel = PQgetCancel(conn.get());
+    REQUIRE(cancel != nullptr);
+
+    // #2530 G8-F1: open the forced-termination fallback connection BEFORE
+    // spawning the worker thread below, not inside the "still not done"
+    // branch after it. NO REQUIRE/CHECK may run between the jthread's
+    // construction and its join() while the worker can still be blocked
+    // under `blocker`'s ACCESS EXCLUSIVE lock: this helper's connect()
+    // (~L45) itself REQUIREs CONNECTION_OK, and a REQUIRE failing there
+    // would throw and start unwinding while the worker is still blocked.
+    // `~jthread` would then call `request_stop()` — a no-op, because the
+    // worker lambda below takes no `stop_token` — and `join()` would
+    // deadlock forever waiting on a worker that can never finish, because
+    // `blocker`'s ROLLBACK further down is never reached either. Opening
+    // `axe` here, before the worker exists, removes that REQUIRE from the
+    // window entirely.
+    PgConn axe = connect(db.dsn());
+
+    std::expected<std::size_t, SecretCodec::LifecycleError> result;
+    std::atomic<bool> done{false};
+    // A plain std::thread plus an explicit join-guard, NOT std::jthread:
+    // Apple Clang's libc++ does not provide std::jthread, so the jthread
+    // form compiles on GCC/MSVC and breaks the macOS leg (caught by CI on
+    // #2580 — local Linux success proves nothing about this). The guard
+    // gives the same guarantee jthread was chosen for: ~thread on a still
+    // joinable thread calls std::terminate, killing the whole shard with no
+    // diagnostic, and the FAIL() below throws. Belt-and-braces alongside
+    // keeping every REQUIRE/CHECK outside the construction-to-join window.
+    std::thread worker([&] {
+        result = codec.live_kek_version_count(conn.get());
+        done.store(true, std::memory_order_release);
+    });
+    struct JoinGuard {
+        std::thread& t;
+        ~JoinGuard() {
+            if (t.joinable())
+                t.join();
+        }
+    } join_guard{worker};
+
+    bool sent_cancel = false;
+    for (int attempt = 0; attempt < 100 && !done.load(std::memory_order_acquire); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        std::array<char, 256> errbuf{};
+        if (PQcancel(cancel, errbuf.data(), static_cast<int>(errbuf.size())) == 1)
+            sent_cancel = true;
+    }
+    PQfreeCancel(cancel);
+
+    // #2530 G7-B5: bound the wait so a cancellation that never lands fails
+    // this test fast with a clear message instead of hanging until the CI
+    // job's outer timeout kills it with none. The loop above already gives
+    // PQcancel ~2s of retries; if the worker still has not observed
+    // completion, force it: sever `conn` from the pre-opened `axe`
+    // connection (mirrors test_kek_op_lock_holder.cpp's severing idiom) so
+    // the blocked query is guaranteed to error out one way or another. No
+    // connect() call here — `axe` already exists (see above).
+    if (!done.load(std::memory_order_acquire)) {
+        const std::string kill =
+            "SELECT pg_terminate_backend(" + std::to_string(conn_pid) + ")";
+        (void)PgResult{PQexec(axe.get(), kill.c_str())};
+        for (int i = 0; i < 100 && !done.load(std::memory_order_acquire); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    }
+
+    // Release the blocker's lock regardless of outcome — never leave a table
+    // lock held past this test, even if the worker never landed.
+    (void)PgResult{PQexec(blocker.get(), "ROLLBACK")};
+
+    // #2530 G8-S9: gate on `done` BEFORE join(), not only after. join()
+    // only returns once the worker has already stored `done=true` as its
+    // last act, so a REQUIRE(done) placed after an unconditional join() is
+    // vacuously true — it can never observe a cancellation/termination that
+    // failed to land, because the test would already be hung at join()
+    // instead of reaching that REQUIRE. FAIL loudly here instead, with the
+    // pid so a real wedge is diagnosable, before letting the join-guard's
+    // join() potentially block the rest of the shard.
+    if (!done.load(std::memory_order_acquire)) {
+        FAIL("worker did not observe cancellation or forced termination within "
+             "the bound (backend pid " +
+             std::to_string(conn_pid) + "); the connection is presumed wedged");
+    }
+    worker.join();
+
+    REQUIRE(sent_cancel);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().kind == SecretCodec::LifecycleError::Kind::query_canceled);
+}
+
 #endif // YUZU_TEST_ENABLE_PG
+
+// ── The KEK-operation advisory lock (#2395, gov cpp-safety BLOCKING) ────────
+//
+// This is the highest-consequence resource in the KEK surface and had ZERO
+// coverage: the REST/MCP tests stub the seam entirely, so nothing ever took a
+// real lease or ran the guard's destructor. A leaked session-scoped advisory
+// lock wedges every future KEK operation cluster-wide, and because session
+// locks are RE-ENTRANT per backend the wedge is asymmetric — the connection
+// that leaked it keeps working while every other one 409s. These tests use two
+// REAL connections so the mutual exclusion and the release are both observed.
+
+TEST_CASE("KEK op lock: mutual exclusion across two connections, released by the guard",
+          "[pg][secrets][kek]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    PgConn a = connect(db.dsn());
+    PgConn b = connect(db.dsn());
+
+    using yuzu::server::detail::KekOpLockAttempt;
+    using yuzu::server::detail::KekOpLockGuard;
+    using yuzu::server::detail::try_lock_kek_op;
+
+    {
+        REQUIRE(try_lock_kek_op(a.get()) == KekOpLockAttempt::kAcquired);
+        KekOpLockGuard guard_a{a.get()};
+
+        // A different SESSION must be excluded — this is the whole point of
+        // using a session advisory lock rather than a per-process mutex.
+        CHECK(try_lock_kek_op(b.get()) == KekOpLockAttempt::kConflict);
+    } // guard_a releases here
+
+    // Once released, the other connection can take it.
+    REQUIRE(try_lock_kek_op(b.get()) == KekOpLockAttempt::kAcquired);
+    KekOpLockGuard guard_b{b.get()};
+    CHECK(try_lock_kek_op(a.get()) == KekOpLockAttempt::kConflict);
+}
+
+TEST_CASE("KEK op lock: the guard leaves nothing held on the connection it released",
+          "[pg][secrets][kek]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    PgConn a = connect(db.dsn());
+    PgConn observer = connect(db.dsn());
+
+    using yuzu::server::detail::KekOpLockAttempt;
+    using yuzu::server::detail::KekOpLockGuard;
+    using yuzu::server::detail::try_lock_kek_op;
+
+    {
+        REQUIRE(try_lock_kek_op(a.get()) == KekOpLockAttempt::kAcquired);
+        KekOpLockGuard guard{a.get()};
+    }
+
+    // Nothing left behind in pg_locks for this key. Checked from a THIRD
+    // session so a re-entrant re-acquire on `a` cannot mask a leak — that
+    // masking is exactly the UP-1 failure mode.
+    //
+    // #2530 H3 (Hermes round 2): `pg_locks` is CLUSTER-WIDE, and the 4 server
+    // test shards share one Postgres container — an unfiltered count here
+    // could observe a SIBLING SHARD's still-held `secrets_kek_op` lock in
+    // its own (different) database and flake this assertion, or worse, mask
+    // a real leak on THIS database behind a nonzero count that actually came
+    // from elsewhere. `AND database = current_database()` scopes the read to
+    // this test's own ephemeral database, matching kek_op_lock.hpp's
+    // production query and test_kek_op_lock_holder.cpp's cross-check helper.
+    PgResult held{PQexec(observer.get(),
+                         "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' "
+                         "AND classid = 2037545589 AND database = (SELECT oid FROM "
+                         "pg_database WHERE datname = current_database())")};
+    REQUIRE(held.status() == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(held.get(), 0, 0)) == "0");
+
+    // And the lock is genuinely free for anyone.
+    CHECK(try_lock_kek_op(observer.get()) == KekOpLockAttempt::kAcquired);
+    KekOpLockGuard cleanup{observer.get()};
+}

@@ -7,17 +7,25 @@
  * service state changes, user sessions) with snapshot IDs for correlation.
  *
  * Schema:
- *   tar_events — core event log (timestamp, type, action, detail_json, snapshot_id)
  *   tar_state  — last-known state per collector for diff computation
  *   tar_config — key/value config (retention_days, redaction patterns, etc.)
+ *   plus the typed warehouse tiers generated from the schema registry.
  *
- * Thread-safe: a std::mutex guards all sqlite3* operations.
+ * The legacy tar_events event log was retired by schema v3; it is neither
+ * created nor queryable (#760 UP-8).
+ *
+ * Thread-safe: a std::mutex guards all sqlite3* operations. The ONE exception is
+ * the `db_`/`query_db_` liveness probes (is_open / query_engine_available),
+ * which read the handle without the mutex on purpose so a status query cannot
+ * block behind a rollup; `db_` is atomic for that reason. See the member
+ * declarations for why that is safe and what it does not promise.
  * Uses WAL mode, busy_timeout=5000, secure_delete=ON.
  */
 
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -352,7 +360,27 @@ public:
     /**
      * Set a config value.
      */
-    void set_config(const std::string& key, const std::string& value);
+    /// False once the store has failed closed -- either it never opened, or a
+    /// wedged transaction forced `execute_atomic_batch` to close it. Callers that
+    /// REPORT state (rather than just read it) must consult this: with the
+    /// connection gone every getter returns its default, so an unguarded status
+    /// surface describes a dead store as a healthy empty one (#2361 Gate 8).
+    [[nodiscard]] bool is_open() const noexcept { return db_ != nullptr; }
+
+    /// True while the read-only query connection (`tar sql`) is usable.
+    /// DELIBERATELY independent of is_open(): the wedged-transaction close takes
+    /// down the WRITE connection only, so historical data stays readable through
+    /// this one. A status surface that PROMISES that read path must consult this
+    /// rather than assume it -- the connection is optional at open time (a
+    /// failure there is warned and tolerated, tar_db.cpp), and promising a read
+    /// path that is not there is worse than admitting the store is dark.
+    [[nodiscard]] bool query_engine_available() const noexcept { return query_db_ != nullptr; }
+
+    /// Returns false if the write did not persist. Retention's clock guard
+    /// depends on this: a silently-dropped write leaves the guard with no
+    /// comparison point on the next pass, forever, with nothing to report
+    /// (#2361 Gate 8 / Sol). Most callers may still ignore the result.
+    bool set_config(const std::string& key, const std::string& value);
 
     // ── Warehouse schema management ─────────────────────────────────────────
 
@@ -426,8 +454,78 @@ public:
     /**
      * Execute arbitrary DDL/DML SQL (for rollup inserts, retention deletes).
      * Returns true on success.
+     *
+     * NOTE this takes `mu_` PER CALL. A caller that issues `BEGIN` through this
+     * method does NOT own the transaction: another thread's write on this same
+     * connection lands between statements and joins it, so a later ROLLBACK
+     * discards that write too. Use `execute_atomic_batch` for anything
+     * transactional.
      */
     bool execute_sql(const std::string& sql);
+
+    /// Outcome of `execute_atomic_batch`.
+    struct BatchResult {
+        bool began{false};     ///< BEGIN IMMEDIATE succeeded
+        bool committed{false}; ///< COMMIT succeeded (false => rolled back)
+        /// Per-statement flags, sized to the input. `failed[i]` means statement
+        /// i did not COMPLETE.
+        ///
+        /// READ THIS WITH `committed`, because the batch is NOT all-or-nothing:
+        ///  - `committed == false`: the transaction rolled back, so every entry
+        ///    is set and no statement had any effect.
+        ///  - `committed == true`: statement i was skipped, and every OTHER
+        ///    statement IS DURABLE. A statement whose error left the transaction
+        ///    intact is flagged and stepped over so one broken table cannot stop
+        ///    retention for the rest.
+        ///
+        /// So `failed[i] == 1` does NOT imply "no effect": a `RAISE(FAIL)`-style
+        /// error can leave statement i partly applied and still flagged. Do not
+        /// treat a set flag as a licence to re-run a non-idempotent statement.
+        std::vector<char> failed;
+    };
+
+    /**
+     * Run `statements` as ONE transaction while holding `mu_` for the whole
+     * thing, so no other writer on this connection can join it.
+     *
+     * That isolation is the point (#2361 Gate 8 / Kimi). `execute_sql` releases
+     * `mu_` between statements, so a caller-driven BEGIN/COMMIT silently
+     * enrolled any concurrent collector INSERT or `set_config` write into the
+     * transaction -- and once retention started rolling back on failure, that
+     * rollback silently discarded those writes after their callers had already
+     * been told they succeeded. `purge_source` already holds `mu_` across
+     * `BEGIN IMMEDIATE`; this is the same pattern, exposed for reuse.
+     *
+     * On a statement error, whether the pass STOPS depends on the error:
+     *  - Errors that abort the transaction themselves (SQLITE_FULL,
+     *    SQLITE_IOERR, SQLITE_CORRUPT, SQLITE_BUSY, a RAISE(ROLLBACK) trigger)
+     *    abandon the whole batch. Continuing would run the rest as autocommits
+     *    the rollback cannot undo, or would commit onto a damaged database.
+     *  - Errors that leave the transaction intact (a plain SQLITE_ERROR from a
+     *    missing column, a corrupt index on ONE table, a RAISE(ABORT) trigger)
+     *    flag that statement and CONTINUE. Stopping there meant one
+     *    permanently-broken table rolled back every pass forever, so nothing was
+     *    ever retained and tar.db grew without bound.
+     *
+     * The discriminator is `sqlite3_get_autocommit()` plus the error code -- see
+     * the implementation. Callers MUST read `failed` together with `committed`;
+     * see BatchResult.
+     *
+     * Cost: collectors and every other user of this connection block for the
+     * batch's duration, so the CALLER must bound each statement. `run_retention`
+     * caps every statement it queues, including the row-count prunes -- an
+     * uncapped `DELETE` here would hold the lock for an unbounded time and stall
+     * the whole plugin (#2361 Gate 8 / Sol). Same trade `purge_source` accepts,
+     * but purge is operator-initiated and rare; this runs every 900 seconds.
+     *
+     * If a ROLLBACK fails with the transaction still OPEN, the connection is
+     * CLOSED (`db_` nulled). Every write on a connection stuck inside a
+     * transaction that will never commit would be reported durable and then lost
+     * at restart, so failing all of them closed -- via the `if (!db_)` check
+     * every method already has -- is the honest outcome. TAR storage is then
+     * offline on that endpoint until the agent restarts.
+     */
+    BatchResult execute_atomic_batch(const std::vector<std::string>& statements);
 
     /**
      * Execute parameterized SQL with two int64 bind values.
@@ -450,12 +548,32 @@ private:
     explicit TarDatabase(sqlite3* db);
 
     /// Internal set_config that assumes caller already holds mu_.
-    void set_config_locked(const std::string& key, const std::string& value);
+    bool set_config_locked(const std::string& key, const std::string& value);
 
-    sqlite3* db_{nullptr};
+    // ATOMIC because it is written at RUNTIME, not only at open/close: the
+    // wedged-rollback path in execute_atomic_batch nulls it under mu_ while
+    // is_open() reads it WITHOUT mu_ from another thread (do_status runs on the
+    // command-dispatch thread, the wedge on the rollup thread). Before that
+    // runtime write existed the unlocked read was benign; adding it made this a
+    // data race (#2361 governance Gate 2).
+    //
+    // Atomic rather than "lock mu_ in is_open()" on purpose: do_status
+    // deliberately avoids taking rollup-scale locks so the diagnostic an
+    // operator runs WHEN TAR IS MISBEHAVING cannot block behind a rollup pass
+    // (see tar_plugin.cpp do_status). A lock-free probe keeps that property and
+    // keeps is_open() const noexcept.
+    //
+    // The probe is still only a POINT-IN-TIME answer: a caller can see `true`
+    // and have the connection close underneath it. That is safe because every
+    // method re-tests `if (!db_)` under mu_ and fails closed, so the worst case
+    // is one status reply that reports ok for a store that died microseconds
+    // later -- self-correcting on the next call.
+    std::atomic<sqlite3*> db_{nullptr};
     // Read-only, authorizer-sandboxed connection used only by execute_user_query
     // for untrusted operator SQL (#760). Null if it could not be opened, in
-    // which case user queries fail closed.
+    // which case user queries fail closed. NOT atomic: unlike db_ it is never
+    // written after construction publishes the object (no runtime close path),
+    // so there is no concurrent writer to race with.
     sqlite3* query_db_{nullptr};
     std::mutex mu_;
     std::mutex query_mu_;

@@ -82,6 +82,8 @@ void ExecutionEventBus::publish(const std::string& execution_id, const std::stri
         if (is_terminal && !ch->terminal) {
             ch->terminal = true;
             ch->terminal_at_ms = ev.timestamp_ms;
+            // C5 (#2409): name the exact terminal event, atomically with the flag.
+            ch->first_terminal_id = ev.id;
         }
         // Fan out under the channel mutex — listeners must not block.
         // The intended pattern is queue-and-notify on a per-connection

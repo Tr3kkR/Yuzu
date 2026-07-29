@@ -5,6 +5,7 @@
  *         extract_plugin
  */
 
+#include "mcp_jsonrpc.hpp"
 #include "web_utils.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -608,6 +609,231 @@ TEST_CASE("audit_token: neutralises k=v structural delimiters + control bytes",
     CHECK(audit_token(std::string("a\tb")) == "a_b");
 }
 
+// ── mcp_body_exceeds_cap (#2437) ────────────────────────────────────────────
+//
+// The pre-routing transport cap's DECISION. Extracted from server.cpp's
+// pre-routing lambda precisely so it is testable here; the wire behaviour it
+// drives (413 without the body ever being read) is pinned separately in
+// test_mcp_body_cap.cpp against a real httplib::Server.
+
+TEST_CASE("mcp_body_exceeds_cap: only /mcp/v1/ is capped", "[web_utils][mcp][bounds]") {
+    constexpr std::uint64_t kCap = 1024;
+    // Other surfaces on the same httplib instance keep httplib's global
+    // default — capping them here would break the multipart certificate
+    // upload and content distribution, which is why this is per-path and not
+    // Server::set_payload_max_length.
+    CHECK_FALSE(mcp_body_exceeds_cap("/api/v1/bundles", kCap * 100, kCap));
+    CHECK_FALSE(mcp_body_exceeds_cap("/api/settings/certificates", kCap * 100, kCap));
+    CHECK_FALSE(mcp_body_exceeds_cap("/", kCap * 100, kCap));
+    // Prefix match, not exact: every method and sub-path under /mcp/v1/.
+    CHECK(mcp_body_exceeds_cap("/mcp/v1/", kCap + 1, kCap));
+    CHECK(mcp_body_exceeds_cap("/mcp/v1/anything", kCap + 1, kCap));
+    // A path that merely CONTAINS the prefix elsewhere is not capped.
+    CHECK_FALSE(mcp_body_exceeds_cap("/proxy/mcp/v1/x", kCap + 1, kCap));
+}
+
+TEST_CASE("mcp_body_exceeds_cap: exactly at the cap is admitted", "[web_utils][mcp][bounds]") {
+    constexpr std::uint64_t kCap = 1024;
+    // Strictly greater-than. The docs publish a "<= cap" contract, so an
+    // off-by-one here would reject a request the documentation promises to
+    // accept.
+    CHECK_FALSE(mcp_body_exceeds_cap("/mcp/v1/", kCap - 1, kCap));
+    CHECK_FALSE(mcp_body_exceeds_cap("/mcp/v1/", kCap, kCap));
+    CHECK(mcp_body_exceeds_cap("/mcp/v1/", kCap + 1, kCap));
+}
+
+TEST_CASE("is_mcp_path: scoped to match the auth chokepoint, not narrower",
+          "[web_utils][mcp][bounds]") {
+    // The cap must cover EVERYTHING the auth chokepoint admits, or a path is
+    // authenticated-but-uncapped. Auth and the engine quota gate both scope on
+    // "/mcp/", so this does too: scoping to "/mcp/v1/" alone left "/mcp/v1"
+    // and "/mcp/v1x" reachable and unbounded, evadable by editing one
+    // character (governance Gate 4 UP-5, Gate 8 security LOW-4).
+    CHECK(is_mcp_path("/mcp/v1/"));
+    CHECK(is_mcp_path("/mcp/v1"));
+    CHECK(is_mcp_path("/mcp/v1/anything"));
+    CHECK(is_mcp_path("/mcp/v1x"));
+    // A future /mcp/v2/ is capped BY DEFAULT rather than shipping uncapped and
+    // waiting for someone to notice - the whole point of matching the auth
+    // scope instead of a version-specific one.
+    CHECK(is_mcp_path("/mcp/v2/"));
+
+    // Still bounded: the prefix must be a real path segment, and an unrelated
+    // route that merely contains it is untouched.
+    CHECK_FALSE(is_mcp_path("/mcp"));
+    CHECK_FALSE(is_mcp_path("/mcpx/v1/"));
+    CHECK_FALSE(is_mcp_path("/proxy/mcp/v1/"));
+    CHECK_FALSE(is_mcp_path("/api/v1/bundles"));
+}
+
+TEST_CASE("mcp_body_unmeasurable: refuses any framing or encoding we do not solely interpret",
+          "[web_utils][mcp][bounds]") {
+    // Signature takes header VALUES, not a pre-computed "is it chunked" bool.
+    // That is the whole fix: the previous version matched httplib's decision by
+    // hand with a case-SENSITIVE find("chunked") while httplib uses
+    // case_ignore::equal, so one capital letter admitted a body that was then
+    // read as chunked under the 100 MB global default.
+    auto unmeasurable = [](std::string_view method, bool has_cl, std::string_view te,
+                           std::string_view ce) {
+        return mcp_body_unmeasurable("/mcp/v1/", method, has_cl, te, ce);
+    };
+
+    SECTION("Transfer-Encoding is refused in ANY case, on ANY method") {
+        for (auto te : {"chunked", "Chunked", "CHUNKED", "cHuNkEd", "identity, chunked",
+                        "gzip", "anything-at-all"}) {
+            INFO("Transfer-Encoding: " << te);
+            // Declaring a Content-Length alongside must not buy admission -
+            // httplib consults Transfer-Encoding first and ignores the length.
+            CHECK(unmeasurable("POST", /*has_cl=*/true, te, ""));
+            // httplib's expect_content treats chunking independently of the
+            // method, so a chunked GET/DELETE reaches the same reader.
+            CHECK(unmeasurable("GET", false, te, ""));
+            CHECK(unmeasurable("DELETE", false, te, ""));
+            CHECK(unmeasurable("OPTIONS", false, te, ""));
+        }
+    }
+
+    SECTION("non-identity Content-Encoding is refused") {
+        // This build compiles CPPHTTPLIB_BROTLI_SUPPORT: httplib decompresses
+        // transparently and bounds only the DECOMPRESSED size against its 100
+        // MB global, so Content-Length measures the wrong thing entirely.
+        for (auto ce : {"br", "gzip", "deflate", "BR", "Gzip"}) {
+            INFO("Content-Encoding: " << ce);
+            CHECK(unmeasurable("POST", /*has_cl=*/true, "", ce));
+        }
+        // identity IS the no-op encoding, in any case, and stays admissible.
+        for (auto ce : {"identity", "Identity", "IDENTITY"}) {
+            INFO("Content-Encoding: " << ce);
+            CHECK_FALSE(unmeasurable("POST", /*has_cl=*/true, "", ce));
+        }
+    }
+
+    SECTION("a body-bearing method with no Content-Length is refused") {
+        CHECK(unmeasurable("POST", /*has_cl=*/false, "", ""));
+        CHECK(unmeasurable("PUT", false, "", ""));
+        CHECK(unmeasurable("PATCH", false, "", ""));
+    }
+
+    SECTION("a plain measurable request is admitted") {
+        CHECK_FALSE(unmeasurable("POST", /*has_cl=*/true, "", ""));
+        // Bodyless methods carry nothing to measure - the GET SSE channel and
+        // DELETE session teardown must not be refused by a rule aimed at
+        // bodies. DELETE is the load-bearing one: httplib's expect_content is
+        // true for it, so it is TEMPTING to require a Content-Length there,
+        // but MCP teardown sends no body and many clients omit the header
+        // entirely - 411-ing it would break a shipped route to close a hazard
+        // that is currently unreachable. See mcp_body_unmeasurable's contract.
+        CHECK_FALSE(unmeasurable("GET", false, "", ""));
+        CHECK_FALSE(unmeasurable("DELETE", false, "", ""));
+        // ...but a DELETE that carries real framing IS refused.
+        CHECK(unmeasurable("DELETE", false, "chunked", ""));
+        CHECK(unmeasurable("DELETE", true, "", "br"));
+    }
+
+    SECTION("other surfaces keep httplib's global default - this rule is per-path") {
+        CHECK_FALSE(mcp_body_unmeasurable("/api/v1/bundles", "POST", false, "chunked", "br"));
+    }
+}
+
+// ── JSON depth guard (#2437, governance Gate 5 CH-1) ─────────────────────
+
+TEST_CASE("json_exceeds_depth: rejects the nesting that SIGSEGVs dump()",
+          "[web_utils][mcp][bounds]") {
+    using yuzu::server::mcp::json_exceeds_depth;
+    using yuzu::server::mcp::kMcpMaxJsonDepth;
+
+    // MEASURED, not assumed: nlohmann parses very deep input fine and its
+    // destructor is iterative, but dump() is RECURSIVE - 500k levels (0.95 MiB
+    // raw, a quarter of the transport cap) segfaults the process, and
+    // execute_instruction's bound check calls v.dump() on a non-string params
+    // value. This guard exists so the tree is never constructed.
+    SECTION("deep input is rejected") {
+        const std::string deep = std::string(kMcpMaxJsonDepth + 1, '[') +
+                                 std::string(kMcpMaxJsonDepth + 1, ']');
+        CHECK(json_exceeds_depth(deep, kMcpMaxJsonDepth));
+    }
+    SECTION("exactly at the limit is admitted") {
+        const std::string ok =
+            std::string(kMcpMaxJsonDepth, '[') + std::string(kMcpMaxJsonDepth, ']');
+        CHECK_FALSE(json_exceeds_depth(ok, kMcpMaxJsonDepth));
+    }
+    SECTION("a realistic execute_bundle envelope is nowhere near the limit") {
+        // The deepest legitimate shape: envelope > params > arguments > steps >
+        // step > params > value. If this ever trips, the limit is too tight.
+        CHECK_FALSE(json_exceeds_depth(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_bundle",)"
+            R"("arguments":{"agent_id":"a","steps":[{"plugin":"p","action":"a",)"
+            R"("params":{"k":"v"}}]}}})",
+            kMcpMaxJsonDepth));
+    }
+    SECTION("brackets INSIDE a string are not structure") {
+        // The scanner must not be fooled into rejecting a legitimate payload
+        // whose string values happen to contain brackets - a scope expression
+        // or a script body will.
+        std::string s = R"({"scope":")" + std::string(200, '[') + R"("})";
+        CHECK_FALSE(json_exceeds_depth(s, kMcpMaxJsonDepth));
+        // ...nor into ACCEPTING real nesting that follows an ESCAPED quote.
+        // The value is the one-character string `"`, after which the brackets
+        // ARE structure. A scanner that treated the escaped quote as closing
+        // the string would mis-track depth from here on.
+        std::string evil = R"({"k":"\"")" + std::string(kMcpMaxJsonDepth + 1, '[') + "}";
+        CHECK(json_exceeds_depth(evil, kMcpMaxJsonDepth));
+    }
+    SECTION("an escaped backslash does not swallow the closing quote") {
+        // The value is the string `a\`; the quote AFTER the escaped backslash
+        // closes it, so the brackets are structure. Getting this wrong the
+        // other way - treating that quote as escaped - would let a deep
+        // payload hide inside what the scanner believes is still a string.
+        std::string s = R"({"k":"a\\")" + std::string(kMcpMaxJsonDepth + 1, '[') + "}";
+        CHECK(json_exceeds_depth(s, kMcpMaxJsonDepth));
+    }
+}
+
+TEST_CASE("parse_request refuses the depth bomb instead of dying on it",
+          "[web_utils][mcp][bounds]") {
+    // THE regression test for governance Gate 5 CH-1. Reproduces the measured
+    // crash payload: 500k nesting levels, 0.95 MiB raw - a QUARTER of the
+    // 4 MiB transport cap, so the cap admits it.
+    //
+    // BE PRECISE ABOUT WHAT DIES, because the first version of this comment
+    // was wrong: nlohmann's parse() handles 500k levels fine and its destructor
+    // is iterative, so removing the guard makes THIS test fail cleanly rather
+    // than crash. The SIGSEGV comes later, from the recursive dump() - and
+    // execute_instruction's bound check calls v.dump() on any non-string
+    // params value. The guard exists so the deep tree is never constructed and
+    // no downstream traversal, present or future, can reach it.
+    const std::string bomb = std::string(500000, '[') + std::string(500000, ']');
+    REQUIRE(bomb.size() < 4u * 1024 * 1024); // the transport cap would admit it
+
+    auto parsed = yuzu::server::mcp::parse_request(bomb);
+    REQUIRE_FALSE(parsed.has_value());
+    CHECK(parsed.error().find("-32700") != std::string::npos);
+    CHECK(parsed.error().find("nests too deeply") != std::string::npos);
+
+    // And the ordinary parse errors still behave - the guard runs before the
+    // parser but must not shadow it.
+    auto bad = yuzu::server::mcp::parse_request("{not json");
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().find("-32700") != std::string::npos);
+
+    // A legitimate request is untouched.
+    auto ok = yuzu::server::mcp::parse_request(
+        R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(ok.has_value());
+    CHECK(ok->method == "tools/list");
+}
+
+TEST_CASE("mcp_body_exceeds_cap: absent Content-Length is not a SIZE violation",
+          "[web_utils][mcp][bounds]") {
+    // 0 is what the caller passes when the header is absent. This predicate
+    // answers "is the declared size over the cap", and an absent size is not
+    // an over-size — refusing that shape is mcp_body_unmeasurable's job (411),
+    // tested above. This pins only that the size predicate stays
+    // single-purpose; the two must not be collapsed, or the 411 rule and the
+    // 413 rule start answering each other's questions.
+    CHECK_FALSE(mcp_body_exceeds_cap("/mcp/v1/", 0, 1024));
+}
+
 // ── is_login_exempt_path (H1, 2026-07-08 SCIM review) ───────────────────────
 
 TEST_CASE("is_login_exempt_path: /scim/v2/* is exempt (prefix match)",
@@ -651,4 +877,46 @@ TEST_CASE("is_login_exempt_path: every pre-existing exempt path is unchanged",
     CHECK(is_login_exempt_path("/static/app.css"));
     // Deliberately NOT exempt (requires a session): step-up MFA.
     CHECK_FALSE(is_login_exempt_path("/login/mfa/stepup"));
+}
+
+TEST_CASE("agent_error_display bounds the FIRST record, not a byte window",
+          "[web_utils][agent-error]") {
+    // Sol adversarial review. Agent replies are newline-separated records, so a
+    // byte-count truncation of the raw output is wrong in both directions.
+    // `tar status`'s offline reply is `error|<long line>` followed by
+    // `storage_state|offline`, and the 300-byte window that replaced a 200-byte
+    // one ran PAST the newline and rendered a trailing `storage_stat` as debris.
+    const std::string offline =
+        "error|TAR storage is offline on this endpoint; the database was closed after a "
+        "transaction could not be rolled back. Collection and retention are both stopped. The "
+        "read-only query connection is unavailable too, so `tar sql` cannot read the historical "
+        "data either. Restart the agent to recover.\nstorage_state|offline";
+
+    const auto shown = yuzu::server::agent_error_display(offline);
+    CHECK(shown.starts_with("TAR storage is offline")); // prefix stripped
+    CHECK(shown.ends_with("Restart the agent to recover."));
+    // The whole point: no debris from the NEXT record, at any length.
+    CHECK(shown.find("storage_state") == std::string::npos);
+    CHECK(shown.find('\n') == std::string::npos);
+
+    // A message longer than the bound is still cut, but never mid-codepoint.
+    const std::string wide = "error|" + std::string(60, 'x') + "\xC3\xA9" + std::string(60, 'y');
+    const auto cut = yuzu::server::agent_error_display(wide, 61);
+    CHECK(cut.size() == 60); // stepped back off the 2-byte sequence, not split
+    CHECK(cut == std::string(60, 'x'));
+
+    // No prefix and no newline: returned as-is.
+    CHECK(yuzu::server::agent_error_display("plain text") == "plain text");
+
+    // Degenerate shapes must not render an EMPTY message -- the operator would
+    // see "The device reported an error: " with nothing after it. The leading
+    // newline case is a regression the byte window did not have.
+    CHECK(yuzu::server::agent_error_display("error|\ndetail here") == "detail here");
+    CHECK(yuzu::server::agent_error_display("error|line one\r\nline two") == "line one");
+    // A malformed all-continuation run truncates rather than erasing everything.
+    const std::string junk = "error|A" + std::string(50, '\x80');
+    CHECK_FALSE(yuzu::server::agent_error_display(junk, 10).empty());
+    // Genuinely empty input stays empty without reading out of bounds.
+    CHECK(yuzu::server::agent_error_display("error|").empty());
+    CHECK(yuzu::server::agent_error_display("").empty());
 }

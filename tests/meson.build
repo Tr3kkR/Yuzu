@@ -393,6 +393,7 @@ if build_server
       'unit/server/test_mfa_store.cpp',
       'unit/server/test_auth_lockout.cpp',
       'unit/server/test_auth_break_glass.cpp',
+      'unit/server/test_auth_db_pg.cpp',
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_cidr_match.cpp',
       'unit/server/test_nvd.cpp',
@@ -410,11 +411,15 @@ if build_server
       'unit/server/test_bundle_orchestrator.cpp',
       'unit/server/test_rest_bundle.cpp',
       'unit/server/test_audit_store.cpp',
+      'unit/server/test_audit_retention_rules.cpp',
+      'unit/server/test_sqlite_raii.cpp',
       'unit/server/test_rest_audit_sample.cpp',
       'unit/server/test_rest_audit_helper.cpp',
       'unit/server/test_tag_store.cpp',
       'unit/server/test_scope_engine.cpp',
       'unit/server/test_web_utils.cpp',
+      'unit/server/test_mcp_body_cap.cpp',
+      'unit/server/test_dispatch_target_shape.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',
@@ -429,6 +434,7 @@ if build_server
       'unit/server/test_schedule_routes.cpp',
       'unit/server/test_schedule_runner.cpp',
       'unit/server/test_rbac_store.cpp',
+      'unit/server/test_list_read_confinement.cpp',
       'unit/server/test_oidc_principal_key.cpp',
       'unit/server/test_oidc_provider.cpp',
       'unit/server/test_oidc_routes.cpp',
@@ -440,6 +446,8 @@ if build_server
       'unit/server/test_legacy_shim.cpp',
       'unit/server/test_management_group_store.cpp',
       'unit/server/test_dashboard_tar_retention.cpp',
+      'unit/server/test_dashboard_tar_fragments.cpp',
+      'unit/server/test_route_sink_harness.cpp',
       'unit/server/test_rest_tar_purge.cpp',
       'unit/server/test_api_token_store.cpp',
       'unit/server/test_engine_principal_store.cpp',
@@ -506,6 +514,10 @@ if build_server
       'unit/server/test_x509_ca.cpp',
       'unit/server/test_ca_store.cpp',
       'unit/server/test_ca_routes.cpp',
+      'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
+      'unit/server/test_kek_op_lock_holder.cpp', # #2530 B6 — advisory-lock holder query
+      'unit/server/test_kek_rotate_control.cpp', # #2530 B3/B4 — rotate control-flow ordering + half-commit classification
+      'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',
@@ -577,7 +589,7 @@ if build_server
       'unit/server/test_app_perf_cohort_reader.cpp',
       'unit/server/test_pg_array.cpp',
       'unit/server/test_scim_store.cpp',
-      'unit/server/test_scim_group_store.cpp',
+      'unit/server/test_scim_store_pg.cpp',
       'unit/server/test_scim_json.cpp',
       'unit/server/test_scim_routes.cpp',
     ),
@@ -642,15 +654,32 @@ if build_server
     dependencies: [yuzu_server_core_dep, catch2_dep, dependency('openssl', required: true, include_type: 'system')],
   )
   # Sharded 2026-07-13 (#2092 — the split the 2026-07-12 recalibration comment
-  # promised): two test() entries over the SAME binary, partitioned by Catch2
+  # promised): test() entries over the SAME binary, partitioned by Catch2
   # tag filter. '~[pg]' is everything not Postgres-backed; '[pg]' is the
-  # Postgres-substrate cases (~72 cases across 28 files). The complement is
-  # exact: every Postgres-touching test carries [pg] and no [pg] test is
-  # hidden ([.]), so the shards partition the visible case set with nothing
-  # lost or run twice (guard: --list-tests counts, N_all == N_nonpg + N_pg).
-  # meson runs the entries in parallel, so suite wall time is max(shards),
-  # and each shard gets its own budget. Both budgets are sized for the *contended*
-  # Wee Tam box, not per-op cost: ~[pg] = 600s (quiet Windows ~231s), [pg] = 900s.
+  # Postgres-substrate cases. The complement is exact: every Postgres-touching
+  # test carries [pg] and no [pg] test is hidden ([.]), so the shards partition
+  # the visible case set with nothing lost or run twice (guard: --list-tests
+  # counts, N_all == N_nonpg + N_pg).
+  #
+  # RE-SHARDED 2026-07-16 (auth.db -> Postgres migration, ADR-0006): that cutover
+  # moved the entire auth/scim/mfa/route surface onto Postgres, ~doubling [pg]
+  # from ~330 to ~660 cases. Two failure modes surfaced and are fixed here:
+  #   (1) ~180 newly-Postgres route/store tests had been left UNTAGGED, so they
+  #       ran in the ~[pg] shard — a partition violation (they only skip-not-run
+  #       there when a DSN is absent; with a DSN, e.g. every CI leg, they RUN and
+  #       inflate ~[pg]). Empirical fix: every case that skips a no-DSN run via
+  #       the PG helper now carries [pg] (verified: ~[pg] no-DSN POSTGRES-skips == 0).
+  #   (2) the single ~660-case [pg] entry blew the 900s budget on the slow
+  #       GHA-hosted macos-15 runner. [pg] is now SPLIT into two balanced shards
+  #       by a count-based discriminator (per-case CREATE DATABASE ... TEMPLATE
+  #       clone cost is near-uniform, so case-count tracks wall time):
+  #         shard A = [pg] AND (routes|store|token)   ~321 cases
+  #         shard B = [pg] AND NOT (routes|store|token) ~338 cases
+  #       Exact-partition guard: N([pg]) == N(A) + N(B). meson runs all three
+  #       entries in parallel, so suite wall time is max(shard).
+  # Budgets are sized for the *contended* Wee Tam box, not per-op cost:
+  # ~[pg] = 600s (quiet Windows ~231s); each [pg] half = 600s (each is ~half the
+  # old 900s full-[pg] load, so 600s is generous even under Wee Tam c4 contention).
   #
   # HISTORY / do-not-regress: [pg] was raised 600->900 on 2026-07-14 when the
   # fsync-bound CREATE DATABASE ... TEMPLATE + DROP DATABASE WITH (FORCE) (~20x
@@ -668,18 +697,42 @@ if build_server
   # caps concurrent heavy Windows test phases per box), NOT a bigger budget —
   # raising a number just moves the cliff. A real hang is still bounded by the
   # job-level timeouts (90-120 min in ci.yml, 60 min in nightly.yml). The Catch2
-  # cleanup/sweep listener (test_pg_template_cleanup.cpp) fires in both shards —
+  # cleanup/sweep listener (test_pg_template_cleanup.cpp) fires in all shards —
   # idempotent, harmless without a DSN. Constraints the shards must keep:
   #   - only tag-filter specs may appear in args (flake-retry.py strips
   #     positional tag specs before an isolated case retry — Catch2 ORs
-  #     positional specs);
-  #   - neither entry name may be a substring of the other (flake-retry maps
-  #     meson-junit names by longest substring match).
+  #     positional specs). Each [pg] half is ONE comma-OR spec (Catch2 ORs
+  #     inside a single arg; multiple positional args would AND, not OR);
+  #   - no entry name may be a substring of another (flake-retry maps
+  #     meson-junit names by longest substring match) — 'shard A'/'shard B'
+  #     and 'server unit tests' are pairwise non-substring.
   # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the first
   # move is the concurrency gate / per-op cost (Defender TEMP exclusion, RAM disk),
   # then split or rebalance — raising the number is the last resort, not the first.
-  test('server unit tests', server_test_exe, args: ['~[pg]'], suite: 'server', timeout: 600)
-  test('server pg unit tests', server_test_exe, args: ['[pg]'], suite: 'server', timeout: 900)
+  #
+  # #2395 split the non-PG '~[pg]' entry, which had reached 603/600s (101%) on
+  # Windows and tripped the #2092 unrecovered-timeout gate. The suite was already
+  # AT budget: 18 added cases (~0.5%) were the straw, not the cause — at 100% any
+  # PR adding a single test trips it. Split rather than a timeout bump, which is
+  # what the warning itself asks for.
+  #
+  # Partition is by [auth]+[mcp] vs the rest, chosen by MEASURED TIME, not case
+  # count: [auth] alone is ~14s of the ~35s local total and dominates everything
+  # else ([mcp] 4.1s, [rest] 0.8s, [dex] 0.5s, the rest <0.5s each). The result is
+  # lopsided by count (430 vs 3057 cases) and balanced by time (~17.5s vs ~26s) —
+  # a timeout cares about seconds. Verified an exact partition: 430 + 3057 = 3487,
+  # Catch2's own counts. Catch2's native --shard-count/--shard-index would be
+  # tidier but is DELIBERATELY not used: those are options, not positional specs,
+  # so flake-retry.py's _cmd_without_test_specs would keep them across an isolated
+  # case retry and silently filter out the very case being retried.
+  test('server unit tests shard A', server_test_exe,
+       args: ['~[pg][auth],~[pg][mcp]'], suite: 'server', timeout: 600)
+  test('server unit tests shard B', server_test_exe,
+       args: ['~[pg]~[auth]~[mcp]'], suite: 'server', timeout: 600)
+  test('server pg unit tests shard A', server_test_exe,
+       args: ['[pg][routes],[pg][store],[pg][token]'], suite: 'server', timeout: 600)
+  test('server pg unit tests shard B', server_test_exe,
+       args: ['[pg]~[routes]~[store]~[token]'], suite: 'server', timeout: 600)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
@@ -717,6 +770,16 @@ test('close automation logic',
 test('flake-retry selftest',
   _python3_test,
   args: [files('../scripts/ci/flake-retry.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# End-to-end fake-Meson contract. In particular, an expired/malformed flake
+# registry must fail before the real test runner could be invoked. The script
+# uses POSIX executable fakes and returns a clean platform skip on Windows.
+test('flake-retry integration selftest',
+  _python3_test,
+  args: [files('../scripts/ci/test_flake_retry.py')],
   suite: 'docs',
   timeout: 30,
 )

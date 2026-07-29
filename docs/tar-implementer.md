@@ -61,7 +61,9 @@ collect_slow    │ enumerate_services()            │       service_live
 rollup          │   tar_aggregator runs SQL       │
   (15min) ────► │   INSERT INTO ..._hourly        │ ───►  *_hourly / *_daily / *_monthly
                 │   from each lower tier          │
-                │ retention_sql() per table       │ ───►  prunes oldest rows
+                │ run_retention():                │
+                │   retention_sql() row-count     │ ───►  trims to a row ceiling
+                │   guarded capped DELETE (time)  │ ───►  paced, clock-guarded
                 └─────────────────────────────────┘
 ```
 
@@ -116,8 +118,9 @@ patterns to `kDefaultRedactionPatterns` in `tar_collectors.hpp` rather
 than scrubbing per-callsite.
 
 **Schema versioning.** `tar_db.cpp` runs an idempotent migration at open
-time. Current schema version is 3 (legacy `tar_events` retired in PR
-M14; see the migration in `apply_migrations`). Bumps go in the same
+time. Current schema version is **5** (legacy `tar_events` was retired at v3 in
+PR M14, but `kCreateSchema` kept recreating it on every open — v5 stops that and
+drops it from already-migrated databases, #2093). Bumps go in the same
 function, never in `applies_*` collectors.
 
 ---

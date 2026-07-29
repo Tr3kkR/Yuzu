@@ -38,6 +38,8 @@ env:
   CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
   CCACHE_COMPRESSLEVEL: "1"
+  # Self-hosted Big Tam and Wee Tam runners each own one 8C/16T L3 domain.
+  YUZU_BUILD_JOBS: "16"
 
 jobs:
   # ── Linux x64 release build ──────────────────────────────────────────
@@ -56,7 +58,7 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -168,7 +170,7 @@ jobs:
             -Dbuild_tests=false
 
       - name: Build
-        run: meson compile -C build-linux
+        run: meson compile -C build-linux -j "$YUZU_BUILD_JOBS"
 
       - name: ccache stats
         if: always()
@@ -316,7 +318,7 @@ jobs:
       ImageOS: ubuntu24
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -489,7 +491,7 @@ jobs:
       HAS_SIGNING_CERT: ${{ secrets.WINDOWS_SIGNING_CERT != '' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
@@ -554,7 +556,7 @@ jobs:
             -Dbuild_tests=false
 
       - name: Build
-        run: meson compile -C build-windows
+        run: meson compile -C build-windows -j $env:YUZU_BUILD_JOBS
 
       - name: ccache stats
         if: always()
@@ -815,7 +817,7 @@ jobs:
       HAS_NOTARIZATION: ${{ secrets.MACOS_SIGNING_CERT != '' && secrets.MACOS_NOTARIZATION_TEAM_ID != '' }}
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
@@ -1197,7 +1199,7 @@ jobs:
             dockerfile: deploy/docker/Dockerfile.gateway
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -1272,6 +1274,7 @@ jobs:
           tags: yuzu-hc-verify/${{ matrix.image }}:${{ github.sha }}
           build-args: |
             TRIPLET=x64-linux
+            YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
           cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}
           provenance: false
           sbom: false
@@ -1308,6 +1311,7 @@ jobs:
           # build-arg is still safe -- unused build-args are ignored.
           build-args: |
             TRIPLET=x64-linux
+            YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
           # Registry cache lives in GHCR itself under a :buildcache tag.
           # mode=max caches intermediate layers too (best hit rate).
           cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}
@@ -1423,7 +1427,7 @@ jobs:
       attestations: write    # actions/attest-build-provenance
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -1627,7 +1631,7 @@ jobs:
             dockerfile: deploy/docker/Dockerfile.agent.chisel
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -1702,6 +1706,8 @@ jobs:
           push: false
           load: true
           tags: yuzu-hc-verify/${{ matrix.image }}-chisel:${{ github.sha }}
+          build-args: |
+            YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
           cache-from: type=local,src=${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}-chisel
           provenance: false
           sbom: false
@@ -1729,6 +1735,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            YUZU_BUILD_JOBS=${{ env.YUZU_BUILD_JOBS }}
           # NOTE: deliberately NO TRIPLET build-arg. The server/agent chisel
           # Dockerfiles derive the vcpkg triplet from buildx's per-arch
           # TARGETARCH when TRIPLET is empty
@@ -1848,7 +1856,7 @@ jobs:
       id-token: write        # cosign keyless + Sigstore OIDC
       attestations: write    # actions/attest-build-provenance
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
@@ -1980,7 +1988,7 @@ jobs:
       id-token: write   # cosign sign-blob keyless (SHA256SUMS.sigstore)
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 

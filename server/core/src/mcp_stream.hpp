@@ -136,9 +136,18 @@ inline constexpr std::size_t kMcpStreamsPerPrincipalDefault = 4;
 /// fixed-size pin array here is the ring-side enforcement of the same bound.
 inline constexpr std::size_t kMaxStreamedPostsPerSession = 4;
 
-/// Why a stream ended. Wire-visible (the final `stream-closed` frame), audited
-/// (`mcp.stream.close` `reason=`), and distinct per CH-4 — a client must be able
-/// to tell "your credential was revoked" from "our auth backend is down".
+/// The streamed-POST admission cap (StreamBudget, per principal) and this ring-side per-session
+/// pin-slot cap are the SAME bound seen from two sides (2f PR 3b): admission must never let in
+/// more streamed POSTs than the ring can pin finals for. `sse_bus` aliases the detail namespace
+/// where the budget constant lives (stream_budget.hpp is included above; the reverse include
+/// would be a cycle, which is why the assert lives here, not there).
+static_assert(kMaxStreamedPostsPerSession == sse_bus::kPerPrincipalMcpPost,
+              "streamed-POST per-principal budget cap must equal the ring's per-session pin-slot "
+              "cap — else admission could admit a streamed POST the ring cannot pin a final for");
+
+/// Why a stream ended. Wire-visible (the JSON-RPC-wrapped `notifications/yuzu.stream_closed`
+/// notification, 2f PR 3b), audited (`mcp.stream.close` `reason=`), and distinct per CH-4 — a
+/// client must be able to tell "your credential was revoked" from "our auth backend is down".
 enum class McpStreamClose {
     kNone,               ///< still open
     kClientGone,         ///< peer disconnected / write failed
@@ -147,8 +156,32 @@ enum class McpStreamClose {
     kCredentialRevoked,  ///< re-validation said the credential is definitively gone
     kAuthUnavailable,    ///< re-validation was indeterminate past the grace window
     kInternalError,      ///< the pump caught an exception — OUR fault, not the client's
+    // The next three are produced ONLY by the streamed-POST surface (2f PR 3b); the GET pump
+    // never emits them. Declared here so to_string / close_remediation / the metric seed cover
+    // the whole closed reason set from C4, before their producers land in C6c/C7.
+    kCancelled,          ///< the client sent notifications/cancelled; the execution continues
+    kCapExpired,         ///< the streamed-POST response time cap elapsed; the execution continues
+    kCompleted,          ///< the final was delivered then EOF — no close frame is written for this
 };
 const char* to_string(McpStreamClose reason);
+
+/// Build the JSON-RPC-wrapped stream-close notification body (2f PR 3b, PENDING 2):
+///   {"jsonrpc":"2.0","method":"notifications/yuzu.stream_closed","params":{ A4 body ... }}
+/// carried under the DEFAULT `message` SSE event type (NOT a bespoke `event: stream-closed`, which
+/// a spec MCP client parsing JSON-RPC messages off the stream would never see). `params` is the
+/// same A4-shaped body every denial on this route uses (reason / correlation_id / retry_after_ms /
+/// remediation). `extra_params_json` is an optional RAW fragment appended inside `params` — the
+/// caller includes the leading comma, e.g. `,"execution_id":"exec-1","partial":true` (C6c/C7) — or
+/// empty. CONTRACT (Gate 2 security/architect): the fragment is concatenated VERBATIM, so any
+/// STRING value in it MUST be `detail::json_quoted`-escaped by the caller — an unescaped `"` / `\`
+/// / newline in a value would corrupt the JSON envelope on a live stream (a JSON-injection sink).
+/// Server-minted ids (`exec-*` etc.) are format-safe, but a future producer passing any
+/// agent/execution-derived string must quote it and add a test that a `"`-bearing value cannot
+/// break the envelope. The frame is off-ring, id-less and non-replayable: a close is a
+/// point-in-time terminal signal, not a resumable frame. Shared by the GET pump and the
+/// streamed-POST pump.
+std::string make_stream_closed_frame(McpStreamClose reason, std::string_view correlation_id,
+                                     std::string_view extra_params_json = {});
 
 /// Tri-state credential re-validation (Decision 15(c)+(i)). The distinction is
 /// load-bearing: kRevoked kills the stream NOW, kIndeterminate starts a bounded
@@ -478,6 +511,75 @@ private:
     yuzu::Gauge* gauge_streams_handover_ = nullptr;
 };
 
+/// The per-tick credential re-validation grace state machine, extracted from McpStreamPump
+/// (2f PR 3b) so the streamed-POST pump (McpPostPump) can share it byte-for-byte. Fed one
+/// StreamRevalidate verdict per tick, it owns ALL of the grace/jitter/staleness state and
+/// decides whether the stream continues or must close — and with which reason — WITHOUT touching
+/// the wire: the pump owns `stream_->close` and the close frame, this owns only the policy.
+///
+/// The distinctions are load-bearing (Decision 15(c)/(i), CH-4, #2367):
+///   * kRevoked       — authoritative revocation, an IMMEDIATE kill (no grace).
+///   * kIndeterminate — the auth backend is unreachable (NOT a revocation): ride a bounded,
+///                      per-stream-jittered grace window rather than cut every live stream at the
+///                      same instant (the correlated-brownout mass-kill, ADR-0006).
+///   * kValid         — the store was asked and answered: an authoritative confirmation.
+///   * kValidStale    — a positive answer served from a cache of known max age (#2367): clamp the
+///                      grace floor forward by at most one window so cache residency and the grace
+///                      window can never ADD.
+class RevalidateGrace {
+public:
+    struct Config {
+        std::chrono::milliseconds grace = kMcpRevalidateGraceDefault;
+        std::chrono::milliseconds jitter_max{0};    ///< max extra per-stream grace, chosen once
+        std::chrono::milliseconds max_staleness{0};  ///< #2367; 0 = answers always authoritative
+    };
+
+    using Clock = std::function<std::chrono::steady_clock::time_point()>;
+
+    /// What the pump must do after feeding a verdict.
+    enum class Outcome {
+        kContinue,               ///< stream lives (healthy, or riding a bounded grace window)
+        kCloseCredentialRevoked, ///< authoritative revocation — kill now
+        kCloseAuthUnavailable,   ///< grace window expired, or an unknown verdict (fail closed)
+    };
+
+    /// `last_authoritative_ok_` seeds to now(): attach performed a fresh authoritative
+    /// authentication before this exists, and seeding to the epoch would make the very first
+    /// indeterminate tick compute an instantly-expired deadline.
+    RevalidateGrace(Config cfg, Clock clock)
+        : cfg_(std::move(cfg)), clock_(std::move(clock)), last_authoritative_ok_(now()) {}
+
+    /// Feed one tick's verdict; updates grace state and returns the wire outcome.
+    Outcome on_verdict(StreamRevalidate verdict);
+
+private:
+    std::chrono::steady_clock::time_point now() const {
+        return clock_ ? clock_() : std::chrono::steady_clock::now();
+    }
+    /// Drop the current indeterminate-grace spell. Called from BOTH the kValid and kValidStale
+    /// arms — a cache hit is as much a confirmation as a read-through (#2367); round-1's BLOCKING
+    /// bug was exactly one arm clearing the deadline while the other left it armed.
+    void clear_grace_deadline_() {
+        grace_start_.reset();
+        grace_deadline_.reset();
+    }
+
+    Config cfg_;
+    Clock clock_;
+    // When the credential was last confirmed AUTHORITATIVELY (store asked and answered), as
+    // opposed to served from cache (#2367). The indeterminate grace deadline is measured from
+    // HERE, so a stream cannot extend its life by riding cached answers then collecting a full
+    // fresh window once they expire.
+    std::chrono::steady_clock::time_point last_authoritative_ok_;
+    // Where the current indeterminate spell's budget is measured from (the last authoritative
+    // confirmation, NOT the moment the store first failed to answer).
+    std::optional<std::chrono::steady_clock::time_point> grace_start_;
+    // = grace_start_ + grace + a per-stream jitter chosen once when grace_start_ is set. Because
+    // grace_start_ is backdated it can already be in the past when armed, so the expiry test runs
+    // on the arming tick too.
+    std::optional<std::chrono::steady_clock::time_point> grace_deadline_;
+};
+
 /// The content-provider body of one live GET stream.
 ///
 /// `pump_once` is the test seam: it takes a `WriteFn` rather than an
@@ -551,17 +653,6 @@ public:
 private:
     bool pump_once_impl(const WriteFn& write); ///< the throwing body pump_once() guards
     bool finish(const WriteFn& write, McpStreamClose reason);
-    std::chrono::steady_clock::time_point now() const;
-
-    /// Drop the current indeterminate-grace spell. Called from BOTH the kValid
-    /// and kValidStale arms of the revalidate switch — a cache hit is as much a
-    /// confirmation as a read-through (#2367). Shared so the two arms cannot
-    /// silently diverge: round-1's BLOCKING bug was exactly one of them
-    /// clearing the deadline while the other left it armed.
-    void clear_grace_deadline_() {
-        grace_start_.reset();
-        grace_deadline_.reset();
-    }
 
     std::shared_ptr<McpStreamSink> sink_;
     std::shared_ptr<McpStreamState> stream_;
@@ -569,27 +660,11 @@ private:
     std::function<StreamRevalidate()> revalidate_;
     std::function<bool()> session_alive_;
     Config cfg_;
-    ClockFn clock_;
     yuzu::MetricsRegistry* metrics_ = nullptr;
-    // #2367. When this stream's credential was last confirmed AUTHORITATIVELY —
-    // the store was asked and answered — as opposed to served from a cache
-    // (StreamRevalidate::kValidStale). The indeterminate grace deadline is
-    // measured from HERE, not from the tick the outage was noticed, so a stream
-    // cannot extend its life by riding cached answers and then collecting a
-    // full fresh grace window once they expire. Seeded at construction: attach
-    // performs a fresh authoritative authentication before this pump exists.
-    std::chrono::steady_clock::time_point last_authoritative_ok_;
-    // Where the current indeterminate spell's budget is measured from: the last
-    // authoritative confirmation (see above), NOT the moment the store first
-    // failed to answer.
-    std::optional<std::chrono::steady_clock::time_point> grace_start_;
-    // The effective grace deadline for THIS stream's current indeterminate spell,
-    // = grace_start_ + revalidate_grace + a per-stream jitter chosen once when
-    // grace_start_ is set (see Config::revalidate_grace_jitter_max). Reset alongside
-    // grace_start_ when the credential re-validates AUTHORITATIVELY. Because
-    // grace_start_ is backdated it can already be in the past when armed, so the
-    // expiry test runs on the arming tick too.
-    std::optional<std::chrono::steady_clock::time_point> grace_deadline_;
+    // The credential re-validation grace policy (revoke/indeterminate/valid/stale, jitter,
+    // #2367 staleness clamp). Owns all of the grace state + the injected clock; this pump keeps
+    // only the wire action taken on its verdict. Constructed from cfg_ + the ClockFn.
+    RevalidateGrace grace_;
 };
 
 /// The `GET /mcp/v1/` tail, called by `McpServer::build_get_handler` after its

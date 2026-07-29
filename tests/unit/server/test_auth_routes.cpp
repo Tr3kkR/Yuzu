@@ -106,7 +106,7 @@ httplib::Request request_with_header(const std::string& name, const std::string&
 }  // namespace
 
 TEST_CASE("AuthRoutes::resolve_session — Bearer token populates principal",
-          "[auth_routes]") {
+          "[pg][auth_routes]") {
     AuthRoutesFixture fix;
     auto raw = fix.mint_token();
     auto req = request_with_header("Authorization", "Bearer " + raw);
@@ -118,7 +118,7 @@ TEST_CASE("AuthRoutes::resolve_session — Bearer token populates principal",
 }
 
 TEST_CASE("AuthRoutes::resolve_session — X-Yuzu-Token populates principal",
-          "[auth_routes]") {
+          "[pg][auth_routes]") {
     AuthRoutesFixture fix;
     auto raw = fix.mint_token();
     auto req = request_with_header("X-Yuzu-Token", raw);
@@ -129,7 +129,7 @@ TEST_CASE("AuthRoutes::resolve_session — X-Yuzu-Token populates principal",
 }
 
 TEST_CASE("AuthRoutes::resolve_session — session cookie populates principal",
-          "[auth_routes]") {
+          "[pg][auth_routes]") {
     AuthRoutesFixture fix;
     auto cookie = fix.auth_mgr.authenticate("test_user", "test_password");
     REQUIRE(cookie.has_value());
@@ -141,7 +141,7 @@ TEST_CASE("AuthRoutes::resolve_session — session cookie populates principal",
 }
 
 TEST_CASE("AuthRoutes::resolve_session — no auth returns nullopt",
-          "[auth_routes]") {
+          "[pg][auth_routes]") {
     AuthRoutesFixture fix;
     httplib::Request req;
     auto session = fix.ar->resolve_session(req);
@@ -150,7 +150,7 @@ TEST_CASE("AuthRoutes::resolve_session — no auth returns nullopt",
 
 TEST_CASE("AuthRoutes::make_audit_event — populates principal from Bearer token "
           "(regression: mcp.* audit rows had empty principal)",
-          "[auth_routes][audit]") {
+          "[pg][auth_routes][audit]") {
     AuthRoutesFixture fix;
     auto raw = fix.mint_token();
     auto req = request_with_header("Authorization", "Bearer " + raw);
@@ -164,7 +164,7 @@ TEST_CASE("AuthRoutes::make_audit_event — populates principal from Bearer toke
 }
 
 TEST_CASE("AuthRoutes::make_audit_event — populates principal from X-Yuzu-Token",
-          "[auth_routes][audit]") {
+          "[pg][auth_routes][audit]") {
     AuthRoutesFixture fix;
     auto raw = fix.mint_token();
     auto req = request_with_header("X-Yuzu-Token", raw);
@@ -176,7 +176,7 @@ TEST_CASE("AuthRoutes::make_audit_event — populates principal from X-Yuzu-Toke
 }
 
 TEST_CASE("AuthRoutes::make_audit_event — populates principal from session cookie",
-          "[auth_routes][audit]") {
+          "[pg][auth_routes][audit]") {
     AuthRoutesFixture fix;
     auto cookie = fix.auth_mgr.authenticate("test_user", "test_password");
     REQUIRE(cookie.has_value());
@@ -190,7 +190,7 @@ TEST_CASE("AuthRoutes::make_audit_event — populates principal from session coo
 }
 
 TEST_CASE("AuthRoutes::make_audit_event — empty principal when no auth present",
-          "[auth_routes][audit]") {
+          "[pg][auth_routes][audit]") {
     AuthRoutesFixture fix;
     httplib::Request req;
     auto event = fix.ar->make_audit_event(req, "anonymous", "success");
@@ -201,7 +201,7 @@ TEST_CASE("AuthRoutes::make_audit_event — empty principal when no auth present
 
 TEST_CASE("AuthRoutes::emit_event — analytics event records principal from "
           "Bearer token (regression: same shape as audit_event bug)",
-          "[auth_routes][analytics]") {
+          "[pg][auth_routes][analytics]") {
     AuthRoutesFixture fix;
     auto raw = fix.mint_token();
     auto req = request_with_header("Authorization", "Bearer " + raw);
@@ -228,7 +228,7 @@ TEST_CASE("AuthRoutes::emit_event — analytics event records principal from "
 // ---------------------------------------------------------------------------
 
 TEST_CASE("AuthRoutes::require_admin — service-scoped token from admin is rejected",
-          "[auth_routes][scope][mcp]") {
+          "[pg][auth_routes][scope][mcp]") {
     AuthRoutesFixture fix;
     // Mint a token scoped to "finance-svc"; creator is an admin.
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
@@ -258,7 +258,7 @@ TEST_CASE("AuthRoutes::require_admin — service-scoped token from admin is reje
 }
 
 TEST_CASE("AuthRoutes::require_admin — MCP token from admin is rejected",
-          "[auth_routes][scope][mcp]") {
+          "[pg][auth_routes][scope][mcp]") {
     AuthRoutesFixture fix;
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch()).count();
@@ -275,7 +275,7 @@ TEST_CASE("AuthRoutes::require_admin — MCP token from admin is rejected",
 }
 
 TEST_CASE("AuthRoutes::require_admin — unscoped admin token is accepted (regression guard)",
-          "[auth_routes][scope][mcp]") {
+          "[pg][auth_routes][scope][mcp]") {
     AuthRoutesFixture fix;
     auto raw = fix.api_tokens->create_token("plain", "test_user");
     REQUIRE(raw.has_value());
@@ -294,7 +294,7 @@ TEST_CASE("AuthRoutes::require_admin — unscoped admin token is accepted (regre
 // ---------------------------------------------------------------------------
 
 TEST_CASE("AuthRoutes::require_permission — readonly MCP tier blocks Execute regardless of RBAC",
-          "[auth_routes][scope][mcp]") {
+          "[pg][auth_routes][scope][mcp]") {
     AuthRoutesFixture fix;
     // Fixture has rbac_store=nullptr (RBAC disabled). test_user is admin.
     // Tier enforcement must fire regardless of RBAC state.
@@ -324,7 +324,7 @@ TEST_CASE("AuthRoutes::require_permission — readonly MCP tier blocks Execute r
 }
 
 TEST_CASE("AuthRoutes::require_permission — readonly MCP tier allows Read without RBAC",
-          "[auth_routes][scope][mcp]") {
+          "[pg][auth_routes][scope][mcp]") {
     AuthRoutesFixture fix;
     // readonly tier permits Read; creator is admin; RBAC disabled → should pass.
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
@@ -344,7 +344,7 @@ TEST_CASE("AuthRoutes::require_permission — readonly MCP tier allows Read with
 // ---------------------------------------------------------------------------
 
 TEST_CASE("AuthRoutes::require_scoped_permission — operator MCP tier allows Execute without RBAC",
-          "[auth_routes][scope][mcp]") {
+          "[pg][auth_routes][scope][mcp]") {
     AuthRoutesFixture fix;
     // operator tier permits Execution:Execute; creator is admin; RBAC disabled → pass.
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
@@ -360,7 +360,7 @@ TEST_CASE("AuthRoutes::require_scoped_permission — operator MCP tier allows Ex
 }
 
 TEST_CASE("AuthRoutes::require_scoped_permission — readonly MCP tier blocks Execute",
-          "[auth_routes][scope][mcp]") {
+          "[pg][auth_routes][scope][mcp]") {
     AuthRoutesFixture fix;
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch()).count();
@@ -398,7 +398,7 @@ TEST_CASE("AuthRoutes::require_scoped_permission — readonly MCP tier blocks Ex
 // ---------------------------------------------------------------------------
 
 TEST_CASE("AuthRoutes::require_permission — supervised MCP token blocked from approval-gated Execute",
-          "[auth_routes][scope][mcp]") {
+          "[pg][auth_routes][scope][mcp]") {
     AuthRoutesFixture fix;
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch()).count();
@@ -425,7 +425,7 @@ TEST_CASE("AuthRoutes::require_permission — supervised MCP token blocked from 
 // recall consumes the ticket then dies at the auth layer. This is the exact
 // integration bug the UAT smoke caught (the MCP unit harness mocks perm_fn).
 TEST_CASE("AuthRoutes::require_permission — approval gate is skipped on the MCP transport",
-          "[auth_routes][scope][mcp]") {
+          "[pg][auth_routes][scope][mcp]") {
     AuthRoutesFixture fix;
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch()).count();
@@ -453,7 +453,7 @@ TEST_CASE("AuthRoutes::require_permission — approval gate is skipped on the MC
 // Execute, so requires_approval() was false for the REST pair and a supervised
 // MCP token could quarantine (and release) via REST with NO approval (#520).
 TEST_CASE("AuthRoutes::require_permission — supervised token mirror-denied on REST quarantine POST",
-          "[auth_routes][scope][mcp][quarantine]") {
+          "[pg][auth_routes][scope][mcp][quarantine]") {
     AuthRoutesFixture fix;
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch()).count();
@@ -475,7 +475,7 @@ TEST_CASE("AuthRoutes::require_permission — supervised token mirror-denied on 
 }
 
 TEST_CASE("AuthRoutes::require_permission — supervised token mirror-denied on REST quarantine DELETE",
-          "[auth_routes][scope][mcp][quarantine]") {
+          "[pg][auth_routes][scope][mcp][quarantine]") {
     AuthRoutesFixture fix;
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch()).count();
@@ -494,7 +494,7 @@ TEST_CASE("AuthRoutes::require_permission — supervised token mirror-denied on 
 }
 
 TEST_CASE("AuthRoutes::require_scoped_permission — supervised MCP token blocked from approval-gated Delete",
-          "[auth_routes][scope][mcp]") {
+          "[pg][auth_routes][scope][mcp]") {
     AuthRoutesFixture fix;
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch()).count();
@@ -511,7 +511,7 @@ TEST_CASE("AuthRoutes::require_scoped_permission — supervised MCP token blocke
 }
 
 TEST_CASE("AuthRoutes::require_permission — supervised MCP token allows Read (not approval-gated)",
-          "[auth_routes][scope][mcp]") {
+          "[pg][auth_routes][scope][mcp]") {
     AuthRoutesFixture fix;
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch()).count();
@@ -530,7 +530,7 @@ TEST_CASE("AuthRoutes::require_permission — supervised MCP token allows Read (
 // ---------------------------------------------------------------------------
 
 TEST_CASE("AuthRoutes::require_auth — oversized Bearer token is rejected (DoS protection #630)",
-          "[auth_routes][dos]") {
+          "[pg][auth_routes][dos]") {
     AuthRoutesFixture fix;
     std::string big_token(1000, 'a');
     auto req = request_with_header("Authorization", "Bearer " + big_token);
@@ -542,7 +542,7 @@ TEST_CASE("AuthRoutes::require_auth — oversized Bearer token is rejected (DoS 
 }
 
 TEST_CASE("AuthRoutes::require_auth — oversized X-Yuzu-Token is rejected (DoS protection #630)",
-          "[auth_routes][dos]") {
+          "[pg][auth_routes][dos]") {
     AuthRoutesFixture fix;
     std::string big_token(1000, 'b');
     auto req = request_with_header("X-Yuzu-Token", big_token);
@@ -615,7 +615,7 @@ TEST_CASE("AuthRoutes::url_decode — mixed valid and malformed sequences (H-A)"
 // every stream on the fleet at the same instant (chaos CH-4).
 
 TEST_CASE("revalidate_stream: a live token for the stream's principal is valid",
-          "[auth][stream][ch4]") {
+          "[pg][auth][stream][ch4]") {
     AuthRoutesFixture f;
     const auto token = f.mint_token();
     auto req = request_with_header("Authorization", "Bearer " + token);
@@ -623,7 +623,7 @@ TEST_CASE("revalidate_stream: a live token for the stream's principal is valid",
 }
 
 TEST_CASE("revalidate_stream: a revoked token DEFINITIVELY ends the stream",
-          "[auth][stream][ch4]") {
+          "[pg][auth][stream][ch4]") {
     AuthRoutesFixture f;
     const auto token = f.mint_token();
     auto live = f.api_tokens->validate_token(token);
@@ -637,7 +637,7 @@ TEST_CASE("revalidate_stream: a revoked token DEFINITIVELY ends the stream",
 }
 
 TEST_CASE("revalidate_stream: a valid token for ANOTHER principal is not authority",
-          "[auth][stream][ch4]") {
+          "[pg][auth][stream][ch4]") {
     AuthRoutesFixture f;
     const auto token = f.mint_token(); // belongs to test_user
     auto req = request_with_header("Authorization", "Bearer " + token);
@@ -646,14 +646,14 @@ TEST_CASE("revalidate_stream: a valid token for ANOTHER principal is not authori
     CHECK(f.ar->revalidate_stream(req, "someone_else") == auth::CredentialCheck::kRevoked);
 }
 
-TEST_CASE("revalidate_stream: no credential at all is a definitive no", "[auth][stream][ch4]") {
+TEST_CASE("revalidate_stream: no credential at all is a definitive no", "[pg][auth][stream][ch4]") {
     AuthRoutesFixture f;
     httplib::Request bare;
     CHECK(f.ar->revalidate_stream(bare, "test_user") == auth::CredentialCheck::kRevoked);
 }
 
 TEST_CASE("revalidate_stream: a dead cookie FALLS THROUGH to a live token",
-          "[auth][stream][ch4]") {
+          "[pg][auth][stream][ch4]") {
     // The invariant: a stream lives iff a fresh request with these headers would still
     // authenticate as this principal — so this must mirror resolve_session's
     // fall-through exactly. An earlier version returned kRevoked as soon as the cookie
@@ -669,7 +669,7 @@ TEST_CASE("revalidate_stream: a dead cookie FALLS THROUGH to a live token",
 }
 
 TEST_CASE("revalidate_stream: X-Yuzu-Token is honoured alongside a dead Bearer",
-          "[auth][stream][ch4]") {
+          "[pg][auth][stream][ch4]") {
     AuthRoutesFixture f;
     const auto token = f.mint_token();
     httplib::Request req;
@@ -679,7 +679,7 @@ TEST_CASE("revalidate_stream: X-Yuzu-Token is honoured alongside a dead Bearer",
 }
 
 TEST_CASE("revalidate_stream: an unreachable token store is INDETERMINATE, not revoked",
-          "[auth][stream][ch4]") {
+          "[pg][auth][stream][ch4]") {
     // CH-4's second half. If the store cannot answer, we do not KNOW the credential is
     // gone — and treating "cannot tell" as "revoked" would cut every stream on the
     // fleet the moment the auth store hiccupped. The pump rides out a bounded grace

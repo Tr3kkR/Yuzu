@@ -12,6 +12,7 @@
 #include "file_utils.hpp"
 #include "web_utils.hpp"
 #include <yuzu/server/auth.hpp>
+#include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/server/server.hpp>
 
@@ -25,6 +26,9 @@
 #include "ca_routes.hpp"
 #include "ca_store.hpp"
 #include "default_certs.hpp"
+#include "kek_op_lock.hpp"
+#include "kek_rotate_control.hpp"
+#include "kek_routes.hpp"
 #include "key_provider.hpp"
 #include "scim_routes.hpp"
 #include "x509_ca.hpp"
@@ -55,6 +59,8 @@
 #include "dex_app_perf_model.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+#include "pg/secret_codec.hpp"
 #include "device_inventory_store.hpp"
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
@@ -83,6 +89,8 @@
 #include "scope_yaml.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "dispatch_target_shape.hpp" // check_targeting_shape / targeting_supplied (#2500)
+#include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
 #include "compliance_routes.hpp"
@@ -196,6 +204,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -307,6 +316,23 @@ using yuzu::server::audit_token;
 // (rest_api_v1.cpp, workflow_routes.cpp) can adopt the pending slot into
 // their own stream lifetime via `adopt_quota_slot_into_stream`. server.cpp
 // keeps only the httplib-specific, worker-thread-affine call sites below.
+
+// -- KEK rotation seam helpers (#2395) -----------------------------------------
+//
+// The three KekOps lambdas (register_routes call site below) all need to
+// serialize on a CLUSTER-WIDE session advisory lock before touching
+// `auth_secret_codec_` — a rotate racing another rotate (on this server or
+// another one pointed at the same database) must be refused, never
+// interleaved. This is a DIFFERENT key from the codec's own INTERNAL
+// transaction-scoped lock (`pg_advisory_xact_lock(2037545589,
+// hashtext('secrets_kek'))`, pg/secret_codec.cpp:30, taken inside
+// rotate_kek() itself) — reusing that key here would have our own call to
+// rotate_kek() deadlock against the very lock we are holding. Same first
+// argument (an arbitrary fixed classifier picked to match the codec's), but
+// hashtext() of a distinct second-key string ('secrets_kek_op' vs
+// 'secrets_kek'), which Postgres's two-key advisory-lock form keys on
+// jointly — so the two locks never collide.
+
 
 } // namespace detail
 
@@ -483,7 +509,7 @@ public:
         metrics_.describe("yuzu_mcp_streams_cap",
                           "Effective concurrent MCP SSE stream cap after the worker-pool clamp",
                           "gauge");
-        metrics_.describe("yuzu_mcp_stream_closes_total", "MCP GET SSE streams closed, by reason",
+        metrics_.describe("yuzu_mcp_stream_closes_total", "MCP SSE streams closed, by reason",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_frames_dropped_total",
                           "Frames dropped before reaching a connection's per-connection queue — "
@@ -550,6 +576,25 @@ public:
                           "Progress-bridge projector wake cycles. An event-driven liveness signal: "
                           "records_active > 0 with a flat rate here means the projector is wedged",
                           "counter");
+        metrics_.describe("yuzu_mcp_bridge_teardown_incomplete_total",
+                          "Progress-bridge teardown steps that could not complete on the "
+                          "maintenance thread, by reason. DEFENCE IN DEPTH, not the live "
+                          "out-of-memory signal: all three steps allocate nothing, so only a "
+                          "mutex failure can reach them today - use "
+                          "yuzu_mcp_stream_terminal_publish_failures_total for allocation "
+                          "pressure. The claim is one-way, so a record that fails here is never "
+                          "retried and what it still owns is held until the process restarts; a "
+                          "retained record also pins that session's whole stream state, its "
+                          "replay ring and any pinned finals. Alert on > 0",
+                          "counter");
+        metrics_.describe("yuzu_mcp_maintenance_tick_failures_total",
+                          "MCP maintenance ticks that threw and were contained, by tick "
+                          "(#2487). The tick is skipped, not retried. bridge_sweep: pin-ack, "
+                          "session-death and pressure teardown are all stalled while it grows. "
+                          "session_gc: expired sessions keep their streams and pinned finals "
+                          "until a tick succeeds. Both are guarded separately so one failing "
+                          "cannot suppress the other",
+                          "counter");
         metrics_.describe("yuzu_mcp_stream_final_unpinned_total",
                           "Committed terminal frames that found no free pin slot and were published "
                           "UNPINNED (a real terminal is committed rather than lost to preserve a "
@@ -579,6 +624,14 @@ public:
                             "subscribe_failed", "arm_threw"}) {
             metrics_.counter("yuzu_mcp_bridge_degrade_total", {{"reason", reason}});
         }
+        // #2487: CLOSED reason set, derived from the bridge's own stage table so a
+        // fourth owned resource cannot be added without this loop following.
+        for (auto stage : mcp::McpStreamBridge::kTeardownStageNames) {
+            metrics_.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"reason", stage}});
+        }
+        for (auto tick : {"bridge_sweep", "session_gc"}) {
+            metrics_.counter("yuzu_mcp_maintenance_tick_failures_total", {{"tick", tick}});
+        }
         metrics_.counter("yuzu_mcp_stream_frames_dropped_total");
         metrics_.counter("yuzu_mcp_stream_frames_too_large_total");
         metrics_.counter("yuzu_mcp_stream_publish_failures_total");
@@ -589,8 +642,97 @@ public:
         for (const auto& tool : mcp::approval_gated_tool_names()) {
             metrics_.counter("yuzu_mcp_tool_args_invalid_total", {{"tool", tool}});
         }
+        // #2437 handler-side bound denials. The label set is closed on BOTH
+        // axes: `tool` is execute_instruction alone (the only tool that EMITS
+        // this counter today; the two kAgenticParamMaxLen read tools bound in
+        // the handler but audit without a metric) and `reason` is the fixed
+        // literal set below - so this pre-seed is exhaustive and absent() stays
+        // meaningful. Extend both lists together if a second tool gains bounds.
+        // Iterated from the ONE array in mcp_input_bounds.hpp rather than
+        // restated here: a second literal list is how a new rule ends up
+        // emitted-but-unseeded, which passes its own test and silently breaks
+        // absent() alerting. This commit's six targeting reasons went into
+        // that array, not into a list here - which is the tether working.
+        for (const auto reason : yuzu::server::mcp::kExecInstrBoundReasons) {
+            metrics_.counter("yuzu_mcp_tool_args_too_large_total",
+                             {{"tool", "execute_instruction"}, {"reason", std::string(reason)}});
+        }
+        // #2500 REST targeting refusals. Deliberately NOT the MCP counter above:
+        // these are different surfaces with different gates, and folding them into
+        // one series would make `yuzu_mcp_*` count calls that never touched MCP.
+        // Both axes are closed — `route` is the REST surfaces that dispatch or
+        // narrow on caller-supplied targeting, `reason` iterates the ONE array in
+        // dispatch_target_shape.hpp — so this pre-seed is exhaustive and absent()
+        // stays meaningful. A reason added at an emit site instead of in that array
+        // is emitted-but-unseeded: it passes its own test while the dashboard reads
+        // zero and the alert never fires.
+        metrics_.describe("yuzu_server_dispatch_target_rejected_total",
+                          "REST dispatch calls refused because a supplied targeting argument "
+                          "named no device, plus dispatch-closure calls that named no target at "
+                          "all (#2500). Both labels are closed sets; every reachable pair is "
+                          "pre-seeded at boot so absent() stays meaningful.",
+                          "counter");
+        // The route-level reasons below are the literals in `kRouteRejectReasons`
+        // (dispatch_target_shape.hpp). They are spelled out here rather than
+        // iterated because each applies to a DIFFERENT route subset, and a
+        // single loop over the array would seed unreachable pairs — which is
+        // exactly what the per-route seeding fixes. `test_dispatch_target_shape.cpp`
+        // binds the two lists so a reason added at an emit site without a home
+        // in the array fails a test.
+        //
+        // Seeded PER ROUTE rather than as a cross-product: `result_set_parent`
+        // can only ever emit the two parent_id reasons, and the dispatch routes
+        // can never emit them. Seeding the full product would publish series
+        // that no code path can reach, which reads on a dashboard as "this has
+        // never happened" when the truth is "this cannot happen" (governance).
+        for (const char* route : {"command", "instruction_execute"}) {
+            for (const auto reason : yuzu::server::kTargetingShapeReasons)
+                metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                                 {{"route", route}, {"reason", std::string(reason)}});
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonBodyType)}});
+        }
+        for (const auto reason : {yuzu::server::kReasonParentIdType,
+                                  yuzu::server::kReasonParentIdEmpty})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "result_set_parent"}, {"reason", std::string(reason)}});
+        // `policy_remediate` has its OWN reachable set, not the dispatch routes'.
+        // It refuses `scope` outright (PolicyEvaluator::remediate takes only
+        // agent_ids), so `scope_type`, `scope_empty` and `target_conflict` can
+        // never be emitted there — seeding them would publish series no code
+        // path can reach, which reads on a dashboard as "never happened" when
+        // the truth is "cannot happen".
+        for (const auto reason : {yuzu::server::kReasonBodyType,
+                                  yuzu::server::kReasonScopeUnsupported,
+                                  yuzu::server::kReasonAgentIdsType,
+                                  yuzu::server::kReasonAgentIdsEmpty,
+                                  yuzu::server::kReasonAgentIdType}) {
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "policy_remediate"}, {"reason", std::string(reason)}});
+        }
+        // The shared dispatch closure's last-line-of-defence arm. Its own route
+        // label because it is not a REST surface — background runners reach it
+        // too — and a non-zero value here means a CALLER forgot to name a
+        // target, which is a code defect rather than a client one.
+        metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                         {{"route", "dispatch_closure"},
+                          {"reason", std::string(yuzu::server::kReasonClosureNoTarget)}});
+        // #2437 transport-layer body rejection (pre-routing, pre-auth). No
+        // `tool` label: the body is never read, so nothing is known about the
+        // call beyond its path — a tool label here would be a fabrication.
+        // `reason` distinguishes a measured over-cap body (413) from one this
+        // server refuses to measure at all (411: chunked, or POST with no
+        // Content-Length — both would otherwise revert to httplib's 100 MB
+        // default and evade the cap entirely).
+        for (auto reason : {"over_cap", "unmeasurable"}) {
+            metrics_.counter("yuzu_mcp_body_too_large_total", {{"reason", reason}});
+        }
         for (auto reason : {"client_disconnect", "superseded", "session_terminated",
-                            "credential_revoked", "auth_unavailable", "internal_error"}) {
+                            "credential_revoked", "auth_unavailable", "internal_error",
+                            // 2f PR 3b streamed-POST close reasons — producers land in C6c/C7;
+                            // pre-seeded here so the closed label set is complete from C4.
+                            "cancelled", "cap_expired", "completed"}) {
             metrics_.counter("yuzu_mcp_stream_closes_total", {{"reason", reason}});
         }
         metrics_.counter("yuzu_mcp_stream_replay_ring_evictions_total");
@@ -796,6 +938,88 @@ public:
                           "Cooldown entries evicted at the capacity bound", "counter");
         metrics_.describe("yuzu_server_dex_alert_routed_types",
                           "Number of obs_types currently routed to alerts", "gauge");
+        // ADR-0010 §Decision 3. Carried in the gauge family because the
+        // authoritative cumulative count lives in SecretCodec and is exported
+        // pull-model at scrape time, but it IS a monotonic counter — declared
+        // as one here so the scrape emits `# TYPE ... counter` and the `_total`
+        // suffix matches docs/observability-conventions.md.
+        metrics_.describe("yuzu_server_secret_decrypt_failures_total",
+                          "Envelope-encrypted secret decrypt failures by store and failure class "
+                          "(tamper, unresolvable KEK, malformed blob)",
+                          "counter");
+        // #2530 B7 — KEK rotate/rewrap/status observability. The four gauges
+        // are sampled from Postgres cluster state on health_recompute_thread_
+        // (15s cadence); the counter follows the same pull-model-carried-as-
+        // counter pattern as yuzu_server_secret_decrypt_failures_total above
+        // (the authoritative cumulative total lives in kek_op_outcome_counts_,
+        // incremented at each kek_ops.{rotate,rewrap,status} return point).
+        metrics_.describe("yuzu_server_kek_op_lock_held",
+                          "Whether the cluster-wide secrets_kek_op advisory lock currently has a "
+                          "granted holder (1) or not (0). A diagnostic snapshot, not a "
+                          "safe-to-retire signal (#2525).",
+                          "gauge");
+        metrics_.describe("yuzu_server_kek_live_versions",
+                          "Count of non-retired KEK versions (secrets.kek_meta rows with "
+                          "retired_at IS NULL). Compare against --kek-max-live-versions.",
+                          "gauge");
+        // #2530 G8-S12: the configured --kek-max-live-versions ceiling,
+        // exported as its OWN gauge so YuzuKekCeilingApproaching (below) can
+        // alert on the RATIO yuzu_server_kek_live_versions /
+        // yuzu_server_kek_max_live_versions instead of a hardcoded 32 —
+        // retirement is impossible under #2525, so this ceiling is a
+        // lifetime cap, and without this an operator who has already raised
+        // the flag (the supported #2530 B5 escape hatch) gets no
+        // proximity warning before hitting the NEW ceiling's 409. A static
+        // config value, not sampled from Postgres — set once here, at boot,
+        // so it stays published even when the KEK substrate itself is never
+        // reachable (unlike the four gauges above, which are sampled from
+        // cluster state on health_recompute_thread_ and can legitimately be
+        // absent or frozen on a degrade).
+        metrics_.describe("yuzu_server_kek_max_live_versions",
+                          "The configured --kek-max-live-versions ceiling. A static config "
+                          "value (set once at boot), not sampled from Postgres like the other "
+                          "yuzu_server_kek_* gauges. Compare against "
+                          "yuzu_server_kek_live_versions to gauge ceiling proximity.",
+                          "gauge");
+        metrics_.gauge("yuzu_server_kek_max_live_versions")
+            .set(static_cast<double>(cfg_.kek_max_live_versions));
+        metrics_.describe("yuzu_server_kek_active_version",
+                          "The KEK version new secret encrypts currently use (the newest "
+                          "non-retired kek_meta version).",
+                          "gauge");
+        // #2530 G7-B4: `yuzu_server_kek_oldest_version_in_use` was RETIRED —
+        // it was fed only by the 15s health_recompute_thread_ sampler, which
+        // dropped it (the query is the unbatched full-column scan whose
+        // scale ceiling #2530 explicitly deferred; running it every 15s
+        // instead of only on operator demand made that deferred problem
+        // worse, not better). `GET /status`'s `oldest_in_use` field is
+        // unaffected — it still computes this value on demand, which is
+        // where it belongs.
+        metrics_.describe("yuzu_server_kek_operations_total",
+                          "KEK rotate/rewrap/status attempts by op and outcome (success, "
+                          "conflict, cooldown, ceiling, query_canceled, clock_anomaly, "
+                          "half_committed, unavailable, internal).",
+                          "counter");
+        // #2530 G7-S5: pre-seed the closed {op x outcome} vocabulary to 0
+        // (same closed-label-set pre-seed pattern as
+        // yuzu_server_principal_quota_exhausted_total below), so an outcome
+        // that has never fired — "ceiling" or "clock_anomaly" being the
+        // interesting ones — reads as a true zero, distinguishable from "not
+        // wired up at all". Bounded: 3 ops x 9 outcomes = 27 series.
+        for (auto kek_op : {"rotate", "rewrap", "status"}) {
+            for (auto outcome : {"success", "conflict", "cooldown", "ceiling", "query_canceled",
+                                 "clock_anomaly", "half_committed", "unavailable", "internal"}) {
+                metrics_.gauge("yuzu_server_kek_operations_total",
+                               {{"op", kek_op}, {"outcome", outcome}});
+            }
+        }
+        metrics_.describe("yuzu_server_kek_metrics_unavailable_total",
+                          "KEK cluster-state reads (health_recompute_thread_, #2530 G8-S2: "
+                          "short-circuited after the first failure within a sweep, so this is "
+                          "at most one increment per 15s sweep) that could not read Postgres; "
+                          "on each occurrence every KEK gauge above HOLDS its prior published "
+                          "value rather than publishing a false 0.",
+                          "counter");
         metrics_.describe("yuzu_fleet_agents_by_os", "Connected agents by operating system",
                           "gauge");
         metrics_.describe("yuzu_fleet_agents_by_arch", "Connected agents by CPU architecture",
@@ -981,6 +1205,67 @@ public:
         // operators that the audit chain itself is degraded.
         metrics_.describe("yuzu_server_audit_emit_failed_total",
                           "Audit events that failed to persist (sqlite3_step != DONE)", "counter");
+        // #2360 retention clock guard. The two counters answer DIFFERENT
+        // questions and must not be collapsed: skips means the guard declined a
+        // delete that would have wiped the evidence table (this server's clock
+        // moved), failed means the cleanup pass itself errored. Both leave rows
+        // undeleted, so without the second an operator watching an audit table
+        // that never shrinks would read a broken cleanup loop as a working guard.
+        metrics_.describe("yuzu_server_audit_clock_anomaly_skips_total",
+                          "Audit retention passes declined. A declined pass warns "
+                          "and deletes NOTHING; one increment per declined pass. "
+                          "Triggers: the pass would have expired every datable "
+                          "row; the gap since the previous pass exceeded a fixed 7 "
+                          "days (a forward clock jump OR an outage that long); or "
+                          "the stored reading was not usable - ahead of the clock, "
+                          "negative, present but not an integer, or unreadable. "
+                          "Reducing audit_retention_days can also cause a decline "
+                          "by design. Triage: "
+                          "docs/user-manual/audit-log.md#the-retention-clock-guard. "
+                          "The decision rule itself is classify() in "
+                          "audit_retention_rules.hpp plus the fact construction in "
+                          "AuditStore::cleanup_once, pinned by tests - it is "
+                          "deliberately not paraphrased here",
+                          "counter");
+        metrics_.describe("yuzu_server_audit_cleanup_failed_total",
+                          "Audit retention passes that did not fully do their job: an unreadable "
+                          "probe, a failed delete, a refused implausible clock, a closed store, or "
+                          "an exception caught at the thread boundary. Note one site fires AFTER a "
+                          "successful delete (the post-delete backlog probe), so this means "
+                          "'retention is not fully healthy', not 'nothing was deleted'",
+                          "counter");
+        // The cap that makes an allowed wipe pace out introduces its own failure
+        // mode: if it binds on EVERY pass for a sustained period, expiry is
+        // outrunning the drain and audit.db grows without bound. Neither counter
+        // above moves in that state, so this pair is the only way it is visible.
+        // Counted rather than measured with a COUNT(*) backlog gauge on purpose
+        // -- that query would scan under the same lock every audit write takes.
+        metrics_.describe("yuzu_server_audit_rows_deleted_total",
+                          "Audit rows deleted by retention", "counter");
+        metrics_.describe("yuzu_server_audit_retention_cap_reached_total",
+                          "Audit retention passes that hit the per-pass delete cap, leaving a "
+                          "backlog for the next pass",
+                          "counter");
+        // Liveness. Every other retention series is silence-means-healthy, so a
+        // cleanup thread that never runs leaves them all flat at 0 -- identical
+        // to a quiet, healthy store, while audit.db grows without bound. These
+        // two are what an operator alerts on the ABSENCE of.
+        metrics_.describe("yuzu_server_audit_retention_passes_total",
+                          "Audit retention passes attempted, including declined and failed ones. "
+                          "Flat means the cleanup thread is not running - the one condition the "
+                          "other retention counters cannot report",
+                          "counter");
+        metrics_.describe("yuzu_server_audit_retention_last_pass_unixtime",
+                          "Wall-clock reading of the most recent audit retention pass WHOSE CLOCK "
+                          "WAS USABLE; 0 if none has run in this process. Read WITH "
+                          "retention_passes_total: stale here while that RISES means the reaper "
+                          "is alive but refusing an implausible clock, which is a different fault "
+                          "from stopped",
+                          "gauge");
+        metrics_.describe("yuzu_server_audit_retention_persist_failed_total",
+                          "Failures to persist the audit retention clock reading, which degrades "
+                          "clock-anomaly detection across a restart",
+                          "counter");
         // PR W1.1 sre-1 (gov Gate 6, sre): CSPRNG-failure paging signal.
         // Increments in the token-create handlers (api_token, device_token)
         // when `secure_random::fill_random` returns prng_failure (entropy
@@ -1120,6 +1405,36 @@ public:
         metrics_.describe("yuzu_auth_sso_provision_total",
                           "Total durable SSO identity provision/refresh upserts, by source",
                           "counter");
+        // Fail-closed-path observability (governance hardening round,
+        // sre BLOCKING). Every 503 an operator/agentic worker sees from a
+        // `is_store_unavailable` guard on the auth/MFA surface increments
+        // this, labelled by the route that hit it — so a PG/KEK outage is
+        // visible as a metric spike distinct from ordinary 401/403 traffic,
+        // and SRE can tell WHICH fail-closed path is degraded. Bounded,
+        // pre-seeded closed label set (route) per
+        // docs/observability-conventions.md, so absent() alerts stay
+        // meaningful.
+        metrics_.describe("yuzu_auth_secret_unavailable_total",
+                          "Total requests refused 503 by an is_store_unavailable fail-closed "
+                          "guard on the auth/MFA surface, by route",
+                          "counter");
+        for (auto route : {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate"}) {
+            metrics_.counter("yuzu_auth_secret_unavailable_total", {{"route", route}});
+        }
+        // First-boot seed observability (authdb MEDIUM). Incremented exactly
+        // once, iff `seed_admin_if_empty` actually seeded the sole admin row
+        // (an empty `auth.users` table) — a no-op (table already populated,
+        // the common case on every restart) leaves this at 0. No labels: the
+        // event is binary and rare enough that a plain counter (0 forever, or
+        // 1 after the one genuine fresh-start boot) is the whole signal.
+        metrics_.describe("yuzu_auth_fresh_start_reset_total",
+                          "1 iff this boot seeded the sole admin user into an empty auth.users "
+                          "table (fresh-start), 0 otherwise",
+                          "counter");
+        metrics_.counter("yuzu_auth_fresh_start_reset_total");
+        if (cfg_.auth_fresh_start_seeded) {
+            metrics_.counter("yuzu_auth_fresh_start_reset_total").increment();
+        }
         // SCIM v2 provisioning observability (governance hardening round,
         // M-METRICS). Registered unconditionally (like every other describe()
         // in this constructor) even when --scim-enable is off, so Prometheus
@@ -1928,6 +2243,67 @@ public:
             }
         }
 
+        // AuthDB — born-on-PG authentication persistence (ADR-0006 substrate
+        // migration). Same fail-CLOSED construction posture as every other
+        // born-on-PG store (ADR-0012 §1). Construction order is load-bearing
+        // (see the member-declaration comment): FileKeyProvider →
+        // SecretCodec (constructed only — NOT init'd yet) → AuthDB (this is
+        // what migrates `auth.users` AND registers `mfa_totp_secret` as a
+        // secret column) → SecretCodec::init() (runs AFTER AuthDB so the
+        // column it validates already exists) → ScimStore.
+        if (pg_pool_ && !startup_failed_) {
+            const std::filesystem::path key_dir =
+                cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
+            auth_key_provider_ = std::make_unique<FileKeyProvider>(key_dir);
+            auth_secret_codec_ = std::make_unique<pg::SecretCodec>(*auth_key_provider_);
+            auth_db_ = std::make_unique<AuthDB>(*pg_pool_, *auth_secret_codec_);
+            if (!auth_db_->is_open()) {
+                spdlog::error("[PG] Refusing to start: auth store (AuthDB) migration/open failed "
+                              "(database reachable but the auth schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                // Substrate-level boot init (ADR-0010 §2) — MUST run before any
+                // store attempts an encrypt/decrypt through auth_secret_codec_.
+                // AuthDB above is the only registrant on this codec instance
+                // today, but init() is where its column is actually verified.
+                auto lease = pg_pool_->acquire();
+                if (!lease) {
+                    spdlog::error("[PG] Refusing to start: could not acquire a connection to run "
+                                  "SecretCodec::init() ({})",
+                                  pg_pool_->last_error());
+                    startup_failed_ = true;
+                } else {
+                    auto init_res = auth_secret_codec_->init(lease.get());
+                    lease.reset();
+                    if (!init_res) {
+                        spdlog::error(
+                            "[PG] Refusing to start: SecretCodec::init() failed — {}: {}",
+                            pg::SecretCodec::to_string(init_res.error().kind),
+                            init_res.error().message);
+                        startup_failed_ = true;
+                    } else {
+                        auth_mgr_.set_auth_db(auth_db_.get());
+                    }
+                }
+            }
+        }
+
+        // ScimStore — born-on-PG SCIM v2 store (ADR-0006). Constructed
+        // unconditionally (cheap to open; mirrors every other always-on
+        // born-on-PG store) — route registration + the configured bearer
+        // token stay gated on --scim-enable in start_web_server(), which
+        // reuses this member instead of constructing its own.
+        if (pg_pool_ && !startup_failed_) {
+            scim_store_ = std::make_unique<ScimStore>(*pg_pool_);
+            if (!scim_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: SCIM store migration/open failed "
+                              "(database reachable but the scim_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            }
+        }
+
         // Initialize response store
         {
             auto resp_db = cfg_.db_dir() / "responses.db";
@@ -2178,6 +2554,49 @@ public:
             if (fleet_topology_store_ && audit_store_ && audit_store_->is_open())
                 fleet_topology_store_->set_audit_store(audit_store_.get());
 
+            // ── ADR-0010 §Decision 3 evidence surface ────────────────────
+            //
+            // This PR is SecretCodec's FIRST production consumer, and
+            // ADR-0010 puts the observability wiring on "the per-store
+            // migration PRs" — i.e. here. Without it the codec's KEK
+            // lifecycle verbs (`kek.generated`/`kek.rotated`/`kek.retired`)
+            // and, most importantly, `secret.decrypt_failure` — the tamper /
+            // wrong-KEK / corrupt-blob signal — are computed and then
+            // discarded, so a fleet could be failing every MFA decrypt with
+            // nothing in the audit log to say so. (Flagged by the 2026-07-25
+            // review, HIGH #4: `set_audit_hook` was called only from tests.)
+            //
+            // Wired HERE rather than at the codec's construction above
+            // because `audit_store_` does not exist yet at that point.
+            //
+            // Lifetime: the lambda captures `this` and reads `audit_store_`
+            // at call time rather than capturing the pointer, so a reset
+            // store cannot dangle; `stop()` additionally clears the hook
+            // before destroying the codec. Attribution is system-level by
+            // design (ADR-0010 arch-7) — operator attribution for
+            // rotate/retire rides the route-level audit event of whichever
+            // surface invoked them.
+            if (auth_secret_codec_) {
+                auth_secret_codec_->set_audit_hook(
+                    [this](std::string_view verb, const std::string& detail_json) {
+                        if (!audit_store_ || !audit_store_->is_open())
+                            return;
+                        const bool failure = (verb == "secret.decrypt_failure");
+                        (void)audit_store_->log(
+                            {.timestamp = std::time(nullptr),
+                             .principal = "system:secret-codec",
+                             .principal_role = "system",
+                             .action = std::string(verb),
+                             .target_type = "Secret",
+                             .target_id = "auth",
+                             // detail_json carries AAD coordinates, kek_version
+                             // and the failure class ONLY — never ciphertext,
+                             // plaintext, DEK or key bytes (secret_codec.hpp).
+                             .detail = detail_json,
+                             .result = failure ? "failure" : "success"});
+                    });
+            }
+
             // Gate 7 compliance F-1 — durable evidence that the viz
             // kill-switch took effect. The per-request `kill_switch` audit
             // row in VizRoutes only fires when a request actually hits a
@@ -2255,6 +2674,31 @@ public:
                 ev.detail = "instruction-definition signature enforcement disabled at startup "
                             "(--allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS) "
                             "— unsigned definitions will be accepted at import";
+                ev.result = "success";
+                (void)audit_store_->log(ev);
+            }
+
+            // #2530 B5 — mirror the unsigned_packs/unsigned_definitions
+            // startup-posture audit pattern: raising --kek-max-live-versions
+            // above the shipped default is a deliberate, temporary risk
+            // acceptance pending #2525 (no retire route exists, so this is
+            // the supported escape hatch that keeps rotation usable once an
+            // install hits the ceiling). The matching spdlog::warn fires
+            // earlier, in main.cpp, before audit_store_ exists.
+            if (detail::kek_ceiling_is_risk_acceptance(cfg_.kek_max_live_versions) &&
+                audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.action = "server.kek_ceiling_raised";
+                ev.target_type = "Secret";
+                ev.target_id = "kek";
+                ev.detail = std::format(
+                    "--kek-max-live-versions raised to {} (default {}) at startup — a deliberate, "
+                    "temporary risk acceptance pending #2525 (no KEK retire route exists yet)",
+                    cfg_.kek_max_live_versions, detail::kKekMaxLiveVersionsDefault);
                 ev.result = "success";
                 (void)audit_store_->log(ev);
             }
@@ -3685,6 +4129,175 @@ public:
                     else
                         metrics_.counter("yuzu_inventory_stale_count_unavailable_total").increment();
                 }
+                // #2530 B7 — KEK cluster-state gauges, sampled HERE rather
+                // than from GET /status (a gauge refreshed only on a /status
+                // call would go stale and miss a lock held by another server
+                // process pointed at the same database — the whole point of
+                // a scrape-time collector).
+                //
+                // #2530 G7-B4: this comment used to claim this sampler
+                // mirrored count_stale_agents' degrade handling, but until
+                // this fix it only bounded the pool ACQUIRE (250ms) — never
+                // EXECUTION — so the KEK reads fell back to the pool's 30s
+                // default statement_timeout each. This is a SERIAL thread
+                // shared with the security-relevant agent-revocation
+                // teardown sweep (and joined before `pg_pool_.reset()` in
+                // `stop()`), so a degraded DB could hold it for a long
+                // multiple of that. Fixed by wrapping the reads in an
+                // explicit transaction with a `SET LOCAL statement_timeout`,
+                // matching count_stale_agents' actual pattern (per-statement
+                // cap, not just a bounded acquire). Budget: 500ms. Both
+                // reads below touch small, cheap relations (`kek_meta` has
+                // one row per live KEK version; `pg_locks` is tiny), so a
+                // healthy read completes in low single-digit ms — 500ms caps
+                // worst-case exposure at ~1s across the two sequential
+                // reads, in the same spirit as count_stale_agents' 250ms
+                // single-query budget (scaled up slightly for a
+                // two-statement transaction), and stays short enough not to
+                // meaningfully delay the revocation-teardown backstop
+                // sharing this thread.
+                //
+                // #2530 G7-B4 also DROPS `oldest_kek_version_in_use` from
+                // this periodic sweep and retires the
+                // `yuzu_server_kek_oldest_version_in_use` gauge with it
+                // (docs/user-manual/server-admin.md updated to match): it is
+                // the UNBATCHED FULL-COLUMN SCAN whose ceiling #2530
+                // explicitly deferred as out of scope (see
+                // `test_secret_column_registration_tripwire.cpp`), and
+                // running that scan every 15s instead of only on operator
+                // demand materially worsens the very problem the deferral
+                // acknowledged. `GET /status` still computes it on demand,
+                // which is where it belongs.
+                //
+                // On ANY degrade every gauge below HOLDS its prior published
+                // value and `yuzu_server_kek_metrics_unavailable_total` is
+                // bumped instead — never a fabricated 0 (it would read as
+                // "no KEK versions" / "lock free" during exactly the outage
+                // an operator needs this for).
+                if (auth_secret_codec_ && pg_pool_) {
+                    // In-process, no DB round trip — always fresh.
+                    metrics_.gauge("yuzu_server_kek_active_version")
+                        .set(static_cast<double>(auth_secret_codec_->active_kek_version()));
+                    constexpr auto kKekMetricsAcquireTimeout = std::chrono::milliseconds{250};
+                    constexpr auto kKekMetricsStatementTimeout = std::chrono::milliseconds{500};
+                    if (auto kek_lease = pg_pool_->try_acquire_for(kKekMetricsAcquireTimeout)) {
+                        PGconn* kek_conn = kek_lease.get();
+                        pg::PgResult begin{PQexec(kek_conn, "BEGIN")};
+                        bool txn_ok = begin.status() == PGRES_COMMAND_OK;
+                        if (txn_ok) {
+                            const std::string timeout_sql =
+                                "SET LOCAL statement_timeout = '" +
+                                std::to_string(kKekMetricsStatementTimeout.count()) + "ms'";
+                            pg::PgResult t{PQexec(kek_conn, timeout_sql.c_str())};
+                            txn_ok = t.status() == PGRES_COMMAND_OK;
+                        }
+                        if (txn_ok) {
+                            // #2530 G8-S2: short-circuit after the FIRST
+                            // failed read. A 57014 (statement_timeout) on
+                            // `live_kek_version_count` doesn't just fail that
+                            // one query — it aborts the whole transaction, so
+                            // unconditionally running `kek_op_lock_holder`
+                            // next (the pre-fix shape) executed against an
+                            // already-aborted transaction: it failed too
+                            // (double-counting `..._unavailable_total` for
+                            // ONE underlying cause), AND its own
+                            // `spdlog::error("KEK op: lock-holder query
+                            // failed: ...")` logged a misleading message that
+                            // named the wrong query. `read_ok` tracks whether
+                            // it is still meaningful to keep reading in this
+                            // transaction.
+                            bool read_ok = true;
+                            if (auto live = auth_secret_codec_->live_kek_version_count(kek_conn))
+                                metrics_.gauge("yuzu_server_kek_live_versions")
+                                    .set(static_cast<double>(*live));
+                            else
+                                read_ok = false;
+
+                            // #2530 T5: kek_op_lock_holder distinguishes a
+                            // query failure (`determined == false`) from a
+                            // genuinely unheld lock — on a failure this gauge
+                            // HOLDS its prior published value (the
+                            // surrounding block's no-fabricated-zero rule)
+                            // rather than publishing a misleading 0. #2530
+                            // G7-S1: read `lock_held` directly, never derived
+                            // from `pid.has_value()` — a granted holder with
+                            // a NULL pid is still held.
+                            if (read_ok) {
+                                auto holder = detail::kek_op_lock_holder(kek_conn);
+                                if (holder.determined) {
+                                    metrics_.gauge("yuzu_server_kek_op_lock_held")
+                                        .set(holder.lock_held ? 1.0 : 0.0);
+                                } else {
+                                    read_ok = false;
+                                }
+                            }
+
+                            if (!read_ok)
+                                metrics_.counter("yuzu_server_kek_metrics_unavailable_total")
+                                    .increment();
+
+                            // Best-effort: this is a read-only transaction —
+                            // a failed COMMIT here (e.g. the connection died
+                            // mid-txn, or the transaction was already aborted
+                            // by a statement_timeout above) only means the
+                            // already-published gauge/counter updates above
+                            // stand as read; it does not undo them, and the
+                            // connection is returned to the pool either way.
+                            pg::PgResult commit{PQexec(kek_conn, "COMMIT")};
+                            (void)commit;
+                        } else {
+                            pg::PgResult rollback{PQexec(kek_conn, "ROLLBACK")};
+                            (void)rollback;
+                            metrics_.counter("yuzu_server_kek_metrics_unavailable_total")
+                                .increment();
+                        }
+                    } else {
+                        metrics_.counter("yuzu_server_kek_metrics_unavailable_total").increment();
+                    }
+                } else if (!stop_requested_.load(std::memory_order_acquire)) {
+                    // #2530 G7-M1: the KEK substrate is unavailable — the
+                    // exact condition under which every KEK operation
+                    // records outcome="unavailable" below — so say so on the
+                    // metrics-unavailable side too, rather than silently
+                    // skipping straight past this whole block.
+                    //
+                    // #2530 G8-S7: gated on `!stop_requested_` — `stop()`
+                    // resets `auth_secret_codec_`/`pg_pool_` strictly AFTER
+                    // `health_recompute_thread_.join()` returns, so this
+                    // branch should never observe null pointers mid-shutdown
+                    // today. This check is defense-in-depth against that
+                    // ordering ever regressing (e.g. a future teardown
+                    // reorder), so a clean shutdown can never arm
+                    // YuzuKekMetricsUnavailable on churn elsewhere in this
+                    // function.
+                    metrics_.counter("yuzu_server_kek_metrics_unavailable_total").increment();
+                }
+
+                // #2530 G7-M1: moved OUT of the `auth_secret_codec_ &&
+                // pg_pool_` guard above — this loop needs NO Postgres access,
+                // it is a pure in-process read of the accumulator each
+                // kek_ops.{rotate,rewrap,status} lambda increments at its
+                // return points (same pull-model-carried-as-counter pattern
+                // as yuzu_server_secret_decrypt_failures_total). That guard
+                // is the EXACT condition under which every KEK operation
+                // records outcome="unavailable" (the kek_ops.* seams below
+                // check the same two pointers and fail with
+                // Failure::Unavailable when either is null), so publishing
+                // this loop only inside the guard meant the
+                // `yuzu_server_kek_operations_total{outcome="unavailable"}`
+                // series went dark precisely when that outcome was firing —
+                // it needed to be visible, and it was the one thing
+                // guaranteed to be invisible.
+                {
+                    std::lock_guard<std::mutex> kek_outcome_lk{kek_op_outcome_mu_};
+                    for (const auto& [key, count] : kek_op_outcome_counts_) {
+                        const auto& [op, outcome] = key;
+                        metrics_
+                            .gauge("yuzu_server_kek_operations_total",
+                                   {{"op", op}, {"outcome", outcome}})
+                            .set(static_cast<double>(count));
+                    }
+                }
                 // F2a PR3: per-cohort fleet perf gauges — same cycle, same
                 // staleness window as the fleet families above.
                 publish_cohort_perf_gauges();
@@ -3823,6 +4436,22 @@ public:
                     // OBS-4: surface audit-pipeline persistence failures.
                     metrics_.gauge("yuzu_server_audit_emit_failed_total")
                         .set(static_cast<double>(audit_store_->emit_failed_count()));
+                    // #2360: retention clock guard. Declined-wipe passes and
+                    // failed passes are scraped separately (see describe above).
+                    metrics_.gauge("yuzu_server_audit_clock_anomaly_skips_total")
+                        .set(static_cast<double>(audit_store_->clock_anomaly_skips_count()));
+                    metrics_.gauge("yuzu_server_audit_cleanup_failed_total")
+                        .set(static_cast<double>(audit_store_->cleanup_failed_count()));
+                    metrics_.gauge("yuzu_server_audit_rows_deleted_total")
+                        .set(static_cast<double>(audit_store_->rows_deleted_count()));
+                    metrics_.gauge("yuzu_server_audit_retention_cap_reached_total")
+                        .set(static_cast<double>(audit_store_->cap_reached_count()));
+                    metrics_.gauge("yuzu_server_audit_retention_persist_failed_total")
+                        .set(static_cast<double>(audit_store_->persist_failed_count()));
+                    metrics_.gauge("yuzu_server_audit_retention_passes_total")
+                        .set(static_cast<double>(audit_store_->retention_passes_count()));
+                    metrics_.gauge("yuzu_server_audit_retention_last_pass_unixtime")
+                        .set(static_cast<double>(audit_store_->last_pass_unixtime()));
                 }
                 // PR 5b — ExecutionEventBus observability. Same scrape-as-
                 // gauge pattern used for AuditStore + GuaranteedStateStore
@@ -3852,10 +4481,53 @@ public:
                 // calls are O(records ≤256) / O(sessions) in-memory scans placed
                 // AFTER the CRL/stale-agent sweep (no same-tick delay to it) -
                 // microseconds at the 15s cadence, no request-path contention.
+                //
+                // S-BRIDGE-TICK-GUARD (#2487): this loop is a bare std::thread body,
+                // so an exception escaping it is std::terminate - a WHOLE-PROCESS
+                // abort triggered by a transient allocation failure inside a
+                // maintenance sweep. Both calls allocate (each snapshots its map),
+                // and the bridge's teardown path allocates again beneath that.
+                //
+                // GUARDED SEPARATELY, on purpose: gc() is what actually destroys an
+                // expired session's stream and releases its memory, so sharing one
+                // try with sweep() would let a snapshot failure under memory
+                // pressure skip the call most likely to relieve that pressure. The
+                // pairing above is preserved - gc() still runs only alongside a live
+                // bridge - but neither failure now suppresses the other. A missed
+                // tick simply defers to the next one.
+                //
+                // The handlers NEST their own observability: spdlog formatting and
+                // the metric lookup both allocate, so a flat handler re-throws from
+                // inside the very catch meant to contain the failure and terminates
+                // anyway (precedent: the nested guard in mcp_stream.cpp's publish
+                // boundary). Do not collapse these into a single flat catch.
                 if (mcp_stream_bridge_) {
-                    mcp_stream_bridge_->sweep();
+                    try {
+                        mcp_stream_bridge_->sweep();
+                    } catch (...) {
+                        try {
+                            spdlog::error("MCP bridge sweep tick failed; deferring to next tick");
+                            metrics_
+                                .counter("yuzu_mcp_maintenance_tick_failures_total",
+                                         {{"tick", "bridge_sweep"}})
+                                .increment();
+                        } catch (...) {  // NOLINT(bugprone-empty-catch) - nested by design
+                        }
+                    }
                     if (mcp_sessions_) {
-                        mcp_sessions_->gc();
+                        try {
+                            mcp_sessions_->gc();
+                        } catch (...) {
+                            try {
+                                spdlog::error(
+                                    "MCP session gc tick failed; deferring to next tick");
+                                metrics_
+                                    .counter("yuzu_mcp_maintenance_tick_failures_total",
+                                             {{"tick", "session_gc"}})
+                                    .increment();
+                            } catch (...) {  // NOLINT(bugprone-empty-catch) - nested by design
+                            }
+                        }
                     }
                 }
                 // Guardian scalars + cumulative write/reap counters. Use
@@ -3888,6 +4560,26 @@ public:
                 if (baseline_store_) {
                     metrics_.gauge("yuzu_server_guardian_baselines_total")
                         .set(static_cast<double>(baseline_store_->baseline_count()));
+                }
+                // ADR-0010 §Decision 3 — `yuzu_server_secret_decrypt_failures_total`
+                // {store, failure_class}. The codec accumulates these
+                // internally; before the 2026-07-25 review (HIGH #4) nothing
+                // read them, so the metric existed only as a comment in
+                // secret_codec.hpp. Exported pull-model at scrape time (#1909
+                // pattern) — the codec keeps the authoritative cumulative
+                // count, so this is a `set()` of a monotonic total, not an
+                // increment, and a scrape that races a failure simply reports
+                // it on the next one.
+                if (auth_secret_codec_) {
+                    for (const auto& [key, count] : auth_secret_codec_->decrypt_failure_counts()) {
+                        const auto& [store, cls] = key;
+                        metrics_
+                            .gauge("yuzu_server_secret_decrypt_failures_total",
+                                   {{"store", store},
+                                    {"failure_class",
+                                     std::string(pg::SecretCodec::to_string(cls))}})
+                            .set(static_cast<double>(count));
+                    }
                 }
                 // Process health sampling (22.1)
                 {
@@ -4203,6 +4895,18 @@ public:
 
         stop_requested_.store(true, std::memory_order_release);
 
+        // Signal AuthDB's provisional-MFA reaper to stop up front (it is owned
+        // inside AuthDB, not a ServerImpl member thread, so it is not in the
+        // joins below). This is signal-only — the join happens at
+        // auth_db_.reset() near the pool teardown — but requesting it here lets
+        // the reaper wind down concurrently with the rest of shutdown (it polls
+        // the flag each 1s), so that later join is near-instant rather than
+        // waiting out an in-flight cleanup. Its query is bounded by the pool's
+        // statement_timeout/lock_timeout regardless.
+        if (auth_db_) {
+            auth_db_->request_stop();
+        }
+
         // Join the fleet health recomputation thread
         if (health_recompute_thread_.joinable()) {
             health_recompute_thread_.join();
@@ -4362,6 +5066,21 @@ public:
             mcp_stream_bridge_->shutdown();
             mcp_stream_bridge_.reset();
         }
+
+        // cpp-safety SHOULD (governance hardening round): `auth_mgr_` is
+        // owned by main.cpp and OUTLIVES this ServerImpl (unlike every store
+        // above, which this object owns) — it holds a raw `AuthDB*` set via
+        // set_auth_db() at construction. `auth_db_` destructs along with the
+        // rest of this object's members once stop() returns, so a stray
+        // post-shutdown call into `auth_mgr_` (host-CLI one-shot, a lingering
+        // reference) would otherwise dereference a dangling pointer. Both
+        // HTTP and gRPC handler threads are already quiesced by the drains
+        // above, so it is safe to null this now — belt-and-braces, same
+        // pattern as the tracker/cert-callback nulling just above (the
+        // TrackerScope contract, auth_db_'s destruct-before-drop still holds
+        // regardless — this only protects the OUTSIDE-owned raw pointer).
+        auth_mgr_.set_auth_db(nullptr);
+
         // Release Phase 2 components (RAII handles close).
         execution_tracker_.reset();
         // PR 3 — bus outlives the tracker by member-order convention,
@@ -4463,6 +5182,28 @@ public:
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
         app_perf_fleet_store_.reset();
+        // Auth substrate (ADR-0006/0010) — destruct-before-pool, and in
+        // dependency order. AuthDB owns a background reaper thread
+        // (cleanup_provisional_mfa) that leases pg_pool_ via
+        // try_acquire_for(); it is joined only in ~AuthDB::Impl, so auth_db_
+        // MUST be reset before pg_pool_ or the reaper's next acquire touches a
+        // destroyed pool (UAF on the security-critical auth store — the pure
+        // ~ServerImpl order is coincidentally safe via declaration order, but
+        // stop() proactively resets pg_pool_ below and would defeat it).
+        // auth_db_ borrows auth_secret_codec_, which borrows
+        // auth_key_provider_, so tear down inner-to-outer: stores → codec →
+        // key provider → pool.
+        scim_store_.reset();
+        auth_db_.reset();
+        // Clear the ADR-0010 audit hook before the codec dies. The hook
+        // captures `this` and reads audit_store_ at call time, so it cannot
+        // dangle on a reset store — but dropping it here keeps the codec's
+        // documented contract ("the wiring must set_audit_hook({}) before
+        // destroying the target") satisfied unconditionally.
+        if (auth_secret_codec_)
+            auth_secret_codec_->set_audit_hook({});
+        auth_secret_codec_.reset();
+        auth_key_provider_.reset();
         pg_pool_.reset();
     }
 
@@ -5995,6 +6736,177 @@ private:
                 return httplib::Server::HandlerResponse::Handled;
             }
 
+            // MCP request-body bound (#2437). Placed HERE, after the rate
+            // limiter and before auth, for two reasons that are easy to get
+            // wrong:
+            //   * httplib calls this pre-routing handler BEFORE it reads the
+            //     request body (httplib.h: pre_routing_handler_ in routing(),
+            //     read_content later in the same function), so returning
+            //     Handled costs a header parse and never buffers the payload.
+            //     Enforcing the same bound inside the MCP handler would be too
+            //     late — the body is already in memory by then.
+            //   * it is per-path, NOT the server-global
+            //     `set_payload_max_length` knob, which would also cap the
+            //     multipart certificate upload and content distribution on
+            //     this same httplib instance. httplib's 100 MB default stays
+            //     as the outer backstop for every other route.
+            // Unlike the on-behalf-of guard above, this sits AFTER the rate
+            // limiter: there is no diagnostic reason to let an oversized-body
+            // flood bypass the limiter, and no misconfiguration it would mask.
+            // A chunked or Content-Length-less POST/PUT/PATCH is REFUSED 411,
+            // not admitted: httplib consults Transfer-Encoding before
+            // Content-Length and reads a header-less POST to EOF, so either
+            // shape would revert to the 100 MB default and evade this cap
+            // entirely. A bound removable by deleting a header is not a bound.
+            // ON THE UNREAD BODY (checked at primary source against the
+            // vendored httplib 0.37.1 — don't re-derive, and re-check on a
+            // vcpkg baseline bump). Returning Handled means the body is never
+            // read off the socket. What ACTUALLY happens next:
+            //   * write_response_core stamps `Connection: close` on any status
+            //     >= 400 (httplib.h:10789, "Don't leave connections open after
+            //     errors"), so a conforming client closes.
+            //   * but NOTHING sets httplib's `connection_closed` flag for an
+            //     error response, so process_server_socket_core loops again
+            //     (httplib.h:5516-5531). A client that already transmitted the
+            //     declared body — which it always has under
+            //     `Expect: 100-continue`, since process_request auto-answers
+            //     100 BEFORE routing — leaves those bytes to be parsed as
+            //     subsequent request lines on this same socket.
+            //   * bounded: <= keep_alive_max_count_ (100) parses and the idle
+            //     timeout, then teardown. Malformed lines 400 before
+            //     pre-routing runs (so they skip the rate limiter); a
+            //     well-formed smuggled request goes through the FULL middleware
+            //     chain including auth, so there is no auth bypass.
+            // Same shape as the two early returns above (on-behalf-of 403,
+            // rate-limit 429), which have always returned Handled on POSTs
+            // carrying bodies — this adds an instance of an existing pattern,
+            // not a new one.
+            // CAVEAT IF A REVERSE PROXY IS EVER PUT IN FRONT: an unread
+            // Content-Length body is a textbook request-smuggling primitive
+            // between proxy and origin. The shipped rigs expose the server
+            // directly, so this is a documented constraint, not a live bug.
+            // The DECISION lives in web_utils.hpp so it has direct unit
+            // coverage (same reason is_login_exempt_path was extracted from
+            // this lambda); only this call site is review-only.
+            // The path test is hoisted to the CALL SITE, not left inside the
+            // predicate: get_header_value_u64 is a function ARGUMENT and is
+            // therefore evaluated unconditionally, so the predicate's internal
+            // && cannot short-circuit it. Measured at 14.22 ns/request
+            // unguarded vs 0.84 ns guarded, on EVERY request server-wide
+            // (governance perf-S1).
+            if (is_mcp_path(req.path)) {
+              // Hoisted ABOVE the try so the catch below can answer with the
+              // right status: collapsing an unmeasurable-body refusal into a
+              // 413 would tell the client to shrink a body whose size was
+              // never the problem.
+              bool unmeasurable_cause = false;
+              // CONTAIN THE WHOLE BRANCH, not just the metric (governance Gate 8,
+              // security + cpp-safety). httplib invokes this handler from TWO
+              // sites: routing() (inside process_request's try/catch) and the
+              // WebSocket-upgrade path at httplib.h:11741, which is NOT — and
+              // ThreadPool::worker runs tasks bare. A GET /mcp/v1/ carrying
+              // `Upgrade: websocket` and an oversized Content-Length reaches
+              // here via that second site, so a bad_alloc from the header read,
+              // the log, the sanitizers, the counter OR the envelope build is
+              // std::terminate. The first attempt guarded only the one operation
+              // it had been told about; the hazard is the path.
+              try {
+                const bool oversize = mcp_body_exceeds_cap(
+                    req.path, req.get_header_value_u64("Content-Length", 0),
+                    mcp::kMcpMaxRequestBodyBytes);
+                // Header VALUES passed through, not a re-implementation of
+                // httplib's parsing — matching its decision by hand is what
+                // let `Transfer-Encoding: Chunked` through last round.
+                const bool unmeasurable = mcp_body_unmeasurable(
+                    req.path, req.method, req.has_header("Content-Length"),
+                    req.get_header_value("Transfer-Encoding"),
+                    req.get_header_value("Content-Encoding"));
+                unmeasurable_cause = unmeasurable;
+                if (oversize || unmeasurable) {
+                    // Throttled log: this is a pre-auth ingress rejection with
+                    // NO principal to audit, and observability-conventions.md
+                    // requires metric + sampled log for exactly that shape.
+                    // Mirrors the on-behalf-of guard above, whose sanitizer
+                    // this reuses (httplib percent-decodes req.path, so raw
+                    // control bytes would otherwise forge log lines).
+                    // OWN throttle, NOT onbehalf::note_rejection (governance
+                    // Gate 8 security HIGH-1). Reusing it fed
+                    // yuzu_onbehalf_rejected_total, which carries a CRITICAL
+                    // alert reading "likely a header-injecting proxy" — so an
+                    // unauthenticated chunked-POST flood would have paged
+                    // someone about an ADR-1005 breach that never happened,
+                    // and would have consumed the shared 1-in-100 log slot
+                    // that the genuine on-behalf-of warnings need. Never
+                    // borrow a security control's counter for a transport
+                    // bound.
+                    // ONE COUNTER PER REASON. A shared counter lets a cheap
+                    // over_cap flood (huge Content-Length, no body sent)
+                    // suppress ~99% of the unmeasurable lines, hiding the
+                    // rarer signal behind the noisier one.
+                    static std::atomic<std::uint64_t> over_cap_hits{0};
+                    static std::atomic<std::uint64_t> unmeasurable_hits{0};
+                    constexpr std::uint64_t kBodyLogEvery = 100;
+                    auto& hits = unmeasurable ? unmeasurable_hits : over_cap_hits;
+                    if (hits.fetch_add(1, std::memory_order_relaxed) % kBodyLogEvery == 0) {
+                        spdlog::warn("[#2437] rejected {} {} from {}: {} (1 log per {} "
+                                     "rejections; the counter records all)",
+                                     onbehalf::sanitize_for_log(req.method, 16),
+                                     onbehalf::sanitize_for_log(req.path),
+                                     onbehalf::sanitize_for_log(req.remote_addr, 64),
+                                     unmeasurable ? "unmeasurable body" : "body over cap",
+                                     kBodyLogEvery);
+                    }
+                    try {
+                        metrics_
+                            .counter("yuzu_mcp_body_too_large_total",
+                                     {{"reason", unmeasurable ? "unmeasurable" : "over_cap"}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                        // Guarded because this call site is NOT inside
+                        // httplib's try/catch on the WebSocket-upgrade path
+                        // (httplib.h:11741 vs routing()'s at :11811), and
+                        // ThreadPool::worker invokes tasks bare — an escaped
+                        // throw here is std::terminate (cpp-safety S1 / UP-9).
+                        // The sibling handler-side increment is guarded the
+                        // same way; observability must never kill the process.
+                    }
+                    res.status = unmeasurable ? 411 : 413;
+                    res.set_content(
+                        unmeasurable
+                            ? detail::a4_denial(
+                                  res, 411,
+                                  "MCP requests must carry a body this server can size "
+                                  "in advance",
+                                  detail::A4ErrorOpts{
+                                      .remediation =
+                                          "send the JSON-RPC body with a Content-Length "
+                                          "header, no Transfer-Encoding, and no "
+                                          "Content-Encoding other than identity; a body "
+                                          "whose size cannot be checked before reading it "
+                                          "cannot be admitted under the 4 MiB MCP cap "
+                                          "(see docs/mcp-server.md)"})
+                            : detail::a4_denial(
+                                  res, 413, "request body exceeds the MCP transport limit",
+                                  detail::A4ErrorOpts{
+                                      .remediation =
+                                          "the largest accepted MCP request body is 4 MiB; "
+                                          "reduce the arguments, or for a large "
+                                          "execute_bundle use the REST twin POST "
+                                          "/api/v1/bundles (see docs/mcp-server.md)"}),
+                        "application/json");
+                  return httplib::Server::HandlerResponse::Handled;
+                }
+              } catch (...) { // NOLINT(bugprone-empty-catch)
+                  // Last-resort containment for the WHOLE branch, including the
+                  // header read that decides it. We cannot build an envelope if
+                  // we got here, but we can still refuse rather than let the
+                  // throw reach httplib's UNGUARDED WebSocket-upgrade call site
+                  // and take the process down.
+                  res.status = unmeasurable_cause ? 411 : 413;
+                  return httplib::Server::HandlerResponse::Handled;
+              }
+            }
+
             // Allow unauthenticated access to login pages, health, OIDC flow, and OpenAPI spec.
             // /health and /api/health are ALSO covered by the early-return
             // exemption at the top of this lambda (which additionally skips
@@ -7213,7 +8125,7 @@ private:
                        const std::string& tt, const std::string& ti, const std::string& d) {
                     return audit_log(r, a, rs, tt, ti, d);
                 },
-                action_label, cfg_.mfa_enforcement);
+                action_label, cfg_.mfa_enforcement, &metrics_);
         };
 
         // -- Settings routes (extracted to settings_routes.cpp) ---------------
@@ -7515,6 +8427,12 @@ private:
             // Parse JSON body: { "plugin": "...", "action": "...", "agent_ids": [...] }
             auto plugin = extract_json_string(req.body, "plugin");
             auto action = extract_json_string(req.body, "action");
+            // SILENT-DROP helper, kept deliberately: it returns {} for omitted,
+            // empty, non-array and parse-failure alike. That erasure is #2500's
+            // defect, and this call is safe ONLY because `check_targeting_shape`
+            // runs below on the separately-parsed `body` and refuses every shape
+            // whose erasure would matter. Moving this below that check, or
+            // removing it, requires re-reading that ordering first.
             auto agent_ids = extract_json_string_array(req.body, "agent_ids");
 
             if (plugin.empty() || action.empty()) {
@@ -7525,9 +8443,149 @@ private:
                 return;
             }
 
+            // plugin/action are IDENTIFIERS. Bounding them here is what actually
+            // closes the audit-detail forgery that a previous round only half
+            // fixed: `sanitize_for_log` normalises control bytes, but leaves
+            // space, `=`, `:` and `-` alone, so a caller could still plant
+            //     plugin = "noop reason=agent_ids_empty"
+            //     action = "noop \u2192 4000 agent(s)"
+            // and produce a durable denial row that mimics the SUCCESS format
+            // (`reason=<r> <plugin>:<action>` vs `plugin:action \u2192 N agent(s)`).
+            // Byte-shape safety is not field-structure safety. Validating the
+            // input is also what bounds the row size and keeps the column
+            // well-formed, which is three problems closed at one gate instead of
+            // three sanitisers at three sinks.
+            //
+            // Charset matches what shipped content actually uses - every
+            // `plugin`/`action` in content/definitions/*.yaml fits this, and
+            // dotted server actions (`workflow.list`) are live content, so `.`
+            // must stay legal. Length matches MCP's kExecInstrIdentMaxLen so the
+            // two execute surfaces agree on what an identifier is.
+            {
+                constexpr size_t kIdentMax = 128;
+                const auto bad_ident = [](const std::string& v) {
+                    if (v.size() > kIdentMax)
+                        return true;
+                    return std::any_of(v.begin(), v.end(), [](unsigned char c) {
+                        return !(std::isalnum(c) || c == '_' || c == '.' || c == '-');
+                    });
+                };
+                if (bad_ident(plugin) || bad_ident(action)) {
+                    res.status = 400;
+                    res.set_content(
+                        R"j({"error":{"code":400,"message":"plugin and action must be identifiers ([A-Za-z0-9_.-], max 128 bytes)"},"meta":{"api_version":"v1"}})j",
+                        "application/json");
+                    return;
+                }
+            }
+
             // All commands require Execution:Execute permission
             if (!require_permission(req, res, "Execution", "Execute"))
                 return;
+
+            // ── Targeting shape: supplied-but-names-nothing is an ERROR (#2500) ──
+            // Run on the PARSED BODY, never on `agent_ids` above.
+            // `extract_json_string_array` returns {} for omitted, empty, not-an-array
+            // AND parse-failure alike, and that erasure IS this defect: a check
+            // written against its output cannot see `{"agent_ids":"dev-01"}` or
+            // `{"scope":5}` at all, and would ship half the bug with green tests.
+            //
+            // Placed AFTER require_permission so a refusal is attributable to a
+            // principal and can carry an audit row; before any dispatch-shaped work.
+            // The `plugin`/`action` emptiness check above deliberately stays where it
+            // is rather than being subsumed the way `ident_empty` subsumed MCP's: it
+            // currently runs BEFORE require_permission, and moving an auth-adjacent
+            // check is not something to do silently inside a targeting fix.
+            // Parsed with allow_exceptions=false rather than a try/catch that falls
+            // through. The earlier form set "named no target" in its catch and
+            // CONTINUED, arguing the catch was unreachable because a body that does
+            // not parse yields an empty `plugin`. That holds for parse errors — but
+            // not for std::bad_alloc: under memory pressure a body of
+            // {"agent_ids":[]} would have landed in the catch and proceeded to
+            // broadcast. A fail-OPEN catch inside the fix for a widening defect
+            // (governance, cpp-safety). A discarded value yields contains()==false
+            // on every query below, so an unparseable body is refused here rather
+            // than continuing with unknown targeting.
+            const auto body = nlohmann::json::parse(req.body, nullptr, /*allow_exceptions=*/false);
+            // `check_targeting_shape` requires an OBJECT: contains() is false for an
+            // array or scalar, so `["dev-1"]` would read as "named no target" and
+            // broadcast — the very shape this route is being fixed for. Three Gate-3
+            // reviewers found this independently; the precondition is enforced here
+            // and pinned by a route test, not left as a comment on the header.
+            if (!body.is_object()) {
+                // Counted and audited like every other refusal in this family.
+                // The fold's own argument against an uncounted refusal applies
+                // here: an invisible one cannot reach the alert this change
+                // ships, and this is the shape three reviewers had to find by
+                // reading rather than by watching a dashboard.
+                metrics_
+                    .counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "command"}, {"reason", std::string(kReasonBodyType)}})
+                    .increment();
+                // Capture the audit return and surface partial-success, per the
+                // AuditFn contract (SOC 2 CC6.6, PR #883) and the
+                // instruction.import precedent. The status stays 400 — the
+                // request WAS invalid, and answering 503 because we could not
+                // record that would trade a correct refusal for an outage.
+                const bool audit_ok = audit_log(req, "command.dispatch", "denied", "command", "",
+                                                std::string("reason=") + std::string(kReasonBodyType));
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = 400;
+                // `audit_emitted` is omitted entirely when no audit store is
+                // configured: audit_log() returns true in that case, so
+                // reporting `true` would assert a row landed on a deployment
+                // that keeps none. Absent means "no claim", not "false".
+                nlohmann::json err{{"error",
+                                    {{"code", 400},
+                                     {"message", "request body must be a JSON object"}}},
+                                   {"meta", {{"api_version", "v1"}}}};
+                if (audit_store_)
+                    err["audit_emitted"] = audit_ok;
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+            if (auto bv = yuzu::server::check_targeting_shape(body)) {
+                metrics_
+                    .counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "command"}, {"reason", bv->reason}})
+                    .increment();
+                // The detail carries WHAT was being attempted, not just why it
+                // was refused. The success row records `plugin:action -> N
+                // agent(s)`; a denial that records only `reason=` lets an
+                // auditor show that an operator was blocked but not what they
+                // were trying to run — on a control whose whole purpose is
+                // reconstructing near-miss blast radius (governance, compliance).
+                // `plugin`/`action` are CALLER-SUPPLIED and this route bounds
+                // neither length nor charset (unlike MCP's kExecInstrIdentMaxLen).
+                // Concatenating them raw into an evidence field let a caller
+                // forge a row that mimics the success format
+                // (`plugin:action -> N agent(s)`) and write an arbitrarily large
+                // durable row before any dispatch — turning the field this fold
+                // added FOR blast-radius reconstruction into the thing an
+                // attacker writes. Sanitised through the same helper the
+                // on-behalf-of guard uses for untrusted log text: control chars
+                // and CR/LF become '?', length capped (governance, security).
+                const bool audit_ok =
+                    audit_log(req, "command.dispatch", "denied", "command", "",
+                              std::string("reason=") + bv->reason + " " +
+                                  onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                  onbehalf::sanitize_for_log(action, 128));
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = 400;
+                // Same gate as the body_type denial above: with no audit store
+                // configured, audit_log() returns true without writing, so an
+                // unconditional `true` here would assert a row landed on a
+                // deployment that keeps none. Absent = no claim.
+                nlohmann::json err{{"error", {{"code", 400}, {"message", bv->message}}},
+                                   {"meta", {{"api_version", "v1"}}}};
+                if (audit_store_)
+                    err["audit_emitted"] = audit_ok;
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+            const bool named_target = yuzu::server::targeting_supplied(body);
 
             // Per-action securable elevation + scope confinement for DESTRUCTIVE
             // generic-dispatch actions (governance HIGH #2). /api/command otherwise
@@ -7556,7 +8614,7 @@ private:
                     if (!require_permission(req, res, it->second.first, it->second.second))
                         return;
                     // Destructive dispatch must be explicitly targeted + in scope.
-                    if (agent_ids.empty() || !extract_json_string(req.body, "scope").empty()) {
+                    if (agent_ids.empty() || !extract_json_string(body, "scope").empty()) {
                         res.status = 400;
                         res.set_content(
                             R"({"error":{"code":400,"message":"destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are refused"},"meta":{"api_version":"v1"}})",
@@ -7605,15 +8663,15 @@ private:
 
             // Parameters: pass-through key-value pairs to the agent plugin
             {
-                auto params_map = extract_json_string_map(req.body, "params");
+                auto params_map = extract_json_string_map(body, "params");
                 for (const auto& [k, v] : params_map) {
                     (*cmd.mutable_parameters())[k] = v;
                 }
             }
 
             // Stagger/delay: prevent thundering herd on large-fleet dispatch
-            auto stagger = extract_json_int(req.body, "stagger", 0);
-            auto delay = extract_json_int(req.body, "delay", 0);
+            auto stagger = extract_json_int(body, "stagger", 0);
+            auto delay = extract_json_int(body, "delay", 0);
             if (stagger > 0)
                 cmd.set_stagger_seconds(stagger);
             if (delay > 0)
@@ -7621,11 +8679,24 @@ private:
 
             agent_service_.record_send_time(command_id);
 
-            // Check for scope-based targeting
-            auto scope_expr = extract_json_string(req.body, "scope");
+            // Check for scope-based targeting. Reuses the parsed body like the
+            // other post-auth reads; this site was missed when the rest were
+            // converted and re-parsed the whole body to read a key the handler
+            // already had (governance).
+            auto scope_expr = extract_json_string(body, "scope");
 
             int sent = 0;
-            if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
+            // `__all__` is the PUBLISHED ground scope kind (/discover/scope-kinds,
+            // the MCP execute_instruction schema, docs/scope-walking-design.md), and
+            // it is handled here as "no scope expression" so the ordering matches the
+            // shared closure and the MCP one exactly: an explicit agent_ids list
+            // still wins. Before #2500 this route fed `__all__` to scope::parse,
+            // which fails, so the caller got a 503 having reached nobody — while the
+            // sibling instruction-execute route broadcast on the same string. One
+            // advertised scope kind must not mean two things across sibling REST
+            // routes (governance, security MEDIUM).
+            const auto arm = yuzu::server::classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+            if (arm == yuzu::server::DispatchArm::Group) {
                 // Group-based dispatch — resolve group members
                 auto group_id = scope_expr.substr(6);
                 if (mgmt_group_store_) {
@@ -7635,7 +8706,7 @@ private:
                             ++sent;
                     }
                 }
-            } else if (!scope_expr.empty()) {
+            } else if (arm == yuzu::server::DispatchArm::Scope) {
                 // Scope expression dispatch.
                 // Owner principal for from_result_set: resolution (review B1).
                 // This raw path is untracked (no execution row), so read the
@@ -7670,15 +8741,72 @@ private:
                         ++sent;
                     }
                 }
-            } else if (agent_ids.empty()) {
-                // Broadcast to all agents
-                sent = registry_.send_to_all(cmd);
-            } else {
+            } else if (arm == yuzu::server::DispatchArm::Ids) {
                 for (const auto& aid : agent_ids) {
                     if (registry_.send_to(aid, cmd)) {
                         ++sent;
                     }
                 }
+            } else if (arm == yuzu::server::DispatchArm::Broadcast) {
+                // Explicitly asked for the fleet by its published name.
+                sent = registry_.send_to_all(cmd);
+            } else {
+                // Broadcast ONLY when the caller named no target at all (#2500).
+                // A target that was SUPPLIED but resolved to nothing must never
+                // widen to the whole fleet — `{"agent_ids": []}` from a device
+                // filter that matched nothing is the likelier shape than the
+                // type-confused one, and it read as "no devices" to whoever sent it.
+                //
+                // The shape check ~150 lines above already refuses those bodies, so
+                // this branch is UNREACHABLE today. It is second line of defence,
+                // not the fix: the silent-drop `extract_json_string_array` call and
+                // this sink sit far apart with the permission gate, the destructive
+                // block and the params extraction between them, and this is the one
+                // place where a reorder turns a specific-looking target list into
+                // the entire fleet. Falsifiable on its own terms — neuter the shape
+                // check and `{"agent_ids": []}` is still refused here.
+                //
+                // (An earlier version of this comment said the pre-#2500 caller
+                // "got a 503"; the base code answered 400 "invalid scope". The
+                // docs and tests were corrected in an earlier fold and this
+                // comment was missed.)
+                if (named_target) {
+                    // Derive the label from which field was actually supplied,
+                    // as the MCP sink does. Hardcoding `agent_ids_empty` would
+                    // mislabel a `scope`-only violation if this arm ever became
+                    // reachable, and a wrong reason on a fleet-safety refusal is
+                    // worse than no reason.
+                    const auto sink_reason = body.contains("agent_ids")
+                                                 ? kTargetingShapeReasons[1]  // agent_ids_empty
+                                                 : kTargetingShapeReasons[4]; // scope_empty
+                    metrics_
+                        .counter("yuzu_server_dispatch_target_rejected_total",
+                                 {{"route", "command"}, {"reason", std::string(sink_reason)}})
+                        .increment();
+                    // Empty target_id, matching the source-side denial above: the
+                    // same verb must not carry two different target shapes, and a
+                    // command_id for a command that was never dispatched reads in
+                    // the audit trail as though one was.
+                    const bool audit_ok =
+                        audit_log(req, "command.dispatch", "denied", "command", "",
+                                  "reason=" + std::string(sink_reason) + " " +
+                                      onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                      onbehalf::sanitize_for_log(action, 128));
+                    if (!audit_ok)
+                        res.set_header("Sec-Audit-Failed", "true");
+                    res.status = 400;
+                    nlohmann::json err{
+                        {"error",
+                         {{"code", 400},
+                          {"message", "a targeting argument was supplied but resolved to no "
+                                      "target; omit it entirely to target all agents"}}},
+                        {"meta", {{"api_version", "v1"}}}};
+                    if (audit_store_)
+                        err["audit_emitted"] = audit_ok;
+                    res.set_content(err.dump(), "application/json");
+                    return;
+                }
+                sent = registry_.send_to_all(cmd);
             }
 
             // Forward commands queued for gateway agents
@@ -10269,7 +11397,23 @@ private:
                 agent_service_.record_execution_id(command_id, execution_id);
             }
             int sent = 0;
-            if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
+            // Broadcast is something a caller ASKS FOR by name (#2500).
+            // `__all__` is not new vocabulary: the MCP closure below has always
+            // special-cased it, and this closure's own callers already
+            // described their untargeted path as "__all__" in their comments —
+            // they simply passed empty and relied on the fall-through.
+            //
+            // ORDERING IS LOAD-BEARING and mirrors the MCP closure exactly:
+            // `__all__` is treated as "no scope expression", NOT as a
+            // first-wins broadcast. An earlier revision of this commit put the
+            // broadcast branch at the TOP of the chain, which made
+            // {agent_ids:["a"], scope:"__all__"} reach the whole fleet here
+            // while the MCP closure reached exactly agent "a" — a widening
+            // introduced by the commit that exists to remove widenings, and a
+            // fourth dialect of a token that already had three. An explicit id
+            // list must always win over a broadcast request.
+            const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+            if (arm == DispatchArm::Group) {
                 auto group_id = scope_expr.substr(6);
                 if (mgmt_group_store_) {
                     auto members = mgmt_group_store_->get_members(group_id);
@@ -10277,7 +11421,7 @@ private:
                         if (registry_.send_to(m.agent_id, cmd))
                             ++sent;
                 }
-            } else if (!scope_expr.empty()) {
+            } else if (arm == DispatchArm::Scope) {
                 // from_result_set: is owner-scoped; recover the dispatching
                 // operator from the execution row (run_async / workflow /
                 // scheduled all create it with dispatched_by before dispatch).
@@ -10308,12 +11452,48 @@ private:
                         if (registry_.send_to(aid, cmd))
                             ++sent;
                 }
-            } else if (agent_ids.empty()) {
-                sent = registry_.send_to_all(cmd);
-            } else {
+            } else if (arm == DispatchArm::Ids) {
                 for (const auto& aid : agent_ids)
                     if (registry_.send_to(aid, cmd))
                         ++sent;
+            } else if (arm == DispatchArm::Broadcast) {
+                sent = registry_.send_to_all(cmd);
+            } else {
+                // NO TARGET NAMED AT ALL — reach NOBODY, not everybody (#2500).
+                //
+                // This closure has TEN callers (governance corrected an earlier
+                // count of eight: DexRoutes and TarTreeRoutes reach it through
+                // 5-param adapters). Eight were safe only because eight authors
+                // each remembered to guard their own inputs, and the two that
+                // did not were the pair #2500 was filed about. That is a single
+                // point of failure with a ten-way surface, and the failure mode
+                // is the worst one available: an unintended fleet-wide dispatch
+                // that reports success.
+                //
+                // Inverting the default makes the eleventh caller's omission
+                // harmless. Every caller that legitimately broadcasts names
+                // kBroadcastScope — a grep-able request, not the residue of an
+                // empty vector.
+                //
+                // No behaviour changed when this landed: every existing caller
+                // either guards its inputs, passes a specific id, or was updated
+                // in the same commit to name the sentinel.
+                // COUNTED, not just logged. This branch is the actual last line
+                // of defence across all ten callers of this closure, and it had
+                // strictly weaker observability than the `/api/command` inline
+                // branch that this PR's own argument called dead code — an
+                // invisible refusal cannot reach the alert this change ships
+                // (governance, SRE). There is no `req` here, so no audit row is
+                // possible: this closure is called by background runners as well
+                // as routes, and a fabricated request context would be worse
+                // evidence than none. The counter is the durable signal.
+                metrics_
+                    .counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "dispatch_closure"}, {"reason", std::string(kReasonClosureNoTarget)}})
+                    .increment();
+                spdlog::warn("dispatch {}:{} named no target (no agent_ids, no scope) — reaching "
+                             "no agents; pass scope \"{}\" to broadcast deliberately",
+                             plugin, norm_action, kBroadcastScope);
             }
             forward_gateway_pending();
             if (sent > 0)
@@ -10618,7 +11798,7 @@ private:
                 emit_event(event_type, req, attrs, payload_data);
             },
             policy_store_.get(), [this]() -> std::string { return registry_.to_json(); },
-            policy_evaluator_.get());
+            policy_evaluator_.get(), &metrics_); // #2500 targeting-refusal counter
 
         // GuardianRoutes — /guardian + /fragments/guardian/* (Guaranteed State
         // dashboard; docs/guardian-mvp-contract.md §8). Fragment renderers are
@@ -11594,7 +12774,26 @@ private:
                 agent_service_.record_send_time(command_id);
 
                 int sent = 0;
-                if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
+                // Same classifier as the other three sinks (#2500). This
+                // closure KEEPS broadcast-on-unnamed: dashboard_routes.cpp maps
+                // its form's `__all__` selection to empty+empty before calling,
+                // so `None` here means the operator picked "all agents" in the
+                // UI. Routed through the shared function anyway so a future
+                // refactor pointing this at command_dispatch_fn — whose `None`
+                // reaches nobody — becomes a visible decision rather than a
+                // silent conversion of every dashboard fleet-execute to a no-op.
+                //
+                // ONE ARM DID CHANGE, contrary to what an earlier version of
+                // this comment claimed: a literal `scope_expr == "__all__"` used
+                // to reach the Scope arm, fail `scope::parse`, and dispatch to
+                // NOBODY. It now broadcasts, matching every other sink. That is
+                // unreachable today because dashboard_routes.cpp strips the
+                // sentinel before calling, and it is the behaviour we want if it
+                // ever becomes reachable — but "no arm changed" was not true and
+                // is exactly the kind of preservation claim this PR keeps
+                // getting wrong (governance, consistency).
+                const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+                if (arm == DispatchArm::Group) {
                     auto group_id = scope_expr.substr(6);
                     if (mgmt_group_store_) {
                         auto members = mgmt_group_store_->get_members(group_id);
@@ -11603,7 +12802,7 @@ private:
                                 ++sent;
                         }
                     }
-                } else if (!scope_expr.empty()) {
+                } else if (arm == DispatchArm::Scope) {
                     auto parsed = yuzu::scope::parse(scope_expr);
                     if (parsed) {
                         auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
@@ -11614,13 +12813,16 @@ private:
                                 ++sent;
                         }
                     }
-                } else if (agent_ids.empty()) {
-                    sent = registry_.send_to_all(cmd);
-                } else {
+                } else if (arm == DispatchArm::Ids) {
                     for (const auto& aid : agent_ids) {
                         if (registry_.send_to(aid, cmd))
                             ++sent;
                     }
+                } else if (arm == DispatchArm::Broadcast || arm == DispatchArm::None) {
+                    // Explicit for the same reason as the MCP sink: a future
+                    // DispatchArm must not become a fleet broadcast by falling
+                    // through an `else`.
+                    sent = registry_.send_to_all(cmd);
                 }
 
                 forward_gateway_pending();
@@ -11719,6 +12921,7 @@ private:
         // subscribes per-connection.
         wf_deps.execution_event_bus = execution_event_bus_.get();
         wf_deps.stream_budget = stream_budget_.get(); // ADR-0034: one budget, every surface
+        wf_deps.metrics = &metrics_;                  // #2500 targeting-refusal counter
         workflow_routes_->register_routes(*web_server_, std::move(wf_deps));
 
         // NotificationRoutes — /api/notifications/*
@@ -11761,10 +12964,465 @@ private:
                 return import_subordinate_chain(intermediate_pem, parent_chain_pem);
             });
 
+        // -- #2395: KEK rotation REST surface (/api/v1/secrets/kek/*) -------------
+        // The crypto + Postgres access is injected as the KekOps seam so
+        // kek_routes.{hpp,cpp} links neither (kek_routes.hpp header comment).
+        // Every lambda below follows the same five-step contract: (1) null-check
+        // BOTH auth_secret_codec_ AND pg_pool_ — stop() resets them while
+        // ServerImpl still lives (~4664-4667 above); (2) lease a connection with a
+        // bounded timeout; (3) take the cluster-wide `secrets_kek_op` session
+        // advisory lock (detail::try_lock_kek_op / KekOpLockGuard above) —
+        // non-blocking, so a concurrent KEK op is a `Conflict`, never a wait; (4)
+        // call the codec; (5) classify and SANITISE any failure — a
+        // codec-internal std::expected error string (which can carry
+        // PQerrorMessage text) is spdlog::error'd server-side and NEVER copied
+        // into KekOpResult, which crosses to the HTTP boundary (kek_routes.hpp
+        // rule B).
+        kek_routes_ = std::make_unique<KekRoutes>();
+        {
+            // Built into the MEMBER, not a block-scoped local: the same three
+            // operations back BOTH the REST routes registered here and the MCP
+            // twins wired further down (mcp_server_ does not exist yet at this
+            // point). One instance means the two surfaces can never drift in
+            // failure classification or remediation wording.
+            KekOps& kek_ops = kek_ops_;
+            kek_ops.rotate = [this]() -> KekOpResult {
+                KekOpResult result;
+                if (!auth_secret_codec_ || !pg_pool_) {
+                    result.failure = KekOpResult::Failure::Unavailable;
+                    record_kek_op_outcome("rotate", detail::kek_op_outcome_label(result.failure));
+                    return result;
+                }
+                auto lease = pg_pool_->try_acquire_for(detail::kKekOpAcquireTimeout);
+                if (!lease) {
+                    result.failure = KekOpResult::Failure::Unavailable;
+                    record_kek_op_outcome("rotate", detail::kek_op_outcome_label(result.failure));
+                    return result;
+                }
+                switch (detail::try_lock_kek_op(lease.get())) {
+                case detail::KekOpLockAttempt::kError: {
+                    // Defensive release (gov cpp-safety BLOCKING / UP-1): we
+                    // could not read the try-lock result, so we do NOT know
+                    // whether the server granted it. Unlocking a lock we never
+                    // held is a harmless `false`; skipping the release when it
+                    // WAS granted returns a lock-holding connection to the pool
+                    // and wedges every future KEK operation cluster-wide.
+                    detail::KekOpLockGuard release_if_held{lease.get()};
+                    result.failure = KekOpResult::Failure::Unavailable;
+                    record_kek_op_outcome("rotate", detail::kek_op_outcome_label(result.failure));
+                    return result;
+                }
+                case detail::KekOpLockAttempt::kConflict:
+                    result.failure = KekOpResult::Failure::Conflict;
+                    record_kek_op_outcome("rotate", detail::kek_op_outcome_label(result.failure));
+                    return result;
+                case detail::KekOpLockAttempt::kAcquired:
+                    break;
+                }
+                detail::KekOpLockGuard lock_guard{lease.get()}; // released before `lease`
+                                                                 // returns to the pool
+                                                                 // (reverse declaration
+                                                                 // order).
+
+                // #2530 B3 — the whole 5-step sequence below runs while
+                // holding the cluster-wide `secrets_kek_op` advisory lock
+                // acquired above, so two servers pointed at the same database
+                // can never both pass these checks. Order is load-bearing;
+                // see kek_rotate_control.hpp's `evaluate_rotate_preconditions`
+                // doc comment for why, and its [pg]-free unit tests for the
+                // ordering pinned in isolation from a live rotate.
+
+                // #2530 G7-S9: the pre-#2530 process-local pre-check (5
+                // minutes, in-memory, no DB round trip) was REMOVED here —
+                // it ran before the durable checks below with a hardcoded
+                // interval that could not be configured down, so an operator
+                // who set `--kek-min-rotate-interval` below 5 minutes was
+                // still refused for the full 5 minutes on THIS path, and
+                // this path never populated `cooldown_retry_after_ms`,
+                // silently falling back to the dishonest 300000 constant
+                // that was fixed everywhere else in this same round (#2530
+                // B2/G7-B2). It was never the authoritative control (that's
+                // steps 1-3 below, backed by `secrets.kek_meta.created_at`)
+                // and the two connection-pool reads it saved (`rotate_clock`,
+                // `live_kek_version_count`) happen on a path that has
+                // already taken a pooled connection and the cluster-wide
+                // advisory lock, so the savings were marginal against the
+                // correctness/honesty cost. If a cheap pre-DB short-circuit
+                // is wanted again, it must clamp to
+                // `min(short_circuit_window, cfg_.kek_min_rotate_interval_secs)`
+                // and populate an honest `cooldown_retry_after_ms` on that
+                // path — do not reintroduce a hardcoded window.
+
+                // Step 1 + step 2: the durable rotation clock feeds BOTH the
+                // clock-anomaly check and the durable rate limit, from one
+                // single-statement read so both timestamps come from the
+                // same database server clock (SecretCodec::rotate_clock doc
+                // comment) — never the app host's.
+                auto clock = auth_secret_codec_->rotate_clock(lease.get());
+                if (!clock) {
+                    spdlog::error("KEK rotate: rotate_clock failed: {}",
+                                 clock.error().internal_message);
+                    result.failure =
+                        (clock.error().kind == pg::SecretCodec::LifecycleError::Kind::query_canceled)
+                            ? KekOpResult::Failure::QueryCanceled
+                            : KekOpResult::Failure::Internal;
+                    record_kek_op_outcome("rotate", detail::kek_op_outcome_label(result.failure));
+                    return result;
+                }
+
+                // Step 3's input (live version count) is read up front too —
+                // evaluate_rotate_preconditions decides in the contract order
+                // regardless of the order these two DB reads happen in; only
+                // the DECISION order (clock anomaly, then cooldown, then
+                // ceiling) is load-bearing, not the read order.
+                auto live = auth_secret_codec_->live_kek_version_count(lease.get());
+                if (!live) {
+                    spdlog::error("KEK rotate: live_kek_version_count failed: {}",
+                                 live.error().internal_message);
+                    result.failure =
+                        (live.error().kind == pg::SecretCodec::LifecycleError::Kind::query_canceled)
+                            ? KekOpResult::Failure::QueryCanceled
+                            : KekOpResult::Failure::Internal;
+                    record_kek_op_outcome("rotate", detail::kek_op_outcome_label(result.failure));
+                    return result;
+                }
+                result.live_versions = static_cast<std::uint32_t>(*live);
+
+                const auto pre = detail::evaluate_rotate_preconditions(
+                    *clock, std::chrono::seconds{cfg_.kek_min_rotate_interval_secs}, *live,
+                    static_cast<std::uint32_t>(cfg_.kek_max_live_versions));
+                if (pre.failure != KekOpResult::Failure::None) {
+                    result.failure = pre.failure;
+                    result.cooldown_retry_after_ms = pre.cooldown_retry_after_ms;
+                    result.clock_skew_secs = pre.clock_skew_secs;
+                    switch (pre.failure) {
+                    case KekOpResult::Failure::ClockAnomaly:
+                        // #2530 G7-B6: report the observed skew MAGNITUDE, not
+                        // just the boolean fact of the anomaly — a few
+                        // seconds of NTP jitter and a row dated a year out
+                        // demand completely different operator responses,
+                        // and until this fix the log line (and the 503 body,
+                        // see kek_routes.cpp's write_failure) could not tell
+                        // them apart.
+                        spdlog::error(
+                            "KEK rotate refused: newest kek_meta row is dated {}s in the future "
+                            "relative to the database server's own clock — the durable rotation "
+                            "rate limit cannot be computed safely; investigate the database "
+                            "server's clock before retrying. A FORWARD skew like this is NOT "
+                            "self-clearing — it persists until real time catches up to the "
+                            "stored timestamp, and there is no configuration escape for this "
+                            "refusal (see docs/user-manual/server-admin.md)",
+                            pre.clock_skew_secs);
+                        break;
+                    case KekOpResult::Failure::Cooldown:
+                        spdlog::warn(
+                            "KEK rotate refused: durable rotation rate limit not yet elapsed "
+                            "({}ms remaining of --kek-min-rotate-interval={}s)",
+                            pre.cooldown_retry_after_ms, cfg_.kek_min_rotate_interval_secs);
+                        break;
+                    case KekOpResult::Failure::VersionCeiling:
+                        spdlog::warn("KEK rotate refused: live KEK version count {} has reached "
+                                     "the configured ceiling --kek-max-live-versions={}", *live,
+                                     cfg_.kek_max_live_versions);
+                        break;
+                    default:
+                        break;
+                    }
+                    record_kek_op_outcome("rotate", detail::kek_op_outcome_label(result.failure));
+                    return result;
+                }
+
+                // Step 4 (process-local cooldown stamp) was removed with the
+                // pre-check itself — #2530 G7-S9 above.
+
+                // Step 5: mint. Half-committed detection (#2395 rule):
+                // SecretCodec::rotate_kek (secret_codec.hpp) documents that
+                // active_version_ is ALREADY advanced by the time it can
+                // fail — the only failure path after that point is a
+                // rewrap_all() error; every earlier failure (init not run,
+                // version-space exhausted, KEK generation, fingerprint
+                // INSERT, BEGIN/COMMIT) returns strictly BEFORE
+                // active_version_ is touched. So comparing
+                // active_kek_version() before vs. after the call is a
+                // reliable, contract-matching signal — and it is safe from a
+                // concurrent-mutation false-positive because we hold the
+                // cluster-wide `secrets_kek_op` lock for the entire call, so
+                // no OTHER KEK operation (on this server or any other
+                // pointed at the same database) can be advancing
+                // active_version_ underneath us in this window.
+                const std::uint32_t before = auth_secret_codec_->active_kek_version();
+
+                // Why the try/catch, stated accurately so nobody deletes it as
+                // boilerplate (Hermes pass 1 raised it; pass 2 corrected my
+                // reasoning). It is NOT the audit hook: emit_audit
+                // (pg/secret_codec.cpp:281-288) swallows every exception, so
+                // the hook cannot throw out of rotate_kek. What CAN throw past
+                // the mint is anything in the trailing rewrap_all — allocation
+                // for a large result set being the realistic case.
+                //
+                // Either way the hazard is the same and is why the catch has to
+                // stay: active_version_ has ALREADY advanced by then
+                // (secret_codec.cpp:827), so an exception that escaped this
+                // lambda would surface as a generic 500 rather than the
+                // half-committed instruction, and an operator (or automation)
+                // following the obvious impulse would retry /rotate and mint a
+                // spurious version on top of an already-advanced one. Catching
+                // here means the before/after version check runs on EVERY
+                // failure path, thrown or returned.
+                std::optional<std::uint32_t> rotated_version;
+                bool rotate_threw = false;
+                auto mint_error_kind = pg::SecretCodec::LifecycleError::Kind::database;
+                try {
+                    auto rotated = auth_secret_codec_->rotate_kek(lease.get());
+                    if (rotated) {
+                        rotated_version = *rotated;
+                    } else {
+                        mint_error_kind = rotated.error().kind;
+                        spdlog::error("KEK rotate failed: {}", rotated.error().internal_message);
+                    }
+                } catch (const std::exception& e) {
+                    rotate_threw = true;
+                    spdlog::error("KEK rotate threw: {}", e.what());
+                } catch (...) {
+                    rotate_threw = true;
+                    spdlog::error("KEK rotate threw a non-std exception");
+                }
+                if (!rotated_version) {
+                    // #2530 B4: half-commit classification WINS — evaluated
+                    // FIRST, and it overrides a query_canceled `Kind` on the
+                    // underlying error. See
+                    // kek_rotate_control.hpp::classify_rotate_mint_failure
+                    // for why (the short version: retrying /rotate on a
+                    // half-committed rotation mints a spurious, unretirable
+                    // extra version every time — the operator must be told
+                    // to call /rewrap regardless of what caused the trailing
+                    // rewrap_all() to fail).
+                    const std::uint32_t after = auth_secret_codec_->active_kek_version();
+                    const bool version_advanced = after > before;
+                    result.failure =
+                        detail::classify_rotate_mint_failure(version_advanced, mint_error_kind);
+                    if (rotate_threw && version_advanced)
+                        spdlog::critical("KEK rotate threw AFTER advancing the active version to "
+                                         "v{} — the mint committed; resume with /rewrap, do NOT "
+                                         "retry /rotate",
+                                         after);
+                    record_kek_op_outcome("rotate", detail::kek_op_outcome_label(result.failure));
+                    return result;
+                }
+                result.new_version = *rotated_version;
+                // rotate_kek() runs its own internal rewrap_all() as part of
+                // minting (secret_codec.cpp ~824-838) but DISCARDS that call's
+                // row count, returning only the new version. Rather than
+                // report `rows_rewrapped: 0` — which would be a confidently
+                // wrong number on a rotation that in fact re-wrapped every row
+                // — the /rotate response omits the count entirely and reports
+                // `rotation_complete` instead. That is the signal an operator
+                // actually needs (the ADR-0010 §3 completion signal), and it is
+                // one we can produce truthfully: reaching here means
+                // rotate_kek's internal rewrap_all() returned success, so no
+                // row is left on a superseded version. An operator who wants a
+                // count can call /rewrap, which reports a real one (0 when
+                // there is genuinely nothing left to do).
+                result.rotation_complete = true;
+                record_kek_op_outcome("rotate", detail::kek_op_outcome_label(result.failure));
+                return result;
+            };
+            kek_ops.rewrap = [this]() -> KekOpResult {
+                KekOpResult result;
+                if (!auth_secret_codec_ || !pg_pool_) {
+                    result.failure = KekOpResult::Failure::Unavailable;
+                    record_kek_op_outcome("rewrap", detail::kek_op_outcome_label(result.failure));
+                    return result;
+                }
+                auto lease = pg_pool_->try_acquire_for(detail::kKekOpAcquireTimeout);
+                if (!lease) {
+                    result.failure = KekOpResult::Failure::Unavailable;
+                    record_kek_op_outcome("rewrap", detail::kek_op_outcome_label(result.failure));
+                    return result;
+                }
+                switch (detail::try_lock_kek_op(lease.get())) {
+                case detail::KekOpLockAttempt::kError: {
+                    // Defensive release (gov cpp-safety BLOCKING / UP-1): we
+                    // could not read the try-lock result, so we do NOT know
+                    // whether the server granted it. Unlocking a lock we never
+                    // held is a harmless `false`; skipping the release when it
+                    // WAS granted returns a lock-holding connection to the pool
+                    // and wedges every future KEK operation cluster-wide.
+                    detail::KekOpLockGuard release_if_held{lease.get()};
+                    result.failure = KekOpResult::Failure::Unavailable;
+                    record_kek_op_outcome("rewrap", detail::kek_op_outcome_label(result.failure));
+                    return result;
+                }
+                case detail::KekOpLockAttempt::kConflict:
+                    result.failure = KekOpResult::Failure::Conflict;
+                    record_kek_op_outcome("rewrap", detail::kek_op_outcome_label(result.failure));
+                    return result;
+                case detail::KekOpLockAttempt::kAcquired:
+                    break;
+                }
+                detail::KekOpLockGuard lock_guard{lease.get()};
+
+                // rewrap_all() never mints a version — it only re-wraps rows
+                // already on a non-active version under the current active one
+                // — so there is no half-committed state to distinguish here.
+                // #2530 item 3 completion: a canceled/timed-out rewrap scan
+                // (LifecycleError::Kind::query_canceled) is now classified
+                // as QueryCanceled rather than a generic Internal, matching
+                // rotate's classification and the fixed metrics/audit
+                // outcome vocabulary (both already carry a "query_canceled"
+                // token that would otherwise never fire for this op).
+                auto rewrapped = auth_secret_codec_->rewrap_all(lease.get());
+                if (!rewrapped) {
+                    spdlog::error("KEK rewrap failed: {}", rewrapped.error().internal_message);
+                    result.failure =
+                        (rewrapped.error().kind == pg::SecretCodec::LifecycleError::Kind::query_canceled)
+                            ? KekOpResult::Failure::QueryCanceled
+                            : KekOpResult::Failure::Internal;
+                    record_kek_op_outcome("rewrap", detail::kek_op_outcome_label(result.failure));
+                    return result;
+                }
+                result.rows_rewrapped = *rewrapped;
+                record_kek_op_outcome("rewrap", detail::kek_op_outcome_label(result.failure));
+                return result;
+            };
+            kek_ops.status = [this]() -> KekOpResult {
+                KekOpResult result;
+                if (!auth_secret_codec_ || !pg_pool_) {
+                    result.failure = KekOpResult::Failure::Unavailable;
+                    record_kek_op_outcome("status", detail::kek_op_outcome_label(result.failure));
+                    return result;
+                }
+                auto lease = pg_pool_->try_acquire_for(detail::kKekOpAcquireTimeout);
+                if (!lease) {
+                    result.failure = KekOpResult::Failure::Unavailable;
+                    record_kek_op_outcome("status", detail::kek_op_outcome_label(result.failure));
+                    return result;
+                }
+                // status deliberately does NOT take the operation lock.
+                //
+                // It did in the first cut, to avoid a "torn" read across an
+                // in-flight rotation. That was wrong twice over (gov
+                // unhappy-path UP-3, security LOW):
+                //
+                //  1. It made the ONLY diagnostic unavailable exactly while the
+                //     thing it diagnoses is running — an operator polling during
+                //     a long rewrap got 409, indistinguishable from a wedged
+                //     lock, which is the opposite of what a status endpoint is
+                //     for.
+                //  2. It let any Security:Read caller contend an exclusive lock
+                //     against a running rotation, and burn a pooled connection
+                //     waiting for it.
+                //
+                // And the "torn" read is not actually a problem: mid-rewrap we
+                // observe oldest_in_use < active_version and report
+                // rotation_complete=false, which is TRUE and is precisely the
+                // in-progress signal the operator wants. A momentarily stale
+                // read errs toward "not complete", never toward a false
+                // "complete".
+                //
+                // #2530 B2/B6: `live_versions`/`lock_held`/`lock_holder_pid`
+                // are each their own SELECT, taken lock-free at possibly
+                // different instants (KekOpResult doc comment) — this route
+                // STILL never takes `secrets_kek_op` itself; the lock-holder
+                // observation below only ever OBSERVES via pg_locks.
+                result.active_version = auth_secret_codec_->active_kek_version();
+                auto oldest = auth_secret_codec_->oldest_kek_version_in_use(lease.get());
+                if (!oldest) {
+                    spdlog::error("KEK status: oldest_kek_version_in_use failed: {}",
+                                 oldest.error().internal_message);
+                    result.failure =
+                        (oldest.error().kind == pg::SecretCodec::LifecycleError::Kind::query_canceled)
+                            ? KekOpResult::Failure::QueryCanceled
+                            : KekOpResult::Failure::Internal;
+                    record_kek_op_outcome("status", detail::kek_op_outcome_label(result.failure));
+                    return result;
+                }
+                result.oldest_in_use = *oldest;
+                // Completion is `== active_version`, NOT `>=` (gov unhappy-path
+                // UP-6). A row whose header references a version HIGHER than the
+                // active one is an anomaly — a restore against a newer keys dir,
+                // or a blob from another install — and `>=` would report that
+                // state as "complete", which is the worst possible false
+                // comfort: it says "every secret is on the current key" about
+                // rows whose key is not even registered here.
+                if (!result.oldest_in_use.has_value()) {
+                    result.rotation_complete = true; // no secret rows at all
+                } else if (*result.oldest_in_use > result.active_version) {
+                    spdlog::error("KEK status: oldest referenced version v{} EXCEEDS the active "
+                                  "version v{} — a secret row references a KEK this install has "
+                                  "not registered (restore skew?); reporting NOT complete",
+                                  *result.oldest_in_use, result.active_version);
+                    result.rotation_complete = false;
+                } else {
+                    result.rotation_complete = (*result.oldest_in_use == result.active_version);
+                }
+
+                // #2530 B2/B6/T5 diagnostic snapshots. Both queries here are
+                // deliberately non-fatal to the whole status response — a
+                // live_kek_version_count or lock-holder outage shouldn't
+                // take down the rest of an otherwise-healthy status read —
+                // but a query failure degrades its ONE field to `nullopt`
+                // ("could not be determined"), NEVER to a fabricated
+                // `0`/`false`. Yuzu's standing rule (already honoured by the
+                // periodic metrics gauge sampled below, in
+                // health_recompute_thread_) is that a value nobody could
+                // determine is ABSENT, never a confident negative. This
+                // matters most for `lock_held`: this field exists so an
+                // operator can diagnose a backend wedged holding
+                // `secrets_kek_op` — the failure mode where every KEK
+                // operation 409s forever — and reporting `lock_held: false`
+                // from a query FAILURE would tell them "there is no wedge"
+                // during exactly the incident this field was added for.
+                // Both failures are logged loudly here so they're
+                // distinguishable in server logs from a truthful negative.
+                //
+                // Not bumping `yuzu_server_kek_metrics_unavailable_total`
+                // here: that counter is specific to the scrape-time sampler
+                // (health_recompute_thread_, #2530 B7) below, which samples
+                // periodically regardless of request volume — overloading it
+                // with this on-demand, per-request degrade would conflate
+                // two different signals (cluster health cadence vs. one
+                // caller's status read). `record_kek_op_outcome("status",
+                // ...)` below still records this call as a successful status
+                // read (the response is a 200 with an honest partial
+                // degrade), which is the correct per-request outcome.
+                auto live = auth_secret_codec_->live_kek_version_count(lease.get());
+                if (live) {
+                    result.live_versions = static_cast<std::uint32_t>(*live);
+                } else {
+                    spdlog::error("KEK status: live_kek_version_count failed: {}",
+                                 live.error().internal_message);
+                }
+                auto holder = detail::kek_op_lock_holder(lease.get());
+                if (holder.determined) {
+                    // #2530 G7-S1: read `lock_held` directly rather than
+                    // deriving it from `pid.has_value()` — a granted holder
+                    // row with a NULL pid is still held (see
+                    // KekOpLockHolder's doc comment).
+                    result.lock_held = holder.lock_held;
+                    result.lock_holder_pid = holder.pid;
+                    // #2530 H1: surface WHEN this snapshot was taken, not
+                    // just what it said — a stale pid corroborated against
+                    // pg_stat_activity minutes later can already belong to
+                    // an unrelated backend (pids are reused).
+                    result.lock_holder_captured_at = holder.captured_at;
+                } else {
+                    spdlog::error("KEK status: lock-holder query failed; lock_held/"
+                                 "lock_holder_pid left undetermined (never fabricated false)");
+                }
+
+                record_kek_op_outcome("status", detail::kek_op_outcome_label(result.failure));
+                return result;
+            };
+            kek_routes_->register_routes(*web_server_, perm_fn, audit_fn, kek_ops);
+        }
+
         // -- SCIM v2 provisioning (/scim/v2/*) — enterprise IdP auto-(de)provisioning --
-        // Entirely inert when disabled: no store, no routes, no route table
-        // entries at all. main.cpp already refuses to start if --scim-enable is
-        // set without --scim-token or without HTTPS (CC6.2 fail-closed).
+        // Routes + the configured bearer token are entirely inert when
+        // disabled: no route table entries at all. scim_store_ itself was
+        // already constructed (born-on-PG, unconditional) in the ctor above
+        // — main.cpp already refuses to start if --scim-enable is set without
+        // --scim-token or without HTTPS (CC6.2 fail-closed).
         if (cfg_.scim_enable) {
             // sec-L3/UP-9 (governance hardening round): trim leading/trailing
             // ASCII whitespace from the admin-group config value — same
@@ -11775,8 +13433,7 @@ private:
             // trimmed value.
             cfg_.scim_admin_group = trim_ascii_whitespace(cfg_.scim_admin_group);
 
-            scim_store_ = std::make_unique<ScimStore>(cfg_.db_dir() / "auth.db");
-            if (!scim_store_->is_open()) {
+            if (!scim_store_ || !scim_store_->is_open()) {
                 // H3 (2026-07-08 review): previously logged-and-continued,
                 // which left /scim/v2/* permanently rejecting every request
                 // (require_bearer always fails against a closed store)
@@ -11790,8 +13447,8 @@ private:
                 // exits non-zero on startup_failed() — matching main.cpp's
                 // own "refuses to start without a token" fail-closed posture
                 // for this same feature.
-                spdlog::error("SCIM: failed to open auth.db for the SCIM resource/token store — "
-                             "refusing to start.");
+                spdlog::error("SCIM: the SCIM resource/token store (scim_store schema) is not "
+                             "open — refusing to start.");
                 startup_failed_ = true;
             } else if (!scim_store_->set_token(cfg_.scim_token, "boot")) {
                 // H3: same reasoning — a persist failure here is just as
@@ -12192,7 +13849,8 @@ private:
                 mcp_stream_bridge_ = std::make_unique<mcp::McpStreamBridge>(
                     execution_event_bus_.get(), mcp_sessions_.get(), &metrics_,
                     [this](const std::string& action, const std::string& execution_id,
-                           const std::string& detail) {
+                           const std::string& detail,
+                           mcp::McpStreamBridge::AuditResult result) {
                         if (audit_store_ && audit_store_->is_open()) {
                             AuditEvent ev;
                             ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
@@ -12203,7 +13861,12 @@ private:
                             ev.target_type = "Execution";
                             ev.target_id = execution_id;
                             ev.detail = detail;
-                            ev.result = "success";
+                            // NOT hardcoded "success" (#2487 review): a teardown that
+                            // could not complete, or a disposition that published
+                            // nothing, must not be evidenced as a successful action.
+                            ev.result =
+                                result == mcp::McpStreamBridge::AuditResult::kFailure ? "failure"
+                                                                                      : "success";
                             (void)audit_store_->log(ev);
                         }
                     });
@@ -12218,6 +13881,13 @@ private:
             // REST/settings wiring above. Nullable — an unwired
             // engine_principal_store_ leaves every engine-principal tool
             // answering "unavailable" rather than 503/crashing.
+            // KEK ops are wired UNCONDITIONALLY, exactly as the REST routes are
+            // (server.cpp's kek_routes_->register_routes above). This must NOT
+            // sit inside the engine-principal conditional below: doing so made
+            // the MCP tools answer "unavailable" whenever engine_principal_store_
+            // was null while the REST twins worked fine — two surfaces
+            // disagreeing about whether the same capability exists (ADR-1005 A1).
+            mcp_server_->set_kek_ops(kek_ops_); // same seam instance as the REST twins
             if (engine_principal_store_) {
                 mcp_server_->set_engine_principal_store(engine_principal_store_.get());
                 mcp_server_->set_engine_credential_store(api_token_store_.get());
@@ -12267,15 +13937,21 @@ private:
                     }
 
                     int sent = 0;
-                    if (!scope_expr.empty() && scope_expr != "__all__" &&
-                        scope_expr.starts_with("group:")) {
+                    // Same classifier as the other two sinks (#2500). MCP's
+                    // handler normalises an omitted target to kBroadcastScope
+                    // before dispatching (mcp_server.cpp), so `None` cannot
+                    // arrive here meaning "unnamed"; the tail maps it to
+                    // broadcast so MCP's deliberate broadcast-on-empty contract
+                    // is stated rather than left as a fallthrough.
+                    const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+                    if (arm == DispatchArm::Group) {
                         auto group_id = scope_expr.substr(6);
                         if (mgmt_group_store_) {
                             for (const auto& m : mgmt_group_store_->get_members(group_id))
                                 if (registry_.send_to(m.agent_id, cmd))
                                     ++sent;
                         }
-                    } else if (!scope_expr.empty() && scope_expr != "__all__") {
+                    } else if (arm == DispatchArm::Scope) {
                         // Owner-scoped from_result_set: recover the principal
                         // from the MCP-created execution row (review B1).
                         std::string principal;
@@ -12301,12 +13977,22 @@ private:
                                 if (registry_.send_to(aid, cmd))
                                     ++sent;
                         }
-                    } else if (agent_ids.empty()) {
-                        sent = registry_.send_to_all(cmd);
-                    } else {
+                    } else if (arm == DispatchArm::Ids) {
                         for (const auto& aid : agent_ids)
                             if (registry_.send_to(aid, cmd))
                                 ++sent;
+                    } else if (arm == DispatchArm::Broadcast || arm == DispatchArm::None) {
+                        // Broadcast, or None — which mcp_server.cpp has already
+                        // normalised to kBroadcastScope, so it cannot arrive
+                        // here meaning "unnamed". MCP keeps broadcast-on-empty
+                        // deliberately: its guard is upstream at the C8 gate and
+                        // in the handler, not at this sink.
+                        //
+                        // Named explicitly rather than left as a bare `else`: a
+                        // fifth DispatchArm added later would otherwise fall
+                        // into fleet-wide broadcast at this sink and the
+                        // dashboard's, silently, at two of four sites.
+                        sent = registry_.send_to_all(cmd);
                     }
 
                     forward_gateway_pending();
@@ -12585,6 +14271,39 @@ private:
             }
         } catch (...) {}
         return {};
+    }
+
+    // ── json-taking overloads (#2500) ─────────────────────────────────────
+    // The string-taking helpers above each parse the whole body. /api/command
+    // called them eight times and this fix added a ninth parse of the same
+    // string, on a route with no size cap beyond httplib's 100 MB default.
+    // These let a handler that has ALREADY parsed reuse the object. Semantics
+    // are deliberately identical to their string twins — same key checks, same
+    // type checks, same fallbacks — so reusing the parse cannot change what a
+    // field resolves to. Consolidating the remaining pre-auth parses needs the
+    // plugin/action check moved relative to require_permission and is tracked
+    // separately.
+    static std::string extract_json_string(const nlohmann::json& j, const std::string& key) {
+        if (j.is_object() && j.contains(key) && j[key].is_string())
+            return j[key].get<std::string>();
+        return {};
+    }
+
+    static std::unordered_map<std::string, std::string>
+    extract_json_string_map(const nlohmann::json& j, const std::string& key) {
+        std::unordered_map<std::string, std::string> result;
+        if (j.is_object() && j.contains(key) && j[key].is_object()) {
+            for (auto& [k, v] : j[key].items())
+                result[k] = v.is_string() ? v.get<std::string>() : v.dump();
+        }
+        return result;
+    }
+
+    static int32_t extract_json_int(const nlohmann::json& j, const std::string& key,
+                                    int32_t default_value = 0) {
+        if (j.is_object() && j.contains(key) && j[key].is_number_integer())
+            return j[key].get<int32_t>();
+        return default_value;
     }
 
     static int32_t extract_json_int(const std::string& body, const std::string& key,
@@ -12874,10 +14593,63 @@ private:
     std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
     std::unique_ptr<CaRoutes> ca_routes_; // PKI PR4: /api/v1/ca/*
-    // SCIM v2 provisioning (/scim/v2/*) — only constructed when --scim-enable.
-    // ScimStore opens its OWN connection to the SAME auth.db AuthDB manages
-    // (see scim_store.hpp); scim_routes_ borrows non-owning ScimStore*/
-    // AuthManager*/AuditStore* pointers, all of which outlive it.
+    std::unique_ptr<KekRoutes> kek_routes_; // #2395: /api/v1/secrets/kek/*
+    // The three KEK operations, shared by the REST routes above and the MCP
+    // twins. Each lambda captures `this` and re-checks auth_secret_codec_ and
+    // pg_pool_ at CALL time, because stop() resets both while this object is
+    // still alive. Held as a member (not a local) purely so both surfaces get
+    // the same instance — see the registration site.
+    KekOps kek_ops_;
+    // #2530 G7-S9: the process-local rotate cooldown (mutex + timestamp) that
+    // used to live here was REMOVED — it was superseded by the durable,
+    // cluster-wide rate limit read from `secrets.kek_meta.created_at`
+    // (`--kek-min-rotate-interval`, evaluated in the `kek_ops.rotate` seam
+    // below) and had degraded into a correctness bug: its hardcoded 5-minute
+    // window could not be configured down and never populated an honest
+    // `cooldown_retry_after_ms`. See the removal comment at the former
+    // check site in the `kek_ops.rotate` seam for the full rationale.
+
+    // #2530 B7 — `yuzu_server_kek_operations_total{op,outcome}`. Follows the
+    // `yuzu_server_secret_decrypt_failures_total` pull-model precedent
+    // (~L4263): incremented HERE, at each kek_ops.{rotate,rewrap,status}
+    // return point (in-process, no DB access — this is NOT a Postgres query),
+    // and published as a `set()` of the current cumulative total by
+    // health_recompute_thread_ every ~15s, so the scrape reads a monotonic
+    // counter it never has to compute itself.
+    std::mutex kek_op_outcome_mu_;
+    std::map<std::pair<std::string, std::string>, std::uint64_t> kek_op_outcome_counts_;
+
+    /// Thread-safe increment of one (op, outcome) cell. `outcome` MUST be one
+    /// of the fixed #2530 B7 vocabulary tokens (`detail::kek_op_outcome_label`,
+    /// kek_rotate_control.hpp) — never a free-form string, or the metric
+    /// grows an unbounded label cardinality.
+    void record_kek_op_outcome(std::string_view op, std::string_view outcome) {
+        std::lock_guard<std::mutex> lk{kek_op_outcome_mu_};
+        ++kek_op_outcome_counts_[{std::string(op), std::string(outcome)}];
+    }
+
+    // ── Postgres-backed AuthDB (ADR-0006 substrate migration) + its
+    // dependency chain ──────────────────────────────────────────────────
+    // Declared in this EXACT order — FileKeyProvider → SecretCodec → AuthDB
+    // → ScimStore — so reverse-declaration-order destruction is safe:
+    // AuthDB's background provisional-MFA reaper thread (started in its
+    // ctor) touches both secret_codec_ and pg_pool_, so it MUST stop before
+    // either goes away; declaring auth_db_ after auth_secret_codec_ (which
+    // is after auth_key_provider_) guarantees the reaper joins (~AuthDB)
+    // before the codec/provider destruct. Both auth_db_ and scim_store_
+    // borrow pg_pool_ (declared far above, near metrics_) by reference, so
+    // they must destruct before it — true here since every member below
+    // this point is declared, hence destructs, before pg_pool_ does.
+    std::unique_ptr<FileKeyProvider> auth_key_provider_;
+    std::unique_ptr<pg::SecretCodec> auth_secret_codec_;
+    std::unique_ptr<AuthDB> auth_db_;
+    // SCIM v2 provisioning (/scim/v2/*) — the store is constructed
+    // unconditionally alongside AuthDB (born-on-PG, cheap to open); only
+    // route registration + the configured bearer token are gated on
+    // --scim-enable (start_web_server()). ScimStore holds its own
+    // independent PgPool lease per call (see scim_store.hpp — no shared-
+    // connection lock order with AuthDB); scim_routes_ borrows non-owning
+    // ScimStore*/AuthManager*/AuditStore* pointers, all of which outlive it.
     std::unique_ptr<ScimStore> scim_store_;
     std::unique_ptr<ScimRoutes> scim_routes_;
     std::unique_ptr<DiscoverRoutes> discover_routes_; // A2: /api/v1/discover/* (Issue 17.1)

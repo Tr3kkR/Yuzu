@@ -635,6 +635,243 @@ TEST_CASE("item 6 stamps: a permanently-throwing pass never advances them",
     worker.stop();
 }
 
+TEST_CASE("progress flag: a token-starved (deferred) pass is NOT verified-idle (flag false)",
+          "[spark][guardian][drain][maint]") {
+    // A pass that returns on deferred_no_token did no replay and verified nothing, so the flag must
+    // be false (the page stamp then reads as a growing age on a permanently token-starved worker).
+    // Deterministic and running-worker-free: the burn is synchronous, so no wall-clock token refill
+    // can race the assertion (the earlier running-worker form of this test was a documented flake
+    // risk under CI contention - governance QE-1). The gate's end-to-end consumption of a false
+    // flag is proven by the read-fail / prune-scan / boot-barrier stamp tests above.
+    JournalRig rig;
+    // Burn the startup token burst: page net-new batches until a pass reports deferred_no_token.
+    // Successive synchronous calls advance wall-clock by ~microseconds, far below the 0.1/s refill,
+    // so the bucket drains and stays dry within the loop.
+    rig.persist_batch("seed", 2);
+    REQUIRE(rig.journal->page_into_window(*rig.rt, journal_now_ms_for_test()).records_paged == 2);
+    for (int i = 0; i < 12; ++i)
+        rig.persist_batch("f" + std::to_string(i), 1);
+    JournalPageStats stats;
+    bool dry = false;
+    for (int i = 0; i < 40 && !dry; ++i) {
+        stats = rig.journal->page_into_window(*rig.rt, journal_now_ms_for_test());
+        dry = stats.deferred_no_token;
+    }
+    REQUIRE(dry); // net-new work still pending, bucket empty
+    CHECK(stats.records_paged == 0);
+    CHECK_FALSE(stats.progress_or_verified_idle);
+}
+
+TEST_CASE("item 6 stamps: a page pass whose read fails does not refresh the age (#2452)",
+          "[spark][guardian][drain][maint]") {
+    // The other half of the page gate: a candidate/value read failure leaves the pass unable to
+    // establish what is replayable, so it must not read as fresh. Inject a long run of page
+    // candidate-scan failures - each increments page_read_failures and does no replay - while
+    // prune stays healthy and advances (proving the passes ran).
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal,
+                                      .page_interval = 0ms,
+                                      .prune_interval = 0ms});
+    // Latch the boot-prune barrier with one clean synchronous page first (a read failure before
+    // it latches would merely be retried), then fail every subsequent page candidate scan. A
+    // read-failed pass returns before charging a token, so the bucket never drains and every
+    // pass reaches (and fails at) the candidate scan.
+    REQUIRE(worker.maintenance_once({.page = true}).records_paged == 1);
+    rig.journal->inject_page_read_failures_for_test(1'000'000); // outlasts the whole test window
+
+    worker.start();
+    const auto page_seed = worker.last_page_success_steady_ms();
+    const auto prune_seed = worker.last_prune_success_steady_ms();
+    REQUIRE(page_seed > 0);
+    REQUIRE(prune_seed > 0);
+    REQUIRE(spin_until([&] { return worker.last_prune_success_steady_ms() > prune_seed; }));
+    const auto prune_mark = worker.last_prune_success_steady_ms();
+    REQUIRE(spin_until([&] { return worker.last_prune_success_steady_ms() > prune_mark; }));
+    CHECK(worker.last_page_success_steady_ms() == page_seed); // frozen: every pass read-failed
+    CHECK(rig.journal->page_read_failures() > 0);             // ...and the passes really ran
+    worker.stop();
+}
+
+TEST_CASE("item 6 stamps: a prune whose scan fails does not refresh the age (#2452)",
+          "[spark][guardian][drain][maint]") {
+    // The prune-side sibling of the page gate. A prune whose scan fails returns read_ok=false
+    // WITHOUT throwing (a KvStore read error is fail-safe), so gating the success stamp on "did
+    // not throw" alone would read a permanently-unreadable retention loop as fresh. Inject a long
+    // run of prune scan failures; prune_failures counts the passes that ran while the stamp must
+    // stay at its seed.
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal,
+                                      .page_interval = 1h, // keep page out of it
+                                      .prune_interval = 0ms});
+    rig.journal->inject_read_failures_for_test(1'000'000); // every prune scan fails, no throw
+
+    worker.start();
+    const auto prune_seed = worker.last_prune_success_steady_ms();
+    REQUIRE(prune_seed > 0);
+    // Wait for several prune passes to have run and fail-scanned, then confirm the success stamp
+    // never advanced. RED before #2452: `if (ok)` advanced it on every read_ok=false pass.
+    REQUIRE(spin_until([&] { return rig.journal->prune_failures() >= 4; }));
+    CHECK(worker.last_prune_success_steady_ms() == prune_seed);
+    worker.stop();
+}
+
+TEST_CASE("item 6 stamps: a page pass whose boot-prune barrier scan fails does not refresh the age (#2452)",
+          "[spark][guardian][drain][maint]") {
+    // The boot-prune barrier inside page_into_window runs a prune scan before the FIRST replay can
+    // page anything. If that scan fails, the pass paged nothing and established nothing - but the
+    // failure is counted on prune_failures, NOT page_read_failures, and the pass sets no
+    // deferred/sent-scan flag. Without JournalPageStats::read_failed the page stamp would advance
+    // on this zero-work pass (a residual instance of the same #2452 bug class, found in review).
+    // Inject prune scan failures so the barrier never latches; every page pass takes this exit. Do
+    // NOT pre-page (that would latch the barrier). prune_failures proves cycles ran - both the
+    // maintenance prune and the barrier's own prune increment it - while the page stamp stays put.
+    JournalRig rig;
+    rig.persist("r1");
+    CollectingSink sink;
+    GuardianOutboxDrainWorker worker(*rig.rt, std::ref(sink), /*periodic_bound_ms=*/5,
+                                     {.journal = rig.journal,
+                                      .page_interval = 0ms,
+                                      .prune_interval = 0ms});
+    rig.journal->inject_read_failures_for_test(1'000'000); // every prune scan fails; barrier never latches
+
+    worker.start();
+    const auto page_seed = worker.last_page_success_steady_ms();
+    REQUIRE(page_seed > 0);
+    REQUIRE(spin_until([&] { return rig.journal->prune_failures() >= 4; }));
+    CHECK(worker.last_page_success_steady_ms() == page_seed); // frozen: every page pass hit the failing barrier
+    CHECK(rig.journal->page_read_failures() == 0); // the barrier is counted on prune_failures, not here
+    worker.stop();
+}
+
+// ── progress_or_verified_idle: the page stamp's positive gate signal (#2452 Gate 7) ──
+// These pin the flag DIRECTLY on page_into_window's return (synchronous, deterministic) rather
+// than through a running worker: the worker gate's CONSUMPTION of the flag is proven end-to-end by
+// the four stamp tests above (each a pass with flag==false leaves the stamp frozen). A page pass is
+// healthy iff it placed records OR ran a full scan finding a clean, unblocked, uncorrupted,
+// readable idle backlog; every degraded/no-work outcome must leave the flag false.
+
+TEST_CASE("progress flag: a clean idle pass is verified-idle (flag true)",
+          "[spark][guardian][drain][maint]") {
+    JournalRig rig; // empty journal
+    const auto stats = rig.journal->page_into_window(*rig.rt, journal_now_ms_for_test());
+    CHECK(stats.records_paged == 0);
+    CHECK(stats.progress_or_verified_idle); // scan completed, nothing to page, nothing wrong
+}
+
+TEST_CASE("progress flag: a pass that places records is progress (flag true)",
+          "[spark][guardian][drain][maint]") {
+    JournalRig rig;
+    rig.persist_batch("r", 2);
+    const auto stats = rig.journal->page_into_window(*rig.rt, journal_now_ms_for_test());
+    CHECK(stats.records_paged == 2);
+    CHECK(stats.progress_or_verified_idle);
+}
+
+TEST_CASE("progress flag: a quarantine-only pass is NOT verified-idle (flag false, UP-2)",
+          "[spark][guardian][drain][maint]") {
+    // A pass that only quarantines corrupt batches placed nothing and verified no clean backlog -
+    // it must not read fresh, else a mass-corruption endpoint shows a healthy age while zero
+    // records reach the server. Quarantine is a SUCCESSFUL read of a corrupt value (not a read
+    // failure), so only the any_quarantine_this_pass term keeps the flag false. RED before Gate 7.
+    JournalRig rig;
+    const std::int64_t now = journal_now_ms_for_test();
+    for (std::uint64_t i = 0; i < 3; ++i)
+        REQUIRE(rig.kv->set(kJournalNamespace,
+                            journal_batch_key(now, "corrupt" + std::to_string(i), i),
+                            "not valid json"));
+    const auto stats = rig.journal->page_into_window(*rig.rt, now);
+    CHECK(stats.records_paged == 0);
+    CHECK(rig.journal->quarantined() == 3); // the pass really did quarantine every candidate
+    CHECK_FALSE(stats.progress_or_verified_idle);
+}
+
+TEST_CASE("progress flag: a quarantine-RENAME-FAILING pass is NOT verified-idle (flag false, UP-5)",
+          "[spark][guardian][drain][maint]") {
+    // Even when the corrupt batch's quarantine rename FAILS (a pre-planted quarantine: twin
+    // conflicts), the pass placed nothing and left a stuck corrupt batch - not a clean idle
+    // backlog. The corrupt signal is set BEFORE the rename, so a rename failure cannot slip past
+    // the positive flag (the residual no-work exit the negative enumeration would have missed).
+    JournalRig rig;
+    const std::int64_t now = journal_now_ms_for_test();
+    const auto key = journal_batch_key(now, "corrupt", 0);
+    REQUIRE(rig.kv->set(kJournalNamespace, key, "not valid json"));
+    // Pre-plant the quarantine twin so the page-side rename conflicts (not Renamed).
+    REQUIRE(rig.kv->set(kJournalNamespace, journal_quarantine_key(key), "pre-existing twin"));
+    const auto stats = rig.journal->page_into_window(*rig.rt, now);
+    CHECK(stats.records_paged == 0);
+    CHECK(rig.journal->quarantine_failures() >= 1); // the rename really failed
+    CHECK_FALSE(stats.progress_or_verified_idle);
+}
+
+TEST_CASE("progress flag: a fully-window-blocked pass is NOT verified-idle (flag false, UP-1)",
+          "[spark][guardian][drain][maint]") {
+    // records_paged==0 with headroom_blocked=true is a genuine replay-congestion stall behind a
+    // saturated send window, not a clean idle - the flag must be false so the age gauge grows.
+    JournalRig rig{/*outbox_capacity=*/1}; // clamped up to kMaxJournalEntriesPerBatch
+    const std::size_t cap = rig.rt->lifecycle_headroom();
+    rig.persist_batch("blocked", 3); // needs 3 slots
+    std::vector<OutboxEntry> fill;
+    for (std::size_t i = 0; i < cap; ++i) // fill the window completely: nothing fits
+        fill.push_back(OutboxEntry::lifecycle("live", 1, "live-" + std::to_string(i),
+                                              1'700'000'000'000'000'000, "armed", "file", "n"));
+    REQUIRE(rig.rt->try_page_batch(std::move(fill)).added == cap);
+    REQUIRE(rig.rt->lifecycle_headroom() == 0);
+    const auto stats = rig.journal->page_into_window(*rig.rt, journal_now_ms_for_test());
+    CHECK(stats.headroom_blocked);
+    CHECK(stats.records_paged == 0);
+    CHECK_FALSE(stats.progress_or_verified_idle);
+}
+
+TEST_CASE("progress flag: a value-read-failing pass that places nothing is NOT verified-idle (flag false)",
+          "[spark][guardian][drain][maint]") {
+    JournalRig rig;
+    rig.persist_batch("r", 2);
+    rig.journal->inject_value_read_failures_for_test(1); // the one candidate's value read fails
+    const auto stats = rig.journal->page_into_window(*rig.rt, journal_now_ms_for_test());
+    CHECK(stats.records_paged == 0);
+    CHECK(stats.read_failed);
+    CHECK_FALSE(stats.progress_or_verified_idle);
+}
+
+TEST_CASE("progress flag: a sent-scan-failing idle pass is NOT verified-idle (flag false, UP8-2)",
+          "[spark][guardian][drain][maint]") {
+    // A degraded sent-label scan means the pass could not fully verify what was already delivered,
+    // so an otherwise-idle pass is not "verified idle" (parity with the pre-Gate-7 gate, restored
+    // after governance Gate 8 found the term dropped). Empty backlog isolates it: the sent-scan
+    // still runs (it is unconditional on !replay_sent), fails, and nothing places - so
+    // sent_scan_failed is the SOLE false-driver. A pass that re-offers everything and PLACES
+    // records still reads fresh via the records_paged>0 override.
+    JournalRig rig; // empty backlog
+    rig.journal->inject_sent_scan_failures_for_test(1);
+    const auto stats = rig.journal->page_into_window(*rig.rt, journal_now_ms_for_test());
+    CHECK(stats.sent_scan_failed);
+    CHECK(stats.records_paged == 0);
+    CHECK_FALSE(stats.progress_or_verified_idle);
+}
+
+TEST_CASE("progress flag: records placed OVERRIDES a same-pass read failure (flag true, QE-4/#2452)",
+          "[spark][guardian][drain][maint]") {
+    // The records_paged>0 disjunct: a pass that placed records is progress even if one other
+    // candidate read failed - so a persistently flaky single candidate cannot cry wolf while the
+    // rest of the backlog drains. Non-vacuous BECAUSE this is a single synchronous pass carrying
+    // BOTH signals at once: reverting the `records_paged>0 ||` disjunct reddens this (the pass
+    // would then read as stale despite real progress).
+    JournalRig rig;
+    rig.persist_batch("a", 2); // first-considered candidate; its value read is failed below
+    rig.persist_batch("b", 2); // second candidate; pages normally
+    rig.journal->inject_value_read_failures_for_test(1); // fails only the FIRST value read
+    const auto stats = rig.journal->page_into_window(*rig.rt, journal_now_ms_for_test());
+    CHECK(stats.read_failed);          // a candidate value read did fail this pass
+    CHECK(stats.records_paged > 0);    // ...but another candidate still paged
+    CHECK(stats.progress_or_verified_idle); // progress wins: the stamp reads fresh
+}
+
 TEST_CASE("item 6 stamps + episode age: lock-free readers race a live worker (TSan checkpoint)",
           "[spark][guardian][drain][maint][tsan]") {
     // The age telemetry's concurrency shape is lock-free readers (the heartbeat)
@@ -934,18 +1171,25 @@ struct StreamLikeSink {
     std::mutex mu;
     bool stream_up{false};       ///< nullptr guardian_sink_stream_ equivalent
     bool write_fails{false};     ///< Write() returning false equivalent
+    std::size_t retained{0};
     std::vector<std::string> sent_ids;
 
     SendResult operator()(const OutboxEntry& e) {
         std::lock_guard<std::mutex> lk{mu};
-        if (!stream_up || write_fails)
+        if (!stream_up || write_fails) {
+            ++retained;
             return SendResult::Retain; // keep the head and stop this pass
+        }
         sent_ids.push_back(e.event_id);
         return SendResult::Sent;
     }
     std::size_t count() {
         std::lock_guard<std::mutex> lk{mu};
         return sent_ids.size();
+    }
+    std::size_t retain_count() {
+        std::lock_guard<std::mutex> lk{mu};
+        return retained;
     }
     void set_stream(bool up) {
         std::lock_guard<std::mutex> lk{mu};
@@ -1371,7 +1615,14 @@ TEST_CASE("R4: a refill re-arm does not wait out the periodic bound",
     // Deterministic precondition: some room, but not enough for the batch.
     REQUIRE(rig.rt->lifecycle_headroom() == kMaxJournalEntriesPerBatch - 4);
     worker.start();
-    CHECK(spin_until([&] { return rig.journal->pages() >= 1; }));
+    REQUIRE(spin_until([&] { return rig.journal->pages() >= 1; }));
+    // Pin the link-down half of the scenario before reconnecting. Merely observing
+    // the page counter is too early: the worker increments it before the following
+    // drain. If this thread raises the link during that gap, the boot drain can send
+    // the four live entries and its refill re-arm coalesces with notify() into one
+    // forced page. That is correct runtime behaviour, but the old assertion then
+    // waited for a third page that the scenario no longer required.
+    REQUIRE(spin_until([&] { return sink.retain_count() >= 1; }));
     const auto pages_before = rig.journal->pages();
 
     // Link returns. The NEXT cycle pages (blocked: the REQUIRE above pins headroom at

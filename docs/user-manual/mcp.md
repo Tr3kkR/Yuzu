@@ -199,8 +199,9 @@ change: a notification POST now answers `202` instead of `204`).
   own cache entry expires and it re-reads the store — up to the 60 s cache TTL plus one
   tick. (Cookie sessions are per-process and in-memory, so a cookie-authenticated
   stream simply does not exist on another replica; the bound above is an API-token
-  property.) Streams end with a final
-  `stream-closed` frame carrying the reason and an A4 envelope — `client_disconnect`,
+  property.) Streams end with a JSON-RPC `notifications/yuzu.stream_closed` notification
+  carried as a normal `message` on the stream (not a bespoke `event: stream-closed` frame),
+  whose `params` carry the reason in an A4 envelope — `client_disconnect`,
   `superseded`, `session_terminated`, `credential_revoked`, or `auth_unavailable` (the
   auth store was unreachable for longer than the **60 s** grace window — the stream is not
   cut the instant the store hiccups, but the exposure is bounded: a revoked credential
@@ -573,6 +574,20 @@ confirming no ticket was created or consumed. Two strictness notes: `integer`
 parameters must be JSON integers (an integral float like `1.0` is rejected),
 and `maxLength` limits are byte counts.
 
+Targeting arguments are **type-checked and never coerced**, and an empty target
+set is an error rather than a widening:
+
+- a non-string entry in `agent_ids`, or a non-string `scope`, is rejected;
+- a **supplied but empty** `agent_ids` (now `minItems: 1` in the published
+  schema) or an empty `scope` string is rejected.
+
+Omitting both is still the documented way to target every agent. The reason
+for the strictness: entries the server could not use were previously dropped,
+and a target set that emptied out fell through to the "nothing specified"
+default — which means the whole fleet. So a client whose device filter matched
+nothing, or which emitted numeric ids, could dispatch fleet-wide and be told it
+succeeded. You now get `-32602` instead.
+
 **Examples of key parameters:**
 
 - `agent_id` (string) -- required by `get_agent_details`, `get_agent_inventory`,
@@ -779,6 +794,28 @@ approval queue.
 ---
 
 ## Security Considerations
+
+### Request-body limit
+
+`/mcp/v1/` only accepts request bodies it can size before reading them:
+
+- a declared `Content-Length` above **4 MiB** is refused `413`;
+- a request carrying **any** `Transfer-Encoding`, **any** `Content-Encoding`
+  other than `identity`, or a `POST`/`PUT`/`PATCH` with no `Content-Length`, is
+  refused `411 Length Required` — the server will not admit a body whose size
+  it cannot check in advance. (A compressed body is refused because the server
+  would otherwise be measuring the compressed bytes while buffering the
+  decompressed ones.)
+
+Both are refused *before the body is read*, so an oversized request costs a
+header parse rather than memory. Send JSON-RPC with a `Content-Length`, no chunked encoding and no
+compression and you will never meet either. The `GET` SSE channel and
+`DELETE` carry no body and are unaffected.
+
+One consequence worth knowing: this cap is **tighter than `execute_bundle`'s
+own step limits allow**. A saturated 2-step bundle (~4.02 MiB) is refused over
+MCP although `POST /api/v1/bundles` still accepts it. If you need multi-MiB
+bundle parameters, use the REST endpoint.
 
 ### Default-enabled behavior
 
@@ -1007,6 +1044,35 @@ The real result was never lost - only its *streamed* copy was dropped.
 (`get_execution_status` / `query_responses`). This code cannot occur for
 `execute_instruction` progress in the current release (the parked-result path activates
 with the later SSE-on-`POST` rung); it is documented here for forward compatibility.
+
+### A streamed final can be dropped entirely
+
+**Symptom**: A parked streamed request produces **no terminal frame and no close
+frame** - the stream simply goes quiet.
+
+**Cause**: Under allocation failure the server can fail to build or publish the terminal
+frame at all. When that happens it deliberately does **not** poison the stream (poisoning
+is reserved for a double publish failure and 410s every later attach on that session), so
+there is nothing for the client to observe. The server records the outcome honestly in its
+own audit log and metrics, but it has no way to tell the client.
+
+**Fix**: Never wait indefinitely on a streamed terminal. Always keep a client-side
+timeout and the `execution_id` you were given at dispatch, and fall back to
+`get_execution_status` / `query_responses` when the timeout fires. That fallback is the
+supported recovery path for every streamed-result failure mode on this surface, not just
+this one.
+
+Like the `-32014` case above, this cannot occur for `execute_instruction` progress in the
+current release - the parked-result path it arises from activates with the later
+SSE-on-`POST` rung. It is documented here for forward compatibility.
+
+**A related case**: if the failure happens while the server is publishing rather than
+building the frame, the session may additionally be left *poisoned* - every later attach
+returns 410 and the client must re-initialize rather than resume. A currently-connected
+stream may not even receive a close frame in that case, so it will sit heart-beating
+until your own timeout fires. The server records the poison state in its own audit trail,
+but nothing tells the client, so the same timeout-plus-`execution_id` recovery applies -
+and a 410 on a subsequent attach means re-initialize, not retry.
 
 ### -32004: MCP tier does not allow this operation
 

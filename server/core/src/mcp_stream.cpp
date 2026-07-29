@@ -101,6 +101,16 @@ const char* close_remediation(McpStreamClose reason) {
     case McpStreamClose::kInternalError:
         return "a server-side fault ended this stream — reconnect; durable results remain "
                "fetchable by execution_id";
+    case McpStreamClose::kCancelled:
+        return "cancellation acknowledged — the execution continues server-side; fetch the "
+               "result by execution_id";
+    case McpStreamClose::kCapExpired:
+        return "the streamed-response time cap elapsed — the execution continues server-side; "
+               "fetch the result by execution_id, or reconnect via GET to resume";
+    case McpStreamClose::kCompleted:
+        // kCompleted never produces a close FRAME (the final is written then EOF); this exists
+        // only so the audit/metric label set is exhaustive. No client action is warranted.
+        return "the stream completed normally — no action needed";
     case McpStreamClose::kClientGone:
     case McpStreamClose::kSuperseded:
     case McpStreamClose::kNone:
@@ -108,6 +118,7 @@ const char* close_remediation(McpStreamClose reason) {
     }
     return "reconnect with Last-Event-ID to resume within the replay window";
 }
+
 
 // Strict, non-throwing cursor parse. std::stoull would be wrong twice over: it does
 // not throw on "-1" (it WRAPS to UINT64_MAX, which lands past the ring window and so
@@ -158,8 +169,31 @@ const char* to_string(McpStreamClose reason) {
         return "auth_unavailable";
     case McpStreamClose::kInternalError:
         return "internal_error";
+    case McpStreamClose::kCancelled:
+        return "cancelled";
+    case McpStreamClose::kCapExpired:
+        return "cap_expired";
+    case McpStreamClose::kCompleted:
+        return "completed";
     }
     return "unknown";
+}
+
+// PENDING 2 (2f PR 3b): the JSON-RPC-wrapped stream-close notification. See the declaration in
+// mcp_stream.hpp for the shape + the `extra_params_json` contract. Public (matches the header);
+// close_remediation above is TU-local but name-visible here.
+std::string make_stream_closed_frame(McpStreamClose reason, std::string_view correlation_id,
+                                     std::string_view extra_params_json) {
+    std::string body =
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/yuzu.stream_closed\",\"params\":{\"reason\":";
+    body += detail::json_quoted(to_string(reason));
+    body += ",\"correlation_id\":";
+    body += detail::json_quoted(correlation_id);
+    body += ",\"retry_after_ms\":null,\"remediation\":";
+    body += detail::json_quoted(close_remediation(reason));
+    body += extra_params_json; // raw ,"key":val fragment (leading comma) from the caller, or empty
+    body += "}}";
+    return body;
 }
 
 // ── McpStreamState ──────────────────────────────────────────────────────────
@@ -502,6 +536,39 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
             return out;
         }
 
+        // 1a. Contiguity (#2435). A nonzero cursor that clears the window check above can STILL
+        //     front a NON-contiguous surviving suffix: eviction is oldest-unpinned-first and
+        //     skips pinned finals (Decision 15(f)), so the ring can hold [.., pinned final N, ..]
+        //     with the unpinned frames between the cursor and N already evicted. The replay loop
+        //     below serves every surviving id > cursor, so it would hand the client id N right
+        //     after its cursor with a SILENT hole where cursor+1..N-1 used to be — the exact
+        //     Last-Event-ID gap the resume mechanism must never produce. Require the surviving
+        //     ids strictly above the cursor to form an unbroken run cursor+1, cursor+2, ...,
+        //     next_id_-1 (the ring is ascending by id — frames push to back, eviction erases in
+        //     place). Any hole -> kGap: the client re-initializes and fetches the final by
+        //     execution_id (the Decision 15(f) durable handle), rather than resume over a gap.
+        //     Checked BEFORE any mutation, so a gapped attach leaves the session untouched.
+        if (last_event_id != 0) {
+            std::uint64_t expected = last_event_id + 1;
+            for (const auto& ev : ring_) {
+                if (ev.id <= last_event_id) {
+                    continue; // already delivered — not part of the replayed suffix
+                }
+                if (ev.id != expected) {
+                    out.status = AttachStatus::kGap; // hole between cursor and a surviving frame
+                    return out;
+                }
+                ++expected;
+            }
+            if (expected != next_id_) {
+                // The surviving run did not reach the newest assigned id — the tail of the
+                // replay window is missing. (Normally unreachable: the newest frame is never
+                // evicted; belt-and-braces so a future eviction change can't open a silent gap.)
+                out.status = AttachStatus::kGap;
+                return out;
+            }
+        }
+
         // 1b. Unpin acknowledged finals (unpin rule (b)): a cursor at or past a pinned
         //     final's id proves the client already consumed it, so it no longer needs the
         //     eviction exemption - release it and let its ring space be reclaimed. (A pinned
@@ -754,6 +821,91 @@ std::size_t McpStreamState::frame_bytes(const McpStreamEvent& ev) {
     return ev.event_type.size() + ev.data.size();
 }
 
+// ── RevalidateGrace ─────────────────────────────────────────────────────────
+
+RevalidateGrace::Outcome RevalidateGrace::on_verdict(StreamRevalidate verdict) {
+    switch (verdict) {
+    case StreamRevalidate::kRevoked:
+        // Authoritative revocation — an immediate kill, no grace.
+        return Outcome::kCloseCredentialRevoked;
+    case StreamRevalidate::kIndeterminate:
+        // The auth backend is unreachable — that is NOT a revocation. Ride it out for a bounded
+        // grace window rather than cutting every live stream on the fleet at the same instant.
+        // The deadline carries a per-stream jitter chosen ONCE here (Config::jitter_max).
+        if (!grace_deadline_.has_value()) {
+            // #2367: the budget is measured from the last AUTHORITATIVE confirmation, not from
+            // this tick. A credential re-check served from a cache (kValidStale below) keeps the
+            // stream alive without re-confirming anything, so starting the clock here would let
+            // cache residency and the grace window ADD — the stream rides the cache, then
+            // collects a full fresh grace window on top. Backdating keeps total survival past a
+            // real confirmation bounded by `grace`, however much of it was spent on cached
+            // answers.
+            grace_start_ = last_authoritative_ok_;
+            std::chrono::milliseconds jitter{0};
+            if (cfg_.jitter_max.count() > 0) {
+                // A per-stream offset in [0, jitter_max]. thread_local RNG seeded once per worker;
+                // non-cryptographic — this only decorrelates timers, it guards nothing.
+                static thread_local std::minstd_rand rng{static_cast<std::uint32_t>(
+                    std::chrono::steady_clock::now().time_since_epoch().count())};
+                // The modulo is done in the int64 (chrono::rep) domain and the span is clamped to
+                // a sane ceiling FIRST. If the knob ever becomes operator-controlled, a raw
+                // static_cast<uint32>(count()) + 1 could wrap to 0 (div-by-zero) on a 32-bit
+                // result_type, or silently truncate a > UINT32_MAX-ms value. Contain it here.
+                constexpr std::int64_t kMaxJitterMs = 3600 * 1000; // one hour is plenty
+                const std::int64_t span =
+                    std::min<std::int64_t>(cfg_.jitter_max.count(), kMaxJitterMs);
+                jitter = std::chrono::milliseconds{static_cast<std::int64_t>(rng()) % (span + 1)};
+            }
+            grace_deadline_ = *grace_start_ + cfg_.grace + jitter;
+        }
+        // Expiry is tested below, after the switch (kValidStale can clear a deadline, so the test
+        // must run once the verdict is known, not inline here).
+        break;
+    case StreamRevalidate::kValid:
+        // An AUTHORITATIVE confirmation: the store was asked and answered.
+        last_authoritative_ok_ = now();
+        clear_grace_deadline_();
+        break;
+    case StreamRevalidate::kValidStale:
+        // Valid, but nothing was asked of the store on this tick — the answer came from a cache
+        // with a known maximum age. Advance the floor: without using the cache entry (positive
+        // evidence the store confirmed this principal within max_staleness),
+        // last_authoritative_ok_ would only refresh on the tick that happens to MISS. A principal
+        // with several concurrent streams refreshes the shared entry from whichever stream ticks
+        // first, so every OTHER stream would ride cached answers far longer than the TTL and then
+        // face a deadline already in the past the instant the store blipped: zero grace, all at
+        // once. Clamping to now - max_staleness bounds that to one cache window per stream and
+        // can only ever move the floor FORWARD (never past now), so it cannot extend a life.
+        // Then CLEAR the deadline exactly as kValid does — a cache hit is as much a confirmation
+        // as a read-through (the entry cannot exist unless an authoritative read succeeded within
+        // the window, and a revoke erases it synchronously). Leaving a deadline armed here was
+        // the round-1 defect: two streams on one principal, the outage ends, the first re-reads
+        // and warms the shared entry, and the second then rides hits with an outage-era deadline
+        // still counting down — closing auth_unavailable against a reachable store and an Active
+        // principal, contradicting CH-4's recovered-backend invariant.
+        if (cfg_.max_staleness.count() > 0) {
+            last_authoritative_ok_ = std::max(last_authoritative_ok_, now() - cfg_.max_staleness);
+        }
+        clear_grace_deadline_();
+        break;
+    default:
+        // Fail CLOSED on an enumerator this state machine does not know, matching
+        // auth_routes.cpp's `return R::kRevoked` fall-out: falling out of the switch would leave
+        // the stream RUNNING on an auth answer nobody interpreted.
+        return Outcome::kCloseAuthUnavailable;
+    }
+
+    // Fire a backdated kIndeterminate deadline on its OWN arming tick. Only the kIndeterminate arm
+    // leaves a deadline armed past this point (kValid and kValidStale both cleared it above); its
+    // deadline is backdated to last_authoritative_ok_, so it can already be in the past when first
+    // armed, and the pre-#2367 "arm now, test next tick" shape would grant an extra tick of life
+    // to a stream whose budget was already spent.
+    if (grace_deadline_.has_value() && now() > *grace_deadline_) {
+        return Outcome::kCloseAuthUnavailable;
+    }
+    return Outcome::kContinue;
+}
+
 // ── McpStreamPump ───────────────────────────────────────────────────────────
 
 McpStreamPump::McpStreamPump(std::shared_ptr<McpStreamSink> sink,
@@ -770,18 +922,12 @@ McpStreamPump::McpStreamPump(std::shared_ptr<McpStreamSink> sink,
                              yuzu::MetricsRegistry* metrics)
     : sink_(std::move(sink)), stream_(std::move(stream)), generation_(generation),
       revalidate_(std::move(revalidate)), session_alive_(std::move(session_alive)), cfg_(cfg),
-      clock_(std::move(clock)), metrics_(metrics) {
-    // #2367: the grace budget is measured from the last authoritative
-    // confirmation, and attach already performed one — GET admission
-    // authenticates the request fully before this pump is constructed. Seeding
-    // to "now" rather than the epoch is what stops the very first
-    // indeterminate tick from computing an instantly-expired deadline.
-    last_authoritative_ok_ = now();
-}
-
-std::chrono::steady_clock::time_point McpStreamPump::now() const {
-    return clock_ ? clock_() : std::chrono::steady_clock::now();
-}
+      metrics_(metrics),
+      // The grace policy owns the clock + the #2367 last-authoritative seed (attach already
+      // authenticated the request fully before this pump exists).
+      grace_(RevalidateGrace::Config{cfg.revalidate_grace, cfg.revalidate_grace_jitter_max,
+                                     cfg.revalidate_max_staleness},
+             std::move(clock)) {}
 
 bool McpStreamPump::finish(const WriteFn& write, McpStreamClose reason) {
     sink_->set_close_reason(reason);
@@ -792,20 +938,22 @@ bool McpStreamPump::finish(const WriteFn& write, McpStreamClose reason) {
     // newer stream on this session, so the only thing that can be waiting on the far
     // end of this socket is the stalled peer that caused the takeover in the first
     // place; writing to it would block this worker for the full write timeout (30 s)
-    // while its lease is still charged. Every other reason gets the frame.
-    if (actual != McpStreamClose::kSuperseded) {
-        // Decision 15(f): a close is never indistinguishable from a clean completion,
-        // and the reason is machine-parseable in the same A4 shape as every denial on
-        // this route (so a client has ONE error contract, not two).
+    // while its lease is still charged. kCompleted likewise writes NO close frame — the
+    // streamed-POST pump delivers its real final then EOFs, and a close frame after a
+    // successful final would be a spurious second terminal (this makes the documented
+    // "kCompleted never produces a close frame" invariant structural, not just a comment;
+    // the GET pump never sets kCompleted, so this is forward-proofing for C6c/C7). Every
+    // other reason gets the frame.
+    if (actual != McpStreamClose::kSuperseded && actual != McpStreamClose::kCompleted) {
+        // Decision 15(f): a close is never indistinguishable from a clean completion, and the
+        // reason is machine-parseable in the same A4 shape as every denial on this route (so a
+        // client has ONE error contract, not two). PENDING 2 (2f PR 3b): the frame is now a
+        // JSON-RPC-wrapped `notifications/yuzu.stream_closed` under the default `message` event
+        // type, so it is a normal message on the stream rather than a bespoke `event:
+        // stream-closed` a spec client would not see. Off-ring, id-less (SseEvent default id 0).
         const auto cid = yuzu::server::detail::make_correlation_id();
-        std::string body = "{\"reason\":";
-        body += detail::json_quoted(to_string(actual));
-        body += ",\"correlation_id\":";
-        body += detail::json_quoted(cid);
-        body += ",\"retry_after_ms\":null,\"remediation\":";
-        body += detail::json_quoted(close_remediation(actual));
-        body += "}";
-        (void)write_all(write, sse_bus::format_sse(sse_bus::SseEvent{"stream-closed", body}));
+        (void)write_all(write, sse_bus::format_sse(sse_bus::SseEvent{
+                                   "message", make_stream_closed_frame(actual, cid)}));
     }
     return false;
 }
@@ -875,116 +1023,20 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
     // never block a publisher (which would hold McpStreamState::mu_ and in turn
     // stall attach/close for this session).
 
-    // Credential re-validation, once per tick (Decision 15(c)/(i), CH-4).
+    // Credential re-validation, once per tick (Decision 15(c)/(i), CH-4). The grace state
+    // machine (revoke = immediate kill, indeterminate = bounded jittered grace, stale-cache floor
+    // clamp) lives in RevalidateGrace so the streamed-POST pump shares it byte-for-byte (2f PR
+    // 3b); this pump owns only the wire action taken on its verdict.
     if (revalidate_) {
-        switch (revalidate_()) {
-        case StreamRevalidate::kRevoked:
+        switch (grace_.on_verdict(revalidate_())) {
+        case RevalidateGrace::Outcome::kCloseCredentialRevoked:
             stream_->close(McpStreamClose::kCredentialRevoked);
             return finish(write, McpStreamClose::kCredentialRevoked);
-        case StreamRevalidate::kIndeterminate:
-            // The auth backend is unreachable — that is NOT a revocation. Ride it
-            // out for a bounded grace window rather than cutting every live stream
-            // on the fleet at the same instant. The deadline carries a per-stream
-            // jitter chosen ONCE here, so streams that all entered grace together do
-            // not all die together (Config::revalidate_grace_jitter_max).
-            if (!grace_deadline_.has_value()) {
-                // #2367: the budget is measured from the last AUTHORITATIVE
-                // confirmation, not from this tick. A credential re-check that
-                // was served from a cache (kValidStale below) keeps the stream
-                // alive without re-confirming anything, so starting the clock
-                // here would let cache residency and the grace window ADD —
-                // the stream rides the cache, then collects a full fresh grace
-                // window on top. Backdating keeps total survival past a real
-                // confirmation bounded by revalidate_grace, however much of it
-                // was spent on cached answers.
-                grace_start_ = last_authoritative_ok_;
-                std::chrono::milliseconds jitter{0};
-                if (cfg_.revalidate_grace_jitter_max.count() > 0) {
-                    // A per-stream offset in [0, jitter_max]. thread_local RNG seeded once
-                    // per worker; non-cryptographic — this only decorrelates timers, it
-                    // guards nothing.
-                    static thread_local std::minstd_rand rng{static_cast<std::uint32_t>(
-                        std::chrono::steady_clock::now().time_since_epoch().count())};
-                    // The modulo is done in the int64 (chrono::rep) domain and the span is
-                    // clamped to a sane ceiling FIRST. The knob is hardwired to grace/2
-                    // today, but if it ever becomes operator-controlled, a raw
-                    // `static_cast<uint32>(count()) + 1` could wrap to 0 (div-by-zero) on a
-                    // 32-bit result_type, or silently truncate a > UINT32_MAX-ms value.
-                    // Contain it at the source now, not when the wiring lands.
-                    constexpr std::int64_t kMaxJitterMs = 3600 * 1000; // one hour is plenty
-                    const std::int64_t span =
-                        std::min<std::int64_t>(cfg_.revalidate_grace_jitter_max.count(),
-                                               kMaxJitterMs);
-                    jitter = std::chrono::milliseconds{
-                        static_cast<std::int64_t>(rng()) % (span + 1)};
-                }
-                grace_deadline_ = *grace_start_ + cfg_.revalidate_grace + jitter;
-            }
-            // Expiry is tested below, after the switch (kValidStale can clear a
-            // deadline, so the test must run once the verdict is known, not
-            // inline here).
-            break;
-        case StreamRevalidate::kValid:
-            // An AUTHORITATIVE confirmation: the store was asked and answered.
-            last_authoritative_ok_ = now();
-            clear_grace_deadline_();
-            break;
-        case StreamRevalidate::kValidStale:
-            // Valid, but nothing was asked of the store on this tick — the
-            // answer came from a cache with a known maximum age.
-            //
-            // Advance the floor. The cache entry is positive evidence that the
-            // store confirmed this principal within `max_staleness`, and
-            // without using it `last_authoritative_ok_` would only refresh on
-            // the tick that happens to MISS. A principal with several
-            // concurrent streams refreshes the shared entry from whichever
-            // stream ticks first, so every OTHER stream would ride cached
-            // answers far longer than the TTL and then face a deadline already
-            // in the past the instant the store blipped: zero grace, all at
-            // once. Clamping to `now - max_staleness` bounds that to one cache
-            // window per stream and can only ever move the floor FORWARD (never
-            // past `now`), so it cannot extend a life.
-            if (cfg_.revalidate_max_staleness.count() > 0) {
-                last_authoritative_ok_ =
-                    std::max(last_authoritative_ok_, now() - cfg_.revalidate_max_staleness);
-            }
-            // Then CLEAR the deadline, exactly as kValid does — a cache hit is
-            // as much a confirmation as a read-through (the entry cannot exist
-            // unless an authoritative read succeeded within the window, and a
-            // revoke erases it synchronously). Leaving a deadline armed here
-            // was the round-1 defect: two streams on one principal, the outage
-            // ends, the first stream re-reads and warms the shared entry, and
-            // the second then rides hits with an outage-era deadline still
-            // counting down — closing `auth_unavailable` against a reachable
-            // store and an Active principal, contradicting CH-4's
-            // recovered-backend invariant. The bound survives because the floor
-            // advanced only to `now - max_staleness`, and a cached answer
-            // cannot outlive a dead store by more than one window (entries
-            // expire and are not renewed without a successful read), so a real
-            // outage still ends the stream within `revalidate_grace` of its
-            // last authoritative confirmation.
-            clear_grace_deadline_();
-            break;
-        default:
-            // Fail CLOSED on an enumerator this pump does not know, matching
-            // auth_routes.cpp's `return R::kRevoked` fall-out. `werror` is off,
-            // so an unhandled value is a warning, not a build failure — and
-            // falling out of the switch would leave the stream RUNNING on an
-            // auth answer nobody interpreted. This PR is itself proof that
-            // enumerators get added.
+        case RevalidateGrace::Outcome::kCloseAuthUnavailable:
             stream_->close(McpStreamClose::kAuthUnavailable);
             return finish(write, McpStreamClose::kAuthUnavailable);
-        }
-
-        // Fire a backdated kIndeterminate deadline on its OWN arming tick. Only
-        // the kIndeterminate arm leaves a deadline armed past this point (kValid
-        // and kValidStale both cleared it above); its deadline is backdated to
-        // `last_authoritative_ok_`, so it can already be in the past when first
-        // armed, and the pre-#2367 "arm now, test next tick" shape would grant
-        // an extra tick of life to a stream whose budget was already spent.
-        if (grace_deadline_.has_value() && now() > *grace_deadline_) {
-            stream_->close(McpStreamClose::kAuthUnavailable);
-            return finish(write, McpStreamClose::kAuthUnavailable);
+        case RevalidateGrace::Outcome::kContinue:
+            break;
         }
     }
 

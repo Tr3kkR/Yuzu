@@ -32,7 +32,7 @@
 #include "audit_store.hpp"
 #include "test_route_sink.hpp"
 #include "../../../server/core/src/totp.hpp"
-#include "../test_helpers.hpp"
+#include "test_auth_db_pg_helper.hpp"
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -72,7 +72,7 @@ struct HardenedHarness {
     Config cfg{};
     yuzu::MetricsRegistry metrics; // wired so the CC6.3/CC6.6 SIEM counters fire (review #1735 LOW)
     auth::AuthManager auth_mgr{};
-    AuthDB auth_db;
+    yuzu::test::AuthDbPg auth_db;
     // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs the current TEST_CASE
     // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken.
     // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
@@ -87,18 +87,16 @@ struct HardenedHarness {
     yuzu::server::test::TestRouteSink sink;
 
     HardenedHarness(const std::string& auth_mode, const std::string& break_glass_user)
-        : tmp(yuzu::test::unique_temp_path("auth-hardened-")),
-          auth_db(tmp.path, /*cleanup_interval_secs=*/0) {
+        : tmp(yuzu::test::unique_temp_path("auth-hardened-")) {
         cfg.auth_config_path = tmp.path / "auth.cfg";
         cfg.https_enabled = false; // no Secure cookie suffix
         cfg.auth_mode = auth_mode;
         cfg.break_glass_user = break_glass_user;
 
-        REQUIRE(auth_db.initialize().has_value());
         auth_mgr.load_config(cfg.auth_config_path);
         seed_user("admin", "adminpassword1", auth::Role::admin);
         seed_user("alice", "alicepassword1", auth::Role::user);
-        auth_mgr.set_auth_db(&auth_db);
+        auth_mgr.set_auth_db(auth_db.get());
         auth_mgr.set_metrics_registry(&metrics);
 
         audit_store = std::make_unique<AuditStore>(tmp.path / "audit.db");
@@ -119,13 +117,13 @@ struct HardenedHarness {
         auto salt = auth::AuthManager::random_bytes(16);
         auto salt_hex = auth::AuthManager::bytes_to_hex(salt);
         REQUIRE(auth_db
-                    .upsert_user(name, auth::AuthManager::pbkdf2_sha256(pw, salt, 100'000), salt_hex,
-                                 role)
+                    ->upsert_user(name, auth::AuthManager::pbkdf2_sha256(pw, salt, 100'000), salt_hex,
+                                  role)
                     .has_value());
     }
 
     void enroll_mfa(const std::string& name) {
-        auto init = auth_db.mfa_init_enrollment(name, "Yuzu");
+        auto init = auth_db->mfa_init_enrollment(name, "Yuzu");
         REQUIRE(init.has_value());
         // Complete enrollment with a code at the current counter. These tests
         // stop at the 202 challenge — they never submit a login TOTP — so the
@@ -134,11 +132,11 @@ struct HardenedHarness {
         REQUIRE(bytes.has_value());
         std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
         auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-        REQUIRE(auth_db.mfa_verify_enrollment(name, code).has_value());
+        REQUIRE(auth_db->mfa_verify_enrollment(name, code).has_value());
     }
 
     void arm(const std::string& name, int window_secs = 3600) {
-        REQUIRE(auth_db.arm_break_glass(name, window_secs).has_value());
+        REQUIRE(auth_db->arm_break_glass(name, window_secs).has_value());
     }
 
     int count_audits(const std::string& action, const std::string& principal = {}) {
@@ -175,7 +173,7 @@ constexpr const char* kFormCt = "application/x-www-form-urlencoded";
 } // namespace
 
 TEST_CASE("standard mode: local login still works (regression guard)",
-          "[auth][hardened][routes]") {
+          "[pg][auth][hardened][routes]") {
     HardenedHarness h("standard", "");
     auto res = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
                            kFormCt);
@@ -186,7 +184,7 @@ TEST_CASE("standard mode: local login still works (regression guard)",
 }
 
 TEST_CASE("sso-only: non-break-glass local login is rejected with a generic 401",
-          "[auth][hardened][routes]") {
+          "[pg][auth][hardened][routes]") {
     HardenedHarness h("sso-only", "");
     auto res = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
                            kFormCt);
@@ -205,7 +203,7 @@ TEST_CASE("sso-only: non-break-glass local login is rejected with a generic 401"
 }
 
 TEST_CASE("sso-only: a valid password is still rejected when local login is disabled",
-          "[auth][hardened][routes]") {
+          "[pg][auth][hardened][routes]") {
     // Even the correct credential must not mint a session in sso-only mode for a
     // non-exempt user — the disable is unconditional, not a password check.
     HardenedHarness h("sso-only", "");
@@ -220,7 +218,7 @@ TEST_CASE("sso-only: a valid password is still rejected when local login is disa
 }
 
 TEST_CASE("sso-only: break-glass user is still rejected when NOT armed",
-          "[auth][hardened][routes]") {
+          "[pg][auth][hardened][routes]") {
     HardenedHarness h("sso-only", "admin");
     // admin is the configured break-glass user but has not been armed.
     auto res = h.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword1"}}),
@@ -235,7 +233,7 @@ TEST_CASE("sso-only: break-glass user is still rejected when NOT armed",
 }
 
 TEST_CASE("sso-only: armed break-glass user with MFA proceeds to the MFA challenge",
-          "[auth][hardened][routes]") {
+          "[pg][auth][hardened][routes]") {
     HardenedHarness h("sso-only", "admin");
     h.enroll_mfa("admin");
     h.arm("admin");
@@ -255,7 +253,7 @@ TEST_CASE("sso-only: armed break-glass user with MFA proceeds to the MFA challen
 }
 
 TEST_CASE("sso-only: a non-break-glass user is rejected even while another is armed",
-          "[auth][hardened][routes]") {
+          "[pg][auth][hardened][routes]") {
     HardenedHarness h("sso-only", "admin");
     h.enroll_mfa("admin");
     h.arm("admin");
@@ -269,7 +267,7 @@ TEST_CASE("sso-only: a non-break-glass user is rejected even while another is ar
 }
 
 TEST_CASE("sso-only: armed break-glass user WITHOUT MFA is HARD-DENIED, not offered enrollment",
-          "[auth][hardened][routes]") {
+          "[pg][auth][hardened][routes]") {
     // Governance UP-1 (BLOCKING fix). The boot guard normally refuses to start
     // with an MFA-less break-glass user; if one slips through (MFA cleared
     // out-of-band after boot), the login handler must HARD-DENY — never offer
@@ -290,7 +288,7 @@ TEST_CASE("sso-only: armed break-glass user WITHOUT MFA is HARD-DENIED, not offe
 }
 
 TEST_CASE("sso-only: the break-glass account is exempt from failed-login lockout",
-          "[auth][hardened][routes]") {
+          "[pg][auth][hardened][routes]") {
     // Governance Hermes-F / UP-13: without the exemption an attacker who learns
     // the break-glass username could spray wrong passwords to keep it locked and
     // render the escape hatch unreachable during the very IdP outage it exists
@@ -321,7 +319,7 @@ TEST_CASE("sso-only: the break-glass account is exempt from failed-login lockout
 }
 
 TEST_CASE("sso-only: wrong password against an armed break-glass user is a normal login failure",
-          "[auth][hardened][routes]") {
+          "[pg][auth][hardened][routes]") {
     // The break-glass success row (auth.breakglass.login) must fire only AFTER
     // verify_password succeeds — a wrong password takes the standard
     // auth.login_failed path and never produces a spurious "ok" break-glass row.

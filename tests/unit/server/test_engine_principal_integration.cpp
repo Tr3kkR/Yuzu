@@ -8,10 +8,11 @@
  * test_rbac_store.cpp / test_auth_db*.cpp — this file exercises them wired
  * together the way server.cpp actually wires them.
  *
- * PG-gated where PG stores are involved (ApiTokenStore, EnginePrincipalStore):
- * skips when YUZU_TEST_POSTGRES_DSN is unset, fails when it is set but broken
- * (test_helpers.hpp skip-vs-fail contract). The RBAC/AuthDB namespace-collision
- * coverage is plain SQLite and needs no PG gate.
+ * PG-gated where PG stores are involved (ApiTokenStore, EnginePrincipalStore,
+ * and — since the ADR-0006 substrate migration — AuthDB itself): skips when
+ * YUZU_TEST_POSTGRES_DSN is unset, fails when it is set but broken
+ * (test_helpers.hpp skip-vs-fail contract). The RBAC-only namespace-collision
+ * coverage stays plain SQLite and needs no PG gate.
  */
 
 #include "auth_routes.hpp"
@@ -23,17 +24,20 @@
 #include "oidc_provider.hpp"
 #include "rbac_store.hpp"
 
-#include "../test_helpers.hpp"
+#include "test_auth_db_pg_helper.hpp"
 
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <httplib.h>
 
+#include <libpq-fe.h>
 #include <sqlite3.h>
 
 #include <chrono>
@@ -64,17 +68,51 @@ void setup_engine_principal_store_pg_template(const std::string& dsn) {
 yuzu::test::PgTestTemplate engine_principal_integ_template{
     "engineprincipal_integ", &setup_engine_principal_store_pg_template};
 
+// One migrated clone + one persistent pool for the whole FILE, TRUNCATE-reset
+// between tests instead of a fresh CREATE DATABASE + new pool per test (the
+// dominant Windows [pg]-shard cost, #2354 — see test_software_inventory_store
+// .cpp's SwinvShared, the reference conversion). Built lazily; at testRunEnded
+// the pool is drained and the clone dropped (keep_until_run_end). CARVE-OUT
+// note: the T8 collision-scan TEST_CASE below deliberately stays on per-case
+// AuthDbPg (NOT the shared sibling) — it needs a seeded and a clean AuthDB
+// database to coexist in one Catch2 leaf.
+struct EpIntegShared {
+    yuzu::test::PostgresTestDb db{engine_principal_integ_template};
+    std::optional<yuzu::server::pg::PgPool> pool;
+    EpIntegShared() {
+        INFO("[EpIntegShared] bundle status (blank == database came up OK): " << db.error());
+        REQUIRE(db.available());
+        pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = db.dsn(), .size = 4});
+        REQUIRE(pool->valid());
+        db.keep_until_run_end([this]() noexcept { pool.reset(); });
+    }
+};
+EpIntegShared& ep_integ_shared() {
+    static EpIntegShared s;
+    return s;
+}
+
+/// Same call-site interface as before; now a fresh store per fixture over the
+/// file-wide shared clone/pool, TRUNCATE-restored at construction (the ctor's
+/// migration check is a no-op on the already-migrated clone).
 class EnginePrincipalStorePg {
 public:
     EnginePrincipalStorePg() {
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
-        db_.emplace(engine_principal_integ_template);
-        REQUIRE(db_->available());
-        pool_.emplace(yuzu::server::pg::PgPool::Options{.conninfo = db_->dsn(), .size = 4});
-        REQUIRE(pool_->valid());
-        store_ = std::make_unique<EnginePrincipalStore>(*pool_);
+        {
+            // Scoped: released before the store ctor takes its own lease.
+            auto lease = ep_integ_shared().pool->acquire();
+            REQUIRE(lease);
+            auto trunc = yuzu::server::pg::exec_params(
+                lease.get(),
+                "TRUNCATE engine_principal_store.engine_principals RESTART IDENTITY CASCADE",
+                std::vector<std::string>{});
+            INFO("[EpIntegShared] reset: " << PQresultErrorMessage(trunc.get()));
+            REQUIRE(trunc.status() == PGRES_COMMAND_OK);
+        }
+        store_ = std::make_unique<EnginePrincipalStore>(*ep_integ_shared().pool);
         REQUIRE(store_->is_open());
     }
 
@@ -84,15 +122,9 @@ public:
     [[nodiscard]] EnginePrincipalStore* get() const noexcept { return store_.get(); }
     EnginePrincipalStore* operator->() const noexcept { return store_.get(); }
 
-    void reset() noexcept {
-        store_.reset();
-        pool_.reset();
-        db_.reset();
-    }
+    void reset() noexcept { store_.reset(); }
 
 private:
-    std::optional<yuzu::test::PostgresTestDb> db_;
-    std::optional<yuzu::server::pg::PgPool> pool_;
     std::unique_ptr<EnginePrincipalStore> store_;
 };
 
@@ -113,7 +145,7 @@ TEST_CASE("Engine session synthesis: active principal + engine token -> engine s
           "[pg][engine_principal][integration][auth_routes]") {
     Config cfg{};
     auth::AuthManager auth_mgr{};
-    yuzu::test::ApiTokenStorePg api_tokens;
+    yuzu::test::ApiTokenStorePgShared api_tokens;
     EnginePrincipalStorePg engine_store;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
@@ -234,7 +266,7 @@ TEST_CASE("Engine stream re-validation end-to-end: first tick authoritative, nex
           "[pg][engine_principal][integration][auth_routes][cache]") {
     Config cfg{};
     auth::AuthManager auth_mgr{};
-    yuzu::test::ApiTokenStorePg api_tokens;
+    yuzu::test::ApiTokenStorePgShared api_tokens;
     EnginePrincipalStorePg engine_store;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider;
@@ -416,40 +448,27 @@ TEST_CASE("Engine namespace: local group create inside 'engine:' is rejected",
 }
 
 TEST_CASE("Engine namespace: the T8 startup collision-scan preflight finds pre-existing rows",
-          "[engine_principal][integration][collision_scan]") {
+          "[pg][engine_principal][integration][collision_scan]") {
     // ── AuthDB side: seed a users row that predates the 'engine:' reservation.
     // `upsert_sso_identity` now rejects an 'engine:'-shaped principal outright
     // (the write surface itself guards the reserved namespace per design
     // §3.3 — a dedicated `[auth_db]` test proves the rejection), so a
     // pre-existing colliding row can no longer be produced through the API.
     // Simulate "a row that predates the reservation" the same way the RBAC
-    // side does below: migrate the schema via the real store, close it, seed
-    // the row with a second raw connection, close that, then reopen (required
-    // on Windows).
-    auto auth_dir = yuzu::test::TempDir{"engine-ns-users-"};
-    fs::create_directories(auth_dir.path);
-    auto auth_db_path = auth_dir.path / "auth.db";
+    // side does below, but over a SECOND libpq connection (AuthDB is now
+    // Postgres-backed, ADR-0006) rather than a raw sqlite3 handle.
+    yuzu::test::AuthDbPg auth_db;
     {
-        AuthDB seed_db(auth_dir.path, /*cleanup_interval_secs=*/0);
-        REQUIRE(seed_db.initialize().has_value());
+        yuzu::server::pg::PgConn conn{PQconnectdb(auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult res{PQexec(
+            conn.get(),
+            "INSERT INTO auth.users (username, password_hash, salt_hex, role, "
+            "identity_source, external_iss, external_sub, display_name) "
+            "VALUES ('engine:legacy', '', '', 'user', 'oidc', "
+            "'https://issuer.example', 'sub-1', 'Legacy Engine-Named Row')")};
+        REQUIRE(res.ok());
     }
-    {
-        sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open_v2(auth_db_path.string().c_str(), &raw,
-                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr) ==
-               SQLITE_OK);
-        char* err = nullptr;
-        int rc = sqlite3_exec(raw,
-                              "INSERT INTO users (username, password_hash, salt_hex, role, "
-                              "identity_source, external_iss, external_sub, display_name) "
-                              "VALUES ('engine:legacy', '', '', 'user', 'oidc', "
-                              "'https://issuer.example', 'sub-1', 'Legacy Engine-Named Row')",
-                              nullptr, nullptr, &err);
-        REQUIRE(rc == SQLITE_OK);
-        sqlite3_close(raw);
-    }
-    AuthDB auth_db(auth_dir.path, /*cleanup_interval_secs=*/0);
-    REQUIRE(auth_db.initialize().has_value());
 
     // ── RbacStore side: seed a local group row that predates the reservation.
     // create_group() now rejects this shape outright (previous TEST_CASE), so
@@ -478,7 +497,7 @@ TEST_CASE("Engine namespace: the T8 startup collision-scan preflight finds pre-e
     REQUIRE(rbac_store.is_open());
 
     SECTION("both scanners individually find the seeded collisions") {
-        auto colliding_users = auth_db.find_reserved_prefix_users("engine:");
+        auto colliding_users = auth_db->find_reserved_prefix_users("engine:");
         REQUIRE(colliding_users.has_value());
         REQUIRE(colliding_users->size() == 1);
         CHECK((*colliding_users)[0] == "engine:legacy");
@@ -490,7 +509,7 @@ TEST_CASE("Engine namespace: the T8 startup collision-scan preflight finds pre-e
     }
 
     SECTION("simulated server.cpp preflight: either non-empty scan means fail-closed") {
-        auto colliding_users = auth_db.find_reserved_prefix_users("engine:");
+        auto colliding_users = auth_db->find_reserved_prefix_users("engine:");
         auto colliding_groups = rbac_store.find_local_groups_with_prefix("engine:");
         // A scan error (nullopt) on EITHER half must read as fail-closed (G3 + symmetric users half).
         bool would_refuse_to_start =
@@ -500,16 +519,13 @@ TEST_CASE("Engine namespace: the T8 startup collision-scan preflight finds pre-e
     }
 
     SECTION("a clean database has no collisions and would NOT fail closed") {
-        auto clean_auth_dir = yuzu::test::TempDir{"engine-ns-users-clean-"};
-        fs::create_directories(clean_auth_dir.path);
-        AuthDB clean_auth_db(clean_auth_dir.path, /*cleanup_interval_secs=*/0);
-        REQUIRE(clean_auth_db.initialize().has_value());
+        yuzu::test::AuthDbPg clean_auth_db;
 
         auto clean_rbac_path = yuzu::test::unique_temp_path("engine-ns-groups-clean-");
         RbacStore clean_rbac(clean_rbac_path);
         REQUIRE(clean_rbac.is_open());
 
-        auto colliding_users = clean_auth_db.find_reserved_prefix_users("engine:");
+        auto colliding_users = clean_auth_db->find_reserved_prefix_users("engine:");
         auto colliding_groups = clean_rbac.find_local_groups_with_prefix("engine:");
         bool would_refuse_to_start =
             !colliding_users.has_value() || !colliding_users->empty() ||
@@ -571,7 +587,7 @@ TEST_CASE("ManagementGroupStore::assign_role rejects principal_type=='engine' ou
 
 TEST_CASE("ApiTokenStore engine block: referential integrity against a real EnginePrincipalStore",
           "[pg][engine_principal][integration][token]") {
-    yuzu::test::ApiTokenStorePg api_tokens;
+    yuzu::test::ApiTokenStorePgShared api_tokens;
     EnginePrincipalStorePg engine_store;
 
     REQUIRE(engine_store->create("Vuln Sync", "alice", "j", "internal", "admin", "engine:vuln")
@@ -658,7 +674,7 @@ TEST_CASE("ApiTokenStore engine block: referential integrity against a real Engi
 TEST_CASE("ApiTokenStore::create_token rejects an 'engine:'-namespaced principal_id under "
           "principal_kind=='human'",
           "[pg][engine_principal][integration][token]") {
-    yuzu::test::ApiTokenStorePg api_tokens;
+    yuzu::test::ApiTokenStorePgShared api_tokens;
     const auto now = now_epoch();
 
     SECTION("default (unspecified) principal_kind is rejected") {
@@ -695,7 +711,7 @@ namespace {
 struct EngineRbacGateFixture {
     Config cfg{};
     auth::AuthManager auth_mgr{};
-    yuzu::test::ApiTokenStorePg api_tokens;
+    yuzu::test::ApiTokenStorePgShared api_tokens;
     EnginePrincipalStorePg engine_store;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
