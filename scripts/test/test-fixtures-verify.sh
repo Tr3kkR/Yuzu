@@ -213,9 +213,27 @@ else
     set_result "enrollment_tokens" "skipped"
 fi
 
-# --- API tokens preserved -------------------------------------------------
+# --- API tokens INVALIDATED on upgrade, by design (ADR-0030) --------------
+#
+# This assertion is INVERTED, not relaxed. ADR-0030 moved `ApiTokenStore` from
+# SQLite (`api-tokens.db`) onto the Postgres substrate as a FRESH-START CUTOVER
+# WITH NO MIGRATION: every API and MCP bearer token minted before the upgrade
+# stops working the moment the new server starts. That is documented,
+# operator-facing, intended behaviour — `docs/user-manual/upgrading.md`
+# "Breaking: API and MCP bearer tokens are invalidated on upgrade" and the
+# matching `server-admin.md` note.
+#
+# The old form asserted `API_COUNT >= 1` and hard-failed Phase 2 on correct
+# behaviour. It was red on five consecutive branches (#2581, #2609), and a
+# permanently-red gate is an unread gate: it also masked a second, still
+# unexplained signal in the same output ("no MigrationRunner events seen").
+#
+# So SURVIVING tokens are now the failure. Under ADR-0030 a non-empty list
+# after the upgrade means the cutover did not happen and a legacy store is
+# still being read — which is a real defect, and the one this check now exists
+# to catch. `ok` here counts a VERIFIED INVARIANT, not a surviving row.
 
-info "verifying API tokens preserved"
+info "verifying API tokens are invalidated on upgrade (ADR-0030)"
 API_PRESENT_BEFORE=$(read_state api_token_present)
 if [[ "$API_PRESENT_BEFORE" == "True" ]]; then
     # API tokens ARE exposed via REST v1 — use that instead of the
@@ -223,23 +241,35 @@ if [[ "$API_PRESENT_BEFORE" == "True" ]]; then
     API_LIST=$(curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
         "$DASHBOARD_URL/api/v1/tokens" 2>/dev/null || echo "")
     if [[ -n "$API_LIST" && "$API_LIST" != *"\"error\""* ]]; then
-        # Count tokens in data[] — a successful upgrade keeps at least 1.
+        # -1 is a SENTINEL for "could not read the list", and it is load-bearing
+        # now that zero is the PASS condition. The previous version printed 0 on
+        # a parse failure, which was survivable while >=1 meant success — a
+        # malformed body simply failed. Inverting the test without inverting this
+        # would turn every unreadable response into a silent PASS. Missing or
+        # non-list `data` is treated the same way: unreadable, not empty.
         API_COUNT=$(echo "$API_LIST" | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
-    print(len(d.get('data', [])))
-except: print(0)" 2>/dev/null || echo "0")
-        if (( API_COUNT >= 1 )); then
-            ok "API tokens preserved ($API_COUNT present)"
-            set_result "api_tokens" "preserved ($API_COUNT)"
+except Exception:
+    print(-1); raise SystemExit(0)
+if not isinstance(d, dict) or not isinstance(d.get('data'), list):
+    print(-1)
+else:
+    print(len(d['data']))" 2>/dev/null || echo "-1")
+        if (( API_COUNT == 0 )); then
+            ok "API tokens invalidated as designed (ADR-0030 — 0 present, operators must re-mint)"
+            set_result "api_tokens" "invalidated as designed (ADR-0030)"
+        elif (( API_COUNT > 0 )); then
+            fl "API tokens SURVIVED the upgrade ($API_COUNT present) — ADR-0030 specifies a fresh-start cutover with no migration, so a legacy store is still being read"
+            set_result "api_tokens" "survived ($API_COUNT) — cutover did not happen"
         else
-            fl "API tokens lost (had >= 1, now 0)"
-            set_result "api_tokens" "lost"
+            fl "API tokens endpoint returned an unreadable envelope (no JSON object with a list \`data\`): ${API_LIST:0:200}"
+            set_result "api_tokens" "endpoint unreadable"
         fi
     else
         fl "API tokens endpoint failed or returned error: ${API_LIST:0:200}"
-        set_result "api_tokens" "lost or endpoint broken"
+        set_result "api_tokens" "endpoint broken"
     fi
 else
     warn "no API token was written — skipping verify"
