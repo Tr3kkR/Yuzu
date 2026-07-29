@@ -1,7 +1,8 @@
 # Tuning `/governance` for signal density
 
-**Status:** proposal for team discussion
-**Date:** 2026-07-28
+**Status:** shipped — §3 and §8–§10 are live in `.claude/skills/governance/SKILL.md` and CLAUDE.md standing rules 1–4.
+**Rounds:** four — §5 (adversarial review of the first draft), §7–§8 (colleague amendments), §9 (severity derivation, #2623), §10 (ledger provenance and prose ownership, #2619 + #2620).
+**Date:** 2026-07-28, last amended 2026-07-29
 **Adversarial review:** `enterprise-architect` (fable) and `gpt-5.6-sol` (codex), independently. **Both returned BLOCK on the first draft.** Their objections are recorded in §5 and have been folded in — the change set below is materially smaller than what was first proposed.
 
 **Second round (2026-07-28):** a colleague responded with a larger proposal (termination protocol, finding classification, triage, record design) plus a five-item amendment list for this PR. Four amendments were accepted, one refuted; both reviewers re-ran at maximum rigour to verify before anything was changed. §7 records that exchange. Three further defects **in this PR** were found during it and fixed.
@@ -480,8 +481,16 @@ parallel 4 KB appenders and 12 at 90 KB lost nothing), which is what makes read-
 the thing to forbid rather than concurrency. And the two candidate conventions for recording
 a changed disposition — rewrite the row, or append a second — were measured to give
 different answers to "how many findings did this run raise" and to whether a refuted
-BLOCKING still reads as open. Supersede-never-edit with highest-`pass_ordinal`-wins is now
-stated, along with the append idiom, because an unstated convention means no reader is right.
+BLOCKING still reads as open. Supersede-never-edit is now stated along with the append
+idiom, because an unstated convention means no reader is right.
+
+The precedence key took a second round to get right, and Gate 8 is what caught it. The
+first fix ordered supersession by `pass_ordinal` — which, combined with `pass_ordinal: 0`
+for post-run appends, meant a post-run row could never supersede anything: a collaborator
+refuting a finding the run had closed would sit in the file, visible to `cat`, and be
+silently outranked by the published read rule. Four agents raised it independently and one
+executed it against a real reader script. Precedence is `recorded_at`; `pass_ordinal`
+records which round a row belongs to and was never a precedence key.
 
 Also corrected: `governance.d/README.md` claimed the loss window was "the same window a
 changelog fragment already lives in". It is not the same in kind. A changelog fragment is an

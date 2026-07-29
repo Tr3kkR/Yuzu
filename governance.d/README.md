@@ -24,11 +24,9 @@ already-recorded finding's disposition may change later. Which field records the
 kind, and how an absent row must be read, are defined with the other fields in the Gate 8
 table — deliberately not restated here.
 
-Two rules govern those later writes, and both are in the Gate 8 recipe: every write after
-the create is an **append** (`>>`, never `>` — the `noclobber` guard protects the create
-only), and a row is **superseded, never edited** — a changed disposition is a new row with
-the same `finding_id` and a higher `pass_ordinal`, and the highest-`pass_ordinal` row wins.
-An append to an already-merged fragment goes through a pull request like any other change.
+Two rules govern those later writes, both defined in the Gate 8 recipe: writes after the
+create are **appends**, and a row is **superseded, never edited**. An append to an
+already-merged fragment goes through a pull request like any other change.
 
 ## Why these are committed
 
@@ -38,13 +36,9 @@ reviewer, and SOC 2 CC8.1 evidence has to be retrievable by someone other than t
 who generated it (#2618, decided on #2604).
 
 Two costs, accepted deliberately. Fragments appear in diffs. And a fragment can be lost —
-but NOT on the changelog fragment's terms, so do not reason from that analogy: an
-uncommitted changelog fragment is an untracked new file, which `git clean` removes
-conspicuously, whereas a row appended to an already-committed fragment is a modification to
-a **tracked** file, which `git clean -xfd && git checkout -- .` reverts silently, leaving a
-plausible-looking ledger behind. A rebase, squash or branch tidy over the appending commit
-does the same. Commit the create with the work it reviews, and commit each append on the
-same push that makes the claim it records.
+but **not** on the changelog fragment's terms, so do not reason from that analogy; the Gate
+8 recipe has the detail. Commit the create with the work it reviews, and commit each append
+on the same push that makes the claim it records.
 
 ## Limitations — read these before treating a fragment as evidence
 
