@@ -19,10 +19,16 @@ One file per **run**, not per PR. Gate 8 iterates, and `pass_ordinal` distinguis
 *inside* a file; a fresh run gets a fresh fragment.
 
 A fragment is not sealed when the run ends. Findings from a PR review, an
-`/adversarial-review`, or another external pass are appended to it with
-`source: "collaborator"` / `"external-model"`, and a finding already recorded may later gain
-a `refuted` disposition. An absent `collaborator` row means nothing was recorded — it is not
-evidence that no external review happened.
+`/adversarial-review`, or another external pass are appended after the run finishes, and an
+already-recorded finding's disposition may change later. Which field records the reviewer's
+kind, and how an absent row must be read, are defined with the other fields in the Gate 8
+table — deliberately not restated here.
+
+Two rules govern those later writes, and both are in the Gate 8 recipe: every write after
+the create is an **append** (`>>`, never `>` — the `noclobber` guard protects the create
+only), and a row is **superseded, never edited** — a changed disposition is a new row with
+the same `finding_id` and a higher `pass_ordinal`, and the highest-`pass_ordinal` row wins.
+An append to an already-merged fragment goes through a pull request like any other change.
 
 ## Why these are committed
 
@@ -31,9 +37,32 @@ which were fixed, which were deferred and by whom. A per-machine path cannot be 
 reviewer, and SOC 2 CC8.1 evidence has to be retrievable by someone other than the person
 who generated it (#2618, decided on #2604).
 
-Two costs, accepted deliberately: fragments appear in diffs, and an uncommitted fragment is
-destroyed by `git clean` — the same window a changelog fragment already lives in. Commit it
-with the work it reviews.
+Two costs, accepted deliberately. Fragments appear in diffs. And a fragment can be lost —
+but NOT on the changelog fragment's terms, so do not reason from that analogy: an
+uncommitted changelog fragment is an untracked new file, which `git clean` removes
+conspicuously, whereas a row appended to an already-committed fragment is a modification to
+a **tracked** file, which `git clean -xfd && git checkout -- .` reverts silently, leaving a
+plausible-looking ledger behind. A rebase, squash or branch tidy over the appending commit
+does the same. Commit the create with the work it reviews, and commit each append on the
+same push that makes the claim it records.
+
+## Limitations — read these before treating a fragment as evidence
+
+- **Nothing writes these automatically.** Every row is hand-authored. There is no validator,
+  so "required" and "required iff" in the field table are conventions, not enforcement.
+- **Rows are author-writable and appendable after merge.** `recorded_at` and the
+  supersede-never-edit rule are what make a later change legible; git history is the
+  integrity substrate, and a squash-merge collapses it.
+- **An absent row is uninformative.** It does not mean a reviewer passed, and an absent
+  external-review row does not mean no external review happened.
+
+## Retention
+
+Indefinite, by default and not yet by decision. Nothing prunes these. Whether they are
+pruned, assembled at release, or kept indefinitely as the access-review campaigns
+deliberately are, has not been decided — unlike those campaigns, where indefinite retention
+IS the recorded decision. The de facto posture is the conservative one; do not describe it
+as a policy.
 
 ## Throwaway local runs
 
@@ -46,8 +75,3 @@ nothing needs cleaning up.
 `.claude/skills/governance/SKILL.md`. Deliberately not restated here — an earlier draft of
 this README listed the fields and had already dropped `classification`, which is exactly the
 second-copy drift the governance rule itself forbids.
-
-## Retention
-
-Not decided. Nothing prunes these today. Whether they are pruned, assembled at release, or
-kept indefinitely as compliance evidence is a separate call and deliberately not made here.

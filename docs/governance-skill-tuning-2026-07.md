@@ -64,6 +64,18 @@ questions, two owners:
 
 Capping rather than prohibiting means a mis-classification costs a line of noise instead of a lost finding.
 
+**Amended by #2620 — there are three categories, not two, and the cap has an owner.**
+Absence is neither wording nor contradiction: a *missing* required doc contradicts nothing,
+so the cap cannot reach it, and it is a truth finding derived as `I7`. "Required" is defined
+rather than judged — a routed-concern row names the doc for a changed path, or one of
+`docs-writer`'s numbered deep-dive checks matches the diff; in-code prose never qualifies,
+which is what stops a wording nit being re-filed as an absence to escape the cap. And the
+cap only consolidates if the other agents stop: wording is now `docs-writer`'s to file
+alone, whereas §3.2 as written above left every agent still reporting it. Both amendments
+land in the same commit that gave `docs-writer`'s Gate 2 brief a mandate over in-code prose
+— the gap §7 identified was closed in the prose-ownership section but not in the brief that
+implements it.
+
 ### 3.3 Fix the Gate 8 re-review roster
 
 The skill says re-run *"only the gates whose findings would be affected by the fix"*. Wrong axis.
@@ -426,3 +438,76 @@ the facts are recorded next to the label, so a wrong band is a visible mismatch.
 is weaker than "derived rather than chosen" and is the honest one — judgement moved into
 field *selection* (I5-vs-I2 for a corrupting crash, I8-vs-I3 for stale-served-as-fresh)
 rather than disappearing.
+
+## 10. Ledger provenance and prose ownership (follow-up, #2619 / #2620)
+
+Two gaps left open by §8's ledger schema and §3.2's prose split, both filed from the #2604
+review and closed together.
+
+**#2619 — the ledger could not record who found a thing, or that a claim was wrong.**
+§8 amendment 1+2 specified the row as `pass_ordinal` / `finding_id` / `provenance` /
+`caused_by` / `adjudicated_by` / `waiver_rationale` / native and mapped severity. Two
+absences survived it. The row had no way to say a finding came from a human colleague or a
+model outside this pipeline — #2604 is its own proof, since a collaborator's review of it
+produced four accepted amendments and three defects found from the inside, none of which
+could be written to the ledger that PR was adding. And `rejected` could not distinguish "we
+chose not to act" from "this was factually wrong, here is the evidence", which is the more
+durable of the two because it stops the claim recurring.
+
+Added: `source` (`governance-agent` / `collaborator` / `external-model`) with a
+`reporter_ref` required on non-agent rows, `reviewed_at_sha`, `recorded_at`, `schema_version`,
+and a `refuted` disposition carrying `refuted_by` plus an independent `refuted_by_reporter`.
+`agent` was renamed `reporter` — once `source` admits non-agents, a required field named
+`agent` has no honest value in two of its three cases.
+
+The governance run on the change itself moved several of these. The first draft added only
+`source` and `refuted`, and justified `source` by the #2604 incident where two external
+models confirmed a wrong claim because all three reviewers shared one working copy whose
+merge-base was ten days stale. Gate 4 pointed out that reviewer *kind* does not detect that
+at all — all three would have been labelled truthfully — so `reviewed_at_sha` was added and
+the claim about `source` narrowed to what it actually does. Gate 6 pushed back on the
+evidence framing: a self-declared independence claim recorded by the party under review is
+not auditable, hence `reporter_ref`. And the same round found that `classification` still
+enumerated two categories after the prose rule had grown a third, that `disposition` had no
+non-terminal value so a finding could not be recorded when raised, and that `policy_floor`
+was required but inapplicable to most findings.
+
+**Appendability was the expensive part.** Blessing post-run appends without a write model
+turned out to reopen the exact defect the `noclobber` recipe was written for. Gate 5 ran it:
+the create idiom copied one line later, outside its subshell, truncated a two-row ledger to
+one row at exit 0 with no output. Concurrent `>>` appends were *falsified* as a risk (20
+parallel 4 KB appenders and 12 at 90 KB lost nothing), which is what makes read-modify-write
+the thing to forbid rather than concurrency. And the two candidate conventions for recording
+a changed disposition — rewrite the row, or append a second — were measured to give
+different answers to "how many findings did this run raise" and to whether a refuted
+BLOCKING still reads as open. Supersede-never-edit with highest-`pass_ordinal`-wins is now
+stated, along with the append idiom, because an unstated convention means no reader is right.
+
+Also corrected: `governance.d/README.md` claimed the loss window was "the same window a
+changelog fragment already lives in". It is not the same in kind. A changelog fragment is an
+untracked new file that `git clean` removes conspicuously; an appended row is a modification
+to a tracked file that `git clean -xfd && git checkout -- .` reverts silently, leaving a
+plausible-looking ledger.
+
+**#2620 — the prose split was stated where it was declared, not where it is read.**
+§3.2 above and §8 amendment 3 established that `docs-writer` owns wording including in-code
+prose. Its own Gate 2 brief was never updated: five checks, every one a documentation
+*file*, no mention of comments or log strings. An agent reading only its brief could not
+know the mandate had widened — the same shape as the gap §7 found, one layer down. The brief
+now carries it as check 6, scoped to prose the diff changes rather than every comment in a
+touched file, and `.claude/agents/docs-writer.md` was updated too: it still listed only
+documentation domains, and its Blocking Criteria still asserted the blanket BLOCKING that
+standing rule 2 had replaced with the `I7` derivation.
+
+The second half is the absence category described in §3.2's amendment above. Its cost was
+noticed during the run: `I7`'s EXPOSURE is genuinely under-determined — no `E0`–`E6` value
+naturally fits "a reader is misled by a document that isn't there" — and the
+`EXPOSURE undeterminable → gates` rule would therefore have made every missing doc a
+blocker, inverting the SHOULD-by-default intent. `I4`/`I7` now take `E3` absent a named
+reason.
+
+**Still open**, filed rather than fixed: the `.codex` runner's `docs-writer` role prompt
+carries the same narrower copy, and PR #2631's replacement text does not close it either;
+the ledger has no run-level record, so findings-per-run has no denominator and per-agent
+yield stays uncomputable; and there is still no vehicle for appending to a fragment that has
+already merged other than a further pull request.

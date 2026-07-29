@@ -326,8 +326,12 @@ floor.
   EPISTEMIC STATUS is an operation on the GATE, not on the band. Derive and
   report the band normally; `speculative` then converts the finding into a
   MANDATORY INVESTIGATION rather than a merge blocker: it is recorded at its
-  derived band, it must be resolved to `verified` or `likely` before the gate
-  passes, and resolving it may confirm the band and block. It is a deferral of
+  derived band, it must be resolved to `verified`, `likely`, or `refuted` before
+  the gate passes, and resolving it may confirm the band and block. `refuted` is
+  a resolution, not an escape: it is the disposition, it carries its evidence and
+  an independent refuter, and it is how a speculative claim that turns out FALSE
+  leaves the gate — without it, a correctly-killed finding either wedges the gate
+  or gets relabelled `likely`, which falsifies the record. It is a deferral of
   the decision, never a dismissal of it. `verified` and `likely` gate normally.
   If a finding is BOTH speculative AND has unresolved EXPOSURE, it GATES
   outright: a schema failure outranks weak evidence, because the unknown may
@@ -355,8 +359,10 @@ Two different questions, two different owners:
 
 So: report a comment or doc when it CONTRADICTS the code — that is a truth finding,
 at your own native severity, and it is yours to raise whatever agent you are. A
-WORDING-ONLY observation is capped at NICE; report it if you think it matters,
-never above.
+WORDING-ONLY observation belongs to `docs-writer`: if you are any other agent, do
+not file it at all. That is the half that makes this a consolidation rather than a
+sixth opinion — routing prose to one reviewer only works if the other five stop.
+`docs-writer` files wording at NICE, capped.
 
 Exception, and it is load-bearing: a factually false comment adjacent to a security
 or control-flow branch IS a contradiction, not wording. #2202 shipped a comment
@@ -368,6 +374,21 @@ is a TRUTH finding, derived per standing rule 2 as `I7` (SHOULD by default, BLOC
 where the omission conceals a breaking change, security-relevant behaviour, a
 data-loss risk, a migration step, or an irreversible operation). Never file a
 missing-doc finding as NICE on the grounds that it is "documentation".
+
+**"Required" is defined, not judged.** A doc is required when EITHER a
+`.claude/routed-concerns.md` row names it for a changed path, OR one of
+`docs-writer`'s numbered checks 1–5 matches the diff. Nothing else qualifies. Two
+consequences, both deliberate: an absence finding must cite which of those it rests
+on, and **in-code prose (check 6) can NEVER generate an absence finding** — an
+uncommented function is not a missing required doc. Without that boundary this rule
+becomes a laundering route: any wording nit restates as "the doc does not state X"
+and walks from NICE to SHOULD, which would re-create the noise this whole line of
+work exists to reduce.
+
+For `I4` and `I7` findings, EXPOSURE is `E3` unless you can name a specific reason
+otherwise. A document that isn't there is read by an ordinary operator; it is not a
+timer and not an escalation. Recording `unresolved` here instead would gate every
+missing doc, contradicting the `I7`-is-SHOULD-by-default rule two paragraphs up.
 
 (Capping wording rather than banning it is deliberate: deciding whether prose is
 descriptive or normative is exactly the disputed question, so a mis-classification
@@ -634,11 +655,20 @@ Do not assert a blanket BLOCKING.
 
 You own WORDING everywhere prose appears, not only in documentation
 FILES: in-code comments and log/error-message text are yours too
-(standing rule 3). The DOMAIN agent owns whether that prose is TRUE —
-a comment that contradicts the code is theirs to raise, at native
-severity. A wording-only observation is capped at NICE, whoever raises
-it. A required doc that is MISSING is neither: absence contradicts
-nothing, so it is a truth finding derived as `I7` above, never capped.
+(standing rule 3), and you are the ONLY agent who files wording —
+the others are told not to. The DOMAIN agent owns whether that prose
+is TRUE: a comment that contradicts the code is theirs to raise, at
+native severity. When you spot one, report it and say which agent owns
+the truth call rather than sizing it yourself — Gate 3 and Gate 8
+prompts carry your findings forward, so naming the owner is what
+transfers it.
+
+A required doc that is MISSING is a third category, not wording:
+absence contradicts nothing, so it is a truth finding derived as `I7`
+above, never capped at NICE (the `I7` cap at HIGH still applies).
+"Required" means a `.claude/routed-concerns.md` row names the doc for a
+changed path, or one of checks 1–5 below matches the diff — nothing
+else, and never check 6.
 
 Specifically verify:
 1. REST API docs (`docs/user-manual/rest-api.md`) — endpoint signature,
@@ -653,17 +683,27 @@ Specifically verify:
    patterns, new release gates
 5. Any audit action table, permission table, or error-code table
    that the REST/store/plugin API contract touches
-6. In-code prose in the diff — comments, log lines, error and
-   user-facing strings: clarity, staleness, spelling, and house
-   convention. Report a wording problem as NICE; if the text asserts
-   something the code does not do, say so and hand the truth call to
-   the owning domain agent rather than sizing it yourself
+6. In-code prose the diff ADDS OR MODIFIES — comments, log lines,
+   error and user-facing strings: clarity, staleness, spelling, house
+   convention. Scoped to changed lines, NOT to every comment in a
+   touched file; on a large C++ diff the whole-file reading would
+   crowd out checks 1–5, which are the ones that produce the `I7`
+   findings that actually gate. Wording is capped at NICE. If the text
+   asserts something the code does not do, that is a contradiction:
+   report it and name the owning domain agent, who sizes it. Check 6
+   can never produce an absence finding
 
 ## Output format
 
-Severity per standing rule 2: a user-facing behaviour change with no doc is `I7` — MEDIUM by default, HIGH (blocking) only when the omission conceals a breaking change, security-relevant behaviour, a data-loss risk, a migration step, or an irreversible operation.
+Severity is DERIVED, per the shared preamble — state TRIGGER, IMPACT
+(every `I` that applies), EXPOSURE (every `E`), and EPISTEMIC STATUS
+for each finding, then the derived band and your own label. A missing
+required doc is `I7`: MEDIUM by default, HIGH (blocking) only when the
+omission conceals a breaking change, security-relevant behaviour, a
+data-loss risk, a migration step, or an irreversible operation. `I4`
+and `I7` take `E3` unless you can name a reason otherwise.
 SHOULD-FIX = doc drift that would confuse an operator.
-NICE-TO-HAVE = style/precision improvements.
+NICE-TO-HAVE = style/precision improvements, and all wording findings.
 
 For each, quote current doc text (or "missing from X") and propose
 replacement. Report in under 600 words.
@@ -1175,12 +1215,48 @@ Strategy:
    a timestamp. One file per RUN, not per PR: Gate 8 iterates, `pass_ordinal`
    distinguishes rounds inside a file, and a fresh run gets a fresh fragment.
 
+   **Every write after the create is an APPEND. Never `>`.**
+
+   ```bash
+   printf '%s\n' "$ROW" >> "$LEDGER"     # the ONLY way to add a row
+   ```
+
+   `noclobber` above is scoped to its subshell and protects the CREATE only — it
+   does nothing for a later write, and your interactive shell does not have it set.
+   Measured: the create idiom copied one line later, outside that subshell,
+   truncated a two-row ledger to one row with **exit 0 and no output**. That is the
+   same silent-overwrite class the `mv` recipe was rejected for, re-entering through
+   the write the next paragraph blesses, so the append idiom is stated here rather
+   than left to be inferred from the nearest visible redirect.
+
+   Concurrent `>>` appends are safe — 20 parallel appenders of 4 KB rows, and 12 of
+   90 KB rows, produced zero lost or torn lines under `O_APPEND` on a local
+   filesystem. It is the read-modify-write that loses rows, which is why the
+   supersede rule below forbids editing a row in place.
+
+   **A row is SUPERSEDED, never edited.** A disposition that changes after the fact
+   — a finding later fixed, deferred, or refuted — is a NEW row carrying the same
+   `finding_id` and a higher `pass_ordinal`. **The highest-`pass_ordinal` row for a
+   `finding_id` is the live one; earlier rows are history, not open findings.**
+   State that read rule wherever a fragment is counted: measured on the two
+   candidate conventions, rewrite-in-place and append-a-second-row give different
+   answers to "how many findings did this run raise" (2 vs 3) and to whether a
+   refuted BLOCKING still reads as open (no vs yes). Either convention is workable;
+   an unstated one means no reader can be right. Rewriting also destroys the prior
+   disposition at the artefact level — `cat` shows only the final state — so the
+   append convention is the one chosen.
+
    **Why in the repo.** The record is evidence for whoever reviews the PR — which
    findings were raised, which fixed, which deferred and by whom. A path under
    `$HOME` is unreadable by the reviewer by construction, and SOC 2 CC8.1 evidence
    has to be retrievable by someone other than whoever produced it. The cost is
-   accepted deliberately: fragments appear in diffs, and an uncommitted one is
-   destroyed by `git clean` — the same window a changelog fragment already lives in.
+   accepted deliberately, and it is NOT the changelog fragment's cost: an
+   uncommitted changelog fragment is an untracked NEW file, so `git clean` removes
+   it conspicuously. A row appended to an already-committed fragment is a
+   MODIFICATION to a tracked file — `git clean -xfd && git checkout -- .` reverts it
+   silently and leaves a plausible-looking ledger behind. Commit an append on the
+   same push that makes the claim it records; a rebase, squash, or branch tidy over
+   that commit is the loss path, and nothing detects it.
 
    There is still **no database and no shared store**; this is a per-run file that
    happens to be version-controlled. Retention — whether old fragments are pruned,
@@ -1191,9 +1267,15 @@ Strategy:
 
    | field | why |
    |---|---|
-   | `run_id`, `commit_range`, `agent` | which run, which diff, who found it |
-   | `source` | `agent` / `collaborator` / `external-model` — WHAT KIND of reviewer, distinct from `agent`'s who. A finding raised by a human colleague or a non-Claude model is the highest-signal kind available and had nowhere to be written; see the working-copy note below |
-   | `pass_ordinal` | **which round.** Without it the final pass is indistinguishable from the first, and `caused_by` below presupposes a round identity the schema would otherwise lack |
+   | `schema_version` | integer, currently `1`. Per ROW, never per file: appends are permitted, so one fragment can legitimately hold rows written under two versions of this table. A row without it predates #2619 |
+   | `run_id` | which run. Use the fragment's `mktemp` stem — it is already unique and already on disk, so the id and the filename cannot disagree |
+   | `commit_range` | which diff |
+   | `reporter` | WHO found it — a governance-agent name, a person's handle, or a model id. Named `agent` before #2619; renamed because `source` below admits reporters that are not agents, and a required field with no honest value for two of its three cases is a schema defect, not a naming quibble |
+   | `source` | `governance-agent` / `collaborator` / `external-model` — WHAT KIND of reporter, distinct from `reporter`'s who. Spelled `governance-agent`, not `agent`, per CLAUDE.md's three-meanings glossary. A Codex or Kimi run driven by `.codex/skills/governance` is a `governance-agent` row — `external-model` is for a model reviewing OUTSIDE this pipeline. A non-`governance-agent` row MUST carry `reporter_ref` |
+   | `reporter_ref` (required iff `source` is not `governance-agent`) | an externally-checkable reference the change's author does not control — a PR review URL or id, or a named human. `source` is otherwise a self-declared claim of independent review recorded by the party under review, which is the one property this artefact most needs to be checkable |
+   | `reviewed_at_sha` | the HEAD the reporter actually read, and its merge-base with `origin/dev`. This is the field that closes the failure `source` is justified by: reviewer KIND does not detect three reviewers sharing one stale checkout, the merge-base does |
+   | `recorded_at` | ISO-8601, when the ROW was written — not when the run started. Mandatory because appending after the run is permitted: without it, a row added post-merge is indistinguishable from one written at the gate, and a squash-merge collapses the git history that would otherwise carry the ordering |
+   | `pass_ordinal` | **which round.** Without it the final pass is indistinguishable from the first, and `caused_by` below presupposes a round identity the schema would otherwise lack. A row appended AFTER the run ends carries the `run_id` of the run it reviews and `pass_ordinal: 0` — round zero means "outside the run's rounds", and `recorded_at` says when |
    | `finding_id` | stable across rounds — `caused_by` is uncomputable without a join key |
    | `severity_native` | the agent's OWN vocabulary, unmodified |
    | `severity_mapped` | BLOCKING / SHOULD / NICE, derived per the severity rule |
@@ -1201,46 +1283,57 @@ Strategy:
    | `impact` | every applicable `I1`…`I9` — a list; the strongest gives the band |
    | `exposure` | every applicable `E0`…`E6`, or `unresolved` — a list, not one value. `E6` is applied last and dominates every raise |
    | `epistemic_status` | `verified` / `likely` / `speculative` |
-   | `independent_reporters` | how many agents raised it WITHOUT having been shown it — downstream echoes are not confirmations |
-   | `policy_floor` | the floor hit, if the finding gates as a contract violation rather than by derivation |
+   | `independent_reporters` | how many REPORTERS raised it WITHOUT having been shown it — downstream echoes are not confirmations. Counts reporters of every `source`, not agents only: a human colleague finding the same defect independently is the strongest confirmation available, and counting it zero inverts the signal |
+   | `policy_floor` (nullable) | the floor hit, if the finding gates as a contract violation rather than by derivation. Null on an ordinary finding, which is most of them |
    | `provenance` | `introduced` / `newly-reachable` / `pre-existing`. **Adjudicated, not inferred from prose.** Default to `introduced` when contested |
    | `file`, `line`, `summary` | where and what |
-   | `classification` + rationale | truth-contradiction vs wording, and why |
-   | `disposition` | `fixed` / `deferred-to-issue #N` / `rejected` / `refuted`. `rejected` = we chose not to act. `refuted` = the claim was factually WRONG, and `refuted_by` carries the evidence — a different outcome with a different downstream use, so never collapse the two |
-   | `refuted_by` (required iff `disposition` is `refuted`) | the evidence that killed the claim — the command run and its output, the `git show origin/dev:<path>` that disproved an absence, the file:line that contradicts it. A `refuted` row with no evidence is a `rejected` row wearing a stronger word |
+   | `classification` + rationale | `truth-contradiction` / `wording` / `absence`, and why. `absence` is the third category the prose rule names — a required doc that is missing contradicts nothing, so forcing it into the other two is what the rule exists to stop |
+   | `disposition` | `open` / `fixed` / `deferred-to-issue #N` / `rejected` / `refuted`. `open` is the value at the moment a finding is RAISED — the other four are terminal, and a schema whose only values are terminal cannot record a finding before it is resolved. `rejected` = we chose not to act. `refuted` = the claim was factually WRONG, and `refuted_by` carries the evidence — a different outcome with a different downstream use, so never collapse the two |
+   | `refuted_by` (required iff `disposition` is `refuted`) | the evidence that killed the claim — the command run and its output, the `git show origin/dev:<path>` that disproved an absence, the file:line that contradicts it. A `refuted` row with no evidence is a `rejected` row wearing a stronger word. The refutation must defeat the DEFECT, not merely the citation: a real finding that names the wrong `file:line` is corrected, never refuted, or the recorded kill shape suppresses a true claim on the next run |
+   | `refuted_by_reporter` (required iff `disposition` is `refuted`) | who refuted it, and that they were not the change's author. `adjudicated_by` already carries this requirement and the manual-cleanup floor exception states it outright — a self-authored refutation of one's own blocking finding is exactly the case both were written for, and `refuted` is the disposition that most reduces downstream scrutiny |
    | `adjudicated_by` (nullable) | who approved a departure, and that they were not the change's author |
    | `caused_by` (nullable) | did round N's fix create this round N+1 finding |
    | `waiver_rationale` (nullable) | *why* an unresolved gating finding was allowed to pass. A signature with no reasoning is content-free exception evidence |
 
-   The four nullable fields exist so the schema is stable when the process that
-   produces them lands. **Recording an `adjudicated_by` or `waiver_rationale` does
-   NOT establish that a signed waiver may release a gating finding** — no such
-   merge contract is adopted here. Today's rule is unchanged: gating findings are
-   resolved before the gate passes. The columns are there so a future decision
-   about waivers has somewhere to write, not because one has been made.
+   The nullable fields exist so the schema is stable when the process that
+   produces them lands. **Recording an `adjudicated_by`, `waiver_rationale`, or
+   `refuted` disposition does NOT establish that a gating finding may be released** —
+   no such merge contract is adopted here. Today's rule is unchanged: gating
+   findings are resolved before the gate passes, and a refutation resolves one only
+   if the refutation is itself correct and independently recorded. The columns are
+   there so a future decision has somewhere to write, not because one has been made.
 
    **Which sources a run is expected to record.** A `/governance` run records
-   `source: "agent"` rows only. Rows with `source: "collaborator"` or
+   `source: "governance-agent"` rows only. Rows with `source: "collaborator"` or
    `"external-model"` are written when a PR review, an `/adversarial-review`, or an
    equivalent external pass actually happens — so **an absent `collaborator` row
    means nothing was recorded, NOT that no external review occurred**, and it must
    never be read as evidence that none was sought. Adding those rows to an existing
    fragment is a normal, expected append; a run does not own its file exclusively
-   once it has finished.
+   once it has finished. An append to a fragment that has already merged goes
+   through a pull request like any other change to the repo — never an amend over
+   the original commit, and never a direct push that alters an evidence record
+   without review.
 
-   **Why `source` is worth a column.** Independent review is only independent if the
-   WORKING COPIES are. On #2604 two external models independently confirmed a claim
-   that was wrong — all three reviewers were reading one working copy whose merge-base
-   predated the file in question by ten days, so the agreement measured the checkout,
-   not the code. A colleague with a current checkout killed it in a single pass.
-   `source` is what makes that visible after the fact, and it is the same reason
-   `independent_reporters` counts only reporters who were not shown the finding.
+   **Why `source` is worth a column, and what it does NOT do.** Independent review
+   is only independent if the WORKING COPIES are. On #2604 two external models
+   independently confirmed a claim that was wrong — all three reviewers were reading
+   one working copy whose merge-base predated the file in question by ten days, so
+   the agreement measured the checkout, not the code. A colleague with a current
+   checkout killed it in a single pass. `source` alone does NOT detect that: it
+   records reviewer KIND, and all three of those reviewers would have been truthfully
+   labelled. `reviewed_at_sha` is the field that detects it, which is why the two
+   land together. `source` answers a different and narrower question — was this row
+   produced inside the pipeline or outside it — and `independent_reporters` counts
+   reporters who were not shown the finding.
 
    **Known gap, unsolved:** the absence of a finding row cannot distinguish "the
    reviewer passed" from "the reviewer never ran". A clean-result record needs its
-   own design. `source` narrows this for external review — an absent `collaborator`
-   row is now explicitly uninformative rather than ambiguously so — but does not
-   close it.
+   own design. `source` narrows the MISREADING risk for external review — an absent
+   `collaborator` row is now explicitly uninformative rather than ambiguously so —
+   but it adds no assertive power and does not close the gap. Nor does a PRESENT
+   row assert much on its own: `reporter_ref` is what makes it checkable, and
+   without one the field is a claim about the reviewer made by the reviewed.
 
    Why this exists at all: governance is the repo's largest issue-inflow source, and
    nothing has ever recorded what it found. CI outcomes, durations and flakes are
