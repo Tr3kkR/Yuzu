@@ -50,26 +50,34 @@ merged, 81 of 81 local branches predated it.
 
 ```bash
 git fetch origin dev -q || echo "WARNING: fetch failed - origin/dev may itself be stale"
-# What does origin/dev have that this branch does NOT? Three dots, and this
-# direction only: your own edits to these files are not staleness.
-MISSING=$(git diff --name-only HEAD...origin/dev -- \
-            .claude/skills/governance/ .claude/routed-concerns.md CLAUDE.md)
-[ -z "$MISSING" ] \
-  && echo "governance assets current" \
-  || { echo "STALE - missing from your tree:"; echo "$MISSING"; }
+for f in .claude/skills/governance/SKILL.md .claude/routed-concerns.md CLAUDE.md; do
+  git diff --quiet origin/dev -- "$f" \
+    && echo "  ok       $f" \
+    || echo "  DIFFERS  $f   ($(git diff --shortstat origin/dev -- "$f" | sed 's/^ *//'))"
+done
 ```
 
-Three things about that command are load-bearing.
+Three things about that loop are load-bearing.
 
-**`HEAD...origin/dev`, three dots, in that direction only.** It asks what `origin/dev` has
-since the merge-base that this tree does not. A two-dot `git diff origin/dev` conflates
-that with *your own* edits to the same files, which is not staleness - and a branch
-legitimately editing the skill would then have to be granted an exemption it asserts for
-itself. That exemption is exactly the shape this pipeline rejects elsewhere: the ledger
-requires an adjudicator who is not the change's author, and a self-declared bypass is the
-same hole wearing a different hat. The three-dot form removes the need for one, because a
-branch's own edits never appear in it. **It names the missing files rather than returning a
-bare boolean**, so the report is evidence rather than an assertion.
+**It compares the WORKING TREE, because that is what gets read.** The skill is loaded from
+your checkout, not from a commit, so the commit is the wrong object to test. An earlier
+version of this check compared `HEAD...origin/dev` - commit against commit - which reports
+**current** for a tree whose branch is up to date but which has an older skill checked into
+it (`git checkout <old-sha> -- .claude/skills/governance/`), and reports **stale** for a
+tree like the one this paragraph was written from, whose branch is months behind but whose
+files were copied across and are byte-identical to `origin/dev`. Both answers were wrong,
+and the dangerous one was the first.
+
+**It reports per path, and shows the size of the difference**, so the output is evidence
+rather than a verdict. A bare boolean over three aggregated paths tells you nothing you can
+act on.
+
+**It does not try to tell you WHY a file differs.** Whether you edited it or checked out an
+older copy is not knowable from git - both produce a working tree that differs from
+`origin/dev` - so the check reports the fact and leaves the judgement to you. If you are
+deliberately editing one of these files, `DIFFERS` on that path is expected and the diff it
+names is your own. Claiming to distinguish the two would be asserting something unverifiable,
+which is the failure mode a previous revision of this section shipped.
 
 **The fetch guard.** A bare `git fetch` whose exit status is discarded fails silently
 offline or on expired auth, and the comparison then runs against a stale cached
@@ -79,10 +87,11 @@ one direction this check exists to prevent.
 **`CLAUDE.md` is included** because it is loaded into every session, so a stale summary
 there outranks a correct skill in practice.
 
-If it reports stale, reconcile before running: rebase or merge `origin/dev`, or read the
-named files from `origin/dev` directly (`git show origin/dev:<path>`) and use those. Do not
-proceed on the assumption that your copy is current - the same failure mode produces
-confident false claims about which agents a change routes to.
+If a path you are not editing reports `DIFFERS`, reconcile before running: rebase or merge
+`origin/dev`, or copy the current files across (`git checkout origin/dev -- <path>`), which
+is enough on its own - the check passes on content, so the files do not have to be committed
+to be current. Do not proceed on the assumption that your copy is current: the same failure
+mode produces confident false claims about which agents a change routes to.
 
 **The same rule applies to any claim that a file, row or invariant is ABSENT.** Check
 `git show origin/dev:<path>`, never `ls` or a working-tree grep. Staleness inverts absence
