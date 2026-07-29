@@ -317,9 +317,11 @@ floor.
 
 ### Absences — and which way each one points
 
-- TRIGGER unresolved → keep IMPACT honest, set EPISTEMIC STATUS `speculative`.
-  Never record a lower IMPACT than you observed in order to express low
-  confidence.
+- TRIGGER unresolved → keep IMPACT honest. It is `speculative` ONLY if you also
+  have no code path — that is the definition above. If you READ the code and
+  named the path but cannot yet isolate the input, it stays `likely` (so it
+  gates) and is flagged for adjudication. Never record a lower IMPACT than you
+  observed in order to express low confidence.
 
   EPISTEMIC STATUS is an operation on the GATE, not on the band. Derive and
   report the band normally; `speculative` then converts the finding into a
@@ -1132,13 +1134,25 @@ Strategy:
    # Override to a scratch dir for a throwaway local run you will not commit.
    GOV_DIR="${YUZU_GOV_LOG_DIR:-governance.d}"
    mkdir -p "$GOV_DIR"
-   LEDGER="$(mktemp "$GOV_DIR/<PR-or-issue-number>-<short-slug>.XXXXXX")" \
-     && mv "$LEDGER" "$LEDGER.jsonl" && LEDGER="$LEDGER.jsonl"
+
+   # O_EXCL must protect the path that is actually COMMITTED. `mktemp` on a stem
+   # followed by `mv "$X" "$X.jsonl"` does NOT: mv overwrites silently, so a
+   # suffix collision destroys the earlier run's findings with no error at all.
+   # `mktemp -u` supplies only the random stem; `noclobber` does the atomic create.
+   LEDGER="$(mktemp -u "$GOV_DIR/<PR-or-issue-number>-<short-slug>.XXXXXX").jsonl"
+   (set -o noclobber; : > "$LEDGER") \
+     || { echo "ledger exists, refusing to overwrite: $LEDGER" >&2; exit 1; }
    ```
 
-   `mktemp` creates with `O_EXCL`, so two runs in the same second on the same PR
-   cannot collide — uniqueness is enforced by the filesystem rather than assumed
-   from a timestamp. One file per RUN, not per PR: Gate 8 iterates, `pass_ordinal`
+   **Do not "simplify" this to `mktemp "$GOV_DIR/….XXXXXX.jsonl"`.** GNU `mktemp`
+   accepts `X`s mid-template; BSD/macOS `mktemp` requires them trailing, and this
+   repo ships macOS. The two-step exists for portability — the bug was doing the
+   second step with `mv` instead of an exclusive create.
+
+   The `noclobber` redirect is what makes the guarantee: the committed `.jsonl`
+   path is created `O_EXCL`, so a suffix collision FAILS LOUDLY instead of
+   overwriting. Uniqueness is enforced by the filesystem rather than assumed from
+   a timestamp. One file per RUN, not per PR: Gate 8 iterates, `pass_ordinal`
    distinguishes rounds inside a file, and a fresh run gets a fresh fragment.
 
    **Why in the repo.** The record is evidence for whoever reviews the PR — which
@@ -1164,7 +1178,7 @@ Strategy:
    | `severity_mapped` | BLOCKING / SHOULD / NICE, derived per the severity rule |
    | `trigger` | the concrete input/state/config, or `unresolved` |
    | `impact` | every applicable `I1`…`I9` — a list; the strongest gives the band |
-   | `exposure` | every applicable `E1`…`E6`, or `unresolved` — a list, not one value |
+   | `exposure` | every applicable `E0`…`E6`, or `unresolved` — a list, not one value. `E6` is applied last and dominates every raise |
    | `epistemic_status` | `verified` / `likely` / `speculative` |
    | `independent_reporters` | how many agents raised it WITHOUT having been shown it — downstream echoes are not confirmations |
    | `policy_floor` | the floor hit, if the finding gates as a contract violation rather than by derivation |

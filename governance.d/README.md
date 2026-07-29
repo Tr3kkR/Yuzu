@@ -9,9 +9,11 @@ governance.d/<PR-or-issue-number>-<short-slug>.<random>.jsonl
 
 - `<PR-or-issue-number>` — the PR number if you have it, else the issue.
 - `<short-slug>` — 2–5 words, kebab-case.
-- `<random>` — supplied by `mktemp`, which creates with `O_EXCL`. Two runs in the same
-  second on the same PR cannot collide; uniqueness is enforced by the filesystem rather
-  than assumed from a timestamp.
+- `<random>` — a `mktemp` stem, with the final `.jsonl` path created under `noclobber`
+  so the committed artifact itself is opened `O_EXCL`. A suffix collision therefore FAILS
+  LOUDLY rather than overwriting an earlier run's findings; uniqueness is enforced by the
+  filesystem rather than assumed from a timestamp. The recipe is in the skill — do not
+  reimplement it with `mv`, which overwrites silently.
 
 One file per **run**, not per PR. Gate 8 iterates, and `pass_ordinal` distinguishes rounds
 *inside* a file; a fresh run gets a fresh fragment.
@@ -34,11 +36,10 @@ nothing needs cleaning up.
 
 ## Fields
 
-Defined in `.claude/skills/governance/SKILL.md` under Gate 8 — `run_id`, `commit_range`,
-`agent`, `pass_ordinal`, `finding_id`, `severity_native`, `severity_mapped`, `trigger`,
-`impact`, `exposure`, `epistemic_status`, `independent_reporters`, `policy_floor`,
-`provenance`, `disposition`, `caused_by`, `adjudicated_by`, `waiver_rationale`,
-`file`, `line`, `summary`.
+**Defined in one place only:** the Gate 8 field table in
+`.claude/skills/governance/SKILL.md`. Deliberately not restated here — an earlier draft of
+this README listed the fields and had already dropped `classification`, which is exactly the
+second-copy drift the governance rule itself forbids.
 
 ## Retention
 

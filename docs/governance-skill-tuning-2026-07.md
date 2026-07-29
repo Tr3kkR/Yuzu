@@ -153,7 +153,7 @@ On an ordinary PR: unchanged roster, quieter output — and after a few weeks, t
 
 ---
 
-## 7. Second-round amendments (2026-07-28)
+## 8. Second-round amendments (2026-07-28)
 
 A colleague reviewed this PR and returned a larger proposal plus a five-item amendment
 list. Both adversarial reviewers re-ran at maximum rigour to verify every claim from the
@@ -231,7 +231,7 @@ retained and strengthened here.
 
 ---
 
-## 8. Severity derivation (follow-up, PR #2623)
+## 9. Severity derivation (follow-up, PR #2623)
 
 §3.1 calibrated the merge **threshold** — one gating tier, with native labels mapping onto
 it. That fixed the gate and left the bands undefined: CRITICAL and HIGH both mapped to the
@@ -246,7 +246,7 @@ own severity, exactly as today"*, naming §3.1 as what makes that mapping reliab
 ### The model
 
 Four **independent** fields per finding — TRIGGER, IMPACT (`I1`–`I9`, base band), EXPOSURE
-(**all** applicable `E1`–`E6`, strongest modifier wins), EPISTEMIC STATUS — plus a separate
+(**all** applicable `E0`–`E6`, strongest raise first then any cap; `E6` applies last and dominates), EPISTEMIC STATUS — plus a separate
 set of **policy floors** that gate as contract violations without running through the
 derivation. `BLOCKING` = derived band CRITICAL or HIGH.
 
@@ -391,7 +391,7 @@ directly on how confidence is recorded. Two failures of the same shape, a month 
 pointing opposite ways:
 
 - Three reviewers confirmed a factually wrong claim because all three read one working tree
-  whose merge-base predated the file in question (#2604 / this document §7).
+  whose merge-base predated the file in question (#2604 / this document §8).
 - A reviewer **withdrew a correct finding** on a peer's incomplete evidence, while that peer
   was independently confirming it (#2622).
 
