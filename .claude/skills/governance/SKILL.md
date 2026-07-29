@@ -138,30 +138,88 @@ require `sre` and `compliance-officer` — size never gates a routed concern.
 ## Shared preamble — inject this into EVERY agent prompt
 
 Twelve agents asked for "BLOCKING / SHOULD / NICE" with no definition invent twelve
-different bars, and the operator normalises by hand. Paste this block verbatim into
-every Gate 2/3/4/6 prompt, in addition to that agent's own focus.
+different bars, and the operator normalises by hand. #2604 calibrated the merge
+THRESHOLD, which fixed the gate but left the bands undefined — CRITICAL and HIGH
+both map to GATING with no criterion separating them, while the ledger records the
+native band and CLAUDE.md acts on it. The block below closes that: the band is
+derived from stated facts, so a wrong band shows up as a mismatch between the facts
+and the label rather than as an unfalsifiable judgement.
+
+Paste this block verbatim into every Gate 2/3/4/6 prompt, in addition to that
+agent's own focus.
 
 ```
-## Severity — report in YOUR OWN vocabulary, against these shared thresholds
+## Severity — DERIVE it, do not choose it
 
-Keep the severity vocabulary your own brief specifies (security-guardian:
+Report in the severity vocabulary your own brief specifies (security-guardian:
 CRITICAL/HIGH/MEDIUM/LOW/INFO; docs-writer: BLOCKING/SHOULD-FIX/NICE-TO-HAVE;
-most others: BLOCKING/SHOULD/NICE). Do NOT switch vocabularies — the operator
-normalises with the map below, and a renamed band loses information.
+most others: BLOCKING/SHOULD/NICE). Do NOT switch vocabularies — a renamed band
+loses information. But do NOT pick a band by feel either: state three facts, and
+the band follows from them.
 
-What is calibrated is the THRESHOLD, not the label:
+Every finding MUST carry:
 
-GATING  — would cause incorrect behaviour, data loss, a security regression, or
-  misleading operator guidance in production. You must be able to name the failing
-  input or state. If you cannot, it is not gating.
-  Maps from: CRITICAL, HIGH, BLOCKING.
-SHOULD  — a real defect with bounded blast radius, or a missing test for a
-  behaviour that has one.
-  Maps from: MEDIUM, SHOULD, SHOULD-FIX.
-NICE    — everything else. Maps from: LOW, INFO, NICE, NICE-TO-HAVE.
+1. TRIGGER — the concrete input, state, or configuration that produces it.
+   Name it. "Under load" and "in some cases" are not triggers.
+2. CONSEQUENCE — the observable wrong outcome, from the closed list below.
+3. REACHABILITY — who can reach the trigger, from the closed list below.
 
-Where your vocabulary does not map cleanly, say so and treat it as GATING. That
-default is deliberate: an unmappable finding must not be silently downgraded.
+### Consequence — gives the base band
+
+  C1  security-control bypass — an authn, authz, confinement, crypto, or
+      audit control does not hold                                     base HIGH
+  C2  silent data loss or corruption — data destroyed or wrong, with
+      no error surfaced to anyone                                     base HIGH
+  C3  wrong result returned as correct — the caller cannot tell       base HIGH
+  C4  misleading OR absent operator guidance — a doc, runbook, or
+      error message directs an operator to a harmful or ineffective
+      action; or a shipped behaviour change an operator must know
+      about is documented nowhere                                     base HIGH
+  C5  unavailability — crash, hang, deadlock, wedge, unbounded growth  base MEDIUM
+  C6  degraded but correct — slow, wasteful, noisy; output still right base LOW
+  C7  no observable consequence yet — latent, stylistic, or
+      defence-in-depth only                                           base INFO
+
+### Reachability — modifies the base band
+
+  R1  unauthenticated, in the DEFAULT configuration                   raise one band
+  R2  an authenticated actor reaching data or actions above its own
+      privilege (escalation, confinement escape)                      raise one band
+  R3  operator-privileged, default configuration                      no change
+  R4  requires a non-default configuration                            no change
+  R5  requires a race, or a rare environmental condition (clock skew,
+      disk full, concurrent writer, partial failure)                  no change
+  R6  not reachable in production — test-only, dead branch, or
+      unreachable by construction                                     floor at LOW;
+                                                                      say which
+
+Bands, ordered:  INFO < LOW < MEDIUM < HIGH < CRITICAL
+
+R4 is deliberately NOT a downgrade. In Yuzu the default is frequently the LESS
+hardened setting — RBAC off is the default, `--auth-mode=sso-only` is opt-in — so
+"only with the flag on" often means "only for the customers who care most".
+
+### The gate
+
+BLOCKING = the derived band is CRITICAL or HIGH. That is the whole definition,
+and it is the gate CLAUDE.md already states.
+
+For briefs using BLOCKING/SHOULD/NICE, or docs-writer's BLOCKING/SHOULD-FIX/
+NICE-TO-HAVE:  BLOCKING = CRITICAL or HIGH,  SHOULD(-FIX) = MEDIUM,
+NICE(-TO-HAVE) = LOW or INFO. The mapping is DERIVED from the table above, not
+asserted alongside it.
+
+### Three absences that look alike and are not
+
+- You cannot name a TRIGGER → the finding is not substantiated, so it is not
+  gating. Report at C7/INFO and say what you would need to confirm it.
+- You cannot determine REACHABILITY → default to R3 and mark it unknown. Do not
+  guess R1 (inflates) or R6 (hides). The unknown must appear in the finding.
+- Your vocabulary does not map → gate it, and say so. A schema failure is the
+  operator's to resolve, never a reason to silently downgrade.
+
+The first is about YOUR evidence and points down. The others are about the
+SCHEMA and point up. That is deliberate, not a contradiction.
 
 ## Prose: docs-writer owns WORDING, the domain agent owns TRUTH
 
@@ -929,7 +987,10 @@ Strategy:
    | `pass_ordinal` | **which round.** Without it the final pass is indistinguishable from the first, and `caused_by` below presupposes a round identity the schema would otherwise lack |
    | `finding_id` | stable across rounds — `caused_by` is uncomputable without a join key |
    | `severity_native` | the agent's OWN vocabulary, unmodified |
-   | `severity_mapped` | GATING / SHOULD / NICE per the shared threshold map |
+   | `severity_mapped` | GATING / SHOULD / NICE, derived per the severity rule |
+   | `trigger` | the concrete input/state/config. Free text, but naming one is what makes the finding substantiated |
+   | `consequence` | `C1`…`C7` from the closed list |
+   | `reachability` | `R1`…`R6` from the closed list; suffix `?` when defaulted to R3 as unknown |
    | `provenance` | `introduced` / `newly-reachable` / `pre-existing`. **Adjudicated, not inferred from prose.** Default to `introduced` when contested |
    | `file`, `line`, `summary` | where and what |
    | `classification` + rationale | truth-contradiction vs wording, and why |

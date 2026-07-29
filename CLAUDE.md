@@ -47,7 +47,7 @@ Pipeline (8 gates, convention-enforced): Change Summary + Resource Ledger → se
 
 Four standing rules the skill enforces (#2604), all catastrophic-if-violated:
 1. **Routed-concern triggers are UNCONDITIONAL.** Step 0 and Gate 8 must *open* `.claude/routed-concerns.md` and match it row by row against the changed paths - never work from recall. **Diff size never gates a routed concern**: the matrix decides WHICH agents, never WHETHER.
-2. **Agents report in their OWN severity vocabulary**; the skill calibrates the threshold. GATING maps from CRITICAL / HIGH / BLOCKING. **An unmappable severity defaults to GATING** - nothing is silently downgraded.
+2. **Severity is DERIVED, not chosen.** Every finding states a TRIGGER, a CONSEQUENCE (closed list `C1`–`C7`) and a REACHABILITY (closed list `R1`–`R6`); the band follows from those three, and **BLOCKING = the derived band is CRITICAL or HIGH**. Agents keep their OWN vocabulary — the derivation calibrates the band, not the label. An unnameable trigger is **not** gating (unsubstantiated); an undeterminable reachability defaults to `R3`, marked unknown; **an unmappable severity defaults to GATING** - nothing is silently downgraded.
 3. **Prose: `docs-writer` owns WORDING** (including in-code comments and log/error strings); **the DOMAIN agent owns TRUTH**. A comment that *contradicts* the code is a truth finding at native severity and any agent may raise it; wording-only is capped at NICE.
 4. **Gate 8 re-runs every gate whose DOMAIN THE FIX DIFF TOUCHES**, not only those whose findings prompted the fix - the old rule shipped a broken macOS leg on #2580.
 

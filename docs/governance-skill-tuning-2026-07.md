@@ -228,3 +228,72 @@ the practical exit is fatigue. Their own text says exactly this. What should not
 conceded is that every subsequent finding is churn: on #2580, re-review of the fix rounds
 found three genuine BLOCKING defects introduced *by the fixes*, which is why Gate 8 is
 retained and strengthened here.
+
+---
+
+## 8. Severity derivation (follow-up, PR #2623)
+
+§3.1 calibrated the merge **threshold** — GATING / SHOULD / NICE, with native labels
+mapping onto it. That fixed the gate and left the bands undefined. CRITICAL and HIGH
+both map to GATING with no criterion separating them; LOW and INFO both map to NICE.
+Exactly one clause in the shipped block is falsifiable — *"you must be able to name the
+failing input or state"* — and the rest are adjectives: "misleading operator guidance",
+"bounded blast radius", "everything else".
+
+That matters because the pipeline both **records** the native band (`severity_native` in
+the ledger) and **acts** on it (CLAUDE.md: "CRITICAL/HIGH are blocking, MEDIUM should be
+fixed, LOW addressed"). It is also the input FortitudeEtc's deferred triage design assumes
+— his table keys on *"the reviewer's own severity, exactly as today"*, and his own text
+says #2604's shared severity definitions are what make that mapping reliable rather than
+reconstructed per run.
+
+### The change
+
+Severity becomes a **function of three stated facts** rather than a label a reviewer
+picks: a TRIGGER, a CONSEQUENCE from a closed list of seven, and a REACHABILITY from a
+closed list of six. Consequence gives a base band; reachability modifies it; `BLOCKING`
+is defined as a derived band of CRITICAL or HIGH. The three facts are recorded in the
+ledger next to `severity_native`.
+
+Three decisions worth arguing rather than assuming:
+
+- **`R4` (non-default configuration) is not a downgrade.** In Yuzu the default is
+  frequently the *less* hardened setting — RBAC off is the default, `--auth-mode=sso-only`
+  is opt-in — so "only with the flag on" often means "only for the customers who care
+  most". Importing a CVSS-shaped assumption here would invert the intended posture.
+- **`C4` folds "absent" in with "misleading".** A shipped behaviour change documented
+  nowhere is a truth finding, not a wording one. This resolves the unclassified
+  missing-doc case (#2620) inside the severity rule rather than beside it.
+- **Two absences point in opposite directions on purpose.** An unnameable trigger is
+  the *reviewer's* evidence failing, so it is not gating. An unmappable vocabulary is the
+  *schema* failing, so it gates. They look contradictory sitting next to each other and
+  are not.
+
+### What makes it testable, and what does not
+
+No prose makes an LLM's severity assignment deterministic, and this does not claim to.
+What the three fields buy is **auditability**: a wrong band becomes a visible mismatch
+between the stated facts and the assigned label, checkable after the fact. Today a wrong
+band is indistinguishable from a right one because nothing is stated.
+
+The validation step, not yet built: a calibration corpus of findings whose bands the team
+already agrees on — #2202's four HIGH auth findings, #2580's nine BLOCKING plus the three
+Gate 8 fix-round defects, #222's UP-11 round, #2360's clock-guard rounds. The rule is
+validated iff applying it reproduces the agreed bands.
+
+**One result to expect, flagged rather than absorbed:** this table appears to promote
+parts of #2202 from HIGH to CRITICAL (`C1` security-control bypass + `R2` lower-privilege
+actor). Either the table is too aggressive or those findings were under-labelled. That
+disagreement is the useful output and should be argued.
+
+### Open for the team
+
+1. Is `C4` at base HIGH right? It makes a wrong runbook line gate. The #2580 `pg_locks`
+   case says yes — the shipped runbook walked a DBA toward terminating another tenant's
+   backend. A stale flag name in a doc says no. The trigger requirement may already be
+   doing that work.
+2. Should `R5` (race / rare condition) raise rather than hold? The worst recent defects —
+   the clock-guard family, the swallowed anomaly — are all `R5`.
+3. Does CRITICAL earn its existence? It is reachable only via `C1`/`C2` + `R1`/`R2`, and
+   the gate is identical to HIGH. Fine if it is reporting signal rather than control flow,
+   but worth saying out loud.
