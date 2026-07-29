@@ -1096,56 +1096,126 @@ Strategy:
 1. **Fold compatible fixes into one commit.** If sec flags H1, docs flags B3, QA flags B5, and they all touch related files, fix as a single "hardening round" commit rather than three small ones.
 2. **Re-run Gate 2 security on the hardening round.** Prior runs have caught HIGH regressions introduced by the fix commit itself. Always re-review.
 
-### Deciding fix-now vs defer — two tests, not a quota
+### Deciding what happens to a NON-BLOCKING finding
 
-Every finding needs a disposition: fold it into this change, split it into its
-own, drop it, or file it. Two questions decide, and they compose. Neither is a
-count — the right number of deferrals for a run is whatever these two produce,
-which is sometimes all of them, sometimes none.
+**Order matters, and this step is third.** Establish, in this order: is the
+finding valid; what is its provenance; what band does it DERIVE to; does it hit a
+policy floor. Only then does anything below apply.
 
-**1. Is it a CORRECTION, or does it add a MECHANISM?**
-A correction to code already under review gets reviewed in the same pass and
-costs almost nothing to fold. Anything that adds a probe, a gate, a fixture, a
-dependency, or a new call path re-opens the review surface, and that is where the
-cost actually is.
+**A gating finding is never dropped.** A derived CRITICAL/HIGH, or any policy
+floor, is fixed — or the change itself is withdrawn or re-cut. Nothing in this
+section is a waiver, and no reasoned ledger row makes a blocker optional; Gate 8's
+rule is unchanged. An INVALID finding — false, inapplicable, or disproven — is
+`rejected` with the evidence, at any band.
 
-**2. Would this change still be worth merging without the fix?**
-If no, the fix is part of the deliverable and belongs in it. If yes, the finding
-is separable by definition — which is the whole argument for splitting it out.
+What follows applies ONLY to findings that are valid and non-blocking.
 
-|  | Load-bearing for this change | Not load-bearing |
+#### Test 1 — does the fix open an independently reviewable surface?
+
+Folding a fix keeps it in the SAME review pass, which is cheaper than a second
+one. That is not a claim that corrections are cheap to get right: Gate 8 re-routes
+every fix diff through all touched domains precisely because they are not.
+
+What actually costs is a fix that introduces a surface a reviewer must reason
+about on its own:
+
+- new authority or privilege
+- new persistent state, or a new ownership lifecycle
+- new external I/O, or a new protocol
+- a new public contract or compatibility boundary
+- a new dependency, process, thread, or deployment requirement
+
+**Completing an existing mandatory seam is NOT one of these**, even when the
+edited code is technically a probe or a gate. Adding a newly load-bearing store to
+the `/readyz` conjunction is the reference case: it is a probe, and it is a
+correction, and it folds. Do not let the label decide — most non-trivial
+corrections add a branch or a call path, so "does it add a mechanism" collapses on
+that case. Ask whether the surface is independently reviewable.
+
+Where classification is genuinely arguable, it does not decide anything: fold it
+and let Gate 8's routing determine the review cost.
+
+#### Test 2 — can the ACCEPTED CONTRACT still be satisfied without it?
+
+Not "is the change still worthwhile" — that is a preference, and it is answered by
+whoever benefits from saying yes. Anchor it to the envelope fixed BEFORE the
+findings arrived:
+
+- the originating issue's or ADR's requirements
+- user-facing and changelog claims
+- Gate 1's declared interfaces, behaviour, and security impact
+- any normative repository invariant
+
+If satisfying that envelope requires the fix, it belongs in the change. If
+satisfying it requires **withdrawing a claim or an acceptance criterion**, that is
+a scope change: it needs an explicit non-author adjudication and a re-cut, and it
+is not ordinary deferral. (#2581 is the worked example — the branch ended up
+withdrawing "proves invalidation" down to "proves owner-visible row absence".
+That was the right call, and it was a scope change, not a deferral.)
+
+#### The dispositions
+
+| | Contract needs it | Contract does not |
 |---|---|---|
-| **Correction** | Fold | Fold if trivial and in a file already touched; otherwise its own small change. Rarely worth an issue |
-| **New mechanism** | **RE-CUT** — the scope was drawn wrong. Redraw around the mechanism, with the rest as a prerequisite change ahead of it | **Split** |
+| **No independent surface** | Fold | Fold if trivial and in a file already touched; otherwise its own small change |
+| **Independent surface** | **RE-CUT** (below) | **Split** — its own change, on its own review |
 
-The bottom-right is the expensive mistake, and it is measured rather than
-theorised. On #2581 a bearer probe was folded into a 41-line assertion fix that
-did not need it: six further blocking findings across two more review rounds,
-**none of them in the original change**, and the branch had to be re-cut anyway.
-The bottom-left is not a split but a re-cut — if the mechanism IS the
-deliverable, the boundary was drawn in the wrong place to begin with.
+The expensive mistake is the bottom-right: an independent surface folded into a
+change whose contract did not need it. Measured on #2581 — a bearer-token probe
+folded into a 41-line assertion fix produced six further blocking findings across
+two more rounds, none of them in the original change, and the branch was re-cut
+anyway. Note what the probe actually brought: a persisted credential, an
+authenticated network call, and status-code semantics. New authority, new state,
+new I/O. That is the cost, not the line count — the corrections in that same
+branch ran to 287 lines and converged.
 
-This is also *why* the familiar splits are right, which makes the reasoning
-transferable to cases no list enumerates:
+**Re-cut, concretely** — it is not a relabelled split, and it is only real if you
+say which is which:
 
-- behaviour change + its observability → two changes, behaviour first
-  (observability is mechanism)
-- behaviour change + the refactor that makes it testable → two changes, refactor
-  **first** (the refactor is mechanism the behaviour depends on)
-- a new REST route, MCP tool, store, proto change, schema migration or plugin ABI
-  change → alone, always (mechanism at its largest)
+- the mechanism becomes the deliverable and keeps the original acceptance criteria
+- the remainder goes FIRST, as a prerequisite that must have standalone value; if
+  it has none, do not split it out — the two land together or not at all
+- governance runs on the prerequisite independently, and again on the integrated
+  range
+- if the original branch's contract is withdrawn rather than narrowed, replace the
+  PR rather than shortening it
 
-**Deferral is not the safe default.** Filing is a real disposition only when the
-work is separable, has a plausible owner, and you can state what done looks like.
-Otherwise the honest options are fix it or drop it. A DROP recorded with its
-reason — in the PR body, and as `disposition: rejected` plus a rationale in the
-ledger — is legitimate evidence that the finding was considered and judged. That
-is what a change-management control asks for. It does not ask that every finding
-became a ticket, and a ticket nobody will own is worse than a recorded drop,
-because it looks like tracking while being none of it.
+The familiar splits are instances of Test 1, which is why they generalise:
+observability is a new surface, so it follows the behaviour change; a refactor
+that makes something testable is a surface the behaviour depends on, so it goes
+first; a new REST route, MCP tool, store, proto change, schema migration or plugin
+ABI change gets its OWN REVIEW UNIT — with the wiring that makes it reachable.
+"Alone" never means landing a dormant half: that is `I6` shipped-incomplete or
+dormant-authorisation, which gates.
 
-One issue carrying ten acceptance criteria is usually the same information as ten
-issues, in a form somebody can actually finish.
+#### Filing, dropping, and why the default matters
+
+Filing is the right disposition for separable work with a stated definition of
+done. It is the WRONG disposition for work nobody will pick up: governance is this
+repo's largest issue-inflow source, and inflow has run far ahead of closure —
+directionally, 183 opened against 17 closed in the five days to 2026-07-27, with
+509 of the open set never commented on. (Those figures compare different cohorts
+and ignore closure lag; treat them as a signal to look, not as a measurement.)
+
+So the failure mode runs both ways, and neither is safe:
+
+- file everything → a write-only log that buries the findings that mattered
+- drop what is inconvenient → real work disappears with no record
+
+The guard is that **dropping must not be cheaper than filing.** A valid
+non-blocking finding that will not be fixed and will not be filed is recorded as
+`disposition: not-planned`, and that requires a named adjudicator who is NOT the
+change's author, plus a rationale. `rejected` is reserved for findings that are
+false, inapplicable, or disproven — never for real work without an owner.
+
+Bundling follows `docs/agents/issue-standard.md`, which is authoritative: one
+actionable outcome per issue, split multi-finding bundles, and dedupe is the only
+inflow filter. This section changes which findings reach that procedure; it does
+not change the procedure.
+
+**Parity:** `.codex/skills/governance/SKILL.md` is the Codex-side runner for the
+same pipeline and states its own disposition rule for MEDIUM/SHOULD findings. A
+change here that is not mirrored there silently forks the two. Update both.
 
 ## Gate 8 — Iterate And Ledger
 
@@ -1279,23 +1349,20 @@ Skipping Gate 4 or Gate 5 to save time is rarely worth it. **Do NOT skip Gate 3 
 
 ## Post-run follow-ups — file deferred findings per the issue standard
 
-After the run passes and the commits push, file whatever survived the Gate 7
-disposition tests as genuinely separable work with a plausible owner.
+After the run passes and the commits push, file whatever Gate 7's disposition step
+routed to filing.
 
 **There is no expected number, and the previous version of this sentence gave
 one.** It said a run "typically produces 8-15 deferred follow-up items", which
-functioned as a quota: it made filing the default disposition and made a run that
-filed nothing look incomplete. A run that folds every correction and defers one
-mechanism is a good run. So is a run that files nothing at all.
+functioned as a quota: it made filing the default and made a run that filed
+nothing look incomplete. Git history shows that figure entered the runbook as a
+descriptive observation from early runs, not as a calibrated control. A run that
+folds every correction and splits one surface is a good run; so is a run that
+files nothing, PROVIDED each finding has a recorded disposition per Gate 7.
 
-The cost of getting this wrong is measured. Governance is the repo's largest
-issue-inflow source, and in the five days to 2026-07-27 the tracker took 183 new
-issues against 17 closed, with 509 of the open set never commented on. At that
-ratio an issue nobody will own is not tracking — it is a write-only log that
-buries the findings that mattered. Prefer a recorded drop, or one issue carrying
-several acceptance criteria, over a spray of tickets that each look small.
-
-Filing follows `docs/agents/issue-standard.md` exactly; the binding procedure:
+Filing follows `docs/agents/issue-standard.md` exactly — it is authoritative on
+shape and volume, including that dedupe is the only inflow filter. The binding
+procedure:
 
 1. **Draft the candidate list** — one actionable outcome per candidate; split multi-finding bundles; type each honestly (`bug` / `task` / `decision` / `spike` — a choice-to-be-made is a `decision`, not a code task).
 2. **Dedupe every candidate (mandatory — dedupe is the only inflow filter):**
