@@ -6,9 +6,17 @@
 # against the (now-upgraded) server. Each check produces a per-fixture
 # {name, status, expected, actual} entry in fixtures-verify.json.
 #
+# NOT every fixture asserts SURVIVAL. `api_tokens` asserts whichever contract
+# the upgrade edge under test actually carries (see --api-tokens-expect): on an
+# edge that crosses the ADR-0030 SQLite->Postgres cutover, the CORRECT outcome
+# is that every pre-upgrade token is gone, and surviving tokens are the failure.
+# So a red result here does not automatically mean "data loss" — read the
+# per-fixture line, which always names the real cause, not just the summary
+# banner.
+#
 # Exit codes:
-#   0  every fixture survived
-#   1  one or more fixtures missing (data loss during upgrade)
+#   0  every fixture upheld its contract (survival, or documented invalidation)
+#   1  one or more contracts violated — read the per-fixture lines for which
 #   2  bad arguments
 #
 # Usage:
@@ -35,6 +43,12 @@ USERNAME="admin"
 PASSWORD=""
 STATE_FILE=""
 REPORT_FILE=""
+# Which contract the api_tokens fixture must uphold on THIS upgrade edge.
+# Default `preserved` is the SAFE direction: an unknown or unclassified edge
+# asserts the stronger, non-inverted contract, so it fails loudly rather than
+# silently accepting zero tokens. The orchestrator sets `invalidated` only when
+# it OBSERVES the legacy-store boot warning (test-upgrade-stack.sh step 6b).
+API_TOKENS_EXPECT="${API_TOKENS_EXPECT:-preserved}"
 TIMEOUT_S=15
 
 usage() {
@@ -49,6 +63,11 @@ Required:
 Optional:
   --user NAME              admin user (default: admin)
   --report-file PATH       per-fixture verify status (default: alongside state file)
+  --api-tokens-expect W    preserved|invalidated (default: preserved). Which
+                           contract the api_tokens fixture must uphold on THIS
+                           upgrade edge. `invalidated` is correct only for an
+                           edge crossing the ADR-0030 SQLite->Postgres cutover;
+                           test-upgrade-stack.sh sets it from an observable.
   --timeout SECONDS        per-call timeout (default: 15)
 EOF
 }
@@ -59,6 +78,7 @@ while [[ $# -gt 0 ]]; do
         --user)        USERNAME="$2"; shift 2 ;;
         --password)    PASSWORD="$2"; shift 2 ;;
         --state-file)  STATE_FILE="$2"; shift 2 ;;
+        --api-tokens-expect) API_TOKENS_EXPECT="$2"; shift 2 ;;
         --report-file) REPORT_FILE="$2"; shift 2 ;;
         --timeout)     TIMEOUT_S="$2"; shift 2 ;;
         -h|--help)     usage; exit 0 ;;
@@ -68,6 +88,10 @@ done
 
 if [[ -z "$DASHBOARD_URL" || -z "$PASSWORD" || -z "$STATE_FILE" ]]; then
     usage >&2
+    exit 2
+fi
+if [[ "$API_TOKENS_EXPECT" != "preserved" && "$API_TOKENS_EXPECT" != "invalidated" ]]; then
+    echo "--api-tokens-expect must be 'preserved' or 'invalidated' (got '$API_TOKENS_EXPECT')" >&2
     exit 2
 fi
 if [[ ! -f "$STATE_FILE" ]]; then
@@ -88,8 +112,13 @@ ok()   { printf "  ${G}\u2713${N} %s\n" "$*"; PRESERVED=$((PRESERVED + 1)); }
 fl()   { printf "  ${R}\u2717${N} %s\n" "$*"; LOST=$((LOST + 1)); }
 warn() { printf "  ${Y}\u26a0${N} %s\n" "$*"; SKIPPED=$((SKIPPED + 1)); }
 info() { printf "  ${C}\u2192${N} %s\n" "$*"; }
+# A fixture whose contract was UPHELD but which was not preserved — the
+# ADR-0030 invalidation arm. Counted separately so `preserved_count` and the
+# summary line never claim a deliberately-destroyed fixture survived.
+okx()  { printf "  ${G}\u2713${N} %s\n" "$*"; UPHELD=$((UPHELD + 1)); }
 
 PRESERVED=0
+UPHELD=0
 LOST=0
 SKIPPED=0
 COOKIES="$(mktemp -t yuzu-test-verify.XXXXXX)"
@@ -247,6 +276,8 @@ if [[ "$API_PRESENT_BEFORE" == "True" ]]; then
         # malformed body simply failed. Inverting the test without inverting this
         # would turn every unreadable response into a silent PASS. Missing or
         # non-list `data` is treated the same way: unreadable, not empty.
+        # Verified by mutation: restore the old `except: print(0)` and both a
+        # 502 HTML body and a `{"meta":{}}` envelope score as a clean PASS.
         API_COUNT=$(echo "$API_LIST" | python3 -c "
 import sys, json
 try:
@@ -257,15 +288,34 @@ if not isinstance(d, dict) or not isinstance(d.get('data'), list):
     print(-1)
 else:
     print(len(d['data']))" 2>/dev/null || echo "-1")
-        if (( API_COUNT == 0 )); then
-            ok "API tokens invalidated as designed (ADR-0030 — 0 present, operators must re-mint)"
-            set_result "api_tokens" "invalidated as designed (ADR-0030)"
-        elif (( API_COUNT > 0 )); then
-            fl "API tokens SURVIVED the upgrade ($API_COUNT present) — ADR-0030 specifies a fresh-start cutover with no migration, so a legacy store is still being read"
-            set_result "api_tokens" "survived ($API_COUNT) — cutover did not happen"
-        else
+        # An EMPTY API_COUNT would satisfy `(( API_COUNT == 0 ))` — bash treats
+        # the empty string as 0 in an arithmetic context, which silently routes
+        # a python that exited 0 with no stdout into the PASS branch and defeats
+        # the sentinel above. Measured, not theorised: `A=""; (( A == 0 ))` is
+        # true. Anything non-integer is coerced to the unreadable sentinel.
+        [[ "$API_COUNT" =~ ^-?[0-9]+$ ]] || API_COUNT=-1
+        if (( API_COUNT < 0 )); then
             fl "API tokens endpoint returned an unreadable envelope (no JSON object with a list \`data\`): ${API_LIST:0:200}"
             set_result "api_tokens" "endpoint unreadable"
+        elif [[ "$API_TOKENS_EXPECT" == "invalidated" ]]; then
+            # This edge CROSSES the ADR-0030 cutover, so the tokens must be gone.
+            if (( API_COUNT == 0 )); then
+                okx "API tokens invalidated as designed (ADR-0030 — 0 present, operators must re-mint)"
+                set_result "api_tokens" "invalidated as designed (ADR-0030)"
+            else
+                fl "API tokens SURVIVED an upgrade that crossed the ADR-0030 cutover ($API_COUNT present) — a legacy store is still being read"
+                set_result "api_tokens" "survived ($API_COUNT) — cutover did not happen"
+            fi
+        else
+            # This edge does NOT cross the cutover (or could not be classified),
+            # so the ordinary preservation contract applies and zero is loss.
+            if (( API_COUNT >= 1 )); then
+                ok "API tokens preserved ($API_COUNT present)"
+                set_result "api_tokens" "preserved ($API_COUNT)"
+            else
+                fl "API tokens lost (had >= 1, now 0) on an edge that does not cross the ADR-0030 cutover"
+                set_result "api_tokens" "lost"
+            fi
         fi
     else
         fl "API tokens endpoint failed or returned error: ${API_LIST:0:200}"
@@ -284,8 +334,8 @@ fi
 # run. We hard-fail it here so the upgrade test cannot silently pass.
 WROTE_COUNT=$(read_state wrote_count)
 WROTE_COUNT=${WROTE_COUNT:-0}
-if [[ $WROTE_COUNT -gt 0 && $PRESERVED -eq 0 ]]; then
-    fl "guarantee inversion: writer recorded $WROTE_COUNT fixtures, verifier preserved 0 — every check skipped or failed"
+if [[ $WROTE_COUNT -gt 0 && $((PRESERVED + UPHELD)) -eq 0 ]]; then
+    fl "guarantee inversion: writer recorded $WROTE_COUNT fixtures, verifier upheld 0 — every check skipped or failed"
     set_result "guarantee_inversion" "writer wrote $WROTE_COUNT, verify preserved 0"
 fi
 
@@ -297,6 +347,7 @@ mkdir -p "$(dirname "$REPORT_FILE")"
     echo "  \"verified_at\": $(date +%s),"
     echo "  \"wrote_count\": $WROTE_COUNT,"
     echo "  \"preserved_count\": $PRESERVED,"
+    echo "  \"upheld_count\": $UPHELD,"
     echo "  \"lost_count\": $LOST,"
     echo "  \"skipped_count\": $SKIPPED,"
     echo "  \"fixtures\": {"
@@ -312,12 +363,15 @@ mkdir -p "$(dirname "$REPORT_FILE")"
 } > "$REPORT_FILE"
 
 echo ""
-TOTAL=$((PRESERVED + LOST + SKIPPED))
-if [[ $LOST -eq 0 && ! ( $WROTE_COUNT -gt 0 && $PRESERVED -eq 0 ) ]]; then
-    echo -e "${G}fixtures verify: $PRESERVED/$TOTAL preserved${N} ($SKIPPED skipped)"
+TOTAL=$((PRESERVED + UPHELD + LOST + SKIPPED))
+if [[ $LOST -eq 0 && ! ( $WROTE_COUNT -gt 0 && $((PRESERVED + UPHELD)) -eq 0 ) ]]; then
+    echo -e "${G}fixtures verify: $PRESERVED preserved, $UPHELD upheld-by-contract, of $TOTAL${N} ($SKIPPED skipped)"
     exit 0
 else
-    echo -e "${R}fixtures verify: $LOST LOST, $PRESERVED preserved, $SKIPPED skipped — DATA LOSS DETECTED${N}"
+    echo -e "${R}fixtures verify: $LOST FAILED, $PRESERVED preserved, $UPHELD upheld, $SKIPPED skipped — FIXTURE CONTRACT VIOLATED${N}"
+    echo -e "${R}Read the per-fixture lines above for the cause. NOT every failure is data loss:${N}"
+    echo -e "${R}api_tokens fails when tokens SURVIVE an ADR-0030 cutover edge — that is a stale${N}"
+    echo -e "${R}legacy store still being read, not lost data, and needs the opposite fix.${N}"
     if [[ $WROTE_COUNT -gt 0 && $PRESERVED -eq 0 ]]; then
         echo -e "${R}GUARANTEE INVERSION: writer recorded $WROTE_COUNT fixtures but zero were verified.${N}"
         echo -e "${R}This may indicate (a) silent data loss, (b) endpoint moved to a different path,${N}"

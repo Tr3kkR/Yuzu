@@ -392,7 +392,8 @@ if [[ $READY -ne 1 ]]; then
     else
         fl "/readyz never recovered after upgrade (waited ${WAITED}s)"
     fi
-    docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+    YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+        docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
         --project-name "$PROJECT_NAME" logs server | tail -100 >> "$LOG_FILE"
     record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "post-upgrade not ready"
     exit 1
@@ -402,7 +403,14 @@ ok "/readyz ready after upgrade (waited ${WAITED}s)"
 # --- Step 6: count migration runner events --------------------------------
 
 phase "step: count MigrationRunner events in server log"
-MIGR_COUNT=$(docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+# The env prefix is REQUIRED, not decorative: without YUZU_TEST_CONFIG the
+# compose file's cred bind-mount spec is `:/etc/yuzu/yuzu-server.cfg:ro`, which
+# compose rejects outright. `2>/dev/null` then swallows the error, `grep -c`
+# returns 0, and this step reports "no MigrationRunner events seen" having never
+# read a log line. That is the root cause of #2609's second, unexplained signal:
+# measured at 0 here, and 13 with the prefix restored against the same stack.
+MIGR_COUNT=$(YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+    docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
     --project-name "$PROJECT_NAME" logs server 2>/dev/null \
     | grep -c "MigrationRunner: .* migrated to v" || true)
 if (( MIGR_COUNT > 0 )); then
@@ -411,6 +419,46 @@ if (( MIGR_COUNT > 0 )); then
         --name "phase2_migration_events" --value "$MIGR_COUNT" --unit "count" >/dev/null || true
 else
     warn "no MigrationRunner events seen — maybe DB was already at HEAD schema?"
+fi
+
+# --- Step 6b: did THIS upgrade edge cross the ApiTokenStore cutover? -------
+#
+# ADR-0030 moved ApiTokenStore from SQLite to Postgres as a fresh-start cutover
+# with no migration, so whether API tokens SHOULD survive depends entirely on
+# which edge is under test — and `--old-version` FLOATS to GitHub's current
+# "Latest release". Today v0.13.0 (2026-07-11) predates the cutover (4a05df88,
+# 2026-07-15), so tokens are correctly invalidated. The moment a release
+# CONTAINING the cutover becomes Latest, Phase 2 becomes a Postgres->Postgres
+# edge over a `postgres-data` volume this compose file deliberately preserves
+# across the image swap: tokens survive, and a hardcoded "expect invalidated"
+# would fail the gate while announcing something false.
+#
+# So derive the arm from an OBSERVABLE rather than a version table. The new
+# server warns at boot when it finds a legacy api-tokens.db in the surviving
+# data volume (server.cpp: "[auth] Legacy SQLite api-tokens.db found at").
+# That fires if and only if this edge crossed the cutover, and it keeps working
+# unedited as releases move.
+#
+# The default is `preserved` — the SAFE direction. If the observable is absent
+# or the grep fails, we assert the stronger, NON-inverted contract, so an
+# unknown edge reads as a loud failure rather than a silent pass.
+
+phase "step: classify the API-token upgrade edge"
+API_TOKENS_EXPECT="preserved"
+# Probe the FILESYSTEM, not the boot log. The server does log a "Legacy SQLite
+# api-tokens.db found at" warning on a crossing edge, and an earlier revision of
+# this step grepped for it — but `docker compose logs` lags the process, so the
+# line is reliably present minutes later and intermittently absent at the moment
+# this step runs. A log grep here is a race; the file either exists in the
+# preserved data volume or it does not.
+if YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+    docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+    --project-name "$PROJECT_NAME" exec -T server \
+    test -f /var/lib/yuzu/api-tokens.db 2>/dev/null; then
+    API_TOKENS_EXPECT="invalidated"
+    ok "edge CROSSES the ADR-0030 cutover — API tokens must be invalidated"
+else
+    ok "edge does NOT cross the ADR-0030 cutover — API tokens must be preserved"
 fi
 
 # --- Step 7: fixtures-verify ----------------------------------------------
@@ -422,6 +470,7 @@ if bash "$HERE/test-fixtures-verify.sh" \
     --dashboard "$DASHBOARD_URL" \
     --user "$USERNAME" --password "$PASSWORD" \
     --state-file "$STATE_FILE" \
+    --api-tokens-expect "$API_TOKENS_EXPECT" \
     --report-file "$REPORT_FILE" >> "$LOG_FILE" 2>&1; then
     ok "fixtures verified"
     FIXTURE_VERIFY_OK=1
