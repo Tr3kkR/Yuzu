@@ -3237,7 +3237,10 @@ public:
                 if (!result_set_store_->migrate_from_sqlite(rs_db)) {
                     spdlog::error("[PG] Refusing to start: result-set legacy-SQLite backfill "
                                   "failed (see prior log lines) — result_set_store is "
-                                  "authoritative and must not serve partially-migrated data");
+                                  "authoritative and must not serve partially-migrated data. "
+                                  "Operator remediation: repair {} or move it aside to skip the "
+                                  "backfill (pinned sets in it will NOT carry over)",
+                                  rs_db.string());
                     startup_failed_ = true;
                 } else {
                     spdlog::info("ResultSetStore initialized (schema result_set_store; legacy "

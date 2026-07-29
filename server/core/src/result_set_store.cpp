@@ -601,8 +601,13 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::insert_row_impl(
         // concurrent create for the same owner is possible (Postgres real
         // concurrency replaces the SQLite single-writer mutex) — acceptable
         // for a soft DoS guard, not a security boundary.
+        // Expired-but-unswept rows do NOT count against the quota (Gate 4
+        // UP-6): a stalled gc sweep would otherwise convert GC debt into
+        // spurious operator Quota failures. Still soft-guard-grade.
         pg::PgResult qc = pg::exec_params(
-            conn, "SELECT COUNT(*) FROM result_set_store.result_sets WHERE owner_principal = $1",
+            conn,
+            "SELECT COUNT(*) FROM result_set_store.result_sets WHERE owner_principal = $1 "
+            "AND (pinned OR ttl_at >= extract(epoch from now())::bigint)",
             std::vector<std::string>{req.owner_principal});
         if (qc.status() != PGRES_TUPLES_OK) {
             spdlog::error("ResultSetStore::insert_row_impl: quota check failed: {}",
