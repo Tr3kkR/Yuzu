@@ -43,6 +43,8 @@ constexpr int kQueryRowCap = 100000;
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
+constexpr const char* kReasonInvalidKey = "invalid_key";
+constexpr const char* kReasonStale = "stale"; // conflict-predicate suppression (H2)
 constexpr const char* kDegradeSource = "generic";
 // Sample the per-site degrade WARN (leading edge of an episode, then every Nth)
 // so a sustained PG outage cannot flood the log — the counter is the continuous
@@ -359,7 +361,13 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
                 ins.get() ? PQresultErrorField(ins.get(), PG_DIAG_SQLSTATE) : nullptr;
             const std::string sqlstate = sqlstate_p ? sqlstate_p : "";
             const bool row_data_error =
-                sqlstate.size() == 5 && (sqlstate.starts_with("22") || sqlstate.starts_with("23"));
+                sqlstate.size() == 5 && (sqlstate.starts_with("22") || sqlstate.starts_with("23") ||
+                                         sqlstate.starts_with("54"));
+            // 54xxx (program_limit_exceeded: oversized field/statement) is
+            // row-data by construction — a legacy data_json blob bigger than
+            // Postgres will take fails on THAT row every boot; treating it as
+            // infra would make one pathological blob a permanent boot loop
+            // (Gate 4 UP-1).
             pg::PgResult back = pg::exec_params(c, "ROLLBACK TO SAVEPOINT legacy_row_backfill",
                                                 std::vector<std::string>{});
             if (back.status() != PGRES_COMMAND_OK) {
@@ -428,7 +436,7 @@ void InventoryStore::upsert(const std::string& agent_id, const std::string& plug
     // key would be un-erasable by the decommission cascade's empty-id guard.
     if (is_blank(agent_id) || is_blank(plugin)) {
         spdlog::warn("InventoryStore: upsert rejected: blank agent_id/plugin (plugin={})", plugin);
-        note_ingest_dropped(metrics_, "invalid_key");
+        note_ingest_dropped(metrics_, kReasonInvalidKey);
         return;
     }
     if (collected_at == 0)
@@ -478,7 +486,7 @@ void InventoryStore::upsert(const std::string& agent_id, const std::string& plug
     // reports (and any row pinned ahead by a PRE-clamp deployment — those
     // drain as their stored collected_at ages past now).
     if (affected_rows(res) == 0) {
-        note_ingest_dropped(metrics_, "stale");
+        note_ingest_dropped(metrics_, kReasonStale);
         spdlog::debug("InventoryStore: upsert suppressed stale report for agent={} plugin={} "
                       "(incoming collected_at={} older than stored)",
                       agent_id, plugin, collected_at);

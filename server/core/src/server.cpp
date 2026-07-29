@@ -797,7 +797,7 @@ public:
         // Generic InventoryStore observability (ADR-0037 hardening round).
         metrics_.describe("yuzu_inventory_ingest_dropped_total",
                           "Generic InventoryStore upsert calls that did not persist, by reason "
-                          "(store_not_open/pool_acquire_timeout/query_error/invalid_key) — the "
+                          "(store_not_open/pool_acquire_timeout/query_error/invalid_key/stale) — the "
                           "agent's next report re-sends the same blob (fail-soft), but a "
                           "sustained non-zero rate means writes are silently not landing",
                           "counter");

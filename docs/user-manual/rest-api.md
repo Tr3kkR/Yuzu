@@ -3655,9 +3655,6 @@ List all inventory tables (one per plugin that reports inventory data).
 }
 ```
 
-`result_truncated_by_cap` (bool, optional) — present and `true` when the underlying
-inventory read hit the server row cap; absent devices may simply not have been
-read rather than not matching.
 
 **Errors:**
 
@@ -3767,6 +3764,12 @@ Each condition object:
   "meta": { "api_version": "v1" }
 }
 ```
+
+`result_truncated_by_cap` (bool, optional) — emitted at the **top level of the
+envelope** (alongside `data`), present and `true` when the underlying inventory
+read hit its row cap (5,000 for this route): absent devices may simply not have
+been read rather than not matching. (The typed software route carries the same
+flag inside `data` — placement alignment is tracked with #2633.)
 
 **Errors:**
 

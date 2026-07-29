@@ -111,6 +111,18 @@ opens:
   were filed as malformed on 22xxx/23xxx SQLSTATE only; genuine infrastructure errors abort
   the backfill unstamped instead, so a retry is never lost silently) makes every boot after
   the first a cheap lookup — the legacy SQLite file is never re-read once stamped.
+  The full reconciliation identity for an auditor is
+  `legacy sqlite rows = inserted (legacy_rows) + live-row conflicts + skipped_bad +
+  blank-key skips` — blank-key skips are logged, not persisted (they are GDPR-unerasable
+  rows the store refuses on every path, not data loss).
+
+  **Operator recovery when the backfill fails closed** (Gate 4 UP-1/UP-2): a legacy row
+  failing with a non-row-data SQLSTATE aborts the backfill unstamped and the server
+  refuses to boot on every restart until resolved. The escape hatch is moving the legacy
+  `inventory.db` aside — the missing-file path stamps `legacy_rows = 0` and boots; live
+  agents re-push their blobs on the next report cycle. NOTE the trade: rows for
+  decommissioned/offline agents are NOT re-pushed and must be re-imported manually from
+  the retained read-only legacy file if needed.
 - **Never clobbers a live row**: every backfilled row is inserted
   `ON CONFLICT (agent_id, plugin) DO NOTHING` — if a live agent has already re-reported for
   that `(agent_id, plugin)` pair since this boot sequence started (a race the boot-time

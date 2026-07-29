@@ -198,7 +198,8 @@ public:
     /// process — a caller that PERSISTS the result as a targeting set (the
     /// from-inventory-query result-set route) must refuse a capped read
     /// rather than materialise a silently-incomplete set; the metric alone
-    /// cannot reach that decision point.
+    /// cannot reach that decision point. Cap ceiling + exact-at-cap false
+    /// positive tracked in #2633 (keyset pagination / limit+1 probe).
     [[nodiscard]] std::optional<std::vector<InventoryRecord>>
     query(const InventoryQuery& q, bool* truncated = nullptr) const;
 
