@@ -69,10 +69,15 @@ const std::vector<pg::PgMigration>& migrations() {
          // migrate_from_sqlite() is a cheap no-op on every boot after the
          // first. `legacy_rows` records rows ACTUALLY inserted (not the size
          // of the in-memory legacy row list — see migrate_from_sqlite).
+         // `skipped_bad` (governance H1) makes a row-data skip AUDITABLE
+         // after the fact — a stamp with skipped_bad > 0 says the backfill
+         // completed but filed N legacy rows as malformed (22xxx/23xxx
+         // SQLSTATE only; infrastructure errors abort unstamped instead).
          "CREATE TABLE backfill_state ("
          "  id           INT PRIMARY KEY,"
          "  migrated_at  BIGINT NOT NULL,"
-         "  legacy_rows  BIGINT NOT NULL DEFAULT 0);"},
+         "  legacy_rows  BIGINT NOT NULL DEFAULT 0,"
+         "  skipped_bad  BIGINT NOT NULL DEFAULT 0);"},
     };
     return kMigrations;
 }
@@ -310,17 +315,45 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
                 std::vector<std::string>{r.agent_id, r.plugin, r.data_json,
                                          std::to_string(r.collected_at)});
             if (ins.status() == PGRES_COMMAND_OK) {
-                pg::exec_params(c, "RELEASE SAVEPOINT legacy_row_backfill",
-                               std::vector<std::string>{});
+                pg::PgResult rel_ok = pg::exec_params(c, "RELEASE SAVEPOINT legacy_row_backfill",
+                                                      std::vector<std::string>{});
+                if (rel_ok.status() != PGRES_COMMAND_OK) {
+                    // LOW (governance): checked like every neighbouring
+                    // statement — a failed RELEASE is an infra-level signal.
+                    spdlog::error("InventoryStore: migrate_from_sqlite: RELEASE SAVEPOINT failed "
+                                  "(infra error, aborting backfill): {}",
+                                  PQerrorMessage(c));
+                    return false;
+                }
                 inserted += affected_rows(ins); // 0 on ON CONFLICT DO NOTHING no-op, else 1
                 continue;
             }
 
-            // Per-row failure (e.g. invalid-UTF-8 data_json/agent_id/plugin,
-            // or another constraint violation): capture the error + the
-            // row's identity, then try to recover the transaction via
-            // ROLLBACK TO SAVEPOINT.
-            const std::string row_err = PQerrorMessage(c);
+            // Per-row failure. Governance H1 (2026-07-29): "rollback
+            // succeeded" is NOT a discriminator between a malformed row and
+            // a RECOVERABLE INFRASTRUCTURE error — statement_timeout (57014,
+            // the pool pins statement_timeout=30000 on every connection),
+            // deadlock (40P01), serialization failure (40001) and
+            // lock_not_available (55P03) are all per-statement AND
+            // savepoint-recoverable by design, and all reachable during a
+            // loaded first-boot backfill. Filing one of those as a "bad row"
+            // loses the row PERMANENTLY and SILENTLY (the completion stamp
+            // below short-circuits every later boot). Read the SQLSTATE and
+            // skip ONLY genuine row-data classes: 22xxx (data exception) and
+            // 23xxx (integrity constraint). Everything else — class 40
+            // (txn rollback), 53 (insufficient resources), 55 (object state),
+            // 57 (operator intervention/timeout), 58 (system error),
+            // XX (internal), and anything unrecognised — fails the backfill
+            // closed so the next boot retries with the marker unstamped
+            // (the header's own contract: "FAILS CLOSED only on a genuine
+            // INFRASTRUCTURE error ... never on a single bad row").
+            const std::string row_err =
+                ins.get() ? PQresultErrorMessage(ins.get()) : PQerrorMessage(c);
+            const char* sqlstate_p =
+                ins.get() ? PQresultErrorField(ins.get(), PG_DIAG_SQLSTATE) : nullptr;
+            const std::string sqlstate = sqlstate_p ? sqlstate_p : "";
+            const bool row_data_error =
+                sqlstate.size() == 5 && (sqlstate.starts_with("22") || sqlstate.starts_with("23"));
             pg::PgResult back = pg::exec_params(c, "ROLLBACK TO SAVEPOINT legacy_row_backfill",
                                                 std::vector<std::string>{});
             if (back.status() != PGRES_COMMAND_OK) {
@@ -332,17 +365,35 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
                              PQerrorMessage(c));
                 return false;
             }
-            pg::exec_params(c, "RELEASE SAVEPOINT legacy_row_backfill", std::vector<std::string>{});
+            if (!row_data_error) {
+                spdlog::error("InventoryStore: migrate_from_sqlite: row insert failed with "
+                              "non-row-data SQLSTATE '{}' (agent_id={} plugin={}): {} — treating "
+                              "as an infrastructure error and aborting the backfill unstamped; "
+                              "the next boot retries",
+                              sqlstate.empty() ? "<none>" : sqlstate, r.agent_id, r.plugin,
+                              row_err);
+                return false;
+            }
+            pg::PgResult rel = pg::exec_params(c, "RELEASE SAVEPOINT legacy_row_backfill",
+                                               std::vector<std::string>{});
+            if (rel.status() != PGRES_COMMAND_OK) {
+                spdlog::error("InventoryStore: migrate_from_sqlite: RELEASE SAVEPOINT failed "
+                              "(infra error, aborting backfill): {}",
+                              PQerrorMessage(c));
+                return false;
+            }
             ++skipped_bad;
             spdlog::warn("InventoryStore: migrate_from_sqlite: skipping bad legacy row "
-                        "agent_id={} plugin={}: {}",
-                        r.agent_id, r.plugin, row_err);
+                        "agent_id={} plugin={} (SQLSTATE {}): {}",
+                        r.agent_id, r.plugin, sqlstate, row_err);
         }
         pg::PgResult stamp = pg::exec_params(
             c,
-            "INSERT INTO inventory_store.backfill_state (id, migrated_at, legacy_rows) "
-            "VALUES (1, $1::bigint, $2::bigint) ON CONFLICT (id) DO NOTHING",
-            std::vector<std::string>{std::to_string(now_secs()), std::to_string(inserted)});
+            "INSERT INTO inventory_store.backfill_state (id, migrated_at, legacy_rows, "
+            "skipped_bad) "
+            "VALUES (1, $1::bigint, $2::bigint, $3::bigint) ON CONFLICT (id) DO NOTHING",
+            std::vector<std::string>{std::to_string(now_secs()), std::to_string(inserted),
+                                     std::to_string(skipped_bad)});
         return stamp.status() == PGRES_COMMAND_OK;
     });
     if (!ok) {
@@ -376,6 +427,17 @@ void InventoryStore::upsert(const std::string& agent_id, const std::string& plug
     }
     if (collected_at == 0)
         collected_at = now_secs();
+    // Governance H2 (2026-07-29): CLAMP the agent-supplied clock to server
+    // receipt time — the stale-overwrite guard below compares collected_at,
+    // so without a clamp ONE future-skewed (or hostile) report pins its row
+    // forever: every later honest report fails the conflict predicate,
+    // updates zero rows, and returns success. Same defect the sibling
+    // SoftwareInventoryStore already fixed (#1685, ADR-0016 Update
+    // 2026-06-27, incl. its migration v3 clamp for pre-fix rows) and the
+    // standing clock-guard rule: on an endpoint the user controls, a quiet
+    // reset IS the bypass. Backfill is unaffected (legacy rows predate now).
+    if (collected_at > now_secs())
+        collected_at = now_secs();
     auto lease = pool_.try_acquire_for(kIngestAcquireTimeout);
     if (!lease) {
         spdlog::warn("InventoryStore: upsert skipped for agent={} plugin={}, no connection ({})",
@@ -400,6 +462,20 @@ void InventoryStore::upsert(const std::string& agent_id, const std::string& plug
         spdlog::warn("InventoryStore: upsert failed for agent={} plugin={}: {}", agent_id, plugin,
                      PQerrorMessage(lease.get()));
         note_ingest_dropped(metrics_, kReasonQueryError);
+        return;
+    }
+    // Governance H2, observability half: a conflict-predicate suppression
+    // (stored row is newer) updates ZERO rows but still returns
+    // PGRES_COMMAND_OK — without this check a suppressed write is invisible
+    // (no log, no metric), which is exactly how the pre-clamp freeze hid.
+    // With the clamp above this now only fires for genuinely-reordered older
+    // reports (and any row pinned ahead by a PRE-clamp deployment — those
+    // drain as their stored collected_at ages past now).
+    if (affected_rows(res) == 0) {
+        note_ingest_dropped(metrics_, "stale");
+        spdlog::debug("InventoryStore: upsert suppressed stale report for agent={} plugin={} "
+                      "(incoming collected_at={} older than stored)",
+                      agent_id, plugin, collected_at);
     }
 }
 
@@ -491,7 +567,10 @@ InventoryStore::get(const std::string& agent_id, const std::string& plugin) cons
 
 // ── Query (authoritative read) ───────────────────────────────────────────────
 
-std::optional<std::vector<InventoryRecord>> InventoryStore::query(const InventoryQuery& q) const {
+std::optional<std::vector<InventoryRecord>> InventoryStore::query(const InventoryQuery& q,
+                                                                  bool* truncated) const {
+    if (truncated)
+        *truncated = false;
     if (!open_) {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
@@ -572,6 +651,8 @@ std::optional<std::vector<InventoryRecord>> InventoryStore::query(const Inventor
     // ever return in one call); a caller-supplied smaller limit gets a debug
     // breadcrumb (expected/routine pagination-adjacent truncation).
     if (static_cast<int>(out.size()) == limit) {
+        if (truncated)
+            *truncated = true; // governance M1: in-process signal, see header
         if (metrics_)
             metrics_->counter("yuzu_inventory_query_truncated_total").increment();
         if (limit == kQueryRowCap)

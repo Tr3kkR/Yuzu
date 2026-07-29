@@ -19,6 +19,7 @@
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "rest_api_v1.hpp"
 #include "result_set_store.hpp"
 #include "test_route_sink.hpp"
@@ -68,9 +69,11 @@ struct AsyncHarness {
     /// widening and has its own code path. Its handler 503s before any input
     /// validation when the store is unwired (dependency-before-validation is
     /// the convention on these routes), so reaching its parent_id guard at all
-    /// requires a real store.
-    yuzu::test::TempDbFile inv_db{std::string_view("rs-async-inv-")};
-    std::unique_ptr<InventoryStore> inventory;
+    /// requires a real store. Post-ADR-0037 that store is Postgres-backed, so
+    /// it is INJECTED by the one [pg]-tagged case that needs it rather than
+    /// owned here — keeping every other case in this file out of the [pg]
+    /// shard (partition invariant).
+    InventoryStore* inventory{nullptr};
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
 
@@ -80,7 +83,8 @@ struct AsyncHarness {
     bool dispatch_throws{false};
     bool wire_dispatch{true}; // false → leave the callback empty (503 path)
 
-    explicit AsyncHarness(bool with_dispatch = true) : wire_dispatch(with_dispatch) {
+    explicit AsyncHarness(bool with_dispatch = true, InventoryStore* inv = nullptr)
+        : inventory(inv), wire_dispatch(with_dispatch) {
         store = std::make_unique<ResultSetStore>(rs_db.path);
         REQUIRE(store->is_open());
 
@@ -90,9 +94,6 @@ struct AsyncHarness {
 
         instr = std::make_unique<InstructionStore>(":memory:");
         REQUIRE(instr->is_open());
-
-        inventory = std::make_unique<InventoryStore>(inv_db.path);
-        REQUIRE(inventory->is_open());
 
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
@@ -127,7 +128,7 @@ struct AsyncHarness {
                             /*quarantine_store=*/nullptr, /*response_store=*/nullptr, instr.get(),
                             tracker.get(), /*schedule_engine=*/nullptr, /*approval_manager=*/nullptr,
                             /*tag_store=*/nullptr, /*audit_store=*/nullptr, /*service_group_fn=*/{},
-                            /*tag_push_fn=*/{}, inventory.get(),
+                            /*tag_push_fn=*/{}, inventory,
                             /*product_pack_store=*/nullptr, /*sw_deploy_store=*/nullptr,
                             /*device_token_store=*/nullptr, /*license_store=*/nullptr,
                             /*guaranteed_state_store=*/nullptr, &metrics, /*session_revoke_fn=*/{},
@@ -319,21 +320,6 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
                            {{"route", "result_set_parent"}, {"reason", "parent_id_type"}})
                   .value() == 1.0);
     }
-    SECTION("from-inventory-query — the fourth instance, its own code path") {
-        // Not covered by the run_async guard: this producer has its own
-        // parent_id block and was missed by the first round of the fix. It is
-        // synchronous, so the consequence was a READ across every device rather
-        // than a dispatch — narrower blast radius, same defect.
-        AsyncHarness h;
-        int status = 0;
-        h.post("/api/v1/result-sets/from-inventory-query", R"({"query":"os=linux","parent_id":""})",
-               status);
-        REQUIRE(status == 400);
-        CHECK(h.metrics
-                  .counter("yuzu_server_dispatch_target_rejected_total",
-                           {{"route", "result_set_parent"}, {"reason", "parent_id_empty"}})
-                  .value() == 1.0);
-    }
     SECTION("a non-object body is refused, not read as an absent parent_id") {
         AsyncHarness h;
         int status = 0;
@@ -452,4 +438,45 @@ TEST_CASE("re-eval: not-owned / missing set is 404", "[result_set][async][reeval
     int status = 0;
     h.post("/api/v1/result-sets/rs_00000000000deadbeef/re-eval", "", status);
     REQUIRE(status == 404);
+}
+
+// file-local PG template for the ONE case above that needs a real (ADR-0037,
+// Postgres-backed) InventoryStore: from-inventory-query 503s before input
+// validation when the store is unwired, so its parent_id guard is reachable
+// only with a live store. Distinct key from test_inventory_store.cpp's
+// "inventory" (same setup shape, separate registry entry by convention).
+namespace {
+yuzu::test::PgTestTemplate rs_async_inventory_tpl{
+    "rsasync_inventory", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        InventoryStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("rsasync_inventory template: store failed to migrate");
+    }};
+} // namespace
+
+TEST_CASE("#2500 — from-inventory-query: the fourth instance, its own code path",
+          "[pg][result_set][async][targeting][security]") {
+    // Not covered by the run_async guard: this producer has its own
+    // parent_id block and was missed by the first round of the fix. It is
+    // synchronous, so the consequence was a READ across every device rather
+    // than a dispatch — narrower blast radius, same defect. Split out of the
+    // sibling #2500 TEST_CASE when InventoryStore went Postgres (ADR-0037):
+    // this is the only section needing the PG store, and the split keeps the
+    // rest of that case out of the [pg] shard.
+    YUZU_REQUIRE_PG_DB_TPL(db, rs_async_inventory_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    InventoryStore inv{pool};
+    REQUIRE(inv.is_open());
+
+    AsyncHarness h(/*with_dispatch=*/true, &inv);
+    int status = 0;
+    h.post("/api/v1/result-sets/from-inventory-query", R"({"query":"os=linux","parent_id":""})",
+           status);
+    REQUIRE(status == 400);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "result_set_parent"}, {"reason", "parent_id_empty"}})
+              .value() == 1.0);
 }

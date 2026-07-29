@@ -194,7 +194,13 @@ public:
     /// more rows may exist past what is returned — this is logged and bumps
     /// `yuzu_inventory_query_truncated_total` so an operator/caller can tell
     /// "capped at N" from "exactly N" (full keyset pagination is a follow-up).
-    [[nodiscard]] std::optional<std::vector<InventoryRecord>> query(const InventoryQuery& q) const;
+    /// Governance M1 (2026-07-29): pass `truncated` to receive that signal in
+    /// process — a caller that PERSISTS the result as a targeting set (the
+    /// from-inventory-query result-set route) must refuse a capped read
+    /// rather than materialise a silently-incomplete set; the metric alone
+    /// cannot reach that decision point.
+    [[nodiscard]] std::optional<std::vector<InventoryRecord>>
+    query(const InventoryQuery& q, bool* truncated = nullptr) const;
 
     /// Get all inventory records for a specific agent. AUTHORITATIVE read:
     /// same nullopt-on-degrade contract as `query` (this delegates to it).

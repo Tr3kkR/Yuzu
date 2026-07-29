@@ -5809,7 +5809,8 @@ void RestApiV1::register_routes(
                       if (!eval_req.agent_id.empty())
                           iq.agent_id = eval_req.agent_id;
                       iq.limit = 5000;
-                      auto records_raw = inventory_store->query(iq);
+                      bool inv_truncated = false;
+                      auto records_raw = inventory_store->query(iq, &inv_truncated);
                       if (!records_raw) {
                           res.status = 503;
                           res.set_content(detail::a4_error(res, "inventory store degraded"),
@@ -5830,6 +5831,26 @@ void RestApiV1::register_routes(
                                       .add("matched_value", r.matched_value)
                                       .add("plugin", r.plugin)
                                       .add("collected_at", r.collected_at));
+                      }
+                      // Governance M1: an evaluation computed over a CAPPED
+                      // inventory read is honest about it — absent agents may
+                      // simply not have been read (same flag name as the
+                      // typed-store route, result_truncated_by_cap). Same
+                      // data/pagination/meta shape as list_json, plus the flag.
+                      if (inv_truncated) {
+                          auto pag = JObj()
+                                         .add("total", static_cast<int64_t>(results.size()))
+                                         .add("start", int64_t{0})
+                                         .add("page_size", int64_t{50})
+                                         .str();
+                          res.set_content(JObj()
+                                              .raw("data", arr.str())
+                                              .add("result_truncated_by_cap", true)
+                                              .raw("pagination", pag)
+                                              .raw("meta", R"({"api_version":"v1"})")
+                                              .str(),
+                                          "application/json");
+                          return;
                       }
                       res.set_content(list_json(arr.str(), static_cast<int64_t>(results.size())),
                                       "application/json");
@@ -6283,9 +6304,22 @@ void RestApiV1::register_routes(
 
                       InventoryQuery iq;
                       iq.limit = 5000;
-                      auto records_raw = inventory_store->query(iq);
+                      bool inv_truncated = false;
+                      auto records_raw = inventory_store->query(iq, &inv_truncated);
                       if (!records_raw) {
                           rs_err(res, 503, "inventory store degraded");
+                          return;
+                      }
+                      if (inv_truncated) {
+                          // Governance M1: a capped read must NEVER be
+                          // materialised as a targeting set — the missing tail
+                          // silently changes who gets acted on (#2500/#2492
+                          // dispatch-targeting invariant class). 503 rather
+                          // than a partial set; raising the cap / keyset
+                          // pagination is the tracked follow-up.
+                          rs_err(res, 503,
+                                 "inventory query truncated at the row cap - refusing to "
+                                 "materialise a partial result set");
                           return;
                       }
                       std::vector<std::pair<std::string, std::string>> records;

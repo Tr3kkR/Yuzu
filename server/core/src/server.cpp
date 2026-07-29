@@ -2931,8 +2931,6 @@ public:
             agent_service_.set_webhook_store(webhook_store_.get());
         if (offload_target_store_)
             agent_service_.set_offload_target_store(offload_target_store_.get());
-        if (inventory_store_)
-            agent_service_.set_inventory_store(inventory_store_.get());
 
         // Initialize instruction store (Phase 2)
         {
@@ -5104,10 +5102,13 @@ public:
             heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
         offline_endpoint_store_.reset();
         // Generic InventoryStore (ADR-0037): same discipline as the typed PG
-        // stores below — null the borrowed pointer in both ingest services,
-        // then drop the store, BEFORE the pool (governance IS1: this was
-        // previously the one PG store missing this unwire-then-reset step).
-        agent_service_.set_inventory_store(nullptr);
+        // stores below — null the borrowed pointer in the ingest service
+        // that actually borrows it (the gateway ProxyInventory path; the
+        // direct ReportInventory path has no generic-store loop and
+        // AgentServiceImpl's never-read/never-set pointer was deleted per
+        // governance LOW 2026-07-29), then drop the store, BEFORE the pool
+        // (governance IS1: this was previously the one PG store missing
+        // this unwire-then-reset step).
         if (gateway_service_)
             gateway_service_->set_inventory_store(nullptr);
         inventory_store_.reset();

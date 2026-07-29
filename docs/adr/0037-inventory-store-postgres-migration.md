@@ -67,6 +67,22 @@ argument does not justify here).
   returns without throwing — it must never block the gRPC/gateway ingest thread. The agent's
   next report re-sends the same blob, so a dropped write self-heals. This mirrors
   `SoftwareInventoryStore`'s ingest posture exactly.
+
+  **Stale-overwrite guard + agent-clock clamp (governance H2, 2026-07-29).** The Postgres
+  upsert adds a conflict predicate the SQLite implementation did not have:
+  `... DO UPDATE SET ... WHERE EXCLUDED.collected_at >= inventory_data.collected_at`, so a
+  reordered/duplicate OLDER report can never clobber a newer row. Because that predicate
+  compares the **agent-supplied** `collected_at`, the incoming value is first **clamped to
+  server receipt time** (`min(collected_at, now)`, with `0 → now` as before) — without the
+  clamp, one future-skewed or hostile report pins its row forever while every later honest
+  report silently updates zero rows (the exact defect the sibling `SoftwareInventoryStore`
+  fixed in #1685 / ADR-0016 Update 2026-06-27, and the standing clock-guard rule: on an
+  endpoint the user controls, a quiet reset IS the bypass). A conflict-predicate suppression
+  (zero rows updated on a genuinely-older report) is observable: it bumps
+  `yuzu_inventory_ingest_dropped_total{reason="stale"}` and a debug log — never a silent
+  success. Rows written by a pre-clamp deployment drain naturally as their stored
+  `collected_at` ages past `now`; no migration clamp is needed (this store shipped the guard
+  and the clamp in the same release, unlike the sibling's retrofit).
 - **Reads (`list_tables`, `get`, `query`, `get_agent_inventory`, `count`): AUTHORITATIVE.** A
   store/pool/query failure is reported as a degrade — `std::nullopt` for the list/count reads,
   `std::unexpected(InventoryReadError::kDegraded)` for the single-record `get` (mirroring
