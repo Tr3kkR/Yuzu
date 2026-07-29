@@ -35,8 +35,7 @@ param(
   [string]$ToolCache  = 'D:\ci\tool_cache',
   # Persistent CI telemetry is deliberately per runner (no cross-agent SQLite
   # writer contention) and outside every checkout/branch-clean boundary.
-  [string]$TelemetryRoot = 'D:\ci\test-runs',
-  [int]   $BuildJobs  = 16          # threads per CCD; caps ninja -j (see below)
+  [string]$TelemetryRoot = 'D:\ci\test-runs'
 )
 $ErrorActionPreference = 'Continue'
 
@@ -93,10 +92,14 @@ New-Item -ItemType Directory -Force (Split-Path $telemetryDb) | Out-Null
 [Environment]::SetEnvironmentVariable('YUZU_TEST_DB', $telemetryDb, 'Process')
 Write-Host "[r$Index] YUZU_TEST_DB = $telemetryDb (persistent, per-runner)"
 
-# Cap build parallelism to this CCD's thread count so ninja doesn't oversubscribe
-# the pinned threads (ninja sizes -j from the 64-CPU system count, ignoring the
-# affinity mask). ci.yml's Windows Build step honors -j $YUZU_BUILD_JOBS when set.
-[Environment]::SetEnvironmentVariable('YUZU_BUILD_JOBS', "$BuildJobs", 'Process')
+# Provisioning owns the build-width contract. Consume the refreshed machine
+# value rather than carrying a second wrapper default that can silently drift.
+# This wrapper is specific to the 9970X's fixed 16-thread CCD envelope.
+if($env:YUZU_BUILD_JOBS -ne '16'){
+  Write-Error "[r$Index] YUZU_BUILD_JOBS must be provisioned as 16 (got '$($env:YUZU_BUILD_JOBS ?? '<unset>')')"
+  exit 1
+}
+Write-Host "[r$Index] YUZU_BUILD_JOBS = $env:YUZU_BUILD_JOBS (provisioned machine contract)"
 
 # Registration-time self-test: assert the toolchain manifest (if present) before
 # taking jobs, so a mis-provisioned box is flagged loudly at startup instead of

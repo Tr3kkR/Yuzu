@@ -55,6 +55,21 @@ struct ReconcileResult {
     size_t removed{0};
 };
 
+/// Discriminated result of `RbacStore::authorize_list_read` — the ADR-0017
+/// admit-then-filter list gate for per-agent list/fan-out reads.
+enum class ListReadDecision {
+    DenyAll,     ///< no grant anywhere — 403 (REST) / empty (dashboard)
+    AdmitAll,    ///< global grant, or RBAC loaded-and-disabled → unfiltered read
+    AdmitScoped, ///< management-group-confined — read ONLY `visible_agents`
+};
+
+struct ListReadAuthorization {
+    ListReadDecision decision{ListReadDecision::DenyAll}; ///< fail-closed default (INV-1)
+    /// Populated ONLY for `AdmitScoped`; the management-group-visible agent set
+    /// (possibly empty ⇒ zero rows, INV-2). Left empty for Deny/AdmitAll.
+    std::vector<std::string> visible_agents;
+};
+
 class RbacStore {
 public:
     explicit RbacStore(const std::filesystem::path& db_path);
@@ -270,6 +285,54 @@ public:
                                  const std::string& operation, const std::string& agent_id,
                                  const ManagementGroupStore* mgmt_store) const;
 
+    // ── ADR-0017 admit-then-filter list gate ─────────────────────────────
+    /// The single chokepoint for list/fan-out reads of per-agent data under
+    /// management-group confinement (ADR-0017; resolves #1714 World A). Returns
+    /// a discriminated decision the transport wrappers (`require_list_read` and
+    /// its MCP/dashboard twins) render into 403 / unfiltered read / scoped read:
+    ///   * `AdmitAll`  — the caller holds `<securable>:<op>` globally, OR RBAC
+    ///     enforcement is loaded-and-explicitly-disabled (legacy-open); read the
+    ///     whole fleet, no per-agent filter.
+    ///   * `AdmitScoped(visible_agents)` — a management-group-confined caller;
+    ///     read ONLY `visible_agents` (empty set ⇒ zero rows, INV-2).
+    ///   * `DenyAll` — no grant anywhere; 403 (REST) / empty (dashboard).
+    /// FAIL-CLOSED (INV-1/INV-5): any `rbac.db`/mgmt-store error, `!is_open()`,
+    /// or unresolvable scope yields `DenyAll`, never `AdmitAll`. Keys on
+    /// `rbac_enforcement_in_effect()`. #1715 combining lattice: a global ALLOW
+    /// overrides a group deny (→ `AdmitAll`); a global DENY does NOT override a
+    /// group allow (additive) — deny-overrides applies only within a group's own
+    /// assignments. This is the ONE resolver that `check_scoped_permission`,
+    /// `holds_permission_via_any_group`, and `visible_agents_for_permission` all
+    /// share (INV-7), pinned by a cross-check test.
+    ListReadAuthorization authorize_list_read(const std::string& username,
+                                              const std::string& securable_type,
+                                              const std::string& operation,
+                                              const ManagementGroupStore* mgmt_store) const;
+
+    /// "Does this user hold `<securable>:<op>` via ANY management group?" — the
+    /// list-admit computation (ADR-0017), for a gate with no single `agent_id`
+    /// to pass to `check_scoped_permission`. True iff the user has at least one
+    /// group ALLOW assignment for the permission (a global grant is handled
+    /// separately by `authorize_list_read`'s `AdmitAll`). Fail-closed: false on
+    /// any store error.
+    bool holds_permission_via_any_group(const std::string& username,
+                                        const std::string& securable_type,
+                                        const std::string& operation,
+                                        const ManagementGroupStore* mgmt_store) const;
+
+    /// The permission-specific visible set (ADR-0017 INV-4, descendant-ward):
+    /// every agent the confined `username` may see for `<securable>:<op>`. The
+    /// INV-7 set-equivalence invariant (pinned by a property test):
+    ///   `visible_agents_for_permission(u,s,o) == { a : check_scoped_permission(u,s,o,a) }`
+    /// for a non-global caller. Computed batched as
+    /// `members(allow-groups ∪ descendants) \ members(deny-groups ∪ descendants)`.
+    /// Fail-closed (INV-1/INV-5): `unexpected(msg)` on any store error, so a
+    /// partial read never over-discloses (an unseen deny would).
+    std::expected<std::vector<std::string>, std::string>
+    visible_agents_for_permission(const std::string& username, const std::string& securable_type,
+                                  const std::string& operation,
+                                  const ManagementGroupStore* mgmt_store) const;
+
     /// Check if a specific role grants a permission (for service-scoped token validation).
     bool check_role_has_permission(const std::string& role_name, const std::string& securable_type,
                                    const std::string& operation) const;
@@ -296,6 +359,39 @@ private:
     /// namespace reservation (§3.3) is what keeps the three UNION arms from
     /// ever colliding. Caller must hold at least a shared lock on mtx_.
     std::vector<std::string> collect_roles_locked(const std::string& username) const;
+
+    // ── ADR-0017 shared list-gate resolver (INV-7) ───────────────────────
+    /// {groups where the user holds an ALLOW for (sec,op)} and {groups where a
+    /// DENY}. The ONE shared classification behind `check_scoped_permission`,
+    /// `holds_permission_via_any_group`, `visible_agents_for_permission`, and
+    /// `authorize_list_read` (INV-7). Fail-closed: `unexpected(msg)` on any
+    /// store error, so a read failure denies rather than silently dropping a
+    /// deny (→ over-disclosure).
+    struct PermGroups {
+        std::vector<std::string> allow_groups;
+        std::vector<std::string> deny_groups;
+    };
+    std::expected<PermGroups, std::string> resolve_perm_groups(
+        const std::string& username, const std::string& securable_type,
+        const std::string& operation, const ManagementGroupStore* mgmt_store) const;
+
+    /// `members(allow ∪ descendants) \ members(deny ∪ descendants)`, sorted +
+    /// deduped. Fail-closed: propagates any subtree-read error.
+    std::expected<std::vector<std::string>, std::string>
+    expand_visible_set(const PermGroups& pg, const ManagementGroupStore* mgmt_store) const;
+
+    /// The user's RBAC group names (`group_members`), error-propagating so a
+    /// read failure fails the whole resolution closed (INV-5).
+    std::expected<std::vector<std::string>, std::string>
+    user_rbac_group_names(const std::string& username) const;
+
+    /// Deny-wins (sec,op) verdict per role, from ONE targeted query
+    /// (`WHERE securable_type=? AND operation=?`) rather than materializing the
+    /// whole `role_permissions` table client-side — the ADR-0017 perf-F5 hot-path
+    /// fix (resolve_perm_groups runs per-agent in fleet-list loops). Map values:
+    /// -1 deny (wins), 1 allow, 0 none. Fail-closed: unexpected on store error.
+    std::expected<std::unordered_map<std::string, int>, std::string>
+    role_effects_for(const std::string& securable_type, const std::string& operation) const;
 
     // Permission cache (G3-PERF-004): avoids 2+ SQL queries per REST request.
     // Invalidated by incrementing cache_generation_ on any permission/role mutation.

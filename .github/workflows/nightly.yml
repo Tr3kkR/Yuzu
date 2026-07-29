@@ -31,6 +31,8 @@ env:
   CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
   CCACHE_COMPRESSLEVEL: "1"
+  # Big Tam and Wee Tam both allocate one 8C/16T L3 domain per runner.
+  YUZU_BUILD_JOBS: "16"
 
 jobs:
   # ── Preflight: Big Tam runner-health gate ─────────────────────────────
@@ -54,7 +56,7 @@ jobs:
       failure_kind: ${{ steps.health.outputs.failure_kind }}
       failure_report: ${{ steps.health.outputs.failure_report }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Probe runner health
@@ -102,7 +104,7 @@ jobs:
             fi
           fi
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -177,7 +179,7 @@ jobs:
             -Db_sanitize=address,undefined
 
       - name: Build
-        run: meson compile -C build-linux-asan
+        run: meson compile -C build-linux-asan -j "$YUZU_BUILD_JOBS"
 
       # Postgres for server tests (ADR-0006 decision 8, #1318).
       # Idempotent persistent docker container — per agent on the 4-runner
@@ -239,7 +241,7 @@ jobs:
             fi
           fi
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -324,7 +326,7 @@ jobs:
             -Db_sanitize=thread
 
       - name: Build
-        run: meson compile -C build-linux-tsan
+        run: meson compile -C build-linux-tsan -j "$YUZU_BUILD_JOBS"
 
       - name: Build gai_sync_shim (TSan + glibc getaddrinfo_a workaround)
         # cpp-httplib's non-blocking DNS routes through glibc's getaddrinfo_a(),
@@ -497,7 +499,7 @@ jobs:
             fi
           fi
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -588,7 +590,7 @@ jobs:
             -Dcpp_args="-D_DISABLE_STRING_ANNOTATION -D_DISABLE_VECTOR_ANNOTATION"
 
       - name: Build
-        run: meson compile -C build-windows-asan tests/yuzu_agent_tests ${YUZU_BUILD_JOBS:+-j $YUZU_BUILD_JOBS}
+        run: meson compile -C build-windows-asan tests/yuzu_agent_tests -j "$YUZU_BUILD_JOBS"
 
       - name: Test
         run: |
@@ -638,7 +640,7 @@ jobs:
             fi
           fi
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           clean: false
@@ -721,7 +723,7 @@ jobs:
             -Db_coverage=true
 
       - name: Build
-        run: meson compile -C build-linux-coverage
+        run: meson compile -C build-linux-coverage -j "$YUZU_BUILD_JOBS"
 
       # Postgres for server tests (ADR-0006 decision 8, #1318) — same
       # idempotent docker-container step as ci.yml's linux job.

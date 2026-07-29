@@ -98,7 +98,7 @@ jobs:
             | xargs -r docker image rm -f || true
           echo "healthcheck-gate leftovers older than 24h swept"
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # clean: false is load-bearing on the self-hosted agents: they share
@@ -145,7 +145,7 @@ jobs:
           after_total=$(find "$base/yuzu-vcpkg-binary-cache-"* -type f 2>/dev/null | wc -l || echo 0)
           echo "before=${before_total} deleted=${deleted} after=${after_total}"
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # clean: false is load-bearing on the self-hosted agents: they share

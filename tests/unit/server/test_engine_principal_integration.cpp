@@ -30,6 +30,7 @@
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
@@ -67,17 +68,51 @@ void setup_engine_principal_store_pg_template(const std::string& dsn) {
 yuzu::test::PgTestTemplate engine_principal_integ_template{
     "engineprincipal_integ", &setup_engine_principal_store_pg_template};
 
+// One migrated clone + one persistent pool for the whole FILE, TRUNCATE-reset
+// between tests instead of a fresh CREATE DATABASE + new pool per test (the
+// dominant Windows [pg]-shard cost, #2354 — see test_software_inventory_store
+// .cpp's SwinvShared, the reference conversion). Built lazily; at testRunEnded
+// the pool is drained and the clone dropped (keep_until_run_end). CARVE-OUT
+// note: the T8 collision-scan TEST_CASE below deliberately stays on per-case
+// AuthDbPg (NOT the shared sibling) — it needs a seeded and a clean AuthDB
+// database to coexist in one Catch2 leaf.
+struct EpIntegShared {
+    yuzu::test::PostgresTestDb db{engine_principal_integ_template};
+    std::optional<yuzu::server::pg::PgPool> pool;
+    EpIntegShared() {
+        INFO("[EpIntegShared] bundle status (blank == database came up OK): " << db.error());
+        REQUIRE(db.available());
+        pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = db.dsn(), .size = 4});
+        REQUIRE(pool->valid());
+        db.keep_until_run_end([this]() noexcept { pool.reset(); });
+    }
+};
+EpIntegShared& ep_integ_shared() {
+    static EpIntegShared s;
+    return s;
+}
+
+/// Same call-site interface as before; now a fresh store per fixture over the
+/// file-wide shared clone/pool, TRUNCATE-restored at construction (the ctor's
+/// migration check is a no-op on the already-migrated clone).
 class EnginePrincipalStorePg {
 public:
     EnginePrincipalStorePg() {
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
-        db_.emplace(engine_principal_integ_template);
-        REQUIRE(db_->available());
-        pool_.emplace(yuzu::server::pg::PgPool::Options{.conninfo = db_->dsn(), .size = 4});
-        REQUIRE(pool_->valid());
-        store_ = std::make_unique<EnginePrincipalStore>(*pool_);
+        {
+            // Scoped: released before the store ctor takes its own lease.
+            auto lease = ep_integ_shared().pool->acquire();
+            REQUIRE(lease);
+            auto trunc = yuzu::server::pg::exec_params(
+                lease.get(),
+                "TRUNCATE engine_principal_store.engine_principals RESTART IDENTITY CASCADE",
+                std::vector<std::string>{});
+            INFO("[EpIntegShared] reset: " << PQresultErrorMessage(trunc.get()));
+            REQUIRE(trunc.status() == PGRES_COMMAND_OK);
+        }
+        store_ = std::make_unique<EnginePrincipalStore>(*ep_integ_shared().pool);
         REQUIRE(store_->is_open());
     }
 
@@ -87,15 +122,9 @@ public:
     [[nodiscard]] EnginePrincipalStore* get() const noexcept { return store_.get(); }
     EnginePrincipalStore* operator->() const noexcept { return store_.get(); }
 
-    void reset() noexcept {
-        store_.reset();
-        pool_.reset();
-        db_.reset();
-    }
+    void reset() noexcept { store_.reset(); }
 
 private:
-    std::optional<yuzu::test::PostgresTestDb> db_;
-    std::optional<yuzu::server::pg::PgPool> pool_;
     std::unique_ptr<EnginePrincipalStore> store_;
 };
 
@@ -116,7 +145,7 @@ TEST_CASE("Engine session synthesis: active principal + engine token -> engine s
           "[pg][engine_principal][integration][auth_routes]") {
     Config cfg{};
     auth::AuthManager auth_mgr{};
-    yuzu::test::ApiTokenStorePg api_tokens;
+    yuzu::test::ApiTokenStorePgShared api_tokens;
     EnginePrincipalStorePg engine_store;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
@@ -237,7 +266,7 @@ TEST_CASE("Engine stream re-validation end-to-end: first tick authoritative, nex
           "[pg][engine_principal][integration][auth_routes][cache]") {
     Config cfg{};
     auth::AuthManager auth_mgr{};
-    yuzu::test::ApiTokenStorePg api_tokens;
+    yuzu::test::ApiTokenStorePgShared api_tokens;
     EnginePrincipalStorePg engine_store;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider;
@@ -558,7 +587,7 @@ TEST_CASE("ManagementGroupStore::assign_role rejects principal_type=='engine' ou
 
 TEST_CASE("ApiTokenStore engine block: referential integrity against a real EnginePrincipalStore",
           "[pg][engine_principal][integration][token]") {
-    yuzu::test::ApiTokenStorePg api_tokens;
+    yuzu::test::ApiTokenStorePgShared api_tokens;
     EnginePrincipalStorePg engine_store;
 
     REQUIRE(engine_store->create("Vuln Sync", "alice", "j", "internal", "admin", "engine:vuln")
@@ -645,7 +674,7 @@ TEST_CASE("ApiTokenStore engine block: referential integrity against a real Engi
 TEST_CASE("ApiTokenStore::create_token rejects an 'engine:'-namespaced principal_id under "
           "principal_kind=='human'",
           "[pg][engine_principal][integration][token]") {
-    yuzu::test::ApiTokenStorePg api_tokens;
+    yuzu::test::ApiTokenStorePgShared api_tokens;
     const auto now = now_epoch();
 
     SECTION("default (unspecified) principal_kind is rejected") {
@@ -682,7 +711,7 @@ namespace {
 struct EngineRbacGateFixture {
     Config cfg{};
     auth::AuthManager auth_mgr{};
-    yuzu::test::ApiTokenStorePg api_tokens;
+    yuzu::test::ApiTokenStorePgShared api_tokens;
     EnginePrincipalStorePg engine_store;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
