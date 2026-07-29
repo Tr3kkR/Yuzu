@@ -383,17 +383,24 @@ TEST_CASE("CROSS-CHECK: scope_kind_catalog entries are honored by evaluate_scope
             // `from_result_set:<id>` short-circuits to an implicit EXISTS
             // condition — `from_result_set:<id> == <value>` is a parse error).
             // No ResultSetStore wired here (authz semantics belong to
-            // test_scope_walking_authz.cpp) — assert the kind resolves to
-            // "no match" rather than throwing/crashing the parser.
+            // test_scope_walking_authz.cpp) — assert the kind is RECOGNISED by
+            // the resolver rather than throwing/crashing the parser.
             expr = "from_result_set:rs_nonexistent";
             auto parsed = yuzu::scope::parse(expr);
             REQUIRE(parsed.has_value());
-            // No rs_store passed — the from_result_set: preload never runs,
-            // so this call cannot degrade (nullopt); has_value() is always
-            // true here (ADR-0036).
+            // H1 (governance 2026-07-29): with no store to owner-resolve
+            // against, the resolver ABORTS (nullopt) — it never reports "no
+            // match". Reporting "no match" is the fail-open shape H1 closed: a
+            // `NOT from_result_set:<id>` atom would invert it into a
+            // fleet-wide match. See the `evaluate_scope` contract in
+            // agent_registry.hpp (abort case 3).
+            //
+            // This is a STRONGER cross-check than the unknown-kind arm below:
+            // a kind the resolver did NOT recognise falls through to the
+            // generic attribute path and yields a populated-but-empty vector,
+            // so only a recognised from_result_set: atom can produce nullopt.
             auto matched = registry.evaluate_scope(*parsed, nullptr);
-            REQUIRE(matched.has_value());
-            CHECK(matched->empty());
+            CHECK_FALSE(matched.has_value());
             continue;
         }
         if (k.kind == "ostype")
