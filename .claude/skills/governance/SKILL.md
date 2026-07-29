@@ -332,6 +332,12 @@ should cost a line of noise, not a lost finding.)
 
 ## Verify what you can, read-only
 
+Verify the reviewer read what you think it read. A finding derived from corrupted
+input is confident and wrong, and reads exactly like a finding derived from clean
+input — a shell `patsub_replacement` setting silently rewrote every `&` in a review
+payload on #2622, and the corruption was invisible in the output. Echo back a
+distinctive line of the source before trusting a review of it.
+
 Where a claim can be tested cheaply — a query, a compile, a one-case test — TEST IT
 and report the output. An empirically verified finding outranks a reasoned one, and
 a reasoned finding about observable behaviour should say it was not verified. The
@@ -1022,6 +1028,26 @@ Convergence is the strongest confidence signal this pipeline produces — "found
 independently by three agents" is why a finding gets acted on without re-derivation.
 This pass keeps that signal and drops the re-reading; it must not launder it.
 
+**But count only INDEPENDENT reporters.** This pipeline manufactures correlation on
+purpose: Gate 3 is handed Gate 2's findings and Gate 4 is handed Gate 2's and Gate
+3's, all "for your context only, do not duplicate". An agent that was SHOWN a
+finding and agrees is an echo, not a confirmation. Only agents in the SAME parallel
+wave — who could not see one another — are independent.
+
+So the attribution line reads `independently: 2 of 4 (Gate 4 wave); echoed: 1
+downstream`, never a bare count. A finding echoed by five downstream agents and
+raised independently by one is a ONE-agent finding. Record `independent_reporters`
+in the ledger, not just `agent`.
+
+This cuts both ways and neither direction is safe to assume: correlated reviewers
+overstate confidence, and a reviewer that defers to a peer's partial conclusion can
+withdraw a finding that was correct. Both have happened here inside a month — three
+reviewers confirming a false claim because they shared one stale working tree
+(#2604), and a reviewer dropping a true finding on a peer's incomplete evidence
+while that peer was independently confirming it (#2622). Neither is visible from
+the output. When it matters, measure the claim yourself rather than counting who
+agreed.
+
 ---
 
 ## Gate 7 — Findings Resolution
@@ -1081,6 +1107,7 @@ Strategy:
    | `impact` | `I1`…`I9` from the closed list |
    | `exposure` | every applicable `E1`…`E6`, or `unresolved` — a list, not one value |
    | `epistemic_status` | `verified` / `likely` / `speculative` |
+   | `independent_reporters` | how many agents raised it WITHOUT having been shown it — downstream echoes are not confirmations |
    | `policy_floor` | the floor hit, if the finding gates as a contract violation rather than by derivation |
    | `provenance` | `introduced` / `newly-reachable` / `pre-existing`. **Adjudicated, not inferred from prose.** Default to `introduced` when contested |
    | `file`, `line`, `summary` | where and what |

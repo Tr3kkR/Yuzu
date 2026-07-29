@@ -347,6 +347,32 @@ about prose" complaint. It is recorded here rather than left to be discovered. T
 a CLAUDE.md section that no longer exists (routed out in `c2e0b1c7`); that false citation
 is corrected in the same commit.
 
+### Reviewer independence — folded in from #2622
+
+@FortitudeEtc's #2622 review thread surfaced something this PR needs, because it bears
+directly on how confidence is recorded. Two failures of the same shape, a month apart and
+pointing opposite ways:
+
+- Three reviewers confirmed a factually wrong claim because all three read one working tree
+  whose merge-base predated the file in question (#2604 / this document §7).
+- A reviewer **withdrew a correct finding** on a peer's incomplete evidence, while that peer
+  was independently confirming it (#2622).
+
+Neither is visible from the transcript. As he put it: correlated reviewers are worth less
+than their count suggests, and neither party can tell from the output.
+
+That is not just an anecdote about external reviews — **this pipeline manufactures the
+correlation deliberately**. Gate 3 is handed Gate 2's findings, Gate 4 is handed Gate 2's
+and Gate 3's, and Gate 6b then reports convergence as "the strongest confidence signal this
+pipeline produces". An agent shown a finding that agrees with it is an echo, not a second
+opinion. The synthesis pass now counts only same-wave reporters as independent, the
+attribution line says which is which, and `independent_reporters` is a ledger field.
+
+The same thread produced a second, cheaper lesson: a shell `patsub_replacement` setting
+silently rewrote every `&` in a review payload, so one reviewer analysed corrupted source
+and produced confident findings about the corruption rather than an error. Reviewing input
+integrity is now part of the empiricism rule.
+
 ### What this does and does not claim
 
 It does not make an LLM's assignment deterministic. It makes the assignment **auditable**:
