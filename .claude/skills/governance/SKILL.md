@@ -1108,11 +1108,12 @@ is unchanged.
 
 An INVALID finding — false, inapplicable, or disproven — is `rejected` with the
 evidence. At a derived CRITICAL/HIGH, or on a policy floor, `rejected` additionally
-requires an adjudicator recorded in `adjudicated_by` who is not the author and
-not the agent that raised it — the same separation the floor exception at the top of
-this file asks for when it says "an agent other than the one proposing it". Otherwise "inapplicable" is a
-self-granted waiver, and the dangerous disposition ends up cheaper than the safe
-one.
+requires an adjudicator recorded in `adjudicated_by` who is not the author, not the
+agent that raised it, and not the party arguing the rejection. That is STRICTER than
+the floor exception at the top of this file ("an agent other than the one proposing
+it") and does not claim to restate it — an earlier revision asserted the two were
+the same separation and they are not. Otherwise "inapplicable" is a self-granted
+waiver, and the dangerous disposition ends up cheaper than the safe one.
 
 Everything below applies ONLY to findings that are valid and non-blocking.
 
@@ -1218,13 +1219,26 @@ excluded from the active backlog, and crucially **retained in the
 duplicate-detection snapshot**, so the next run touching that area surfaces it.
 That is the resurfacing mechanism: proximity, not a calendar.
 
-Parking is CONSTRAINED, and the constraints are stated at the filing procedure
-rather than here — deliberately, next to the command and the dedupe step that
-execute them. Every previous revision of this section stated a rule in Gate 7 that
-some procedure 200 lines away had to carry out, and every time the two ends
-disagreed. Do not restate them here: a rule written at both ends is how they drift.
-In summary only: a park is barred for findings carrying `I1`/`I2`/`I3`, and a second
-sighting escalates out of `roadmap`.
+Parking is CONSTRAINED. Two constraints, stated HERE because this is where the
+disposition is decided. The procedure that carries them out holds the command and
+the check but **not** the rule — every previous revision put the rule in one place
+and an echo of it in the other, and the echo went stale every time, most recently a
+summary that dropped the band-independence clause in constraint 1, which is the half
+that does the work.
+
+1. **`roadmap` is unavailable for any finding carrying `I1`, `I2` or `I3` in its
+   ledger `impact` list, whatever its derived band.** A finding lands at MEDIUM when
+   its EXPOSURE is rare, not when its consequence is small. A rare path to a failed
+   security control, to data loss, or to a silent wrong answer gets a priority, not
+   a park.
+2. **Escalate on second sighting.** If the mandatory dedupe probe turns up an
+   existing `roadmap` issue for a finding a later run raises again, that recurrence
+   is the signal it is not going away: fix it, or promote it out of `roadmap` with a
+   priority. **Never re-park.** This bounds the failure at ignored-once.
+
+A third of the tracker already carries the label, so both matter. Constraint 1 is
+checkable against the ledger and Gate 8 step 4 does it; constraint 2 needs the
+dedupe probe's result and the target issue's labels, so it stays procedural.
 
 Neither the number of issues nor the number of parks is a target. What is required
 is that every valid finding ends somewhere recorded — fixed, filed, linked to an
@@ -1332,7 +1346,7 @@ for whoever owns that runner.
    | `provenance` | `introduced` / `newly-reachable` / `pre-existing`. **Adjudicated, not inferred from prose.** Default to `introduced` when contested |
    | `file`, `line`, `summary` | where and what |
    | `classification` + rationale | truth-contradiction vs wording, and why |
-   | `disposition` | `fixed` / `deferred-to-issue #N` / `roadmap-#N` / `linked-to-#N` / `re-cut` / `rejected`. The `#N` values are completed when the issue is filed or identified, which happens after the run — fill them in before the PR merges; the fragment is committed with the work and may be amended until then. `roadmap-#N` is valid work parked per Gate 7, subject to the constraints stated at the post-run filing procedure — do not restate them here. `re-cut` records that the original acceptance criteria travelled to the mechanism. `rejected` means false, inapplicable or disproven — at CRITICAL/HIGH or on a floor it requires a non-author `adjudicated_by` |
+   | `disposition` | `fixed` / `deferred-to-issue #N` (a NEW issue was filed) / `roadmap-#N` (parked) / `linked-to-#N` (an EXISTING issue already covers it) / `split` / `re-cut` / `rejected`. The `#N` values are completed when the issue is filed or identified, which happens after the run: fill them in before the PR merges, in a NEW commit — never `git commit --amend` or a rebase, which rewrites evidence a reviewer may already have read. If filing slips past the merge, amend on `dev` in a follow-up commit and say so in the run report; a fragment left holding `#?` makes the park unauditable, which is the failure the disposition exists to prevent. `roadmap-#N` is valid work parked per Gate 7, under the two constraints stated there. `split` records that the work left this change as its own review unit; `re-cut` that the original acceptance criteria travelled to the mechanism. `rejected` means false, inapplicable or disproven — at CRITICAL/HIGH or on a floor it requires the `adjudicated_by` separation Gate 7 states |
    | `adjudicated_by` (nullable) | who approved a departure, and that they were not the change's author |
    | `caused_by` (nullable) | did round N's fix create this round N+1 finding |
    | `waiver_rationale` (nullable) | *why* an unresolved gating finding was allowed to pass. A signature with no reasoning is content-free exception evidence |
@@ -1355,6 +1369,34 @@ for whoever owns that runner.
    mattered" are both unfalsifiable, and no roster change can be argued from evidence.
    See `docs/governance-skill-tuning-2026-07.md`.
 
+4. **Check the dispositions against the ledger BEFORE the final decision.** Gate 7's
+   first park constraint is the only one a machine can see, so see it — whoever writes
+   the run report runs this against the fragment from step 3:
+
+   ```bash
+   jq -e 'select((.disposition | test("^(roadmap|linked-to)-")) and
+                 (.impact[]? | test("^I[123]$")))' governance.d/<fragment>.jsonl
+   ```
+
+   It must match NOTHING. **A clean check is exit 4 and a violation is exit 0** —
+   `jq -e` reports 4 when no result was produced at all, so the PASS case here is the
+   non-zero one. Measured on jq-1.8.1; do not wire it into a bare `if` or `&&` without
+   accounting for that inversion. A match is a park, or a dedupe-link onto a parked
+   issue, carrying `I1`, `I2` or `I3`. The gate does not pass and the report does not
+   go out until that row is re-dispositioned.
+
+   `linked-to-` is in the pattern deliberately: linking an `I1` finding onto an
+   existing `roadmap` issue reaches the same outcome as parking it, and a check that
+   only saw `roadmap-` would miss it.
+
+   **What this check cannot see, and an earlier revision wrongly claimed it could:**
+   the label half of the park contract (`roadmap` XOR priority + triage state) lives
+   on GitHub, not in any ledger field, and constraint 2 needs the dedupe probe's
+   result. Both stay procedural. It also reads a field the author supplied — an
+   `impact` list with `I1` omitted passes it, which is the gaming vector the severity
+   block already names — so spot-check parked rows' `impact` against their own
+   `trigger` and `summary`.
+
 ## Known patterns from prior runs
 
 **Pattern A: sibling IDOR.** When fixing an authorization gap on endpoint X, grep for every other endpoint in the same file/semantic and verify they have the same check. #222 closed the REST path but left the HTMX dashboard path open. The governance security-guardian caught it only when explicitly told to look for siblings.
@@ -1373,10 +1415,11 @@ One full governance run on a non-trivial commit range is ~6-9 parallel agent cal
 
 Skipping Gate 4 or Gate 5 to save time is rarely worth it. **Do NOT skip Gate 3 domain agents on the grounds that a change is small** — that guidance predates the unconditional routed-trigger floor above and contradicts it. Diff size does not gate a routed concern: `.claude/routed-concerns.md` keys on file identity and change type precisely because those files carry catastrophic-if-violated invariants at any line count. Use the decision matrix to decide WHICH agents, never WHETHER.
 
-## Post-run follow-ups — file deferred findings per the issue standard
+## Post-run follow-ups — file or park deferred findings per the issue standard
 
-After the run passes and the commits push, file whatever Gate 7's disposition step
-routed to filing.
+After the run passes and the commits push, file **or park** whatever Gate 7's
+disposition step routed to either. Both branches are in step 3; the constraints on
+parking are Gate 7's, stated there.
 
 **There is no expected number, and the previous version of this sentence gave
 one.** It said a run "typically produces 8-15 deferred follow-up items", which
@@ -1399,33 +1442,31 @@ procedure:
    An existing issue covers it → comment the new evidence there instead of filing. Related but a distinct outcome → file with `Relates to #N` in the body.
 
    **If the duplicate target carries `roadmap`, comment-and-leave is FORBIDDEN.** That
-   is a re-park, and a recurrence is the signal the finding is not going away: fix it,
-   or promote the issue out of `roadmap` — which means removing the `roadmap` label and
-   adding exactly one priority AND exactly one triage state, since `triage-labels.md`
-   requires every non-`roadmap` issue to carry both. A half-promoted issue is a
-   contract violation. Record the promotion in the ledger row's rationale.
+   is a re-park, barred by Gate 7's second constraint: fix it, or promote the issue out
+   of `roadmap` — remove the `roadmap` label, add a triage state, and add a priority
+   once triaged (`triage-labels.md`: `roadmap` never coexists with a priority or a
+   triage state, and a triaged issue carries both). A half-promoted issue is a contract
+   violation. Name the promotion in the run report: the ledger row records
+   `linked-to-#N`, and no ledger field carries a free-text disposition note.
 3. **File survivors** with the four body sections (Context / Evidence with `file:line` against current `origin/dev` / Acceptance criteria / Origin naming this governance run plus the dedupe probes and their results):
    ```bash
    gh issue create --repo Tr3kkR/Yuzu --title "..." \
      --label <type> --label governance-deferred --label <P1|P2> --label ready-for-agent \
      --body-file <candidate>.md
    ```
-   **Parking instead of filing** — for valid work that will not be scheduled. `roadmap`
-   is XOR with (priority + triage state) per `docs/agents/triage-labels.md`, so the park
-   branch carries NEITHER:
+   **Parking instead of filing** — for valid work that will not be scheduled, under the
+   two constraints at Gate 7's "Filing, parking, and why the default matters". The rule
+   is there; the command is here. `roadmap` is XOR with (priority + triage state) per
+   `docs/agents/triage-labels.md`, so the park branch carries NEITHER:
    ```bash
    gh issue create --repo Tr3kkR/Yuzu --title "..." \
      --label <type> --label governance-deferred --label roadmap \
      --body-file <candidate>.md
    ```
    No `P0/P1/P2`, no `ready-for-agent`/`needs-triage`. `governance-deferred` is an
-   inflow counter, not a priority or a triage state, so it survives the XOR. Parking is
-   **barred** for any finding carrying `I1` (security-control failure), `I2` (data loss)
-   or `I3` (silent wrong answer) in its ledger `impact` list, **whatever its derived
-   band** — a finding lands at MEDIUM when its EXPOSURE is rare, not when its
-   consequence is small, and a rare path to those three gets a priority, not a park.
-   Both facts are mechanically checkable from the ledger: no row may carry
-   `roadmap-#N` together with `I1`/`I2`/`I3`. Check it before the run report goes out.
+   inflow counter, not a priority or a triage state, so it survives the XOR. The
+   ledger-side check on the `I1`/`I2`/`I3` bar has already run by this point — it is
+   Gate 8 step 4, before the gate passes, not after the commits push.
 
    (`<type>` and `<P1|P2>` are placeholders — pass exactly one real label each, e.g. `--label task --label P2`.
    `gh search issues` is rate-limited (~30/min): on a 403 mid-batch, wait 60 seconds and continue —
