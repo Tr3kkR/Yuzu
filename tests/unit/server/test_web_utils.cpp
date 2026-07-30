@@ -310,6 +310,60 @@ TEST_CASE("normalise_trusted_origins: splitting, trimming, casing, ports", "[web
         const auto got = normalise_trusted_origins(std::vector<std::string>{" , ,\t", ""});
         CHECK(got.empty());
     }
+    SECTION("a BARE entry with an explicit default port is refused as ambiguous") {
+        // This section previously asserted the OPPOSITE — that `h:443` collapsing
+        // to `h` was "deliberate". It was not: `h` then admitted BOTH `http://h`
+        // and `https://h`, which is verbatim the defect the scheme-aware strip
+        // was added to close, surviving on the axis its own tests did not cover.
+        // A test that blesses a defect is worse than no test, so this pins the
+        // refusal instead.
+        //
+        // Refusal, not a guess: `h:443` cannot say which scheme it means, and
+        // keeping the port would make it unmatchable (the request side
+        // canonicalises `https://h:443` to `h`). The operator writes the scheme.
+        CHECK(normalise_trusted_origins(std::vector<std::string>{"h:443"}).empty());
+        CHECK(normalise_trusted_origins(std::vector<std::string>{"h:80"}).empty());
+        // A non-default port is unambiguous under either scheme and is kept.
+        {
+            const auto got = normalise_trusted_origins(std::vector<std::string>{"h:8443"});
+            REQUIRE(got.size() == 1);
+            CHECK(got[0] == "h:8443");
+        }
+        // And the scheme-qualified forms are the documented way to say it.
+        {
+            const auto got = normalise_trusted_origins(std::vector<std::string>{"https://h:443"});
+            REQUIRE(got.size() == 1);
+            CHECK(got[0] == "https://h");
+        }
+    }
+    SECTION("a bare entry still matches its host under either scheme") {
+        // The looseness that IS deliberate: no port means no port, and the
+        // request side canonicalises the scheme's own default away, so one bare
+        // entry covers `https://h`, `https://h:443`, `http://h` and `http://h:80`
+        // — while `https://h:80` stays a different origin.
+        const auto trusted = normalise_trusted_origins(std::vector<std::string>{"h"});
+        REQUIRE(trusted.size() == 1);
+        CHECK(origin_is_same_site("proxy:8080", "https://h", "", trusted));
+        CHECK(origin_is_same_site("proxy:8080", "https://h:443", "", trusted));
+        CHECK(origin_is_same_site("proxy:8080", "http://h", "", trusted));
+        CHECK(origin_is_same_site("proxy:8080", "http://h:80", "", trusted));
+        CHECK_FALSE(origin_is_same_site("proxy:8080", "https://h:80", "", trusted));
+    }
+    SECTION("guards run on the CANONICAL form, so port suffixes cannot smuggle") {
+        // Each of these reached the allowlist before the guard order was fixed:
+        // `null:443` normalised to `null` and admitted every opaque origin;
+        // `:443` normalised to `""` and matched a host-less source.
+        CHECK(normalise_trusted_origins(std::vector<std::string>{"null:443"}).empty());
+        CHECK(normalise_trusted_origins(std::vector<std::string>{"null:80"}).empty());
+        CHECK(normalise_trusted_origins(std::vector<std::string>{"NULL:443"}).empty());
+        CHECK(normalise_trusted_origins(std::vector<std::string>{":443"}).empty());
+        CHECK(normalise_trusted_origins(std::vector<std::string>{"https://:443"}).empty());
+    }
+    SECTION("userinfo is refused here as well as on the request side") {
+        // Kept verbatim before, so the boot log advertised an entry that the
+        // request side would always fail closed on — dishonest deployment evidence.
+        CHECK(normalise_trusted_origins(std::vector<std::string>{"https://evil@h"}).empty());
+    }
     SECTION("default-port stripping is SCHEME-AWARE (#2641 review)") {
         // The two sections above pin the cases where scheme and default port
         // AGREE. These are the cases where they DISAGREE, and the first version
@@ -319,19 +373,23 @@ TEST_CASE("normalise_trusted_origins: splitting, trimming, casing, ports", "[web
         //
         // RFC 6454: an origin is (scheme, host, port), and the port is omitted
         // from the canonical form only when it is that SCHEME's default.
-        CHECK(normalise_trusted_origins(std::vector<std::string>{"https://h:80"})[0] == "https://h:80");
-        CHECK(normalise_trusted_origins(std::vector<std::string>{"http://h:443"})[0] == "http://h:443");
+        // Bound and size-checked before indexing: `normalise_trusted_origins`
+        // legitimately DROPS entries, so a bare `[0]` on a regression would be
+        // out-of-range UB presenting as a crash or a false pass, not a clean
+        // failure. The sections above use the same shape.
+        const auto https_80 = normalise_trusted_origins(std::vector<std::string>{"https://h:80"});
+        REQUIRE(https_80.size() == 1);
+        CHECK(https_80[0] == "https://h:80");
+        const auto http_443 = normalise_trusted_origins(std::vector<std::string>{"http://h:443"});
+        REQUIRE(http_443.size() == 1);
+        CHECK(http_443[0] == "http://h:443");
         // ...while the scheme's OWN default still collapses.
-        CHECK(normalise_trusted_origins(std::vector<std::string>{"https://h:443"})[0] == "https://h");
-        CHECK(normalise_trusted_origins(std::vector<std::string>{"http://h:80"})[0] == "http://h");
-    }
-    SECTION("a bare entry stays scheme-agnostic, and that is deliberate") {
-        // A bare host carries no scheme, so it cannot have a scheme default to
-        // consult; it matches host-only by design. Both default ports therefore
-        // still collapse here — this is the loose form, and an operator wanting
-        // strictness writes the scheme.
-        CHECK(normalise_trusted_origins(std::vector<std::string>{"h:443"})[0] == "h");
-        CHECK(normalise_trusted_origins(std::vector<std::string>{"h:80"})[0] == "h");
+        const auto https_443 = normalise_trusted_origins(std::vector<std::string>{"https://h:443"});
+        REQUIRE(https_443.size() == 1);
+        CHECK(https_443[0] == "https://h");
+        const auto http_80 = normalise_trusted_origins(std::vector<std::string>{"http://h:80"});
+        REQUIRE(http_80.size() == 1);
+        CHECK(http_80[0] == "http://h");
     }
     SECTION("the reserved token `null` is refused as an entry (#2641 review)") {
         // `Origin: null` is what every sandboxed iframe, redirected POST and
@@ -341,9 +399,15 @@ TEST_CASE("normalise_trusted_origins: splitting, trimming, casing, ports", "[web
         // foot-gun.
         CHECK(normalise_trusted_origins(std::vector<std::string>{"null"}).empty());
         CHECK(normalise_trusted_origins(std::vector<std::string>{"NULL"}).empty());
-        CHECK(normalise_trusted_origins(std::vector<std::string>{"https://null"}).empty());
-        // A host that merely CONTAINS the token is a real host and is kept.
-        CHECK(normalise_trusted_origins(std::vector<std::string>{"null.example"})[0] == "null.example");
+        // A host that merely CONTAINS the token is a real host and is kept,
+        // and so is a SCHEME-QUALIFIED `null` — the opaque serialisation is the
+        // bare token only, so refusing `https://null` was a false refusal.
+        const auto contains = normalise_trusted_origins(std::vector<std::string>{"null.example"});
+        REQUIRE(contains.size() == 1);
+        CHECK(contains[0] == "null.example");
+        const auto qualified = normalise_trusted_origins(std::vector<std::string>{"https://null"});
+        REQUIRE(qualified.size() == 1);
+        CHECK(qualified[0] == "https://null");
     }
 }
 

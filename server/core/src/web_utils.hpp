@@ -222,6 +222,32 @@ inline std::string url_decode(const std::string& s) {
     return out;
 }
 
+/// Strip `hostport`'s trailing port ONLY when it is the default for `scheme`.
+///
+/// `scheme` is the lowercased `"https://"` / `"http://"` prefix, or empty. An
+/// EMPTY scheme strips nothing: without a scheme there is no default to be the
+/// default OF, and guessing is what the #2641 review caught. The earlier version
+/// treated empty as "collapse both 443 and 80", which meant a bare entry
+/// `h:443` silently also trusted `http://h` — the exact defect this function was
+/// added to fix, surviving on the axis its tests did not cover. A bare entry
+/// carrying an explicit default port is now REFUSED by
+/// `normalise_trusted_origins` as ambiguous rather than quietly widened here.
+///
+/// A leading `:` (`":443"`) is left alone: erasing at index 0 would yield an
+/// empty entry, and an empty entry matches a host-less source.
+[[nodiscard]] inline std::string strip_scheme_default_port(std::string hostport,
+                                                           std::string_view scheme) {
+    const auto colon = hostport.rfind(':');
+    if (colon == std::string::npos || colon == 0)
+        return hostport;
+    const auto port = hostport.substr(colon + 1);
+    const bool is_default =
+        (scheme == "https://" && port == "443") || (scheme == "http://" && port == "80");
+    if (is_default)
+        hostport.erase(colon);
+    return hostport;
+}
+
 /// Normalise operator-supplied CSRF trusted origins (`--csrf-trusted-origin`,
 /// #2537) into the form `origin_is_same_site` compares against. Call ONCE at
 /// boot, not per request.
@@ -231,12 +257,26 @@ inline std::string url_decode(const std::string& s) {
 /// do NOT add a CLI11 `->delimiter(',')` (that would split twice and mangle
 /// entries — the #1271 lesson on the SAN parser).
 ///
-/// Normalisation is: trim, drop empties, drop the reserved token `null`,
-/// ASCII-lowercase, drop any path/query/fragment tail, and strip a default port
-/// — but only the default port OF THE ENTRY'S OWN SCHEME. A scheme is PRESERVED
-/// when supplied, because an entry that carries one is compared on scheme as
-/// well as host — that is how a configured deployment also closes the weaker
-/// half of #2537, where `http://h` satisfied a request to `https://h`.
+/// Normalisation runs IN THIS ORDER, and the order is load-bearing — an earlier
+/// version documented a different one, and following the documented sequence
+/// would have re-admitted `NULL` and `null/x` as entries:
+///
+///   1. split on commas, trim, drop whitespace-only pieces
+///   2. ASCII-lowercase
+///   3. split the scheme off (so the path strip cannot eat `//`)
+///   4. drop any path/query/fragment tail
+///   5. refuse a BARE entry carrying an explicit `:443`/`:80` as ambiguous
+///   6. strip the default port OF THE ENTRY'S OWN SCHEME
+///   7. drop empties, the bare reserved token `null`, and anything with userinfo
+///
+/// Steps 6 and 7 are in that order on purpose: every guard must see the CANONICAL
+/// value. Running them the other way round is how `null:443` and `:443` reached
+/// the allowlist as `null` and `""`.
+///
+/// A scheme is PRESERVED when supplied, because an entry that carries one is
+/// compared on scheme as well as host — that is how a configured deployment also
+/// closes the weaker half of #2537, where `http://h` satisfied a request to
+/// `https://h`.
 ///
 /// The scheme-awareness of the port strip is load-bearing and was missing in the
 /// first version (#2641 review). Stripping `443`/`80` unconditionally collapsed
@@ -250,27 +290,6 @@ inline std::string url_decode(const std::string& s) {
 /// verbatim and will simply never match, which fails closed. Silently accepting
 /// a wildcard in a CSRF allowlist would be the whole control undone by one
 /// character.
-/// Strip `hostport`'s trailing port ONLY when it is the default for `scheme`.
-///
-/// `scheme` is the lowercased `"https://"` / `"http://"` prefix, or empty. An
-/// empty scheme means the caller could not know a default — a bare allowlist
-/// entry, or an `Origin` with no scheme — and is deliberately treated as the
-/// LOOSE case: both `443` and `80` collapse, because a bare entry matches on
-/// host alone by design and an operator wanting strictness writes the scheme.
-[[nodiscard]] inline std::string strip_scheme_default_port(std::string hostport,
-                                                           std::string_view scheme) {
-    const auto colon = hostport.rfind(':');
-    if (colon == std::string::npos)
-        return hostport;
-    const auto port = hostport.substr(colon + 1);
-    const bool is_default = scheme.empty() ? (port == "443" || port == "80")
-                                           : (scheme == "https://" && port == "443") ||
-                                                 (scheme == "http://" && port == "80");
-    if (is_default)
-        hostport.erase(colon);
-    return hostport;
-}
-
 [[nodiscard]] inline std::vector<std::string>
 normalise_trusted_origins(std::span<const std::string> raw) {
     std::vector<std::string> out;
@@ -301,17 +320,54 @@ normalise_trusted_origins(std::span<const std::string> raw) {
                 if (const auto idx = piece.find(delim); idx != std::string::npos)
                     piece.erase(idx);
             }
-            if (piece.empty())
+            // A BARE entry carrying an explicit default port is AMBIGUOUS and is
+            // refused. `h:443` cannot say which scheme it means, and the previous
+            // answer — collapse it to `h` and match either scheme — reproduced
+            // exactly the defect this whole function exists to prevent: declaring
+            // one origin silently trusted a second. Refusing is the only honest
+            // option, because both alternatives are wrong (guessing https is a
+            // guess; keeping the port makes it unmatchable, since the request side
+            // canonicalises `https://h:443` to `h`). The operator writes
+            // `https://h` or `http://h` and the ambiguity disappears.
+            // `main.cpp` reports supplied-vs-accepted counts at boot so a refusal
+            // is visible rather than silent.
+            if (scheme.empty()) {
+                if (const auto colon = piece.rfind(':');
+                    colon != std::string::npos && colon != 0) {
+                    const auto port = piece.substr(colon + 1);
+                    if (port == "443" || port == "80")
+                        continue;
+                }
+            }
+
+            piece = strip_scheme_default_port(std::move(piece), scheme);
+
+            // Both guards below run on the CANONICAL form, deliberately. Running
+            // them earlier is how `null:443` and `:443` slipped past: each guard
+            // inspected an intermediate value that the port strip then turned
+            // into the very thing being guarded against (#2641 governance).
+            // Empty, or host-less (`:443`). A leading colon means the host part
+            // is absent, which is not an origin: `strip_scheme_default_port`
+            // deliberately will not erase at index 0 (that would manufacture an
+            // empty entry), so the check has to name both shapes.
+            if (piece.empty() || piece.front() == ':')
                 continue;
             // `null` is the RESERVED serialisation of an opaque origin — what a
             // sandboxed iframe, a cross-origin redirected POST and a `file://`
             // document all send. It is not a host, so an entry of `null` would
             // admit every one of them at once. Refuse it rather than hand an
-            // operator that foot-gun (#2641 review). A host that merely CONTAINS
-            // the token (`null.example`) is a real host and is kept.
-            if (piece == "null")
+            // operator that foot-gun (#2641 review).
+            //
+            // Gated on a BARE entry: the opaque serialisation is the token alone,
+            // never scheme-qualified. `https://null` is a real (if unfortunate)
+            // internal hostname and is kept — refusing it was a false refusal.
+            // A host that merely CONTAINS the token (`null.example`) is kept too.
+            if (scheme.empty() && piece == "null")
                 continue;
-            piece = strip_scheme_default_port(std::move(piece), scheme);
+            // Userinfo is rejected on the REQUEST side and must be rejected here
+            // too, or the boot log advertises an entry that can never match.
+            if (piece.find('@') != std::string::npos)
+                continue;
             out.push_back(scheme + piece);
         }
     }
@@ -406,9 +462,16 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
     // and `https://h` stay distinct on both sides rather than collapsing into
     // one over-broad entry (#2641 review).
     const std::string want_scheme = extract_scheme(source);
-    std::string want = strip_scheme_default_port(*extracted, want_scheme);
+    std::string want = strip_scheme_default_port(std::move(*extracted), want_scheme);
     for (auto& c : want)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    // Defence in depth, and deliberately not delegated. `normalise_trusted_origins`
+    // drops every entry that could match an empty host, but that is a DIFFERENT
+    // function — the gate's safety should not rest on an invariant enforced
+    // elsewhere, especially now that five call sites supply the span. An empty
+    // `want` means a host-less source, which is never a same-site claim.
+    if (want.empty() || want.front() == ':')
+        return false;
     for (const auto& entry : trusted_origins) {
         if (const auto sep = entry.find("://"); sep != std::string::npos) {
             // Scheme-qualified entry: BOTH must match, so https:// in config

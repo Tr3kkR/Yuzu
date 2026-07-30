@@ -730,8 +730,26 @@ int main(int argc, char* argv[]) {
     // exactly once at boot rather than per request. Storing the normalised form
     // back into cfg means every consumer compares like for like, and the gate
     // itself stays a pure comparison.
+    // Count what was SUPPLIED before normalising, so a rejected entry can be
+    // reported. Normalisation legitimately drops pieces (empty, host-less,
+    // userinfo, the reserved `null`, an ambiguous bare `h:443`), and a raw token
+    // may itself be comma-separated, so the count is per piece, not per flag.
+    std::size_t supplied = 0;
+    for (const auto& token : cfg.csrf_trusted_origins) {
+        std::size_t pos = 0;
+        while (pos <= token.size()) {
+            const auto comma = token.find(',', pos);
+            const auto piece = token.substr(pos, comma == std::string::npos ? std::string::npos
+                                                                           : comma - pos);
+            pos = (comma == std::string::npos) ? token.size() + 1 : comma + 1;
+            if (piece.find_first_not_of(" \t\r\n") != std::string::npos)
+                ++supplied;
+        }
+    }
     cfg.csrf_trusted_origins = yuzu::server::normalise_trusted_origins(cfg.csrf_trusted_origins);
-    if (!cfg.csrf_trusted_origins.empty()) {
+    const std::size_t accepted = cfg.csrf_trusted_origins.size();
+
+    if (accepted > 0) {
         // Boot-log the accepted set as deployment evidence: an operator who
         // mistypes an entry sees an opaque 403 at the dashboard, and this line
         // is what turns that into a two-second diagnosis.
@@ -743,7 +761,20 @@ int main(int argc, char* argv[]) {
         }
         spdlog::info("CSRF same-site gate: accepting {} operator-declared external origin(s) "
                      "in addition to the request Host — {}",
-                     cfg.csrf_trusted_origins.size(), joined);
+                     accepted, joined);
+    }
+    // A config whose entries were ALL rejected previously logged nothing — boot
+    // output byte-identical to not passing the flag, followed by every proxied
+    // dashboard POST 403ing opaquely. That is the exact diagnosis this logging
+    // exists to provide, so silence was the one outcome it could not afford.
+    // Partial rejection was equally quiet: `null,https://h` logged "1 origin"
+    // while the operator supplied two.
+    if (supplied > accepted) {
+        spdlog::warn("CSRF same-site gate: {} of {} supplied --csrf-trusted-origin value(s) were "
+                     "REJECTED as invalid and are NOT trusted. Rejected shapes: empty, host-less "
+                     "(`:443`), userinfo (`u@h`), the reserved token `null`, and a bare host with "
+                     "an explicit default port (`h:443` — write `https://h` or `http://h`).",
+                     supplied - accepted, supplied);
     }
 
     // ── MFA enforcement mode advisory ──

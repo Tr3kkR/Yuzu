@@ -251,12 +251,27 @@ scheme**:
 | `http://yuzu.example:80` | `http://yuzu.example` | 80 is the http default |
 | `https://yuzu.example:80` | *unchanged* | 80 is **not** the https default, so it is significant |
 | `yuzu.example:8443` | *unchanged* | not a default under any scheme |
-| `yuzu.example:443` | `yuzu.example` | a bare entry is scheme-agnostic, so either default collapses |
+| `yuzu.example:443` | **rejected** | ambiguous — a bare entry cannot say which scheme's default this is |
 
-The scheme-qualified rows matter. An earlier version stripped `:80`/`:443` without consulting the
-scheme, so `https://yuzu.example:80` collapsed onto `https://yuzu.example` — which is port 443.
-Declaring one origin silently trusted a second. Write the scheme when you want the port to mean
-something.
+The last row is the one to read twice. An earlier version collapsed a bare `yuzu.example:443` to
+`yuzu.example`, which then trusted **both** `http://yuzu.example` and `https://yuzu.example` — one
+declared origin silently trusting a second, which is the whole defect this canonicalisation exists
+to prevent. Guessing `https` would be a guess, and keeping the port would make the entry unmatchable
+(the request side canonicalises `https://yuzu.example:443` to `yuzu.example`). So it is refused, and
+you write `https://yuzu.example` or `http://yuzu.example` instead.
+
+A bare entry with **no** port is still deliberately loose: `yuzu.example` covers
+`https://yuzu.example`, `https://yuzu.example:443`, `http://yuzu.example` and
+`http://yuzu.example:80` — but not `https://yuzu.example:80`, which is a different origin.
+
+Entries are also rejected if they are empty, host-less (`:443`), or carry userinfo (`u@host`) — the
+last because the request side always fails closed on `@`, so accepting it would put an entry in the
+boot log that could never match.
+
+**Rejections are reported.** If any supplied value is refused, the server warns at boot with the
+accepted-versus-supplied counts. Before this, an all-invalid config produced boot output identical
+to not passing the flag at all, and the first symptom was the same opaque 403 the flag exists to
+remove.
 
 **Confirming it took.** The server logs the accepted set once at boot:
 
