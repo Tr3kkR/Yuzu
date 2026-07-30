@@ -5142,7 +5142,8 @@ void RestApiV1::register_routes(
         if (q.limit > 1000)
             q.limit = 1000;
 
-        auto records = inventory_store->query(q);
+        bool inventory_truncated = false;
+        auto records = inventory_store->query(q, &inventory_truncated);
         if (!records) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "inventory store degraded"), "application/json");
@@ -5161,7 +5162,17 @@ void RestApiV1::register_routes(
             item.add("collected_at", r.collected_at);
             arr.add(item);
         }
-        res.set_content(list_json(arr.str(), static_cast<int64_t>(records->size())),
+        const auto pagination = JObj()
+                                    .add("total", static_cast<int64_t>(records->size()))
+                                    .add("start", int64_t{0})
+                                    .add("page_size", int64_t{50})
+                                    .str();
+        res.set_content(JObj()
+                            .raw("data", arr.str())
+                            .raw("pagination", pagination)
+                            .raw("meta", R"({"api_version":"v1"})")
+                            .add("result_truncated_by_cap", inventory_truncated)
+                            .str(),
                         "application/json");
     });
 
@@ -6241,7 +6252,6 @@ void RestApiV1::register_routes(
                               res.set_header("Sec-Audit-Failed", "true");
                       };
                       if (!inventory_store || !inventory_store->is_open()) {
-                          audit_failure("store_unavailable");
                           rs_err(res, 503, "inventory store not available");
                           return;
                       }

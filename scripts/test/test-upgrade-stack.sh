@@ -316,30 +316,13 @@ if [[ $FIXTURE_WRITE_OK -eq 0 ]]; then
     exit 1
 fi
 
-# Seed the actual previous-release SQLite shape into the persistent server
-# volume. The old stack has no agent service in this rig, so create the row on
-# the host, stop the old server, then copy it into the stopped container. One
-# set-valued fixture is enough to prove path wiring, schema compatibility,
-# startup backfill, and rollback-file retention end to end.
+# Seed the database actually created by the previous-release image. The old
+# stack has no agent service in this rig, so stop it, copy its inventory.db to
+# the host, add only the fixture row, then copy that same database back. This
+# catches released-schema drift that recreating the expected DDL here would
+# hide, while still proving path wiring, startup backfill, and rollback-file
+# retention end to end.
 LEGACY_INVENTORY_DB="$PHASE2_DIR/inventory.db"
-python3 - "$LEGACY_INVENTORY_DB" <<'PY'
-import sqlite3, sys
-path = sys.argv[1]
-db = sqlite3.connect(path)
-db.execute("""CREATE TABLE inventory_data (
-  agent_id TEXT NOT NULL,
-  plugin TEXT NOT NULL,
-  data_json TEXT NOT NULL DEFAULT '{}',
-  collected_at INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (agent_id, plugin))""")
-db.execute("INSERT INTO inventory_data VALUES (?, ?, ?, ?)",
-           ("upgrade-agent-generic", "upgrade_custom", '{"survived":true}', 1700000000))
-db.commit()
-db.close()
-PY
-# docker cp preserves the mode; world-write is test-only and lets the
-# unprivileged `yuzu` user exercise rollback-copy erasure in later assertions.
-chmod 666 "$LEGACY_INVENTORY_DB"
 OLD_SERVER_ID=$(YUZU_VERSION="$OLD_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
     docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
     --project-name "$PROJECT_NAME" ps -q server)
@@ -351,6 +334,30 @@ fi
 YUZU_VERSION="$OLD_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
     docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
     --project-name "$PROJECT_NAME" stop server >> "$LOG_FILE" 2>&1
+if ! docker cp "${OLD_SERVER_ID}:/var/lib/yuzu/inventory.db" \
+    "$LEGACY_INVENTORY_DB" >> "$LOG_FILE" 2>&1; then
+    fl "could not read previous-release inventory.db from the server volume"
+    record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "old inventory db missing"
+    exit 1
+fi
+python3 - "$LEGACY_INVENTORY_DB" <<'PY'
+import sqlite3, sys
+path = sys.argv[1]
+db = sqlite3.connect(path)
+found = db.execute(
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='inventory_data'"
+).fetchone()
+if not found:
+    raise SystemExit("previous-release inventory.db has no inventory_data table")
+db.execute("INSERT OR REPLACE INTO inventory_data "
+           "(agent_id, plugin, data_json, collected_at) VALUES (?, ?, ?, ?)",
+           ("upgrade-agent-generic", "upgrade_custom", '{"survived":true}', 1700000000))
+db.commit()
+db.close()
+PY
+# The copied-out file can be owned by root while the new image runs as the
+# unprivileged `yuzu` user. World-write is confined to this disposable test.
+chmod 666 "$LEGACY_INVENTORY_DB"
 if ! docker cp "$LEGACY_INVENTORY_DB" \
     "${OLD_SERVER_ID}:/var/lib/yuzu/inventory.db" >> "$LOG_FILE" 2>&1; then
     fl "could not seed legacy inventory.db into the server volume"
@@ -453,6 +460,29 @@ PG_INVENTORY_JSON=$(docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
 if [[ "$PG_INVENTORY_JSON" != '{"survived":true}' ]]; then
     fl "generic inventory SQLite→PostgreSQL upgrade assertion failed"
     record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "inventory backfill missing"
+    exit 1
+fi
+INVENTORY_COOKIES="$PHASE2_DIR/inventory-verify.cookies"
+INVENTORY_LOGIN_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -c "$INVENTORY_COOKIES" \
+    --max-time 15 "$DASHBOARD_URL/login" \
+    -d "username=${USERNAME}&password=${PASSWORD}" 2>/dev/null || echo "000")
+INVENTORY_API_BODY=""
+if [[ "$INVENTORY_LOGIN_HTTP" =~ ^[23] ]]; then
+    INVENTORY_API_BODY=$(curl -s -b "$INVENTORY_COOKIES" --max-time 15 \
+        -H "Content-Type: application/json" -X POST \
+        "$DASHBOARD_URL/api/v1/inventory/query" \
+        -d '{"agent_id":"upgrade-agent-generic","plugin":"upgrade_custom","limit":10}' \
+        2>/dev/null || echo "")
+fi
+if ! printf '%s' "$INVENTORY_API_BODY" | python3 -c '
+import json, sys
+body = json.load(sys.stdin)
+rows = body.get("data", [])
+assert len(rows) == 1 and rows[0].get("data") == {"survived": True}
+assert body.get("result_truncated_by_cap") is False
+'; then
+    fl "authoritative inventory REST assertion failed after upgrade"
+    record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "inventory REST verify failed"
     exit 1
 fi
 NEW_SERVER_ID=$(YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \

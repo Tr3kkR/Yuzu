@@ -3893,7 +3893,6 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
                 if (!inventory_store || !inventory_store->is_open()) {
-                    mcp_audit("failure", "inventory store unavailable");
                     res.set_content(
                         error_response(id, kInternalError, "Inventory store unavailable"),
                         "application/json");
@@ -3942,7 +3941,6 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
                 if (!inventory_store || !inventory_store->is_open()) {
-                    mcp_audit("failure", "inventory store unavailable");
                     res.set_content(
                         error_response(id, kInternalError, "Inventory store unavailable"),
                         "application/json");
@@ -3984,7 +3982,6 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
                 if (!inventory_store || !inventory_store->is_open()) {
-                    mcp_audit("failure", "inventory store unavailable");
                     res.set_content(
                         error_response(id, kInternalError, "Inventory store unavailable"),
                         "application/json");

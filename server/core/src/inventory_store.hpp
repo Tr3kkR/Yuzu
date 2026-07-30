@@ -27,9 +27,9 @@
 /// Failure posture (ADR-0012 §1), split by operation class:
 ///  - **Ingest (`upsert`)**: FAIL-SOFT. A transient lease/query failure logs
 ///    a warning and returns — never throws, never blocks the gRPC/gateway
-///    ingest thread. The agent's next report re-sends the same blob, so a
-///    dropped write self-heals (mirrors `SoftwareInventoryStore`'s ingest
-///    posture).
+///    ingest thread. The next changed/full report re-sends the same blob
+///    (bounded by the weekly full floor), so a dropped write self-heals
+///    (mirrors `SoftwareInventoryStore`'s ingest posture).
 ///  - **Reads (`list_tables`, `get`, `query`, `get_agent_inventory`,
 ///    `count`)**: AUTHORITATIVE. A store/pool/query failure is reported as a
 ///    degrade — `std::nullopt` for the list/count reads, `std::unexpected(
@@ -151,6 +151,8 @@ public:
     ///    the decommission cascade's empty-id guard could never reach it).
     ///    This store is FAIL-SOFT / self-healing (the agent re-pushes), so one
     ///    malformed legacy blob must not permanently brick the server.
+    ///    A generic blob over 8 MiB is skipped before copying into process
+    ///    memory and counted in `skipped_bad`.
     ///  - FAILS CLOSED on a genuine INFRASTRUCTURE error — the initial
     ///    connection/lease, the backfill transaction's own BEGIN/SAVEPOINT/
     ///    COMMIT, a non-row-data/unknown INSERT SQLSTATE, or a `ROLLBACK TO
@@ -159,6 +161,10 @@ public:
     ///    error (`startup_failed_ = true` in `server.cpp`) — per ADR-0009, the
     ///    server refuses to start rather than serve against an unreachable
     ///    database.
+    ///  - This pre-serving, one-time operation is ADR-0012's documented
+    ///    lease-discipline exception: its PostgreSQL transaction remains open
+    ///    while one size-capped SQLite row at a time is stepped so inserts and
+    ///    the completion/reconciliation stamp commit atomically.
     ///  - The `backfill_state.legacy_rows` stamp records the count of rows
     ///    actually inserted (per-statement affected-row count via
     ///    `PQcmdTuples`), not the size of the in-memory legacy row list —
@@ -167,7 +173,7 @@ public:
 
     /// Upsert inventory data for an agent+plugin pair. FAIL-SOFT ingest: a
     /// lease/query failure is logged and this returns without throwing — the
-    /// agent's next report re-sends the same blob (a drop bumps
+    /// agent's next changed/full report re-sends the same blob (a drop bumps
     /// `yuzu_inventory_ingest_dropped_total`). A blank (empty/whitespace-only)
     /// `agent_id` or `plugin` is REJECTED (logged, no write) — never persisted
     /// as an un-erasable orphan the decommission cascade's empty-id guard

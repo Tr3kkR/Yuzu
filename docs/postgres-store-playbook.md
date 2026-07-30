@@ -160,8 +160,10 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   (SOC 2); skippable behind a flag only for purely TTL'd ephemeral stores (`response`).
 - **Secret columns transform, never copy** (ADR-0010): a backfill that touches secret material
   encrypts/hashes on the way in — a plain column copy of a secret is forbidden.
-- **Rollback window**: retain the legacy `<name>.db` read-only for exactly one release, then
-  remove it. The upgrade-test (`scripts/test/docker-compose.upgrade-test.yml`) must assert the
+- **Rollback window**: retain the legacy `<name>.db` for exactly one release, then remove it.
+  Backfill opens it read-only; a wired subject/device erasure path must delete that identity
+  from the rollback copy so rollback cannot resurrect erased data. The upgrade-test
+  (`scripts/test/docker-compose.upgrade-test.yml`) must assert the
   config/reference/audit data survives previous-release-SQLite → new-release-Postgres.
 - **Port the transaction owner**: `SqliteTxn`/`SqliteStmt` → `pool.with_txn` (multi-statement
   invariants) or a single autocommit statement (single-statement mutate-and-return).

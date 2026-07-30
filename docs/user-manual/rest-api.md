@@ -3718,7 +3718,10 @@ Query inventory data across agents with filters.
 | `until` | integer | No | Unix timestamp — only records collected before this time |
 | `limit` | integer | No | Max results (default 100, max 1000) |
 
-**Response:** List of inventory records matching the query.
+**Response:** List of inventory records matching the query, plus top-level
+`result_truncated_by_cap`. When that flag is `true`, the server's row or 8 MiB aggregate
+payload budget was reached and the returned fleet result is incomplete; callers must not
+interpret omitted rows as absence.
 
 **Errors:**
 

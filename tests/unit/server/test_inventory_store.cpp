@@ -115,6 +115,19 @@ void seed_legacy_db(const std::filesystem::path& path,
     }
 }
 
+void seed_oversized_legacy_blob(const std::filesystem::path& path) {
+    yuzu::server::SqliteDb db;
+    REQUIRE(sqlite3_open_v2(path.string().c_str(), db.addr(), SQLITE_OPEN_READWRITE, nullptr) ==
+            SQLITE_OK);
+    // Generate the payload inside SQLite: the test does not need an 8 MiB
+    // client-side std::string merely to prove the pre-copy guard.
+    REQUIRE(sqlite3_exec(db.get(),
+                         "INSERT INTO inventory_data "
+                         "(agent_id, plugin, data_json, collected_at) VALUES "
+                         "('legacy-oversized', 'custom_oversized', zeroblob(8388609), 600)",
+                         nullptr, nullptr, nullptr) == SQLITE_OK);
+}
+
 // Wall-clock now, mirroring the store's internal `now_secs()` — used only to
 // bound assertions on the store's own clamping, never to construct fixture
 // data that would itself need clamping.
@@ -577,8 +590,8 @@ TEST_CASE("InventoryStore migrate_from_sqlite leaves no stamp or rows on retryab
     CHECK(std::string(PQgetvalue(state.get(), 0, 1)) == "0");
 }
 
-TEST_CASE("InventoryStore migrate_from_sqlite skips a bad row (invalid UTF-8) and a "
-          "blank-key row without bricking boot — good rows still land",
+TEST_CASE("InventoryStore migrate_from_sqlite skips invalid, oversized, and blank-key rows "
+          "without bricking boot — good rows still land",
           "[pg][inventory]") {
     // IB2/UP-1: InventoryStore is FAIL-SOFT/self-healing (the agent re-pushes), so
     // a single malformed legacy row must never abort the whole backfill/boot.
@@ -622,6 +635,7 @@ TEST_CASE("InventoryStore migrate_from_sqlite skips a bad row (invalid UTF-8) an
     // Bad/blank rows interleaved with good ones so the SAVEPOINT recovery must
     // actually resume the loop, not just tolerate a trailing failure.
     seed_legacy_db(legacy.path, {good, bad, blank_id, blank_plugin, good2});
+    seed_oversized_legacy_blob(legacy.path);
 
     REQUIRE(store.migrate_from_sqlite(legacy.path)); // must NOT fail closed — no infra error
 
@@ -642,15 +656,19 @@ TEST_CASE("InventoryStore migrate_from_sqlite skips a bad row (invalid UTF-8) an
     REQUIRE(blank_plugin_row.has_value());
     CHECK(blank_plugin_row->empty()); // skipped, never landed
 
+    auto oversized = store.get("legacy-oversized", "custom_oversized");
+    REQUIRE(oversized.has_value());
+    CHECK_FALSE(oversized->has_value());
+
     auto c = store.count();
     REQUIRE(c.has_value());
-    CHECK(*c == 2); // only the two good rows — bad + both blank-key rows skipped
+    CHECK(*c == 2); // only two good rows; bad, oversized, and blank-key rows skipped
 
     // Governance H1: `skipped_bad` makes the row-data skip AUDITABLE after the
     // fact via `backfill_state`, independent of the in-memory counters above —
     // read it back over a second connection the way an operator/tool would.
-    // Only the invalid-UTF-8 row increments skipped_bad; the two blank-key
-    // rows take the separate GDPR-orphan-guard skip path (not counted here).
+    // Invalid UTF-8 and the oversized blob increment skipped_bad; the two
+    // blank-key rows take the separate GDPR-orphan-guard path.
     {
         auto lease = pool.acquire();
         REQUIRE(lease);
@@ -662,8 +680,8 @@ TEST_CASE("InventoryStore migrate_from_sqlite skips a bad row (invalid UTF-8) an
         REQUIRE(stamp.status() == PGRES_TUPLES_OK);
         REQUIRE(PQntuples(stamp.get()) == 1);
         CHECK(std::string(PQgetvalue(stamp.get(), 0, 0)) == "2"); // legacy_rows == good-row count
-        CHECK(std::string(PQgetvalue(stamp.get(), 0, 1)) == "1"); // skipped_bad == 1
-        CHECK(std::string(PQgetvalue(stamp.get(), 0, 2)) == "5"); // every source row seen
+        CHECK(std::string(PQgetvalue(stamp.get(), 0, 1)) == "2"); // bad UTF-8 + oversized
+        CHECK(std::string(PQgetvalue(stamp.get(), 0, 2)) == "6"); // every source row seen
         CHECK(std::string(PQgetvalue(stamp.get(), 0, 3)) == "0");
         CHECK(std::string(PQgetvalue(stamp.get(), 0, 4)) == "2");
         CHECK(std::string(PQgetvalue(stamp.get(), 0, 5)) == "0");

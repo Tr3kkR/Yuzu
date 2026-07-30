@@ -342,7 +342,7 @@ whose ingest is failing. Four further series sharpen the picture:
   a cold-cache `need_full` herd.
 - `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
   `pool_acquire_timeout` / `query_error`; source ∈ `installed_software` / `device_ci` /
-  `generic`) — an
+  `software_licensing` / `product_registry` / `generic`) — an
   **authoritative read** that returned
   a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
   pool saturation, so without this counter a degraded fleet software query is
@@ -367,13 +367,15 @@ whose ingest is failing. Four further series sharpen the picture:
   it can stall while `yuzu_inventory_read_degrade_total` stays quiet).
 - `yuzu_inventory_ingest_dropped_total{reason}` (counter, reason ∈ `store_not_open` /
   `pool_acquire_timeout` / `query_error` / `invalid_key` / `stale`) — generic-store
-  (ADR-0037) upsert calls that did not persist. Ingest is fail-soft (the agent's next
-  report re-sends the blob), so alert on a **sustained rate**, never on presence;
+  (ADR-0037) upsert calls that did not persist. Ingest is fail-soft (the next
+  changed/full report re-sends the blob, bounded by the weekly full floor), so alert on a
+  **sustained rate**, never on presence;
   `reason="stale"` in particular spikes benignly for the duration of a server clock
   step-back and self-heals (the stale-overwrite guard compares receipt-clamped
   timestamps).
-  `YuzuGenericInventoryPersistenceDropped` warns only after that rate remains
-  non-zero for 15 minutes, avoiding alerts for a single self-healing report.
+  `YuzuGenericInventoryPersistenceDropped` warns only after a non-`stale` reason's rate
+  remains non-zero for 15 minutes, avoiding alerts for a single self-healing report or
+  expected clock-step stale suppression.
 - `yuzu_inventory_query_truncated_total` (counter) — generic-store reads that hit their
   row cap or 8 MiB aggregate payload cap. A non-zero rate on the result-set
   producer path pairs with 503s from

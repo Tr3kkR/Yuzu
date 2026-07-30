@@ -398,14 +398,19 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
             lease.get(),
             "INSERT INTO inventory_store.inventory_data "
             "(agent_id, plugin, data_json, collected_at) "
-            "SELECT 'byte-agent-' || g, 'custom_large', repeat('x', 3145728), g "
-            "FROM generate_series(1, 3) AS g",
+            "VALUES ('byte-agent', 'custom_large', repeat('x', 8388609), 1)",
             std::vector<std::string>{});
         REQUIRE(seeded.status() == PGRES_COMMAND_OK);
         lease.reset();
 
         AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
         int status = 0;
+        auto query = h.post("/api/v1/inventory/query", R"({"limit":10})", status);
+        REQUIRE(status == 200);
+        CHECK(query["result_truncated_by_cap"] == true);
+        REQUIRE(query["data"].is_array());
+        CHECK(query["data"].empty());
+
         h.post("/api/v1/result-sets/from-inventory-query", R"({"name":"must-not-exist"})",
                status);
         REQUIRE(status == 503);

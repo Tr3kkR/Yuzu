@@ -66,7 +66,8 @@ argument does not justify here).
 
 - **Ingest (`upsert`): FAIL-SOFT.** A transient lease/query failure is logged and the call
   returns without throwing — it must never block the gRPC/gateway ingest thread. The agent's
-  next report re-sends the same blob, so a dropped write self-heals. This mirrors
+  next changed/full report re-sends the same blob (bounded by the weekly full floor), so a
+  dropped write self-heals. This mirrors
   `SoftwareInventoryStore`'s ingest posture exactly.
 
   **Stale-overwrite guard + agent-clock clamp (governance H2, 2026-07-29).** The Postgres
@@ -113,10 +114,11 @@ opens:
 - **Idempotency**: a single-row `backfill_state` table (`id = 1`, stamped with
   `migrated_at`, inserted-row count (`legacy_rows`), total `source_rows`, conflicts, blank-key
   skips, typed-source skips, and `skipped_bad`). A completed stamp with `skipped_bad > 0` means
-  rows were filed as malformed on SQLSTATE class 22 (data), 23 (integrity), or 54 (a
-  row-specific program limit such as an oversized blob). Every other/unknown SQLSTATE aborts
-  the backfill unstamped, so an infrastructure retry is never lost silently. Every later boot
-  is a cheap lookup; the legacy SQLite file is not re-read once stamped.
+  rows exceeded the explicit 8 MiB pre-copy legacy-blob bound or were filed as malformed on
+  SQLSTATE class 22 (data), 23 (integrity), or 54 (a row-specific program limit). Every
+  other/unknown SQLSTATE aborts the backfill unstamped, so an infrastructure retry is never
+  lost silently. Every later boot is a cheap lookup; the legacy SQLite file is not re-read
+  once stamped.
   The full reconciliation identity for an auditor is
   `source_rows = inserted (legacy_rows) + conflicts + skipped_bad + skipped_blank_key +
   skipped_typed`; every term is durable in `backfill_state`.
@@ -124,8 +126,12 @@ opens:
   **Operator recovery when the backfill fails closed** (Gate 4 UP-1/UP-2): a legacy row
   failing with a non-row-data SQLSTATE aborts the backfill unstamped and the server
   refuses to boot on every restart until resolved. The escape hatch is moving the legacy
-  `inventory.db` aside — the missing-file path stamps `legacy_rows = 0` and boots; live
-  gateway-connected live agents re-push generic blobs on the next report cycle. The direct
+  `inventory.db` aside — the missing-file path stamps `legacy_rows = 0` and boots. Treat the
+  moved file as an operator-managed personal-data backup: restrict access, retain it no longer
+  than the one-release rollback window, delete a decommissioned subject from it manually, and
+  purge it after repair/manual import with that action recorded as erasure evidence. Live
+  gateway-connected agents re-push generic blobs on their next changed/full report (bounded by
+  the weekly full floor), not necessarily the next hash-only cycle. The direct
   `ReportInventory` path currently carries typed sources only, so direct-connected,
   decommissioned, and offline agents' generic rows require manual import from the retained
   legacy file if needed.
@@ -150,9 +156,13 @@ opens:
   acquire their own single connection and release it before the other begins — holding two
   connections concurrently from this one call would deadlock a size-1 pool (e.g. a test
   pool), which the implementation avoids by construction (see the doc comment on
-  `migrate_from_sqlite` in `inventory_store.hpp`).
+  `migrate_from_sqlite` in `inventory_store.hpp`). The insert transaction intentionally remains
+  open while SQLite is stepped so all inserts and the reconciliation stamp commit atomically.
+  This is ADR-0012's narrow one-time exception: it runs fail-closed before this server serves,
+  streams at most one capped blob, and never applies to a runtime request.
 - **Cost**: the backfill streams one SQLite row at a time through one PostgreSQL transaction,
-  so peak process memory is bounded to one legacy blob rather than total legacy-store size.
+  so peak process memory is bounded to one legacy blob (8 MiB maximum) rather than total
+  legacy-store size.
   Inserts remain one statement per row under SAVEPOINT; batching is a future throughput
   optimization, not a memory-safety prerequisite.
 
@@ -197,7 +207,8 @@ opens:
   `kInternalError` rather than an empty success response.
 - `docs/postgres-migration-ladder.md`'s `InventoryStore` row moves from Wave 1 to Done, citing
   this ADR.
-- The legacy `inventory.db` stays on disk, read-only, for one release per ADR-0009; its
+- The legacy `inventory.db` stays on disk for one release per ADR-0009; backfill opens it
+  read-only, while wired device erasure may delete rows so rollback cannot resurrect data. Its
   removal is a follow-up for the release after this one ships.
 
 ## Follow-ups and accepted risks

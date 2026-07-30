@@ -41,6 +41,10 @@ constexpr int kQueryRowCap = 100000;
 // Bound bytes returned by libpq as well as row count. Generic plugin blobs can
 // be multi-MiB; a row-only cap still permits a single query to OOM the server.
 constexpr std::int64_t kQueryByteCap = 8 * 1024 * 1024;
+// A single legacy row must also be bounded before it is copied into process
+// memory. Values above the read budget cannot be returned by query() as a
+// complete record and are filed as malformed during the one-time backfill.
+constexpr int kLegacyBlobByteCap = 8 * 1024 * 1024;
 
 // Read-degrade reason labels (mirror SoftwareInventoryStore / DeviceInventoryStore
 // / the alert taxonomy). Shared counter, distinguished by the "source" label.
@@ -61,33 +65,32 @@ const std::vector<pg::PgMigration>& migrations() {
     // the migration transaction, so these tables land in `inventory_store`.
     // Runtime statements below schema-qualify explicitly.
     static const std::vector<pg::PgMigration> kMigrations = {
-        {1,
-         "CREATE TABLE inventory_data ("
-         "  agent_id     TEXT NOT NULL,"
-         "  plugin       TEXT NOT NULL,"
-         "  data_json    TEXT NOT NULL DEFAULT '{}',"
-         "  collected_at BIGINT NOT NULL DEFAULT 0,"
-         "  PRIMARY KEY (agent_id, plugin));"
-         "CREATE INDEX inventory_data_plugin_idx ON inventory_data (plugin);"
-         "CREATE INDEX inventory_data_collected_idx ON inventory_data (collected_at);"},
+        {1, "CREATE TABLE inventory_data ("
+            "  agent_id     TEXT NOT NULL,"
+            "  plugin       TEXT NOT NULL,"
+            "  data_json    TEXT NOT NULL DEFAULT '{}',"
+            "  collected_at BIGINT NOT NULL DEFAULT 0,"
+            "  PRIMARY KEY (agent_id, plugin));"
+            "CREATE INDEX inventory_data_plugin_idx ON inventory_data (plugin);"
+            "CREATE INDEX inventory_data_collected_idx ON inventory_data (collected_at);"},
         {2,
          // Backfill stamp (ADR-0009/0037): a single-row sentinel so
          // migrate_from_sqlite() is a cheap no-op on every boot after the
          // first. `legacy_rows` records rows ACTUALLY inserted (not the size
          // of the in-memory legacy row list — see migrate_from_sqlite).
-         // `skipped_bad` makes SQLSTATE 22/23/54 row-data skips auditable;
-         // migration v3 adds every other reconciliation term.
+         // `skipped_bad` makes the explicit legacy byte-cap and SQLSTATE
+         // 22/23/54 row-data skips auditable; migration v3 adds every other
+         // reconciliation term.
          "CREATE TABLE backfill_state ("
          "  id           INT PRIMARY KEY,"
          "  migrated_at  BIGINT NOT NULL,"
          "  legacy_rows  BIGINT NOT NULL DEFAULT 0,"
          "  skipped_bad  BIGINT NOT NULL DEFAULT 0);"},
-        {3,
-         "ALTER TABLE backfill_state "
-         "ADD COLUMN source_rows BIGINT NOT NULL DEFAULT 0, "
-         "ADD COLUMN conflicts BIGINT NOT NULL DEFAULT 0, "
-         "ADD COLUMN skipped_blank_key BIGINT NOT NULL DEFAULT 0, "
-         "ADD COLUMN skipped_typed BIGINT NOT NULL DEFAULT 0;"},
+        {3, "ALTER TABLE backfill_state "
+            "ADD COLUMN source_rows BIGINT NOT NULL DEFAULT 0, "
+            "ADD COLUMN conflicts BIGINT NOT NULL DEFAULT 0, "
+            "ADD COLUMN skipped_blank_key BIGINT NOT NULL DEFAULT 0, "
+            "ADD COLUMN skipped_typed BIGINT NOT NULL DEFAULT 0;"},
     };
     return kMigrations;
 }
@@ -277,7 +280,6 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
             };
             LegacyRow r{.agent_id = col_text(0),
                         .plugin = col_text(1),
-                        .data_json = col_text(2),
                         .collected_at = sqlite3_column_int64(legacy_stmt.get(), 3)};
             ++source_rows;
             // GDPR orphan guard (IS5/UP-7): never backfill a row the
@@ -299,6 +301,26 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
                              r.agent_id, r.plugin);
                 continue;
             }
+            // Read the SQLite-owned pointer/length before constructing the
+            // std::string. This prevents one pathological legacy blob from
+            // allocating up to SQLite's global length limit during boot.
+            const int data_bytes = sqlite3_column_bytes(legacy_stmt.get(), 2);
+            if (data_bytes < 0 || data_bytes > kLegacyBlobByteCap) {
+                ++skipped_bad;
+                spdlog::warn("InventoryStore: migrate_from_sqlite: skipping oversized legacy "
+                             "blob agent_id={} plugin={} ({} bytes, cap={})",
+                             r.agent_id, r.plugin, data_bytes, kLegacyBlobByteCap);
+                continue;
+            }
+            const auto* data = sqlite3_column_text(legacy_stmt.get(), 2);
+            if (!data && sqlite3_column_type(legacy_stmt.get(), 2) != SQLITE_NULL) {
+                spdlog::error("InventoryStore: migrate_from_sqlite: legacy blob conversion "
+                              "failed for agent_id={} plugin={}: {}",
+                              r.agent_id, r.plugin, sqlite3_errmsg(legacy.get()));
+                return false;
+            }
+            r.data_json.assign(data ? reinterpret_cast<const char*>(data) : "",
+                               static_cast<std::size_t>(data_bytes));
 
             pg::PgResult sp = pg::exec_params(c, "SAVEPOINT legacy_row_backfill",
                                               std::vector<std::string>{});
@@ -766,6 +788,11 @@ bool InventoryStore::delete_agent(const std::string& agent_id) {
                       PQerrorMessage(lease.get()));
         return false;
     }
+    // Do not retain a shared-pool lease across filesystem/SQLite work. The
+    // PostgreSQL delete is idempotent, so a later SQLite failure returns false
+    // and the decommission cascade can safely retry both halves.
+    res.reset();
+    lease.reset();
 
     if (legacy_db_path_.empty())
         return true;

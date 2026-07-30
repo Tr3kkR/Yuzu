@@ -53,7 +53,8 @@ data).
 
 - Each per-store migration carries a `migrate_from_sqlite()` implementation and an upgrade-test
   assertion; the recipe is uniform, so per-store ADRs focus on schema, not mechanism.
-- The rollback window is exactly one release (the read-only legacy file). A defect discovered
+- The rollback window is exactly one release (the retained legacy file: backfill reads it only;
+  wired subject/device erasure may delete rows). A defect discovered
   after the legacy file is removed has no in-place rollback — so the one-release retention and
   the upgrade-test gate are load-bearing, not optional.
 - **Secrets stores (`api_token`, `ca`) are explicitly out of scope for this mechanism.** They

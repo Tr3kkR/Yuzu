@@ -790,17 +790,19 @@ public:
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error) and source "
-                          "(installed_software/device_ci/generic — generic is the ADR-0037 "
-                          "InventoryStore). /readyz stays green under pure pool saturation, so "
+                          "(installed_software/device_ci/software_licensing/product_registry/"
+                          "generic — generic is the ADR-0037 InventoryStore). /readyz stays "
+                          "green under pure pool saturation, so "
                           "this is the read-path degrade signal",
                           "counter");
         // Generic InventoryStore observability (ADR-0037 hardening round).
-        metrics_.describe("yuzu_inventory_ingest_dropped_total",
-                          "Generic InventoryStore upsert calls that did not persist, by reason "
-                          "(store_not_open/pool_acquire_timeout/query_error/invalid_key/stale) — the "
-                          "agent's next report re-sends the same blob (fail-soft), but a "
-                          "sustained non-zero rate means writes are silently not landing",
-                          "counter");
+        metrics_.describe(
+            "yuzu_inventory_ingest_dropped_total",
+            "Generic InventoryStore upsert calls that did not persist, by reason "
+            "(store_not_open/pool_acquire_timeout/query_error/invalid_key/stale) — the next "
+            "changed/full report re-sends the blob (weekly full floor), but a sustained "
+            "non-zero rate means writes are silently not landing",
+            "counter");
         // Closed reason dimension: seed every reachable path so an idle or
         // newly-started server exports zeros and absent-series alerting remains
         // distinguishable from a scrape/configuration failure.
@@ -3461,9 +3463,11 @@ public:
                 if (!inventory_store_->migrate_from_sqlite(inv_db)) {
                     spdlog::error("[PG] Refusing to start: generic inventory store backfill from "
                                   "legacy {} failed (ADR-0009 fail-closed; see prior log lines). "
-                                  "Operator remediation: repair the file or move it aside to skip "
+                                  "Operator remediation: repair the file or quarantine it as an "
+                                  "operator-managed backup per ADR-0037 to skip "
                                   "the backfill — gateway-connected live agents re-push generic "
-                                  "blobs; direct-connected, offline, and decommissioned agents' "
+                                  "blobs on a changed/full report (weekly full floor); direct-"
+                                  "connected, offline, and decommissioned agents' "
                                   "generic blobs need manual re-import (ADR-0037)",
                                   inv_db.string());
                     startup_failed_ = true;
@@ -11466,7 +11470,8 @@ private:
             if (q.limit > 1000)
                 q.limit = 1000;
 
-            auto records = inventory_store_->query(q);
+            bool inventory_truncated = false;
+            auto records = inventory_store_->query(q, &inventory_truncated);
             if (!records) {
                 res.status = 503;
                 res.set_content(
@@ -11487,7 +11492,10 @@ private:
                                {"data", data_obj},
                                {"collected_at", r.collected_at}});
             }
-            res.set_content(nlohmann::json({{"results", arr}, {"count", arr.size()}}).dump(),
+            res.set_content(nlohmann::json({{"results", arr},
+                                            {"count", arr.size()},
+                                            {"result_truncated_by_cap", inventory_truncated}})
+                                .dump(),
                             "application/json");
         });
 
