@@ -3892,7 +3892,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                if (!inventory_store) {
+                if (!inventory_store || !inventory_store->is_open()) {
                     res.set_content(
                         error_response(id, kInternalError, "Inventory store unavailable"),
                         "application/json");
@@ -3902,9 +3902,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 iq.agent_id = param_str(args, "agent_id");
                 iq.plugin = param_str(args, "plugin");
                 iq.limit = std::min(param_int32(args, "limit", 100), 1000);
-                auto records = inventory_store->query(iq);
+                bool inventory_truncated = false;
+                auto records = inventory_store->query(iq, &inventory_truncated);
+                if (!records) {
+                    mcp_audit("failure", "inventory store degraded; query");
+                    res.set_content(
+                        error_response(id, kInternalError, "Inventory store degraded"),
+                        "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& r : records) {
+                for (const auto& r : *records) {
                     arr.add(JObj()
                                 .add("agent_id", r.agent_id)
                                 .add("plugin", r.plugin)
@@ -3915,6 +3923,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     JObj()
                         .raw("content",
                              JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
+                        .add("result_truncated_by_cap", inventory_truncated)
                         .str();
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");
@@ -3931,15 +3940,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                if (!inventory_store) {
+                if (!inventory_store || !inventory_store->is_open()) {
                     res.set_content(
                         error_response(id, kInternalError, "Inventory store unavailable"),
                         "application/json");
                     return;
                 }
                 auto tables = inventory_store->list_tables();
+                if (!tables) {
+                    mcp_audit("failure", "inventory store degraded; list tables");
+                    res.set_content(
+                        error_response(id, kInternalError, "Inventory store degraded"),
+                        "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& t : tables) {
+                for (const auto& t : *tables) {
                     arr.add(JObj()
                                 .add("plugin", t.plugin)
                                 .add("agent_count", t.agent_count)
@@ -3965,7 +3981,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                if (!inventory_store) {
+                if (!inventory_store || !inventory_store->is_open()) {
                     res.set_content(
                         error_response(id, kInternalError, "Inventory store unavailable"),
                         "application/json");
@@ -3977,9 +3993,17 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto records = inventory_store->get_agent_inventory(agent_id);
+                bool inventory_truncated = false;
+                auto records = inventory_store->get_agent_inventory(agent_id, &inventory_truncated);
+                if (!records) {
+                    mcp_audit("failure", "inventory store degraded; get agent");
+                    res.set_content(
+                        error_response(id, kInternalError, "Inventory store degraded"),
+                        "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& r : records) {
+                for (const auto& r : *records) {
                     arr.add(JObj()
                                 .add("plugin", r.plugin)
                                 .add("data", r.data_json)
@@ -3989,6 +4013,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     JObj()
                         .raw("content",
                              JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
+                        .add("result_truncated_by_cap", inventory_truncated)
                         .str();
                 mcp_audit("success", agent_id);
                 res.set_content(success_response(id, result), "application/json");

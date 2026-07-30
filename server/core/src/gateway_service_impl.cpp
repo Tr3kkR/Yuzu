@@ -535,6 +535,13 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
         return grpc::Status::OK;
     }
 
+    // The generic loop runs before the typed seams, so enforce the shared
+    // whole-report cap here before any store write or pool acquisition.
+    if (!validate_inventory_report_source_count(agent_id, *request, metrics_)) {
+        response->set_received(true);
+        return grpc::Status::OK;
+    }
+
     // Generic per-source blob persistence (sync-framework baseline; backs the
     // kInventoryQuery scope source + the inventory eval engine). The TYPED sources
     // (installed_software / app_perf / device_ci / software_licensing) are persisted

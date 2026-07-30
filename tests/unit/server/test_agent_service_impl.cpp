@@ -40,10 +40,13 @@
 #include "gateway_service_impl.hpp"
 #include "inventory_store.hpp"
 #include "peer_ip.hpp"
+#include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
+
+#include "../test_helpers.hpp"
 
 #include <algorithm>
 #include <memory>
@@ -936,9 +939,20 @@ TEST_CASE("ProxyRegister: a wired signer issues a per-agent cert for a gateway-e
     CHECK(resp.issued_ca_chain() == "CHAIN-PEM");
 }
 
+namespace {
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): the generic
+// InventoryStore is the only PG store these two [pg] tests construct.
+yuzu::test::PgTestTemplate inventory_h1_tpl{"agent_svc_inventory", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::InventoryStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("agent_svc_inventory template: store failed to migrate");
+}};
+} // namespace
+
 TEST_CASE("ProxyInventory: device_ci is NOT double-stored into the generic InventoryStore "
           "(H1 — gateway parity + Inventory:Read boundary)",
-          "[agent_service][gateway][inventory][device_ci]") {
+          "[pg][agent_service][gateway][inventory][device_ci]") {
     // Regression for the round-2 H1: the gateway generic-blob loop must skip every
     // TYPED source (is_typed_inventory_source) — else device_ci's serial/UUID/MAC
     // lands in the generic InventoryStore, which is read on Infrastructure:Read,
@@ -946,11 +960,14 @@ TEST_CASE("ProxyInventory: device_ci is NOT double-stored into the generic Inven
     // since the direct path has no generic loop).
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
     using yuzu::server::InventoryStore;
+    YUZU_REQUIRE_PG_DB_TPL(db, inventory_h1_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
     GatewayResponseHarness h;
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
 
-    InventoryStore inv{":memory:"}; // the generic blob store (read on Infrastructure:Read)
+    InventoryStore inv{pool}; // the generic blob store (read on Infrastructure:Read)
     REQUIRE(inv.is_open());
     gateway_svc.set_inventory_store(&inv);
 
@@ -970,13 +987,17 @@ TEST_CASE("ProxyInventory: device_ci is NOT double-stored into the generic Inven
     apb::InventoryAck ack;
     REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
 
-    CHECK_FALSE(inv.get("agent-gw-inv", "device_ci").has_value()); // H1: not in the generic store
-    CHECK(inv.get("agent-gw-inv", "custom_source").has_value());   // generic source still works
+    auto device_ci_row = inv.get("agent-gw-inv", "device_ci");
+    REQUIRE(device_ci_row.has_value());      // not degraded
+    CHECK_FALSE(device_ci_row->has_value()); // H1: not in the generic store
+    auto custom_row = inv.get("agent-gw-inv", "custom_source");
+    REQUIRE(custom_row.has_value());
+    CHECK(custom_row->has_value()); // generic source still works
 }
 
 TEST_CASE("ProxyInventory: software_licensing is NOT double-stored into the generic "
           "InventoryStore (typed-registry same-change rule + SoftwareLicensing boundary)",
-          "[agent_service][gateway][inventory][software_licensing]") {
+          "[pg][agent_service][gateway][inventory][software_licensing]") {
     // Clone of the device_ci H1 parity case for the software_licensing typed key
     // (ADR-0024 Decision 5 / roadmap C-9 pattern): the gateway generic-blob loop
     // must skip every TYPED source (is_typed_inventory_source) — else detected-
@@ -986,11 +1007,14 @@ TEST_CASE("ProxyInventory: software_licensing is NOT double-stored into the gene
     // since the direct path has no generic loop).
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
     using yuzu::server::InventoryStore;
+    YUZU_REQUIRE_PG_DB_TPL(db, inventory_h1_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
     GatewayResponseHarness h;
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
 
-    InventoryStore inv{":memory:"}; // the generic blob store (read on Infrastructure:Read)
+    InventoryStore inv{pool}; // the generic blob store (read on Infrastructure:Read)
     REQUIRE(inv.is_open());
     gateway_svc.set_inventory_store(&inv);
     // No SoftwareLicensingStore wired — the skip must hold regardless of the
@@ -1012,8 +1036,48 @@ TEST_CASE("ProxyInventory: software_licensing is NOT double-stored into the gene
     apb::InventoryAck ack;
     REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
 
-    CHECK_FALSE(inv.get("agent-gw-lic", "software_licensing").has_value()); // not double-stored
-    CHECK(inv.get("agent-gw-lic", "custom_source").has_value()); // generic source still works
+    auto lic_row = inv.get("agent-gw-lic", "software_licensing");
+    REQUIRE(lic_row.has_value());      // not degraded
+    CHECK_FALSE(lic_row->has_value()); // not double-stored
+    auto custom_row = inv.get("agent-gw-lic", "custom_source");
+    REQUIRE(custom_row.has_value());
+    CHECK(custom_row->has_value()); // generic source still works
+}
+
+TEST_CASE("ProxyInventory: over-cap source maps are rejected before generic writes",
+          "[pg][agent_service][gateway][inventory][security]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    using yuzu::server::InventoryStore;
+    YUZU_REQUIRE_PG_DB_TPL(db, inventory_h1_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    GatewayResponseHarness h;
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+    InventoryStore inv{pool};
+    REQUIRE(inv.is_open());
+    gateway_svc.set_inventory_store(&inv);
+
+    auto reg = make_gw_register(h.auth_mgr, "agent-gw-source-cap", /*csr_pem=*/"");
+    apb::RegisterResponse rresp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &reg, &rresp).ok());
+    REQUIRE(rresp.accepted());
+
+    apb::InventoryReport rpt;
+    rpt.set_session_id(rresp.session_id());
+    for (int i = 0; i < 65; ++i)
+        (*rpt.mutable_plugin_data())["custom-" + std::to_string(i)] = "{}";
+    apb::InventoryAck ack;
+    REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
+    CHECK(ack.received());
+
+    auto rows = inv.get_agent_inventory("agent-gw-source-cap");
+    REQUIRE(rows.has_value());
+    CHECK(rows->empty());
+    CHECK(h.metrics
+              .counter("yuzu_inventory_ingest_total",
+                       {{"source", "__report__"}, {"outcome", "rejected"}})
+              .value() == 1.0);
 }
 
 TEST_CASE("ProxyRegister: no signer wired → enrolls but issues no cert (graceful degrade)",

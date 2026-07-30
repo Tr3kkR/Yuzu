@@ -65,6 +65,11 @@ premature before observed contention. Three hard rules make a shared pool safe:
   probe has already proved reachability.
 - **(b) Never hold a lease (or a `with_txn`) across network, disk, or other external work.** A
   lease is checked out, used for SQL, and returned; nothing slow happens while it is held.
+  The sole documented exception is a fail-closed, pre-serving, one-time legacy backfill whose
+  atomic insert-plus-completion stamp requires one transaction while it streams a bounded row
+  from the legacy store. The per-store ADR must justify that exception, cap per-row memory, and
+  make retry behavior explicit; ordinary runtime methods, including erasure, remain subject to
+  this rule without exception.
 - **(c) One logical operation holds at most one lease at a time.** A store method must not call
   another store, or re-enter the pool, while holding a lease — that is the pool-exhaustion
   deadlock (the holder waits for a connection that only frees when holders return theirs).
