@@ -67,6 +67,13 @@ RUN --mount=type=cache,target=/opt/vcpkg/buildtrees \
 # ── Stage 2: build — configure + compile (reuses cached deps) ────────────
 FROM deps AS builder
 
+# An empty value preserves Meson/Ninja's platform default for local builds.
+# Big Tam CI passes 16 explicitly because Docker BuildKit workers are children
+# of dockerd, not of the L3-pinned GitHub runner service, and therefore do not
+# inherit its CPU affinity or environment. Ninja interprets `-j0` as unlimited,
+# so the compile command omits `-j` entirely when this argument is empty.
+ARG YUZU_BUILD_JOBS=
+
 ENV CC="ccache gcc-13" \
     CXX="ccache g++-13" \
     CCACHE_DIR=/root/.cache/ccache
@@ -79,7 +86,7 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
         -Dcmake_prefix_path=/src/vcpkg_installed/${TRIPLET} \
         -Dbuild_tests=false \
         -Dbuild_agent=false \
-    && meson compile -C builddir \
+    && meson compile -C builddir ${YUZU_BUILD_JOBS:+-j "${YUZU_BUILD_JOBS}"} \
     && ccache -s
 
 # ── Stage 3: runtime ─────────────────────────────────────────────────────

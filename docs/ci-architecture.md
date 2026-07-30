@@ -130,7 +130,7 @@ so the push hits BuildKit's own solver cache and rebuilds nothing.
 
 | Runner | Host | Jobs |
 |---|---|---|
-| `yuzu-bigtam-linux-{0..3}` | Big Tam Threadripper 9970X, native Ubuntu **26.04** (gcc-15/clang-21) | **all self-hosted Linux** (shared label `yuzu-bigtam-linux`): ci.yml `linux` matrix, `proto-compat`, sanitizer-tests (asan/tsan), nightly (asan/tsan/coverage), codeql Linux leg, **release.yml** (build-linux, build-gateway, docker-publish\*), cache-prune-linux. 4 runners on one host. |
+| `yuzu-bigtam-linux-{0..3}` | Big Tam Threadripper 9970X, native Ubuntu **26.04** (gcc-15/clang-21) — 4 L3/CCD-pinned runners (`0-7,32-39`; `8-15,40-47`; `16-23,48-55`; `24-31,56-63`), Ninja capped at `-j16` | **all self-hosted Linux** (shared label `yuzu-bigtam-linux`): ci.yml `linux` matrix, `proto-compat`, sanitizer-tests (asan/tsan), nightly (asan/tsan/coverage), codeql Linux leg, **release.yml** (build-linux, build-gateway, docker-publish\*), cache-prune-linux. 4 runners on one host. Provisioned from [`deploy/linux/`](../deploy/linux/README.md). |
 | `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, nightly `windows-asan`, codeql Windows leg, release `build-windows`, instructions-windows-validate, cache-prune-windows. Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
 | `macos-15` | GitHub-hosted | macos matrix |
 
@@ -165,6 +165,15 @@ runs 4 runners on one host, so every apt step is `flock`-serialized on
 (`scripts/ci/ensure-postgres.sh`), and meson is installed per-job via
 `pip --user` (it is not a host default). Full history + per-file detail:
 **`docs/ci-ubuntu-2604-cutover.md`**.
+
+Each Big Tam runner is bounded to one kernel-reported L3 domain via a systemd
+drop-in (`CPUAffinity` plus cgroup `AllowedCPUs`) and exports
+`YUZU_BUILD_JOBS=16`. Linux's SMT numbering is split: L3 0 is
+`0-7,32-39`, not the contiguous Windows `0-15`. CI passes that cap explicitly
+to `meson compile -j`; a process affinity mask does not make Ninja's default
+processor detection affinity-aware, while `-j16` alone is not an L3 pin. The
+versioned source and verification commands are in
+[`deploy/linux/`](../deploy/linux/README.md).
 
 ### Build speed (Big Tam)
 
@@ -515,6 +524,21 @@ recovered listed cases into the runner's `ci_flake_events` table alongside the
 suite timings. `tests/known-flaky.json` remains the reviewed source of truth —
 the database is observation history, never an implicit allowlist. This is
 reversible test tooling — no ADR (rationale in the wrapper header).
+
+**Triage note — shared-fixture files fail as a cluster on a PG blip.** The
+shared-DB + TRUNCATE fixture files (#2362, #2603: `test_software_inventory_store`,
+`test_software_licensing_*`, `test_product_registry_store`,
+`test_rest_access_review`, `test_engine_principal_{lifecycle,integration}`, and
+later conversions) hold one clone + one pool for the whole file. A Postgres
+blip mid-file therefore reds out *several unrelated-looking CRUD cases in one
+file* — and flake-retry's isolated re-run (fresh process, fresh clone) will
+often recover them, so the incident can masquerade as N independent "recovered
+known flakes". Before treating such a cluster as N regressions (or adding them
+to `known-flaky.json`), grep the junit failure text for
+`PGRES_COMMAND_OK`, `REQUIRE( lease )`, `is_open()`, or the bundle/reset tags
+(`[ApiTokenStorePgShared]`, `[AuthDbPgShared]`, `[EpLcShared]`,
+`[EpIntegShared]`, `[AccRevShared]`, `acc_rev_reset`) — a cluster of those in
+one file is one PG-instance event, not a test bug.
 
 ## Workflow-PR canary
 

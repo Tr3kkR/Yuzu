@@ -140,6 +140,12 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   `CCACHE_DIR=D:\ci\ccache`. Set in each runner's `.env` (durable) and exported
   by the wrapper. The vcpkg binary cache is content-addressed → concurrent writes
   across runners are safe.
+- **Build parallelism.** Provisioning sets machine-level
+  `YUZU_BUILD_JOBS=16`; `Start-PinnedRunner.ps1` consumes that value and refuses
+  to start if it is missing or differs from the fixed 16-thread CCD envelope.
+  `Assert-Toolchain.ps1` also compares the live machine value with the manifest.
+  CI passes it explicitly as `meson compile -j 16`; affinity controls placement
+  but does not make Ninja ignore the host-wide 64-CPU count.
 - **Persistent CI telemetry.** Each runner owns
   `D:\ci\test-runs\yuzu-weetam-windows-N\test-runs.db`. Provisioning initializes
   all four databases; the pin wrapper exports the matching path as
@@ -177,9 +183,11 @@ verified by `Assert-Toolchain.ps1`:
   "host": "WEETAM",
   "runner_count": 4,
   "pins":  { "python": "3.14.6", "meson": "1.11.1", "erlang": "28.4.2",
-             "rebar3": "3.24.0", "postgres": "18.4", "vcpkg_baseline": "4b77da7..." },
+             "rebar3": "3.24.0", "postgres": "18.4", "build_jobs": 16,
+             "vcpkg_baseline": "4b77da7..." },
   "env":   { "VCPKG_ROOT": "C:\\vcpkg", "CCACHE_DIR": "D:\\ci\\ccache",
              "RUNNER_TOOL_CACHE": "D:\\ci\\tool_cache",
+             "YUZU_BUILD_JOBS": "16",
              "YUZU_ESCRIPT": "...erts-*\\bin\\escript.exe",
              "YUZU_REBAR3": "C:\\tools\\rebar3\\rebar3",
              "YUZU_TEST_POSTGRES_DSN": "postgresql://yuzu:yuzu@127.0.0.1:5433/yuzu_test" },

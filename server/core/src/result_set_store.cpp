@@ -1,14 +1,30 @@
 #include "result_set_store.hpp"
-#include "migration_runner.hpp"
 
+#include "audit_retention_rules.hpp"
+
+#include "pg/pg_array.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_migration_runner.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+#include "sqlite_raii.hpp"
+
+#include <libpq-fe.h>
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <sqlite3.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
-#include <mutex>
+#include <cerrno>
+#include <cstdlib>
+#include <format>
+#include <limits>
 #include <random>
+#include <string_view>
+#include <utility>
 
 namespace yuzu::server {
 
@@ -26,6 +42,7 @@ static int64_t now_epoch_ms() {
         .count();
 }
 
+// Only used against legacy SQLite text columns (may be nullptr).
 static const char* safe(const char* p) {
     return p ? p : "";
 }
@@ -93,81 +110,6 @@ static bool parse_cursor(const std::string& c, int64_t& lu, int64_t& ca, std::st
     return true;
 }
 
-// ── Construction / teardown ──────────────────────────────────────────────────
-
-ResultSetStore::ResultSetStore(const std::filesystem::path& db_path) {
-    int rc = sqlite3_open_v2(db_path.string().c_str(), &db_,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                             nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("ResultSetStore: failed to open {}: {}", db_path.string(),
-                      sqlite3_errmsg(db_));
-        if (db_) {
-            sqlite3_close(db_);
-            db_ = nullptr;
-        }
-        return;
-    }
-    sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db_, "PRAGMA foreign_keys=ON;", nullptr, nullptr, nullptr);
-    create_tables();
-    if (db_)
-        spdlog::info("ResultSetStore: opened {}", db_path.string());
-}
-
-ResultSetStore::~ResultSetStore() {
-    if (db_)
-        sqlite3_close(db_);
-}
-
-bool ResultSetStore::is_open() const {
-    return db_ != nullptr;
-}
-
-void ResultSetStore::create_tables() {
-    static const std::vector<Migration> kMigrations = {
-        {1, R"(
-            CREATE TABLE IF NOT EXISTS result_sets (
-                id                  TEXT PRIMARY KEY,
-                name                TEXT,
-                owner_principal     TEXT NOT NULL,
-                created_at          INTEGER NOT NULL,
-                ttl_at              INTEGER NOT NULL,
-                last_used_at        INTEGER NOT NULL,
-                pinned              INTEGER NOT NULL DEFAULT 0,
-                parent_id           TEXT REFERENCES result_sets(id) ON DELETE SET NULL,
-                source_kind         TEXT NOT NULL,
-                source_payload      TEXT NOT NULL,
-                status              TEXT NOT NULL DEFAULT 'materialized',
-                source_execution_id TEXT NOT NULL DEFAULT '',
-                matcher             TEXT NOT NULL DEFAULT '',
-                device_count        INTEGER NOT NULL DEFAULT 0,
-                CHECK (length(id) >= 5 AND substr(id,1,3) = 'rs_'),
-                CHECK (ttl_at >= created_at)
-            );
-            CREATE TABLE IF NOT EXISTS result_set_members (
-                result_set_id TEXT NOT NULL REFERENCES result_sets(id) ON DELETE CASCADE,
-                device_id     TEXT NOT NULL,
-                PRIMARY KEY (result_set_id, device_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_result_sets_owner_used
-                ON result_sets(owner_principal, last_used_at);
-            CREATE INDEX IF NOT EXISTS idx_result_sets_owner_name
-                ON result_sets(owner_principal, name);
-            CREATE INDEX IF NOT EXISTS idx_result_sets_parent ON result_sets(parent_id);
-            CREATE INDEX IF NOT EXISTS idx_result_sets_status ON result_sets(status);
-            CREATE INDEX IF NOT EXISTS idx_result_set_members_dev
-                ON result_set_members(device_id);
-        )"},
-    };
-    if (!MigrationRunner::run(db_, "result_set_store", kMigrations)) {
-        spdlog::error("ResultSetStore: schema migration failed, closing database");
-        sqlite3_close(db_);
-        db_ = nullptr;
-    }
-}
-
 // ── ID generation ────────────────────────────────────────────────────────────
 
 std::string ResultSetStore::generate_id() {
@@ -175,13 +117,11 @@ std::string ResultSetStore::generate_id() {
     // "rs_" + 11 hex digits of epoch-ms (sortable to ~year 2527) + 16 hex
     // digits of randomness for collision resistance within the same ms.
     //
-    // Entropy note (review finding E): the random suffix is collision
-    // resistance, NOT an authenticator. rs_ ids are display identifiers; the
-    // authorization boundary is the per-owner check in evaluate_scope and
-    // load_owned() on every route, not id unguessability. This deliberately
-    // follows the secure_random.hpp #801 convention ("non-token ID generation
-    // is intentionally NOT routed through the CSPRNG") — once the owner check
-    // lands, knowing another operator's id grants nothing.
+    // Entropy note (review finding E, preserved from the SQLite implementation):
+    // the random suffix is collision resistance, NOT an authenticator. rs_ ids
+    // are display identifiers; the authorization boundary is the per-owner
+    // check in evaluate_scope and member_set_owned() on every route, not id
+    // unguessability.
     thread_local std::mt19937_64 rng{std::random_device{}()};
     std::array<char, 40> buf{};
     std::snprintf(buf.data(), buf.size(), "rs_%011llx%016llx",
@@ -190,50 +130,426 @@ std::string ResultSetStore::generate_id() {
     return std::string(buf.data());
 }
 
-// ── Row reader ───────────────────────────────────────────────────────────────
+namespace {
 
-static ResultSet read_row(sqlite3_stmt* s) {
-    ResultSet r;
-    r.id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-    r.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-    r.owner_principal = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
-    r.created_at = sqlite3_column_int64(s, 3);
-    r.ttl_at = sqlite3_column_int64(s, 4);
-    r.last_used_at = sqlite3_column_int64(s, 5);
-    r.pinned = sqlite3_column_int64(s, 6) != 0;
-    if (sqlite3_column_type(s, 7) != SQLITE_NULL)
-        r.parent_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 7)));
-    r.source_kind = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 8)));
-    r.source_payload = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 9)));
-    r.status = result_set_status_from(safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 10))));
-    r.source_execution_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 11)));
-    r.matcher = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 12)));
-    r.device_count = sqlite3_column_int64(s, 13);
-    return r;
+constexpr const char* kStoreName = "result_set_store";
+
+// Bounded acquires (ADR-0012 §2(a)): authoritative store, so reads/writes wait
+// a little longer than a fail-soft store's hot-path budget, but every runtime
+// acquire is still bounded — none may block indefinitely on a saturated pool.
+constexpr std::chrono::milliseconds kReadTimeout{2000};
+constexpr std::chrono::milliseconds kWriteTimeout{4000};
+
+const std::vector<pg::PgMigration>& migrations() {
+    // Unqualified DDL: the runner sets `search_path` to the store schema for
+    // the migration transaction, so `result_sets` et al. land in
+    // `result_set_store`. Runtime statements below schema-qualify explicitly.
+    static const std::vector<pg::PgMigration> kMigrations = {
+        {1,
+         "CREATE TABLE result_sets ("
+         "  id                  TEXT PRIMARY KEY,"
+         "  name                TEXT,"
+         "  owner_principal     TEXT NOT NULL,"
+         "  created_at          BIGINT NOT NULL,"
+         "  ttl_at              BIGINT NOT NULL,"
+         "  last_used_at        BIGINT NOT NULL,"
+         "  pinned              BOOLEAN NOT NULL DEFAULT FALSE,"
+         "  parent_id           TEXT REFERENCES result_sets(id) ON DELETE SET NULL,"
+         "  source_kind         TEXT NOT NULL,"
+         "  source_payload      TEXT NOT NULL,"
+         "  status              TEXT NOT NULL DEFAULT 'materialized',"
+         "  source_execution_id TEXT NOT NULL DEFAULT '',"
+         "  matcher             TEXT NOT NULL DEFAULT '',"
+         "  device_count        BIGINT NOT NULL DEFAULT 0,"
+         "  CHECK (length(id) >= 5 AND substr(id,1,3) = 'rs_'),"
+         "  CHECK (ttl_at >= created_at));"
+         "CREATE TABLE result_set_members ("
+         "  result_set_id TEXT NOT NULL REFERENCES result_sets(id) ON DELETE CASCADE,"
+         "  device_id     TEXT NOT NULL,"
+         "  PRIMARY KEY (result_set_id, device_id));"
+         "CREATE INDEX idx_result_sets_owner_used ON result_sets(owner_principal, last_used_at);"
+         "CREATE INDEX idx_result_sets_owner_name ON result_sets(owner_principal, name);"
+         "CREATE INDEX idx_result_sets_parent ON result_sets(parent_id);"
+         "CREATE INDEX idx_result_sets_status ON result_sets(status);"
+         "CREATE INDEX idx_result_set_members_dev ON result_set_members(device_id);"
+         // Backfill idempotency marker (ADR-0009). A dedicated row — NEVER
+         // inferred from result_sets being empty, since gc_sweep legitimately
+         // empties it over the store's lifetime.
+         "CREATE TABLE sqlite_backfill ("
+         "  id           SMALLINT PRIMARY KEY,"
+         "  completed_at BIGINT NOT NULL,"
+         "  CHECK (id = 1));"
+         // Durable state for the gc_sweep retention clock guard (#2360 class;
+         // routed-concern "Clock-guarded retention"). SHARED rows rather than
+         // process-local members: on Postgres N server replicas each run the
+         // sweep, so the persisted reading and the anomaly-dedup fact set
+         // must be one shared truth under the sweep's advisory lock — a
+         // process-local copy paces at N x cap and one skewed replica would
+         // put every replica into independent decline (the ladder's AuditStore
+         // row records the same requirement for its own migration).
+         "CREATE TABLE gc_meta ("
+         "  key   TEXT PRIMARY KEY,"
+         "  value TEXT NOT NULL);"},
+    };
+    return kMigrations;
 }
 
-static constexpr const char* kRowCols =
+std::int64_t to_i64(const char* s) {
+    if (s == nullptr || s[0] == '\0')
+        return 0;
+    return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
+}
+int to_int(const char* s) { return static_cast<int>(to_i64(s)); }
+bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
+
+constexpr const char* kRowCols =
     "id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, "
     "source_kind, source_payload, status, source_execution_id, matcher, device_count";
 
-std::optional<ResultSet> ResultSetStore::get_impl(const std::string& id) const {
-    if (!db_)
-        return std::nullopt;
-    sqlite3_stmt* s = nullptr;
-    std::string sql = std::string("SELECT ") + kRowCols + " FROM result_sets WHERE id = ? LIMIT 1;";
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
-        return std::nullopt;
-    sqlite3_bind_text(s, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-    std::optional<ResultSet> result;
-    if (sqlite3_step(s) == SQLITE_ROW)
-        result = read_row(s);
-    sqlite3_finalize(s);
-    return result;
+ResultSet read_row(PGresult* res, int i) {
+    ResultSet r;
+    int c = 0;
+    r.id = PQgetvalue(res, i, c++);
+    // NULL and "" are indistinguishable via PQgetvalue on a text column — same
+    // ambiguity the legacy SQLite reader had (sqlite3_column_text on a NULL
+    // column also yields ""), so this is not a behavioral change.
+    r.name = PQgetvalue(res, i, c++);
+    r.owner_principal = PQgetvalue(res, i, c++);
+    r.created_at = to_i64(PQgetvalue(res, i, c++));
+    r.ttl_at = to_i64(PQgetvalue(res, i, c++));
+    r.last_used_at = to_i64(PQgetvalue(res, i, c++));
+    r.pinned = to_bool(PQgetvalue(res, i, c++));
+    if (!PQgetisnull(res, i, c))
+        r.parent_id = PQgetvalue(res, i, c);
+    ++c;
+    r.source_kind = PQgetvalue(res, i, c++);
+    r.source_payload = PQgetvalue(res, i, c++);
+    r.status = result_set_status_from(PQgetvalue(res, i, c++));
+    r.source_execution_id = PQgetvalue(res, i, c++);
+    r.matcher = PQgetvalue(res, i, c++);
+    r.device_count = to_i64(PQgetvalue(res, i, c++));
+    return r;
 }
 
-std::optional<ResultSet> ResultSetStore::get(const std::string& id) const {
-    std::shared_lock lock(mtx_);
-    return get_impl(id);
+std::vector<std::string_view> as_views(const std::vector<std::string>& v) {
+    std::vector<std::string_view> out;
+    out.reserve(v.size());
+    for (const auto& s : v)
+        out.emplace_back(s);
+    return out;
+}
+
+// Shared by pin() (same connection, no extra round trip) and the public
+// count_pinned_for_owner(). Returns -1 on query error so callers can
+// distinguish "zero pinned" from "could not determine" (authoritative posture
+// — a caller must not silently treat a DB error as "under the limit").
+int count_pinned_on(PGconn* conn, const std::string& owner) {
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "SELECT COUNT(*) FROM result_set_store.result_sets WHERE owner_principal = $1 AND "
+        "pinned = true",
+        std::vector<std::string>{owner});
+    if (res.status() != PGRES_TUPLES_OK)
+        return -1;
+    return to_int(PQgetvalue(res.get(), 0, 0));
+}
+
+// RAII owner for the legacy SQLite connection migrate_from_sqlite opens
+// read-only. sqlite3_close runs on scope exit — including exception unwind
+// (e.g. a std::bad_alloc thrown mid read-loop building a ResultSet/string) —
+// so no early-return/error path can leak the handle (gov cpp-safety). Local
+// to this file: the only sqlite3* connection this store ever opens (the
+// runtime store lives entirely on pg::PgPool). Pairs with the existing
+// per-statement `SqliteStmt` owner (sqlite_raii.hpp) for the prepare/step
+// loops below.
+class SqliteConnGuard {
+public:
+    SqliteConnGuard() = default;
+    ~SqliteConnGuard() { reset(); }
+
+    SqliteConnGuard(const SqliteConnGuard&) = delete;
+    SqliteConnGuard& operator=(const SqliteConnGuard&) = delete;
+    SqliteConnGuard(SqliteConnGuard&& o) noexcept : db_(o.db_) { o.db_ = nullptr; }
+    SqliteConnGuard& operator=(SqliteConnGuard&& o) noexcept {
+        if (this != &o) {
+            reset();
+            db_ = o.db_;
+            o.db_ = nullptr;
+        }
+        return *this;
+    }
+
+    /// Address for `sqlite3_open_v2(path, guard.addr(), flags, nullptr)`.
+    sqlite3** addr() noexcept { return &db_; }
+    sqlite3* get() const noexcept { return db_; }
+    explicit operator bool() const noexcept { return db_ != nullptr; }
+
+    /// Close early. Idempotent.
+    void reset() noexcept {
+        if (db_) {
+            sqlite3_close(db_);
+            db_ = nullptr;
+        }
+    }
+
+private:
+    sqlite3* db_{nullptr};
+};
+
+} // namespace
+
+// ── Construction ─────────────────────────────────────────────────────────────
+
+ResultSetStore::ResultSetStore(pg::PgPool& pool) : pool_(pool) {
+    auto lease = pool_.acquire();
+    if (!lease) {
+        spdlog::error("ResultSetStore: no database connection at construction ({}) — result-set "
+                      "persistence disabled",
+                      pool_.last_error());
+        return;
+    }
+    if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
+        spdlog::error("ResultSetStore: schema migration failed — result-set persistence disabled");
+        return;
+    }
+    open_ = true;
+}
+
+// ── Backfill (ADR-0009) ──────────────────────────────────────────────────────
+
+bool ResultSetStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path) {
+    if (!open_)
+        return false;
+
+    // Idempotency check: a dedicated marker row, never row-count-inferred
+    // (gc_sweep legitimately empties result_sets over the store's lifetime).
+    // Unbounded acquire() here is construction-time discipline (ADR-0012
+    // §2(a)) — this runs once at boot, before serving, same as the ctor.
+    {
+        auto lease = pool_.acquire();
+        if (!lease) {
+            spdlog::error("ResultSetStore::migrate_from_sqlite: no database connection");
+            return false;
+        }
+        pg::PgResult marker = pg::exec_params(
+            lease.get(), "SELECT 1 FROM result_set_store.sqlite_backfill LIMIT 1",
+            std::vector<std::string>{});
+        if (marker.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::migrate_from_sqlite: backfill-marker check failed: {}",
+                          PQerrorMessage(lease.get()));
+            return false;
+        }
+        if (PQntuples(marker.get()) > 0) {
+            spdlog::info("ResultSetStore::migrate_from_sqlite: already backfilled, skipping");
+            return true;
+        }
+    }
+
+    std::error_code ec;
+    if (!std::filesystem::exists(legacy_db_path, ec)) {
+        // Fresh install — nothing to backfill. Stamp the marker so this branch
+        // is not re-evaluated on every future boot.
+        auto lease = pool_.acquire();
+        if (!lease) {
+            spdlog::error("ResultSetStore::migrate_from_sqlite: no connection to stamp marker");
+            return false;
+        }
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "INSERT INTO result_set_store.sqlite_backfill (id, completed_at) VALUES (1, "
+            "$1::bigint) ON CONFLICT (id) DO NOTHING",
+            std::vector<std::string>{std::to_string(now_epoch())});
+        if (r.status() != PGRES_COMMAND_OK) {
+            spdlog::error("ResultSetStore::migrate_from_sqlite: failed to stamp marker: {}",
+                          PQerrorMessage(lease.get()));
+            return false;
+        }
+        spdlog::info("ResultSetStore::migrate_from_sqlite: no legacy {} — nothing to backfill",
+                     legacy_db_path.string());
+        return true;
+    }
+
+    // Read the legacy SQLite file READ-ONLY. It is retained by the caller
+    // (never deleted here) for the ADR-0009 one-release rollback window.
+    // RAII (gov cpp-safety): SqliteConnGuard/SqliteStmt close/finalize on
+    // every path — including an exception thrown mid read-loop (e.g. a
+    // std::bad_alloc building a ResultSet/string) — so no early return here
+    // can leak the connection or a prepared statement.
+    SqliteConnGuard legacy;
+    if (sqlite3_open_v2(legacy_db_path.string().c_str(), legacy.addr(), SQLITE_OPEN_READONLY,
+                        nullptr) != SQLITE_OK) {
+        spdlog::error("ResultSetStore::migrate_from_sqlite: failed to open legacy {}: {}",
+                      legacy_db_path.string(),
+                      legacy ? sqlite3_errmsg(legacy.get()) : "open failed");
+        return false;
+    }
+
+    std::vector<ResultSet> legacy_sets;
+    {
+        SqliteStmt s;
+        // ORDER BY created_at, id ASC (B3a): the self-referencing parent_id FK
+        // is NOT DEFERRABLE, so a child row's INSERT must never precede its
+        // parent's in the write transaction below. `id` embeds an epoch-ms
+        // prefix (generate_id()) — a finer-grained, still-lexically-ordered
+        // tiebreak for two rows created within the same created_at second.
+        const char* sql =
+            "SELECT id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, "
+            "parent_id, source_kind, source_payload, status, source_execution_id, matcher, "
+            "device_count FROM result_sets ORDER BY created_at ASC, id ASC;";
+        if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK) {
+            spdlog::error(
+                "ResultSetStore::migrate_from_sqlite: legacy result_sets query failed: {}",
+                sqlite3_errmsg(legacy.get()));
+            return false;
+        }
+        int step_rc = SQLITE_OK;
+        while ((step_rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+            ResultSet r;
+            r.id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0)));
+            r.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1)));
+            r.owner_principal =
+                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2)));
+            r.created_at = sqlite3_column_int64(s.get(), 3);
+            r.ttl_at = sqlite3_column_int64(s.get(), 4);
+            r.last_used_at = sqlite3_column_int64(s.get(), 5);
+            r.pinned = sqlite3_column_int64(s.get(), 6) != 0;
+            if (sqlite3_column_type(s.get(), 7) != SQLITE_NULL)
+                r.parent_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 7)));
+            r.source_kind = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 8)));
+            r.source_payload =
+                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 9)));
+            r.status = result_set_status_from(
+                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 10))));
+            r.source_execution_id =
+                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 11)));
+            r.matcher = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 12)));
+            r.device_count = sqlite3_column_int64(s.get(), 13);
+            legacy_sets.push_back(std::move(r));
+        }
+        // H2 (governance): the loop above exits on ANY non-ROW code. Require
+        // the terminal code to be SQLITE_DONE — a corrupt page or I/O error
+        // mid-scan (SQLITE_CORRUPT/SQLITE_IOERR/...) otherwise truncates the
+        // legacy set silently, and the marker below would stamp the backfill
+        // complete over a partial copy, permanently (the marker short-circuits
+        // every later boot). ADR-0009: fail closed on ANY error — including
+        // read-side errors, not just insert-side ones.
+        if (step_rc != SQLITE_DONE) {
+            spdlog::error("ResultSetStore::migrate_from_sqlite: legacy result_sets scan aborted "
+                          "mid-read (rc={} {}): refusing to stamp a partial backfill",
+                          step_rc, sqlite3_errmsg(legacy.get()));
+            return false;
+        }
+        // s finalizes here (end of scope), before the next SqliteStmt opens.
+    }
+
+    std::vector<std::pair<std::string, std::string>> legacy_members; // (result_set_id, device_id)
+    {
+        SqliteStmt s;
+        const char* sql = "SELECT result_set_id, device_id FROM result_set_members;";
+        if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK) {
+            spdlog::error(
+                "ResultSetStore::migrate_from_sqlite: legacy result_set_members query failed: {}",
+                sqlite3_errmsg(legacy.get()));
+            return false;
+        }
+        int step_rc = SQLITE_OK;
+        while ((step_rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+            legacy_members.emplace_back(
+                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0))),
+                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1))));
+        }
+        // H2: same terminal-code discipline as the result_sets scan above.
+        if (step_rc != SQLITE_DONE) {
+            spdlog::error("ResultSetStore::migrate_from_sqlite: legacy result_set_members scan "
+                          "aborted mid-read (rc={} {}): refusing to stamp a partial backfill",
+                          step_rc, sqlite3_errmsg(legacy.get()));
+            return false;
+        }
+    }
+    // `legacy` closes here (end of function scope) via SqliteConnGuard's
+    // destructor — no explicit sqlite3_close() call needed on any path below.
+
+    spdlog::info("ResultSetStore::migrate_from_sqlite: backfilling {} result set(s), {} member "
+                 "row(s) from {}",
+                 legacy_sets.size(), legacy_members.size(), legacy_db_path.string());
+
+    // ONE transaction: fail closed on any error, nothing partially committed
+    // (ADR-0009 "fails closed on any error"). Unbounded with_txn (not
+    // with_txn_for): startup is serial, same discipline as the ctor's
+    // unbounded acquire() (ADR-0012 §2(a)). `failure_detail` (B3b) names the
+    // SPECIFIC offending row so the abort log is actionable, not opaque —
+    // the operator can inspect/fix that exact row in the retained read-only
+    // legacy file before restarting (the marker is never stamped on failure,
+    // so the next boot retries the whole backfill).
+    std::string failure_detail;
+    bool ok = pool_.with_txn([&](PGconn* conn) -> bool {
+        for (const auto& r : legacy_sets) {
+            pg::PgResult res = pg::exec_params(
+                conn,
+                "INSERT INTO result_set_store.result_sets "
+                "(id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, "
+                " parent_id, source_kind, source_payload, status, source_execution_id, matcher, "
+                " device_count) "
+                "VALUES ($1,$2,$3,$4::bigint,$5::bigint,$6::bigint,$7::boolean,$8,$9,$10,$11,"
+                "$12,$13,$14::bigint) ON CONFLICT (id) DO NOTHING",
+                std::vector<std::optional<std::string>>{
+                    r.id, r.name.empty() ? std::nullopt : std::optional<std::string>(r.name),
+                    r.owner_principal, std::to_string(r.created_at), std::to_string(r.ttl_at),
+                    std::to_string(r.last_used_at), std::string(r.pinned ? "true" : "false"),
+                    r.parent_id, r.source_kind, r.source_payload,
+                    std::string(to_string(r.status)), r.source_execution_id, r.matcher,
+                    std::to_string(r.device_count)});
+            if (res.status() != PGRES_COMMAND_OK) {
+                failure_detail = std::format("legacy result_sets row id='{}' (owner='{}'): {}",
+                                             r.id, r.owner_principal, PQerrorMessage(conn));
+                spdlog::error("ResultSetStore::migrate_from_sqlite: insert of {} failed: {}", r.id,
+                              PQerrorMessage(conn));
+                return false;
+            }
+        }
+        for (const auto& [rs_id, dev_id] : legacy_members) {
+            pg::PgResult res = pg::exec_params(
+                conn,
+                "INSERT INTO result_set_store.result_set_members (result_set_id, device_id) "
+                "VALUES ($1,$2) ON CONFLICT DO NOTHING",
+                std::vector<std::string>{rs_id, dev_id});
+            if (res.status() != PGRES_COMMAND_OK) {
+                failure_detail =
+                    std::format("legacy result_set_members row (result_set_id='{}', "
+                                "device_id='{}'): {}",
+                                rs_id, dev_id, PQerrorMessage(conn));
+                spdlog::error(
+                    "ResultSetStore::migrate_from_sqlite: member insert ({}, {}) failed: {}",
+                    rs_id, dev_id, PQerrorMessage(conn));
+                return false;
+            }
+        }
+        pg::PgResult marker = pg::exec_params(
+            conn,
+            "INSERT INTO result_set_store.sqlite_backfill (id, completed_at) VALUES (1, "
+            "$1::bigint) ON CONFLICT (id) DO NOTHING",
+            std::vector<std::string>{std::to_string(now_epoch())});
+        if (marker.status() != PGRES_COMMAND_OK) {
+            failure_detail = std::format("backfill marker stamp: {}", PQerrorMessage(conn));
+            spdlog::error("ResultSetStore::migrate_from_sqlite: failed to stamp backfill marker: {}",
+                          PQerrorMessage(conn));
+            return false;
+        }
+        return true;
+    });
+    if (!ok) {
+        spdlog::error(
+            "ResultSetStore::migrate_from_sqlite: backfill transaction failed and was rolled "
+            "back — result-set data NOT migrated. Offending: {}. Remediation: inspect/fix the "
+            "referenced row in the retained read-only legacy file ({}) — e.g. `sqlite3 {} "
+            "\"SELECT * FROM result_sets WHERE id='<id>'\"` — then restart the server; the "
+            "backfill marker was NOT stamped, so the next boot retries the whole backfill.",
+            failure_detail.empty() ? "unknown (see the specific-row error above)" : failure_detail,
+            legacy_db_path.string(), legacy_db_path.string());
+        return false;
+    }
+    spdlog::info("ResultSetStore::migrate_from_sqlite: backfill complete");
+    return true;
 }
 
 // ── Create ───────────────────────────────────────────────────────────────────
@@ -241,16 +557,14 @@ std::optional<ResultSet> ResultSetStore::get(const std::string& id) const {
 std::expected<ResultSet, ResultSetError> ResultSetStore::insert_row_impl(
     const CreateRequest& req, ResultSetStatus status, const std::string& execution_id,
     const std::vector<std::string>& members) {
-    // Caller holds the unique_lock; the store mutex serialises all writers, so
-    // the quota count + insert below is atomic w.r.t. other store operations
-    // (no reliance on sqlite3_changes()).
-    if (!db_)
+    if (!open_)
         return std::unexpected(ResultSetError::DbError);
 
-    // Deduplicate members up front: device_count must reflect the rows actually
-    // stored (INSERT OR IGNORE silently drops duplicates — review finding L),
-    // and the per-set cap is a DoS guard that must bound the *distinct*
-    // membership, not the raw request size (review finding C).
+    // Deduplicate members up front: device_count must reflect the rows
+    // actually stored (ON CONFLICT DO NOTHING silently drops duplicates —
+    // review finding L, preserved from the SQLite implementation), and the
+    // per-set cap is a DoS guard that must bound the *distinct* membership,
+    // not the raw request size (review finding C).
     std::vector<std::string> uniq;
     uniq.reserve(members.size());
     {
@@ -262,20 +576,6 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::insert_row_impl(
     }
     if (uniq.size() > static_cast<size_t>(kMaxMembersPerSet))
         return std::unexpected(ResultSetError::TooManyMembers);
-
-    // Hard per-operator quota (design §3.3).
-    {
-        sqlite3_stmt* c = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "SELECT COUNT(*) FROM result_sets WHERE owner_principal = ?;", -1,
-                               &c, nullptr) != SQLITE_OK)
-            return std::unexpected(ResultSetError::DbError);
-        sqlite3_bind_text(c, 1, req.owner_principal.c_str(), -1, SQLITE_TRANSIENT);
-        int count = (sqlite3_step(c) == SQLITE_ROW) ? sqlite3_column_int(c, 0) : 0;
-        sqlite3_finalize(c);
-        if (count >= kMaxPerOwner)
-            return std::unexpected(ResultSetError::QuotaExceeded);
-    }
 
     ResultSet row;
     row.id = generate_id();
@@ -293,132 +593,149 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::insert_row_impl(
     row.matcher = req.matcher;
     row.device_count = static_cast<int64_t>(uniq.size());
 
-    if (sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK)
-        return std::unexpected(ResultSetError::DbError);
+    const std::vector<std::string_view> member_views = as_views(uniq);
+    bool quota_exceeded = false;
 
-    auto rollback = [&]() { sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr); };
-
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(
-            db_,
-            "INSERT INTO result_sets (id, name, owner_principal, created_at, ttl_at, "
-            "last_used_at, pinned, parent_id, source_kind, source_payload, status, "
-            "source_execution_id, matcher, device_count) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?);",
-            -1, &s, nullptr) != SQLITE_OK) {
-        rollback();
-        return std::unexpected(ResultSetError::DbError);
-    }
-    sqlite3_bind_text(s, 1, row.id.c_str(), -1, SQLITE_TRANSIENT);
-    if (row.name.empty())
-        sqlite3_bind_null(s, 2);
-    else
-        sqlite3_bind_text(s, 2, row.name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 3, row.owner_principal.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 4, row.created_at);
-    sqlite3_bind_int64(s, 5, row.ttl_at);
-    sqlite3_bind_int64(s, 6, row.last_used_at);
-    if (row.parent_id)
-        sqlite3_bind_text(s, 7, row.parent_id->c_str(), -1, SQLITE_TRANSIENT);
-    else
-        sqlite3_bind_null(s, 7);
-    sqlite3_bind_text(s, 8, row.source_kind.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 9, row.source_payload.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 10, to_string(row.status), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 11, row.source_execution_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 12, row.matcher.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 13, row.device_count);
-    int rc = sqlite3_step(s);
-    sqlite3_finalize(s);
-    if (rc != SQLITE_DONE) {
-        rollback();
-        return std::unexpected(ResultSetError::DbError);
-    }
-
-    if (!uniq.empty()) {
-        sqlite3_stmt* m = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "INSERT OR IGNORE INTO result_set_members (result_set_id, device_id) "
-                               "VALUES (?, ?);",
-                               -1, &m, nullptr) != SQLITE_OK) {
-            rollback();
-            return std::unexpected(ResultSetError::DbError);
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // Hard per-operator quota (design §3.3). A small race against a
+        // concurrent create for the same owner is possible (Postgres real
+        // concurrency replaces the SQLite single-writer mutex) — acceptable
+        // for a soft DoS guard, not a security boundary.
+        // Expired-but-unswept rows do NOT count against the quota (Gate 4
+        // UP-6): a stalled gc sweep would otherwise convert GC debt into
+        // spurious operator Quota failures. Still soft-guard-grade.
+        pg::PgResult qc = pg::exec_params(
+            conn,
+            "SELECT COUNT(*) FROM result_set_store.result_sets WHERE owner_principal = $1 "
+            "AND (pinned OR ttl_at >= extract(epoch from now())::bigint)",
+            std::vector<std::string>{req.owner_principal});
+        if (qc.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::insert_row_impl: quota check failed: {}",
+                          PQerrorMessage(conn));
+            return false;
         }
-        for (const auto& dev : uniq) {
-            sqlite3_bind_text(m, 1, row.id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(m, 2, dev.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(m) != SQLITE_DONE) {
-                sqlite3_finalize(m);
-                rollback();
-                return std::unexpected(ResultSetError::DbError);
+        if (to_int(PQgetvalue(qc.get(), 0, 0)) >= kMaxPerOwner) {
+            quota_exceeded = true;
+            return false;
+        }
+
+        pg::PgResult r1 = pg::exec_params(
+            conn,
+            "INSERT INTO result_set_store.result_sets "
+            "(id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, "
+            " source_kind, source_payload, status, source_execution_id, matcher, device_count) "
+            "VALUES ($1,$2,$3,$4::bigint,$5::bigint,$6::bigint,false,$7,$8,$9,$10,$11,$12,"
+            "$13::bigint) RETURNING id",
+            std::vector<std::optional<std::string>>{
+                row.id, row.name.empty() ? std::nullopt : std::optional<std::string>(row.name),
+                row.owner_principal, std::to_string(row.created_at), std::to_string(row.ttl_at),
+                std::to_string(row.last_used_at), row.parent_id, row.source_kind,
+                row.source_payload, std::string(to_string(row.status)), row.source_execution_id,
+                row.matcher, std::to_string(row.device_count)});
+        if (r1.status() != PGRES_TUPLES_OK || PQntuples(r1.get()) == 0) {
+            spdlog::error("ResultSetStore::insert_row_impl: row insert failed: {}",
+                          PQerrorMessage(conn));
+            return false;
+        }
+
+        if (!uniq.empty()) {
+            pg::PgResult r2 = pg::exec_params(
+                conn,
+                "INSERT INTO result_set_store.result_set_members (result_set_id, device_id) "
+                "SELECT $1, d FROM unnest($2::text[]) AS d ON CONFLICT DO NOTHING",
+                std::vector<std::string>{row.id, pg::to_text_array(member_views)});
+            if (r2.status() != PGRES_COMMAND_OK && r2.status() != PGRES_TUPLES_OK) {
+                spdlog::error("ResultSetStore::insert_row_impl: member insert failed: {}",
+                              PQerrorMessage(conn));
+                return false;
             }
-            sqlite3_reset(m);
         }
-        sqlite3_finalize(m);
-    }
+        return true;
+    });
 
-    if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        rollback();
-        return std::unexpected(ResultSetError::DbError);
-    }
+    if (!ok)
+        return std::unexpected(quota_exceeded ? ResultSetError::QuotaExceeded
+                                              : ResultSetError::DbError);
     return row;
 }
 
 std::expected<ResultSet, ResultSetError> ResultSetStore::create_materialized(
     const CreateRequest& req, const std::vector<std::string>& members) {
-    std::unique_lock lock(mtx_);
     return insert_row_impl(req, ResultSetStatus::Materialized, /*execution_id=*/"", members);
 }
 
 std::expected<ResultSet, ResultSetError> ResultSetStore::create_pending(
     const CreateRequest& req, const std::string& execution_id) {
-    std::unique_lock lock(mtx_);
     return insert_row_impl(req, ResultSetStatus::Pending, execution_id, /*members=*/{});
 }
 
 // ── Read ─────────────────────────────────────────────────────────────────────
 
+std::expected<std::optional<ResultSet>, ResultSetError> ResultSetStore::get(const std::string& id) {
+    if (!open_)
+        return std::unexpected(ResultSetError::DbError);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::get: no connection ({})", pool_.last_error());
+        return std::unexpected(ResultSetError::DbError);
+    }
+    std::string sql = std::string("SELECT ") + kRowCols +
+                      " FROM result_set_store.result_sets WHERE id = $1 LIMIT 1";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{id});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore::get: query failed: {}", PQerrorMessage(lease.get()));
+        return std::unexpected(ResultSetError::DbError);
+    }
+    if (PQntuples(res.get()) == 0)
+        return std::optional<ResultSet>(std::nullopt);
+    return std::optional<ResultSet>(read_row(res.get(), 0));
+}
+
 std::vector<ResultSet> ResultSetStore::list_by_owner(const std::string& owner,
                                                      const std::string& cursor, int limit,
-                                                     std::string& out_next_cursor) const {
-    std::shared_lock lock(mtx_);
+                                                     std::string& out_next_cursor) {
     out_next_cursor.clear();
     std::vector<ResultSet> result;
-    if (!db_)
+    if (!open_)
         return result;
     if (limit <= 0)
         limit = 50;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::list_by_owner: no connection ({})", pool_.last_error());
+        return result;
+    }
 
     int64_t cur_lu = 0, cur_ca = 0;
     std::string cur_id;
     bool has_cursor = !cursor.empty() && parse_cursor(cursor, cur_lu, cur_ca, cur_id);
 
     // Keyset pagination over (last_used_at, created_at, id) DESC.
-    std::string sql = std::string("SELECT ") + kRowCols + " FROM result_sets WHERE owner_principal = ?";
+    std::string sql = std::string("SELECT ") + kRowCols +
+                      " FROM result_set_store.result_sets WHERE owner_principal = $1";
+    std::vector<std::string> params{owner};
     if (has_cursor) {
-        sql +=
-            " AND (last_used_at < ? OR (last_used_at = ? AND (created_at < ? OR "
-            "(created_at = ? AND id < ?))))";
+        sql += " AND (last_used_at < $2::bigint OR (last_used_at = $2::bigint AND "
+              "(created_at < $3::bigint OR (created_at = $3::bigint AND id < $4))))"
+              " ORDER BY last_used_at DESC, created_at DESC, id DESC LIMIT $5::bigint";
+        params.push_back(std::to_string(cur_lu));
+        params.push_back(std::to_string(cur_ca));
+        params.push_back(cur_id);
+    } else {
+        sql += " ORDER BY last_used_at DESC, created_at DESC, id DESC LIMIT $2::bigint";
     }
-    sql += " ORDER BY last_used_at DESC, created_at DESC, id DESC LIMIT ?;";
+    params.push_back(std::to_string(limit + 1)); // fetch one extra to detect next page
 
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore::list_by_owner: query failed: {}",
+                      PQerrorMessage(lease.get()));
         return result;
-    int idx = 1;
-    sqlite3_bind_text(s, idx++, owner.c_str(), -1, SQLITE_TRANSIENT);
-    if (has_cursor) {
-        sqlite3_bind_int64(s, idx++, cur_lu);
-        sqlite3_bind_int64(s, idx++, cur_lu);
-        sqlite3_bind_int64(s, idx++, cur_ca);
-        sqlite3_bind_int64(s, idx++, cur_ca);
-        sqlite3_bind_text(s, idx++, cur_id.c_str(), -1, SQLITE_TRANSIENT);
     }
-    sqlite3_bind_int(s, idx++, limit + 1); // fetch one extra to detect next page
-
-    while (sqlite3_step(s) == SQLITE_ROW)
-        result.push_back(read_row(s));
-    sqlite3_finalize(s);
+    const int rows = PQntuples(res.get());
+    result.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        result.push_back(read_row(res.get(), i));
 
     if (static_cast<int>(result.size()) > limit) {
         result.resize(limit);
@@ -428,33 +745,40 @@ std::vector<ResultSet> ResultSetStore::list_by_owner(const std::string& owner,
 }
 
 std::vector<std::string> ResultSetStore::members(const std::string& id, const std::string& cursor,
-                                                 int limit, std::string& out_next_cursor) const {
-    std::shared_lock lock(mtx_);
+                                                 int limit, std::string& out_next_cursor) {
     out_next_cursor.clear();
     std::vector<std::string> result;
-    if (!db_)
+    if (!open_)
         return result;
     if (limit <= 0)
         limit = 1000;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::members: no connection ({})", pool_.last_error());
+        return result;
+    }
 
     // Keyset over device_id ASC.
-    std::string sql = "SELECT device_id FROM result_set_members WHERE result_set_id = ?";
-    if (!cursor.empty())
-        sql += " AND device_id > ?";
-    sql += " ORDER BY device_id ASC LIMIT ?;";
+    std::string sql =
+        "SELECT device_id FROM result_set_store.result_set_members WHERE result_set_id = $1";
+    std::vector<std::string> params{id};
+    if (!cursor.empty()) {
+        sql += " AND device_id > $2 ORDER BY device_id ASC LIMIT $3::bigint";
+        params.push_back(cursor);
+    } else {
+        sql += " ORDER BY device_id ASC LIMIT $2::bigint";
+    }
+    params.push_back(std::to_string(limit + 1));
 
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore::members: query failed: {}", PQerrorMessage(lease.get()));
         return result;
-    int idx = 1;
-    sqlite3_bind_text(s, idx++, id.c_str(), -1, SQLITE_TRANSIENT);
-    if (!cursor.empty())
-        sqlite3_bind_text(s, idx++, cursor.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(s, idx++, limit + 1);
-
-    while (sqlite3_step(s) == SQLITE_ROW)
-        result.push_back(safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0))));
-    sqlite3_finalize(s);
+    }
+    const int rows = PQntuples(res.get());
+    result.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        result.emplace_back(PQgetvalue(res.get(), i, 0));
 
     if (static_cast<int>(result.size()) > limit) {
         result.resize(limit);
@@ -463,47 +787,50 @@ std::vector<std::string> ResultSetStore::members(const std::string& id, const st
     return result;
 }
 
-std::vector<LineageNode> ResultSetStore::lineage(const std::string& id,
-                                                 const std::string& owner) const {
-    std::shared_lock lock(mtx_);
+std::vector<LineageNode> ResultSetStore::lineage(const std::string& id, const std::string& owner) {
     std::vector<LineageNode> chain;
-    if (!db_)
+    if (!open_)
         return chain;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::lineage: no connection ({})", pool_.last_error());
+        return chain;
+    }
 
+    // One logical operation, one lease (ADR-0012 §2(c)) — up to kLineageDepthCap
+    // sequential hops on the same connection.
     std::optional<std::string> cur = id;
     int depth = 0;
     std::unordered_set<std::string> visited; // cycle guard (review finding J)
     while (cur && depth < kLineageDepthCap) {
         if (!visited.insert(*cur).second)
             break; // a parent_id loop would otherwise spin to the depth cap
-        sqlite3_stmt* s = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "SELECT id, name, source_kind, device_count, parent_id, "
-                               "owner_principal FROM result_sets WHERE id = ? LIMIT 1;",
-                               -1, &s, nullptr) != SQLITE_OK)
+        pg::PgResult res = pg::exec_params(
+            lease.get(),
+            "SELECT id, name, source_kind, device_count, parent_id, owner_principal "
+            "FROM result_set_store.result_sets WHERE id = $1 LIMIT 1",
+            std::vector<std::string>{*cur});
+        if (res.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::lineage: query failed: {}", PQerrorMessage(lease.get()));
             break;
-        sqlite3_bind_text(s, 1, cur->c_str(), -1, SQLITE_TRANSIENT);
-        std::optional<std::string> next;
-        if (sqlite3_step(s) == SQLITE_ROW) {
-            // Owner-filter (review finding B2): stop at the first node not owned
-            // by `owner` so a cross-operator ancestor's name/source_kind/
-            // device_count never reaches the caller.
-            std::string node_owner =
-                safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 5)));
-            if (node_owner != owner) {
-                sqlite3_finalize(s);
-                break;
-            }
-            LineageNode n;
-            n.id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-            n.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-            n.source_kind = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
-            n.device_count = sqlite3_column_int64(s, 3);
-            chain.push_back(std::move(n));
-            if (sqlite3_column_type(s, 4) != SQLITE_NULL)
-                next = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 4)));
         }
-        sqlite3_finalize(s);
+        std::optional<std::string> next;
+        if (PQntuples(res.get()) > 0) {
+            // Owner-filter (review finding B2): stop at the first node not
+            // owned by `owner` so a cross-operator ancestor's name/
+            // source_kind/device_count never reaches the caller.
+            std::string node_owner = PQgetvalue(res.get(), 0, 5);
+            if (node_owner != owner)
+                break;
+            LineageNode n;
+            n.id = PQgetvalue(res.get(), 0, 0);
+            n.name = PQgetvalue(res.get(), 0, 1);
+            n.source_kind = PQgetvalue(res.get(), 0, 2);
+            n.device_count = to_i64(PQgetvalue(res.get(), 0, 3));
+            chain.push_back(std::move(n));
+            if (!PQgetisnull(res.get(), 0, 4))
+                next = PQgetvalue(res.get(), 0, 4);
+        }
         cur = next;
         ++depth;
     }
@@ -512,346 +839,642 @@ std::vector<LineageNode> ResultSetStore::lineage(const std::string& id,
     return chain;
 }
 
-bool ResultSetStore::contains(const std::string& id, const std::string& device_id) const {
-    std::shared_lock lock(mtx_);
-    if (!db_)
-        return false;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT 1 FROM result_set_members WHERE result_set_id = ? AND "
-                           "device_id = ? LIMIT 1;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return false;
-    sqlite3_bind_text(s, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, device_id.c_str(), -1, SQLITE_TRANSIENT);
-    bool found = sqlite3_step(s) == SQLITE_ROW;
-    sqlite3_finalize(s);
-    return found;
+std::expected<bool, ResultSetError> ResultSetStore::contains(const std::string& id,
+                                                             const std::string& device_id) {
+    if (!open_)
+        return std::unexpected(ResultSetError::DbError);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::contains: no connection ({})", pool_.last_error());
+        return std::unexpected(ResultSetError::DbError);
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT 1 FROM result_set_store.result_set_members WHERE result_set_id = $1 AND "
+        "device_id = $2 LIMIT 1",
+        std::vector<std::string>{id, device_id});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore::contains: query failed: {}", PQerrorMessage(lease.get()));
+        return std::unexpected(ResultSetError::DbError);
+    }
+    return PQntuples(res.get()) > 0;
 }
 
-std::unordered_set<std::string>
-ResultSetStore::member_set_owned(const std::string& id, const std::string& owner) const {
-    std::shared_lock lock(mtx_);
-    std::unordered_set<std::string> out;
-    if (!db_)
-        return out;
-    sqlite3_stmt* s = nullptr;
+std::expected<std::unordered_set<std::string>, ResultSetError>
+ResultSetStore::member_set_owned(const std::string& id, const std::string& owner) {
+    if (!open_)
+        return std::unexpected(ResultSetError::DbError);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::member_set_owned: no connection ({})", pool_.last_error());
+        return std::unexpected(ResultSetError::DbError);
+    }
     // The owner join is the authorization gate: a set not owned by `owner`
     // yields zero rows, so the caller sees an empty (non-matching) membership
-    // and never learns it exists — the documented "stale members drop silently"
-    // contract extends cleanly to "not-yours members drop silently".
-    if (sqlite3_prepare_v2(
-            db_,
-            "SELECT m.device_id FROM result_set_members m JOIN result_sets r "
-            "ON r.id = m.result_set_id WHERE m.result_set_id = ? AND r.owner_principal = ?;",
-            -1, &s, nullptr) != SQLITE_OK)
-        return out;
-    sqlite3_bind_text(s, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, owner.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(s) == SQLITE_ROW)
-        out.insert(safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0))));
-    sqlite3_finalize(s);
+    // and never learns it exists — the documented "stale members drop
+    // silently" contract extends cleanly to "not-yours members drop silently".
+    // A DB ERROR is DISTINCT from both of those (std::unexpected, never an
+    // empty set) — see the header's type-distinguishable-reads note; the
+    // caller (AgentRegistry::evaluate_scope) MUST abort on DbError rather
+    // than proceed with a partial preload (the fleet-wide fail-open under a
+    // NOT combinator this contract exists to prevent).
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT m.device_id FROM result_set_store.result_set_members m "
+        "JOIN result_set_store.result_sets r ON r.id = m.result_set_id "
+        "WHERE m.result_set_id = $1 AND r.owner_principal = $2",
+        std::vector<std::string>{id, owner});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore::member_set_owned: query failed: {}",
+                      PQerrorMessage(lease.get()));
+        return std::unexpected(ResultSetError::DbError);
+    }
+    std::unordered_set<std::string> out;
+    const int rows = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        out.insert(PQgetvalue(res.get(), i, 0));
     return out;
 }
 
-std::optional<std::string> ResultSetStore::resolve_alias(const std::string& owner,
-                                                         const std::string& name) const {
-    std::shared_lock lock(mtx_);
-    if (!db_ || name.empty())
-        return std::nullopt;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT id FROM result_sets WHERE owner_principal = ? AND name = ? "
-                           "ORDER BY created_at DESC LIMIT 1;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return std::nullopt;
-    sqlite3_bind_text(s, 1, owner.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, name.c_str(), -1, SQLITE_TRANSIENT);
-    std::optional<std::string> id;
-    if (sqlite3_step(s) == SQLITE_ROW)
-        id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-    sqlite3_finalize(s);
-    return id;
-}
-
-int ResultSetStore::count_for_owner(const std::string& owner) const {
-    std::shared_lock lock(mtx_);
-    if (!db_)
-        return 0;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM result_sets WHERE owner_principal = ?;", -1,
-                           &s, nullptr) != SQLITE_OK)
-        return 0;
-    sqlite3_bind_text(s, 1, owner.c_str(), -1, SQLITE_TRANSIENT);
-    int n = (sqlite3_step(s) == SQLITE_ROW) ? sqlite3_column_int(s, 0) : 0;
-    sqlite3_finalize(s);
-    return n;
-}
-
-int ResultSetStore::count_pinned_for_owner_unlocked(const std::string& owner) const {
-    if (!db_)
-        return 0;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT COUNT(*) FROM result_sets WHERE owner_principal = ? AND "
-                           "pinned = 1;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return 0;
-    sqlite3_bind_text(s, 1, owner.c_str(), -1, SQLITE_TRANSIENT);
-    int n = (sqlite3_step(s) == SQLITE_ROW) ? sqlite3_column_int(s, 0) : 0;
-    sqlite3_finalize(s);
-    return n;
-}
-
-int ResultSetStore::count_pinned_for_owner(const std::string& owner) const {
-    std::shared_lock lock(mtx_);
-    return count_pinned_for_owner_unlocked(owner);
-}
-
-ResultSetStore::Counts ResultSetStore::counts() const {
-    std::shared_lock lock(mtx_);
-    Counts c;
-    if (!db_)
-        return c;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT COUNT(*), "
-                           "COALESCE(SUM(pinned), 0), "
-                           "COALESCE(SUM(status = 'pending'), 0) FROM result_sets;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return c;
-    if (sqlite3_step(s) == SQLITE_ROW) {
-        c.total = sqlite3_column_int(s, 0);
-        c.pinned = sqlite3_column_int(s, 1);
-        c.pending = sqlite3_column_int(s, 2);
+std::expected<std::optional<std::string>, ResultSetError>
+ResultSetStore::resolve_alias(const std::string& owner, const std::string& name) {
+    if (!open_)
+        return std::unexpected(ResultSetError::DbError);
+    if (name.empty())
+        return std::optional<std::string>(std::nullopt); // trivial not-found, not a DB error
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::resolve_alias: no connection ({})", pool_.last_error());
+        return std::unexpected(ResultSetError::DbError);
     }
-    sqlite3_finalize(s);
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT id FROM result_set_store.result_sets WHERE owner_principal = $1 AND name = $2 "
+        "ORDER BY created_at DESC LIMIT 1",
+        std::vector<std::string>{owner, name});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore::resolve_alias: query failed: {}",
+                      PQerrorMessage(lease.get()));
+        return std::unexpected(ResultSetError::DbError);
+    }
+    if (PQntuples(res.get()) == 0)
+        return std::optional<std::string>(std::nullopt);
+    return std::optional<std::string>(std::string(PQgetvalue(res.get(), 0, 0)));
+}
+
+int ResultSetStore::count_for_owner(const std::string& owner) {
+    if (!open_)
+        return 0;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::count_for_owner: no connection ({})", pool_.last_error());
+        return 0;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "SELECT COUNT(*) FROM result_set_store.result_sets WHERE owner_principal = $1",
+        std::vector<std::string>{owner});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore::count_for_owner: query failed: {}",
+                      PQerrorMessage(lease.get()));
+        return 0;
+    }
+    return to_int(PQgetvalue(res.get(), 0, 0));
+}
+
+int ResultSetStore::count_pinned_for_owner(const std::string& owner) {
+    if (!open_)
+        return 0;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::count_pinned_for_owner: no connection ({})",
+                      pool_.last_error());
+        return 0;
+    }
+    int n = count_pinned_on(lease.get(), owner);
+    if (n < 0) {
+        spdlog::error("ResultSetStore::count_pinned_for_owner: query failed: {}",
+                      PQerrorMessage(lease.get()));
+        return 0;
+    }
+    return n;
+}
+
+ResultSetStore::Counts ResultSetStore::counts() {
+    Counts c;
+    if (!open_)
+        return c;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::counts: no connection ({})", pool_.last_error());
+        return c;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT COUNT(*), COALESCE(SUM(pinned::int), 0), "
+        "COALESCE(SUM((status = 'pending')::int), 0) FROM result_set_store.result_sets",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
+        spdlog::error("ResultSetStore::counts: query failed: {}", PQerrorMessage(lease.get()));
+        return c;
+    }
+    c.total = to_int(PQgetvalue(res.get(), 0, 0));
+    c.pinned = to_int(PQgetvalue(res.get(), 0, 1));
+    c.pending = to_int(PQgetvalue(res.get(), 0, 2));
     return c;
 }
 
 // ── Mutate ───────────────────────────────────────────────────────────────────
 
 std::expected<ResultSet, ResultSetError> ResultSetStore::pin(const std::string& id) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected(ResultSetError::DbError);
-    auto row = get_impl(id);
-    if (!row)
-        return std::unexpected(ResultSetError::NotFound);
-    if (row->pinned)
-        return *row; // idempotent
+    // Whole check-count-update sequence under ONE transaction (governance
+    // M3): autocommit statements on a lease are not atomic, so the
+    // kMaxPinsPerOwner check was racy (two concurrent pins by one owner both
+    // count cap-1 and both commit) and the target row could be deleted
+    // between read and update. FOR UPDATE locks the target row; the
+    // per-owner advisory xact lock serialises the CAP check against
+    // concurrent pins of the owner's OTHER sets (a row lock on one set
+    // cannot do that). Both locks are transaction-scoped — pool-safe (the
+    // session-level variants would poison the shared connection; see
+    // docs/postgres-store-playbook.md).
+    std::expected<ResultSet, ResultSetError> out = std::unexpected(ResultSetError::DbError);
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        std::string sel_sql = std::string("SELECT ") + kRowCols +
+                              " FROM result_set_store.result_sets WHERE id = $1 FOR UPDATE";
+        pg::PgResult get_res = pg::exec_params(conn, sel_sql.c_str(), std::vector<std::string>{id});
+        if (get_res.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::pin: read failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        if (PQntuples(get_res.get()) == 0) {
+            out = std::unexpected(ResultSetError::NotFound);
+            return true; // commit the no-op
+        }
+        ResultSet row = read_row(get_res.get(), 0);
+        if (row.pinned) {
+            out = std::move(row); // idempotent — no ttl_at renewal, matches the SQLite behavior
+            return true;
+        }
 
-    // Pin-storm guard (design §3.3): per-operator cap.
-    if (count_pinned_for_owner_unlocked(row->owner_principal) >= kMaxPinsPerOwner)
-        return std::unexpected(ResultSetError::PinLimit);
+        // CROSS-STORE NAMESPACE prefix, matching the sibling stores'
+        // hashtextextended('<store>:' || key) convention.
+        pg::PgResult lk = pg::exec_params(
+            conn, "SELECT pg_advisory_xact_lock(hashtextextended('result_set_store:pin:' || $1, 0))",
+            std::vector<std::string>{row.owner_principal});
+        if (lk.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::pin: owner lock failed: {}", PQerrorMessage(conn));
+            return false;
+        }
 
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "UPDATE result_sets SET pinned = 1, ttl_at = ? WHERE id = ? RETURNING 1;",
-                           -1, &s, nullptr) != SQLITE_OK)
+        // Pin-storm guard (design §3.3): per-operator cap — now race-free
+        // under the owner lock above.
+        int pinned_count = count_pinned_on(conn, row.owner_principal);
+        if (pinned_count < 0) {
+            spdlog::error("ResultSetStore::pin: pin-count check failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        if (pinned_count >= kMaxPinsPerOwner) {
+            out = std::unexpected(ResultSetError::PinLimit);
+            return true;
+        }
+
+        std::string upd_sql = std::string("UPDATE result_set_store.result_sets SET pinned = true, "
+                                          "ttl_at = $1::bigint WHERE id = $2 RETURNING ") +
+                              kRowCols;
+        pg::PgResult upd = pg::exec_params(
+            conn, upd_sql.c_str(),
+            std::vector<std::string>{std::to_string(std::numeric_limits<int64_t>::max()), id});
+        if (upd.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::pin: update failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        if (PQntuples(upd.get()) == 0) {
+            out = std::unexpected(ResultSetError::NotFound); // deleted concurrently
+            return true;
+        }
+        out = read_row(upd.get(), 0);
+        return true;
+    });
+    if (!ok)
         return std::unexpected(ResultSetError::DbError);
-    sqlite3_bind_int64(s, 1, INT64_MAX);
-    sqlite3_bind_text(s, 2, id.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(s);
-    sqlite3_finalize(s);
-    if (rc != SQLITE_ROW)
-        return std::unexpected(ResultSetError::NotFound);
-    return get_impl(id).value();
+    return out;
 }
 
 std::expected<ResultSet, ResultSetError> ResultSetStore::unpin(const std::string& id) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected(ResultSetError::DbError);
-    // Restore ttl_at = max(now + default, original_ttl_at) but original was
-    // INT64_MAX while pinned, so clamp to now + default (design §3.3).
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::unpin: no connection ({})", pool_.last_error());
+        return std::unexpected(ResultSetError::DbError);
+    }
+    // Restore ttl_at = now + default (design §3.3). The original was
+    // INT64_MAX while pinned, so this clamps rather than "restoring" a prior
+    // value — same behavior as the SQLite implementation.
     int64_t new_ttl = now_epoch() + kDefaultTtlSeconds;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "UPDATE result_sets SET pinned = 0, ttl_at = ? WHERE id = ? "
-                           "RETURNING 1;",
-                           -1, &s, nullptr) != SQLITE_OK)
+    std::string sql = std::string("UPDATE result_set_store.result_sets SET pinned = false, "
+                                  "ttl_at = $1::bigint WHERE id = $2 RETURNING ") +
+                      kRowCols;
+    pg::PgResult upd = pg::exec_params(
+        lease.get(), sql.c_str(), std::vector<std::string>{std::to_string(new_ttl), id});
+    if (upd.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore::unpin: update failed: {}", PQerrorMessage(lease.get()));
         return std::unexpected(ResultSetError::DbError);
-    sqlite3_bind_int64(s, 1, new_ttl);
-    sqlite3_bind_text(s, 2, id.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(s);
-    sqlite3_finalize(s);
-    if (rc != SQLITE_ROW)
+    }
+    if (PQntuples(upd.get()) == 0)
         return std::unexpected(ResultSetError::NotFound);
-    return get_impl(id).value();
+    return read_row(upd.get(), 0);
 }
 
 void ResultSetStore::touch(const std::string& id) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::touch: no connection ({})", pool_.last_error());
+        return;
+    }
     int64_t now = now_epoch();
-    sqlite3_stmt* s = nullptr;
     // Do not shorten a pinned set's INT64_MAX ttl; only ever extend.
-    if (sqlite3_prepare_v2(db_,
-                           "UPDATE result_sets SET last_used_at = ?, "
-                           "ttl_at = MAX(ttl_at, ?) WHERE id = ?;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return;
-    sqlite3_bind_int64(s, 1, now);
-    sqlite3_bind_int64(s, 2, now + kDefaultTtlSeconds);
-    sqlite3_bind_text(s, 3, id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE result_set_store.result_sets SET last_used_at = $1::bigint, "
+        "ttl_at = GREATEST(ttl_at, $2::bigint) WHERE id = $3",
+        std::vector<std::string>{std::to_string(now), std::to_string(now + kDefaultTtlSeconds),
+                                 id});
+    if (res.status() != PGRES_COMMAND_OK)
+        spdlog::error("ResultSetStore::touch: update failed: {}", PQerrorMessage(lease.get()));
 }
 
 std::expected<void, ResultSetError> ResultSetStore::delete_set(const std::string& id) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected(ResultSetError::DbError);
-    auto row = get_impl(id);
-    if (!row)
-        return std::unexpected(ResultSetError::NotFound);
-    if (row->pinned)
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::delete_set: no connection ({})", pool_.last_error());
+        return std::unexpected(ResultSetError::DbError);
+    }
+    // ONE conditional statement (governance M3): the base SQLite impl held a
+    // mutex across check+DELETE; two autocommit statements on one lease are
+    // NOT atomic (a lease serialises access to a connection, not a pair of
+    // statements), so a pin landing between them deleted a set the operator
+    // was told was pinned. The predicate makes the pinned-check and the
+    // delete one atomic statement; the follow-up read only CLASSIFIES a miss
+    // (NotFound vs Pinned) and can no longer delete anything.
+    pg::PgResult del = pg::exec_params(
+        lease.get(),
+        "DELETE FROM result_set_store.result_sets WHERE id = $1 AND pinned = false RETURNING id",
+        std::vector<std::string>{id});
+    if (del.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore::delete_set: delete failed: {}", PQerrorMessage(lease.get()));
+        return std::unexpected(ResultSetError::DbError);
+    }
+    if (PQntuples(del.get()) == 1)
+        return {};
+    pg::PgResult probe = pg::exec_params(
+        lease.get(), "SELECT pinned FROM result_set_store.result_sets WHERE id = $1 LIMIT 1",
+        std::vector<std::string>{id});
+    if (probe.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore::delete_set: probe failed: {}", PQerrorMessage(lease.get()));
+        return std::unexpected(ResultSetError::DbError);
+    }
+    if (PQntuples(probe.get()) == 1 && to_bool(PQgetvalue(probe.get(), 0, 0)))
         return std::unexpected(ResultSetError::Pinned); // must unpin first (design §6)
-
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, "DELETE FROM result_sets WHERE id = ? RETURNING 1;", -1, &s,
-                           nullptr) != SQLITE_OK)
-        return std::unexpected(ResultSetError::DbError);
-    sqlite3_bind_text(s, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(s);
-    sqlite3_finalize(s);
-    if (rc != SQLITE_ROW)
-        return std::unexpected(ResultSetError::NotFound);
-    return {};
+    return std::unexpected(ResultSetError::NotFound);
 }
 
 // ── Async materialisation ────────────────────────────────────────────────────
 
-std::vector<PendingSet> ResultSetStore::list_pending() const {
-    std::shared_lock lock(mtx_);
+std::vector<PendingSet> ResultSetStore::list_pending() {
     std::vector<PendingSet> result;
-    if (!db_)
+    if (!open_)
         return result;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT id, owner_principal, source_kind, source_execution_id, "
-                           "matcher, created_at FROM result_sets WHERE status = 'pending' "
-                           "ORDER BY created_at ASC;",
-                           -1, &s, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::list_pending: no connection ({})", pool_.last_error());
         return result;
-    while (sqlite3_step(s) == SQLITE_ROW) {
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT id, owner_principal, source_kind, source_execution_id, matcher, created_at "
+        "FROM result_set_store.result_sets WHERE status = 'pending' ORDER BY created_at ASC",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore::list_pending: query failed: {}", PQerrorMessage(lease.get()));
+        return result;
+    }
+    const int rows = PQntuples(res.get());
+    result.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
         PendingSet p;
-        p.id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        p.owner_principal = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-        p.source_kind = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
-        p.source_execution_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
-        p.matcher = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 4)));
-        p.created_at = sqlite3_column_int64(s, 5);
+        p.id = PQgetvalue(res.get(), i, 0);
+        p.owner_principal = PQgetvalue(res.get(), i, 1);
+        p.source_kind = PQgetvalue(res.get(), i, 2);
+        p.source_execution_id = PQgetvalue(res.get(), i, 3);
+        p.matcher = PQgetvalue(res.get(), i, 4);
+        p.created_at = to_i64(PQgetvalue(res.get(), i, 5));
         result.push_back(std::move(p));
     }
-    sqlite3_finalize(s);
     return result;
 }
 
 std::expected<void, ResultSetError> ResultSetStore::materialize(
     const std::string& id, const std::vector<std::string>& members) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected(ResultSetError::DbError);
-    if (sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK)
-        return std::unexpected(ResultSetError::DbError);
-    auto rollback = [&]() { sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr); };
 
-    if (!members.empty()) {
-        sqlite3_stmt* m = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "INSERT OR IGNORE INTO result_set_members (result_set_id, device_id) "
-                               "VALUES (?, ?);",
-                               -1, &m, nullptr) != SQLITE_OK) {
-            rollback();
-            return std::unexpected(ResultSetError::DbError);
-        }
-        for (const auto& dev : members) {
-            sqlite3_bind_text(m, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(m, 2, dev.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(m) != SQLITE_DONE) {
-                sqlite3_finalize(m);
-                rollback();
-                return std::unexpected(ResultSetError::DbError);
+    // Dedup + drop empties (UP-6): matches insert_row_impl's contract exactly
+    // — device_count must reflect the rows actually stored (ON CONFLICT DO
+    // NOTHING silently drops duplicates), not the raw request size. Before
+    // this fix materialize() skipped this step, so a caller passing
+    // `["a","a"]` over-reported device_count=2 for one stored row.
+    std::vector<std::string> uniq;
+    uniq.reserve(members.size());
+    {
+        std::unordered_set<std::string> seen;
+        seen.reserve(members.size() * 2);
+        for (const auto& dev : members)
+            if (!dev.empty() && seen.insert(dev).second)
+                uniq.push_back(dev);
+    }
+    const std::vector<std::string_view> member_views = as_views(uniq);
+    bool not_found = false;
+
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        if (!uniq.empty()) {
+            pg::PgResult r = pg::exec_params(
+                conn,
+                "INSERT INTO result_set_store.result_set_members (result_set_id, device_id) "
+                "SELECT $1, d FROM unnest($2::text[]) AS d ON CONFLICT DO NOTHING",
+                std::vector<std::string>{id, pg::to_text_array(member_views)});
+            if (r.status() != PGRES_COMMAND_OK && r.status() != PGRES_TUPLES_OK) {
+                spdlog::error("ResultSetStore::materialize: member insert failed: {}",
+                              PQerrorMessage(conn));
+                return false;
             }
-            sqlite3_reset(m);
         }
-        sqlite3_finalize(m);
-    }
-
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "UPDATE result_sets SET status = 'materialized', device_count = ? "
-                           "WHERE id = ? AND status = 'pending' RETURNING 1;",
-                           -1, &s, nullptr) != SQLITE_OK) {
-        rollback();
-        return std::unexpected(ResultSetError::DbError);
-    }
-    sqlite3_bind_int64(s, 1, static_cast<int64_t>(members.size()));
-    sqlite3_bind_text(s, 2, id.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(s);
-    sqlite3_finalize(s);
-    if (rc != SQLITE_ROW) {
-        rollback();
-        return std::unexpected(ResultSetError::NotFound);
-    }
-    if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        rollback();
-        return std::unexpected(ResultSetError::DbError);
-    }
+        pg::PgResult upd = pg::exec_params(
+            conn,
+            "UPDATE result_set_store.result_sets SET status = 'materialized', "
+            "device_count = $1::bigint WHERE id = $2 AND status = 'pending' RETURNING id",
+            std::vector<std::string>{std::to_string(static_cast<int64_t>(uniq.size())), id});
+        if (upd.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::materialize: update failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        if (PQntuples(upd.get()) == 0) {
+            not_found = true;
+            return false;
+        }
+        return true;
+    });
+    if (!ok)
+        return std::unexpected(not_found ? ResultSetError::NotFound : ResultSetError::DbError);
     return {};
 }
 
 void ResultSetStore::mark_failed(const std::string& id, const std::string& reason) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "UPDATE result_sets SET status = 'failed', "
-                           "source_payload = json_set(CASE WHEN json_valid(source_payload) "
-                           "THEN source_payload ELSE '{}' END, '$.failure', ?) "
-                           "WHERE id = ? AND status = 'pending';",
-                           -1, &s, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::mark_failed: no connection ({})", pool_.last_error());
         return;
-    sqlite3_bind_text(s, 1, reason.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
+    }
+    pg::PgResult sel = pg::exec_params(
+        lease.get(),
+        "SELECT source_payload FROM result_set_store.result_sets WHERE id = $1 AND status = "
+        "'pending'",
+        std::vector<std::string>{id});
+    if (sel.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore::mark_failed: read failed: {}", PQerrorMessage(lease.get()));
+        return;
+    }
+    if (PQntuples(sel.get()) == 0)
+        return; // not pending (or gone) — nothing to mark
+
+    // Merge {"failure": reason} into the payload in C++ rather than relying on
+    // a Postgres JSON-validity cast (source_payload is a plain TEXT column,
+    // not jsonb, and an operator-supplied string is not guaranteed valid
+    // JSON) — replicates the SQLite json1 `json_set(... CASE WHEN
+    // json_valid ...)` fallback-to-'{}' behavior.
+    nlohmann::json payload;
+    try {
+        payload = nlohmann::json::parse(std::string(PQgetvalue(sel.get(), 0, 0)));
+        if (!payload.is_object())
+            payload = nlohmann::json::object();
+    } catch (...) {
+        payload = nlohmann::json::object();
+    }
+    payload["failure"] = reason;
+
+    pg::PgResult upd = pg::exec_params(
+        lease.get(),
+        "UPDATE result_set_store.result_sets SET status = 'failed', source_payload = $1 "
+        "WHERE id = $2 AND status = 'pending'",
+        std::vector<std::string>{payload.dump(), id});
+    if (upd.status() != PGRES_COMMAND_OK)
+        spdlog::error("ResultSetStore::mark_failed: update failed: {}", PQerrorMessage(lease.get()));
 }
 
 // ── GC ───────────────────────────────────────────────────────────────────────
 
+// Clock-guarded retention (routed-concern invariant; #2360 class). The
+// cutoff comes from a wall clock, so a bare `DELETE ... WHERE ttl_at < now`
+// is banned: a forward-skewed clock mass-expires sets that are not stale.
+// The guard follows the reference SHAPE (audit_retention_rules.hpp classify
+// + AuditStore::cleanup_once fact-set dedup) with substrate-tuned constants
+// — result sets are 1-hour-TTL operator scratch state, pinned sets are
+// protected by pinned=false regardless of ttl_at.
+//
+// Postgres adaptation (this store is the first PG implementation of the
+// guard; AuditStore's own migration row records the same requirement): the
+// persisted reading + the anomaly-dedup fact set live in SHARED
+// `gc_meta` rows, and one sweep runs fleet-wide at a time under a
+// try-advisory xact lock — process-local state would pace at N x cap across
+// replicas and one skewed replica could put every replica into permanent
+// independent decline.
+//
+// Part-6 anchor decision (recorded, per the invariant): a MISSING stored
+// reading is ordinary — the fresh-store / first-pass-after-migration case —
+// and says nothing by itself; it is reported only when the pass would ALSO
+// expire every datable row (the AuditStore choice, not the TAR choice,
+// because unlike TAR this table is legitimately empty/short-lived in normal
+// operation and a first pass against it deletes at most 1-hour-old scratch).
+namespace {
+constexpr int64_t kGcSweepCapPerPass = 5000;      // part 5: unconditional
+constexpr int64_t kGcBigStepSecs = 86'400;        // part 7: absolute, ~1 day
+constexpr int64_t kGcImplausiblyAheadSecs = 604'800; // part 1: probe excludes
+} // namespace
+
 int ResultSetStore::gc_sweep() {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return 0;
-    // Single DELETE ... RETURNING: count the rows the statement actually removed
-    // rather than a pre-count we assume succeeds (review finding D). The DELETE
-    // runs in one implicit transaction — on error it rolls back, so a non-DONE
-    // terminal code means nothing was deleted and we must not report success.
-    int64_t now = now_epoch();
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "DELETE FROM result_sets WHERE pinned = 0 AND ttl_at < ? RETURNING 1;",
-                           -1, &s, nullptr) != SQLITE_OK) {
-        spdlog::error("ResultSetStore::gc_sweep: prepare failed: {}", sqlite3_errmsg(db_));
+    int deleted = 0;
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // One sweeping replica at a time. try-variant: a busy lock means a
+        // sibling replica is already sweeping this pass — skip quietly.
+        pg::PgResult lk = pg::exec_params(
+            conn,
+            "SELECT pg_try_advisory_xact_lock(hashtextextended('result_set_store:gc_sweep', 0))",
+            std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::gc_sweep: lock probe failed: {}",
+                          PQerrorMessage(conn));
+            return false;
+        }
+        if (!to_bool(PQgetvalue(lk.get(), 0, 0)))
+            return true; // another replica holds the sweep
+
+        const int64_t now = now_epoch();
+
+        // Load the persisted reading + last-reported anomaly fact set.
+        pg::PgResult meta = pg::exec_params(
+            conn, "SELECT key, value FROM result_set_store.gc_meta WHERE key IN "
+                  "('last_pass_now','last_anomaly_facts')",
+            std::vector<std::string>{});
+        if (meta.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::gc_sweep: meta read failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        std::optional<int64_t> prev;
+        bool prev_unusable = false;
+        std::string last_facts;
+        for (int i = 0; i < PQntuples(meta.get()); ++i) {
+            std::string key = safe(PQgetvalue(meta.get(), i, 0));
+            std::string val = safe(PQgetvalue(meta.get(), i, 1));
+            if (key == "last_pass_now") {
+                errno = 0;
+                char* end = nullptr;
+                long long v = std::strtoll(val.c_str(), &end, 10);
+                if (errno != 0 || end == val.c_str() || *end != '\0') {
+                    prev_unusable = true; // part 3: unparseable = anomaly, never a quiet reset
+                } else {
+                    prev = static_cast<int64_t>(v);
+                }
+            } else if (key == "last_anomaly_facts") {
+                last_facts = val;
+            }
+        }
+        // part 3: sanitise BEFORE arithmetic — ahead-of-now or negative is an
+        // anomaly carrier, and `now - prev` on either would be meaningless
+        // (or UB-adjacent on INT64_MIN).
+        if (prev && (*prev < 0 || *prev > now)) {
+            prev_unusable = true;
+            prev.reset();
+        }
+
+        // Stamp the new reading FIRST — an honest observation of the clock
+        // whatever this pass decides (reference behaviour; it is what makes
+        // the guard work when the clock was already wrong before boot).
+        pg::PgResult stamp = pg::exec_params(
+            conn,
+            "INSERT INTO result_set_store.gc_meta (key, value) VALUES ('last_pass_now', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            std::vector<std::string>{std::to_string(now)});
+        if (stamp.status() != PGRES_COMMAND_OK) {
+            spdlog::error("ResultSetStore::gc_sweep: meta stamp failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+
+        // part 1: probe by OUTCOME. Rows stamped implausibly far ahead are
+        // excluded from the datable denominator so one forward-skewed row
+        // cannot disarm the wipe detector forever. pinned rows (ttl_at =
+        // INT64_MAX) are outside the sweep entirely via pinned = false.
+        pg::PgResult probe = pg::exec_params(
+            conn,
+            "SELECT count(*) FILTER (WHERE ttl_at < $1::bigint) AS expiring, "
+            "count(*) FILTER (WHERE ttl_at <= $2::bigint) AS datable "
+            "FROM result_set_store.result_sets WHERE pinned = false",
+            std::vector<std::string>{std::to_string(now),
+                                     std::to_string(now + kGcImplausiblyAheadSecs)});
+        if (probe.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::gc_sweep: probe failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        const int64_t expiring = to_i64(PQgetvalue(probe.get(), 0, 0));
+        const int64_t datable = to_i64(PQgetvalue(probe.get(), 0, 1));
+
+        audit_retention::Facts facts{
+            .has_expired = expiring > 0,
+            .would_wipe = expiring > 0 && expiring >= datable,
+            // part 7: absolute threshold, never scaled to the (1 h) TTL.
+            .big_step = prev.has_value() && expiring > 0 &&
+                        audit_retention::moved_at_least(*prev, now, kGcBigStepSecs) && now > *prev,
+            .prev_unusable = prev_unusable,
+        };
+        const auto anomaly = audit_retention::classify(facts);
+        const std::string facts_ser = std::string(facts.has_expired ? "e" : "-") +
+                                      (facts.would_wipe ? "w" : "-") +
+                                      (facts.big_step ? "s" : "-") +
+                                      (facts.prev_unusable ? "u" : "-");
+        if (anomaly != audit_retention::Anomaly::None) {
+            if (facts_ser != last_facts) {
+                // part 4: report + decline ONCE per distinct fact set. The
+                // FULL fact set is the dedup key (never a latch bool / the
+                // classified enum) — a different anomaly arriving under a
+                // reported one must report again, and a repeat of the same
+                // one must NOT hold the drain forever: the next pass with
+                // equal facts proceeds, paced by the cap, so a legitimately
+                // all-expired table still ages out.
+                spdlog::warn("ResultSetStore::gc_sweep: retention clock anomaly ({} facts={}) — "
+                             "declining this pass; an identical next pass will drain, capped",
+                             static_cast<int>(anomaly), facts_ser);
+                pg::PgResult rec = pg::exec_params(
+                    conn,
+                    "INSERT INTO result_set_store.gc_meta (key, value) VALUES "
+                    "('last_anomaly_facts', $1) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    std::vector<std::string>{facts_ser});
+                if (rec.status() != PGRES_COMMAND_OK) {
+                    spdlog::error("ResultSetStore::gc_sweep: anomaly record failed: {}",
+                                  PQerrorMessage(conn));
+                    return false;
+                }
+                return true; // decline: no delete this pass
+            }
+            // Suppressed repeat of the SAME fact set: condition already
+            // reported; get on with the drain (capped below).
+        } else if (!last_facts.empty()) {
+            // Consumed: a clean pass clears the dedup key so the NEXT
+            // anomaly reports fresh.
+            pg::PgResult clr = pg::exec_params(
+                conn, "DELETE FROM result_set_store.gc_meta WHERE key = 'last_anomaly_facts'",
+                std::vector<std::string>{});
+            if (clr.status() != PGRES_COMMAND_OK) {
+                spdlog::error("ResultSetStore::gc_sweep: anomaly clear failed: {}",
+                              PQerrorMessage(conn));
+                return false;
+            }
+        }
+        if (expiring == 0)
+            return true; // nothing to drain
+
+        // part 5: cap every accepted pass UNCONDITIONALLY — the detectors
+        // above are best-effort, the cap always applies. DELETE ... RETURNING
+        // counts what the statement actually removed (the #1033-banning
+        // idiom). Cascades to result_set_members via the FK.
+        pg::PgResult res = pg::exec_params(
+            conn,
+            "DELETE FROM result_set_store.result_sets WHERE id IN ("
+            "SELECT id FROM result_set_store.result_sets "
+            "WHERE pinned = false AND ttl_at < $1::bigint "
+            "ORDER BY ttl_at ASC LIMIT $2) RETURNING id",
+            std::vector<std::string>{std::to_string(now), std::to_string(kGcSweepCapPerPass)});
+        if (res.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResultSetStore::gc_sweep: delete failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        deleted = PQntuples(res.get());
+        return true;
+    });
+    if (!ok) {
+        spdlog::error("ResultSetStore::gc_sweep: pass aborted (statement failed or txn rolled back — see the preceding gc_sweep error line)");
         return 0;
     }
-    sqlite3_bind_int64(s, 1, now);
-    int count = 0;
-    int rc;
-    while ((rc = sqlite3_step(s)) == SQLITE_ROW) // cascades to result_set_members via FK
-        ++count;
-    sqlite3_finalize(s);
-    if (rc != SQLITE_DONE) {
-        spdlog::error("ResultSetStore::gc_sweep: delete did not complete (rc={}): {}", rc,
-                      sqlite3_errmsg(db_));
-        return 0;
-    }
-    return count;
+    return deleted;
 }
 
 } // namespace yuzu::server
