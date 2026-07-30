@@ -19,6 +19,7 @@
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "rest_api_v1.hpp"
 #include "result_set_store.hpp"
@@ -387,6 +388,29 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
                   .counter("yuzu_server_dispatch_target_rejected_total",
                            {{"route", "result_set_parent"}, {"reason", "parent_id_empty"}})
                   .value() == 1.0);
+    }
+    SECTION("from-inventory-query refuses a byte-capped read without creating a set") {
+        InventoryStore inventory{pool};
+        REQUIRE(inventory.is_open());
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) "
+            "SELECT 'byte-agent-' || g, 'custom_large', repeat('x', 3145728), g "
+            "FROM generate_series(1, 3) AS g",
+            std::vector<std::string>{});
+        REQUIRE(seeded.status() == PGRES_COMMAND_OK);
+        lease.reset();
+
+        AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+        int status = 0;
+        h.post("/api/v1/result-sets/from-inventory-query", R"({"name":"must-not-exist"})",
+               status);
+        REQUIRE(status == 503);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
     }
     SECTION("a non-object body is refused, not read as an absent parent_id") {
         AsyncHarness h(pool);

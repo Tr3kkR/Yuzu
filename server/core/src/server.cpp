@@ -801,10 +801,16 @@ public:
                           "agent's next report re-sends the same blob (fail-soft), but a "
                           "sustained non-zero rate means writes are silently not landing",
                           "counter");
+        // Closed reason dimension: seed every reachable path so an idle or
+        // newly-started server exports zeros and absent-series alerting remains
+        // distinguishable from a scrape/configuration failure.
+        for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error",
+                                  "invalid_key", "stale"})
+            metrics_.counter("yuzu_inventory_ingest_dropped_total", {{"reason", reason}});
         metrics_.describe("yuzu_inventory_query_truncated_total",
-                          "Generic InventoryStore query() calls whose result count hit the "
-                          "effective row limit (caller limit or the kQueryRowCap ceiling) — more "
-                          "rows may exist past what was returned",
+                          "Generic InventoryStore query() calls whose result hit the effective "
+                          "row limit or aggregate byte cap — more rows may exist past what was "
+                          "returned",
                           "counter");
         metrics_.describe("yuzu_inventory_stale_agents",
                           "Agents whose installed-software inventory has not synced within the "
@@ -3456,8 +3462,9 @@ public:
                     spdlog::error("[PG] Refusing to start: generic inventory store backfill from "
                                   "legacy {} failed (ADR-0009 fail-closed; see prior log lines). "
                                   "Operator remediation: repair the file or move it aside to skip "
-                                  "the backfill — live agents re-push on their next report; "
-                                  "decommissioned agents' blobs need manual re-import (ADR-0037)",
+                                  "the backfill — gateway-connected live agents re-push generic "
+                                  "blobs; direct-connected, offline, and decommissioned agents' "
+                                  "generic blobs need manual re-import (ADR-0037)",
                                   inv_db.string());
                     startup_failed_ = true;
                 } else {
@@ -7254,7 +7261,11 @@ private:
             // Cheap: in-memory agent registry count.
             auto online = registry_.agent_count();
 
-            // Store health — is_open() is a constant-time member check, no DB I/O.
+            // Store health — all checks are constant-time and perform no DB I/O.
+            // Match /readyz's non-lease-consuming Postgres reachability signal:
+            // valid() checks configuration and the breaker records real connect
+            // failures without treating a saturated-but-healthy pool as down.
+            bool pg_pool_ok = pg_pool_ && pg_pool_->valid() && !pg_pool_->connect_breaker_open();
             auto response_ok = response_store_ && response_store_->is_open();
             auto audit_ok = audit_store_ && audit_store_->is_open();
             auto instruction_ok = instruction_store_ && instruction_store_->is_open();
@@ -7300,11 +7311,12 @@ private:
             bool approval_ok = approval_manager_ && approval_manager_->is_open();
 
             // Determine overall status
-            bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
-                                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
-                                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
-                                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok &&
-                                 inventory_ok && approval_ok;
+            bool all_stores_ok =
+                pg_pool_ok && response_ok && audit_ok && instruction_ok && policy_ok &&
+                guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
+                offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
+                app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
+                approval_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -7312,7 +7324,8 @@ private:
                 {"uptime_seconds", uptime_sec},
                 {"agents", {{"online", online}}}, // pending added below for authed callers
                 {"stores",
-                 {{"responses", response_ok ? "ok" : "error"},
+                 {{"pg_pool", pg_pool_ok ? "ok" : "error"},
+                  {"responses", response_ok ? "ok" : "error"},
                   {"audit", audit_ok ? "ok" : "error"},
                   {"instructions", instruction_ok ? "ok" : "error"},
                   {"policies", policy_ok ? "ok" : "error"},

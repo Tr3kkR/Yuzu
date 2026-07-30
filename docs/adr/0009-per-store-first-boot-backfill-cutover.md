@@ -33,8 +33,10 @@ data).
 - **Backfill is mandatory** for config/reference stores and for `audit` (SOC 2 retention).
 - **Backfill may be skipped** (behind a flag) for purely TTL'd ephemeral stores (`response`) —
   history ages out, so a clean cut with a bounded gap is acceptable.
-- **The legacy SQLite file is retained read-only for one release** as a rollback net, then
-  removed in the following release.
+- **The legacy SQLite file is retained for one release** as a rollback net, then removed in
+  the following release. Backfill never mutates it; a store with a wired erasure path must,
+  however, delete the same subject/device from the rollback copy so rollback cannot resurrect
+  data whose erasure was reported successful.
 - Each per-store migration's upgrade-test must assert that config/reference/audit data survives
   the previous-release-SQLite → new-release-Postgres transition.
 

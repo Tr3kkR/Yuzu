@@ -950,6 +950,25 @@ groups:
             signals a malformed/abusive/corrupted agent — check the agent version and the
             warn-level "carries too many sources" server logs for the agent_id.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuGenericInventoryPersistenceDropped
+        # Generic InventoryStore ingest is intentionally fail-soft. Alert on a
+        # sustained rate, not a single event: transient pool pressure and stale
+        # reports self-heal on a later agent report. The reason dimension is
+        # pre-seeded at server startup, so absent() remains a scrape/config signal.
+        expr: |
+          sum(rate(yuzu_inventory_ingest_dropped_total[15m])) by (reason) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Generic inventory writes are not persisting ({{ $labels.reason }})"
+          description: >-
+            Generic inventory writes have been dropped for 15 minutes. Check
+            yuzu_pg_pool_* for saturation or connection failures and the server
+            InventoryStore warnings. reason="stale" can follow a server clock
+            step-back and should clear as receipt timestamps catch up; the other
+            reasons indicate unavailable storage, bad keys, or query failures.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryReadDegraded
         # An AUTHORITATIVE inventory read (query_software / get_agent_software)
         # returned a degrade (no data), NOT a silent empty. /readyz deliberately

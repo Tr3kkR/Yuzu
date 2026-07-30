@@ -5,6 +5,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "sqlite_raii.hpp"
+#include "typed_inventory_sources.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -37,6 +38,9 @@ constexpr std::chrono::milliseconds kQueryAcquireTimeout{3000};
 // Hard ceiling on rows a single query will materialise, independent of the
 // caller's `limit`, so the store can never allocate an unbounded result set.
 constexpr int kQueryRowCap = 100000;
+// Bound bytes returned by libpq as well as row count. Generic plugin blobs can
+// be multi-MiB; a row-only cap still permits a single query to OOM the server.
+constexpr std::int64_t kQueryByteCap = 8 * 1024 * 1024;
 
 // Read-degrade reason labels (mirror SoftwareInventoryStore / DeviceInventoryStore
 // / the alert taxonomy). Shared counter, distinguished by the "source" label.
@@ -71,15 +75,19 @@ const std::vector<pg::PgMigration>& migrations() {
          // migrate_from_sqlite() is a cheap no-op on every boot after the
          // first. `legacy_rows` records rows ACTUALLY inserted (not the size
          // of the in-memory legacy row list — see migrate_from_sqlite).
-         // `skipped_bad` (governance H1) makes a row-data skip AUDITABLE
-         // after the fact — a stamp with skipped_bad > 0 says the backfill
-         // completed but filed N legacy rows as malformed (22xxx/23xxx
-         // SQLSTATE only; infrastructure errors abort unstamped instead).
+         // `skipped_bad` makes SQLSTATE 22/23/54 row-data skips auditable;
+         // migration v3 adds every other reconciliation term.
          "CREATE TABLE backfill_state ("
          "  id           INT PRIMARY KEY,"
          "  migrated_at  BIGINT NOT NULL,"
          "  legacy_rows  BIGINT NOT NULL DEFAULT 0,"
          "  skipped_bad  BIGINT NOT NULL DEFAULT 0);"},
+        {3,
+         "ALTER TABLE backfill_state "
+         "ADD COLUMN source_rows BIGINT NOT NULL DEFAULT 0, "
+         "ADD COLUMN conflicts BIGINT NOT NULL DEFAULT 0, "
+         "ADD COLUMN skipped_blank_key BIGINT NOT NULL DEFAULT 0, "
+         "ADD COLUMN skipped_typed BIGINT NOT NULL DEFAULT 0;"},
     };
     return kMigrations;
 }
@@ -177,6 +185,7 @@ InventoryStore::InventoryStore(pg::PgPool& pool) : pool_(pool) {
 // ── Backfill (ADR-0009/0037) ─────────────────────────────────────────────────
 
 bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path) {
+    legacy_db_path_ = legacy_db_path;
     if (!open_)
         return false;
 
@@ -218,57 +227,26 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
         std::string data_json;
         std::int64_t collected_at{0};
     };
-    std::vector<LegacyRow> legacy_rows;
+    SqliteDb legacy;
+    SqliteStmt legacy_stmt;
 
     if (legacy_exists) {
-        // RAII connection owner (IB1, cpp-safety BLOCKING): `sqlite3_close` runs
-        // on every scope exit including a throw mid read-loop (e.g. a
-        // `std::bad_alloc` from `std::string` construction) — no manual
-        // finalize/close path to leak. Declared BEFORE `stmt` so the statement
-        // finalizes first on unwind (SQLite wants live statements finalized
-        // before the connection closes).
-        std::unique_ptr<sqlite3, decltype(&sqlite3_close)> legacy{nullptr, &sqlite3_close};
-        {
-            sqlite3* raw = nullptr;
-            // READONLY: the legacy file is retained as a read-only rollback net
-            // for one release (ADR-0009) — this call never writes to it.
-            const int rc =
-                sqlite3_open_v2(legacy_db_path.string().c_str(), &raw, SQLITE_OPEN_READONLY, nullptr);
-            legacy.reset(raw); // adopt even on failure — sqlite3_open_v2 may still allocate a handle
-            if (rc != SQLITE_OK) {
-                spdlog::error("InventoryStore: migrate_from_sqlite: failed to open legacy db {}: {}",
-                              legacy_db_path.string(),
-                              legacy ? sqlite3_errmsg(legacy.get()) : "open failed");
-                return false;
-            }
-        }
-
-        SqliteStmt stmt;
-        const char* sql = "SELECT agent_id, plugin, data_json, collected_at FROM inventory_data";
-        if (sqlite3_prepare_v2(legacy.get(), sql, -1, stmt.addr(), nullptr) != SQLITE_OK) {
-            spdlog::error("InventoryStore: migrate_from_sqlite: legacy prepare failed: {}",
-                          sqlite3_errmsg(legacy.get()));
+        // Keep one SQLite row live at a time while the PostgreSQL transaction
+        // consumes it. This bounds upgrade memory independently of total
+        // legacy blob volume. Both owners remain alive until the transaction
+        // finishes; `legacy_stmt` finalizes before `legacy` closes.
+        const int rc = sqlite3_open_v2(legacy_db_path.string().c_str(), legacy.addr(),
+                                       SQLITE_OPEN_READONLY, nullptr);
+        if (rc != SQLITE_OK) {
+            spdlog::error("InventoryStore: migrate_from_sqlite: failed to open legacy db {}: {}",
+                          legacy_db_path.string(),
+                          legacy ? sqlite3_errmsg(legacy.get()) : "open failed");
             return false;
         }
-
-        auto col_text = [&](int i) {
-            auto p = sqlite3_column_text(stmt.get(), i);
-            return p ? std::string(reinterpret_cast<const char*>(p)) : std::string{};
-        };
-
-        int rc = SQLITE_DONE;
-        while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {
-            LegacyRow r;
-            r.agent_id = col_text(0);
-            r.plugin = col_text(1);
-            r.data_json = col_text(2);
-            r.collected_at = sqlite3_column_int64(stmt.get(), 3);
-            legacy_rows.push_back(std::move(r));
-        }
-        const bool read_ok = (rc == SQLITE_DONE);
-        stmt.reset(); // finalize before `legacy` closes (destruction order would do this anyway)
-        if (!read_ok) {
-            spdlog::error("InventoryStore: migrate_from_sqlite: legacy read failed (rc={})", rc);
+        const char* sql = "SELECT agent_id, plugin, data_json, collected_at FROM inventory_data";
+        if (sqlite3_prepare_v2(legacy.get(), sql, -1, legacy_stmt.addr(), nullptr) != SQLITE_OK) {
+            spdlog::error("InventoryStore: migrate_from_sqlite: legacy prepare failed: {}",
+                          sqlite3_errmsg(legacy.get()));
             return false;
         }
     }
@@ -282,14 +260,26 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
     // strictly worse than a skipped row. A `ROLLBACK TO SAVEPOINT` that
     // itself fails to execute means the connection/transaction is broken at
     // the INFRASTRUCTURE level (not a per-row problem) — THAT aborts the
-    // whole backfill (fail-closed). A one-time cost (row-by-row insert is
-    // fine for a boot-time backfill of this scale; a fleet-scale batched
-    // insert is the follow-up if a future fleet's legacy table proves large).
+    // whole backfill (fail-closed). Rows stream from SQLite, so peak memory is
+    // bounded to one legacy blob plus the statement results.
     std::int64_t inserted = 0;
+    std::int64_t source_rows = 0;
+    std::int64_t conflicts = 0;
     std::int64_t skipped_bad = 0;
     std::int64_t skipped_blank_key = 0;
+    std::int64_t skipped_typed = 0;
     const bool ok = pool_.with_txn([&](PGconn* c) -> bool {
-        for (const auto& r : legacy_rows) {
+        int legacy_rc = SQLITE_DONE;
+        while (legacy_exists && (legacy_rc = sqlite3_step(legacy_stmt.get())) == SQLITE_ROW) {
+            const auto col_text = [&](int i) {
+                const auto* value = sqlite3_column_text(legacy_stmt.get(), i);
+                return value ? std::string(reinterpret_cast<const char*>(value)) : std::string{};
+            };
+            LegacyRow r{.agent_id = col_text(0),
+                        .plugin = col_text(1),
+                        .data_json = col_text(2),
+                        .collected_at = sqlite3_column_int64(legacy_stmt.get(), 3)};
+            ++source_rows;
             // GDPR orphan guard (IS5/UP-7): never backfill a row the
             // decommission cascade's empty-id short-circuit could never
             // reach.
@@ -297,6 +287,16 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
                 ++skipped_blank_key;
                 spdlog::warn("InventoryStore: migrate_from_sqlite: skipping legacy row with a "
                             "blank agent_id/plugin");
+                continue;
+            }
+            // Typed projections have their own securables. Copying their
+            // legacy blobs into this Infrastructure:Read store would expose
+            // them through a weaker permission after upgrade.
+            if (is_typed_inventory_source(r.plugin)) {
+                ++skipped_typed;
+                spdlog::info("InventoryStore: migrate_from_sqlite: skipping typed legacy source "
+                             "agent_id={} plugin={}",
+                             r.agent_id, r.plugin);
                 continue;
             }
 
@@ -333,7 +333,10 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
                                   PQerrorMessage(c));
                     return false;
                 }
-                inserted += affected_rows(ins); // 0 on ON CONFLICT DO NOTHING no-op, else 1
+                const auto affected = affected_rows(ins);
+                inserted += affected;
+                if (affected == 0)
+                    ++conflicts;
                 continue;
             }
 
@@ -347,8 +350,9 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
             // loaded first-boot backfill. Filing one of those as a "bad row"
             // loses the row PERMANENTLY and SILENTLY (the completion stamp
             // below short-circuits every later boot). Read the SQLSTATE and
-            // skip ONLY genuine row-data classes: 22xxx (data exception) and
-            // 23xxx (integrity constraint). Everything else — class 40
+            // skip ONLY genuine row-data classes: 22xxx (data exception),
+            // 23xxx (integrity constraint), and 54xxx (a row-specific program
+            // limit such as an oversized blob). Everything else — class 40
             // (txn rollback), 53 (insufficient resources), 55 (object state),
             // 57 (operator intervention/timeout), 58 (system error),
             // XX (internal), and anything unrecognised — fails the backfill
@@ -401,13 +405,23 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
                         "agent_id={} plugin={} (SQLSTATE {}): {}",
                         r.agent_id, r.plugin, sqlstate, row_err);
         }
+        if (legacy_exists && legacy_rc != SQLITE_DONE) {
+            spdlog::error("InventoryStore: migrate_from_sqlite: legacy read failed (rc={})",
+                          legacy_rc);
+            return false;
+        }
         pg::PgResult stamp = pg::exec_params(
             c,
-            "INSERT INTO inventory_store.backfill_state (id, migrated_at, legacy_rows, "
-            "skipped_bad) "
-            "VALUES (1, $1::bigint, $2::bigint, $3::bigint) ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO inventory_store.backfill_state "
+            "(id, migrated_at, legacy_rows, skipped_bad, source_rows, conflicts, "
+            "skipped_blank_key, skipped_typed) "
+            "VALUES (1, $1::bigint, $2::bigint, $3::bigint, $4::bigint, $5::bigint, "
+            "$6::bigint, $7::bigint) ON CONFLICT (id) DO NOTHING",
             std::vector<std::string>{std::to_string(now_secs()), std::to_string(inserted),
-                                     std::to_string(skipped_bad)});
+                                     std::to_string(skipped_bad), std::to_string(source_rows),
+                                     std::to_string(conflicts),
+                                     std::to_string(skipped_blank_key),
+                                     std::to_string(skipped_typed)});
         return stamp.status() == PGRES_COMMAND_OK;
     });
     if (!ok) {
@@ -416,9 +430,10 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
         return false;
     }
 
-    spdlog::info("InventoryStore: migrate_from_sqlite backfilled {} legacy row(s) from {} "
-                "(skipped: {} bad, {} blank-key)",
-                inserted, legacy_db_path.string(), skipped_bad, skipped_blank_key);
+    spdlog::info("InventoryStore: migrate_from_sqlite scanned {} legacy row(s) from {}; inserted "
+                 "{}, conflicts {}, skipped {} bad, {} blank-key, {} typed",
+                 source_rows, legacy_db_path.string(), inserted, conflicts, skipped_bad,
+                 skipped_blank_key, skipped_typed);
     return true;
 }
 
@@ -606,25 +621,23 @@ std::optional<std::vector<InventoryRecord>> InventoryStore::query(const Inventor
         limit = kQueryRowCap;
     const int offset = q.offset > 0 ? q.offset : 0;
 
-    std::string sql =
-        "SELECT agent_id, plugin, data_json, collected_at FROM inventory_store.inventory_data "
-        "WHERE 1=1";
+    std::string where = " WHERE 1=1";
     std::vector<std::string> params;
     int p = 0;
     if (!q.agent_id.empty()) {
-        sql += " AND agent_id = $" + std::to_string(++p);
+        where += " AND agent_id = $" + std::to_string(++p);
         params.push_back(q.agent_id);
     }
     if (!q.plugin.empty()) {
-        sql += " AND plugin = $" + std::to_string(++p);
+        where += " AND plugin = $" + std::to_string(++p);
         params.push_back(q.plugin);
     }
     if (q.since > 0) {
-        sql += " AND collected_at >= $" + std::to_string(++p) + "::bigint";
+        where += " AND collected_at >= $" + std::to_string(++p) + "::bigint";
         params.push_back(std::to_string(q.since));
     }
     if (q.until > 0) {
-        sql += " AND collected_at <= $" + std::to_string(++p) + "::bigint";
+        where += " AND collected_at <= $" + std::to_string(++p) + "::bigint";
         params.push_back(std::to_string(q.until));
     }
     // Two separate statements (not one chained `++p` expression): the
@@ -634,10 +647,32 @@ std::optional<std::vector<InventoryRecord>> InventoryStore::query(const Inventor
     // flags (-Wunsequenced), fixed while touching this code.
     const int limit_param = ++p;
     const int offset_param = ++p;
-    sql += " ORDER BY collected_at DESC LIMIT $" + std::to_string(limit_param) +
-           "::bigint OFFSET $" + std::to_string(offset_param) + "::bigint";
+    const int byte_cap_param = ++p;
+    std::string sql =
+        "WITH raw_keys AS ("
+        " SELECT agent_id, plugin, collected_at, octet_length(data_json)::bigint AS data_bytes"
+        " FROM inventory_store.inventory_data" +
+        where + " ORDER BY collected_at DESC, agent_id, plugin LIMIT $" +
+        std::to_string(limit_param) + "::bigint OFFSET $" + std::to_string(offset_param) +
+        "::bigint), candidate_keys AS ("
+        " SELECT agent_id, plugin, collected_at,"
+        " SUM(data_bytes + octet_length(agent_id) + octet_length(plugin) + 8)"
+        " OVER (ORDER BY collected_at DESC, agent_id, plugin) AS cumulative_bytes"
+        " FROM raw_keys), bounded_keys AS ("
+        " SELECT * FROM candidate_keys WHERE cumulative_bytes <= $" +
+        std::to_string(byte_cap_param) +
+        "::bigint), meta AS ("
+        " SELECT COUNT(*)::bigint AS candidate_count,"
+        " (SELECT COUNT(*)::bigint FROM bounded_keys) AS bounded_count FROM candidate_keys)"
+        " SELECT d.agent_id, d.plugin, d.data_json, d.collected_at,"
+        " meta.candidate_count, meta.bounded_count"
+        " FROM meta LEFT JOIN bounded_keys k ON TRUE"
+        " LEFT JOIN inventory_store.inventory_data d"
+        " ON d.agent_id = k.agent_id AND d.plugin = k.plugin"
+        " ORDER BY d.collected_at DESC, d.agent_id, d.plugin";
     params.push_back(std::to_string(limit));
     params.push_back(std::to_string(offset));
+    params.push_back(std::to_string(kQueryByteCap));
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
@@ -649,8 +684,14 @@ std::optional<std::vector<InventoryRecord>> InventoryStore::query(const Inventor
     }
     std::vector<InventoryRecord> out;
     const int n = PQntuples(res.get());
-    out.reserve(static_cast<std::size_t>(n));
+    const auto candidate_count = n > 0 ? result_i64(res, 0, 4) : 0;
+    const auto bounded_count = n > 0 ? result_i64(res, 0, 5) : 0;
+    out.reserve(static_cast<std::size_t>(bounded_count));
     for (int i = 0; i < n; ++i) {
+        // The meta LEFT JOIN returns one all-NULL data row when the first blob
+        // alone exceeds the byte budget; keep the truncation signal but no row.
+        if (PQgetisnull(res.get(), i, 0))
+            continue;
         InventoryRecord r;
         r.agent_id = PQgetvalue(res.get(), i, 0);
         r.plugin = PQgetvalue(res.get(), i, 1);
@@ -664,12 +705,18 @@ std::optional<std::vector<InventoryRecord>> InventoryStore::query(const Inventor
     // hard-cap case gets a WARN (a caller asked for more than the store will
     // ever return in one call); a caller-supplied smaller limit gets a debug
     // breadcrumb (expected/routine pagination-adjacent truncation).
-    if (static_cast<int>(out.size()) == limit) {
+    const bool row_truncated = candidate_count == limit;
+    const bool byte_truncated = bounded_count < candidate_count;
+    if (row_truncated || byte_truncated) {
         if (truncated)
             *truncated = true; // governance M1: in-process signal, see header
         if (metrics_)
             metrics_->counter("yuzu_inventory_query_truncated_total").increment();
-        if (limit == kQueryRowCap)
+        if (byte_truncated)
+            spdlog::warn("InventoryStore: query hit the aggregate byte cap ({} bytes) — result "
+                         "is truncated",
+                         kQueryByteCap);
+        else if (limit == kQueryRowCap)
             spdlog::warn("InventoryStore: query hit the hard row cap ({}) — result is truncated, "
                         "more rows may exist",
                         kQueryRowCap);
@@ -684,11 +731,11 @@ std::optional<std::vector<InventoryRecord>> InventoryStore::query(const Inventor
 // ── Get agent inventory (delegates to query) ─────────────────────────────────
 
 std::optional<std::vector<InventoryRecord>> InventoryStore::get_agent_inventory(
-    const std::string& agent_id) const {
+    const std::string& agent_id, bool* truncated) const {
     InventoryQuery q;
     q.agent_id = agent_id;
     q.limit = 1000;
-    return query(q);
+    return query(q, truncated);
 }
 
 // ── Delete agent ──────────────────────────────────────────────────────────────
@@ -717,6 +764,41 @@ bool InventoryStore::delete_agent(const std::string& agent_id) {
     if (res.status() != PGRES_COMMAND_OK) {
         spdlog::debug("InventoryStore: delete_agent failed for agent={}: {}", agent_id,
                       PQerrorMessage(lease.get()));
+        return false;
+    }
+
+    if (legacy_db_path_.empty())
+        return true;
+    std::error_code ec;
+    const bool legacy_exists = std::filesystem::exists(legacy_db_path_, ec);
+    if (ec) {
+        spdlog::error("InventoryStore: delete_agent cannot stat retained legacy db {}: {}",
+                      legacy_db_path_.string(), ec.message());
+        return false;
+    }
+    if (!legacy_exists)
+        return true;
+
+    SqliteDb legacy;
+    const int open_rc = sqlite3_open_v2(legacy_db_path_.string().c_str(), legacy.addr(),
+                                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr);
+    if (open_rc != SQLITE_OK) {
+        spdlog::error("InventoryStore: delete_agent failed to open retained legacy db {}: {}",
+                      legacy_db_path_.string(),
+                      legacy ? sqlite3_errmsg(legacy.get()) : "open failed");
+        return false;
+    }
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(legacy.get(), "DELETE FROM inventory_data WHERE agent_id = ?", -1,
+                           stmt.addr(), nullptr) != SQLITE_OK) {
+        spdlog::error("InventoryStore: delete_agent failed to prepare retained legacy delete: {}",
+                      sqlite3_errmsg(legacy.get()));
+        return false;
+    }
+    sqlite3_bind_text(stmt.get(), 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+        spdlog::error("InventoryStore: delete_agent failed in retained legacy db for agent={}: {}",
+                      agent_id, sqlite3_errmsg(legacy.get()));
         return false;
     }
     return true;

@@ -58,8 +58,9 @@ argument does not justify here).
   (`plugin`, `collected_at`) carry over as Postgres indexes on the same columns.
 - A second table, `backfill_state` (single sentinel row, `id = 1`), records that the
   first-boot backfill has run — see "Backfill" below.
-- No secrets (ADR-0010 does not apply): `data_json` is plugin-collected inventory content,
-  never credential material.
+- Generic plugins must not emit credentials or secret material: `data_json` is plaintext and
+  its sensitivity is otherwise plugin-dependent. A plugin that needs secret-at-rest storage
+  must use an ADR-0010 envelope-backed store rather than this generic blob channel.
 
 ### Posture (ADR-0012 §1), split by operation class
 
@@ -81,8 +82,10 @@ argument does not justify here).
   (zero rows updated on a genuinely-older report) is observable: it bumps
   `yuzu_inventory_ingest_dropped_total{reason="stale"}` and a debug log — never a silent
   success. Rows written by a pre-clamp deployment drain naturally as their stored
-  `collected_at` ages past `now`; no migration clamp is needed (this store shipped the guard
-  and the clamp in the same release, unlike the sibling's retrofit).
+  `collected_at` ages past `now`; no PostgreSQL-to-PostgreSQL migration clamp is needed because
+  this store ships the guard and clamp together. The one-time SQLite backfill does clamp legacy
+  future-skewed timestamps to migration receipt time, preventing a pre-cutover row from pinning
+  later honest reports; this deliberately changes only invalid future ordering values.
 - **Reads (`list_tables`, `get`, `query`, `get_agent_inventory`, `count`): AUTHORITATIVE.** A
   store/pool/query failure is reported as a degrade — `std::nullopt` for the list/count reads,
   `std::unexpected(InventoryReadError::kDegraded)` for the single-record `get` (mirroring
@@ -95,9 +98,11 @@ argument does not justify here).
   surface a degrade as a 503 / internal-error response rather than folding it into an empty
   200/success — closing the exact fail-open anti-pattern the playbook forbids
   ("An authoritative store that returns an empty result on a DB error").
-- **`delete_agent`**: unchanged contract — returns true iff the DELETE executed successfully;
-  false on a lease timeout or SQL failure, so the `AgentDecommission` cascade records the
-  store Failed rather than a false "erased".
+  Query materialisation is bounded by both row count and an 8 MiB aggregate payload budget;
+  either cap raises the same truncation signal, and targeting-set creation refuses it with 503.
+- **`delete_agent`**: erases PostgreSQL and, during the rollback window, the retained SQLite
+  copy. It returns true only when both backing deletes commit, so `AgentDecommission` records
+  Failed rather than allowing rollback to resurrect an erased device.
 
 ### Backfill (ADR-0009) — standard, mandatory, idempotent, fail-closed
 
@@ -106,45 +111,50 @@ argument does not justify here).
 opens:
 
 - **Idempotency**: a single-row `backfill_state` table (`id = 1`, stamped with
-  `migrated_at` + a `legacy_rows` diagnostic count, plus a `skipped_bad` diagnostic count —
-  governance H1, 2026-07-29: a completed stamp with `skipped_bad > 0` means N legacy rows
-  were filed as malformed on 22xxx/23xxx SQLSTATE only; genuine infrastructure errors abort
-  the backfill unstamped instead, so a retry is never lost silently) makes every boot after
-  the first a cheap lookup — the legacy SQLite file is never re-read once stamped.
+  `migrated_at`, inserted-row count (`legacy_rows`), total `source_rows`, conflicts, blank-key
+  skips, typed-source skips, and `skipped_bad`). A completed stamp with `skipped_bad > 0` means
+  rows were filed as malformed on SQLSTATE class 22 (data), 23 (integrity), or 54 (a
+  row-specific program limit such as an oversized blob). Every other/unknown SQLSTATE aborts
+  the backfill unstamped, so an infrastructure retry is never lost silently. Every later boot
+  is a cheap lookup; the legacy SQLite file is not re-read once stamped.
   The full reconciliation identity for an auditor is
-  `legacy sqlite rows = inserted (legacy_rows) + live-row conflicts + skipped_bad +
-  blank-key skips` — blank-key skips are logged, not persisted (they are GDPR-unerasable
-  rows the store refuses on every path, not data loss).
+  `source_rows = inserted (legacy_rows) + conflicts + skipped_bad + skipped_blank_key +
+  skipped_typed`; every term is durable in `backfill_state`.
 
   **Operator recovery when the backfill fails closed** (Gate 4 UP-1/UP-2): a legacy row
   failing with a non-row-data SQLSTATE aborts the backfill unstamped and the server
   refuses to boot on every restart until resolved. The escape hatch is moving the legacy
   `inventory.db` aside — the missing-file path stamps `legacy_rows = 0` and boots; live
-  agents re-push their blobs on the next report cycle. NOTE the trade: rows for
-  decommissioned/offline agents are NOT re-pushed and must be re-imported manually from
-  the retained read-only legacy file if needed.
+  gateway-connected live agents re-push generic blobs on the next report cycle. The direct
+  `ReportInventory` path currently carries typed sources only, so direct-connected,
+  decommissioned, and offline agents' generic rows require manual import from the retained
+  legacy file if needed.
+- **Typed-source isolation**: legacy `installed_software`, `app_perf`, `device_ci`, and
+  `software_licensing` blobs are not copied into the generic store. Their typed stores have
+  distinct securables; preserving the old generic duplicate would expose them through
+  `Infrastructure:Read` after upgrade.
 - **Never clobbers a live row**: every backfilled row is inserted
   `ON CONFLICT (agent_id, plugin) DO NOTHING` — if a live agent has already re-reported for
   that `(agent_id, plugin)` pair since this boot sequence started (a race the boot-time
   ordering makes possible only in the narrow window between store-open and backfill-run), the
   live row wins, never the stale legacy copy.
-- **Fails CLOSED**: any legacy-open/read error, or any Postgres write error during the
-  backfill transaction, returns `false`; `server.cpp` treats that as a fatal startup error
+- **Fails CLOSED**: any legacy-open/read error, transaction/control-statement error, or
+  non-row-data PostgreSQL write error returns `false`; only SQLSTATE classes 22/23/54 are
+  skipped as malformed row data. `server.cpp` treats `false` as a fatal startup error
   (`startup_failed_ = true`) — the server refuses to serve half-migrated inventory data,
   exactly as ADR-0009 requires.
-- **Read-only legacy access**: the legacy `inventory.db` is opened `SQLITE_OPEN_READONLY` and
-  is never written to. Per ADR-0009 it is retained on disk, unmodified, for exactly one
-  release as the rollback net, then removed in the following release (this ADR does not ship
-  that removal).
+- **Rollback-copy access**: backfill opens legacy `inventory.db` read-only. It is retained for
+  exactly one release, but a successful device decommission deletes that agent's rows from
+  both copies; this narrow mutation preserves the stronger erasure invariant across rollback.
 - **Lease discipline note**: the idempotency check and the backfill-insert transaction each
   acquire their own single connection and release it before the other begins — holding two
   connections concurrently from this one call would deadlock a size-1 pool (e.g. a test
   pool), which the implementation avoids by construction (see the doc comment on
   `migrate_from_sqlite` in `inventory_store.hpp`).
-- **Cost**: the backfill inserts one row at a time inside a single transaction. This is a
-  one-time boot cost (never repeated after the stamp lands), acceptable at today's scale; a
-  batched `unnest()`-based insert (mirroring `SoftwareInventoryStore`'s ingest path) is the
-  follow-up if a fleet's legacy table ever proves large enough to matter.
+- **Cost**: the backfill streams one SQLite row at a time through one PostgreSQL transaction,
+  so peak process memory is bounded to one legacy blob rather than total legacy-store size.
+  Inserts remain one statement per row under SAVEPOINT; batching is a future throughput
+  optimization, not a memory-safety prerequisite.
 
 ## Considered and rejected
 

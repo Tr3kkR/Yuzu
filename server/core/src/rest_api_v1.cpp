@@ -6231,7 +6231,17 @@ void RestApiV1::register_routes(
                       auto session = auth_fn(req, res);
                       if (!session)
                           return;
+                      const auto audit_failure = [&](std::string_view reason) {
+                          bool ok = true;
+                          if (audit_fn)
+                              ok = audit_fn(req, "result_set.create", "failure", "ResultSet", "",
+                                            "source_kind=inventory_query reason=" +
+                                                std::string(reason));
+                          if (!ok)
+                              res.set_header("Sec-Audit-Failed", "true");
+                      };
                       if (!inventory_store || !inventory_store->is_open()) {
+                          audit_failure("store_unavailable");
                           rs_err(res, 503, "inventory store not available");
                           return;
                       }
@@ -6325,6 +6335,7 @@ void RestApiV1::register_routes(
                       bool inv_truncated = false;
                       auto records_raw = inventory_store->query(iq, &inv_truncated);
                       if (!records_raw) {
+                          audit_failure("store_degraded");
                           rs_err(res, 503, "inventory store degraded");
                           return;
                       }
@@ -6335,8 +6346,9 @@ void RestApiV1::register_routes(
                           // dispatch-targeting invariant class). 503 rather
                           // than a partial set; raising the cap / keyset
                           // pagination is the tracked follow-up.
+                          audit_failure("query_truncated");
                           rs_err(res, 503,
-                                 "inventory query truncated at the row cap - refusing to "
+                                 "inventory query truncated at the row or byte cap - refusing to "
                                  "materialise a partial result set");
                           return;
                       }

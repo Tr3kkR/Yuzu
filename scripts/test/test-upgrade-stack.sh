@@ -316,6 +316,49 @@ if [[ $FIXTURE_WRITE_OK -eq 0 ]]; then
     exit 1
 fi
 
+# Seed the actual previous-release SQLite shape into the persistent server
+# volume. The old stack has no agent service in this rig, so create the row on
+# the host, stop the old server, then copy it into the stopped container. One
+# set-valued fixture is enough to prove path wiring, schema compatibility,
+# startup backfill, and rollback-file retention end to end.
+LEGACY_INVENTORY_DB="$PHASE2_DIR/inventory.db"
+python3 - "$LEGACY_INVENTORY_DB" <<'PY'
+import sqlite3, sys
+path = sys.argv[1]
+db = sqlite3.connect(path)
+db.execute("""CREATE TABLE inventory_data (
+  agent_id TEXT NOT NULL,
+  plugin TEXT NOT NULL,
+  data_json TEXT NOT NULL DEFAULT '{}',
+  collected_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (agent_id, plugin))""")
+db.execute("INSERT INTO inventory_data VALUES (?, ?, ?, ?)",
+           ("upgrade-agent-generic", "upgrade_custom", '{"survived":true}', 1700000000))
+db.commit()
+db.close()
+PY
+# docker cp preserves the mode; world-write is test-only and lets the
+# unprivileged `yuzu` user exercise rollback-copy erasure in later assertions.
+chmod 666 "$LEGACY_INVENTORY_DB"
+OLD_SERVER_ID=$(YUZU_VERSION="$OLD_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+    docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+    --project-name "$PROJECT_NAME" ps -q server)
+if [[ -z "$OLD_SERVER_ID" ]]; then
+    fl "could not resolve old server container for inventory fixture"
+    record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "no old server container"
+    exit 1
+fi
+YUZU_VERSION="$OLD_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+    docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+    --project-name "$PROJECT_NAME" stop server >> "$LOG_FILE" 2>&1
+if ! docker cp "$LEGACY_INVENTORY_DB" \
+    "${OLD_SERVER_ID}:/var/lib/yuzu/inventory.db" >> "$LOG_FILE" 2>&1; then
+    fl "could not seed legacy inventory.db into the server volume"
+    record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "inventory seed failed"
+    exit 1
+fi
+ok "legacy generic-inventory fixture seeded"
+
 # --- Step 4: image swap to NEW --------------------------------------------
 
 phase "step: image swap to NEW ${NEW_VERSION}"
@@ -398,6 +441,31 @@ if [[ $READY -ne 1 ]]; then
     exit 1
 fi
 ok "/readyz ready after upgrade (waited ${WAITED}s)"
+
+# ADR-0009 inventory assertion: the real old SQLite file was discovered by
+# startup, its generic row landed in PostgreSQL, and the rollback copy stayed
+# byte-for-byte unchanged during backfill.
+PG_INVENTORY_JSON=$(docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+    --project-name "$PROJECT_NAME" exec -T postgres \
+    psql -U yuzu -d yuzu -Atc \
+    "SELECT data_json FROM inventory_store.inventory_data WHERE agent_id='upgrade-agent-generic' AND plugin='upgrade_custom'" \
+    2>/dev/null || true)
+if [[ "$PG_INVENTORY_JSON" != '{"survived":true}' ]]; then
+    fl "generic inventory SQLite→PostgreSQL upgrade assertion failed"
+    record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "inventory backfill missing"
+    exit 1
+fi
+NEW_SERVER_ID=$(YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+    docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+    --project-name "$PROJECT_NAME" ps -q server)
+LEGACY_AFTER="$PHASE2_DIR/inventory-after.db"
+if ! docker cp "${NEW_SERVER_ID}:/var/lib/yuzu/inventory.db" "$LEGACY_AFTER" \
+    >> "$LOG_FILE" 2>&1 || ! cmp -s "$LEGACY_INVENTORY_DB" "$LEGACY_AFTER"; then
+    fl "legacy inventory.db was not retained unchanged for rollback"
+    record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "rollback copy changed"
+    exit 1
+fi
+ok "generic inventory survived upgrade; rollback copy retained unchanged"
 
 # --- Step 6: count migration runner events --------------------------------
 

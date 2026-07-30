@@ -20,9 +20,9 @@
 /// construction on a pinned lease, schema-qualifies every runtime statement
 /// (`inventory_store.inventory_data`). Mutators check the `PgResult` status
 /// directly rather than `sqlite3_changes()` (#1033); none needs `RETURNING`
-/// (no caller consumes an affected-row count). No secrets (ADR-0010 does not
-/// apply — `data_json` is plugin-collected inventory, not credential
-/// material).
+/// (no caller consumes an affected-row count). Generic plugins must not emit
+/// credentials or secret material: `data_json` is stored as plaintext and its
+/// sensitivity is otherwise plugin-dependent (ADR-0010).
 ///
 /// Failure posture (ADR-0012 §1), split by operation class:
 ///  - **Ingest (`upsert`)**: FAIL-SOFT. A transient lease/query failure logs
@@ -39,10 +39,9 @@
 ///    degrade (503 / banner), never `.value_or({})` it into a silent empty —
 ///    that re-opens the fail-open hole ADR-0016 §7 / the playbook's
 ///    anti-patterns list forbid.
-///  - **`delete_agent`**: returns true iff the DELETE executed successfully;
-///    false on a lease timeout or SQL failure, so the decommission cascade
-///    records the store Failed rather than a false "erased" (unchanged
-///    contract from the SQLite implementation).
+///  - **`delete_agent`**: erases both PostgreSQL and the retained rollback
+///    SQLite copy, when present. It returns false unless both deletes commit,
+///    so the decommission cascade never reports a false "erased" result.
 ///  - **`migrate_from_sqlite`**: the one-time first-boot backfill (ADR-0009).
 ///    FAILS CLOSED — see its own doc comment below.
 
@@ -133,26 +132,30 @@ public:
     ///    and returns true (a fresh install never had a legacy file).
     ///  - Otherwise opens the legacy SQLite file READ-ONLY (via RAII owners —
     ///    no manual finalize/close), reads every row of its `inventory_data`
-    ///    table, and inserts each one into `inventory_store.inventory_data`
+    ///    table, skips sources promoted to typed stores, and inserts each
+    ///    remaining row into `inventory_store.inventory_data`
     ///    via `INSERT ... ON CONFLICT (agent_id, plugin) DO NOTHING` (never
     ///    clobbers a row a live agent has already re-reported since this boot
     ///    sequence started), each under its own SAVEPOINT inside one overall
-    ///    transaction, then stamps completion. The legacy file is never
-    ///    written to — it stays the rollback net for one release (ADR-0009) —
-    ///    and is not deleted by this call.
+    ///    transaction, then stamps completion. The backfill itself does not
+    ///    modify the legacy file; during the one-release rollback window only
+    ///    `delete_agent` may remove rows so an erasure cannot be resurrected
+    ///    by rollback.
     ///  - A single BAD ROW (a legacy value that violates encoding/constraints —
     ///    e.g. invalid UTF-8) does NOT abort the backfill: its SAVEPOINT is
     ///    rolled back, the row is logged at warn + counted skipped, and the
-    ///    loop continues. A row with an empty/blank `agent_id` or `plugin` is
+    ///    loop continues. Skippable row-data failures are SQLSTATE classes
+    ///    22, 23, and 54; every other/unknown class aborts unstamped. A row
+    ///    with an empty/blank `agent_id` or `plugin` is
     ///    skipped the same way (never backfilled as an un-erasable orphan —
     ///    the decommission cascade's empty-id guard could never reach it).
     ///    This store is FAIL-SOFT / self-healing (the agent re-pushes), so one
     ///    malformed legacy blob must not permanently brick the server.
-    ///  - FAILS CLOSED only on a genuine INFRASTRUCTURE error — the initial
+    ///  - FAILS CLOSED on a genuine INFRASTRUCTURE error — the initial
     ///    connection/lease, the backfill transaction's own BEGIN/SAVEPOINT/
-    ///    COMMIT, or a `ROLLBACK TO SAVEPOINT` that itself fails (the signal
-    ///    that the connection, not just one row, is broken) — never on a
-    ///    single bad row. The caller MUST treat `false` as a fatal startup
+    ///    COMMIT, a non-row-data/unknown INSERT SQLSTATE, or a `ROLLBACK TO
+    ///    SAVEPOINT` that itself fails (the signal that the connection, not
+    ///    just one row, is broken). The caller MUST treat `false` as fatal
     ///    error (`startup_failed_ = true` in `server.cpp`) — per ADR-0009, the
     ///    server refuses to start rather than serve against an unreachable
     ///    database.
@@ -190,8 +193,8 @@ public:
     /// Query inventory across agents with filters. AUTHORITATIVE read:
     /// `std::nullopt` on a store/pool/query degrade, NEVER a silent empty. An
     /// empty value = no rows matched. When the result count hits the
-    /// effective limit (the caller's `q.limit`, clamped to `kQueryRowCap`),
-    /// more rows may exist past what is returned — this is logged and bumps
+    /// effective row limit or the aggregate 8 MiB payload budget, more rows
+    /// may exist past what is returned — this is logged and bumps
     /// `yuzu_inventory_query_truncated_total` so an operator/caller can tell
     /// "capped at N" from "exactly N" (full keyset pagination is a follow-up).
     /// Governance M1 (2026-07-29): pass `truncated` to receive that signal in
@@ -204,14 +207,15 @@ public:
     query(const InventoryQuery& q, bool* truncated = nullptr) const;
 
     /// Get all inventory records for a specific agent. AUTHORITATIVE read:
-    /// same nullopt-on-degrade contract as `query` (this delegates to it).
+    /// same nullopt-on-degrade and optional truncation contract as `query`
+    /// (this delegates to it).
     [[nodiscard]] std::optional<std::vector<InventoryRecord>>
-    get_agent_inventory(const std::string& agent_id) const;
+    get_agent_inventory(const std::string& agent_id, bool* truncated = nullptr) const;
 
-    /// Delete inventory data for an agent (e.g., on agent removal). Returns true
-    /// iff the DELETE executed successfully; false on a lease timeout or a
-    /// query failure, so the decommission cascade can record the store as
-    /// Failed rather than a false "erased".
+    /// Delete inventory data for an agent from PostgreSQL and from the retained
+    /// legacy SQLite rollback file, if it exists. Idempotent; returns false if
+    /// either backing delete fails so the decommission cascade can retry and
+    /// cannot report a false "erased".
     [[nodiscard]] bool delete_agent(const std::string& agent_id);
 
     /// Count total inventory records. AUTHORITATIVE read: `std::nullopt` on a
@@ -222,6 +226,9 @@ private:
     pg::PgPool& pool_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
+    // Set by migrate_from_sqlite() during startup, before serving. Read later
+    // by delete_agent(); there is no concurrent writer after startup.
+    std::filesystem::path legacy_db_path_;
 };
 
 } // namespace yuzu::server

@@ -3668,8 +3668,8 @@ List all inventory tables (one per plugin that reports inventory data).
 Creates an owner-scoped result set from an inventory query (scope-walking
 producer; see `docs/scope-walking-design.md` for the full result-set surface).
 One behavior worth calling out here: when the underlying inventory read hits
-the server row cap, the route returns **503** ("inventory query truncated at
-the row cap - refusing to materialise a partial result set") rather than
+the server row cap or 8 MiB aggregate payload cap, the route returns **503**
+("inventory query truncated ... refusing to materialise a partial result set") rather than
 persisting a silently-incomplete set — a fleet-targeting set is never silently
 narrowed.
 
@@ -3768,7 +3768,8 @@ Each condition object:
 
 `result_truncated_by_cap` (bool, optional) — emitted at the **top level of the
 envelope** (alongside `data`), present and `true` when the underlying inventory
-read hit its row cap (5,000 for this route): absent devices may simply not have
+read hit its row cap (5,000 for this route) or 8 MiB aggregate payload cap:
+absent devices may simply not have
 been read rather than not matching. (The typed software route carries the same
 flag inside `data` — placement alignment is tracked with #2633.)
 

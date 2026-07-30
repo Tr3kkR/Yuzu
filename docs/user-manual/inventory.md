@@ -341,7 +341,8 @@ whose ingest is failing. Four further series sharpen the picture:
   hash_only majority doesn't bury the `full` tail, the pool-pressure signal under
   a cold-cache `need_full` herd.
 - `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
-  `pool_acquire_timeout` / `query_error`; source ∈ `installed_software` / `device_ci`) — an
+  `pool_acquire_timeout` / `query_error`; source ∈ `installed_software` / `device_ci` /
+  `generic`) — an
   **authoritative read** that returned
   a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
   pool saturation, so without this counter a degraded fleet software query is
@@ -371,10 +372,13 @@ whose ingest is failing. Four further series sharpen the picture:
   `reason="stale"` in particular spikes benignly for the duration of a server clock
   step-back and self-heals (the stale-overwrite guard compares receipt-clamped
   timestamps).
+  `YuzuGenericInventoryPersistenceDropped` warns only after that rate remains
+  non-zero for 15 minutes, avoiding alerts for a single self-healing report.
 - `yuzu_inventory_query_truncated_total` (counter) — generic-store reads that hit their
-  row cap. A non-zero rate on the result-set producer path pairs with 503s from
-  `POST /api/v1/result-sets/from-inventory-query` (see #2633); on `/inventory/evaluate`
-  it pairs with `result_truncated_by_cap: true` responses.
+  row cap or 8 MiB aggregate payload cap. A non-zero rate on the result-set
+  producer path pairs with 503s from
+  `POST /api/v1/result-sets/from-inventory-query` (see #2633); on
+  `/inventory/evaluate` it pairs with `result_truncated_by_cap: true` responses.
 
 
 The **catalogue rollup** (the `/inventory` Software tab's precomputed counts, refreshed
