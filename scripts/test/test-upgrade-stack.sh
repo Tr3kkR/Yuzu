@@ -380,6 +380,19 @@ if ! docker cp "$LEGACY_INVENTORY_DB" \
     record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "inventory seed failed"
     exit 1
 fi
+# The stopped release can leave WAL/SHM sidecars in the named volume. The
+# locally closed fixture above is a complete, checkpointed main database; if
+# the old sidecars survive beside it, SQLite can replay their pre-fixture
+# snapshot and make the new row invisible to the HEAD backfill. Remove only
+# those transient sidecars while the old server remains stopped.
+if ! docker run --rm --volumes-from "$OLD_SERVER_ID" \
+    --entrypoint /bin/rm "ghcr.io/tr3kkr/yuzu-server:${OLD_VERSION}" \
+    -f /var/lib/yuzu/inventory.db-wal /var/lib/yuzu/inventory.db-shm \
+    >> "$LOG_FILE" 2>&1; then
+    fl "could not clear stale generic-inventory SQLite sidecars"
+    record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "inventory sidecar cleanup failed"
+    exit 1
+fi
 ok "legacy generic-inventory fixture seeded"
 
 # --- Step 4: image swap to NEW --------------------------------------------
