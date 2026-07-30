@@ -348,6 +348,56 @@ if host_os == 'darwin'
   corefoundation_dep = dependency('appleframeworks', modules: ['CoreFoundation', 'Security', 'CFNetwork'])
   grpcpp_dep  = declare_dependency(dependencies: [grpcpp_dep, corefoundation_dep])
   httplib_dep = declare_dependency(dependencies: [httplib_dep, corefoundation_dep])
+
+  # ── Reusable per-target Apple frameworks + Objective-C++/ARC template ──────
+  # Meson has no user-defined functions, so "template" here means: the parts
+  # of the wifi plugin's pioneering objcpp/ARC pattern (agents/plugins/wifi/
+  # meson.build, the first .mm TU in the tree) that are IDENTICAL for every
+  # future Objective-C++ plugin are hoisted here, ONCE, next to the framework
+  # dependency this project already centralises; only the parts that
+  # genuinely vary per target (which frameworks, which .mm sources) stay in
+  # the plugin's own meson.build. A plugin consumes the template as:
+  #
+  #   if host_machine.system() == 'darwin'
+  #     foo_sources += files('src/foo_thing.mm')
+  #     foo_deps    += dependency('appleframeworks', modules: ['Whatever'],
+  #                               include_type: 'system')
+  #     foo_objcpp_args += apple_objcpp_args
+  #   endif
+  #
+  # (the per-target `dependency('appleframeworks', modules: [...])` call itself
+  # is NOT further factored — each target's module list is genuinely target-
+  # specific, and Meson has no dict-kwarg-splat to fold it into one call; see
+  # docs/native-objcpp-conventions.md for the "when is required:true correct"
+  # rule that call must follow.)
+  #
+  # add_languages('objcpp') is a process-global registration — calling it once
+  # here, rather than once per plugin, means a SECOND .mm-consuming plugin
+  # after wifi needs no add_languages call of its own at all (harmless but
+  # redundant if repeated). `native: false` matches wifi's original call
+  # (host-side compiler; irrelevant to cross-compilation, which this project
+  # does not do for macOS). `required: true` is deliberate, not a leftover:
+  # every macOS host this project targets ships a working Objective-C++
+  # front-end in the same Clang that already builds the C++ half, so a
+  # failure here is a real toolchain problem, not a missing-optional-
+  # framework case (that distinction belongs to the PER-FRAMEWORK
+  # `dependency('appleframeworks', ...)` call in each target, not here).
+  add_languages('objcpp', native: false, required: true)
+
+  # objcpp is a separate Meson language from cpp, so this project's
+  # `-std=c++23`/`-fvisibility=hidden` (set above for cpp only) do not reach a
+  # .mm TU; every objcpp target must re-pass them via its own `objcpp_args:`.
+  # Probe for the C++23 spelling rather than hardcoding it: Apple Clang 15
+  # rejects raw `-std=c++23` and needs `-std=c++2b` (docs/ci-cpp23-
+  # troubleshooting.md); newer Apple Clang accepts the canonical spelling, so
+  # prefer it when available instead of pinning the older alias forever.
+  # `-fobjc-arc` is included unconditionally: every objcpp TU in this project
+  # keeps Objective-C object lifetimes ARC-managed (see
+  # docs/native-objcpp-conventions.md) — there is no manual-retain-count
+  # variant to opt out into.
+  _apple_objcpp = meson.get_compiler('objcpp')
+  _apple_objcpp_std = _apple_objcpp.has_argument('-std=c++23') ? '-std=c++23' : '-std=c++2b'
+  apple_objcpp_args = [_apple_objcpp_std, '-fvisibility=hidden', '-fobjc-arc']
 endif
 
 # ── Proto codegen ─────────────────────────────────────────────────────────────
