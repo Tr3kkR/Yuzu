@@ -1277,6 +1277,27 @@ Strategy:
    unstated convention means no reader can be right" that settled the row rule
    settles this one.
 
+   **ATTESTATION FIELDS ARE ROW-SCOPED AND EXEMPT FROM THE MERGE.** The four are
+   `adjudicated_by`, `adjudication_rationale`, `refuted_by` and
+   `refuted_by_reporter`. They are NOT properties of the finding, so merging them
+   forward is a category error: an attestation attaches to the ACT it approves — this
+   de-escalation, this refutation — and a reader binds each to the row that performed
+   that act. They are never inherited by a later row and **never cleared by one**.
+
+   Without that exemption the guard erases itself: append a row nulling
+   `adjudicated_by`, and the live view shows a de-escalated finding with no
+   attestation, while gate and band are unchanged — so the gate-or-band property does
+   not fire. Measured on this change's own ledger, where the rows that withdrew two
+   adjudications did exactly that, and the commit that wrote them called it a worked
+   example. Every prior round of this defect was "a route that moves the band or the
+   gate"; this one is a route that **removes the control** from a finding already
+   moved, which is why naming the gate as the property did not reach it.
+
+   To withdraw an attestation you supersede the ACT it approved — restate the facts
+   or label it authorised, back to where they were. You cannot retract the signature
+   and keep the effect. Unlike the routes above, this class is CLOSED by the schema:
+   the attestation set is exactly those four fields.
+
    ### De-escalation — the guarded property is THE GATE, not a list of fields
 
    **READ THE MERGED VIEW AT THE STRONGER OF ITS FACTS AND ITS LABEL.** The label is
@@ -1328,10 +1349,25 @@ Strategy:
      what the absences rule forbids
    - a terminal `disposition` of `rejected` or `deferred-to-issue #N` over a live
      gating row
+   - **`commit_range` or `reviewed_at_sha` set to `unresolved` by the author** — it
+     voids the only verifiable half of the adjudication guard below (the self-naming
+     check reads git authors over the range), so it weakens the gate by disarming its
+     own precondition
 
    **A new field, or a new route, must be tested against the PROPERTY** — does it
-   weaken the gate or the band — and added to this list when it does. The list is
+   weaken the gate or the band, OR remove an attestation from a finding that has
+   already been de-escalated — and added to this list when it does. The list is
    openly incomplete; treating it as closed is what let round 5 ship.
+
+   **What the adjudication requirement actually achieves — read this before relying
+   on it.** It is an AUDIT TRAIL, not a verified control. It makes a de-escalation
+   attributable and reasoned in writing, and a reader with the repo can detect literal
+   self-naming by comparing `adjudicated_by` against `git log --format='%an'` over
+   `commit_range`. It verifies nothing beyond that: the field is free text, and an
+   `adjudicated_by` naming a governance agent never matches a git author, so the
+   self-check passes vacuously. **A subagent of the authoring session is not
+   independent** — it is the same actor under another name. Independence here is
+   ASSERTED, and the assertion is worth recording; do not describe it as enforced.
 
    **Why the property and not another guarded field.** Rounds 2–5 each hardened one
    route and left the next open: round 2 hardened `refuted`, round 3 found

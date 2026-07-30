@@ -75,9 +75,12 @@ second-copy drift the governance rule itself forbids.
 `2619-ledger-provenance-prose-ownership.sW31cX.jsonl` is the first ledger written and will
 be copied. Three things in it are worth not copying.
 
-No finding in that run hit a policy floor — 33 rows record `policy_floor: null` and 5 omit
-the key — so the fragment never exercises the floor-inheritance rule. Do not read its
-absence as a pattern.
+Exactly ONE finding in that run carries a `policy_floor` — `COL-1`, the collaborator row
+recording the operator's rejection of a proposal to skip a Gate 8 pass. Of the 48 rows, 37
+record `policy_floor: null`, 10 omit the key, and 1 sets it. So the fragment exercises floor
+inheritance exactly once, on a row that is itself unusual (a process violation rather than a
+code finding, and an averted one). Do not read the near-absence as a pattern, and do not
+take `COL-1` as the model for an ordinary floored finding.
 
 Four rows are wrong as written and correct only after supersession: `C2` at `pass_ordinal 2`
 recorded a human recorder in `reporter` with `source: "governance-agent"` and omitted
@@ -86,6 +89,14 @@ and the first `C2` correction described the error without restating the field, s
 field-wise merge it changed nothing. They are left in place because superseding is the rule
 and rewriting is not — but **the merged view is the artefact**. Read it through the merge,
 never row by row.
+
+A third thing not to copy: two rows withdrew an adjudication by nulling
+`adjudicated_by`/`adjudication_rationale`. That was wrong twice over — the adjudications
+were correct (an `I9` finding under a `SHOULD` label IS a genuine facts/label disagreement,
+so lowering the label was a real de-escalation), and nulling an attestation is not how you
+withdraw one. Attestation fields are row-scoped and exempt from the merge; you withdraw an
+attestation by superseding the act it approved. Both withdrawals are themselves superseded
+in the fragment.
 
 Its `recorded_at` values were hand-written and are illustrative: several postdate the commit
 that introduced them, which is physically impossible and would make the commit-time

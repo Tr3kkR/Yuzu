@@ -561,3 +561,48 @@ number — and are now inside the same bar when applied over a live gating row. 
 `adjudicated_by` gained a `required iff` clause plus a named `adjudication_rationale`, having
 been mandated by prose while the field table still marked it merely nullable with no field
 for the reason it demanded.
+
+### Rounds 7 and 8: the guard's own record
+
+Round 6 named the BAND as the guarded property and claimed the rule therefore enumerated no
+fields. Round 7 disproved that — three of round 6's own routes were band-neutral, and
+releasing an `unresolved` sentinel lifts a gate the band cannot see — so the property became
+THE GATE, and the enumeration was restated as openly incomplete rather than closed. Round 7
+also made the stronger-of comparison computable: each label denotes a SET
+(`BLOCKING` = {CRITICAL, HIGH}, `SHOULD` = {MEDIUM}, `NICE` = {LOW, INFO}), because comparing
+against the label's floor reports a false disagreement on every correctly-recorded `I9`/`NICE`
+row — and did, on two rows of this change's own ledger.
+
+Round 8 closed the last one, and it was of a genuinely different kind. Every earlier round
+found a route that moved the band or the gate. This one **removes the control from a finding
+already moved**: the four attestation fields were merged field-wise like any other, so
+appending a row that nulls `adjudicated_by` erases the attestation from the live view while
+gate and band stay put — and the gate-or-band property therefore does not fire. Two agents
+found it independently, both by execution, and the rows that withdrew two adjudications in
+this very change did exactly that while the commit message called it a worked example.
+
+The fix is a category correction: an attestation attaches to the ACT it approves, not to the
+finding, so it is row-scoped and exempt from the merge — never inherited, never cleared. To
+withdraw one you supersede the act, not the signature. Unlike the routes above, this class is
+closed by the schema: the attestation set is exactly those four fields.
+
+Round 8 also had to correct two of its predecessor's own claims. `CLAUDE.md` still said the
+guard was on the band "not on a list of fields" — the sentence round 7's commit message calls
+false — so the always-loaded pointer applied round-6 semantics; that is the missed-copy class
+round 6 had declared closed, recurring on the commit that declared it. And the README asserted
+no finding hit a policy floor while a row added by the same commit carried the only one.
+
+Two honesty corrections came out of it. The adjudication requirement is an **audit trail, not
+a verified control**: the field is free text, an `adjudicated_by` naming a governance agent
+never matches a git author so the self-name check passes vacuously, and a subagent of the
+authoring session is not independent. And the guard's own precondition was unprotected —
+setting `commit_range` or `reviewed_at_sha` to `unresolved` disarms the only verifiable half,
+and is now an enumerated route.
+
+**On the cost of this.** Eight rounds, seven of which shipped a blocking defect of their own,
+on a change that began as two small documentation follow-ups. The generalisable lessons are
+recorded above rather than in a retrospective, because the pattern is not specific to a
+ledger: a guard keyed to a MECHANISM leaks as soon as another mechanism reaches the same
+outcome, and the fix is to name the OUTCOME — then to keep checking, because naming an
+outcome does not prove you have enumerated the ways to reach it. The clock-guarded-retention
+row already said the first half. The second half is new.
