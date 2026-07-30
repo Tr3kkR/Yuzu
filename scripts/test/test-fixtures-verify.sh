@@ -296,11 +296,25 @@ if [[ "$API_PRESENT_BEFORE" == "True" ]]; then
         "$DASHBOARD_URL/api/v1/tokens" 2>/dev/null || echo "")
     # No `"error"` substring pre-check here, deliberately. It rejected any body
     # CONTAINING that literal, so a token legitimately NAMED "error" produced
-    # `api_tokens: endpoint broken` — measured. The `-1` sentinel below is
-    # strictly stronger and has no such blind spot: measured against the helper,
-    # `{"error":"boom"}`, an empty body and `not json` all yield -1 (red), while
-    # `{"data":[{"name":"error"}],...}` correctly yields 1. Screening on the
-    # substring only ever cost a real token name.
+    # `api_tokens: endpoint broken` — measured.
+    #
+    # The `-1` sentinel below covers every error body this ROUTE can actually
+    # produce, which is the honest claim; an earlier revision of this comment said
+    # "strictly stronger", and that is false. Measured against the helper:
+    # `{"error":"boom"}`, an empty body, `not json`, `[]`, `{"meta":{}}`, `null`
+    # and `0` all yield -1 (red), while `{"data":[{"name":"error"}],...}` correctly
+    # yields 1. The shape the removed screen caught and the sentinel does NOT is a
+    # body carrying BOTH a list `data` and an error member — `{"data":[],"error":…}`
+    # yields 0, which on a cutover edge reads as PASS.
+    #
+    # That shape is not reachable from this route today: the A4 error envelope has
+    # no `data` key (`rest_api_v1.cpp`), the success envelope has no `error` key,
+    # and both 503 paths return early — so no server-produced body hits it. It is
+    # reachable from an INTERMEDIARY, and nothing here captures the HTTP status
+    # (`curl -s` above, no `-w '%{http_code}'`), so 0-as-PASS rests entirely on
+    # body shape. Requiring a 200 is the durable fix and is deliberately NOT done
+    # in this commit: it changes the request/parse contract rather than correcting
+    # it. Tracked as a follow-up.
     if [[ -n "$API_LIST" ]]; then
         # -1 is a SENTINEL for "could not read the list", and it is load-bearing
         # now that zero is the PASS condition. The previous version printed 0 on
@@ -449,8 +463,11 @@ if [[ $LOST -eq 0 && ! ( $WROTE_COUNT -gt 0 && $DATA_OK -eq 0 ) ]]; then
 else
     echo -e "${R}fixtures verify: $LOST FAILED, $PRESERVED preserved, $UPHELD upheld, $SKIPPED skipped — FIXTURE CONTRACT VIOLATED${N}"
     echo -e "${R}Read the per-fixture lines above for the cause. NOT every failure is data loss:${N}"
-    echo -e "${R}api_tokens fails when tokens SURVIVE an ADR-0030 cutover edge — that is a stale${N}"
-    echo -e "${R}legacy store still being read, not lost data, and needs the opposite fix.${N}"
+    echo -e "${R}api_tokens can fail TWO ways, with opposite causes — read its per-fixture line:${N}"
+    echo -e "${R}  survived — tokens outlived an ADR-0030 cutover edge. A stale legacy store is${N}"
+    echo -e "${R}    still being read; not lost data, and it needs the opposite fix to a restore.${N}"
+    echo -e "${R}  not armed — the fixture was never minted, so invalidation is unproven. Nothing${N}"
+    echo -e "${R}    was lost; look at the WRITER (test-fixtures-write.sh), not the migration.${N}"
     if [[ $WROTE_COUNT -gt 0 && $DATA_OK -eq 0 ]]; then
         echo -e "${R}GUARANTEE INVERSION: writer recorded $WROTE_COUNT fixtures but zero were verified.${N}"
         echo -e "${R}This may indicate (a) silent data loss, (b) endpoint moved to a different path,${N}"
