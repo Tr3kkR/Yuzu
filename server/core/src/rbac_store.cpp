@@ -7,11 +7,13 @@
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
 #include <shared_mutex>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -1878,77 +1880,229 @@ bool RbacStore::check_scoped_permission(const std::string& username,
                                         const std::string& operation,
                                         const std::string& agent_id,
                                         const ManagementGroupStore* mgmt_store) const {
-    // Note: does NOT hold its own lock. Delegates to check_permission and
-    // get_role_permissions which each acquire shared_lock independently.
+    // Note: does NOT hold its own lock. Delegates to check_permission /
+    // resolve_perm_groups / the mgmt-store, which each acquire their own lock.
 
-    // 1. Try global permission first — if passes, return true immediately
+    // 1. Global permission first (honors a global deny → false). A global ALLOW
+    //    short-circuits — matches #1715(b): a global allow overrides a group deny.
     if (check_permission(username, securable_type, operation))
         return true;
 
-    // 2. If no mgmt_store or no agent_id, cannot do scoped check
+    // 2. No mgmt store or agent → cannot do the scoped check.
     if (!mgmt_store || agent_id.empty())
         return false;
 
-    // 3. Get agent's management groups + ancestors
-    auto groups = mgmt_store->get_agent_groups(agent_id);
-    std::unordered_set<std::string> all_groups;
-    for (const auto& gid : groups) {
-        all_groups.insert(gid);
-        auto ancestors = mgmt_store->get_ancestor_ids(gid);
-        for (const auto& aid : ancestors)
-            all_groups.insert(aid);
-    }
-
-    if (all_groups.empty())
+    // 3. Resolve the user's allow/deny groups ONCE via the shared INV-7 resolver
+    //    (the SAME classification the ADR-0017 list-read primitives use), then
+    //    intersect with the agent's reachable groups (its groups + ancestors —
+    //    ancestor-ward admit). A matching DENY anywhere in that set overrides
+    //    (deny wins within the agent's scoped set); else a matching ALLOW admits.
+    //    Fail-closed: any store error → false, never a silent admit.
+    auto pg = resolve_perm_groups(username, securable_type, operation, mgmt_store);
+    if (!pg)
         return false;
 
-    // 4. Collect user's RBAC group memberships
-    std::unordered_set<std::string> user_rbac_groups;
-    if (db_) {
-        sqlite3_stmt* s = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT group_name FROM group_members WHERE username = ?;", -1,
-                               &s, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(s, 1, username.c_str(), -1, SQLITE_TRANSIENT);
-            while (sqlite3_step(s) == SQLITE_ROW) {
-                auto* g = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
-                if (g)
-                    user_rbac_groups.insert(g);
-            }
-            sqlite3_finalize(s);
+    auto groups = mgmt_store->get_agent_groups(agent_id);
+    std::unordered_set<std::string> reachable;
+    for (const auto& gid : groups) {
+        reachable.insert(gid);
+        for (const auto& aid : mgmt_store->get_ancestor_ids(gid))
+            reachable.insert(aid);
+    }
+    if (reachable.empty())
+        return false;
+
+    for (const auto& g : pg->deny_groups)
+        if (reachable.contains(g))
+            return false; // deny overrides within the agent's scoped set
+    for (const auto& g : pg->allow_groups)
+        if (reachable.contains(g))
+            return true;
+    return false;
+}
+
+// ── ADR-0017 admit-then-filter list gate ─────────────────────────────────────
+
+std::expected<std::vector<std::string>, std::string>
+RbacStore::user_rbac_group_names(const std::string& username) const {
+    std::shared_lock lock(mtx_);
+    std::vector<std::string> groups;
+    if (!db_)
+        return std::unexpected("rbac store not open");
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_, "SELECT group_name FROM group_members WHERE username = ?;", -1,
+                           s.addr(), nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    sqlite3_bind_text(s.get(), 1, username.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+        if (auto* g = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0)))
+            groups.emplace_back(g);
+    }
+    s.reset();
+    if (rc != SQLITE_DONE)
+        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
+    return groups;
+}
+
+std::expected<std::unordered_map<std::string, int>, std::string>
+RbacStore::role_effects_for(const std::string& securable_type, const std::string& operation) const {
+    std::shared_lock lock(mtx_);
+    std::unordered_map<std::string, int> role_effect; // -1 deny (wins), 1 allow, 0 none
+    if (!db_)
+        return std::unexpected("rbac store not open");
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_,
+                           "SELECT role_name, effect FROM role_permissions "
+                           "WHERE securable_type = ? AND operation = ?;",
+                           -1, s.addr(), nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    sqlite3_bind_text(s.get(), 1, securable_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s.get(), 2, operation.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+        const auto* role = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
+        const auto* effect = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1));
+        if (!role || !effect)
+            continue;
+        int& e = role_effect[role];
+        if (std::string_view(effect) == "deny")
+            e = -1; // deny wins within a role, regardless of order
+        else if (std::string_view(effect) == "allow" && e == 0)
+            e = 1;
+    }
+    s.reset();
+    if (rc != SQLITE_DONE)
+        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
+    return role_effect;
+}
+
+std::expected<RbacStore::PermGroups, std::string>
+RbacStore::resolve_perm_groups(const std::string& username, const std::string& securable_type,
+                               const std::string& operation,
+                               const ManagementGroupStore* mgmt_store) const {
+    if (!mgmt_store)
+        return std::unexpected("management group store unavailable");
+
+    auto rbac_groups = user_rbac_group_names(username);
+    if (!rbac_groups)
+        return std::unexpected(rbac_groups.error());
+
+    auto assignments = mgmt_store->get_assignments_for_principal(username, *rbac_groups);
+    if (!assignments)
+        return std::unexpected(assignments.error());
+
+    // Per-role deny-wins verdict for THIS (sec,op) via ONE targeted query
+    // (ADR-0017 perf F5) — resolve_perm_groups runs per-agent in fleet-list
+    // loops, so materializing the whole role_permissions table per call was a
+    // hot-path regression.
+    auto role_effect_r = role_effects_for(securable_type, operation);
+    if (!role_effect_r)
+        return std::unexpected(role_effect_r.error());
+    const auto& role_effect = *role_effect_r;
+
+    PermGroups pg;
+    std::unordered_set<std::string> allow_seen, deny_seen;
+    for (const auto& a : *assignments) {
+        auto it = role_effect.find(a.role_name);
+        if (it == role_effect.end() || it->second == 0)
+            continue;
+        if (it->second == -1) {
+            if (deny_seen.insert(a.group_id).second)
+                pg.deny_groups.push_back(a.group_id);
+        } else if (allow_seen.insert(a.group_id).second) {
+            pg.allow_groups.push_back(a.group_id);
         }
     }
+    return pg;
+}
 
-    // 5. For each management group, check role assignments
-    bool has_allow = false;
-    for (const auto& gid : all_groups) {
-        auto assignments = mgmt_store->get_group_roles(gid);
-        for (const auto& assignment : assignments) {
-            // Check if this assignment is for our user
-            // TODO(engine-scope, ADR-0017): engine principal_type scoped resolution is Phase 5
-            bool matches = false;
-            if (assignment.principal_type == "user" && assignment.principal_id == username)
-                matches = true;
-            else if (assignment.principal_type == "group" &&
-                     user_rbac_groups.contains(assignment.principal_id))
-                matches = true;
+std::expected<std::vector<std::string>, std::string>
+RbacStore::expand_visible_set(const PermGroups& pg, const ManagementGroupStore* mgmt_store) const {
+    if (!mgmt_store)
+        return std::unexpected("management group store unavailable");
+    if (pg.allow_groups.empty())
+        return std::vector<std::string>{}; // holds nothing via groups → empty (INV-2)
 
-            if (!matches)
-                continue;
+    auto allow_agents = mgmt_store->get_member_agents_in_subtrees(pg.allow_groups);
+    if (!allow_agents)
+        return std::unexpected(allow_agents.error());
 
-            // Check if the assigned role grants the required permission
-            auto perms = get_role_permissions(assignment.role_name);
-            for (const auto& p : perms) {
-                if (p.securable_type == securable_type && p.operation == operation) {
-                    if (p.effect == "deny")
-                        return false; // deny overrides
-                    if (p.effect == "allow")
-                        has_allow = true;
-                }
-            }
-        }
+    if (!pg.deny_groups.empty()) {
+        auto deny_agents = mgmt_store->get_member_agents_in_subtrees(pg.deny_groups);
+        if (!deny_agents)
+            return std::unexpected(deny_agents.error());
+        std::unordered_set<std::string> denied(deny_agents->begin(), deny_agents->end());
+        std::vector<std::string> visible;
+        visible.reserve(allow_agents->size());
+        for (auto& a : *allow_agents)
+            if (!denied.contains(a))
+                visible.push_back(std::move(a));
+        allow_agents = std::move(visible);
+    }
+    std::sort(allow_agents->begin(), allow_agents->end());
+    allow_agents->erase(std::unique(allow_agents->begin(), allow_agents->end()),
+                        allow_agents->end());
+    return allow_agents;
+}
+
+bool RbacStore::holds_permission_via_any_group(const std::string& username,
+                                               const std::string& securable_type,
+                                               const std::string& operation,
+                                               const ManagementGroupStore* mgmt_store) const {
+    auto pg = resolve_perm_groups(username, securable_type, operation, mgmt_store);
+    if (!pg)
+        return false; // fail-closed on any store error
+    return !pg->allow_groups.empty();
+}
+
+std::expected<std::vector<std::string>, std::string>
+RbacStore::visible_agents_for_permission(const std::string& username,
+                                         const std::string& securable_type,
+                                         const std::string& operation,
+                                         const ManagementGroupStore* mgmt_store) const {
+    auto pg = resolve_perm_groups(username, securable_type, operation, mgmt_store);
+    if (!pg)
+        return std::unexpected(pg.error());
+    return expand_visible_set(*pg, mgmt_store);
+}
+
+ListReadAuthorization RbacStore::authorize_list_read(const std::string& username,
+                                                     const std::string& securable_type,
+                                                     const std::string& operation,
+                                                     const ManagementGroupStore* mgmt_store) const {
+    ListReadAuthorization out; // DenyAll by default — the INV-1 fail-closed default.
+
+    // Legacy-open: RBAC loaded AND explicitly disabled → full-fleet read (every
+    // authenticated user is a legacy superuser under RBAC-off). A null / load-
+    // failed store returns true from rbac_enforcement_in_effect (enforce) and
+    // falls through to the RBAC path, which denies — never AdmitAll on a corrupt
+    // store (INV-1).
+    if (!rbac_enforcement_in_effect(this)) {
+        out.decision = ListReadDecision::AdmitAll;
+        return out;
     }
 
-    return has_allow;
+    // #1715(b): a global ALLOW overrides any group deny → unfiltered read.
+    if (check_permission(username, securable_type, operation)) {
+        out.decision = ListReadDecision::AdmitAll;
+        return out;
+    }
+
+    // #1715(a): additive — a group allow admits even against a global deny/absent.
+    auto pg = resolve_perm_groups(username, securable_type, operation, mgmt_store);
+    if (!pg || pg->allow_groups.empty()) {
+        out.decision = ListReadDecision::DenyAll; // INV-1/INV-5: error or no grant → deny
+        return out;
+    }
+    auto visible = expand_visible_set(*pg, mgmt_store);
+    if (!visible) {
+        out.decision = ListReadDecision::DenyAll; // fail-closed on a subtree-read error
+        return out;
+    }
+    out.decision = ListReadDecision::AdmitScoped;
+    out.visible_agents = std::move(*visible);
+    return out;
 }
 
 bool RbacStore::check_role_has_permission(const std::string& role_name,

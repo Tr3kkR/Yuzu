@@ -7,9 +7,12 @@
  * service state changes, user sessions) with snapshot IDs for correlation.
  *
  * Schema:
- *   tar_events — core event log (timestamp, type, action, detail_json, snapshot_id)
  *   tar_state  — last-known state per collector for diff computation
  *   tar_config — key/value config (retention_days, redaction patterns, etc.)
+ *   plus the typed warehouse tiers generated from the schema registry.
+ *
+ * The legacy tar_events event log was retired by schema v3; it is neither
+ * created nor queryable (#760 UP-8).
  *
  * Thread-safe: a std::mutex guards all sqlite3* operations. The ONE exception is
  * the `db_`/`query_db_` liveness probes (is_open / query_engine_available),

@@ -1,6 +1,9 @@
 #include "management_group_store.hpp"
 #include "migration_runner.hpp"
 #include "rbac_store.hpp" // RbacStore::validate_assignment — shared engine-principal assignment guard
+#include "sqlite_raii.hpp"
+
+#include <shared_mutex>
 
 #include <spdlog/spdlog.h>
 
@@ -92,6 +95,15 @@ void ManagementGroupStore::create_tables() {
                 ON management_group_members(agent_id);
             CREATE INDEX IF NOT EXISTS idx_mgmt_groups_parent
                 ON management_groups(parent_id);
+        )"},
+        // v2 (ADR-0017 perf F3): the PK on management_group_roles leads with
+        // group_id, so `get_assignments_for_principal`'s
+        // (principal_type, principal_id) lookup — on the per-agent-check hot
+        // path via resolve_perm_groups — fell to a full table SCAN. This index
+        // turns it into a SEARCH.
+        {2, R"(
+            CREATE INDEX IF NOT EXISTS idx_mgmt_roles_principal
+                ON management_group_roles(principal_type, principal_id);
         )"},
     };
     if (!MigrationRunner::run(db_, "management_group_store", kMigrations)) {
@@ -467,6 +479,12 @@ void ManagementGroupStore::refresh_dynamic_membership(
 
 // ── Hierarchy ────────────────────────────────────────────────────────────────
 
+// Ancestor-ward hierarchy walk. DUAL of `get_member_agents_in_subtrees`
+// (descendant-ward): this feeds `check_scoped_permission`'s per-agent admit
+// (an agent is reachable via its group OR any ancestor), while the subtree
+// query feeds the list gate's visible set (a group grant covers its subtree).
+// The two MUST share the depth cap below (`depth < 10`) so admit and visible-set
+// agree on an over-deep/corrupt tree (ADR-0017 INV-7).
 std::vector<std::string> ManagementGroupStore::get_ancestor_ids(const std::string& group_id) const {
     std::vector<std::string> ancestors;
     if (!db_)
@@ -644,6 +662,104 @@ ManagementGroupStore::get_group_roles(const std::string& group_id) const {
         result.push_back(std::move(a));
     }
     sqlite3_finalize(s);
+    return result;
+}
+
+std::expected<std::vector<GroupRoleAssignment>, std::string>
+ManagementGroupStore::get_assignments_for_principal(
+    const std::string& user, const std::vector<std::string>& rbac_groups) const {
+    std::shared_lock lock(mtx_);
+    std::vector<GroupRoleAssignment> result;
+    if (!db_)
+        return std::unexpected("management group store not open");
+
+    // (principal_type='user' AND principal_id=?) OR
+    // (principal_type='group' AND principal_id IN (?,?,...))  — the user arm is
+    // always present; the group arm is appended only when the user is in RBAC
+    // groups, matching check_scoped_permission's user∪group principal matching.
+    std::string sql = "SELECT group_id, principal_type, principal_id, role_name "
+                      "FROM management_group_roles "
+                      "WHERE (principal_type='user' AND principal_id=?)";
+    if (!rbac_groups.empty()) {
+        sql += " OR (principal_type='group' AND principal_id IN (";
+        for (size_t i = 0; i < rbac_groups.size(); ++i)
+            sql += (i ? ",?" : "?");
+        sql += "))";
+    }
+    sql += ';';
+
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    sqlite3_bind_text(s.get(), 1, user.c_str(), -1, SQLITE_TRANSIENT);
+    for (size_t i = 0; i < rbac_groups.size(); ++i)
+        sqlite3_bind_text(s.get(), static_cast<int>(2 + i), rbac_groups[i].c_str(), -1,
+                          SQLITE_TRANSIENT);
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+        GroupRoleAssignment a;
+        a.group_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0)));
+        a.principal_type = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1)));
+        a.principal_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2)));
+        a.role_name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 3)));
+        result.push_back(std::move(a));
+    }
+    s.reset();
+    if (rc != SQLITE_DONE)
+        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
+    return result;
+}
+
+std::expected<std::vector<std::string>, std::string>
+ManagementGroupStore::get_member_agents_in_subtrees(
+    const std::vector<std::string>& seed_groups) const {
+    std::vector<std::string> result;
+    if (seed_groups.empty())
+        return result; // no seeds → empty (no query)
+    std::shared_lock lock(mtx_);
+    if (!db_)
+        return std::unexpected("management group store not open");
+
+    std::string in;
+    for (size_t i = 0; i < seed_groups.size(); ++i)
+        in += (i ? ",?" : "?");
+    // Recursive CTE: seeds ∪ descendants (UNION dedups → cycle-safe), joined to
+    // members. One query (INV-10), descendant-ward (INV-4). This is the exact
+    // DESCENDANT-WARD DUAL of `get_ancestor_ids` (ancestor-ward): a role grant
+    // on group G applies to G and every descendant, so the visible/denied agent
+    // set for a perm-holding group is its subtree's members — the inverse of
+    // `check_scoped_permission` admitting an agent via its group OR any ancestor.
+    // The depth bound MUST match `get_ancestor_ids`' cap (`depth < 10`) so the
+    // two traversals stay SYMMETRIC on a corrupt/over-deep tree (ADR-0017 INV-7 /
+    // unhappy UP-1): a deny beyond the shared cap is missed by BOTH the per-row
+    // ancestor walk and this descendant walk — they agree (both weaker), rather
+    // than the point-check over-admitting what the list gate would suppress.
+    // Validated trees never approach it (`create_group` caps hierarchy at 5).
+    std::string sql = "WITH RECURSIVE subtree(id, depth) AS ("
+                      "  SELECT id, 0 FROM management_groups WHERE id IN (" +
+                      in +
+                      ")"
+                      "  UNION "
+                      "  SELECT g.id, s.depth + 1 FROM management_groups g "
+                      "  JOIN subtree s ON g.parent_id = s.id WHERE s.depth < 10"
+                      ") "
+                      "SELECT DISTINCT m.agent_id FROM management_group_members m "
+                      "JOIN subtree ON m.group_id = subtree.id;";
+
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK)
+        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    for (size_t i = 0; i < seed_groups.size(); ++i)
+        sqlite3_bind_text(s.get(), static_cast<int>(1 + i), seed_groups[i].c_str(), -1,
+                          SQLITE_TRANSIENT);
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+        if (auto* a = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0)))
+            result.emplace_back(a);
+    }
+    s.reset();
+    if (rc != SQLITE_DONE)
+        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
     return result;
 }
 

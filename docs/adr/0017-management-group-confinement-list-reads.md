@@ -10,6 +10,23 @@ context-refs: #1634 (response-reader ruling), PR #1711 (per-row filter foundatio
 
 # 0017 — Management-group confinement applies to list/fan-out reads: the admit-then-filter list gate
 
+> **Update (2026-07-24) — #1715 resolved; PR-A foundation landed.** The global↔management-group
+> deny-precedence lattice the "Combining algorithm" section below left *undecided* has been decided:
+> **cross-boundary combining is additive/OR; deny-overrides applies only within a single group's
+> assignments.** Concretely — **(a)** a global explicit-**deny** does **not** override a management-group
+> **allow** (authority is additive — a row is readable *from* the group grant, per the #1634 ruling);
+> **(b)** a global **allow** **does** override a group deny (→ `AdmitAll`). This ratifies the shipped
+> `check_scoped_permission` behaviour, so PR-A's one-resolver refactor is behaviour-preserving for
+> per-device authz and carries no migration. Frozen in `RbacStore::resolve_perm_groups` — the single
+> INV-7 resolver behind `authorize_list_read`, `holds_permission_via_any_group`,
+> `visible_agents_for_permission`, and `check_scoped_permission`. **PR-A** (the `authorize_list_read`
+> chokepoint returning `DenyAll | AdmitAll | AdmitScoped(visible_set)` + the two primitives + the two
+> batched `ManagementGroupStore` queries + the set-equivalence property test + the INV-7 cross-check)
+> has landed; **no call site is switched yet** (PR-B…E do the per-surface wiring). The transport
+> wrappers (`require_list_read` etc.) land with their first caller in PR-B rather than uncalled here.
+> Ships alongside the decision-independent **#1717** fail-closed gate fix (`require_permission` /
+> `require_scoped_permission` gate on `rbac_enforcement_in_effect`).
+
 ## Context
 
 Management groups confine an operator to a subset of the fleet. For **per-device** routes this
