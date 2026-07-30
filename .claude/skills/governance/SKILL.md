@@ -1244,19 +1244,11 @@ Strategy:
    printf '%s\n' "$ROW" >> "$LEDGER"     # the ONLY way to add a row
    ```
 
-   `noclobber` above is scoped to its subshell and protects the CREATE only — it
-   does nothing for a later write, and your interactive shell does not have it set.
-   Measured: the create idiom copied one line later, outside that subshell,
-   truncated a two-row ledger to one row with **exit 0 and no output**. That is the
-   same silent-overwrite class the `mv` recipe was rejected for, re-entering through
-   the write the next paragraph blesses, so the append idiom is stated here rather
-   than left to be inferred from the nearest visible redirect.
-
-   Concurrent `>>` appends measured safe on a local filesystem — 20 parallel
-   appenders of 4 KB rows, and 12 of 90 KB rows, produced zero lost or torn lines
-   under `O_APPEND`. That is a measurement, not a general guarantee: no network
-   filesystem was tested. It is the read-modify-write that loses rows, which is why
-   the supersede rule below forbids editing a row in place.
+   `noclobber` above is scoped to its subshell and protects the CREATE only — the
+   same idiom reused outside it truncates silently at exit 0 (measured). Concurrent
+   `>>` appends are safe on a local filesystem (measured; no network filesystem
+   tested); it is read-modify-write that loses rows, which is why the supersede rule
+   below forbids editing a row in place.
 
    **A row is SUPERSEDED, never edited.** A disposition that changes after the fact
    — a finding later fixed, deferred, or refuted — is a NEW row carrying the same
@@ -1277,12 +1269,16 @@ Strategy:
    unstated convention means no reader can be right" that settled the row rule
    settles this one.
 
-   **ATTESTATION FIELDS ARE ROW-SCOPED AND EXEMPT FROM THE MERGE.** The four are
-   `adjudicated_by`, `adjudication_rationale`, `refuted_by` and
-   `refuted_by_reporter`. They are NOT properties of the finding, so merging them
-   forward is a category error: an attestation attaches to the ACT it approves — this
-   de-escalation, this refutation — and a reader binds each to the row that performed
-   that act. They are never inherited by a later row and **never cleared by one**.
+   **ATTESTATION FIELDS ARE ROW-SCOPED AND EXEMPT FROM THE MERGE.** The five are
+   `adjudicated_by`, `adjudication_rationale`, `refuted_by`, `refuted_by_reporter`
+   and `waiver_rationale`. They are NOT properties of the finding, so merging them
+   forward is a category error: an attestation attaches to the ACT it records or
+   justifies — this de-escalation, this refutation, this waived pass — and a reader
+   binds each to the row that performed that act. They are never inherited by a later
+   row and **never cleared by one**. (`waiver_rationale` was missed when this rule
+   first said "four": it justifies an act exactly as the others do, and leaving it in
+   the merge let a later row null the only record of WHY a gating finding was allowed
+   to pass — undetectably, since it carries no `required iff`.)
 
    Without that exemption the guard erases itself: append a row nulling
    `adjudicated_by`, and the live view shows a de-escalated finding with no
@@ -1295,8 +1291,18 @@ Strategy:
 
    To withdraw an attestation you supersede the ACT it approved — restate the facts
    or label it authorised, back to where they were. You cannot retract the signature
-   and keep the effect. Unlike the routes above, this class is CLOSED by the schema:
-   the attestation set is exactly those four fields.
+   and keep the effect. A WRONG attestation (a typo, the wrong name) is corrected the
+   same way: supersede the act, re-perform it under the correct attestation; the
+   signature itself is never edited. Retroactive ADDITION is closed by a different
+   clause — `required iff the ROW de-escalates` binds an attestation to the row
+   performing the act, so one appended later attaches to nothing and the unattested
+   de-escalation stays reportable.
+
+   This class is closed by the schema AS IT STANDS: exactly the five fields above
+   carry attestation semantics today. The first version of this sentence said four
+   and called the class closed; `waiver_rationale` was found one round later. So
+   treat any NEW rationale- or attestation-like field as joining the exemption by
+   default — the question is settled per field, never assumed away.
 
    ### De-escalation — the guarded property is THE GATE, not a list of fields
 
@@ -1327,8 +1333,9 @@ Strategy:
    **Any supersession that WEAKENS THE GATE OR THE BAND requires an `adjudicated_by`
    who is not the change's author, plus an `adjudication_rationale`.** The guarded
    property is "would this row make the finding less likely to stop the merge" — the
-   band is the usual mechanism but it is NOT the only one, and the routes below
-   include three that are band-NEUTRAL. Known routes, non-exhaustive:
+   band is the usual mechanism but it is NOT the only one, and most of the routes
+   below are band-NEUTRAL. (No count: two earlier counts of this list both went
+   stale.) Known routes, non-exhaustive:
 
    - `severity_mapped` restated downward
    - `impact` or `exposure` restated to weaker values — note `E6` caps at LOW and
@@ -1356,8 +1363,10 @@ Strategy:
 
    **A new field, or a new route, must be tested against the PROPERTY** — does it
    weaken the gate or the band, OR remove an attestation from a finding that has
-   already been de-escalated — and added to this list when it does. The list is
-   openly incomplete; treating it as closed is what let round 5 ship.
+   already been de-escalated (structurally prevented by the exemption above; stated
+   here so a schema change that reintroduces merged attestations is caught by the
+   property rather than rediscovered) — and added to this list when it does. The
+   list is openly incomplete; treating it as closed is what let round 5 ship.
 
    **What the adjudication requirement actually achieves — read this before relying
    on it.** It is an AUDIT TRAIL, not a verified control. It makes a de-escalation
@@ -1369,21 +1378,12 @@ Strategy:
    independent** — it is the same actor under another name. Independence here is
    ASSERTED, and the assertion is worth recording; do not describe it as enforced.
 
-   **Why the property and not another guarded field.** Rounds 2–5 each hardened one
-   route and left the next open: round 2 hardened `refuted`, round 3 found
-   supersession-by-`fixed`; round 3 fixed precedence, round 4 found de-gating by
-   omission; round 4 forbade lowering by omission, round 5 found explicit lowering;
-   round 5 guarded the label, round 6 found the facts route — and a rule-conforming
-   reader reported ZERO violations on a fragment that de-gated a BLOCKING finding.
-   Round 6 named the band as the property, which closed that whole class provably
-   (weakening one leg is inert under stronger-of, so an attacker must weaken both, and
-   the second step is itself a band drop — closed under composition). But round 6 also
-   claimed the rule "enumerates no fields", and round 7 disproved it: three of round
-   6's own routes are band-neutral, and a sentinel release lifts a gate the band
-   cannot see. The property is the GATE. This is the same lesson the
-   clock-guarded-retention row records — "the fix is the fact set rather than a fourth
-   patch" — with the correction that naming a property does not excuse you from
-   checking whether it covers every mechanism.
+   **Why the property and not another guarded field:** eight rounds of this rule's
+   own history — each guarded one mechanism and was beaten by the next; the property
+   is what survived. The full sequence, the measurements, and the two lessons (name
+   the OUTCOME, not the mechanism; then keep checking, because naming a property does
+   not prove you have enumerated the ways to reach it) are recorded in
+   `docs/governance-skill-tuning-2026-07.md` §10 — the history lives there, not here.
 
    A supersession MAY correct `reporter` — a factual correction of a mis-recorded
    finder, not a re-attribution. `reporter` is immutable as to WHOM it names, not as
@@ -1408,12 +1408,10 @@ Strategy:
    `fixed`, no evidence, no independent reporter) produces the same artefact-level
    read as the hardened one, and routes around it.
 
-   State the read rule wherever a fragment is counted. Measured on the two candidate
-   conventions, rewrite-in-place and append-a-second-row give different answers to
-   "how many findings did this run raise" (2 vs 3) and to whether a refuted BLOCKING
-   still reads as open (no vs yes). Either is workable; an unstated one means no
-   reader can be right. Rewriting also destroys the prior disposition at the artefact
-   level — `cat` shows only the final state — so the append convention is chosen.
+   State the read rule wherever a fragment is counted — the candidate conventions
+   give different answers (measured), so an unstated one means no reader can be
+   right. Rewriting also destroys the prior disposition at the artefact level, which
+   is why the append convention is the one chosen.
 
    Only the fields that CHANGE need restating on a superseding row, plus
    `schema_version`, `run_id`, `finding_id`, `recorded_by`, `recorded_at`,
@@ -1457,7 +1455,11 @@ Strategy:
 
    Fields, all required unless marked — on the row that FIRST raises a finding. A
    superseding row carries only the minimum set above plus what changed; the live
-   view merges them, so "required" is a property of the finding, not of every row:
+   view merges them, so "required" is a property of the finding, not of every row —
+   EXCEPT the five row-scoped attestation fields, which do not merge: their
+   `required iff` clauses bind to the ROW performing the act, and a re-performed act
+   (a second refutation, a re-adjudication) carries its own attestation, never an
+   inherited one:
 
    | field | why |
    |---|---|

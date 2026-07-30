@@ -73,14 +73,19 @@ second-copy drift the governance rule itself forbids.
 ## Reading the first fragment as a template
 
 `2619-ledger-provenance-prose-ownership.sW31cX.jsonl` is the first ledger written and will
-be copied. Three things in it are worth not copying.
+be copied. Several things in it are worth not copying.
 
-Exactly ONE finding in that run carries a `policy_floor` — `COL-1`, the collaborator row
-recording the operator's rejection of a proposal to skip a Gate 8 pass. Of the 48 rows, 37
-record `policy_floor: null`, 10 omit the key, and 1 sets it. So the fragment exercises floor
-inheritance exactly once, on a row that is itself unusual (a process violation rather than a
-code finding, and an averted one). Do not read the near-absence as a pattern, and do not
-take `COL-1` as the model for an ordinary floored finding.
+Exactly one finding in that run carries a `policy_floor` — `COL-1`, the collaborator row
+recording the operator's rejection of a proposal to skip a Gate 8 pass. Every other row
+records it null or omits it, so the fragment exercises floor inheritance exactly once, on a
+row that is itself unusual (a process violation rather than a code finding, and an averted
+one). Do not read the near-absence as a pattern, and do not take `COL-1` as the model for an
+ordinary floored finding.
+
+This README quotes no row counts, deliberately: it stated them three times and was wrong
+three times, because a prose count of an append-only file goes stale the moment a row is
+appended — often in the very commit that updated the count. Compute counts from the
+fragment; never quote them from here.
 
 Four rows are wrong as written and correct only after supersession: `C2` at `pass_ordinal 2`
 recorded a human recorder in `reporter` with `source: "governance-agent"` and omitted

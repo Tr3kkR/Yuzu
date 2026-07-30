@@ -1,7 +1,7 @@
 # Tuning `/governance` for signal density
 
 **Status:** shipped — §3 and §8–§10 are live in `.claude/skills/governance/SKILL.md` and CLAUDE.md standing rules 1–4.
-**Rounds:** four documented here, plus six internal governance rounds on the #2619/#2620 change itself — §5 (adversarial review of the first draft), §7–§8 (colleague amendments), §9 (severity derivation, #2623), §10 (ledger provenance and prose ownership, #2619 + #2620, whose own Gate 8 iterations are recorded in §10).
+**Rounds:** four documented here — §5 (adversarial review of the first draft), §7–§8 (colleague amendments), §9 (severity derivation, #2623), §10 (ledger provenance and prose ownership, #2619 + #2620) — plus the internal Gate 8 iterations on the #2619/#2620 change itself, recorded in §10. (No count of those here: two earlier counts both went stale.)
 **Date:** 2026-07-28, last amended 2026-07-30
 **Adversarial review:** `enterprise-architect` (fable) and `gpt-5.6-sol` (codex), independently. **Both returned BLOCK on the first draft.** Their objections are recorded in §5 and have been folded in — the change set below is materially smaller than what was first proposed.
 
@@ -526,7 +526,9 @@ already merged other than a further pull request.
 
 Rounds 2 through 5 each hardened one route by which a recorded finding could stop gating,
 and each left the next route open beside it. The sequence is worth recording because the
-shape repeated four times and was only broken by changing the KIND of fix.
+shape repeated four times before round 6 changed the KIND of fix — which narrowed the
+class but did not end it: rounds 7 and 8 each found a further mechanism before the
+property stabilised.
 
 | round | hardened | what the next round found beside it |
 |---|---|---|
@@ -606,3 +608,27 @@ ledger: a guard keyed to a MECHANISM leaks as soon as another mechanism reaches 
 outcome, and the fix is to name the OUTCOME — then to keep checking, because naming an
 outcome does not prove you have enumerated the ways to reach it. The clock-guarded-retention
 row already said the first half. The second half is new.
+
+### Round 9 — stopping
+
+The round-8 verification found the missed-copy class a THIRD time — the changelog fragment,
+two rounds stale, on the round that had explicitly gone hunting for missed copies — plus a
+fifth attestation-class field (`waiver_rationale`) left inside the merge by the sentence
+that declared the class closed at four, and the README's row counts wrong for a fourth time,
+recomputed in the same commit that appended the rows that invalidated them.
+
+All were fixed minimally. Three structural fixes were deliberately NOT taken here and are
+filed as follow-ups instead: one contract file instead of four copies (the missed-copy class
+is a copy-count problem, not a diligence problem); a committed ledger validator instead of
+hand-checked counts (three reviewers built one during review and threw it away each time);
+and a convergence rule for Gate 8 so that a fix round's own findings are batched and
+operator-adjudicated rather than looped — this branch ran eight rounds, seven of which
+shipped a blocking defect of their own, on a change that began as two documentation
+follow-ups.
+
+The branch stopped at operator direction. The severity derivation was calibrated against
+under-gating on security code (§"The corpus's own blind spot" above); applied to prose about
+an artefact with no writer and no reader, its ratchets — unmappable gates, unresolved gates,
+`I3` base HIGH — keep the marginal-finding supply above the loop threshold indefinitely,
+because prose has no compiler to discharge claims against. That interaction, not any single
+finding, is the most important thing this branch measured.
