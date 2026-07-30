@@ -1272,26 +1272,51 @@ Strategy:
 
    **List fields REPLACE wholesale, they do not union.** `impact` and `exposure` are
    the two. A supersession restating `impact: ["I8"]` over `["I2","I5"]` yields
-   `["I8"]`, not all three — and because that changes the derived band, any row
-   restating `impact` or `exposure` MUST also restate `severity_mapped`. Otherwise
-   the merged view holds facts that do not derive its own band, which is exactly the
-   checkability the derivation exists to provide. Two conforming readers, one
-   unioning and one replacing, would otherwise produce different live views from the
-   same bytes; the same "an unstated convention means no reader can be right" that
-   settled the row rule settles this one.
+   `["I8"]`, not all three. Two conforming readers, one unioning and one replacing,
+   would otherwise produce different live views from the same bytes; the same "an
+   unstated convention means no reader can be right" that settled the row rule
+   settles this one.
 
-   **A supersession may never LOWER `severity_mapped` or clear `policy_floor` by
-   omission — and lowering it EXPLICITLY carries the same bar as `refuted`:** an
-   `adjudicated_by` who is not the change's author, plus the reason. Without that,
-   restating a band downward is a strictly cheaper route to the artefact-level read
-   `refuted` was hardened to prevent — the author appends `severity_mapped: "NICE"`
-   over a BLOCKING, alone, and the live view agrees. Silence inherits; it does not
-   downgrade, and neither does an unadjudicated restatement.
+   ### De-escalation is ONE rule, not a list of guarded fields
 
-   A supersession MAY correct `reporter` — that is a factual correction of a
-   mis-recorded finder, not a re-attribution, and it is the only legal way to fix
-   one. `reporter` is immutable as to WHOM it names, not as to whether the row got
-   the name right.
+   **READ THE MERGED VIEW AT THE STRONGER OF ITS FACTS AND ITS LABEL.** If the merged
+   `impact`/`exposure`/`epistemic_status` derive a band above `severity_mapped`, the
+   derived band governs; if `severity_mapped` is above what the facts derive, IT
+   governs. A `policy_floor` present anywhere in a finding's history gates until it is
+   explicitly and adjudicatedly cleared. Disagreement between facts and label is not
+   resolved in the writer's favour — it is resolved upward, and it is itself a finding
+   about the ledger.
+
+   **Any supersession that lowers the effective band by ANY route requires an
+   `adjudicated_by` who is not the change's author, plus an `adjudication_rationale`.**
+   The route does not matter: restating `severity_mapped` downward, restating
+   `impact` or `exposure` to weaker values (note `E6` caps at LOW and dominates every
+   raise, so `exposure: ["E6"]` alone is a de-escalation), flipping
+   `epistemic_status` to `speculative`, flipping `provenance` to `pre-existing` (which
+   demotes two policy floors without touching a severity field), clearing
+   `policy_floor`, or a terminal `disposition` of `rejected` / `deferred-to-issue #N`
+   over a live gating row. Restating `severity_mapped` UNCHANGED alongside weakened
+   facts is a de-escalation too — the requirement was never "restate the label", it is
+   "do not lower the band unattended".
+
+   **Why one rule and not a fifth guarded field.** This is the fourth round of this
+   defect. Round 2 hardened `refuted`; round 3 found supersession-by-`fixed` beside
+   it. Round 3 set precedence; round 4 found sparse rows de-gated by omission. Round 4
+   forbade lowering by omission; round 5 found explicit lowering unguarded. Round 5
+   guarded the label; a fact-only restatement walked between them, and a
+   rule-conforming reader reported ZERO violations on a fragment that de-gated a
+   BLOCKING finding. Each patch guarded a route and left the next one open, because
+   the guards were keyed to FIELDS while the property that matters is the BAND. This
+   is the same lesson the clock-guarded-retention row records — "the fix is the fact
+   set rather than a fourth patch". Do not add a sixth guarded field. If a new field
+   can move the band, it is already covered: the rule is about the band.
+
+   A supersession MAY correct `reporter` — a factual correction of a mis-recorded
+   finder, not a re-attribution. `reporter` is immutable as to WHOM it names, not as
+   to whether the row got the name right. A correction that changes `source` such
+   that `reporter_ref` stops being required is a re-attribution, not a correction,
+   and needs the de-escalation bar: it deletes the row's only third-party-retrievable
+   reference.
 
    Precedence is `recorded_at`, NOT `pass_ordinal`, and the difference is
    load-bearing: a post-run row carries `pass_ordinal: 0`, so under an
@@ -1330,7 +1355,7 @@ Strategy:
    the "small forgery" the derivation note below warns about, and it escaped the
    `reporter_ref` requirement by claiming to be a pipeline row. `source` describes
    the REPORTER. If a human appends the row, `recorded_by` is their handle and
-   `reporter`/`source` stay as originally recorded.
+   `reporter`/`source` stay as originally recorded, subject to the correction carve-out above.
 
    `recorded_at` is self-declared and nothing validates it, which matters more now
    that it is the precedence key: an author who dislikes a collaborator's post-run
@@ -1365,7 +1390,7 @@ Strategy:
    | `schema_version` | integer, currently `1`. Per ROW, never per file: appends are permitted, so one fragment can legitimately hold rows written under two versions of this table. A row without it predates #2619 |
    | `run_id` | which run. `basename "${LEDGER%.jsonl}"` — the fragment's filename without its extension, e.g. `2619-ledger-provenance.sW31cX`. Stated as a command because "the mktemp stem" reads three ways: the random suffix alone, the basename, and the full path passed to `mktemp -u` (which varies with `YUZU_GOV_LOG_DIR`) |
    | `commit_range` | which diff. On a row from an external reviewer who read a head rather than a range, the range they were shown, or `unresolved` |
-   | `reporter` | WHO found it — a governance-agent name, a person's handle, or a model id. ONE value, never a joined list: convergence is `independent_reporters`, and a `+`-joined string is an encoding no reader parses. Never changes once written. Named `agent` before #2619; renamed because `source` below admits reporters that are not agents, and a required field with no honest value for two of its three cases is a schema defect, not a naming quibble |
+   | `reporter` | WHO found it — a governance-agent name, a person's handle, or a model id. ONE value, never a joined list: convergence is `independent_reporters`, and a `+`-joined string is an encoding no reader parses. Immutable as to WHOM it names — a supersession may correct a mis-recorded finder, but may not re-attribute the finding to someone else. Named `agent` before #2619; renamed because `source` below admits reporters that are not agents, and a required field with no honest value for two of its three cases is a schema defect, not a naming quibble |
    | `recorded_by` (nullable on the row that first raises a finding, required on a supersession) | WHO wrote this row, as distinct from who found the finding. Null means reporter and recorder are the same |
    | `source` | `governance-agent` / `collaborator` / `external-model` — WHAT KIND of reporter, distinct from `reporter`'s who. Spelled `governance-agent`, not `agent`, per CLAUDE.md's three-meanings glossary. A Codex or Kimi run driven by `.codex/skills/governance` is a `governance-agent` row — `external-model` is for a model reviewing OUTSIDE this pipeline. A non-`governance-agent` row MUST carry `reporter_ref` |
    | `reporter_ref` (required iff `source` is not `governance-agent`) | a THIRD-PARTY-RETRIEVABLE reference: a PR review URL or id, a comment permalink, a transcript path. Not a bare name — a name is a string the author types freely, which is precisely the self-declared claim this field exists to replace. `source` is otherwise an assertion of independent review recorded by the party under review, and that is the one property this artefact most needs to be checkable |
@@ -1382,16 +1407,18 @@ Strategy:
    | `independent_reporters` | how many REPORTERS raised it WITHOUT having been shown it — downstream echoes are not confirmations. Counts reporters of every `source`, not agents only: a human colleague finding the same defect independently is the strongest confirmation available, and counting it zero inverts the signal |
    | `policy_floor` (nullable) | the floor hit, if the finding gates as a contract violation rather than by derivation. Null on an ordinary finding, which is most of them |
    | `provenance` | `introduced` / `newly-reachable` / `pre-existing`. **Adjudicated, not inferred from prose.** Default to `introduced` when contested |
-   | `file`, `line`, `summary` | where and what. `line` takes `unresolved` when the finding is about a file as a whole or the reporter named none — the same sentinel `trigger` and `exposure` use |
+   | `file`, `line`, `summary` | where and what. `line` takes `unresolved` when the finding is about a file as a whole or the reporter named none — the same sentinel `trigger` and `exposure` use. `file` takes `unresolved` for a run-level or process finding that is about no file. **`line` is relative to `reviewed_at_sha`, not to HEAD** — it drifts, so cite the sha when the citation matters |
    | `classification` + rationale | `truth-contradiction` / `wording` / `absence`, and why. `absence` is the third category the prose rule names — a required doc that is missing contradicts nothing, so forcing it into the other two is what the rule exists to stop |
    | `disposition` | `open` / `fixed` / `deferred-to-issue #N` / `rejected` / `refuted`. `open` is the value at the moment a finding is RAISED — the other four are terminal, and a schema whose only values are terminal cannot record a finding before it is resolved. `rejected` = we chose not to act. `refuted` = the claim was factually WRONG, and `refuted_by` carries the evidence — a different outcome with a different downstream use, so never collapse the two |
    | `refuted_by` (required iff `disposition` is `refuted`) | the evidence that killed the claim — the command run and its output, the `git show origin/dev:<path>` that disproved an absence, the file:line that contradicts it. A `refuted` row with no evidence is a `rejected` row wearing a stronger word. The refutation must defeat the DEFECT, not merely the citation: a real finding that names the wrong `file:line` is corrected, never refuted, or the recorded kill shape suppresses a true claim on the next run |
    | `refuted_by_reporter` (required iff `disposition` is `refuted`) | who refuted it, and that they were not the change's author. `adjudicated_by` already carries this requirement and the manual-cleanup floor exception states it outright — a self-authored refutation of one's own blocking finding is exactly the case both were written for, and `refuted` is the disposition that most reduces downstream scrutiny |
-   | `adjudicated_by` (nullable) | who approved a departure, and that they were not the change's author |
+   | `adjudicated_by` (nullable; **required iff the row de-escalates** — see the de-escalation rule) | who approved a departure, and that they were not the change's author. Free text with no `*_ref` sibling: a reader with the repo can detect SELF-naming by comparing against `git log --format='%an'` over `commit_range`, and can verify nothing beyond that. Self-naming is caught; the adjudication itself is unverified, and `commit_range: unresolved` voids even the self-check |
+   | `adjudication_rationale` (required iff `adjudicated_by` is set) | WHY the departure or de-escalation was approved. Distinct from `waiver_rationale`, which is specifically why an unresolved gating finding was allowed to pass |
    | `caused_by` (nullable) | did round N's fix create this round N+1 finding |
    | `waiver_rationale` (nullable) | *why* an unresolved gating finding was allowed to pass. A signature with no reasoning is content-free exception evidence |
 
-   The nullable fields exist so the schema is stable when the process that
+   Three of the nullable fields — `caused_by`, `waiver_rationale`, and `refuted_by`'s
+   pairing — exist so the schema is stable when the process that
    produces them lands. **Recording an `adjudicated_by`, `waiver_rationale`, or
    `refuted` disposition does NOT establish that a gating finding may be released** —
    no such merge contract is adopted here. Today's rule is unchanged: gating

@@ -75,9 +75,20 @@ second-copy drift the governance rule itself forbids.
 `2619-ledger-provenance-prose-ownership.sW31cX.jsonl` is the first ledger written and will
 be copied. Two things in it are worth not copying.
 
-Every row carries `policy_floor: null` — no finding in that run hit a floor, so the fragment
-never exercises the floor-inheritance rule. And three rows are wrong as written and correct
-only after supersession: one recorded a human recorder in `reporter` with
-`source: "governance-agent"`, and two joined several reporters into one string. They are
-left in place because superseding is the rule and rewriting is not, but the merged view is
-the artefact — read it through the merge, not row by row.
+No finding in that run hit a policy floor — 28 rows record `policy_floor: null` and 5 omit
+the key — so the fragment never exercises the floor-inheritance rule. Do not read its
+absence as a pattern.
+
+Four rows are wrong as written and correct only after supersession: `C2` at `pass_ordinal 2`
+recorded a human recorder in `reporter` with `source: "governance-agent"` and omitted
+`recorded_by`/`reviewed_at_sha`; `G8-1` and `G8-4` joined three reporters into one string;
+and the first `C2` correction described the error without restating the field, so under
+field-wise merge it changed nothing. They are left in place because superseding is the rule
+and rewriting is not — but **the merged view is the artefact**. Read it through the merge,
+never row by row.
+
+Its `recorded_at` values were hand-written and are illustrative: several postdate the commit
+that introduced them, which is physically impossible and would make the commit-time
+cross-check reject every row. Real runs should stamp real times. The cross-check bounds
+`recorded_at` from above only, so it never catches the attack it is named for — an author
+appending a later-stamped row and committing it promptly is always "consistent".

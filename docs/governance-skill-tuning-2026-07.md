@@ -1,8 +1,8 @@
 # Tuning `/governance` for signal density
 
 **Status:** shipped — §3 and §8–§10 are live in `.claude/skills/governance/SKILL.md` and CLAUDE.md standing rules 1–4.
-**Rounds:** four — §5 (adversarial review of the first draft), §7–§8 (colleague amendments), §9 (severity derivation, #2623), §10 (ledger provenance and prose ownership, #2619 + #2620).
-**Date:** 2026-07-28, last amended 2026-07-29
+**Rounds:** four documented here, plus six internal governance rounds on the #2619/#2620 change itself — §5 (adversarial review of the first draft), §7–§8 (colleague amendments), §9 (severity derivation, #2623), §10 (ledger provenance and prose ownership, #2619 + #2620, whose own Gate 8 iterations are recorded in §10).
+**Date:** 2026-07-28, last amended 2026-07-30
 **Adversarial review:** `enterprise-architect` (fable) and `gpt-5.6-sol` (codex), independently. **Both returned BLOCK on the first draft.** Their objections are recorded in §5 and have been folded in — the change set below is materially smaller than what was first proposed.
 
 **Second round (2026-07-28):** a colleague responded with a larger proposal (termination protocol, finding classification, triage, record design) plus a five-item amendment list for this PR. Four amendments were accepted, one refuted; both reviewers re-ran at maximum rigour to verify before anything was changed. §7 records that exchange. Three further defects **in this PR** were found during it and fixed.
@@ -488,7 +488,8 @@ The precedence key took a second round to get right, and Gate 8 is what caught i
 first fix ordered supersession by `pass_ordinal` — which, combined with `pass_ordinal: 0`
 for post-run appends, meant a post-run row could never supersede anything: a collaborator
 refuting a finding the run had closed would sit in the file, visible to `cat`, and be
-silently outranked by the published read rule. Four agents raised it independently and one
+silently outranked by the published read rule. Three agents raised it independently
+(`independent_reporters: 3` in the ledger) and one
 executed it against a real reader script. Precedence is `recorded_at`; `pass_ordinal`
 records which round a row belongs to and was never a precedence key.
 
@@ -520,3 +521,43 @@ carries the same narrower copy, and PR #2631's replacement text does not close i
 the ledger has no run-level record, so findings-per-run has no denominator and per-agent
 yield stays uncomputable; and there is still no vehicle for appending to a fragment that has
 already merged other than a further pull request.
+
+### The de-escalation defect, and why the fifth patch became one rule
+
+Rounds 2 through 5 each hardened one route by which a recorded finding could stop gating,
+and each left the next route open beside it. The sequence is worth recording because the
+shape repeated four times and was only broken by changing the KIND of fix.
+
+| round | hardened | what the next round found beside it |
+|---|---|---|
+| 2 | `refuted` needs evidence + an independent refuter | supersession by `disposition: "fixed"` needs neither |
+| 3 | precedence is `recorded_at`, so post-run rows can supersede | a sparse superseding row de-gates by OMITTING `severity_mapped`/`policy_floor` |
+| 4 | field-wise merge; may not lower by omission | lowering EXPLICITLY is unguarded |
+| 5 | explicit lowering needs an adjudicator | restating `exposure: ["E6"]` alone lowers the band without touching a severity field |
+
+Round 5's hole was executed, not argued: a rule-conforming reader reported **zero write-rule
+violations** on a fragment whose merged view de-gated a BLOCKING finding. Restating
+`severity_mapped` *unchanged* alongside weakened facts satisfied the letter of "MUST restate"
+while the facts derived LOW. Flipping `provenance` to `pre-existing` demoted two policy
+floors without touching a severity field at all.
+
+Every guard had been keyed to a FIELD while the property that matters is the BAND, so each
+new field that could move the band opened a new route. Round 6 replaced the four patches
+with one rule: **the merged view is read at the stronger of its facts and its label, and any
+supersession that lowers the effective band by any route needs an adjudicator who is not the
+change's author.** A new field cannot open a new route, because the rule does not enumerate
+fields.
+
+This is the same lesson the clock-guarded-retention routed concern already records — that the
+latch design "needed three separate hand-patches for instances of this same identity problem
+before a fourth was found, which is why the fix is the fact set rather than a fourth patch".
+It cost four rounds to rediscover on a different subsystem, which is an argument for reading
+the routed-concern rows as generalisable engineering lessons rather than only as
+per-file rules.
+
+Two related findings were closed with it: `rejected` and `deferred-to-issue #N` were the
+cheapest terminals available — no evidence, no adjudicator, nothing validating the issue
+number — and are now inside the same bar when applied over a live gating row. And
+`adjudicated_by` gained a `required iff` clause plus a named `adjudication_rationale`, having
+been mandated by prose while the field table still marked it merely nullable with no field
+for the reason it demanded.
