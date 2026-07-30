@@ -294,7 +294,14 @@ if [[ "$API_PRESENT_BEFORE" == "True" ]]; then
     # HTMX fragment. The v1 envelope is {"data":[...], "meta":{}}.
     API_LIST=$(curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
         "$DASHBOARD_URL/api/v1/tokens" 2>/dev/null || echo "")
-    if [[ -n "$API_LIST" && "$API_LIST" != *"\"error\""* ]]; then
+    # No `"error"` substring pre-check here, deliberately. It rejected any body
+    # CONTAINING that literal, so a token legitimately NAMED "error" produced
+    # `api_tokens: endpoint broken` — measured. The `-1` sentinel below is
+    # strictly stronger and has no such blind spot: measured against the helper,
+    # `{"error":"boom"}`, an empty body and `not json` all yield -1 (red), while
+    # `{"data":[{"name":"error"}],...}` correctly yields 1. Screening on the
+    # substring only ever cost a real token name.
+    if [[ -n "$API_LIST" ]]; then
         # -1 is a SENTINEL for "could not read the list", and it is load-bearing
         # now that zero is the PASS condition. The previous version printed 0 on
         # a parse failure, which was survivable while >=1 meant success — a
@@ -372,7 +379,26 @@ if [[ "$API_PRESENT_BEFORE" == "True" ]]; then
         fl "API tokens endpoint failed or returned error: ${API_LIST:0:200}"
         set_result "api_tokens" "endpoint broken"
     fi
+elif [[ "$API_TOKENS_EXPECT" == "invalidated" ]]; then
+    # This edge CROSSES the ADR-0030 cutover, so "no token was written" is NOT a
+    # benign skip: nothing exists whose invalidation could have been observed,
+    # and passing here reports the token contract satisfied on no evidence.
+    #
+    # Measured, not theorised: with `api_token_present:false`, `wrote_count:3`
+    # and `--api-tokens-expect invalidated`, this script exited 0 and reported
+    # `api_tokens: skipped` — a green upgrade gate for the one ADR-0030 claim it
+    # exists to test. The sentinel inside the armed branch was hardened against
+    # an empty count reaching PASS; this OUTER arm still skipped the entire
+    # check, which is the same defect one level up.
+    #
+    # The writer only `warn`s when token creation fails (test-fixtures-write.sh
+    # sets HAS_API_TOKEN=0 and still exits 0), so this is the only place that can
+    # turn an unarmed fixture into a red gate.
+    fl "API token fixture was not armed on a cutover edge — invalidation unproven"
+    set_result "api_tokens" "not armed (invalidation unproven)"
 else
+    # Non-cutover edge: nothing crossed, so an absent fixture neither proves nor
+    # claims anything. A skip is honest here.
     warn "no API token was written — skipping verify"
     set_result "api_tokens" "skipped"
 fi
