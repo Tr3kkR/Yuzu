@@ -89,6 +89,22 @@ public:
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          CaStore* ca_store, PublishCrlFn publish_crl_fn,
                          ExportCsrFn export_csr_fn = {}, ImportChainFn import_chain_fn = {});
+
+    /// Operator-declared external origins for the CSRF same-site gate (#2537),
+    /// already normalised by `normalise_trusted_origins` at boot. Set BEFORE
+    /// `register_routes` — the handlers capture `this` and read the member per
+    /// request, so a later call would not reach an already-registered route.
+    ///
+    /// A setter rather than another `register_routes` parameter because both
+    /// overloads are already long, and because the miss-case is safe: leaving it
+    /// unset means same-host only, which is the pre-#2537 behaviour and refuses a
+    /// proxied browser POST. Forgetting degrades to fail-closed.
+    void set_csrf_trusted_origins(std::vector<std::string> origins) {
+        csrf_trusted_origins_ = std::move(origins);
+    }
+
+private:
+    std::vector<std::string> csrf_trusted_origins_;
 };
 
 } // namespace yuzu::server

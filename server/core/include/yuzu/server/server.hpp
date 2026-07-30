@@ -19,6 +19,19 @@ struct Config {
     std::string web_address{"127.0.0.1"};            // HTMX web UI bind address
     int web_port{8080};                              // HTMX web UI port
 
+    // External origins the dashboard is served on, for the CSRF same-site gate
+    // (--csrf-trusted-origin, repeatable, comma-separated permitted; #2537).
+    // A reverse proxy that rewrites Host makes the browser's Origin and the
+    // server's Host legitimately differ, which 403'd every CSRF-gated dashboard
+    // action behind nginx/Envoy/ALB/Cloudflare. Declaring the external origin
+    // here lets the gate accept it. Entries are normalised ONCE at boot by
+    // web_utils.hpp's normalise_trusted_origins; an entry carrying a scheme
+    // ("https://yuzu.example") is matched on scheme AND host, a bare host on
+    // host only. No forwarded header is ever consulted — the trust anchor is
+    // this config value, which an attacker cannot set. Empty (default) =
+    // same-host only, i.e. pre-#2537 behaviour.
+    std::vector<std::string> csrf_trusted_origins;
+
     bool tls_enabled{true};
     std::filesystem::path tls_server_cert; // PEM server certificate
     std::filesystem::path tls_server_key;  // PEM server private key

@@ -1096,6 +1096,173 @@ Strategy:
 1. **Fold compatible fixes into one commit.** If sec flags H1, docs flags B3, QA flags B5, and they all touch related files, fix as a single "hardening round" commit rather than three small ones.
 2. **Re-run Gate 2 security on the hardening round.** Prior runs have caught HIGH regressions introduced by the fix commit itself. Always re-review.
 
+### Deciding what happens to a NON-BLOCKING finding
+
+**This step is THIRD.** Establish first, in order: is the finding valid; what is its
+provenance; what band does it DERIVE to; does it hit a policy floor.
+
+**A gating finding is never deferred and never dropped.** A derived CRITICAL/HIGH,
+or any policy floor, is fixed — or the change itself is withdrawn or re-cut.
+Nothing below is a waiver and no ledger row makes a blocker optional; Gate 8's rule
+is unchanged.
+
+An INVALID finding — false, inapplicable, or disproven — is `rejected` with the
+evidence. At a derived CRITICAL/HIGH, or on a policy floor, `rejected` additionally
+requires an adjudicator recorded in `adjudicated_by` who is not the author, not the
+agent that raised it, and not the party arguing the rejection. That is STRICTER than
+the floor exception at the top of this file ("an agent other than the one proposing
+it") and does not claim to restate it — an earlier revision asserted the two were
+the same separation and they are not. Otherwise "inapplicable" is a self-granted
+waiver, and the dangerous disposition ends up cheaper than the safe one.
+
+Everything below applies ONLY to findings that are valid and non-blocking.
+
+#### Test 1 — does the fix open an independently reviewable surface?
+
+Folding keeps the fix in the SAME review pass. That is cheaper than a second pass;
+it is NOT a claim that corrections are cheap to get right — Gate 8 re-routes every
+fix diff through all touched domains precisely because they are not.
+
+The cost is in a fix that introduces a surface a reviewer must reason about on its
+own:
+
+- new authority or privilege
+- new persistent state, or a new ownership lifecycle
+- new external I/O, or a new protocol
+- a new public contract or compatibility boundary
+- a new dependency, process, thread, or deployment requirement
+
+**Completing an existing mandatory seam is not one of these**, even when the edited
+code is technically a probe or a gate. Adding a newly load-bearing store to the
+`/readyz` conjunction is the reference case: it is a probe, it is a correction, and
+it folds. A metric or alert riding an already-exposed endpoint folds too; a new
+exporter, dashboard or alert-routing path is a new surface and splits.
+
+**If a bullet matches, it splits — arguability does not rescue it.** A fix that
+carries a credential, makes a network call, or interprets an auth status is never
+seam-completion. Only a finding that matches NO bullet and is still arguable folds,
+and then Gate 8's routing decides the review cost.
+
+#### Test 2 — can the ACCEPTED SCOPE still be satisfied without it?
+
+Not "is the change still worthwhile" — that is a preference, answered by whoever
+benefits from saying yes. Anchor it to the envelope fixed BEFORE the findings
+arrived:
+
+- the originating issue's or ADR's requirements
+- user-facing and changelog claims
+- Gate 1's declared interfaces, behaviour, and security impact
+- any normative repository invariant
+
+**An anchor the change plainly implies but did not declare counts as present.**
+Gate 1 is written by the author before findings arrive, so an under-declared Gate 1
+would otherwise shrink the scope pre-emptively and make every finding outside it
+"not needed". Where the envelope is SILENT on something the change clearly touches,
+that silence is an adjudication trigger, not a licence — the same direction the
+Absences rule takes elsewhere in this file.
+
+If satisfying the envelope requires **withdrawing a claim or an acceptance
+criterion**, that is a scope change: explicit non-author adjudication and a re-cut,
+not ordinary deferral. Strip the withdrawn claim from the changelog fragment, the
+user docs and Gate 1's declared impact in the same change — a narrowed change still
+advertising the original control is `I6` false assurance.
+
+#### The dispositions
+
+**Non-blocking findings only. A gating finding has no cell in this table.**
+
+| | Accepted scope needs it | Accepted scope does not |
+|---|---|---|
+| **No independent surface** | Fold | Fold if trivial — a one-line or mechanical change adding no new branch or condition — and in a file already touched; otherwise its own small change, or file it |
+| **Independent surface** | **RE-CUT** (below) | **Split** — its own change and its own review; or file it |
+
+The expensive mistake is the bottom-right: an independent surface folded into a
+change whose scope did not need it. Measured on #2581 — a bearer-token probe folded
+into a 41-line assertion fix produced six further blocking findings across two more
+rounds, none of them in the original change, and the branch was re-cut anyway. Note
+what the probe brought: a persisted credential, an authenticated network call, and
+status-code semantics. New authority, new state, new I/O. The corrections in that
+same branch ran to 287 insertions (`6bf7e5d2~1..315247e3`, `scripts/ tests/`) and
+converged. **Line count is not the variable; surface is.**
+
+**Re-cut, concretely.** The discriminator is WHICH CHANGE OWNS THE ORIGINAL
+ACCEPTANCE CRITERIA — the mechanism does. Without that it is a stacked split with a
+new name. Then:
+
+- the remainder goes first, as a prerequisite that must have standalone value AND
+  standalone safety; a prerequisite that is only reachable-but-inert is a dormant
+  half — `I6` base MEDIUM, which GATES only under the false-assurance or
+  dormant-authorisation raises, so check which applies rather than assuming it gates. On dispute, default to landing the two together
+- its changelog fragment must not claim the withheld behaviour
+- governance runs on the prerequisite independently, and again on the integrated
+  range
+
+Three further split rules, stated here for the first time — they are NOT
+restatements of existing practice:
+
+- a behaviour change and its observability are two changes, behaviour first
+- a behaviour change and the refactor that makes it testable are two changes,
+  refactor FIRST
+- a new REST route, MCP tool, store, proto change, schema migration or plugin ABI
+  change gets its own review unit, WITH the wiring that makes it reachable —
+  "alone" never means landing a dormant half
+
+#### Filing, parking, and why the default matters
+
+Filing is right for separable work with a stated definition of done. Follow
+`docs/agents/issue-standard.md`, which is authoritative on shape and volume:
+one actionable outcome per issue, split bundles, dedupe is the only inflow filter.
+
+For valid work that is real but will not be scheduled, the existing `roadmap` type
+is the disposition — parked on the roadmap Project, no priority, no triage state,
+excluded from the active backlog, and crucially **retained in the
+duplicate-detection snapshot**, so the next run touching that area surfaces it.
+That is the resurfacing mechanism: proximity, not a calendar.
+
+Parking is CONSTRAINED. Two constraints, stated HERE because this is where the
+disposition is decided. The procedure that carries them out holds the command and
+the check but **not** the rule — every previous revision put the rule in one place
+and an echo of it in the other, and the echo went stale every time, most recently a
+summary that dropped the band-independence clause in constraint 1, which is the half
+that does the work.
+
+1. **`roadmap` is unavailable for any finding carrying `I1`, `I2` or `I3` in its
+   ledger `impact` list, whatever its derived band.** A finding lands at MEDIUM when
+   its EXPOSURE is rare, not when its consequence is small. A rare path to a failed
+   security control, to data loss, or to a silent wrong answer gets a priority, not
+   a park.
+2. **Escalate on second sighting.** If the mandatory dedupe probe turns up an
+   existing `roadmap` issue for a finding a later run raises again, that recurrence
+   is the signal it is not going away: fix it, or promote it out of `roadmap` with a
+   priority. **Never re-park.** This bounds the failure at ignored-once.
+
+Over 300 open issues already carry the label, so both matter. That is a floor rather
+than a share on purpose: an earlier draft said "a third of the tracker", which was
+last true around 2026-07-20 and was already stale when written — measured at 338 of
+1281 open, the parked set had not grown at all while the open count rose by 233.
+
+Constraint 1 is checkable against the ledger, and Gate 8 step 4 does it. Constraint 2
+is not: it needs the dedupe probe's result. Neither is the label contract on the park
+command in that procedure, which lives on GitHub and is not a constraint here at all.
+Those last two stay procedural — see step 4, which states its own blind spots.
+
+Neither the number of issues nor the number of parks is a target. What is required
+is that every valid finding ends somewhere recorded — fixed, filed, linked to an
+existing issue, or parked under the two constraints above.
+
+**Record `provenance` on every finding, and state the split in the run report.**
+`introduced` / `newly-reachable` / `pre-existing` is already a required ledger
+field and is the only way to tell a change that introduced defects from a change
+that merely touched a weak area. Without it, "this run produced forty findings" is
+unattributable, and the reflex is to blame the diff. On #2581 the substantial
+majority were `pre-existing`, which is a fact about the harness, not the fix.
+
+**This file is the canonical runbook.** A separate Codex-side runner exists at
+`.codex/skills/governance/SKILL.md`; for the blocking contract it already defers
+here, which is the right shape. Its disposition rule for MEDIUM/SHOULD findings is
+restated rather than deferred, so it can contradict this section — closing that is
+for whoever owns that runner.
+
 ## Gate 8 — Iterate And Ledger
 
 1. **Re-run every gate whose DOMAIN THE FIX DIFF TOUCHES** — not only those whose
@@ -1171,7 +1338,7 @@ Strategy:
 
    | field | why |
    |---|---|
-   | `run_id`, `commit_range`, `agent` | which run, which diff, who found it |
+   | `run_id`, `commit_range`, `agent` | which run, which diff, who found it. `run_id` is the fragment's own filename stem — it is a join key once rows are extracted from the file, not a uniqueness guarantee: `noclobber` proves no LIVE file in THAT directory shares the stem, which does not span a `YUZU_GOV_LOG_DIR` run or a stem freed by `git clean`. `commit_range` is per-ROW, not per-file, because a Gate 8 re-review reviews a different range each pass. `agent` is SINGULAR — where `independent_reporters` > 1 it names the one whose evidence this row is derived from, and the others' identities are not currently recordable |
    | `pass_ordinal` | **which round.** Without it the final pass is indistinguishable from the first, and `caused_by` below presupposes a round identity the schema would otherwise lack |
    | `finding_id` | stable across rounds — `caused_by` is uncomputable without a join key |
    | `severity_native` | the agent's OWN vocabulary, unmodified |
@@ -1184,9 +1351,9 @@ Strategy:
    | `policy_floor` | the floor hit, if the finding gates as a contract violation rather than by derivation |
    | `provenance` | `introduced` / `newly-reachable` / `pre-existing`. **Adjudicated, not inferred from prose.** Default to `introduced` when contested |
    | `file`, `line`, `summary` | where and what |
-   | `classification` + rationale | truth-contradiction vs wording, and why |
-   | `disposition` | `fixed` / `deferred-to-issue #N` / `rejected` |
-   | `adjudicated_by` (nullable) | who approved a departure, and that they were not the change's author |
+   | `classification` + rationale | truth-contradiction vs wording, and why. The rationale ALSO carries the resolution when two reviewers disagreed and one was upheld — stated here so the use is declared rather than improvised. It does NOT go in `adjudicated_by`: that field is scoped to the three departure standards below, and a `fixed` row involves no departure. The trade-off is accepted knowingly — no query returns "every contested finding and who upheld whom", and a dedicated field would invalidate every fragment already committed |
+   | `disposition` | `fixed` / `deferred-to-issue #N` (a NEW issue was filed) / `roadmap-#N` (parked) / `linked-to-#N` (an EXISTING issue already covers it) / `split` / `re-cut` / `rejected`. The `#N` values are completed when the issue is filed or identified, which happens after the run: fill them in before the PR merges, in a NEW commit — never `git commit --amend` or a rebase, which rewrites evidence a reviewer may already have read. If filing slips past the merge, amend in a follow-up PR — `dev` is protected, so a direct commit is not a path — and say so in the run report; a fragment left holding `#?` makes the park unauditable, which is the failure the disposition exists to prevent. `roadmap-#N` is valid work parked per Gate 7, under the two constraints stated there. `split` records that the work left this change as its own review unit; `re-cut` that the original acceptance criteria travelled to the mechanism. `rejected` means false, inapplicable or disproven — at CRITICAL/HIGH or on a floor it requires the `adjudicated_by` separation Gate 7 states |
+   | `adjudicated_by` (nullable) | who approved a departure, and **which separation applied** — this field serves three different dispositions whose standards are NOT the same, so it states none of them and names the one in force: Gate 7's for `rejected`, Test 2's for a scope change, the floor exception's for a documented impossibility. An earlier revision stated one standard here, which read as the rule for all three and was the weakest of them |
    | `caused_by` (nullable) | did round N's fix create this round N+1 finding |
    | `waiver_rationale` (nullable) | *why* an unresolved gating finding was allowed to pass. A signature with no reasoning is content-free exception evidence |
 
@@ -1208,6 +1375,61 @@ Strategy:
    mattered" are both unfalsifiable, and no roster change can be argued from evidence.
    See `docs/governance-skill-tuning-2026-07.md`.
 
+4. **Check the dispositions against the ledger BEFORE the final decision.** Gate 7's
+   first park constraint is the only part of the park contract a machine can see, so
+   see it. Whoever runs the gate does this — not "whoever writes the run report", which
+   is a post-push artefact and would put the check back after the decision it exists to
+   inform. Run it against `"$LEDGER"` from step 3, never a hardcoded `governance.d/`
+   path: a `YUZU_GOV_LOG_DIR` run keeps its fragment elsewhere, and a check pointed at
+   a file that is not there is the one failure this step cannot afford.
+
+   ```bash
+   jq -e 'select((.disposition | test("^(roadmap|linked-to)")) and
+                 ((.impact // empty | if type == "array" then .[] else . end)
+                  | test("^I[123]$")))' "$LEDGER"
+   ```
+
+   Note the prefixes carry **no trailing hyphen**. Requiring one let a malformed
+   `"disposition":"roadmap"` — an OFF-ENUM value truncated to the bare word — exit
+   clean while carrying `I1`. Measured. To be precise about which shape this fixes:
+   the schema's prescribed *unfilled* park is `roadmap-#?`, and the hyphenated
+   pattern already matched that, so a park awaiting its issue number was never the
+   gap. The gap was a value that is not in the enum at all. Dropping the hyphen
+   costs nothing — no other disposition value begins with either word.
+
+   **A clean check is exit 4; a violation is exit 0.** `jq -e` reports 4 when no result
+   was produced at all, so the PASS case here is a non-zero exit — measured on jq-1.8.1.
+   Do not wire it into a bare `if` or `&&` without accounting for that inversion, and
+   **do not read every non-zero exit as a pass**: a missing or unreadable file is exit
+   2, which is a mis-pathed check, not a clean one. Only 4 is clean.
+
+   The `if type == "array"` normalisation is load-bearing. A bare `.impact[]?` swallows
+   the type error on a scalar, so a row recording `"impact": "I1"` instead of
+   `["I1"]` passed the check as clean — measured.
+
+   A match is a row whose finding may not be parked. Two arms, and they need different
+   handling:
+
+   - `roadmap`-prefixed (`roadmap-#N`, `roadmap-#?`, or the bare word) — a park barred
+     by constraint 1. The gate does not pass and the report does not go out until that
+     row is re-dispositioned.
+   - `linked-to`-prefixed — this one **over-matches by construction, so treat it as a
+     prompt, not a verdict.** Linking an `I1` finding onto an existing *parked* issue reaches
+     the same outcome as parking it, which is why the arm is here; but linking it onto
+     an active prioritised issue is a legitimate ending that Gate 7 explicitly allows.
+     No ledger field records the target's labels, so check them before calling it a
+     violation. Treating every `linked-to-` match as one pushes the reviewer toward
+     filing a duplicate or thinning the `impact` list, which are both worse than the
+     thing being prevented.
+
+   **What this check cannot see, and an earlier revision wrongly claimed it could:**
+   the label half of the park contract (`roadmap` XOR priority + triage state) lives on
+   GitHub, not in any ledger field; the target's labels behind a `linked-to-` row are
+   equally invisible; and constraint 2 needs the dedupe probe's result. All three stay
+   procedural. It also reads a field the author supplied — an `impact` list with `I1`
+   omitted passes, which is the gaming vector the severity block already names — so
+   spot-check parked rows' `impact` against their own `trigger` and `summary`.
+
 ## Known patterns from prior runs
 
 **Pattern A: sibling IDOR.** When fixing an authorization gap on endpoint X, grep for every other endpoint in the same file/semantic and verify they have the same check. #222 closed the REST path but left the HTMX dashboard path open. The governance security-guardian caught it only when explicitly told to look for siblings.
@@ -1226,9 +1448,23 @@ One full governance run on a non-trivial commit range is ~6-9 parallel agent cal
 
 Skipping Gate 4 or Gate 5 to save time is rarely worth it. **Do NOT skip Gate 3 domain agents on the grounds that a change is small** — that guidance predates the unconditional routed-trigger floor above and contradicts it. Diff size does not gate a routed concern: `.claude/routed-concerns.md` keys on file identity and change type precisely because those files carry catastrophic-if-violated invariants at any line count. Use the decision matrix to decide WHICH agents, never WHETHER.
 
-## Post-run follow-ups — file deferred findings per the issue standard
+## Post-run follow-ups — file or park deferred findings per the issue standard
 
-After the run passes and the commits push, governance typically produces 8-15 deferred follow-up items (SHOULD findings scoped out of the PR). Governance is the repo's largest issue-inflow source, so filing follows `docs/agents/issue-standard.md` exactly; the binding procedure:
+After the run passes and the commits push, file **or park** whatever Gate 7's
+disposition step routed to either. Both branches are in step 3; the constraints on
+parking are Gate 7's, stated there.
+
+**There is no expected number, and the previous version of this sentence gave
+one.** It said a run "typically produces 8-15 deferred follow-up items", which
+functioned as a quota: it made filing the default and made a run that filed
+nothing look incomplete. Git history shows that figure entered the runbook as a
+descriptive observation from early runs, not as a calibrated control. A run that
+folds every correction and splits one surface is a good run; so is a run that
+files nothing, PROVIDED each finding has a recorded disposition per Gate 7.
+
+Filing follows `docs/agents/issue-standard.md` exactly — it is authoritative on
+shape and volume, including that dedupe is the only inflow filter. The binding
+procedure:
 
 1. **Draft the candidate list** — one actionable outcome per candidate; split multi-finding bundles; type each honestly (`bug` / `task` / `decision` / `spike` — a choice-to-be-made is a `decision`, not a code task).
 2. **Dedupe every candidate (mandatory — dedupe is the only inflow filter):**
@@ -1237,13 +1473,46 @@ After the run passes and the commits push, governance typically produces 8-15 de
    gh search issues --repo Tr3kkR/Yuzu --state open "<title keywords>" --json number,title --limit 20
    ```
    An existing issue covers it → comment the new evidence there instead of filing. Related but a distinct outcome → file with `Relates to #N` in the body.
+
+   **If the duplicate target carries `roadmap`, comment-and-leave is FORBIDDEN.** That
+   is a re-park, barred by Gate 7's second constraint: fix it, or promote the issue out
+   of `roadmap` — remove the `roadmap` label and add **exactly one priority AND exactly
+   one triage state**. That is the `gh`-path rule, which is the one that binds here
+   because governance files through `gh`: `docs/agents/issue-standard.md` §4 requires
+   "either `roadmap` … or exactly one priority alongside the triage state", and
+   ADR-3001 repeats it. Do NOT weaken this to "a priority once triaged" — that is the
+   any-path telemetry invariant at `triage-labels.md`, and a round of this runbook did
+   exactly that, producing an instruction to leave the issue in a state the `gh`-path
+   rule forbids. A half-promoted issue is a contract violation. Name the promotion in
+   the run report: the ledger row records `linked-to-#N`, and no ledger field carries a
+   free-text disposition note.
 3. **File survivors** with the four body sections (Context / Evidence with `file:line` against current `origin/dev` / Acceptance criteria / Origin naming this governance run plus the dedupe probes and their results):
    ```bash
    gh issue create --repo Tr3kkR/Yuzu --title "..." \
-     --label <type> --label governance-deferred --label <P1|P2> --label ready-for-agent \
+     --label <type> --label governance-deferred --label <P0|P1|P2> --label ready-for-agent \
      --body-file <candidate>.md
    ```
-   (`<type>` and `<P1|P2>` are placeholders — pass exactly one real label each, e.g. `--label task --label P2`.
+   **Parking instead of filing** — for valid work that will not be scheduled, under the
+   two constraints at Gate 7's "Filing, parking, and why the default matters". The rule
+   is there; the command is here. `roadmap` is XOR with (priority + triage state) per
+   `docs/agents/issue-standard.md` §4 — cite THAT, not `triage-labels.md`, whose
+   invariant list is telemetry-shaped and whose weaker "a priority once triaged"
+   phrasing is what a previous round of this runbook mistakenly acted on — so the park
+   branch carries NEITHER:
+   ```bash
+   gh issue create --repo Tr3kkR/Yuzu --title "..." \
+     --label <type> --label governance-deferred --label roadmap \
+     --body-file <candidate>.md
+   ```
+   No `P0/P1/P2`, no `ready-for-agent`/`needs-triage`. `governance-deferred` is an
+   inflow counter, not a priority or a triage state, so it survives the XOR. The
+   ledger-side check on the `I1`/`I2`/`I3` bar has already run by this point — it is
+   Gate 8 step 4, before the gate passes, not after the commits push.
+
+   (`<type>` and `<P0|P1|P2>` are placeholders — pass exactly one real label each, e.g. `--label task --label P2`.
+   The priority axis is `P0`/`P1`/`P2` per `docs/agents/issue-standard.md` §4; an earlier revision
+   wrote `<P1|P2>` here, which silently narrowed the authoritative set and left a governance finding
+   that genuinely warranted `P0` with no legal label.
    `gh search issues` is rate-limited (~30/min): on a 403 mid-batch, wait 60 seconds and continue —
    never skip the probe.)
    **Every governance filing carries `governance-deferred`** (that label is how agent inflow is counted). Add facet labels as they genuinely apply (`tech-debt`, `reliability` for chaos findings, `observability`, `devops`, `security` for hardening — never for exploitable vulnerabilities, which go to private advisories per `SECURITY.md`).
