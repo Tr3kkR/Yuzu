@@ -644,9 +644,23 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
     const auto csrf_trusted = csrf_trusted_origins_;
     sink.Post("/api/settings/ca/revoke", [perm_fn, audit_fn, ca_store, revoke_core, csrf_trusted](
                                              const httplib::Request& req, httplib::Response& res) {
-        // H-1 (#1241): this revoke is authorized by the yuzu_session COOKIE alone,
-        // and SameSite=Lax does not block a top-level cross-site form POST — so a
-        // CSRF gate is mandatory (a forged revoke = fleet-wide lockout DoS). Run it
+        // H-1 (#1241): this revoke is authorized by the yuzu_session COOKIE alone
+        // (a forged revoke = fleet-wide lockout DoS), so it carries a CSRF gate.
+        //
+        // What that gate is actually for, corrected on #2641 review: `SameSite=Lax`
+        // sends the cookie on a cross-site TOP-LEVEL NAVIGATION only for SAFE
+        // methods, and POST is not safe — so a purely cross-site form POST arrives
+        // with NO cookie and is already unauthenticated. (An earlier version of this
+        // comment said Lax "does not block" it. That is wrong. The likely source is
+        // Chrome's Lax+POST intervention, which applies only to cookies with NO
+        // SameSite attribute; `auth_routes.cpp` sets `SameSite=Lax` explicitly, so
+        // it does not apply here.)
+        //
+        // The residual the gate closes is a SAME-SITE sibling origin — subdomain
+        // takeover, XSS on a neighbour, a shared-domain deployment. Those are
+        // same-site for cookie purposes, so they DO carry the cookie, while being a
+        // different ORIGIN, which is exactly what Origin/Referer distinguishes.
+        // Getting this right matters because the next person reasons from it. Run it
         // FIRST, before perm_fn, so a cross-site probe cannot read a perm/role
         // oracle off the response (Hermes PR4b LOW). A browser HTMX POST always
         // carries Origin (or at least Referer); this DESTRUCTIVE cookie endpoint

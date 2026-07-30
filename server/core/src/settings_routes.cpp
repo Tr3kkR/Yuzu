@@ -5248,9 +5248,20 @@ void SettingsRoutes::register_routes(
 
     // Origin/Referer CSRF gate — Hermes Agent red-team finding MEDIUM #2
     // (2026-05-29). Every Settings MFA POST mutates per-user MFA state
-    // using session-cookie auth alone; SameSite=Lax is not strict enough
-    // to stop a cross-site form POST from disabling MFA on a victim
-    // session. We require Origin (or Referer as fallback) to carry the
+    // using session-cookie auth alone.
+    //
+    // Corrected on #2641 review: an earlier version of this comment said
+    // `SameSite=Lax` "is not strict enough to stop a cross-site form POST".
+    // That is wrong. Lax sends the cookie on a cross-site top-level
+    // navigation only for SAFE methods; POST is not safe, so a purely
+    // cross-site form POST arrives with no cookie at all. (Chrome's
+    // Lax+POST intervention applies only to cookies with NO SameSite
+    // attribute — `auth_routes.cpp` sets it explicitly.) What the gate
+    // closes is a SAME-SITE sibling origin: subdomain takeover, XSS on a
+    // neighbour, a shared-domain deployment. Those carry the cookie and
+    // are a different origin, which is what Origin/Referer catches.
+    //
+    // We require Origin (or Referer as fallback) to carry the
     // same host as the request's Host header; absence means a non-
     // browser caller (curl, automation) which is explicitly allowed
     // because programmatic admin clients post without an Origin header.

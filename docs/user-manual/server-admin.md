@@ -236,9 +236,27 @@ Two accepted forms, and the difference matters:
 Prefer the scheme-qualified form. It also closes a weaker pre-existing behaviour in the same
 check, where `http://h` satisfied a request to `https://h`.
 
-Entries are case-insensitive, may carry a port (`yuzu.example:8443`; `:80` and `:443` are
-stripped as defaults), and any path is ignored. **Wildcards are not supported** — `*.example`
-is accepted by the parser but will never match anything, deliberately.
+Entries are case-insensitive, may carry a port, and any path is ignored. **Wildcards are not
+supported** — `*.example` is accepted by the parser but will never match anything, deliberately.
+The reserved token `null` is refused as an entry: it is the serialisation of an *opaque* origin
+(sandboxed iframes, redirected cross-origin POSTs, `file://` documents), not a host, so trusting
+it would admit all of them at once.
+
+Port handling follows RFC 6454 — a port is dropped only when it is the default **for that entry's
+scheme**:
+
+| entry | canonical form | note |
+|---|---|---|
+| `https://yuzu.example:443` | `https://yuzu.example` | 443 is the https default |
+| `http://yuzu.example:80` | `http://yuzu.example` | 80 is the http default |
+| `https://yuzu.example:80` | *unchanged* | 80 is **not** the https default, so it is significant |
+| `yuzu.example:8443` | *unchanged* | not a default under any scheme |
+| `yuzu.example:443` | `yuzu.example` | a bare entry is scheme-agnostic, so either default collapses |
+
+The scheme-qualified rows matter. An earlier version stripped `:80`/`:443` without consulting the
+scheme, so `https://yuzu.example:80` collapsed onto `https://yuzu.example` — which is port 443.
+Declaring one origin silently trusted a second. Write the scheme when you want the port to mean
+something.
 
 **Confirming it took.** The server logs the accepted set once at boot:
 
