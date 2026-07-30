@@ -1236,12 +1236,15 @@ that does the work.
    is the signal it is not going away: fix it, or promote it out of `roadmap` with a
    priority. **Never re-park.** This bounds the failure at ignored-once.
 
-Over 300 open issues already carry the label, so both matter. That is stated as a
-floor rather than a share on purpose: an earlier draft said "a third of the tracker",
-which was true when written and is not now — the open count grew faster than the
-parked one. Constraint 1 is checkable against the ledger and Gate 8 step 4 does it;
-constraint 2 needs the dedupe probe's result and the target issue's labels, so it
-stays procedural.
+Over 300 open issues already carry the label, so both matter. That is a floor rather
+than a share on purpose: an earlier draft said "a third of the tracker", which was
+last true around 2026-07-20 and was already stale when written — measured at 338 of
+1281 open, the parked set had not grown at all while the open count rose by 233.
+
+Constraint 1 is checkable against the ledger, and Gate 8 step 4 does it. Constraint 2
+is not: it needs the dedupe probe's result. Neither is the label contract on the park
+command in that procedure, which lives on GitHub and is not a constraint here at all.
+Those last two stay procedural — see step 4, which states its own blind spots.
 
 Neither the number of issues nor the number of parks is a target. What is required
 is that every valid finding ends somewhere recorded — fixed, filed, linked to an
@@ -1349,8 +1352,8 @@ for whoever owns that runner.
    | `provenance` | `introduced` / `newly-reachable` / `pre-existing`. **Adjudicated, not inferred from prose.** Default to `introduced` when contested |
    | `file`, `line`, `summary` | where and what |
    | `classification` + rationale | truth-contradiction vs wording, and why |
-   | `disposition` | `fixed` / `deferred-to-issue #N` (a NEW issue was filed) / `roadmap-#N` (parked) / `linked-to-#N` (an EXISTING issue already covers it) / `split` / `re-cut` / `rejected`. The `#N` values are completed when the issue is filed or identified, which happens after the run: fill them in before the PR merges, in a NEW commit — never `git commit --amend` or a rebase, which rewrites evidence a reviewer may already have read. If filing slips past the merge, amend on `dev` in a follow-up commit and say so in the run report; a fragment left holding `#?` makes the park unauditable, which is the failure the disposition exists to prevent. `roadmap-#N` is valid work parked per Gate 7, under the two constraints stated there. `split` records that the work left this change as its own review unit; `re-cut` that the original acceptance criteria travelled to the mechanism. `rejected` means false, inapplicable or disproven — at CRITICAL/HIGH or on a floor it requires the `adjudicated_by` separation Gate 7 states |
-   | `adjudicated_by` (nullable) | who approved a departure, and that they were not the change's author |
+   | `disposition` | `fixed` / `deferred-to-issue #N` (a NEW issue was filed) / `roadmap-#N` (parked) / `linked-to-#N` (an EXISTING issue already covers it) / `split` / `re-cut` / `rejected`. The `#N` values are completed when the issue is filed or identified, which happens after the run: fill them in before the PR merges, in a NEW commit — never `git commit --amend` or a rebase, which rewrites evidence a reviewer may already have read. If filing slips past the merge, amend in a follow-up PR — `dev` is protected, so a direct commit is not a path — and say so in the run report; a fragment left holding `#?` makes the park unauditable, which is the failure the disposition exists to prevent. `roadmap-#N` is valid work parked per Gate 7, under the two constraints stated there. `split` records that the work left this change as its own review unit; `re-cut` that the original acceptance criteria travelled to the mechanism. `rejected` means false, inapplicable or disproven — at CRITICAL/HIGH or on a floor it requires the `adjudicated_by` separation Gate 7 states |
+   | `adjudicated_by` (nullable) | who approved a departure, and **which separation applied** — this field serves three different dispositions whose standards are NOT the same, so it states none of them and names the one in force: Gate 7's for `rejected`, Test 2's for a scope change, the floor exception's for a documented impossibility. An earlier revision stated one standard here, which read as the rule for all three and was the weakest of them |
    | `caused_by` (nullable) | did round N's fix create this round N+1 finding |
    | `waiver_rationale` (nullable) | *why* an unresolved gating finding was allowed to pass. A signature with no reasoning is content-free exception evidence |
 
@@ -1373,32 +1376,50 @@ for whoever owns that runner.
    See `docs/governance-skill-tuning-2026-07.md`.
 
 4. **Check the dispositions against the ledger BEFORE the final decision.** Gate 7's
-   first park constraint is the only one a machine can see, so see it — whoever writes
-   the run report runs this against the fragment from step 3:
+   first park constraint is the only part of the park contract a machine can see, so
+   see it. Whoever runs the gate does this — not "whoever writes the run report", which
+   is a post-push artefact and would put the check back after the decision it exists to
+   inform. Run it against `"$LEDGER"` from step 3, never a hardcoded `governance.d/`
+   path: a `YUZU_GOV_LOG_DIR` run keeps its fragment elsewhere, and a check pointed at
+   a file that is not there is the one failure this step cannot afford.
 
    ```bash
    jq -e 'select((.disposition | test("^(roadmap|linked-to)-")) and
-                 (.impact[]? | test("^I[123]$")))' governance.d/<fragment>.jsonl
+                 ((.impact // empty | if type == "array" then .[] else . end)
+                  | test("^I[123]$")))' "$LEDGER"
    ```
 
-   It must match NOTHING. **A clean check is exit 4 and a violation is exit 0** —
-   `jq -e` reports 4 when no result was produced at all, so the PASS case here is the
-   non-zero one. Measured on jq-1.8.1; do not wire it into a bare `if` or `&&` without
-   accounting for that inversion. A match is a park, or a dedupe-link onto a parked
-   issue, carrying `I1`, `I2` or `I3`. The gate does not pass and the report does not
-   go out until that row is re-dispositioned.
+   **A clean check is exit 4; a violation is exit 0.** `jq -e` reports 4 when no result
+   was produced at all, so the PASS case here is a non-zero exit — measured on jq-1.8.1.
+   Do not wire it into a bare `if` or `&&` without accounting for that inversion, and
+   **do not read every non-zero exit as a pass**: a missing or unreadable file is exit
+   2, which is a mis-pathed check, not a clean one. Only 4 is clean.
 
-   `linked-to-` is in the pattern deliberately: linking an `I1` finding onto an
-   existing `roadmap` issue reaches the same outcome as parking it, and a check that
-   only saw `roadmap-` would miss it.
+   The `if type == "array"` normalisation is load-bearing. A bare `.impact[]?` swallows
+   the type error on a scalar, so a row recording `"impact": "I1"` instead of
+   `["I1"]` passed the check as clean — measured.
+
+   A match is a row whose finding may not be parked. Two arms, and they need different
+   handling:
+
+   - `roadmap-` — a park barred by constraint 1. The gate does not pass and the report
+     does not go out until that row is re-dispositioned.
+   - `linked-to-` — this one **over-matches by construction, so treat it as a prompt,
+     not a verdict.** Linking an `I1` finding onto an existing *parked* issue reaches
+     the same outcome as parking it, which is why the arm is here; but linking it onto
+     an active prioritised issue is a legitimate ending that Gate 7 explicitly allows.
+     No ledger field records the target's labels, so check them before calling it a
+     violation. Treating every `linked-to-` match as one pushes the reviewer toward
+     filing a duplicate or thinning the `impact` list, which are both worse than the
+     thing being prevented.
 
    **What this check cannot see, and an earlier revision wrongly claimed it could:**
-   the label half of the park contract (`roadmap` XOR priority + triage state) lives
-   on GitHub, not in any ledger field, and constraint 2 needs the dedupe probe's
-   result. Both stay procedural. It also reads a field the author supplied — an
-   `impact` list with `I1` omitted passes it, which is the gaming vector the severity
-   block already names — so spot-check parked rows' `impact` against their own
-   `trigger` and `summary`.
+   the label half of the park contract (`roadmap` XOR priority + triage state) lives on
+   GitHub, not in any ledger field; the target's labels behind a `linked-to-` row are
+   equally invisible; and constraint 2 needs the dedupe probe's result. All three stay
+   procedural. It also reads a field the author supplied — an `impact` list with `I1`
+   omitted passes, which is the gaming vector the severity block already names — so
+   spot-check parked rows' `impact` against their own `trigger` and `summary`.
 
 ## Known patterns from prior runs
 
@@ -1446,11 +1467,16 @@ procedure:
 
    **If the duplicate target carries `roadmap`, comment-and-leave is FORBIDDEN.** That
    is a re-park, barred by Gate 7's second constraint: fix it, or promote the issue out
-   of `roadmap` — remove the `roadmap` label, add a triage state, and add a priority
-   once triaged (`triage-labels.md`: `roadmap` never coexists with a priority or a
-   triage state, and a triaged issue carries both). A half-promoted issue is a contract
-   violation. Name the promotion in the run report: the ledger row records
-   `linked-to-#N`, and no ledger field carries a free-text disposition note.
+   of `roadmap` — remove the `roadmap` label and add **exactly one priority AND exactly
+   one triage state**. That is the `gh`-path rule, which is the one that binds here
+   because governance files through `gh`: `docs/agents/issue-standard.md` §4 requires
+   "either `roadmap` … or exactly one priority alongside the triage state", and
+   ADR-3001 repeats it. Do NOT weaken this to "a priority once triaged" — that is the
+   any-path telemetry invariant at `triage-labels.md`, and a round of this runbook did
+   exactly that, producing an instruction to leave the issue in a state the `gh`-path
+   rule forbids. A half-promoted issue is a contract violation. Name the promotion in
+   the run report: the ledger row records `linked-to-#N`, and no ledger field carries a
+   free-text disposition note.
 3. **File survivors** with the four body sections (Context / Evidence with `file:line` against current `origin/dev` / Acceptance criteria / Origin naming this governance run plus the dedupe probes and their results):
    ```bash
    gh issue create --repo Tr3kkR/Yuzu --title "..." \
