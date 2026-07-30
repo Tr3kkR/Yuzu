@@ -64,6 +64,38 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
 branch (`main`)**. Cron schedules likewise. New workflows added on `dev` are
 dormant until merged.
 
+### Trusted fork pull-request CI
+
+Automatic `pull_request` runs from forks are deliberately fail-closed. They
+must never emit healthy self-hosted runner outputs, because fork code is not
+trusted to execute on Big Tam or Wee Tam. The ordinary preflight fails red
+when it detects a fork; it does not bypass runner control.
+
+After static review, a maintainer may approve one immutable fork revision.
+First run the hosted review workflow and wait for it to pass:
+
+```bash
+gh workflow run fork-dynamic-review.yml --ref main \
+  -f pr_number=123 -f head_sha=<40-character-head-sha>
+gh run list --workflow=fork-dynamic-review.yml --limit 5
+```
+
+Then dispatch the trusted gate using that exact SHA and successful review run:
+
+```bash
+gh workflow run trusted-fork-ci.yml --ref main \
+  -f pr_number=123 \
+  -f head_sha=<40-character-head-sha> \
+  -f review_run_id=<successful-review-run-id>
+```
+
+The wrapper requires the PR to remain open, verifies that its current head is
+the supplied SHA, requires the hosted review run to match the same PR and SHA,
+and invokes the reusable `ci.yml` matrix. The reusable workflow also requires
+the repository-only `TRUSTED_FORK_CI_GATE` secret, so a fork cannot call it
+directly. Once this deliberate approval is made, the trusted run receives the
+normal CI secret set and executes the full PR gate on the approved revision.
+
 ## Gates outside the tier ladder
 
 ### Docker healthcheck invariants (`docker-healthcheck-invariants.yml`, #751)
@@ -277,6 +309,13 @@ The query requires the `RUNNER_INVENTORY_TOKEN` PAT secret (fine-grained,
 Administration:read on Tr3kkR/Yuzu). Expected failures publish a typed
 `failure_kind` and `failure_report`; an unexpected crash before those outputs
 still takes the sentinel's fallback issue path.
+
+Automatic fork PRs are rejected before the runner query and cannot emit
+healthy self-hosted outputs. Runner-control failures and required-pool outages
+are red operational failures. In particular, an offline Big Tam or Wee Tam
+pool causes nightly preflight to fail and the nightly alert opens
+`nightly-broken`; the repository discipline remains **no merge to main while
+that issue is open**. Follow `docs/ci-troubleshooting.md` before closing it.
 
 As of #1978, preflight also emits a `code_changed` output (from
 `scripts/ci/detect-code-change.sh`); the build jobs additionally gate on

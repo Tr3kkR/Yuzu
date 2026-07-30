@@ -23,6 +23,70 @@ Companion docs:
 
 ---
 
+## 1.1 Runner-control preflight fails or nightly opens `nightly-broken`
+
+**Symptom:**
+
+- `Preflight (runner health)` fails with `auth_error`, `rate_limit`,
+  `api_error`, or `malformed_response`.
+- Nightly preflight reports `Required runner pool unavailable: bigtam` or
+  `weetam`.
+- The nightly workflow opens or updates a `nightly-broken` issue.
+
+**Triage:**
+
+```bash
+gh api repos/Tr3kkR/Yuzu/actions/runners \
+  --jq '.runners[] | [.name, .status, (.labels | map(.name) | join(","))] | @tsv'
+gh run view <run-id> --log-failed
+```
+
+The runner-control query retries transient transport/API failures three times
+with bounded backoff. Authentication failures, rate limits, malformed JSON,
+and inventory configuration errors do not retry. A rate-limit response must
+not be remediated by creating a new PAT; wait for the limit to clear and check
+the failing run again.
+
+For an authentication failure, verify that the repository secret exists and
+that `RUNNER_INVENTORY_TOKEN` is a fine-grained token scoped to `Tr3kkR/Yuzu`
+with `Administration: read`. Do not put that token in a self-hosted job.
+
+For a pool outage, inspect the runner service and host directly using the
+platform-specific sections below. Required-pool outages are intentionally red
+and keep the repository's **no merge to main while `nightly-broken` is open**
+discipline until the next green nightly closes the issue.
+
+---
+
+## 1.2 Trusted execution of a fork pull request
+
+Fork PRs must not run automatically on self-hosted runners. After static
+analysis and maintainer review, use the hosted review workflow first:
+
+```bash
+gh workflow run fork-dynamic-review.yml --ref main \
+  -f pr_number=123 -f head_sha=<40-character-head-sha>
+gh run watch <review-run-id>
+```
+
+Only after that run succeeds, dispatch the trusted full gate:
+
+```bash
+gh workflow run trusted-fork-ci.yml --ref main \
+  -f pr_number=123 \
+  -f head_sha=<40-character-head-sha> \
+  -f review_run_id=<successful-review-run-id>
+```
+
+The trusted workflow validates that the PR is still open, the supplied SHA is
+still its current head, and the hosted review run matches the same PR and SHA.
+It executes the full reusable CI matrix with the normal repository secrets.
+This is an explicit trust decision: do not dispatch it for a fork revision that
+has not been statically reviewed. The `TRUSTED_FORK_CI_GATE` repository secret
+is an additional wrapper-only guard and must not be exposed to build steps.
+
+---
+
 ## 1. Linux runner `yuzu-wsl2-linux` shows offline / tmux is dying
 
 **Symptom:**

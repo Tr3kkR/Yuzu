@@ -30,6 +30,10 @@ PAT requirement: /repos/.../actions/runners requires admin scope, which
 the default GITHUB_TOKEN cannot grant. Set RUNNER_INVENTORY_TOKEN as a
 fine-grained PAT with Administration:read and pass it as GH_TOKEN.
 Without it, both modes emit a typed control-plane failure and exit 1.
+
+Automatic fork pull requests are deliberately not trusted. Preflight rejects
+them before querying self-hosted runner state; a maintainer-approved workflow
+dispatch path must invoke the full CI gate against an immutable PR head SHA.
 """
 
 from __future__ import annotations
@@ -42,12 +46,15 @@ import os
 import re
 import subprocess
 import sys
+import time
 import uuid
 from typing import Any
 
 
 INVENTORY_PATH = ".github/runner-inventory.json"
 QUERY_TIMEOUT_SECONDS = 30
+MAX_QUERY_ATTEMPTS = 3
+RETRY_DELAYS_SECONDS = (1, 2)
 
 # The self-hosted Linux job pool. ci.yml's proto-compat + linux jobs use
 # runs-on: [self-hosted, Linux, X64], so any declared runner whose labels are a
@@ -82,6 +89,7 @@ class QueryState(str, Enum):
 
     OK = "ok"
     AUTH_ERROR = "auth_error"
+    RATE_LIMIT = "rate_limit"
     API_ERROR = "api_error"
     MALFORMED_RESPONSE = "malformed_response"
     CONFIG_ERROR = "config_error"
@@ -147,64 +155,41 @@ def write_output(key: str, value: str) -> None:
             f.write(f"{key}={value}\n")
 
 
-def query_runners() -> QueryResult:
-    """Return a typed result for the GitHub runner-control query."""
-    try:
-        result = subprocess.run(
-            ["gh", "api", "/repos/Tr3kkR/Yuzu/actions/runners"],
-            capture_output=True, text=True, check=False,
-            timeout=QUERY_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
-        return QueryResult(
-            QueryState.API_ERROR,
-            report=f"Runner-control query timed out after {QUERY_TIMEOUT_SECONDS}s",
-        )
-    except OSError as exc:
-        return QueryResult(
-            QueryState.API_ERROR,
-            report=f"Runner-control query could not start: {exc}",
-        )
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        auth_markers = (
-            "401", "403", "bad credentials", "resource not accessible",
-            "must have admin", "requires authentication",
-        )
-        if any(marker in stderr.lower() for marker in auth_markers):
-            print("::error::Runner health check needs a PAT.")
-            print()
-            print("The default GITHUB_TOKEN cannot list /actions/runners — that endpoint")
-            print("requires admin access to the repository, which is not grantable via")
-            print("workflow permissions (no `administration` key at workflow scope).")
-            print()
-            print("To enable, create a PAT and store it as a repo secret:")
-            print("  1. github.com → Settings → Developer settings → Personal access tokens")
-            print("     → Fine-grained tokens → Generate new token")
-            print("  2. Repository access = Tr3kkR/Yuzu only")
-            print("  3. Permissions: 'Administration' = Read-only")
-            print("  4. gh secret set RUNNER_INVENTORY_TOKEN --body <token>")
-            print()
-            print("Raw error from gh api:")
-            print(stderr)
-            return QueryResult(
-                QueryState.AUTH_ERROR,
-                report="Runner-control authentication failed: " + (stderr or "no error text"),
-            )
-        print("::error::Unexpected error querying /actions/runners")
-        print(stderr)
-        return QueryResult(
-            QueryState.API_ERROR,
-            report="Runner-control query failed: " + (stderr or "no error text"),
-        )
+def _classify_query_error(stderr: str) -> QueryState:
+    """Classify gh failures without treating every HTTP 403 as authentication."""
+    text = stderr.lower()
+    if any(marker in text for marker in (
+        "rate limit", "secondary rate", "abuse detection",
+    )):
+        return QueryState.RATE_LIMIT
+    if any(marker in text for marker in (
+        "http 401", "status 401", "bad credentials",
+        "resource not accessible", "must have admin",
+        "requires authentication", "http 403: forbidden",
+    )):
+        return QueryState.AUTH_ERROR
+    return QueryState.API_ERROR
 
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        return QueryResult(
-            QueryState.MALFORMED_RESPONSE,
-            report=f"Runner-control response was not valid JSON: {exc}",
-        )
+
+def _print_auth_instructions(stderr: str) -> None:
+    print("::error::Runner health check needs a PAT.")
+    print()
+    print("The default GITHUB_TOKEN cannot list /actions/runners — that endpoint")
+    print("requires admin access to the repository, which is not grantable via")
+    print("workflow permissions (no `administration` key at workflow scope).")
+    print()
+    print("To enable, create a PAT and store it as a repo secret:")
+    print("  1. github.com → Settings → Developer settings → Personal access tokens")
+    print("     → Fine-grained tokens → Generate new token")
+    print("  2. Repository access = Tr3kkR/Yuzu only")
+    print("  3. Permissions: 'Administration' = Read-only")
+    print("  4. gh secret set RUNNER_INVENTORY_TOKEN --body <token>")
+    print()
+    print("Raw error from gh api:")
+    print(stderr)
+
+
+def _validate_payload(payload: object) -> QueryResult:
     if not isinstance(payload, dict) or not isinstance(payload.get("runners"), list):
         return QueryResult(
             QueryState.MALFORMED_RESPONSE,
@@ -224,7 +209,10 @@ def query_runners() -> QueryResult:
         if (not isinstance(name, str) or not name
                 or not isinstance(status, str) or not status
                 or not isinstance(busy, bool)
-                or not isinstance(labels, list)):
+                or not isinstance(labels, list)
+                or any(not isinstance(label, dict)
+                       or not isinstance(label.get("name"), str)
+                       or not label["name"] for label in labels)):
             return QueryResult(
                 QueryState.MALFORMED_RESPONSE,
                 report=f"Runner-control response entry {index} lacked correctly typed fields",
@@ -235,13 +223,60 @@ def query_runners() -> QueryResult:
                 report=f"Runner-control response contained duplicate runner name {name!r}",
             )
         names.add(name)
-        if any(not isinstance(label, dict) or not isinstance(label.get("name"), str)
-               for label in labels):
-            return QueryResult(
-                QueryState.MALFORMED_RESPONSE,
-                report=f"Runner-control response entry {index} had malformed labels",
-            )
     return QueryResult(QueryState.OK, payload=payload)
+
+
+def query_runners() -> QueryResult:
+    """Return a typed runner-control result with bounded transient retries."""
+    state = QueryState.API_ERROR
+    report = "Runner-control query failed"
+    for attempt in range(MAX_QUERY_ATTEMPTS):
+        try:
+            result = subprocess.run(
+                ["gh", "api", "/repos/Tr3kkR/Yuzu/actions/runners"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=QUERY_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            state = QueryState.API_ERROR
+            report = f"Runner-control query timed out after {QUERY_TIMEOUT_SECONDS}s"
+        except OSError as exc:
+            state = QueryState.API_ERROR
+            report = f"Runner-control query could not start: {exc}"
+        else:
+            if result.returncode != 0:
+                stderr = result.stderr.strip()
+                state = _classify_query_error(stderr)
+                if state is QueryState.AUTH_ERROR:
+                    _print_auth_instructions(stderr)
+                    return QueryResult(
+                        state,
+                        report="Runner-control authentication failed: "
+                        + (stderr or "no error text"),
+                    )
+                if state is QueryState.RATE_LIMIT:
+                    return QueryResult(
+                        state,
+                        report="Runner-control API rate limit reached: "
+                        + (stderr or "no error text"),
+                    )
+                report = "Runner-control query failed: " + (stderr or "no error text")
+            else:
+                try:
+                    payload = json.loads(result.stdout)
+                except json.JSONDecodeError as exc:
+                    return QueryResult(
+                        QueryState.MALFORMED_RESPONSE,
+                        report=f"Runner-control response was not valid JSON: {exc}",
+                    )
+                return _validate_payload(payload)
+
+        if attempt + 1 < MAX_QUERY_ATTEMPTS:
+            time.sleep(RETRY_DELAYS_SECONDS[attempt])
+
+    return QueryResult(state, report=report)
 
 
 def is_healthy(actual: dict[str, Any] | None, expected_labels: list[str]) -> bool:
@@ -251,6 +286,15 @@ def is_healthy(actual: dict[str, Any] | None, expected_labels: list[str]) -> boo
     if actual["status"] != "online":
         return False
     return set(expected_labels).issubset(set(actual["labels"]))
+
+
+def is_fork_pr() -> bool:
+    """Return whether this is an automatic pull request from another repo."""
+    if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
+        return False
+    base = os.environ.get("GITHUB_REPOSITORY", "")
+    head = os.environ.get("GITHUB_HEAD_REPOSITORY", "")
+    return bool(base and head and base != head)
 
 
 def write_control_failure(expected: dict[str, Any], result: QueryResult) -> None:
@@ -310,6 +354,17 @@ def main(argv: list[str] | None = None) -> int:
         write_control_failure({}, result)
         print(f"::error::{result.report}")
         return 1
+
+    if args.mode == "preflight" and is_fork_pr():
+        result = QueryResult(
+            QueryState.AUTH_ERROR,
+            report=("Automatic fork PR preflight is not trusted; use the "
+                    "maintainer-dispatched trusted fork workflow."),
+        )
+        write_control_failure(expected, result)
+        print(f"::error::{result.report}")
+        return 1
+
     result = query_runners()
     if result.state is not QueryState.OK:
         write_control_failure(expected, result)

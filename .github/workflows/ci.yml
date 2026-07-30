@@ -4,7 +4,8 @@ on:
   # push fires only on mainline branches (merges into dev/main) so feature/
   # fix branches with an open PR run CI exactly once via pull_request rather
   # than the previous duplicate (push + pull_request). For pre-PR feature
-  # work, open the PR earlier or use workflow_dispatch.
+  # work, open the PR earlier; fork revisions use the explicit trusted-fork
+  # workflow documented in docs/ci-architecture.md.
   #
   # tags-ignore is belt-and-suspenders: with `branches:` set, GitHub
   # already filters tag pushes — but explicitly excluding `v*` documents
@@ -37,7 +38,20 @@ on:
     # a docs-only PR skips them, and a *skipped* required check is satisfied
     # whereas an *absent* one is not. The `push:` trigger above keeps its
     # paths-ignore — post-merge docs pushes need no build and gate nothing.
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "Open fork PR number approved for trusted execution"
+        required: true
+        type: string
+      head_sha:
+        description: "Exact 40-character PR head SHA approved for execution"
+        required: true
+        type: string
+    secrets:
+      TRUSTED_FORK_CI_GATE:
+        description: "Repository-only sentinel proving the trusted wrapper invoked this workflow"
+        required: true
 
 # Scorecard Token-Permissions hardening: ci.yml builds and tests only —
 # no registry pushes, no release creation. contents:read is all that's
@@ -73,6 +87,78 @@ env:
   CCACHE_COMPRESSLEVEL: "1"
 
 jobs:
+  # The reusable-workflow entry point is intentionally protected by a
+  # repository-only secret. Ordinary pull_request runs still perform the
+  # fail-closed fork check in preflight; only trusted-fork-ci.yml can invoke
+  # this workflow against a fork SHA with secrets available.
+  trusted_inputs:
+    name: "Validate trusted CI inputs"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      checkout_repository: ${{ steps.validate.outputs.checkout_repository }}
+      checkout_ref: ${{ steps.validate.outputs.checkout_ref }}
+      base_sha: ${{ steps.validate.outputs.base_sha }}
+    steps:
+      - id: validate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          APPROVED_SHA: ${{ inputs.head_sha }}
+          TRUSTED_GATE: ${{ secrets.TRUSTED_FORK_CI_GATE }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" != "workflow_call" ]]; then
+            echo "checkout_repository=$REPOSITORY" >> "$GITHUB_OUTPUT"
+            echo "checkout_ref=${GITHUB_REF}" >> "$GITHUB_OUTPUT"
+            if [[ "$EVENT_NAME" == "pull_request" ]]; then
+              echo "base_sha=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            else
+              echo "base_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          [[ "$APPROVED_SHA" =~ ^[0-9a-fA-F]{40}$ ]]
+          [[ -n "$TRUSTED_GATE" ]] || {
+            echo "::error::TRUSTED_FORK_CI_GATE is required; direct reusable-workflow calls are forbidden."
+            exit 1
+          }
+
+          pr_json=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER")
+          state=$(jq -r '.state' <<<"$pr_json")
+          head_sha=$(jq -r '.head.sha' <<<"$pr_json")
+          head_repo=$(jq -r '.head.repo.full_name // empty' <<<"$pr_json")
+          base_sha=$(jq -r '.base.sha' <<<"$pr_json")
+          [[ "$state" == "open" ]] || {
+            echo "::error::PR #$PR_NUMBER is not open."
+            exit 1
+          }
+          [[ "$head_sha" == "$APPROVED_SHA" ]] || {
+            echo "::error::PR #$PR_NUMBER head moved; approved=$APPROVED_SHA current=$head_sha"
+            exit 1
+          }
+          [[ -n "$head_repo" && "$head_repo" != "$REPOSITORY" ]] || {
+            echo "::error::trusted-fork-ci is only for fork-originated PRs."
+            exit 1
+          }
+
+          # Checkout from the base repository at the immutable PR head SHA.
+          # This keeps the comparison base and workflow definitions anchored to
+          # the repository while still executing the approved fork revision.
+          echo "checkout_repository=$REPOSITORY" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "Trusted execution approved for $head_repo PR #$PR_NUMBER @ $head_sha"
+
   # ── Preflight: runner-health gate (PR-7 of CI overhaul plan) ──────────
   # Runs on a GHA-hosted runner (always available) and queries
   # /actions/runners. Each downstream job that targets a self-hosted
@@ -94,6 +180,7 @@ jobs:
   # a successful skip merely because their control-plane evidence is missing.
   preflight:
     name: "Preflight (runner health)"
+    needs: [trusted_inputs]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     # Job-level permissions REPLACE the workflow default (contents: read), so
@@ -122,10 +209,19 @@ jobs:
       # PR skips them instead of blocking forever on absent required checks.
       # Always true for non-PR events (push / workflow_dispatch build always).
       code_changed: ${{ steps.codegate.outputs.code_changed }}
+      checkout_repository: ${{ needs.trusted_inputs.outputs.checkout_repository }}
+      checkout_ref: ${{ needs.trusted_inputs.outputs.checkout_ref }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ needs.trusted_inputs.outputs.checkout_repository }}
+          ref: ${{ needs.trusted_inputs.outputs.checkout_ref }}
           persist-credentials: false
+      - name: Verify trusted checkout
+        if: github.event_name == 'workflow_call'
+        env:
+          EXPECTED_SHA: ${{ needs.trusted_inputs.outputs.checkout_ref }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - name: Runner-health control tests
         run: python3 scripts/ci/test_runner_health_check.py
 
@@ -184,7 +280,6 @@ jobs:
 
       - name: Probe runner health for code-bearing changes
         id: health
-        if: steps.codegate.outputs.code_changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
         run: >-
@@ -222,6 +317,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ needs.preflight.outputs.checkout_repository }}
+          ref: ${{ needs.preflight.outputs.checkout_ref }}
           # Need history so buf can compare against the merge base
           fetch-depth: 0
           persist-credentials: false
@@ -303,6 +400,8 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ needs.preflight.outputs.checkout_repository }}
+          ref: ${{ needs.preflight.outputs.checkout_ref }}
           submodules: recursive
           # clean:false — persist build-linux-{compiler}-{buildtype}/ +
           # vcpkg_installed/ between runs. Branch switches are handled
@@ -662,6 +761,8 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ needs.preflight.outputs.checkout_repository }}
+          ref: ${{ needs.preflight.outputs.checkout_ref }}
           submodules: recursive
           # clean:false — persist build-windows-{debug,release}/ +
           # vcpkg_installed/ between runs. Manual recovery: scripts/ci/runner-reset.sh.
@@ -947,6 +1048,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ needs.preflight.outputs.checkout_repository }}
+          ref: ${{ needs.preflight.outputs.checkout_ref }}
           submodules: recursive
           persist-credentials: false
 
@@ -1246,7 +1349,8 @@ jobs:
   # we want operators to inherit is what landed on main.
   detect-ci-changes:
     name: "Detect CI infrastructure changes"
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: [trusted_inputs]
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_call' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     outputs:
@@ -1254,16 +1358,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ needs.trusted_inputs.outputs.checkout_repository }}
+          ref: ${{ needs.trusted_inputs.outputs.checkout_ref }}
           fetch-depth: 0
           persist-credentials: false
       - id: detect
+        env:
+          TRUSTED_BASE_SHA: ${{ needs.trusted_inputs.outputs.base_sha }}
         run: |
           # PRs diff against the base ref; pushes diff against the SHA
           # before the push (`github.event.before`). For push-to-main
           # that's the previous main tip, which is exactly the boundary
           # we want — anything in this push that touched CI infra needs
           # to (re)warm the canary cache scope.
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          if [[ "${{ github.event_name }}" == "workflow_call" ]]; then
+            base_sha="$TRUSTED_BASE_SHA"
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
             base_sha="${{ github.event.pull_request.base.sha }}"
           else
             base_sha="${{ github.event.before }}"
@@ -1287,7 +1397,7 @@ jobs:
 
   canary:
     name: "Workflow canary (GHA-hosted ubuntu-24.04)"
-    needs: [detect-ci-changes]
+    needs: [detect-ci-changes, trusted_inputs]
     if: needs.detect-ci-changes.outputs.workflows_changed == 'true'
     runs-on: ubuntu-24.04
     # A genuinely cold cache builds the whole vcpkg closure from source on a
@@ -1301,6 +1411,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ needs.trusted_inputs.outputs.checkout_repository }}
+          ref: ${{ needs.trusted_inputs.outputs.checkout_ref }}
           submodules: recursive
           persist-credentials: false
 

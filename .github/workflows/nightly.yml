@@ -789,7 +789,7 @@ jobs:
   alert:
     name: "Open nightly-broken on failure"
     needs: [preflight, sanitize-asan, sanitize-tsan, windows-asan, coverage]
-    if: failure()
+    if: ${{ always() && (failure() || needs.preflight.result == 'failure') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

@@ -52,6 +52,28 @@ class QueryRunnersTests(unittest.TestCase):
         self.assertEqual(auth.state, runner_health.QueryState.AUTH_ERROR)
         self.assertEqual(api.state, runner_health.QueryState.API_ERROR)
 
+    def test_rate_limit_is_distinct_from_authentication_failure(self) -> None:
+        result = self.query(returncode=1, stderr="HTTP 403: API rate limit exceeded")
+        self.assertEqual(result.state, runner_health.QueryState.RATE_LIMIT)
+        self.assertIn("rate limit", result.report.lower())
+
+    def test_transient_api_failure_retries_three_times(self) -> None:
+        payload = {"runners": [runner("linux-0", ["self-hosted", "Linux", "X64"])]}
+        responses = [
+            subprocess.CompletedProcess([], 1, "", "network unreachable"),
+            subprocess.CompletedProcess([], 1, "", "temporary gateway error"),
+            subprocess.CompletedProcess([], 0, json.dumps(payload), ""),
+        ]
+        with (
+            mock.patch.object(runner_health.subprocess, "run", side_effect=responses) as run,
+            mock.patch.object(runner_health.time, "sleep") as sleep,
+        ):
+            result = runner_health.query_runners()
+
+        self.assertEqual(result.state, runner_health.QueryState.OK)
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+
     def test_invalid_json_is_malformed_response(self) -> None:
         result = self.query(stdout="not-json")
         self.assertEqual(result.state, runner_health.QueryState.MALFORMED_RESPONSE)
@@ -117,13 +139,7 @@ class MainTests(unittest.TestCase):
 
     def run_main(self, result, *args: str) -> tuple[int, str]:
         self.output.write_text("", encoding="utf-8")
-        env = {
-            "GITHUB_OUTPUT": str(self.output),
-            # A fork must not be treated as healthy merely because secrets are absent.
-            "GITHUB_EVENT_NAME": "pull_request",
-            "GITHUB_REPOSITORY": "Tr3kkR/Yuzu",
-            "GITHUB_HEAD_REPOSITORY": "contributor/Yuzu",
-        }
+        env = {"GITHUB_OUTPUT": str(self.output)}
         with (
             mock.patch.object(runner_health, "INVENTORY_PATH", str(self.inventory)),
             mock.patch.object(runner_health, "query_runners", return_value=result),
@@ -162,7 +178,32 @@ class MainTests(unittest.TestCase):
         self.assertIn("failure_kind=required_pool_unavailable\n", output)
         self.assertIn("bigtam_pool_healthy=false\n", output)
 
-    def test_healthy_required_pools_pass_despite_fork_environment(self) -> None:
+    def test_automatic_fork_preflight_is_red_and_never_queries(self) -> None:
+        with (
+            mock.patch.object(runner_health, "INVENTORY_PATH", str(self.inventory)),
+            mock.patch.object(runner_health, "query_runners") as query,
+            mock.patch.dict(
+                os.environ,
+                {
+                    "GITHUB_OUTPUT": str(self.output),
+                    "GITHUB_EVENT_NAME": "pull_request",
+                    "GITHUB_REPOSITORY": "Tr3kkR/Yuzu",
+                    "GITHUB_HEAD_REPOSITORY": "contributor/Yuzu",
+                },
+                clear=True,
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            code = runner_health.main(["--mode", "preflight"])
+
+        query.assert_not_called()
+        self.assertEqual(code, 1)
+        output = self.output.read_text(encoding="utf-8")
+        self.assertIn("control_state=auth_error\n", output)
+        self.assertIn("bigtam_pool_healthy=false\n", output)
+        self.assertIn("weetam_pool_healthy=false\n", output)
+
+    def test_healthy_required_pools_pass(self) -> None:
         payload = {
             "runners": [
                 runner("linux-0", self.expected[0]["labels"]),
