@@ -78,19 +78,19 @@ const std::vector<pg::PgMigration>& migrations() {
          // migrate_from_sqlite() is a cheap no-op on every boot after the
          // first. `legacy_rows` records rows ACTUALLY inserted (not the size
          // of the in-memory legacy row list — see migrate_from_sqlite).
-         // `skipped_bad` makes the explicit legacy byte-cap and SQLSTATE
-         // 22/23/54 row-data skips auditable; migration v3 adds every other
-         // reconciliation term.
+         // Keep this published v2 shape immutable. Later reconciliation terms
+         // are append-only migrations below.
          "CREATE TABLE backfill_state ("
          "  id           INT PRIMARY KEY,"
          "  migrated_at  BIGINT NOT NULL,"
-         "  legacy_rows  BIGINT NOT NULL DEFAULT 0,"
-         "  skipped_bad  BIGINT NOT NULL DEFAULT 0);"},
+         "  legacy_rows  BIGINT NOT NULL DEFAULT 0);"},
         {3, "ALTER TABLE backfill_state "
             "ADD COLUMN source_rows BIGINT NOT NULL DEFAULT 0, "
             "ADD COLUMN conflicts BIGINT NOT NULL DEFAULT 0, "
             "ADD COLUMN skipped_blank_key BIGINT NOT NULL DEFAULT 0, "
             "ADD COLUMN skipped_typed BIGINT NOT NULL DEFAULT 0;"},
+        {4, "ALTER TABLE backfill_state "
+            "ADD COLUMN IF NOT EXISTS skipped_bad BIGINT NOT NULL DEFAULT 0;"},
     };
     return kMigrations;
 }
@@ -106,8 +106,7 @@ std::int64_t now_secs() {
 // (migrate_from_sqlite), because the decommission cascade's empty-id
 // short-circuit could never reach it, leaving an un-erasable row.
 bool is_blank(std::string_view s) {
-    return std::all_of(s.begin(), s.end(),
-                       [](unsigned char c) { return std::isspace(c) != 0; });
+    return std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isspace(c) != 0; });
 }
 
 // Parse a Postgres text-format integer cell into int64 (count(*)/MAX()/etc.
@@ -148,8 +147,9 @@ struct DegradeLog {
 DegradeLog note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason,
                              DegradeSampler& s) {
     if (metrics)
-        metrics->counter("yuzu_inventory_read_degrade_total",
-                         {{"reason", reason}, {"source", kDegradeSource}})
+        metrics
+            ->counter("yuzu_inventory_read_degrade_total",
+                      {{"reason", reason}, {"source", kDegradeSource}})
             .increment();
     const std::int64_t now = now_secs();
     const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
@@ -288,7 +288,7 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
             if (is_blank(r.agent_id) || is_blank(r.plugin)) {
                 ++skipped_blank_key;
                 spdlog::warn("InventoryStore: migrate_from_sqlite: skipping legacy row with a "
-                            "blank agent_id/plugin");
+                             "blank agent_id/plugin");
                 continue;
             }
             // Typed projections have their own securables. Copying their
@@ -322,12 +322,12 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
             r.data_json.assign(data ? reinterpret_cast<const char*>(data) : "",
                                static_cast<std::size_t>(data_bytes));
 
-            pg::PgResult sp = pg::exec_params(c, "SAVEPOINT legacy_row_backfill",
-                                              std::vector<std::string>{});
+            pg::PgResult sp =
+                pg::exec_params(c, "SAVEPOINT legacy_row_backfill", std::vector<std::string>{});
             if (sp.status() != PGRES_COMMAND_OK) {
                 spdlog::error("InventoryStore: migrate_from_sqlite: SAVEPOINT failed (infra "
-                             "error, aborting backfill): {}",
-                             PQerrorMessage(c));
+                              "error, aborting backfill): {}",
+                              PQerrorMessage(c));
                 return false; // infra-level failure: fail closed
             }
 
@@ -401,8 +401,8 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
                 // broken at the infrastructure level, not a per-row problem.
                 // Fail closed rather than silently losing more rows.
                 spdlog::error("InventoryStore: migrate_from_sqlite: ROLLBACK TO SAVEPOINT failed "
-                             "after a bad row (infra error, aborting backfill): {}",
-                             PQerrorMessage(c));
+                              "after a bad row (infra error, aborting backfill): {}",
+                              PQerrorMessage(c));
                 return false;
             }
             if (!row_data_error) {
@@ -424,8 +424,8 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
             }
             ++skipped_bad;
             spdlog::warn("InventoryStore: migrate_from_sqlite: skipping bad legacy row "
-                        "agent_id={} plugin={} (SQLSTATE {}): {}",
-                        r.agent_id, r.plugin, sqlstate, row_err);
+                         "agent_id={} plugin={} (SQLSTATE {}): {}",
+                         r.agent_id, r.plugin, sqlstate, row_err);
         }
         if (legacy_exists && legacy_rc != SQLITE_DONE) {
             spdlog::error("InventoryStore: migrate_from_sqlite: legacy read failed (rc={})",
@@ -441,8 +441,7 @@ bool InventoryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
             "$6::bigint, $7::bigint) ON CONFLICT (id) DO NOTHING",
             std::vector<std::string>{std::to_string(now_secs()), std::to_string(inserted),
                                      std::to_string(skipped_bad), std::to_string(source_rows),
-                                     std::to_string(conflicts),
-                                     std::to_string(skipped_blank_key),
+                                     std::to_string(conflicts), std::to_string(skipped_blank_key),
                                      std::to_string(skipped_typed)});
         return stamp.status() == PGRES_COMMAND_OK;
     });
@@ -537,28 +536,29 @@ std::optional<std::vector<InventoryTable>> InventoryStore::list_tables() const {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
             spdlog::warn("InventoryStore: list_tables degraded — store not open (occurrence {})",
-                        d.occurrence);
+                         d.occurrence);
         return std::nullopt;
     }
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
     if (!lease) {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
-            spdlog::warn("InventoryStore: list_tables degraded — no connection ({}) (occurrence {})",
-                        pool_.last_error(), d.occurrence);
+            spdlog::warn(
+                "InventoryStore: list_tables degraded — no connection ({}) (occurrence {})",
+                pool_.last_error(), d.occurrence);
         return std::nullopt;
     }
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT plugin, COUNT(DISTINCT agent_id) AS agent_count, "
-        "MAX(collected_at) AS last_collected "
-        "FROM inventory_store.inventory_data GROUP BY plugin ORDER BY plugin",
-        std::vector<std::string>{});
+    pg::PgResult res =
+        pg::exec_params(lease.get(),
+                        "SELECT plugin, COUNT(DISTINCT agent_id) AS agent_count, "
+                        "MAX(collected_at) AS last_collected "
+                        "FROM inventory_store.inventory_data GROUP BY plugin ORDER BY plugin",
+                        std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK) {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
             spdlog::warn("InventoryStore: list_tables degraded — query failed: {} (occurrence {})",
-                        PQerrorMessage(lease.get()), d.occurrence);
+                         PQerrorMessage(lease.get()), d.occurrence);
         return std::nullopt;
     }
     std::vector<InventoryTable> out;
@@ -582,7 +582,7 @@ InventoryStore::get(const std::string& agent_id, const std::string& plugin) cons
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
             spdlog::warn("InventoryStore: get degraded — store not open (occurrence {})",
-                        d.occurrence);
+                         d.occurrence);
         return std::unexpected(InventoryReadError::kDegraded);
     }
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
@@ -590,19 +590,19 @@ InventoryStore::get(const std::string& agent_id, const std::string& plugin) cons
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
             spdlog::warn("InventoryStore: get degraded — no connection ({}) (occurrence {})",
-                        pool_.last_error(), d.occurrence);
+                         pool_.last_error(), d.occurrence);
         return std::unexpected(InventoryReadError::kDegraded);
     }
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT agent_id, plugin, data_json, collected_at "
-        "FROM inventory_store.inventory_data WHERE agent_id = $1 AND plugin = $2",
-        std::vector<std::string>{agent_id, plugin});
+    pg::PgResult res =
+        pg::exec_params(lease.get(),
+                        "SELECT agent_id, plugin, data_json, collected_at "
+                        "FROM inventory_store.inventory_data WHERE agent_id = $1 AND plugin = $2",
+                        std::vector<std::string>{agent_id, plugin});
     if (res.status() != PGRES_TUPLES_OK) {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
             spdlog::warn("InventoryStore: get degraded — query failed: {} (occurrence {})",
-                        PQerrorMessage(lease.get()), d.occurrence);
+                         PQerrorMessage(lease.get()), d.occurrence);
         return std::unexpected(InventoryReadError::kDegraded);
     }
     if (PQntuples(res.get()) == 0)
@@ -626,7 +626,7 @@ std::optional<std::vector<InventoryRecord>> InventoryStore::query(const Inventor
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
             spdlog::warn("InventoryStore: query degraded — store not open (occurrence {})",
-                        d.occurrence);
+                         d.occurrence);
         return std::nullopt;
     }
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
@@ -634,7 +634,7 @@ std::optional<std::vector<InventoryRecord>> InventoryStore::query(const Inventor
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
             spdlog::warn("InventoryStore: query degraded — no connection ({}) (occurrence {})",
-                        pool_.last_error(), d.occurrence);
+                         pool_.last_error(), d.occurrence);
         return std::nullopt;
     }
 
@@ -701,7 +701,7 @@ std::optional<std::vector<InventoryRecord>> InventoryStore::query(const Inventor
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
             spdlog::warn("InventoryStore: query degraded — query failed: {} (occurrence {})",
-                        PQerrorMessage(lease.get()), d.occurrence);
+                         PQerrorMessage(lease.get()), d.occurrence);
         return std::nullopt;
     }
     std::vector<InventoryRecord> out;
@@ -740,20 +740,20 @@ std::optional<std::vector<InventoryRecord>> InventoryStore::query(const Inventor
                          kQueryByteCap);
         else if (limit == kQueryRowCap)
             spdlog::warn("InventoryStore: query hit the hard row cap ({}) — result is truncated, "
-                        "more rows may exist",
-                        kQueryRowCap);
+                         "more rows may exist",
+                         kQueryRowCap);
         else
             spdlog::debug("InventoryStore: query result truncated at limit={} — more rows may "
-                         "exist",
-                         limit);
+                          "exist",
+                          limit);
     }
     return out;
 }
 
 // ── Get agent inventory (delegates to query) ─────────────────────────────────
 
-std::optional<std::vector<InventoryRecord>> InventoryStore::get_agent_inventory(
-    const std::string& agent_id, bool* truncated) const {
+std::optional<std::vector<InventoryRecord>>
+InventoryStore::get_agent_inventory(const std::string& agent_id, bool* truncated) const {
     InventoryQuery q;
     q.agent_id = agent_id;
     q.limit = 1000;
@@ -838,7 +838,7 @@ std::optional<int64_t> InventoryStore::count() const {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
             spdlog::warn("InventoryStore: count degraded — store not open (occurrence {})",
-                        d.occurrence);
+                         d.occurrence);
         return std::nullopt;
     }
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
@@ -846,17 +846,17 @@ std::optional<int64_t> InventoryStore::count() const {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
             spdlog::warn("InventoryStore: count degraded — no connection ({}) (occurrence {})",
-                        pool_.last_error(), d.occurrence);
+                         pool_.last_error(), d.occurrence);
         return std::nullopt;
     }
-    pg::PgResult res = pg::exec_params(lease.get(),
-                                       "SELECT COUNT(*) FROM inventory_store.inventory_data",
-                                       std::vector<std::string>{});
+    pg::PgResult res =
+        pg::exec_params(lease.get(), "SELECT COUNT(*) FROM inventory_store.inventory_data",
+                        std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK) {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
             spdlog::warn("InventoryStore: count degraded — query failed: {} (occurrence {})",
-                        PQerrorMessage(lease.get()), d.occurrence);
+                         PQerrorMessage(lease.get()), d.occurrence);
         return std::nullopt;
     }
     return result_i64(res, 0, 0);
