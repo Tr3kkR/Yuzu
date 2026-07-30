@@ -513,6 +513,9 @@ if build_server
       'unit/server/test_ca_store.cpp',
       'unit/server/test_ca_routes.cpp',
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
+      'unit/server/test_kek_op_lock_holder.cpp', # #2530 B6 — advisory-lock holder query
+      'unit/server/test_kek_rotate_control.cpp', # #2530 B3/B4 — rotate control-flow ordering + half-commit classification
+      'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',

@@ -1476,9 +1476,12 @@ persistence failed), `503` (CA unavailable). A rejected import is audited
 
 Rotate the secrets key-encryption-key (KEK) that wraps every envelope-encrypted
 secret column (ADR-0010). See `docs/user-manual/server-admin.md` "Key
-management (secrets KEK)" for the full runbook (half-committed recovery, DR
-drill, retirement preconditions). Each route has an MCP twin sharing the same
-failure classification and remediation wording: `rotate_kek`, `rewrap_secrets`,
+management (secrets KEK)" for the full runbook (half-committed recovery,
+rotation runaway control, stuck-lock diagnosis, DR drill, retirement
+preconditions). Each route has an MCP twin sharing the same failure
+classification, remediation wording, and — for `get_kek_status` — the
+identical `live_versions`/`lock_held`/`lock_holder_pid` fields added by
+#2530 (REST/MCP twin parity, ADR-1005): `rotate_kek`, `rewrap_secrets`,
 `get_kek_status`.
 
 #### `POST /api/v1/secrets/kek/rotate`
@@ -1494,26 +1497,85 @@ secret row's wrapped-DEK header under it (payloads untouched). **Permission:**
 `rotation_complete` is the honest completion signal (ADR-0010 §3) — the
 response deliberately omits a rewrapped-row count; call `/rewrap` for one.
 Errors: `400`/`413` (non-empty/oversized body), `403` (missing
-`Security:Write`), `409` (another KEK operation holds the cluster-wide
-advisory lock — retry once it completes), `429` (rotation cooldown, below),
-`503` (codec/Postgres unavailable).
+`Security:Write`), `409` (**two distinct causes** — see below), `429`
+(rotation cooldown, below), `503` (**three distinct causes** — see below).
+
+> **Two different `409`s.** `"another KEK operation is in progress"` means
+> another rotation or re-wrap holds the cluster-wide `secrets_kek_op`
+> advisory lock — wait for it to finish and retry. `"the live KEK version
+> ceiling has been reached"` (#2530) means `--kek-max-live-versions` has been
+> hit — waiting never resolves this one; it needs an operator to explicitly
+> raise the ceiling (documented as a deliberate, audited risk acceptance
+> pending #2525 — see server-admin.md). Distinguish them from the message
+> text, not the status code alone.
+
+> **Three different `503`s.** `"KEK service unavailable"` (codec/Postgres not
+> yet ready — retry once the server reports ready) is the original one.
+> #2530 added two more, neither retryable on a fixed delay: `"a KEK query was
+> canceled or exceeded its statement timeout"` (SQLSTATE `57014` —
+> deliberately worded that way, not "timed out": Postgres also raises this
+> for an administrator's `pg_cancel_backend`, and it is **not necessarily
+> transient** — check `statement_timeout`, database load, cancellation
+> activity, and the registered-column scan size before retrying), and `"the
+> KEK rotation clock is untrustworthy"` (the newest `secrets.kek_meta` row is
+> future-dated relative to the database server's own clock — investigate the
+> database server's clock/NTP, not the KEK subsystem). The response body and
+> server log report the observed skew **magnitude** in seconds, because the
+> two possible skew directions behave differently: a **backward** skew
+> self-clears once the clock reads sanely again, but a **forward** skew
+> (the row was minted while the clock was already ahead — bad NTP, a VM
+> restore, a failover to a host that's ahead) does **not** self-clear — it
+> persists until real time catches up to the stored timestamp, blocking
+> every `/rotate` for that whole duration with **no configuration bypass at
+> all**. See server-admin.md "Clock-anomaly guard" for the full diagnostic
+> procedure. None of the three carry `retry_after_ms`.
 
 > **`500` half-committed — do NOT retry this route.** If rotation registers
 > the new version but fails to finish re-wrapping every row, this returns
 > `500` with a remediation telling you to call `POST
 > /api/v1/secrets/kek/rewrap` to resume. Retrying `/rotate` instead would mint
-> a second, spurious version on top of the half-rotated state.
+> a second, spurious version on top of the half-rotated state. This
+> classification **wins over** a `query_canceled` cause if the cancellation
+> happened after the mint committed — you still get told to call `/rewrap`,
+> never `/rotate`.
 
-> **`429` rotation cooldown.** Rotation *attempts* are rate-limited (5 minutes
-> between attempts, per server). A failed attempt consumes the budget too —
-> deliberately, because a failed rotation is exactly when you must not
-> immediately rotate again: automation that retries `/rotate` on a `500` would
-> otherwise mint a fresh version on every retry, and a KEK version can never be
-> retired (#2525). **`/rewrap` is NOT rate-limited** and is the correct way to
-> finish a half-committed rotation. The cooldown is a rate limiter, not a
-> correctness guarantee: it is per-process, so servers sharing one database each
-> have their own, and a restart clears it. Cluster-wide correctness comes from
-> the advisory lock, which returns `409`, not this.
+> **`429` rotation cooldown — durable and cluster-wide (#2530; #2530
+> G7-S9 removed a weaker second tier).** An earlier cut of this hardening
+> pass added a cheap process-local pre-check (5 minutes, in-memory)
+> alongside the durable control, but it was removed: it was never the
+> authoritative control (it was per-process and a restart cleared it), its
+> hardcoded window could not be configured below 5 minutes, and it never
+> populated an honest `retry_after_ms`. The sole authoritative rate limit
+> today is read from `secrets.kek_meta.created_at` on the database server's
+> own clock, cluster-wide and restart-persistent:
+> `--kek-min-rotate-interval` (seconds, default `3600` = 1h). A fresh
+> install's first rotate attempt is refused for up to this interval too —
+> KEK v1 is minted at boot with `created_at = now()`. A failed
+> attempt consumes the budget too — deliberately, because a failed rotation
+> is exactly when you must not immediately rotate again: automation that
+> retries `/rotate` on a `500` would otherwise mint a fresh version on every
+> retry, and a KEK version can never be retired (#2525). **`/rewrap` is NOT
+> rate-limited** and is the correct way to finish a half-committed rotation.
+> Unlike the `409`/`503` cases above, this `429`'s `retry_after_ms` is
+> **honest** — computed from the same durable database-clock timestamp, so
+> waiting genuinely resolves it (the field is a `uint32` millisecond count
+> that **saturates** at its maximum on an oversized configured interval
+> rather than wrapping, so it can only come out over-long, never falsely
+> short). Cluster-wide *correctness* (as opposed to rate limiting) still
+> comes from the advisory lock, which returns `409`, not this.
+>
+> **`--kek-min-rotate-interval` is a runaway/abuse guard, not a rotation
+> schedule — do NOT set it to your rotation cadence.** It exists to stop a
+> looping caller (buggy automation, a compromised token) hammering
+> `/rotate`, not to express how often you intend to rotate; most operators
+> should never change the default. Raising it directly delays *emergency*
+> re-rotation after a suspected KEK compromise, with no bypass (`/rewrap`
+> only resumes an in-progress rotation, never mints a new version) — e.g.
+> setting it to 90 days to "match" a quarterly policy means a routine
+> rotation followed by a compromise the next day leaves you refused for the
+> next three months, with no escape short of a restart at a lower value
+> mid-incident. The 365-day upper bound is a fat-finger sanity ceiling, not
+> a recommendation.
 
 #### `POST /api/v1/secrets/kek/rewrap`
 
@@ -1526,19 +1588,71 @@ nothing left to do. **Permission:** `Security:Write`. No request body.
 ```
 
 `rows_rewrapped: 0` is a normal outcome, not an error. Errors: `400`/`413`,
-`403` (missing `Security:Write`), `409` (advisory lock held), `503`.
+`403` (missing `Security:Write`), `409` (advisory lock held), `503` (codec/
+Postgres unavailable, **or** `"a KEK query was canceled or exceeded its
+statement timeout"` — same #2530 SQLSTATE `57014` classification and
+non-transient caveat as `/rotate` above; `/rewrap` never returns the ceiling
+or clock-anomaly failures, those are rotate-only preconditions).
 
 #### `GET /api/v1/secrets/kek/status`
 
 Current KEK rotation status. **Permission:** `Security:Read`.
 
 ```json
-{ "active_version": 2, "oldest_in_use": 2, "rotation_complete": true, "meta": { "api_version": "v1" } }
+{
+  "active_version": 2,
+  "oldest_in_use": 2,
+  "rotation_complete": true,
+  "live_versions": 2,
+  "lock_held": false,
+  "lock_holder_pid": null,
+  "meta": { "api_version": "v1" }
+}
 ```
 
 `oldest_in_use` is `null` when no secret rows exist at all (trivially
-complete). Read-only, not audited. Errors: `403` (missing `Security:Read`),
-`409` (advisory lock held), `503`.
+complete). Read-only, not audited, and — unlike `/rotate`/`/rewrap` — this
+route **deliberately never takes** the `secrets_kek_op` advisory lock, so it
+never returns `409` for lock contention. Errors: `403` (missing
+`Security:Read`), `503` (codec/Postgres unavailable, or the same
+`query_canceled` classification as above while reading the oldest-referenced
+version).
+
+> **`live_versions`, `lock_held`, `lock_holder_pid` (#2530).** Diagnostic
+> fields for diagnosing a wedged `secrets_kek_op` lock — before these
+> existed, a stuck holder made every KEK operation `409` forever with no way
+> to see why. `lock_held`/`lock_holder_pid` report the lock **in this
+> server's own database** (the underlying query is filtered by
+> `current_database()`, not cluster-wide — a same-named advisory lock held
+> by an unrelated tenant database sharing the same Postgres instance is
+> never reported here). They are **lock-free snapshots read at possibly
+> different instants**, not one coordinated read — never derive a "safe to
+> retire" conclusion from any combination of them (#2525), and never treat
+> `lock_holder_pid` alone as sufficient grounds to terminate a backend: a
+> healthy long-running re-wrap looks identical to a wedge from this field
+> alone. The full diagnosis-and-remedy procedure (corroborate against
+> `pg_stat_activity` before any DBA action) is in
+> `docs/user-manual/server-admin.md` § "Diagnosing a stuck KEK op lock".
+>
+> **`live_versions` and `lock_held` are `null` — never a fabricated `0`/
+> `false` — when the underlying query could not be determined.** The key is
+> always present; `null` means "could not be determined", not a truthful
+> negative. This matters most for `lock_held`: a `null` here **must never be
+> read as "no lock is held"** — it means the lock state is UNKNOWN.
+> Corroborate via `pg_stat_activity` before concluding anything, exactly as
+> you would for a genuinely-held lock.
+>
+> **`lock_holder_pid` is `null` in THREE distinct situations — always check
+> `lock_held` first to tell them apart:** (1) `lock_held: false` → genuinely
+> unheld, nothing to report; (2) `lock_held: null` → undetermined, the
+> holder query itself failed, the pid is meaningless (not "unheld"); (3)
+> `lock_held: true` with `lock_holder_pid: null` → the lock **is** held, but
+> the holder's backend pid could not be read from `pg_locks` at query time —
+> there is no pid to corroborate against `pg_stat_activity`; instead query
+> `pg_locks` directly for any granted holder of `secrets_kek_op` in the
+> current database (see `docs/user-manual/server-admin.md`'s runbook for the
+> exact query) and, if it also comes back empty or unreadable, escalate to a
+> DBA inspection rather than waiting on a pid that may never arrive.
 
 > **No retire endpoint — by design.** Yuzu does not expose a way to destroy an
 > old KEK version, even though the codec's internal `retire_kek` exists and is
