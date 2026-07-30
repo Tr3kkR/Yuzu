@@ -1154,7 +1154,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      const std::string referer = req.get_header_value("Referer");
                      const bool same_site =
                          !(origin.empty() && referer.empty()) &&
-                         origin_is_same_site(req.get_header_value("Host"), origin, referer);
+                         origin_is_same_site(req.get_header_value("Host"), origin, referer,
+                                             csrf_trusted_origins_);
                      if (!same_site) {
                          audit_fn_(req, "tar.source.reenable", "denied", "command", "",
                                    "csrf_cross_origin");
@@ -1318,7 +1319,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      const std::string referer = req.get_header_value("Referer");
                      const bool same_site =
                          !(origin.empty() && referer.empty()) &&
-                         origin_is_same_site(req.get_header_value("Host"), origin, referer);
+                         origin_is_same_site(req.get_header_value("Host"), origin, referer,
+                                             csrf_trusted_origins_);
                      if (!same_site) {
                          audit_fn_(req, "tar.source.purge", "denied", "command", "",
                                    "csrf_cross_origin");

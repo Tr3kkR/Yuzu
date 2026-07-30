@@ -12857,6 +12857,10 @@ private:
         // DashboardRoutes — /fragments/results, /fragments/results/filter-bar,
         //                   /fragments/create-group-form, /api/dashboard/group-from-results
         dashboard_routes_ = std::make_unique<DashboardRoutes>();
+        // #2537: declare the external origins BEFORE register_routes — the
+        // handlers capture `this` at registration and read the member per
+        // request, so setting it afterwards would never reach a live route.
+        dashboard_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
         dashboard_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn, response_store_.get(),
             mgmt_group_store_.get(), &registry_, tag_store_.get(), &event_bus_,
@@ -13085,6 +13089,9 @@ private:
         // The publish-CRL callback captures `this`; like the agent-cert signer it
         // relies on the gRPC/web drain in stop() running before members destruct.
         ca_routes_ = std::make_unique<CaRoutes>();
+        // #2537: same ordering rule as DashboardRoutes above — register_routes
+        // copies the list into its handler captures, so it must be set first.
+        ca_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
         ca_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn, ca_store_.get(),
             [this]() -> std::optional<std::vector<std::uint8_t>> { return publish_crl(); },
