@@ -1098,26 +1098,31 @@ Strategy:
 
 ### Deciding what happens to a NON-BLOCKING finding
 
-**Order matters, and this step is third.** Establish, in this order: is the
-finding valid; what is its provenance; what band does it DERIVE to; does it hit a
-policy floor. Only then does anything below apply.
+**This step is THIRD.** Establish first, in order: is the finding valid; what is its
+provenance; what band does it DERIVE to; does it hit a policy floor.
 
-**A gating finding is never dropped.** A derived CRITICAL/HIGH, or any policy
-floor, is fixed — or the change itself is withdrawn or re-cut. Nothing in this
-section is a waiver, and no reasoned ledger row makes a blocker optional; Gate 8's
-rule is unchanged. An INVALID finding — false, inapplicable, or disproven — is
-`rejected` with the evidence, at any band.
+**A gating finding is never deferred and never dropped.** A derived CRITICAL/HIGH,
+or any policy floor, is fixed — or the change itself is withdrawn or re-cut.
+Nothing below is a waiver and no ledger row makes a blocker optional; Gate 8's rule
+is unchanged.
 
-What follows applies ONLY to findings that are valid and non-blocking.
+An INVALID finding — false, inapplicable, or disproven — is `rejected` with the
+evidence. At a derived CRITICAL/HIGH, or on a policy floor, `rejected` additionally
+requires a NON-AUTHOR adjudicator recorded in `adjudicated_by`, exactly as the
+floor exception at the top of this file does. Otherwise "inapplicable" is a
+self-granted waiver, and the dangerous disposition ends up cheaper than the safe
+one.
+
+Everything below applies ONLY to findings that are valid and non-blocking.
 
 #### Test 1 — does the fix open an independently reviewable surface?
 
-Folding a fix keeps it in the SAME review pass, which is cheaper than a second
-one. That is not a claim that corrections are cheap to get right: Gate 8 re-routes
-every fix diff through all touched domains precisely because they are not.
+Folding keeps the fix in the SAME review pass. That is cheaper than a second pass;
+it is NOT a claim that corrections are cheap to get right — Gate 8 re-routes every
+fix diff through all touched domains precisely because they are not.
 
-What actually costs is a fix that introduces a surface a reviewer must reason
-about on its own:
+The cost is in a fix that introduces a surface a reviewer must reason about on its
+own:
 
 - new authority or privilege
 - new persistent state, or a new ownership lifecycle
@@ -1125,101 +1130,121 @@ about on its own:
 - a new public contract or compatibility boundary
 - a new dependency, process, thread, or deployment requirement
 
-**Completing an existing mandatory seam is NOT one of these**, even when the
-edited code is technically a probe or a gate. Adding a newly load-bearing store to
-the `/readyz` conjunction is the reference case: it is a probe, and it is a
-correction, and it folds. Do not let the label decide — most non-trivial
-corrections add a branch or a call path, so "does it add a mechanism" collapses on
-that case. Ask whether the surface is independently reviewable.
+**Completing an existing mandatory seam is not one of these**, even when the edited
+code is technically a probe or a gate. Adding a newly load-bearing store to the
+`/readyz` conjunction is the reference case: it is a probe, it is a correction, and
+it folds. A metric or alert riding an already-exposed endpoint folds too; a new
+exporter, dashboard or alert-routing path is a new surface and splits.
 
-Where classification is genuinely arguable, it does not decide anything: fold it
-and let Gate 8's routing determine the review cost.
+**If a bullet matches, it splits — arguability does not rescue it.** A fix that
+carries a credential, makes a network call, or interprets an auth status is never
+seam-completion. Only a finding that matches NO bullet and is still arguable folds,
+and then Gate 8's routing decides the review cost.
 
-#### Test 2 — can the ACCEPTED CONTRACT still be satisfied without it?
+#### Test 2 — can the ACCEPTED SCOPE still be satisfied without it?
 
-Not "is the change still worthwhile" — that is a preference, and it is answered by
-whoever benefits from saying yes. Anchor it to the envelope fixed BEFORE the
-findings arrived:
+Not "is the change still worthwhile" — that is a preference, answered by whoever
+benefits from saying yes. Anchor it to the envelope fixed BEFORE the findings
+arrived:
 
 - the originating issue's or ADR's requirements
 - user-facing and changelog claims
 - Gate 1's declared interfaces, behaviour, and security impact
 - any normative repository invariant
 
-If satisfying that envelope requires the fix, it belongs in the change. If
-satisfying it requires **withdrawing a claim or an acceptance criterion**, that is
-a scope change: it needs an explicit non-author adjudication and a re-cut, and it
-is not ordinary deferral. (#2581 is the worked example — the branch ended up
-withdrawing "proves invalidation" down to "proves owner-visible row absence".
-That was the right call, and it was a scope change, not a deferral.)
+**An anchor the change plainly implies but did not declare counts as present.**
+Gate 1 is written by the author before findings arrive, so an under-declared Gate 1
+would otherwise shrink the scope pre-emptively and make every finding outside it
+"not needed". Where the envelope is SILENT on something the change clearly touches,
+that silence is an adjudication trigger, not a licence — the same direction the
+Absences rule takes elsewhere in this file.
+
+If satisfying the envelope requires **withdrawing a claim or an acceptance
+criterion**, that is a scope change: explicit non-author adjudication and a re-cut,
+not ordinary deferral. Strip the withdrawn claim from the changelog fragment, the
+user docs and Gate 1's declared impact in the same change — a narrowed change still
+advertising the original control is `I6` false assurance.
 
 #### The dispositions
 
-| | Contract needs it | Contract does not |
+**Non-blocking findings only. A gating finding has no cell in this table.**
+
+| | Accepted scope needs it | Accepted scope does not |
 |---|---|---|
-| **No independent surface** | Fold | Fold if trivial and in a file already touched; otherwise its own small change |
-| **Independent surface** | **RE-CUT** (below) | **Split** — its own change, on its own review |
+| **No independent surface** | Fold | Fold if trivial — a one-line or mechanical change adding no new branch or condition — and in a file already touched; otherwise its own small change, or file it |
+| **Independent surface** | **RE-CUT** (below) | **Split** — its own change and its own review; or file it |
 
 The expensive mistake is the bottom-right: an independent surface folded into a
-change whose contract did not need it. Measured on #2581 — a bearer-token probe
-folded into a 41-line assertion fix produced six further blocking findings across
-two more rounds, none of them in the original change, and the branch was re-cut
-anyway. Note what the probe actually brought: a persisted credential, an
-authenticated network call, and status-code semantics. New authority, new state,
-new I/O. That is the cost, not the line count — the corrections in that same
-branch ran to 287 lines and converged.
+change whose scope did not need it. Measured on #2581 — a bearer-token probe folded
+into a 41-line assertion fix produced six further blocking findings across two more
+rounds, none of them in the original change, and the branch was re-cut anyway. Note
+what the probe brought: a persisted credential, an authenticated network call, and
+status-code semantics. New authority, new state, new I/O. The corrections in that
+same branch ran to 287 insertions (`6bf7e5d2~1..315247e3`, `scripts/ tests/`) and
+converged. **Line count is not the variable; surface is.**
 
-**Re-cut, concretely** — it is not a relabelled split, and it is only real if you
-say which is which:
+**Re-cut, concretely.** The discriminator is WHICH CHANGE OWNS THE ORIGINAL
+ACCEPTANCE CRITERIA — the mechanism does. Without that it is a stacked split with a
+new name. Then:
 
-- the mechanism becomes the deliverable and keeps the original acceptance criteria
-- the remainder goes FIRST, as a prerequisite that must have standalone value; if
-  it has none, do not split it out — the two land together or not at all
+- the remainder goes first, as a prerequisite that must have standalone value AND
+  standalone safety; a prerequisite that is only reachable-but-inert is a dormant
+  half, which gates as `I6`. On dispute, default to landing the two together
+- its changelog fragment must not claim the withheld behaviour
 - governance runs on the prerequisite independently, and again on the integrated
   range
-- if the original branch's contract is withdrawn rather than narrowed, replace the
-  PR rather than shortening it
 
-The familiar splits are instances of Test 1, which is why they generalise:
-observability is a new surface, so it follows the behaviour change; a refactor
-that makes something testable is a surface the behaviour depends on, so it goes
-first; a new REST route, MCP tool, store, proto change, schema migration or plugin
-ABI change gets its OWN REVIEW UNIT — with the wiring that makes it reachable.
-"Alone" never means landing a dormant half: that is `I6` shipped-incomplete or
-dormant-authorisation, which gates.
+Three further split rules, stated here for the first time — they are NOT
+restatements of existing practice:
 
-#### Filing, dropping, and why the default matters
+- a behaviour change and its observability are two changes, behaviour first
+- a behaviour change and the refactor that makes it testable are two changes,
+  refactor FIRST
+- a new REST route, MCP tool, store, proto change, schema migration or plugin ABI
+  change gets its own review unit, WITH the wiring that makes it reachable —
+  "alone" never means landing a dormant half
 
-Filing is the right disposition for separable work with a stated definition of
-done. It is the WRONG disposition for work nobody will pick up: governance is this
-repo's largest issue-inflow source, and inflow has run far ahead of closure —
-directionally, 183 opened against 17 closed in the five days to 2026-07-27, with
-509 of the open set never commented on. (Those figures compare different cohorts
-and ignore closure lag; treat them as a signal to look, not as a measurement.)
+#### Filing, parking, and why the default matters
 
-So the failure mode runs both ways, and neither is safe:
+Filing is right for separable work with a stated definition of done. Follow
+`docs/agents/issue-standard.md`, which is authoritative on shape and volume:
+one actionable outcome per issue, split bundles, dedupe is the only inflow filter.
 
-- file everything → a write-only log that buries the findings that mattered
-- drop what is inconvenient → real work disappears with no record
+For valid work that is real but will not be scheduled, the existing `roadmap` type
+is the disposition — parked on the roadmap Project, no priority, no triage state,
+excluded from the active backlog, and crucially **retained in the
+duplicate-detection snapshot**, so the next run touching that area surfaces it.
+That is the resurfacing mechanism: proximity, not a calendar.
 
-The guard is that **dropping must not be cheaper than filing.** A valid
-non-blocking finding that will not be fixed and will not be filed is recorded as
-`disposition: not-planned`, and that requires a named adjudicator who is NOT the
-change's author, plus a rationale. `rejected` is reserved for findings that are
-false, inapplicable, or disproven — never for real work without an owner.
+Two constraints keep `roadmap` from becoming a drop with paperwork. A third of the
+tracker already carries the label, so this matters:
 
-Bundling follows `docs/agents/issue-standard.md`, which is authoritative: one
-actionable outcome per issue, split multi-finding bundles, and dedupe is the only
-inflow filter. This section changes which findings reach that procedure; it does
-not change the procedure.
+1. **`roadmap` is unavailable for any finding carrying `I1`, `I2` or `I3` in its
+   impact list, whatever its derived band.** A finding lands at MEDIUM when its
+   EXPOSURE is rare, not when its consequence is small. A rare path to a failed
+   security control, to data loss, or to a silent wrong answer gets a priority, not
+   a park.
+2. **Escalate on second sighting.** If the mandatory dedupe probe turns up an
+   existing `roadmap` issue for a finding a later run raises again, that recurrence
+   is the signal it is not going away: fix it, or promote it out of `roadmap` with a
+   priority. **Never re-park.** This bounds the failure at ignored-once.
+
+Neither the number of issues nor the number of parks is a target. What is required
+is that every valid finding ends somewhere recorded — fixed, filed, linked to an
+existing issue, or parked under the two constraints above.
+
+**Record `provenance` on every finding, and state the split in the run report.**
+`introduced` / `newly-reachable` / `pre-existing` is already a required ledger
+field and is the only way to tell a change that introduced defects from a change
+that merely touched a weak area. Without it, "this run produced forty findings" is
+unattributable, and the reflex is to blame the diff. On #2581 the substantial
+majority were `pre-existing`, which is a fact about the harness, not the fix.
 
 **This file is the canonical runbook.** A separate Codex-side runner exists at
-`.codex/skills/governance/SKILL.md`. For the blocking contract it already defers
-here ("identical to the Claude runner — load it, do not restate it"), which is the
-right shape. It does, however, RESTATE a disposition rule for MEDIUM/SHOULD
-findings rather than deferring, so it can drift from this section without anyone
-noticing. Closing that by deferring instead of restating is for whoever owns that
-runner; editing this file carries no obligation to maintain it.
+`.codex/skills/governance/SKILL.md`; for the blocking contract it already defers
+here, which is the right shape. Its disposition rule for MEDIUM/SHOULD findings is
+restated rather than deferred, so it can contradict this section — closing that is
+for whoever owns that runner.
 
 ## Gate 8 — Iterate And Ledger
 
@@ -1310,7 +1335,7 @@ runner; editing this file carries no obligation to maintain it.
    | `provenance` | `introduced` / `newly-reachable` / `pre-existing`. **Adjudicated, not inferred from prose.** Default to `introduced` when contested |
    | `file`, `line`, `summary` | where and what |
    | `classification` + rationale | truth-contradiction vs wording, and why |
-   | `disposition` | `fixed` / `deferred-to-issue #N` / `rejected` |
+   | `disposition` | `fixed` / `deferred-to-issue #N` / `roadmap-#N` / `re-cut` / `rejected`. `roadmap-#N` is valid work parked per Gate 7 and is barred for any finding carrying `I1`/`I2`/`I3`. `re-cut` records that the original acceptance criteria travelled to the mechanism. `rejected` means false, inapplicable or disproven — at CRITICAL/HIGH or on a floor it requires a non-author `adjudicated_by` |
    | `adjudicated_by` (nullable) | who approved a departure, and that they were not the change's author |
    | `caused_by` (nullable) | did round N's fix create this round N+1 finding |
    | `waiver_rationale` (nullable) | *why* an unresolved gating finding was allowed to pass. A signature with no reasoning is content-free exception evidence |
