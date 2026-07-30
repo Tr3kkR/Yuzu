@@ -7,7 +7,9 @@
 # guard removed) would either block every docs PR again or, worse, let real
 # code merge without the required build. This exercises the code/docs/mixed,
 # root-vs-nested pattern semantics, the ignore set, and the 3000-file
-# truncation guard hermetically — no network, no GitHub.
+# truncation guard hermetically — no network, no GitHub. It also exercises the
+# named CI-infrastructure class against a temporary git repository, including
+# the former false-green: an unresolvable diff base must select the canary.
 #
 # Run:  bash tests/shell/test_detect_code_change.sh
 set -euo pipefail
@@ -54,6 +56,71 @@ expect true  "docs + nested markdown mixed"       2 $'docs/guide.md\nsdk/README.
 expect true  "truncation guard: 3 seen of 4"      4 $'docs/a.md\ndocs/b.md\ndocs/c.md'
 expect false "3000 docs files at cap boundary"    3000 "$(printf 'docs/f%d.md\n' $(seq 1 3000))"
 expect true  "empty file list"                     0 ''
+expect true  "invalid authoritative total"       nope $'docs/a.md'
+
+# --- named CI-infrastructure class ---
+# --- hermetic git-diff acquisition: match, proven empty, and failure ---
+tmp_repo=$(mktemp -d "${TMPDIR:-/tmp}/yuzu-change-classifier.XXXXXX")
+trap 'rm -rf "$tmp_repo"' EXIT
+git_fixture() {
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    git -C "$tmp_repo" "$@"
+}
+git_fixture init -q
+git_fixture -c user.name=Yuzu -c user.email=yuzu@example.invalid \
+  -c commit.gpgsign=false -c core.hooksPath=/dev/null \
+  commit --allow-empty -qm base
+base=$(git_fixture rev-parse HEAD)
+mkdir -p "$tmp_repo/.github/workflows"
+printf '%s\n' 'name: fixture' > "$tmp_repo/.github/workflows/fixture.yml"
+git_fixture add .github/workflows/fixture.yml
+git_fixture -c user.name=Yuzu -c user.email=yuzu@example.invalid \
+  -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm infra-change
+infra_commit=$(git_fixture rev-parse HEAD)
+
+mkdir -p "$tmp_repo/server"
+printf '%s\n' '// fixture' > "$tmp_repo/server/fixture.cpp"
+git_fixture add server/fixture.cpp
+git_fixture -c user.name=Yuzu -c user.email=yuzu@example.invalid \
+  -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm non-ci-change
+non_ci_commit=$(git_fixture rev-parse HEAD)
+
+# Git's default rename display reports only the destination for a detected
+# rename. Moving a workflow out of the owned tree must still expose its source
+# path and select the canary.
+mkdir -p "$tmp_repo/docs"
+git_fixture mv .github/workflows/fixture.yml docs/fixture.yml
+git_fixture -c user.name=Yuzu -c user.email=yuzu@example.invalid \
+  -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm rename-out
+rename_commit=$(git_fixture rev-parse HEAD)
+
+# A line-oriented classifier cannot prove the prefix of Git's C-quoted output
+# for a control-character filename. It must run the canary fail-closed.
+odd_path=$'docs/line\nbreak.md'
+printf '%s\n' 'fixture' > "$tmp_repo/$odd_path"
+git_fixture add -- "$odd_path"
+git_fixture -c user.name=Yuzu -c user.email=yuzu@example.invalid \
+  -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm quoted-path
+quoted_commit=$(git_fixture rev-parse HEAD)
+
+expect_diff() {
+  local want="$1" desc="$2" base_ref="$3" head_ref="$4"
+  local got
+  got=$(cd "$tmp_repo" && GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    bash "$SCRIPT" --class ci-infrastructure --git-diff "$base_ref" "$head_ref")
+  if [ "$got" = "$want" ]; then
+    printf '  [pass] %s\n' "$desc"; pass=$((pass + 1))
+  else
+    printf '  [FAIL] %s (want %s, got %s)\n' "$desc" "$want" "$got"; fail=$((fail + 1))
+  fi
+}
+
+expect_diff true  "git diff success: CI change selects canary" "$base" "$infra_commit"
+expect_diff false "non-empty non-CI diff may skip canary"       "$infra_commit" "$non_ci_commit"
+expect_diff true  "rename out of CI tree selects canary"        "$non_ci_commit" "$rename_commit"
+expect_diff true  "quoted path runs canary fail-closed"          "$rename_commit" "$quoted_commit"
+expect_diff false "git diff no-change: canary may skip"          HEAD HEAD
+expect_diff true  "git diff failure: canary runs fail-closed"    missing-base HEAD
 
 echo "----"
 echo "detect-code-change: pass=$pass fail=$fail"
