@@ -1236,9 +1236,12 @@ that does the work.
    is the signal it is not going away: fix it, or promote it out of `roadmap` with a
    priority. **Never re-park.** This bounds the failure at ignored-once.
 
-A third of the tracker already carries the label, so both matter. Constraint 1 is
-checkable against the ledger and Gate 8 step 4 does it; constraint 2 needs the
-dedupe probe's result and the target issue's labels, so it stays procedural.
+Over 300 open issues already carry the label, so both matter. That is stated as a
+floor rather than a share on purpose: an earlier draft said "a third of the tracker",
+which was true when written and is not now — the open count grew faster than the
+parked one. Constraint 1 is checkable against the ledger and Gate 8 step 4 does it;
+constraint 2 needs the dedupe probe's result and the target issue's labels, so it
+stays procedural.
 
 Neither the number of issues nor the number of parks is a target. What is required
 is that every valid finding ends somewhere recorded — fixed, filed, linked to an
