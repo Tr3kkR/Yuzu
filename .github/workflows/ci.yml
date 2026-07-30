@@ -141,6 +141,7 @@ jobs:
         run: |
           bash tests/shell/test_check_compose_versions.sh
           bash tests/shell/test_detect_code_change.sh   # docs-only gate classifier (#1978)
+          bash tests/shell/test_review_driver_substitution.sh  # patsub_replacement prompt corruption
 
       # ── Docs-only vs code gate (issue #1978) ───────────────────────────
       # Decide whether the heavy build matrix runs for this PR. The
