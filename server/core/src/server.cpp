@@ -90,6 +90,7 @@
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "dispatch_target_shape.hpp" // check_targeting_shape / targeting_supplied (#2500)
+#include "authz_model.hpp" // #1788: per-arm visibility intersection (in_scope/filter_to_scope)
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -8744,6 +8745,53 @@ private:
                 }
             }
 
+            // ── #1788: per-device visibility on EVERY dispatch arm ──────────────
+            // Everything above gates a possibly-GLOBAL Execution:Execute (or the
+            // destructive-action securable) and, for the destructive list only,
+            // narrows `agent_ids` to a coarser ManagementGroupStore visibility.
+            // Nothing narrowed the actual send set on ANY of the four dispatch
+            // arms below (explicit agent_ids, broadcast, Group, Scope) to the
+            // operator's own Execution:Execute visibility — a management-group-
+            // confined operator could reach a device outside their confinement
+            // through any of them. Derive ONE permission-specific visible set
+            // here and intersect every arm against it before send_to
+            // (`yuzu::server::authz::in_scope`/`filter_to_scope`).
+            //
+            // Composition mirrors `RbacStore::check_scoped_permission`'s OWN
+            // internal order (global first, else the ADR-0017 scoped set) —
+            // #1715(b): a global ALLOW overrides any group deny, so it is read
+            // via the SAME public `check_permission` call, never re-derived.
+            // JIT admin elevation and a service-scoped token's ITServiceOwner
+            // grant are the two OTHER ways `require_permission` above already
+            // admits a caller with no matching `principal_roles` row (neither
+            // is stored as a group-scoped grant `visible_agents_for_permission`
+            // could see) — both are treated as unfiltered here too, or a caller
+            // `require_permission` deliberately admitted would be silently
+            // emptied out below. Fail-closed: any store error narrows to
+            // "nothing visible", never "everything" — never re-decides the
+            // frozen #1715/INV-7 precedence those RbacStore calls already
+            // resolve, only composes on top of it.
+            yuzu::server::authz::VisibleSet exec_visible; // nullopt == unfiltered
+            {
+                auto sess = require_auth(req, res);
+                if (!sess)
+                    return; // require_auth already wrote the response
+                const bool unfiltered =
+                    auth::is_elevated(*sess) || !sess->token_scope_service.empty() ||
+                    (rbac_store_ &&
+                     rbac_store_->check_permission(sess->username, "Execution", "Execute"));
+                if (!unfiltered) {
+                    std::unordered_set<std::string> visible;
+                    if (rbac_store_) {
+                        if (auto v = rbac_store_->visible_agents_for_permission(
+                                sess->username, "Execution", "Execute", mgmt_group_store_.get()))
+                            visible.insert(v->begin(), v->end());
+                        // else: store error -> fail closed, visible stays empty.
+                    }
+                    exec_visible = std::move(visible);
+                }
+            }
+
             if (!registry_.has_any()) {
                 res.status = 503;
                 res.set_content(
@@ -8794,13 +8842,37 @@ private:
             // sibling instruction-execute route broadcast on the same string. One
             // advertised scope kind must not mean two things across sibling REST
             // routes (governance, security MEDIUM).
+            // #1788: send-to-all respecting `exec_visible` — shared by BOTH the
+            // named Broadcast arm and the untargeted-fallthrough arm below, so
+            // the two `send_to_all` call sites can never drift on whether the
+            // operator's own visibility floor applies.
+            const auto dispatch_broadcast = [&]() -> int {
+                if (!exec_visible)
+                    return registry_.send_to_all(cmd);
+                std::vector<std::string> known_ids;
+                for (const auto& a : registry_.to_json_obj())
+                    if (a.contains("agent_id"))
+                        known_ids.push_back(a["agent_id"].get<std::string>());
+                int n = 0;
+                for (const auto& aid :
+                     yuzu::server::authz::filter_to_scope(known_ids, exec_visible))
+                    if (registry_.send_to(aid, cmd))
+                        ++n;
+                return n;
+            };
+
             const auto arm = yuzu::server::classify_dispatch_arm(!agent_ids.empty(), scope_expr);
             if (arm == yuzu::server::DispatchArm::Group) {
-                // Group-based dispatch — resolve group members
+                // Group-based dispatch — resolve group members, then intersect
+                // with the operator's Execution:Execute visible set (#1788): a
+                // management group is a targeting mechanism, not an authz
+                // exemption from it.
                 auto group_id = scope_expr.substr(6);
                 if (mgmt_group_store_) {
                     auto members = mgmt_group_store_->get_members(group_id);
                     for (const auto& m : members) {
+                        if (!yuzu::server::authz::in_scope(exec_visible, m.agent_id))
+                            continue;
                         if (registry_.send_to(m.agent_id, cmd))
                             ++sent;
                     }
@@ -8867,7 +8939,12 @@ private:
                         if (auto matched_ids = registry_.evaluate_scope(
                                 *parsed, tag_store_.get(), custom_properties_store_.get(),
                                 result_set_store_.get(), principal)) {
-                            for (const auto& aid : *matched_ids) {
+                            // #1788: a scope match is a targeting mechanism, not
+                            // an authz exemption — intersect against the
+                            // operator's Execution:Execute visible set before
+                            // dispatch.
+                            for (const auto& aid : yuzu::server::authz::filter_to_scope(
+                                     *matched_ids, exec_visible)) {
                                 if (registry_.send_to(aid, cmd)) {
                                     ++sent;
                                 }
@@ -8886,14 +8963,25 @@ private:
                     }
                 }
             } else if (arm == yuzu::server::DispatchArm::Ids) {
-                for (const auto& aid : agent_ids) {
+                // #1788: an explicit id list is the arm #1788 named directly —
+                // intersect against the operator's Execution:Execute visible
+                // set before dispatch; a hidden id is silently dropped, not an
+                // error (matching how a scope/group match that resolves to
+                // nothing behaves here — the shape check above already refused
+                // an EMPTY supplied list, this is a non-empty list narrowed by
+                // visibility, a different thing).
+                for (const auto& aid :
+                     yuzu::server::authz::filter_to_scope(agent_ids, exec_visible)) {
                     if (registry_.send_to(aid, cmd)) {
                         ++sent;
                     }
                 }
             } else if (arm == yuzu::server::DispatchArm::Broadcast) {
-                // Explicitly asked for the fleet by its published name.
-                sent = registry_.send_to_all(cmd);
+                // Explicitly asked for the fleet by its published name — #1788
+                // still narrows delivery to the operator's visible set; the
+                // NAME `__all__` is preserved (never rejected, never reread as
+                // "no target"), only the SEND SET composes with visibility.
+                sent = dispatch_broadcast();
             } else {
                 // Broadcast ONLY when the caller named no target at all (#2500).
                 // A target that was SUPPLIED but resolved to nothing must never
@@ -8950,7 +9038,10 @@ private:
                     res.set_content(err.dump(), "application/json");
                     return;
                 }
-                sent = registry_.send_to_all(cmd);
+                // #1788: an omitted target means "the whole fleet" (#2500) —
+                // still narrowed to the operator's visible set, same as the
+                // named Broadcast arm above.
+                sent = dispatch_broadcast();
             }
 
             // Forward commands queued for gateway agents
