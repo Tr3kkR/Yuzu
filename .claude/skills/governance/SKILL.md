@@ -36,13 +36,71 @@ Gate 7 — address BLOCKING findings
 Gate 8 — re-review gates whose DOMAIN THE FIX TOUCHED, ledger, final decision
 ```
 
-Per CLAUDE.md: CRITICAL/HIGH are blocking, MEDIUM should be fixed, LOW addressed. Iterate until the team gives a clean bill. No commit until governance passes.
+Per CLAUDE.md standing rule 2: a finding BLOCKS when its **derived** band is CRITICAL or HIGH (see the shared preamble below), plus the policy floors listed there. Iterate until the team gives a clean bill. No commit until governance passes.
 
 ---
 
 ## Step 0 — Before you launch anything
 
-Run these in parallel to size the change and pick domain agents:
+### First: confirm you are running the current pipeline
+
+This skill and the routed-concern table are read **from your working tree**, so a branch
+that predates a change to either silently runs the old pipeline. At the time #2604
+merged, 81 of 81 local branches predated it.
+
+```bash
+git fetch origin dev -q || echo "WARNING: fetch failed - origin/dev may itself be stale"
+for f in .claude/skills/governance/SKILL.md .claude/routed-concerns.md CLAUDE.md; do
+  git diff --quiet origin/dev -- "$f" \
+    && echo "  ok       $f" \
+    || echo "  DIFFERS  $f   ($(git diff --shortstat origin/dev -- "$f" | sed 's/^ *//'))"
+done
+```
+
+Three things about that loop are load-bearing.
+
+**It compares the WORKING TREE, because that is what gets read.** The skill is loaded from
+your checkout, not from a commit, so the commit is the wrong object to test. An earlier
+version of this check compared `HEAD...origin/dev` - commit against commit - which reports
+**current** for a tree whose branch is up to date but which has an older skill checked into
+it (`git checkout <old-sha> -- .claude/skills/governance/`), and reports **stale** for a
+tree like the one this paragraph was written from, whose branch is months behind but whose
+files were copied across and are byte-identical to `origin/dev`. Both answers were wrong,
+and the dangerous one was the first.
+
+**It reports per path, and shows the size of the difference**, so the output is evidence
+rather than a verdict. A bare boolean over three aggregated paths tells you nothing you can
+act on.
+
+**It does not try to tell you WHY a file differs.** Whether you edited it or checked out an
+older copy is not knowable from git - both produce a working tree that differs from
+`origin/dev` - so the check reports the fact and leaves the judgement to you. If you are
+deliberately editing one of these files, `DIFFERS` on that path is expected and the diff it
+names is your own. Claiming to distinguish the two would be asserting something unverifiable,
+which is the failure mode a previous revision of this section shipped.
+
+**The fetch guard.** A bare `git fetch` whose exit status is discarded fails silently
+offline or on expired auth, and the comparison then runs against a stale cached
+`origin/dev` and reports **current** while your tree holds the old pipeline. That is the
+one direction this check exists to prevent.
+
+**`CLAUDE.md` is included** because it is loaded into every session, so a stale summary
+there outranks a correct skill in practice.
+
+If a path you are not editing reports `DIFFERS`, reconcile before running: rebase or merge
+`origin/dev`, or copy the current files across (`git checkout origin/dev -- <path>`), which
+is enough on its own - the check passes on content, so the files do not have to be committed
+to be current. Do not proceed on the assumption that your copy is current: the same failure
+mode produces confident false claims about which agents a change routes to.
+
+**The same rule applies to any claim that a file, row or invariant is ABSENT.** Check
+`git show origin/dev:<path>`, never `ls` or a working-tree grep. Staleness inverts absence
+claims, and an external reviewer pointed at your tree inherits the error rather than
+catching it.
+
+### Then: size the change and pick domain agents
+
+Run these in parallel:
 
 ```bash
 git log --oneline <range>
@@ -80,30 +138,207 @@ require `sre` and `compliance-officer` — size never gates a routed concern.
 ## Shared preamble — inject this into EVERY agent prompt
 
 Twelve agents asked for "BLOCKING / SHOULD / NICE" with no definition invent twelve
-different bars, and the operator normalises by hand. Paste this block verbatim into
-every Gate 2/3/4/6 prompt, in addition to that agent's own focus.
+different bars, and the operator normalises by hand. #2604 calibrated the merge
+THRESHOLD, which fixed the gate but left the bands undefined — CRITICAL and HIGH
+both mapped to the same tier with no criterion separating them, while the ledger
+records the native band and CLAUDE.md acts on it.
+
+The block below closes that: the band is derived from stated facts, so a wrong
+band shows up as a mismatch between the facts and the label rather than as an
+unfalsifiable judgement. Two structural points, both learned the hard way in
+review (#2623):
+
+- **The facts are independent fields, not one choice.** An earlier draft collapsed
+  actor privilege, configuration, rarity and production-reachability into a single
+  enum. A race-based authorisation escape under a non-default flag truthfully
+  satisfied three values that derived different bands, so severity was still being
+  chosen. List every value that applies; the strongest modifier wins.
+- **Contract violations are not operational severity.** A missing Resource Ledger
+  or a broken platform build has no production trigger and no wrong outcome, so an
+  honest derivation lands it at INFO. Those are policy floors and bypass the
+  derivation entirely.
+
+Paste this block verbatim into every Gate 2/3/4/6 prompt, in addition to that
+agent's own focus.
 
 ```
-## Severity — report in YOUR OWN vocabulary, against these shared thresholds
+## Severity — DERIVE it, do not choose it
 
-Keep the severity vocabulary your own brief specifies (security-guardian:
-CRITICAL/HIGH/MEDIUM/LOW/INFO; docs-writer: BLOCKING/SHOULD-FIX/NICE-TO-HAVE;
-most others: BLOCKING/SHOULD/NICE). Do NOT switch vocabularies — the operator
-normalises with the map below, and a renamed band loses information.
+Report in the severity vocabulary your own brief specifies. Do NOT switch
+vocabularies — a renamed band loses information. But do NOT pick a band by feel
+either. State the facts below; the band follows from them. Where your brief's own
+severity criteria disagree with the derived band, **the derived band governs the
+GATE**; record your brief's label as `severity_native` and say they disagreed.
 
-What is calibrated is the THRESHOLD, not the label:
+Every finding MUST carry, as separate fields — they are independent, and collapsing
+them into one choice is what let severity be chosen:
 
-GATING  — would cause incorrect behaviour, data loss, a security regression, or
-  misleading operator guidance in production. You must be able to name the failing
-  input or state. If you cannot, it is not gating.
-  Maps from: CRITICAL, HIGH, BLOCKING.
-SHOULD  — a real defect with bounded blast radius, or a missing test for a
-  behaviour that has one.
-  Maps from: MEDIUM, SHOULD, SHOULD-FIX.
-NICE    — everything else. Maps from: LOW, INFO, NICE, NICE-TO-HAVE.
+1. TRIGGER — the concrete input, state, or configuration that produces it. Name
+   it. "Under load" and "in some cases" are not triggers. If you cannot isolate
+   one, write `unresolved` — do NOT downgrade IMPACT to compensate.
+2. IMPACT — what goes wrong if this ships. Closed list. **List EVERY value that
+   applies**; the strongest gives the base band. A crash that also corrupts is
+   `I2` AND `I5`, and it derives from `I2`. Recording only the weaker one is how
+   severity gets chosen.
+3. EXPOSURE — what is required for it to happen. Closed list. **List EVERY value
+   that applies**; the strongest modifier is the one that counts.
+4. EPISTEMIC STATUS — `verified` (you ran something and observed the outcome),
+   `likely` (reasoned from code you actually read), or `speculative` (you can
+   name neither the code path nor a candidate trigger — a hypothesis about code
+   you have not read). `likely` is the normal case and gates normally. Only
+   `speculative` is exempt, and it is the narrow case, not the humble one.
 
-Where your vocabulary does not map cleanly, say so and treat it as GATING. That
-default is deliberate: an unmappable finding must not be silently downgraded.
+### IMPACT — gives the base band
+
+  I1  security-control failure — an authn, authz, confinement, crypto, or
+      audit control does not hold                                     base HIGH
+  I2  data loss or corruption — data destroyed or wrong. A surfaced
+      error does not lower this; silence is not a precondition                   base HIGH
+  I3  wrong result presented as correct — the caller cannot tell      base HIGH
+  I4  harmful operator guidance — a doc, runbook, or error message
+      directs an operator to a NAMED action that causes damage, or
+      that fails in a way which conceals the real state. Guidance
+      that merely fails visibly and diagnosably is I7 or I8, not I4  base HIGH
+                                                                      (caps at HIGH)
+  I5  unavailability — crash, hang, deadlock, wedge, unbounded growth base MEDIUM
+  I6  capability absent or unreachable — a deliverable the change
+      presents is not actually reachable in production (shipped-
+      incomplete), or a required call site is missing                 base MEDIUM
+  I7  required documentation absent for a shipped behaviour change    base MEDIUM
+                                                                      (caps at HIGH)
+  I8  degraded but correct — slow, wasteful, noisy; output still right base LOW
+  I9  no operational impact — latent, stylistic, defence-in-depth only base INFO
+
+I6 raises to HIGH in exactly two cases:
+  (a) FALSE ASSURANCE — the change advertises a security or data-integrity
+      control as in force which is not in fact enforced; or
+  (b) DORMANT AUTHORISATION CODE — a new authz or enforcement branch ships with
+      no production caller or author, so it goes live later without re-review.
+      #2202 Blocker 4 is the reference case for (b): an RBAC resolver consuming
+      a grant no production route could author. It is (b), NOT (a) — that
+      resolver fails CLOSED, so nothing was under-enforced.
+
+I5 raises to HIGH in any of three cases:
+  (a) it is REPRODUCIBLE unavailability of the server or agent process reached on
+      an ordinary request path — a triggerable control-plane crash gates, and
+      does not need an unauthenticated reporter to do so;
+  (b) it is unbounded or persistent AND falls on a serialised path shared with a
+      security or data-integrity operation (revocation, enforcement, audit,
+      retention);
+  (c) it wedges a state machine. Delaying a
+security operation at scale is a security outcome, not a performance one. #2580's
+15s unbatched sampler on the agent-revocation thread is the reference case, and
+the class also covers #2284's state-machine wedges.
+
+I7 raises to HIGH when the omission conceals a breaking change, a security-
+relevant behaviour, a data-loss risk, a migration step, or an irreversible
+operation. Otherwise it stays MEDIUM. I4 and I7 never exceed HIGH: a document
+is not reached by an attacker, so EXPOSURE cannot promote it to CRITICAL.
+
+### EXPOSURE — list all that apply; strongest modifier wins
+
+  E1  unauthenticated, in the DEFAULT configuration                   raise one band
+  E2  an actor operating BEYOND the privilege it starts with
+      (escalation, confinement escape). Judge by the privilege
+      REQUIRED to begin, never the privilege gained                   raise one band
+  E0  no actor required — it fires unconditionally in production: a timer, a
+      background thread, a boot path, a scheduled sweep                no change
+  E3  any authenticated actor within its own privilege, default
+      configuration — including the ordinary operator                 no change
+  E4  requires a non-default configuration                            no change
+  E5  requires a race or a rare environmental condition (clock skew,
+      disk full, concurrent writer, partial failure)                  no change
+  E6  the WRONG OUTCOME — not merely the code branch — is proven
+      unable to occur in production                                   cap at LOW
+
+Bands, ordered:  INFO < LOW < MEDIUM < HIGH < CRITICAL
+Order of operations: apply the strongest RAISE first, then any CAP. `E6` is
+applied LAST and dominates every raise — the same recorded facts must not derive
+CRITICAL or LOW depending on the order they are read in.
+
+E4 is deliberately NOT a downgrade. In Yuzu the default is frequently the LESS
+hardened setting — RBAC off is the default, `--auth-mode=sso-only` is opt-in — so
+"only with the flag on" often means "only for the customers who care most".
+
+E6 is about the OUTCOME, not the branch. A branch with no production caller is
+usually I6 (shipped-incomplete), not E6 — E6 requires proving the wrong outcome
+cannot occur, which a missing caller does not establish. If both a security
+control failed AND the actor ends up beyond its privilege, that is I1 with E2;
+do not report the escalation as though it were the only fact.
+
+### The gate
+
+BLOCKING = the derived band is CRITICAL or HIGH.
+
+Vocabulary map, derived from the bands above, not asserted alongside them:
+  BLOCKING / SHOULD / NICE     → BLOCKING = CRITICAL|HIGH, SHOULD = MEDIUM,
+                                  NICE = LOW|INFO
+  BLOCKING / SHOULD-FIX / NICE-TO-HAVE  → the same three
+  low / medium / high / critical        → already bands; INFO absent, use LOW
+
+### Policy floors — gate regardless of the derived band
+
+These are contract violations, not operational severity. They do not run through
+IMPACT/EXPOSURE and they always gate:
+
+  - a Resource Ledger omission on a C++ diff
+  - a direct edit to `CHANGELOG.md`, or a missing mandated `changelog.d/` fragment
+  - a broken build or test leg on any supported platform that this change
+    INTRODUCED or newly exposed — not a pre-existing or environmental failure
+  - manual resource cleanup in NEW C++ that is not RAII-wrapped. The
+    "documented impossibility" exception is NOT self-granted: it must be
+    adjudicated by an agent other than the one proposing it and recorded in the
+    ledger with `adjudicated_by`. Pre-existing cleanup in a file this change
+    merely touches is SHOULD, not a floor — a deliberate narrowing, see the
+    tuning doc
+  - a violation of an explicit MUST / never / catastrophic-if-violated invariant.
+    CLOSED to three sources, so floor membership is not a judgement call: a
+    catastrophic-if-violated clause in a `.claude/routed-concerns.md` row; a
+    CLAUDE.md sentence inside a standing-rule or invariant block; an accepted
+    ADR's normative requirements. NARRATIVE prose does not qualify — an ADR
+    saying a thing "never landed" is history, not a contract. If you cannot
+    point at one of those three, it is not a floor — a
+    second copy of a single-chokepoint rule, a forked dangerous-op gate, an
+    approval gate outside the core primitive, a new server SQLite store with no
+    exception ADR. These have no wrong outcome TODAY, which is exactly why the
+    derivation cannot see them
+  - an ownership or lifetime defect of the kind `cpp-safety`'s blocking contract
+    enumerates: a leak, a double-close/double-free, a use-after-free or
+    borrowed-data escape, an unjoined or ambiguously-owned thread, unsafe shell
+    string construction, or a cast resting on undocumented aliasing/lifetime.
+    These derive `I5`/MEDIUM on an ordinary path and would otherwise stop gating
+  - a FALSE-GREEN test offered as closure evidence for a blocking finding — a
+    test that cannot observe what it asserts. Ordinary missing coverage stays
+    SHOULD; this is a floor because it is evidence of resolution that is not
+    evidence of anything (#2580 parity test)
+
+A missing test for a behaviour that has a bounded blast radius is SHOULD, not a
+floor.
+
+### Absences — and which way each one points
+
+- TRIGGER unresolved → keep IMPACT honest. It is `speculative` ONLY if you also
+  have no code path — that is the definition above. If you READ the code and
+  named the path but cannot yet isolate the input, it stays `likely` (so it
+  gates) and is flagged for adjudication. Never record a lower IMPACT than you
+  observed in order to express low confidence.
+
+  EPISTEMIC STATUS is an operation on the GATE, not on the band. Derive and
+  report the band normally; `speculative` then converts the finding into a
+  MANDATORY INVESTIGATION rather than a merge blocker: it is recorded at its
+  derived band, it must be resolved to `verified` or `likely` before the gate
+  passes, and resolving it may confirm the band and block. It is a deferral of
+  the decision, never a dismissal of it. `verified` and `likely` gate normally.
+  If a finding is BOTH speculative AND has unresolved EXPOSURE, it GATES
+  outright: a schema failure outranks weak evidence, because the unknown may
+  be `E1`.
+- EXPOSURE undeterminable → record `unresolved`. It does NOT default to E3, and
+  it GATES pending adjudication. Defaulting an unknown to "no change" is a silent
+  downgrade of a possible E1.
+- Your vocabulary does not map → gate it, and say so.
+
+Your evidence being weak points DOWN, via EPISTEMIC STATUS. The schema failing
+points UP. Those are different things and they are deliberately not symmetric.
 
 ## Prose: docs-writer owns WORDING, the domain agent owns TRUTH
 
@@ -132,6 +367,12 @@ descriptive or normative is exactly the disputed question, so a mis-classificati
 should cost a line of noise, not a lost finding.)
 
 ## Verify what you can, read-only
+
+Verify the reviewer read what you think it read. A finding derived from corrupted
+input is confident and wrong, and reads exactly like a finding derived from clean
+input — a shell `patsub_replacement` setting silently rewrote every `&` in a review
+payload on #2622, and the corruption was invisible in the output. Echo back a
+distinctive line of the source before trusting a review of it.
 
 Where a claim can be tested cheaply — a query, a compile, a one-case test — TEST IT
 and report the output. An empirically verified finding outranks a reasoned one, and
@@ -196,9 +437,10 @@ callback context, subprocess, mapped library, and temp path. Each
 resource must have exactly one owner, one release path, explicit
 transfer behavior, and checked failure cleanup.
 
-Manual cleanup in new or touched C++ code is BLOCKING unless it is
-wrapped in a small RAII owner/scope guard or the exception is documented
-as impossible to express safely. Check every early return between
+Manual cleanup in NEW C++ code is a policy floor (see the shared preamble)
+unless it is wrapped in a small RAII owner/scope guard or the exception is
+documented as impossible to express safely. Pre-existing cleanup in a file
+this change merely touches is SHOULD, not a floor. Check every early return between
 acquire and release.
 
 Shell-command surfaces are high risk: new `system()`, `popen()`, shell
@@ -357,8 +599,10 @@ round.
 ## Output format
 
 Findings table with severity (CRITICAL / HIGH / MEDIUM / LOW / INFO),
-file:line, description, recommended fix. CRITICAL and HIGH block
-merge. Also note any invariants the changes *strengthen* that should
+file:line, description, recommended fix, and the four derivation facts.
+Blocking is decided by the derived band per the shared preamble — do not
+assert it from your own label. Also note any invariants the changes
+*strengthen* that should
 be preserved against future regression.
 
 Report in under 800 words.
@@ -375,9 +619,11 @@ Use `git show <sha>` and `git diff <range>` to see the full scope.
 ## Your job
 
 You are the mandatory docs reviewer for Gate 2. Read every modified
-file and the related user-facing documentation. Per CLAUDE.md
-"Documentation requirements": user-facing behavior changes without
-doc updates are BLOCKING.
+file and the related user-facing documentation. Per standing rule 2:
+a user-facing behaviour change with no doc is `I7` — SHOULD by default,
+BLOCKING when the omission conceals a breaking change, security-relevant
+behaviour, data-loss risk, migration step, or an irreversible operation.
+Do not assert a blanket BLOCKING.
 
 Specifically verify:
 1. REST API docs (`docs/user-manual/rest-api.md`) — endpoint signature,
@@ -395,7 +641,7 @@ Specifically verify:
 
 ## Output format
 
-BLOCKING = user-facing behavior changed and no doc reflects it.
+Severity per standing rule 2: a user-facing behaviour change with no doc is `I7` — MEDIUM by default, HIGH (blocking) only when the omission conceals a breaking change, security-relevant behaviour, a data-loss risk, a migration step, or an irreversible operation.
 SHOULD-FIX = doc drift that would confuse an operator.
 NICE-TO-HAVE = style/precision improvements.
 
@@ -681,7 +927,7 @@ state, schema, and contract consistency. Check:
    the same PR. Contract text: `docs/agentic-first-principle.md` §A5.
    security-guardian co-checks `readOnlyHint`/`destructiveHint`/
    `idempotentHint` truthfulness against tier + dispatch behavior —
-   a false safe-direction hint is a BLOCKING (HIGH) finding.
+   a false safe-direction hint derives `I4` (harmful operator guidance).
 
 10. **Published-contract vs code, and classifier completeness** (see the
    security preamble's "Design-contract & state-machine tracing" check).
@@ -750,7 +996,9 @@ Produce a chaos test design with these entries. For each scenario:
 5. **Trigger** — the action(s) that expose the fault
 6. **Success criteria** — observable post-conditions proving invariant
 7. **Rollback** — how to restore safe state (git reset? DB restore?)
-8. **Severity / phase** — P0 block-merge, P1 pre-release, P2 nightly
+8. **Severity / phase** — P0 block-merge, P1 pre-release, P2 nightly. P0 is a
+   scenario-planning label, NOT a gate: a chaos scenario blocks only if the
+   underlying finding derives CRITICAL/HIGH or hits a policy floor.
 
 Focus on scenarios where two or more unhappy-path risks compound —
 individual fault injection in isolation often misses the real
@@ -776,7 +1024,7 @@ Each agent gets the same Gate 1-5 context and focuses on a different aspect:
 
 Use the same structural preamble as Gate 4 agents, vary the "Your job" stanza to the agent's domain.
 
-**Watch for:** sre routinely catches pre-existing readiness-probe gaps that become BLOCKING because the PR makes an existing store more load-bearing. The HC-1 pattern (store missing from `/readyz`) reappears — always verify the new store(s) in scope are in the probe conjunction.
+**Watch for:** sre routinely catches pre-existing readiness-probe gaps that become gating because the PR makes an existing store more load-bearing (they derive `I5`/`I1` once the store is on a live path). The HC-1 pattern (store missing from `/readyz`) reappears — always verify the new store(s) in scope are in the probe conjunction.
 
 **Watch for:** enterprise-readiness flags breaking-changes-without-upgrade-note more reliably than other agents. If the PR changes non-admin behavior, a changelog FRAGMENT carrying the Breaking entry (`changelog.d/<PR#>-<slug>.changed.md` or `.security.md`, body led with `**Breaking —**`) plus a `docs/user-manual/server-admin.md` upgrade note is almost always required. Do NOT ask for a `CHANGELOG.md` section — that file is frozen and edited only at release.
 
@@ -799,7 +1047,8 @@ as an appendix — you are changing presentation, not content.
 
 Cluster two findings ONLY when they share the same file:line AND the same defect.
 Anything else stays separate. For each cluster: list its reporting agents, take the
-MAXIMUM severity of its members, and do NOT re-adjudicate severity or dismiss a
+MAXIMUM **derived** severity of its members (record the native labels alongside),
+and do NOT re-adjudicate severity or dismiss a
 finding. Mark every cluster PROVISIONAL.
 ```
 
@@ -817,11 +1066,31 @@ Convergence is the strongest confidence signal this pipeline produces — "found
 independently by three agents" is why a finding gets acted on without re-derivation.
 This pass keeps that signal and drops the re-reading; it must not launder it.
 
+**But count only INDEPENDENT reporters.** This pipeline manufactures correlation on
+purpose: Gate 3 is handed Gate 2's findings and Gate 4 is handed Gate 2's and Gate
+3's, all "for your context only, do not duplicate". An agent that was SHOWN a
+finding and agrees is an echo, not a confirmation. Only agents in the SAME parallel
+wave — who could not see one another — are independent.
+
+So the attribution line reads `independently: 2 of 4 (Gate 4 wave); echoed: 1
+downstream`, never a bare count. A finding echoed by five downstream agents and
+raised independently by one is a ONE-agent finding. Record `independent_reporters`
+in the ledger, not just `agent`.
+
+This cuts both ways and neither direction is safe to assume: correlated reviewers
+overstate confidence, and a reviewer that defers to a peer's partial conclusion can
+withdraw a finding that was correct. Both have happened here inside a month — three
+reviewers confirming a false claim because they shared one stale working tree
+(#2604), and a reviewer dropping a true finding on a peer's incomplete evidence
+while that peer was independently confirming it (#2622). Neither is visible from
+the output. When it matters, measure the claim yourself rather than counting who
+agreed.
+
 ---
 
 ## Gate 7 — Findings Resolution
 
-**BLOCKING** = CRITICAL / HIGH security, BLOCKING from any Gate 4-6 agent, or any finding that explicitly says "blocks merge".
+**BLOCKING** = the derived band is CRITICAL or HIGH (shared preamble), or a policy floor was hit. Resolve against the derived band, not the reporting agent's native label — record both. An agent brief that says its own CRITICAL/HIGH "blocks merge" does NOT self-certify: that text predates standing rule 2 and is superseded by the derived band. The only non-derived blocker is a policy floor or an explicit operator instruction.
 
 Strategy:
 1. **Fold compatible fixes into one commit.** If sec flags H1, docs flags B3, QA flags B5, and they all touch related files, fix as a single "hardening round" commit rather than three small ones.
@@ -857,11 +1126,46 @@ Strategy:
 
 2. **Don't commit until governance passes.** Per CLAUDE.md.
 
-3. **Record every finding in the run ledger.** Write a JSONL file at
-   `<run-log-dir>/governance-findings.jsonl` — one object per finding. There is **no
-   database and no shared store yet**; this is a per-run file, and making it durable
-   shared change-control evidence is tracked separately. Do not describe it as more
-   than it is.
+3. **Record every finding in the run ledger.** One JSONL object per finding, in a
+   **repo-committed fragment** on the `changelog.d` model (#2618):
+
+   ```bash
+   # Default: a fragment in the repo, committed with the work it reviews.
+   # Override to a scratch dir for a throwaway local run you will not commit.
+   GOV_DIR="${YUZU_GOV_LOG_DIR:-governance.d}"
+   mkdir -p "$GOV_DIR"
+
+   # O_EXCL must protect the path that is actually COMMITTED. `mktemp` on a stem
+   # followed by `mv "$X" "$X.jsonl"` does NOT: mv overwrites silently, so a
+   # suffix collision destroys the earlier run's findings with no error at all.
+   # `mktemp -u` supplies only the random stem; `noclobber` does the atomic create.
+   LEDGER="$(mktemp -u "$GOV_DIR/<PR-or-issue-number>-<short-slug>.XXXXXX").jsonl"
+   (set -o noclobber; : > "$LEDGER") \
+     || { echo "ledger exists, refusing to overwrite: $LEDGER" >&2; exit 1; }
+   ```
+
+   **Do not "simplify" this to `mktemp "$GOV_DIR/….XXXXXX.jsonl"`.** GNU `mktemp`
+   accepts `X`s mid-template; BSD/macOS `mktemp` requires them trailing, and this
+   repo ships macOS. The two-step exists for portability — the bug was doing the
+   second step with `mv` instead of an exclusive create.
+
+   The `noclobber` redirect is what makes the guarantee: the committed `.jsonl`
+   path is created `O_EXCL`, so a suffix collision FAILS LOUDLY instead of
+   overwriting. Uniqueness is enforced by the filesystem rather than assumed from
+   a timestamp. One file per RUN, not per PR: Gate 8 iterates, `pass_ordinal`
+   distinguishes rounds inside a file, and a fresh run gets a fresh fragment.
+
+   **Why in the repo.** The record is evidence for whoever reviews the PR — which
+   findings were raised, which fixed, which deferred and by whom. A path under
+   `$HOME` is unreadable by the reviewer by construction, and SOC 2 CC8.1 evidence
+   has to be retrievable by someone other than whoever produced it. The cost is
+   accepted deliberately: fragments appear in diffs, and an uncommitted one is
+   destroyed by `git clean` — the same window a changelog fragment already lives in.
+
+   There is still **no database and no shared store**; this is a per-run file that
+   happens to be version-controlled. Retention — whether old fragments are pruned,
+   assembled, or kept indefinitely as the access-review campaigns are — is a
+   separate decision and is NOT made here. Do not describe it as more than it is.
 
    Fields, all required unless marked:
 
@@ -871,7 +1175,13 @@ Strategy:
    | `pass_ordinal` | **which round.** Without it the final pass is indistinguishable from the first, and `caused_by` below presupposes a round identity the schema would otherwise lack |
    | `finding_id` | stable across rounds — `caused_by` is uncomputable without a join key |
    | `severity_native` | the agent's OWN vocabulary, unmodified |
-   | `severity_mapped` | GATING / SHOULD / NICE per the shared threshold map |
+   | `severity_mapped` | BLOCKING / SHOULD / NICE, derived per the severity rule |
+   | `trigger` | the concrete input/state/config, or `unresolved` |
+   | `impact` | every applicable `I1`…`I9` — a list; the strongest gives the band |
+   | `exposure` | every applicable `E0`…`E6`, or `unresolved` — a list, not one value. `E6` is applied last and dominates every raise |
+   | `epistemic_status` | `verified` / `likely` / `speculative` |
+   | `independent_reporters` | how many agents raised it WITHOUT having been shown it — downstream echoes are not confirmations |
+   | `policy_floor` | the floor hit, if the finding gates as a contract violation rather than by derivation |
    | `provenance` | `introduced` / `newly-reachable` / `pre-existing`. **Adjudicated, not inferred from prose.** Default to `introduced` when contested |
    | `file`, `line`, `summary` | where and what |
    | `classification` + rationale | truth-contradiction vs wording, and why |

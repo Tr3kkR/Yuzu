@@ -153,7 +153,7 @@ On an ordinary PR: unchanged roster, quieter output — and after a few weeks, t
 
 ---
 
-## 7. Second-round amendments (2026-07-28)
+## 8. Second-round amendments (2026-07-28)
 
 A colleague reviewed this PR and returned a larger proposal plus a five-item amendment
 list. Both adversarial reviewers re-ran at maximum rigour to verify every claim from the
@@ -228,3 +228,201 @@ the practical exit is fatigue. Their own text says exactly this. What should not
 conceded is that every subsequent finding is churn: on #2580, re-review of the fix rounds
 found three genuine BLOCKING defects introduced *by the fixes*, which is why Gate 8 is
 retained and strengthened here.
+
+---
+
+## 9. Severity derivation (follow-up, PR #2623)
+
+§3.1 calibrated the merge **threshold** — one gating tier, with native labels mapping onto
+it. That fixed the gate and left the bands undefined: CRITICAL and HIGH both mapped to the
+gating tier with no criterion separating them, LOW and INFO both to the bottom tier.
+Exactly one clause was falsifiable — *"you must be able to name the failing input or
+state"* — and the rest were adjectives.
+
+It matters because the pipeline both **records** the native band (`severity_native`) and
+**acts** on it, and because FortitudeEtc's deferred triage design keys on *"the reviewer's
+own severity, exactly as today"*, naming §3.1 as what makes that mapping reliable.
+
+### The model
+
+Four **independent** fields per finding — TRIGGER, IMPACT (`I1`–`I9`, base band), EXPOSURE
+(**all** applicable `E0`–`E6`, strongest raise first then any cap; `E6` applies last and dominates), EPISTEMIC STATUS — plus a separate
+set of **policy floors** that gate as contract violations without running through the
+derivation. `BLOCKING` = derived band CRITICAL or HIGH.
+
+### What the first draft got wrong, and why it is recorded here
+
+The first cut of this PR used a single-choice `CONSEQUENCE` + `REACHABILITY` pair. Two
+independent adversarial reviews (Fable, Sol, both at maximum effort) returned BLOCK, and
+between them established that the shape — not the wording — was the defect:
+
+- **A single reachability enum forced four independent dimensions into one choice** — actor
+  privilege, configuration, rarity, production liveness. A race-based authorisation escape
+  under a non-default flag truthfully satisfied three values that derived different bands.
+  Severity was still being chosen, just with more ceremony. Hence independent fields and
+  "list all that apply".
+- **`R6` said "floor at LOW" where a cap was meant** — mechanically it *raised* an
+  unreachable INFO to LOW and left a dead-code HIGH gating. Both reviewers also found that
+  the obvious one-word fix was wrong too: "no production caller" is not "no production
+  consequence". That distinction is now `I6` (shipped-incomplete) versus `E6` (the wrong
+  outcome provably cannot occur).
+- **The closed list was not closed.** Classes the pipeline blocks on today derived to INFO:
+  Resource Ledger omission, a direct `CHANGELOG.md` edit, a broken platform build leg,
+  non-RAII manual cleanup in new C++, and — found in re-review — violation of any explicit
+  MUST / catastrophic-if-violated invariant in CLAUDE.md, the routed-concern table or an
+  accepted ADR (a second copy of a single-chokepoint rule has no wrong outcome *today*,
+  which is exactly why the derivation cannot see it). They have no production trigger and
+  no wrong outcome, so an honest derivation floors them. All are contract violations and
+  are now **policy floors**. A missing test is NOT a floor — it is SHOULD, restoring
+  §3.1's clause.
+- **The unknown-exposure default was inverted** against this document's own stated
+  principle. Defaulting to "no change" silently downgrades a possible `E1`. Unresolved
+  exposure now gates pending adjudication.
+- **Weak evidence was being expressed as low impact**, which meant recording something
+  false — observed corruption with an unisolated trigger became "no observable
+  consequence". Confidence is now its own field. (`happy-path.md` already carried an
+  `epistemic_status`; this aligns with it rather than inventing it.)
+
+### Calibration against the corpus
+
+Applied to findings whose bands the team already agreed on. Counted honestly, after two
+rounds of re-review forced the count down twice:
+
+- **Two reproduce unaided:** #2202 B2, #2202 B3.
+- **One matches on band with incomplete facts:** the `pg_locks` runbook (`I3` and `I4` both
+  apply, and `E5` — a rare multi-database collision — belongs in the record).
+- **Four are CALIBRATED, not validated** — the model was changed after seeing them derive
+  the wrong band: #2202 B4 (`I6` escalator), the #2580 parity test (false-green floor), the
+  #2580 sampler (`I5` prong (b)), and the `std::jthread` macOS break (the broken-build
+  floor did not exist in the first cut and was added with the corpus row already on the
+  table). Each is marked in the table. The `jthread` row was counted "unaided" through two
+  successive corrections of this tally before the third review round caught it — the count
+  has been wrong in the flattering direction every single time it has been restated, which
+  is worth more as a caution than the number itself.
+- **One acknowledged mismatch remains:** #2202 B1.
+
+A calibrated row is not evidence the rule works; it is the rule being taught. The three of
+them are principled rather than ad hoc — each names a class, not an instance — but the
+distinction has to stay visible or the corpus becomes a mirror.
+
+| finding | derives | historical | |
+|---|---|---|---|
+| #2202 B2 — namespace scan boots clean on corrupt `rbac.db` | I1 + E5 → HIGH | HIGH | match |
+| #2202 B3 — engine actions stamped `principal_class=agent` | I1 + E3 → HIGH | HIGH | match |
+| #2202 B4 — RBAC resolver with no production grant author | I6→HIGH + E3 | HIGH | match **(calibrated: the escalator was added for this class after observing it derive MEDIUM)** |
+| #2580 — `pg_locks` runbook terminates another tenant's backend | I3 + I4 + E3 + E5 → HIGH | BLOCKING | match |
+| #2580 — parity test cannot observe the field it asserts on | policy floor (false-green closure evidence) | BLOCKING | match **(calibrated: floor added for this class)** |
+| #2580 — `std::jthread` breaks the macOS leg | policy floor | BLOCKING | match |
+| #2202 B1 — engine credential gains fleet-wide Read, RBAC off | I1 + E2 → **CRITICAL** | HIGH | **promotion, gate-neutral** |
+| #2580 — 15s sampler unbatched full-column scan | I5 + **E0** → HIGH via prong (b) | BLOCKING | match **(calibrated: escalator added for this class)** |
+
+Four of the eight rows changed the model. Earlier revisions of this section claimed it was
+one, then three; both were wrong, and both were wrong in the direction that made the rule
+look better tested than it is. Re-review
+established that its first wording was also wrong — it claimed the absent capability was an
+under-enforced control, but that resolver fails CLOSED, so nothing was under-enforced. The
+escalator now names two distinct prongs, and B4 is the reference case for the second
+(dormant authorisation code that goes live later without re-review), not the first.
+
+**The remaining mismatch is left in rather than tuned away.** Fitting the table to the corpus
+after seeing it would be overfitting, and the disagreements are the useful output:
+
+1. **#2202 B1.** A credential holding zero grants reads the whole fleet in the default
+   configuration. Fable holds the promotion survives on merit and the historical HIGH was
+   under-banded; Sol holds that read-only privilege expansion is not admin/RCE and HIGH was
+   right. Gate-identical either way, so this is reporting signal, not merge control — but
+   the team should decide, because it sets whether every cross-scope read is CRITICAL.
+2. **#2202 B4 — reviewers split; DECIDED for Fable (2026-07-29).** Fable held that the
+   `I6` escalator's second prong is principled: dormant authorisation code ships and goes
+   live later without re-review, which is a real forward risk independent of today's
+   behaviour. Sol held that B4's missing route failed *closed* — a denial of capability,
+   not a bypass — so it derives `I6`/MEDIUM and belongs in the table as a third mismatch.
+   Both agreed the first wording was wrong: it claimed an under-enforced control, and that
+   resolver over-enforces.
+
+   **Prong (b) stands.** The forward-risk argument is the stronger one for this codebase:
+   an authz branch that ships dormant is reviewed once, at a point when nothing can
+   exercise it, and is live later with no gate between. Sol's objection is correct about
+   B4's *present* failure mode and does not address that. Recorded here because the row
+   remains **calibrated rather than validated** either way — the escalator was written
+   after seeing B4 derive MEDIUM, and deciding the argument does not convert it into
+   evidence that the rule works.
+
+### Four deliberate gate changes, named
+
+Two more, both found in the third review round rather than disclosed by the author:
+
+**Resource-safety defects.** `.claude/agents/cpp-safety.md` blocks leaks, use-after-free,
+unjoined threads and unsafe shell construction unconditionally. A verified fd leak on an
+ordinary authenticated path derives `I5` + `E3` = MEDIUM, so the derivation would have
+stopped gating a class that gates today. Restored as a policy floor rather than an
+escalator, because the existing contract is unconditional and should stay that way.
+
+**Touched-versus-new C++ cleanup.** The floor covers manual cleanup in NEW C++ only;
+`.claude/agents/security-guardian.md:35` and the Gate 2 template block "new **or touched**".
+This narrowing is deliberate — "touched" can force an unrelated legacy rewrite on any PR
+that opens the file — and it came out of the second review round, but it is a real gate
+change and was not named until now.
+
+`I5`'s prong (a) exists because without it a **reproducible authenticated crash of the
+control plane** derived MEDIUM — `I5` base, no exposure raise — and stopped gating. Every
+agent blocks a triggerable control-plane crash today. That was an undisclosed demotion in
+the first cut of this model, found in the third review round, and it is fixed rather than
+disclosed; prong (a) restores the status quo gate.
+
+The one that IS a disclosed change:
+
+### One deliberate gate change, named
+
+`I7` demotes the documentation gate. `docs-writer`'s standing rule — any user-visible
+change with no doc BLOCKS — becomes SHOULD unless the omission conceals a breaking change,
+security-relevant behaviour, a data-loss risk, a migration step or an irreversible
+operation. Since the derived band governs the gate, that is a real narrowing of a whole
+reviewer's mandate, and it is the intended answer to the original "governance is too noisy
+about prose" complaint. It is recorded here rather than left to be discovered. The
+`docs-writer` Gate 2 template previously asserted its blanket BLOCKING on the authority of
+a CLAUDE.md section that no longer exists (routed out in `c2e0b1c7`); that false citation
+is corrected in the same commit.
+
+### Reviewer independence — folded in from #2622
+
+@FortitudeEtc's #2622 review thread surfaced something this PR needs, because it bears
+directly on how confidence is recorded. Two failures of the same shape, a month apart and
+pointing opposite ways:
+
+- Three reviewers confirmed a factually wrong claim because all three read one working tree
+  whose merge-base predated the file in question (#2604 / this document §8).
+- A reviewer **withdrew a correct finding** on a peer's incomplete evidence, while that peer
+  was independently confirming it (#2622).
+
+Neither is visible from the transcript. As he put it: correlated reviewers are worth less
+than their count suggests, and neither party can tell from the output.
+
+That is not just an anecdote about external reviews — **this pipeline manufactures the
+correlation deliberately**. Gate 3 is handed Gate 2's findings, Gate 4 is handed Gate 2's
+and Gate 3's, and Gate 6b then reports convergence as "the strongest confidence signal this
+pipeline produces". An agent shown a finding that agrees with it is an echo, not a second
+opinion. The synthesis pass now counts only same-wave reporters as independent, the
+attribution line says which is which, and `independent_reporters` is a ledger field.
+
+The same thread produced a second, cheaper lesson: a shell `patsub_replacement` setting
+silently rewrote every `&` in a review payload, so one reviewer analysed corrupted source
+and produced confident findings about the corruption rather than an error. Reviewing input
+integrity is now part of the empiricism rule.
+
+### The corpus's own blind spot
+
+Every row is a historical HIGH or BLOCKING. Nothing in it validates that a **non-gating**
+finding stays non-gating — so the rule is calibrated only against under-gating, on a
+project whose originating complaint was *over*-gating. Every escalator added during review
+pushed in the same direction, and none was checked against a finding that should have
+stayed quiet. Adding a handful of historical NICE/LOW findings to the corpus is the obvious
+next step and is not done here.
+
+### What this does and does not claim
+
+It does not make an LLM's assignment deterministic. It makes the assignment **auditable**:
+the facts are recorded next to the label, so a wrong band is a visible mismatch. That claim
+is weaker than "derived rather than chosen" and is the honest one — judgement moved into
+field *selection* (I5-vs-I2 for a corrupting crash, I8-vs-I3 for stale-served-as-fresh)
+rather than disappearing.

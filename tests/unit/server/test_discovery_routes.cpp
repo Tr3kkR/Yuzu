@@ -383,13 +383,24 @@ TEST_CASE("CROSS-CHECK: scope_kind_catalog entries are honored by evaluate_scope
             // `from_result_set:<id>` short-circuits to an implicit EXISTS
             // condition — `from_result_set:<id> == <value>` is a parse error).
             // No ResultSetStore wired here (authz semantics belong to
-            // test_scope_walking_authz.cpp) — assert the kind resolves to
-            // "no match" rather than throwing/crashing the parser.
+            // test_scope_walking_authz.cpp) — assert the kind is RECOGNISED by
+            // the resolver rather than throwing/crashing the parser.
             expr = "from_result_set:rs_nonexistent";
             auto parsed = yuzu::scope::parse(expr);
             REQUIRE(parsed.has_value());
+            // H1 (governance 2026-07-29): with no store to owner-resolve
+            // against, the resolver ABORTS (nullopt) — it never reports "no
+            // match". Reporting "no match" is the fail-open shape H1 closed: a
+            // `NOT from_result_set:<id>` atom would invert it into a
+            // fleet-wide match. See the `evaluate_scope` contract in
+            // agent_registry.hpp (abort case 3).
+            //
+            // This is a STRONGER cross-check than the unknown-kind arm below:
+            // a kind the resolver did NOT recognise falls through to the
+            // generic attribute path and yields a populated-but-empty vector,
+            // so only a recognised from_result_set: atom can produce nullopt.
             auto matched = registry.evaluate_scope(*parsed, nullptr);
-            CHECK(matched.empty());
+            CHECK_FALSE(matched.has_value());
             continue;
         }
         if (k.kind == "ostype")
@@ -409,14 +420,17 @@ TEST_CASE("CROSS-CHECK: scope_kind_catalog entries are honored by evaluate_scope
         auto parsed = yuzu::scope::parse(expr);
         REQUIRE(parsed.has_value());
         auto matched = registry.evaluate_scope(*parsed, nullptr);
-        CHECK(std::find(matched.begin(), matched.end(), "agent-1") != matched.end());
+        REQUIRE(matched.has_value());
+        CHECK(std::find(matched->begin(), matched->end(), "agent-1") != matched->end());
     }
 
     // A made-up kind the resolver has never heard of must resolve to no match
     // (proves the resolver doesn't silently accept everything as a wildcard).
     auto bogus = yuzu::scope::parse(R"(totally_bogus_kind == "x")");
     REQUIRE(bogus.has_value());
-    CHECK(registry.evaluate_scope(*bogus, nullptr).empty());
+    auto bogus_matched = registry.evaluate_scope(*bogus, nullptr);
+    REQUIRE(bogus_matched.has_value());
+    CHECK(bogus_matched->empty());
 }
 
 // CROSS-CHECK #2: yuzu::scope::operator_token's switch (scope_engine.cpp) has
