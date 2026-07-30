@@ -773,8 +773,8 @@ test('flake-retry selftest',
 )
 
 # End-to-end fake-Meson contract. In particular, an expired/malformed flake
-# registry must fail before the real test runner could be invoked. The script
-# uses POSIX executable fakes and returns a clean platform skip on Windows.
+# registry must fail before the real test runner could be invoked. Windows runs
+# the output-adapter cases and skips only the POSIX executable-fake scenarios.
 test('flake-retry integration selftest',
   _python3_test,
   args: [files('../scripts/ci/test_flake_retry.py')],

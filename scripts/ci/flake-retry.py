@@ -41,6 +41,8 @@ import tempfile
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timezone
 
+from github_output import GitHubOutput, MAX_EVIDENCE_DEGRADATIONS
+
 CATCH2_EXE = re.compile(r"yuzu_\w+_tests(\.exe)?$", re.IGNORECASE)
 # A positional Catch2 tag-filter spec as used by sharded meson entries (#2092).
 # Grammar: one or more comma-OR'd AND-groups, each group a run of ~?[tag].
@@ -53,6 +55,7 @@ CATCH2_EXE = re.compile(r"yuzu_\w+_tests(\.exe)?$", re.IGNORECASE)
 # never OR with the retried case name).
 CATCH2_TAG_SPEC = re.compile(r"^(~?\[[^\[\]]+\])+(,(~?\[[^\[\]]+\])+)*$")
 VALID_PLATFORMS = {"windows", "linux", "macos", "all"}
+GITHUB_OUTPUT = GitHubOutput()
 
 
 def detect_os():
@@ -62,18 +65,12 @@ def detect_os():
 
 def gh(kind, msg):
     """Emit a GitHub Actions annotation (::warning::/::notice::/::error::)."""
-    print(f"::{kind}::{msg}", flush=True)
+    return GITHUB_OUTPUT.annotation(kind, msg)
 
 
 def summary(md):
     """Append a markdown block to the job summary, if running under Actions."""
-    path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if path:
-        try:
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(md + "\n")
-        except OSError:
-            pass
+    return GITHUB_OUTPUT.job_summary(md)
 
 
 # ── known-flaky.json ──────────────────────────────────────────────────────────
@@ -327,10 +324,12 @@ def retry_case(test, case, retries):
     return 0
 
 
-def write_retry_report(builddir, this_os, recovered, blocked):
-    """Persist retry evidence without changing the test process' result."""
+def write_retry_report(builddir, this_os, recovered, blocked, reporter=None):
+    """Persist the final retry and output-evidence receipt without changing verdict."""
     import json
 
+    if reporter is None:
+        reporter = GITHUB_OUTPUT
     logs = os.path.join(builddir, "meson-logs")
     path = os.path.join(logs, "flake-retry.json")
     tmp = path + f".{os.getpid()}.tmp"
@@ -345,6 +344,11 @@ def write_retry_report(builddir, this_os, recovered, blocked):
             for case, cross, attempts in recovered
         ],
         "blocked": list(blocked),
+        "evidence_complete": reporter.evidence_complete,
+        "evidence_degradations": list(
+            reporter.degradations[:MAX_EVIDENCE_DEGRADATIONS]
+        ),
+        "evidence_degradation_count": reporter.degradation_count,
     }
     try:
         os.makedirs(logs, exist_ok=True)
@@ -387,7 +391,9 @@ def main(argv=None):
     try:
         flaky = load_known_flaky(args.known_flaky, this_os, args.stale_days)
     except Exception as ex:  # noqa: BLE001 — surface any list error as a hard failure
-        gh("error", f"known-flaky list invalid: {ex}")
+        failure = f"known-flaky list invalid: {ex}"
+        gh("error", failure)
+        write_retry_report(args.builddir, this_os, [], [failure])
         return 2
 
     # 1. Run meson test normally.
@@ -455,8 +461,8 @@ def main(argv=None):
             else:
                 blocked.append(f"{case} (listed flake but failed all {args.retries} retries)")
 
-    # Report.
-    write_retry_report(args.builddir, this_os, recovered, blocked)
+    # Render every annotation and summary before freezing the durable receipt,
+    # so an output failure cannot disappear from evidence_complete.
     for case, cross, _attempts in recovered:
         if cross:
             gh("warning", f"CROSS-PLATFORM flake recovered on retry (needs urgent fix): {case}")
@@ -475,8 +481,9 @@ def main(argv=None):
         for b in blocked:
             gh("error", f"unrecovered test failure (blocking): {b}")
         summary("### flake-retry\n\nBlocking failures: " + ", ".join(f"`{b}`" for b in blocked))
-        return 1
-    return 0
+    result = 1 if blocked else 0
+    write_retry_report(args.builddir, this_os, recovered, blocked)
+    return result
 
 
 # ── self-test (pure logic; runs without a build) ──────────────────────────────
@@ -640,7 +647,7 @@ def _selftest():
             else:
                 os.environ["GITHUB_STEP_SUMMARY"] = old_summary
         stdout = out.getvalue()
-        check("::warning::" in stdout and "server unit tests at 510/600s (85%)" in stdout,
+        check("::warning::" in stdout and "server unit tests at 510/600s (85%25)" in stdout,
               "watchdog warning emits for the over-budget suite")
         check("tar unit tests" not in stdout, "no warning for the under-budget suite")
         with open(summary_path, encoding="utf-8") as f:
