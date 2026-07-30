@@ -1338,7 +1338,7 @@ for whoever owns that runner.
 
    | field | why |
    |---|---|
-   | `run_id`, `commit_range`, `agent` | which run, which diff, who found it |
+   | `run_id`, `commit_range`, `agent` | which run, which diff, who found it. `run_id` is the fragment's own filename stem — it is a join key once rows are extracted from the file, not a uniqueness guarantee: `noclobber` proves no LIVE file in THAT directory shares the stem, which does not span a `YUZU_GOV_LOG_DIR` run or a stem freed by `git clean`. `commit_range` is per-ROW, not per-file, because a Gate 8 re-review reviews a different range each pass. `agent` is SINGULAR — where `independent_reporters` > 1 it names the one whose evidence this row is derived from, and the others' identities are not currently recordable |
    | `pass_ordinal` | **which round.** Without it the final pass is indistinguishable from the first, and `caused_by` below presupposes a round identity the schema would otherwise lack |
    | `finding_id` | stable across rounds — `caused_by` is uncomputable without a join key |
    | `severity_native` | the agent's OWN vocabulary, unmodified |
@@ -1351,7 +1351,7 @@ for whoever owns that runner.
    | `policy_floor` | the floor hit, if the finding gates as a contract violation rather than by derivation |
    | `provenance` | `introduced` / `newly-reachable` / `pre-existing`. **Adjudicated, not inferred from prose.** Default to `introduced` when contested |
    | `file`, `line`, `summary` | where and what |
-   | `classification` + rationale | truth-contradiction vs wording, and why |
+   | `classification` + rationale | truth-contradiction vs wording, and why. The rationale ALSO carries the resolution when two reviewers disagreed and one was upheld — stated here so the use is declared rather than improvised. It does NOT go in `adjudicated_by`: that field is scoped to the three departure standards below, and a `fixed` row involves no departure. The trade-off is accepted knowingly — no query returns "every contested finding and who upheld whom", and a dedicated field would invalidate every fragment already committed |
    | `disposition` | `fixed` / `deferred-to-issue #N` (a NEW issue was filed) / `roadmap-#N` (parked) / `linked-to-#N` (an EXISTING issue already covers it) / `split` / `re-cut` / `rejected`. The `#N` values are completed when the issue is filed or identified, which happens after the run: fill them in before the PR merges, in a NEW commit — never `git commit --amend` or a rebase, which rewrites evidence a reviewer may already have read. If filing slips past the merge, amend in a follow-up PR — `dev` is protected, so a direct commit is not a path — and say so in the run report; a fragment left holding `#?` makes the park unauditable, which is the failure the disposition exists to prevent. `roadmap-#N` is valid work parked per Gate 7, under the two constraints stated there. `split` records that the work left this change as its own review unit; `re-cut` that the original acceptance criteria travelled to the mechanism. `rejected` means false, inapplicable or disproven — at CRITICAL/HIGH or on a floor it requires the `adjudicated_by` separation Gate 7 states |
    | `adjudicated_by` (nullable) | who approved a departure, and **which separation applied** — this field serves three different dispositions whose standards are NOT the same, so it states none of them and names the one in force: Gate 7's for `rejected`, Test 2's for a scope change, the floor exception's for a documented impossibility. An earlier revision stated one standard here, which read as the rule for all three and was the weakest of them |
    | `caused_by` (nullable) | did round N's fix create this round N+1 finding |
@@ -1389,11 +1389,13 @@ for whoever owns that runner.
                   | test("^I[123]$")))' "$LEDGER"
    ```
 
-   Note the prefixes carry **no trailing hyphen**. Requiring one made a malformed
-   `"disposition":"roadmap"` — no issue number, which is exactly the shape a park
-   whose filing never happened leaves behind — exit clean while carrying `I1`.
-   Measured. Dropping the hyphen costs nothing: no other disposition value begins
-   with either word.
+   Note the prefixes carry **no trailing hyphen**. Requiring one let a malformed
+   `"disposition":"roadmap"` — an OFF-ENUM value truncated to the bare word — exit
+   clean while carrying `I1`. Measured. To be precise about which shape this fixes:
+   the schema's prescribed *unfilled* park is `roadmap-#?`, and the hyphenated
+   pattern already matched that, so a park awaiting its issue number was never the
+   gap. The gap was a value that is not in the enum at all. Dropping the hyphen
+   costs nothing — no other disposition value begins with either word.
 
    **A clean check is exit 4; a violation is exit 0.** `jq -e` reports 4 when no result
    was produced at all, so the PASS case here is a non-zero exit — measured on jq-1.8.1.
@@ -1408,10 +1410,11 @@ for whoever owns that runner.
    A match is a row whose finding may not be parked. Two arms, and they need different
    handling:
 
-   - `roadmap-` — a park barred by constraint 1. The gate does not pass and the report
-     does not go out until that row is re-dispositioned.
-   - `linked-to-` — this one **over-matches by construction, so treat it as a prompt,
-     not a verdict.** Linking an `I1` finding onto an existing *parked* issue reaches
+   - `roadmap`-prefixed (`roadmap-#N`, `roadmap-#?`, or the bare word) — a park barred
+     by constraint 1. The gate does not pass and the report does not go out until that
+     row is re-dispositioned.
+   - `linked-to`-prefixed — this one **over-matches by construction, so treat it as a
+     prompt, not a verdict.** Linking an `I1` finding onto an existing *parked* issue reaches
      the same outcome as parking it, which is why the arm is here; but linking it onto
      an active prioritised issue is a legitimate ending that Gate 7 explicitly allows.
      No ledger field records the target's labels, so check them before calling it a
@@ -1492,7 +1495,10 @@ procedure:
    **Parking instead of filing** — for valid work that will not be scheduled, under the
    two constraints at Gate 7's "Filing, parking, and why the default matters". The rule
    is there; the command is here. `roadmap` is XOR with (priority + triage state) per
-   `docs/agents/triage-labels.md`, so the park branch carries NEITHER:
+   `docs/agents/issue-standard.md` §4 — cite THAT, not `triage-labels.md`, whose
+   invariant list is telemetry-shaped and whose weaker "a priority once triaged"
+   phrasing is what a previous round of this runbook mistakenly acted on — so the park
+   branch carries NEITHER:
    ```bash
    gh issue create --repo Tr3kkR/Yuzu --title "..." \
      --label <type> --label governance-deferred --label roadmap \
