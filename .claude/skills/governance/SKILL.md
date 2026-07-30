@@ -1384,10 +1384,16 @@ for whoever owns that runner.
    a file that is not there is the one failure this step cannot afford.
 
    ```bash
-   jq -e 'select((.disposition | test("^(roadmap|linked-to)-")) and
+   jq -e 'select((.disposition | test("^(roadmap|linked-to)")) and
                  ((.impact // empty | if type == "array" then .[] else . end)
                   | test("^I[123]$")))' "$LEDGER"
    ```
+
+   Note the prefixes carry **no trailing hyphen**. Requiring one made a malformed
+   `"disposition":"roadmap"` — no issue number, which is exactly the shape a park
+   whose filing never happened leaves behind — exit clean while carrying `I1`.
+   Measured. Dropping the hyphen costs nothing: no other disposition value begins
+   with either word.
 
    **A clean check is exit 4; a violation is exit 0.** `jq -e` reports 4 when no result
    was produced at all, so the PASS case here is a non-zero exit — measured on jq-1.8.1.
@@ -1480,7 +1486,7 @@ procedure:
 3. **File survivors** with the four body sections (Context / Evidence with `file:line` against current `origin/dev` / Acceptance criteria / Origin naming this governance run plus the dedupe probes and their results):
    ```bash
    gh issue create --repo Tr3kkR/Yuzu --title "..." \
-     --label <type> --label governance-deferred --label <P1|P2> --label ready-for-agent \
+     --label <type> --label governance-deferred --label <P0|P1|P2> --label ready-for-agent \
      --body-file <candidate>.md
    ```
    **Parking instead of filing** — for valid work that will not be scheduled, under the
@@ -1497,7 +1503,10 @@ procedure:
    ledger-side check on the `I1`/`I2`/`I3` bar has already run by this point — it is
    Gate 8 step 4, before the gate passes, not after the commits push.
 
-   (`<type>` and `<P1|P2>` are placeholders — pass exactly one real label each, e.g. `--label task --label P2`.
+   (`<type>` and `<P0|P1|P2>` are placeholders — pass exactly one real label each, e.g. `--label task --label P2`.
+   The priority axis is `P0`/`P1`/`P2` per `docs/agents/issue-standard.md` §4; an earlier revision
+   wrote `<P1|P2>` here, which silently narrowed the authoritative set and left a governance finding
+   that genuinely warranted `P0` with no legal label.
    `gh search issues` is rate-limited (~30/min): on a 403 mid-batch, wait 60 seconds and continue —
    never skip the probe.)
    **Every governance filing carries `governance-deferred`** (that label is how agent inflow is counted). Add facet labels as they genuinely apply (`tech-debt`, `reliability` for chaos findings, `observability`, `devops`, `security` for hardening — never for exploitable vulnerabilities, which go to private advisories per `SECURITY.md`).
