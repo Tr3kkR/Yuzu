@@ -1,0 +1,48 @@
+name: Plugin spawn lexical gate
+
+# Decision-10a (docs/adr/3002-acquisition-ladder.md:459-488): a per-PR lexical
+# gate that greps agents/plugins/* and agents/core for a raw process-spawn
+# token (fork/exec family/system/popen/CreateProcess family/...) outside the
+# registered allowlist -- see scripts/ci/check-plugin-spawn-lexical.sh's own
+# header for the full token/allowlist contract.
+#
+# Deliberately its OWN workflow, not folded into ci.yml: it greps source text
+# and needs no build (no meson/vcpkg/compiler setup at all), so it does not
+# share ci.yml's build-dependent PR fast-path or its `changes`-job path-filter
+# machinery (docker-healthcheck-invariants.yml's "Why no paths: filter" trap
+# does not apply here for the same reason it doesn't need to -- there is
+# nothing expensive to skip, so this workflow simply always runs).
+#
+# This is tier (a) of the ADR's two-tier enforcement; CodeQL (tier b,
+# scheduled, call-identity-aware) is the deep net -- see the ADR for why
+# neither tier alone is sufficient.
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-spawn-gate-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lexical-scan:
+    name: "Lexical spawn scan"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Self-test the detector (fixtures) before trusting it on real source
+        run: bash scripts/ci/check-plugin-spawn-lexical.sh --selftest
+
+      - name: Scan agents/plugins + agents/core for raw spawn tokens
+        run: bash scripts/ci/check-plugin-spawn-lexical.sh

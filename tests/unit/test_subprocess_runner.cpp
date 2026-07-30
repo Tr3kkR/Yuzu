@@ -27,11 +27,15 @@
 
 #include "test_helpers.hpp"
 
+#include <yuzu/agent/subprocess_launch_spec.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
 
 #include <algorithm>
 #include <barrier>
 #include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -65,6 +69,7 @@ TEST_CASE("run_bounded_subprocess collects output from a fast child that exits w
     CHECK_FALSE(result.timed_out);
     CHECK(result.tool_ran);
     CHECK(result.exit_code == 0);
+    CHECK(result.termination_reason == TerminationReason::exited);
     REQUIRE(result.lines.size() == 3);
     CHECK(result.lines[0] == "line1");
     CHECK(result.lines[1] == "line2");
@@ -106,6 +111,7 @@ TEST_CASE("run_bounded_subprocess kills, reaps, and returns partial output + tim
     // the sentinel stays -1 even though the shell itself ran fine.
     CHECK(result.exit_code == -1);
     CHECK(result.tool_ran); // exec of /bin/sh succeeded before the kill
+    CHECK(result.termination_reason == TerminationReason::deadline);
     CHECK(contains_line(result.lines, "first"));
     CHECK(contains_line(result.lines, "second"));
 
@@ -138,6 +144,7 @@ TEST_CASE("run_bounded_subprocess on an empty argv returns a default, never-fabr
     CHECK_FALSE(result.timed_out);
     CHECK_FALSE(result.tool_ran);
     CHECK(result.exit_code == -1);
+    CHECK(result.termination_reason == TerminationReason::spawn_error);
     CHECK(result.lines.empty());
     CHECK(result.output.empty());
 }
@@ -155,6 +162,7 @@ TEST_CASE("run_bounded_subprocess on a nonexistent binary reports a spawn failur
     CHECK_FALSE(result.timed_out);
     CHECK_FALSE(result.tool_ran);
     CHECK(result.exit_code == 127);
+    CHECK(result.termination_reason == TerminationReason::spawn_error);
     CHECK(result.lines.empty());
     CHECK(result.output.empty());
 }
@@ -200,21 +208,29 @@ TEST_CASE("run_bounded_subprocess: a natural nonzero exit survives the stop_afte
     CHECK_FALSE(result.timed_out);
     CHECK(result.tool_ran);
     CHECK(result.exit_code == 3); // NOT clobbered to 0
+    // The child exited on its own (child_reaped was already true when the
+    // line-cap kill decision ran) -- termination_reason correctly credits
+    // `exited`, not `line_limit`, even though the cap was also hit.
+    CHECK(result.termination_reason == TerminationReason::exited);
 }
 
-TEST_CASE("run_bounded_subprocess: stop_after_max_lines still maps a signal-killed cap-stop to success 0",
+TEST_CASE("run_bounded_subprocess: stop_after_max_lines cap-stop of a genuinely signal-killed child "
+          "never fabricates exit_code 0 (ADR-3002 fixes the pre-existing success-sentinel)",
           "[subprocess][deadline][macos][linux]") {
-    // The complementary case the K-5 guard must preserve: a child that keeps
-    // producing lines past the cap and is KILLED by the runner (never exits
-    // naturally) has the -1 signal sentinel, which the fixup legitimately
-    // rewrites to a clean success 0 (the caller got the N lines it asked for).
+    // The complementary case to K-5: a child that keeps producing lines past
+    // the cap and is KILLED by the runner (never exits naturally) keeps the
+    // -1 signal-death sentinel -- ADR-3002 removed the previous fixup that
+    // rewrote this to a fabricated exit_code=0 "success". The "this was a
+    // deliberate, clean stop, not a failure" signal now lives ENTIRELY in
+    // termination_reason (line_limit), never in a synthesized exit code.
     SubprocessResult result = run_bounded_subprocess(
         {"/bin/sh", "-c", "while :; do printf 'x\\n'; done"},
         SubprocessOptions{.deadline = 5000ms, .max_lines = 3, .stop_after_max_lines = true});
 
     CHECK_FALSE(result.timed_out);
     CHECK(result.tool_ran);
-    CHECK(result.exit_code == 0); // signal-death sentinel -> clean bounded success
+    CHECK(result.exit_code == -1); // signal-death sentinel -- NEVER fabricated to 0
+    CHECK(result.termination_reason == TerminationReason::line_limit);
 }
 
 TEST_CASE("run_bounded_subprocess honors a cooperative cancel request against a genuinely running child",
@@ -282,6 +298,7 @@ TEST_CASE("run_bounded_subprocess honors a cooperative cancel request against a 
     REQUIRE(handshake_ok.load()); // the FIFO handshake itself must have worked
     CHECK(result.timed_out);
     CHECK(result.tool_ran); // exec of /bin/sh succeeded well before the cancel landed
+    CHECK(result.termination_reason == TerminationReason::cancelled);
     CHECK(elapsed < 10s);
 }
 
@@ -591,6 +608,338 @@ TEST_CASE("run_bounded_subprocess never leaks a fd opened by a racing thread (TO
     stop.store(true, std::memory_order_relaxed);
     racer.join();
     CHECK_FALSE(any_leak);
+}
+
+// ---------------------------------------------------------------------------
+// ADR-3002 runner-contract gaps + best-practice addendum (A1-A6, B1-B6).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("run_bounded_subprocess rejects a relative argv[0] at RUNTIME in every build type (ADR-3002)",
+          "[subprocess][validation]") {
+    SubprocessResult r = run_bounded_subprocess({"relative/bin/echo"}, SubprocessOptions{.deadline = 1000ms});
+    CHECK_FALSE(r.tool_ran);
+    CHECK_FALSE(r.timed_out);
+    CHECK(r.termination_reason == TerminationReason::spawn_error);
+}
+
+TEST_CASE("run_bounded_subprocess rejects an embedded NUL in any argv element at RUNTIME (ADR-3002)",
+          "[subprocess][validation]") {
+    SubprocessResult r = run_bounded_subprocess({"/bin/echo", std::string("a\0b", 3)},
+                                                  SubprocessOptions{.deadline = 1000ms});
+    CHECK_FALSE(r.tool_ran);
+    CHECK(r.termination_reason == TerminationReason::spawn_error);
+}
+
+TEST_CASE("run_bounded_subprocess reports `signaled` for a child that dies from its OWN signal, "
+          "never confused with a runner-initiated kill",
+          "[subprocess][termination_reason]") {
+    // The generous 5s deadline proves this resolves via the child's own
+    // self-signal, not our deadline path.
+    SubprocessResult r = run_bounded_subprocess({"/bin/sh", "-c", "kill -9 $$"},
+                                                  SubprocessOptions{.deadline = 5000ms});
+    CHECK_FALSE(r.timed_out);
+    CHECK(r.tool_ran); // exec of /bin/sh succeeded before the self-signal
+    CHECK(r.exit_code == -1); // signal death -- never a fabricated exit status
+    CHECK(r.termination_reason == TerminationReason::signaled);
+}
+
+TEST_CASE("a per-invocation CancellationToken cancels only its own call, never a concurrent one "
+          "sharing no token (ADR-3002 per-invocation cancel)",
+          "[subprocess][cancel_token]") {
+    auto token_a = std::make_shared<CancellationToken>();
+    auto token_b = std::make_shared<CancellationToken>();
+    token_a->cancel(); // pre-armed: token_a's own call must notice this on its very first poll
+
+    SubprocessResult result_b;
+    std::thread b_thread([&]() {
+        result_b = run_bounded_subprocess({"/bin/sh", "-c", "sleep 0.3; exit 5"},
+                                           SubprocessOptions{.deadline = 5000ms, .cancel_token = token_b});
+    });
+
+    SubprocessResult result_a = run_bounded_subprocess(
+        {"/bin/sleep", "30"}, SubprocessOptions{.deadline = 60000ms, .cancel_token = token_a});
+    b_thread.join();
+
+    CHECK(result_a.timed_out);
+    CHECK(result_a.termination_reason == TerminationReason::cancelled);
+
+    // token_b was never cancelled -- its call runs to a genuine natural
+    // completion, proving token_a's cancellation had no effect on it.
+    CHECK_FALSE(result_b.timed_out);
+    CHECK(result_b.tool_ran);
+    CHECK(result_b.exit_code == 5);
+    CHECK(result_b.termination_reason == TerminationReason::exited);
+}
+
+TEST_CASE("run_bounded_subprocess honors a caller-configured output_cap_bytes smaller than the "
+          "historical ~1MB default (ADR-3002: caller-configurable byte cap)",
+          "[subprocess][output_cap]") {
+    SubprocessResult r =
+        run_bounded_subprocess({"/usr/bin/yes", "x"}, SubprocessOptions{.deadline = 300ms, .output_cap_bytes = 1000});
+    CHECK(r.output_truncated);
+    CHECK(r.output.size() == 1000);
+}
+
+TEST_CASE("run_bounded_subprocess: on_line delivers every produced line, uncapped by max_lines "
+          "(ADR-3002 streaming primitive)",
+          "[subprocess][streaming]") {
+    std::vector<std::string> streamed;
+    SubprocessResult r = run_bounded_subprocess(
+        {"/usr/bin/printf", "%s\n", "a", "b", "c", "d", "e"},
+        SubprocessOptions{.deadline = 5000ms, .max_lines = 2,
+                           .on_line = [&](const std::string& line) { streamed.push_back(line); }});
+    CHECK_FALSE(r.timed_out);
+    REQUIRE(r.lines.size() == 2);   // the collect-at-end contract stays capped
+    REQUIRE(streamed.size() == 5);  // every line reaches the streaming callback, uncapped
+    CHECK(streamed[0] == "a");
+    CHECK(streamed[4] == "e");
+}
+
+TEST_CASE("run_bounded_subprocess: A6 chdir's the child into working_dir",
+          "[subprocess][working_dir]") {
+    std::filesystem::path dir = yuzu::test::unique_temp_path("yuzu_test_cwd_");
+    REQUIRE(std::filesystem::create_directory(dir));
+    struct Cleanup {
+        std::filesystem::path p;
+        ~Cleanup() {
+            std::error_code ec;
+            std::filesystem::remove(p, ec);
+        }
+    } cleanup{dir};
+
+    SubprocessResult r = run_bounded_subprocess({"/bin/pwd"},
+                                                  SubprocessOptions{.deadline = 5000ms, .working_dir = dir.string()});
+    CHECK(r.tool_ran);
+    REQUIRE(r.lines.size() == 1);
+    std::error_code ec;
+    CHECK(std::filesystem::path(r.lines[0]) == std::filesystem::canonical(dir, ec));
+}
+
+TEST_CASE("run_bounded_subprocess: A4 always suppresses core dumps in the child",
+          "[subprocess][rlimits]") {
+    SubprocessResult r =
+        run_bounded_subprocess({"/bin/sh", "-c", "ulimit -c"}, SubprocessOptions{.deadline = 5000ms});
+    CHECK(r.tool_ran);
+    REQUIRE(r.lines.size() == 1);
+    CHECK(r.lines[0] == "0");
+}
+
+TEST_CASE("run_bounded_subprocess: A6 umask(077) leaves the child with a restrictive default umask",
+          "[subprocess][rlimits]") {
+    SubprocessResult r =
+        run_bounded_subprocess({"/bin/sh", "-c", "umask"}, SubprocessOptions{.deadline = 5000ms});
+    CHECK(r.tool_ran);
+    REQUIRE(r.lines.size() == 1);
+    CHECK(r.lines[0].find("077") != std::string::npos);
+}
+
+TEST_CASE("run_bounded_subprocess: A5 env is a clear-and-allow-list, not the daemon's own environment",
+          "[subprocess][env]") {
+    SubprocessResult r = run_bounded_subprocess({"/usr/bin/env"}, SubprocessOptions{.deadline = 5000ms});
+    CHECK(r.tool_ran);
+    CHECK(contains_line(r.lines, "LC_ALL=C"));
+    for (const auto& line : r.lines) {
+        CHECK(line.substr(0, 3) != "LD_");
+        CHECK(line.substr(0, 5) != "DYLD_");
+        CHECK(line.substr(0, 4) != "IFS=");
+        CHECK(line.substr(0, 9) != "BASH_ENV=");
+        CHECK(line.substr(0, 11) != "GCONV_PATH=");
+    }
+}
+
+TEST_CASE("run_bounded_subprocess: B3 an opt-in RLIMIT_CPU cap is applied to the child, off by default "
+          "on every other test in this file",
+          "[subprocess][rlimits]") {
+    SubprocessOptions opts{.deadline = 5000ms};
+    opts.rlimits.cpu_seconds = 7;
+    SubprocessResult r = run_bounded_subprocess({"/bin/sh", "-c", "ulimit -t"}, opts);
+    CHECK(r.tool_ran);
+    CHECK(contains_line(r.lines, "7"));
+}
+
+TEST_CASE("run_bounded_subprocess captures a nonzero child rusage on reap (B4), never fabricated",
+          "[subprocess][rusage]") {
+    SubprocessResult r =
+        run_bounded_subprocess({"/bin/sh", "-c", "exit 0"}, SubprocessOptions{.deadline = 5000ms});
+    CHECK(r.tool_ran);
+    // A real fork+exec always burns SOME user or system time -- never both
+    // zero for a process that actually ran.
+    CHECK((r.child_user_time.count() > 0 || r.child_system_time.count() > 0));
+}
+
+TEST_CASE("run_bounded_subprocess: soft_terminate_grace lets a trapping child exit cleanly instead of "
+          "being SIGKILLed immediately (ADR-3002 mutating-tool grace)",
+          "[subprocess][soft_terminate]") {
+    SubprocessResult r = run_bounded_subprocess(
+        {"/bin/sh", "-c", "trap 'exit 42' TERM; while :; do sleep 0.05; done"},
+        SubprocessOptions{.deadline = 300ms, .soft_terminate_grace = 2000ms});
+    CHECK(r.timed_out);
+    CHECK(r.tool_ran);
+    // Proves SIGTERM (not an immediate SIGKILL) was delivered and the trap
+    // ran to completion within the grace window -- a hard-killed child could
+    // never report this exit code (see the -1 sentinel below).
+    CHECK(r.exit_code == 42);
+    CHECK(r.termination_reason == TerminationReason::deadline);
+}
+
+TEST_CASE("run_bounded_subprocess: soft_terminate_grace escalates to the unmodified hard kill once "
+          "the grace elapses without the child responding",
+          "[subprocess][soft_terminate]") {
+    const auto start = std::chrono::steady_clock::now();
+    SubprocessResult r = run_bounded_subprocess(
+        {"/bin/sh", "-c", "trap '' TERM; while :; do sleep 0.05; done"},
+        SubprocessOptions{.deadline = 200ms, .soft_terminate_grace = 300ms});
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    CHECK(r.timed_out);
+    CHECK(r.exit_code == -1); // never caught the grace -- escalated to the hard SIGKILL
+    CHECK(r.termination_reason == TerminationReason::deadline);
+    // Bounded: deadline (200ms) + soft grace (300ms) + kDrainGrace (2000ms) +
+    // generous CI-noise margin.
+    CHECK(elapsed < 10s);
+}
+
+TEST_CASE("exec_verify (B6) accepts a correctly-sized target and execs it via the verified path",
+          "[subprocess][exec_verify]") {
+    struct stat st{};
+    REQUIRE(::stat("/bin/echo", &st) == 0);
+    SubprocessOptions opts{.deadline = 5000ms};
+    opts.exec_verify.enabled = true;
+    opts.exec_verify.require_root_owned = false; // test binaries aren't root-owned in CI
+    opts.exec_verify.expected_size = static_cast<std::uint64_t>(st.st_size);
+    SubprocessResult r = run_bounded_subprocess({"/bin/echo", "hi"}, opts);
+    CHECK(r.tool_ran);
+    CHECK(r.exit_code == 0);
+}
+
+TEST_CASE("exec_verify (B6) fails CLOSED on a size mismatch instead of exec'ing anyway",
+          "[subprocess][exec_verify]") {
+    SubprocessOptions opts{.deadline = 5000ms};
+    opts.exec_verify.enabled = true;
+    opts.exec_verify.require_root_owned = false;
+    opts.exec_verify.expected_size = 1; // /bin/echo is never exactly 1 byte
+    SubprocessResult r = run_bounded_subprocess({"/bin/echo", "hi"}, opts);
+    CHECK_FALSE(r.tool_ran);
+    CHECK(r.termination_reason == TerminationReason::spawn_error);
+}
+
+TEST_CASE("probe_tool_path returns the first existing, absolute, executable candidate",
+          "[subprocess][probe]") {
+    CHECK(probe_tool_path({"/no/such/thing-xyz", "/bin/sh"}) == "/bin/sh");
+    CHECK(probe_tool_path({"/no/such/thing-xyz"}).empty());
+    CHECK(probe_tool_path({"relative/path", "/bin/sh"}) == "/bin/sh"); // relative candidates skipped
+}
+
+// ---------------------------------------------------------------------------
+// B1: the pure build_launch_spec()/LaunchSpec core, exercised WITHOUT
+// spawning a real process (CLAUDE.md test discipline) -- the bounded
+// real-child tests above remain the integration layer this does not
+// replace.
+// ---------------------------------------------------------------------------
+
+namespace {
+class FakeSpawner : public yuzu::agent::Spawner {
+public:
+    yuzu::agent::SpawnOutcome scripted;
+    yuzu::agent::SpawnOutcome spawn(const yuzu::agent::LaunchSpec&) override { return scripted; }
+};
+} // namespace
+
+TEST_CASE("build_launch_spec rejects the same things run_bounded_subprocess rejects at runtime (B1)",
+          "[subprocess][launch_spec]") {
+    using yuzu::agent::build_launch_spec;
+    using yuzu::agent::LaunchOptions;
+    using yuzu::agent::LaunchSpecError;
+
+    CHECK(build_launch_spec({}, LaunchOptions{}).error == LaunchSpecError::empty_argv);
+    CHECK(build_launch_spec({"relative/bin"}, LaunchOptions{}).error == LaunchSpecError::relative_argv0);
+    CHECK(build_launch_spec({"/bin/echo", std::string("a\0b", 3)}, LaunchOptions{}).error ==
+          LaunchSpecError::embedded_nul);
+    CHECK(build_launch_spec({"/path/tool.bat"}, LaunchOptions{}).error ==
+          LaunchSpecError::banned_windows_extension);
+    CHECK(build_launch_spec({"/path/TOOL.CMD"}, LaunchOptions{}).error ==
+          LaunchSpecError::banned_windows_extension); // case-insensitive
+    CHECK(build_launch_spec({"/path/tool.com"}, LaunchOptions{}).error ==
+          LaunchSpecError::banned_windows_extension);
+    CHECK(build_launch_spec({"C:\\tools\\thing.exe"}, LaunchOptions{}).error ==
+          LaunchSpecError::none); // a valid Windows-absolute argv[0]
+}
+
+TEST_CASE("build_launch_spec assembles the A5 clear-and-allow-list env with no LD_/DYLD_ leakage (B1)",
+          "[subprocess][launch_spec]") {
+    using namespace yuzu::agent;
+    LaunchOptions opts;
+    opts.tz = std::string("UTC");
+    LaunchSpec spec = build_launch_spec({"/bin/echo", "hi"}, opts);
+    REQUIRE(spec.error == LaunchSpecError::none);
+
+    bool has_path = false;
+    bool has_lc_all = false;
+    bool has_tz = false;
+    for (const auto& e : spec.env) {
+        CHECK(e.key.substr(0, 3) != "LD_");
+        CHECK(e.key.substr(0, 5) != "DYLD_");
+        CHECK(e.key != "IFS");
+        CHECK(e.key != "BASH_ENV");
+        CHECK(e.key != "GCONV_PATH");
+        if (e.key == "PATH")
+            has_path = true;
+        if (e.key == "LC_ALL") {
+            has_lc_all = true;
+            CHECK(e.value == "C");
+        }
+        if (e.key == "TZ") {
+            has_tz = true;
+            CHECK(e.value == "UTC");
+        }
+    }
+    CHECK(has_path);
+    CHECK(has_lc_all);
+    CHECK(has_tz);
+}
+
+TEST_CASE("quote_windows_arg follows the Colascione backslash-before-quote algorithm (A2)",
+          "[subprocess][launch_spec]") {
+    using yuzu::agent::quote_windows_arg;
+    CHECK(quote_windows_arg("") == "\"\"");
+    CHECK(quote_windows_arg("simple") == "simple");
+    CHECK(quote_windows_arg("a b c") == "\"a b c\"");
+    CHECK(quote_windows_arg("ab\"c") == "\"ab\\\"c\"");
+    CHECK(quote_windows_arg("a\\b") == "a\\b"); // no space/quote -> unquoted, backslash untouched
+    CHECK(quote_windows_arg("a\\b c") == "\"a\\b c\""); // quoted for the space; a lone backslash
+                                                          // not preceding a quote/end is NOT doubled
+    CHECK(quote_windows_arg("a b\\") == "\"a b\\\\\""); // trailing backslash IS doubled before the
+                                                          // closing quote we add
+}
+
+TEST_CASE("build_launch_spec precomputes the Windows handle policy from merge_stderr (A1/B1)",
+          "[subprocess][launch_spec]") {
+    using namespace yuzu::agent;
+    LaunchOptions merged_opts;
+    merged_opts.merge_stderr = true;
+    LaunchSpec merged_spec = build_launch_spec({"/bin/echo"}, merged_opts);
+    REQUIRE(merged_spec.error == LaunchSpecError::none);
+    CHECK(merged_spec.windows_handles.inherit_stdout_write);
+    CHECK(merged_spec.windows_handles.inherit_stderr_write);
+
+    LaunchSpec default_spec = build_launch_spec({"/bin/echo"}, LaunchOptions{});
+    REQUIRE(default_spec.error == LaunchSpecError::none);
+    CHECK(default_spec.windows_handles.inherit_stdout_write);
+    CHECK_FALSE(default_spec.windows_handles.inherit_stderr_write);
+}
+
+TEST_CASE("the Spawner interface is independently injectable/testable without spawning a process (B1)",
+          "[subprocess][launch_spec]") {
+    using namespace yuzu::agent;
+    LaunchSpec spec = build_launch_spec({"/bin/echo", "hi"}, LaunchOptions{});
+    REQUIRE(spec.error == LaunchSpecError::none);
+
+    FakeSpawner fake;
+    fake.scripted = SpawnOutcome{true, 0, false};
+    SpawnOutcome outcome = fake.spawn(spec);
+    CHECK(outcome.tool_ran);
+    CHECK(outcome.exit_code == 0);
+    CHECK_FALSE(outcome.spawn_error);
 }
 
 #endif // !_WIN32
