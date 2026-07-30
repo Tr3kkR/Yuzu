@@ -214,6 +214,23 @@ message CommandResponse {
   string plugin  = 7;
   string action  = 8;
   bytes  payload = 9;
+
+  // CC-07 plugin→host typed result-status seam (ABI4, sdk/include/yuzu/plugin.h).
+  // Populated from the agent-side YuzuExecuteResult the plugin reports via
+  // yuzu_ctx_set_result_status() during execute(); PLUGIN_RESULT_UNDECLARED
+  // (the zero value) means the plugin never called it — either an ABI<4
+  // plugin (int-only execute()) or an ABI4 plugin that didn't report a typed
+  // status for this call. This is the plugin→host CC-07 status ONLY; it is
+  // NOT the subprocess-runner termination-reason enum (a separate, later,
+  // out-of-scope-for-this-PR concept) and carries no mapping to it.
+  enum PluginResultStatus {
+    PLUGIN_RESULT_UNDECLARED        = 0;
+    PLUGIN_RESULT_OK                = 1;
+    PLUGIN_RESULT_UNAVAILABLE       = 2;
+    PLUGIN_RESULT_PERMISSION_DENIED = 3;
+    PLUGIN_RESULT_CONSTRAINED       = 4;
+  }
+  PluginResultStatus plugin_result_status = 10;
 }
 
 // ── Inventory ─────────────────────────────────────────────────────────────────

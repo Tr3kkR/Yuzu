@@ -69,6 +69,11 @@ struct AgentExecStatus {
     int64_t completed_at{0};
     int exit_code{0};
     std::string error_detail;
+    /// CC-07 plugin→host typed result status (agent.proto CommandResponse
+    /// .plugin_result_status, mirrors YuzuResultStatus from
+    /// sdk/include/yuzu/plugin.h). 0 (PLUGIN_RESULT_UNDECLARED) for legacy
+    /// rows and for any response whose plugin never reported a typed status.
+    int plugin_result_status{0};
 };
 
 // ── Execution statistics (capability 1.9) ────────────────────────────

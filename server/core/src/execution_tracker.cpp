@@ -118,7 +118,42 @@ void ExecutionTracker::create_tables() {
             CREATE INDEX IF NOT EXISTS idx_executions_dispatched ON executions(dispatched_at);
             CREATE INDEX IF NOT EXISTS idx_executions_definition ON executions(definition_id);
         )"},
+        // v2 (PR1.1 — ABI4 CC-07 result seam): per-agent plugin-reported typed
+        // status, mirroring agent.proto CommandResponse.plugin_result_status.
+        // Default 0 = PLUGIN_RESULT_UNDECLARED, exactly what a legacy row
+        // (and any response whose plugin never reported a typed status)
+        // should read as.
+        {2, R"(
+            ALTER TABLE agent_exec_status ADD COLUMN plugin_result_status INTEGER NOT NULL DEFAULT 0;
+        )"},
     };
+    // Pre-migration probe (mirrors response_store.cpp): a developer who
+    // pre-added the column on an iterated build hits SQLITE_ERROR: duplicate
+    // column name on the next ALTER, which MigrationRunner treats as failure.
+    {
+        sqlite3_stmt* probe = nullptr;
+        bool col_exists = false;
+        if (sqlite3_prepare_v2(db_,
+                               "SELECT 1 FROM pragma_table_info('agent_exec_status') "
+                               "WHERE name='plugin_result_status' LIMIT 1",
+                               -1, &probe, nullptr) == SQLITE_OK) {
+            col_exists = (sqlite3_step(probe) == SQLITE_ROW);
+            sqlite3_finalize(probe);
+        }
+        int current_v = MigrationRunner::current_version(db_, "execution_tracker");
+        if (col_exists && current_v < 2) {
+            sqlite3_stmt* stamp = nullptr;
+            if (sqlite3_prepare_v2(db_,
+                                   "INSERT OR REPLACE INTO schema_meta "
+                                   "(store, version, upgraded_at) VALUES (?, 2, ?)",
+                                   -1, &stamp, nullptr) == SQLITE_OK) {
+                sqlite3_bind_text(stamp, 1, "execution_tracker", -1, SQLITE_STATIC);
+                sqlite3_bind_int64(stamp, 2, now_epoch());
+                sqlite3_step(stamp);
+                sqlite3_finalize(stamp);
+            }
+        }
+    }
     if (!MigrationRunner::run(db_, "execution_tracker", kMigrations)) {
         spdlog::error("ExecutionTracker: schema migration failed");
     }
@@ -224,7 +259,8 @@ ExecutionTracker::get_agent_statuses(const std::string& execution_id) const {
     if (sqlite3_prepare_v2(
             db_,
             "SELECT agent_id, status, dispatched_at, first_response_at, completed_at, exit_code, "
-            "error_detail FROM agent_exec_status WHERE execution_id = ? ORDER BY agent_id",
+            "error_detail, COALESCE(plugin_result_status, 0) FROM agent_exec_status "
+            "WHERE execution_id = ? ORDER BY agent_id",
             -1, &stmt, nullptr) != SQLITE_OK)
         return results;
 
@@ -239,6 +275,7 @@ ExecutionTracker::get_agent_statuses(const std::string& execution_id) const {
         a.completed_at = sqlite3_column_int64(stmt, 4);
         a.exit_code = sqlite3_column_int(stmt, 5);
         a.error_detail = col_text(stmt, 6);
+        a.plugin_result_status = sqlite3_column_int(stmt, 7);
         results.push_back(std::move(a));
     }
     sqlite3_finalize(stmt);
@@ -341,14 +378,15 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
 
         const char* sql = R"(
             INSERT INTO agent_exec_status
-            (execution_id, agent_id, status, dispatched_at, first_response_at, completed_at, exit_code, error_detail)
-            VALUES (?,?,?,?,?,?,?,?)
+            (execution_id, agent_id, status, dispatched_at, first_response_at, completed_at, exit_code, error_detail, plugin_result_status)
+            VALUES (?,?,?,?,?,?,?,?,?)
             ON CONFLICT(execution_id, agent_id) DO UPDATE SET
                 status=excluded.status,
                 first_response_at=CASE WHEN agent_exec_status.first_response_at=0 THEN excluded.first_response_at ELSE agent_exec_status.first_response_at END,
                 completed_at=excluded.completed_at,
                 exit_code=excluded.exit_code,
-                error_detail=excluded.error_detail
+                error_detail=excluded.error_detail,
+                plugin_result_status=excluded.plugin_result_status
         )";
         sqlite3_stmt* stmt = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
@@ -364,6 +402,7 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
         sqlite3_bind_int64(stmt, i++, s.completed_at);
         sqlite3_bind_int(stmt, i++, s.exit_code);
         sqlite3_bind_text(stmt, i++, s.error_detail.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, i++, s.plugin_result_status);
 
         sqlite3_step(stmt);
         sqlite3_finalize(stmt);
@@ -376,6 +415,8 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
             payload["completed_at"] = s.completed_at;
             if (!s.error_detail.empty())
                 payload["error_detail"] = s.error_detail;
+            if (s.plugin_result_status != 0)
+                payload["plugin_result_status"] = s.plugin_result_status;
         }
     } // mtx_ released here — publish below runs lock-free.
 

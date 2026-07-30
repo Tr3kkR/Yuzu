@@ -28,7 +28,11 @@
 # to carry, with GitHub's root-anchored filter semantics — a bare `*.md`,
 # `LICENSE`, or `.gitignore` pattern matches ONLY the repository root, never a
 # nested path:
-#   - docs/**                        (any depth under docs/)
+#   - docs/**                        (any depth under docs/), EXCEPT
+#     docs/os-capability-matrix.md — carved OUT of docs/** (#2204 PR1.1): it
+#     carries a machine-generated block, so a hand-edit there must still run
+#     the build/gate matrix. Kept in lockstep with the ci.yml `push:`
+#     trigger's paths-ignore negation entry.
 #   - root-level *.md                (README.md, but NOT sdk/README.md)
 #   - LICENSE, .gitignore            (root only)
 #   - .github/runner-inventory.json
@@ -145,6 +149,17 @@ for f in "${files[@]}"; do
     esac
   else
     case "$f" in
+      docs/os-capability-matrix.md)
+        # Carved out of the docs-only ignore set (#2204 PR1.1): this file
+        # carries a machine-generated block (tools/capmatrix-gen +
+        # scripts/ci/check-capability-matrix.sh) that only stays honest if a
+        # hand-edit here still runs the full build/gate matrix — a docs-only
+        # PR that quietly edited the generated block would otherwise skip
+        # the drift gate entirely. Matched IN LOCKSTEP with the ci.yml
+        # `push:` trigger's paths-ignore negation — edit both or neither.
+        echo "detect-code-change: docs/os-capability-matrix.md carved out of docs-only -> building: $f" >&2
+        emit true
+        ;;
       docs/*) ;;                                        # docs/** (any depth)
       LICENSE|.gitignore) ;;                             # root-only exact match
       .github/runner-inventory.json) ;;

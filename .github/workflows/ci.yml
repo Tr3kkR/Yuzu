@@ -27,6 +27,17 @@ on:
       - '.gitignore'
       - '.github/runner-inventory.json'
       - '.github/workflows/runner-inventory-sentinel.yml'
+      # Carved OUT of docs/** (#2204 PR1.1): docs/os-capability-matrix.md
+      # carries a machine-generated block (tools/capmatrix-gen +
+      # scripts/ci/check-capability-matrix.sh) — a push that only touches
+      # this file must still run the build/gate matrix. Kept in lockstep
+      # with the docs-only case in scripts/ci/detect-code-change.sh. MUST
+      # stay the LAST pattern in this list: GitHub Actions path filters
+      # resolve each changed file by the LAST pattern in the list that
+      # matches it (positive or negated) — placing this negation anywhere
+      # earlier would let a later positive pattern that also happens to
+      # match this path re-exclude it.
+      - '!docs/os-capability-matrix.md'
   pull_request:
     branches: [main, dev]
     # No paths-ignore here (issue #1978). Filtering this whole workflow out
@@ -630,6 +641,19 @@ jobs:
 
       - name: Build
         run: meson compile -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -j "$YUZU_BUILD_JOBS"
+
+      # #2204 capability-matrix drift gate (PR1.1). Runs right after Build so
+      # capmatrix-gen and every agents/plugins/*/ shared object already
+      # exist — the script discovers the full plugin set from the source
+      # tree itself (not a hand-maintained subset), so a missing artifact
+      # for ANY plugin is a hard failure (never a skip), and a stale
+      # docs/os-capability-matrix.md generated block fails the same way.
+      # RATCHET mode only (do not flip to hard-fail on any undeclared plugin
+      # — that is a later PR): the undeclared-plugin count must not grow.
+      - name: Capability matrix drift gate (#2204)
+        run: |
+          bash scripts/ci/check-capability-matrix.sh \
+            "build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}"
 
       # Link-provenance assertion (#1331 review HIGH-2): prove the canary linked
       # vcpkg's static libpq archive, not a system/dynamic libpq. Per ADR-0008

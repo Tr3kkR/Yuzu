@@ -146,6 +146,82 @@ When adding or changing a collector/guard/plugin, assume the **other** platforms
 are a deliberate decision you must record — in code (a stub + comment), in the
 relevant user-manual "Platform coverage" section, and in this matrix.
 
+## Generated: ABI4 per-action capability declarations (#2204)
+
+PR1.1 builds the generator this doc's "Make this self-maintaining" section
+below used to propose only as a follow-up issue: `tools/capmatrix-gen`
+dlopens each built plugin's `YuzuPluginDescriptor` (ABI4,
+`sdk/include/yuzu/plugin.h`) and emits the block below from its
+`action_descriptors` array. `scripts/ci/check-capability-matrix.sh` regenerates
+and byte-diffs this block on every Linux CI leg, in **RATCHET mode**: the
+"Undeclared plugins" list may shrink as plugins adopt the descriptor but must
+never grow.
+
+This PR ships the *machinery* only — no plugin populates `action_descriptors`
+yet (that is per-plugin follow-up work; TAR unified its `OsSupportStatus`
+enum with the descriptor's `YuzuSupportLevel` as a first step, see the TAR
+section above, but does not yet populate its own `action_descriptors`). Every
+plugin the CI gate currently tracks therefore shows up as undeclared below —
+expected, and exactly what the ratchet baseline reflects today.
+
+<!-- BEGIN GENERATED: capmatrix-gen (#2204) — do not hand-edit; regenerate with
+     tools/capmatrix-gen, verified by scripts/ci/check-capability-matrix.sh -->
+| Plugin | Action | OS | Support | Rung | Mechanism | Fallback |
+|---|---|---|---|---|---|---|
+
+**Undeclared plugins** (ABI<4, or ABI4 with no capability declarations yet — RATCHET: this count must never grow):
+
+- `agent_actions`
+- `agent_logging`
+- `antivirus`
+- `asset_tags`
+- `bitlocker`
+- `certificates`
+- `chargen`
+- `content_dist`
+- `device_identity`
+- `diagnostics`
+- `discovery`
+- `disk_space`
+- `event_logs`
+- `example`
+- `filesystem`
+- `firewall`
+- `hardware`
+- `http_client`
+- `installed_apps`
+- `interaction`
+- `ioc`
+- `license_scan`
+- `msi_packages`
+- `netprobe`
+- `netstat`
+- `network_actions`
+- `network_config`
+- `network_diag`
+- `os_info`
+- `processes`
+- `procfetch`
+- `quarantine`
+- `rdp_control`
+- `registry`
+- `sccm`
+- `script_exec`
+- `services`
+- `sockwho`
+- `software_actions`
+- `status`
+- `storage`
+- `tags`
+- `tar`
+- `users`
+- `vuln_scan`
+- `wifi`
+- `windows_updates`
+- `wmi`
+- `wol`
+<!-- END GENERATED -->
+
 ## Make this self-maintaining
 
 The truth already exists machine-readable; the durable fix is to render the matrix
@@ -167,10 +243,18 @@ from it rather than hand-curate:
   `agents/plugins/*/src/`; a Windows-only plugin has a `#ifndef _WIN32` "not
   available" no-op.
 
-**Proposed follow-up (file as an issue):** a small build-time generator that walks
-those sources and emits this table (and optionally an in-product *Settings →
-Coverage* page), so per-OS support can never silently diverge from the doc again.
-Until that lands, this page is the single place to look — keep it honest.
+**Status:** the generator machinery landed (PR1.1, [above](#generated-abi4-per-action-capability-declarations-2204))
+as `tools/capmatrix-gen` + the `check-capability-matrix.sh` CI drift gate, reading
+the ABI4 `YuzuPluginDescriptor.action_descriptors` array rather than any of the
+four sources above directly. What's left is per-source/per-plugin **adoption** —
+TAR, Guards, Spark, and DEX each still expose their per-OS truth through their
+own hand-maintained structure (`OsSupportStatus`, the per-type support arrays,
+`dex_obs_platforms()`); wiring each into `action_descriptors` so the *rest of
+this page* (not just the generated block) renders from code is the remaining
+follow-up. An in-product *Settings → Coverage* page reading the same array
+remains a further possible step. Until every source is wired through, this page
+is still the single place to look for the hand-curated sections above — keep it
+honest.
 
 ## Verification
 

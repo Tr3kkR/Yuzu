@@ -117,6 +117,13 @@ void ResponseStore::create_tables() {
         {3, R"(
             ALTER TABLE responses ADD COLUMN received_at_ms INTEGER NOT NULL DEFAULT 0;
         )"},
+        // v4 (PR1.1 — ABI4 CC-07 result seam): plugin-reported typed status,
+        // mirroring agent.proto CommandResponse.plugin_result_status. Default
+        // 0 = PLUGIN_RESULT_UNDECLARED, exactly what a legacy row (and any
+        // response whose plugin never reported a typed status) should read as.
+        {4, R"(
+            ALTER TABLE responses ADD COLUMN plugin_result_status INTEGER NOT NULL DEFAULT 0;
+        )"},
     };
     // Pre-migration probe (mirrors instruction_store.cpp:197-216): if the
     // execution_id column already exists and schema_meta is below v2, stamp
@@ -182,6 +189,36 @@ void ResponseStore::create_tables() {
             }
         }
     }
+    // v4 pre-migration probe (mirrors v2/v3 above): a developer who
+    // pre-added plugin_result_status on an iterated build hits
+    // SQLITE_ERROR: duplicate column name on the next ALTER.
+    {
+        sqlite3_stmt* probe = nullptr;
+        bool col_exists = false;
+        if (sqlite3_prepare_v2(db_,
+                               "SELECT 1 FROM pragma_table_info('responses') "
+                               "WHERE name='plugin_result_status' LIMIT 1",
+                               -1, &probe, nullptr) == SQLITE_OK) {
+            col_exists = (sqlite3_step(probe) == SQLITE_ROW);
+            sqlite3_finalize(probe);
+        }
+        int current_v = MigrationRunner::current_version(db_, "response_store");
+        if (col_exists && current_v < 4) {
+            sqlite3_stmt* stamp = nullptr;
+            if (sqlite3_prepare_v2(db_,
+                                   "INSERT OR REPLACE INTO schema_meta "
+                                   "(store, version, upgraded_at) VALUES (?, 4, ?)",
+                                   -1, &stamp, nullptr) == SQLITE_OK) {
+                auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+                sqlite3_bind_text(stamp, 1, "response_store", -1, SQLITE_STATIC);
+                sqlite3_bind_int64(stamp, 2, now);
+                sqlite3_step(stamp);
+                sqlite3_finalize(stamp);
+            }
+        }
+    }
     if (!MigrationRunner::run(db_, "response_store", kMigrations)) {
         spdlog::error("ResponseStore: schema migration failed, closing database");
         sqlite3_close(db_);
@@ -195,8 +232,8 @@ void ResponseStore::prepare_insert_stmt() {
     const char* sql = R"(
         INSERT INTO responses (instruction_id, agent_id, timestamp, status, output,
                                error_detail, ttl_expires_at, plugin, execution_id,
-                               received_at_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               received_at_ms, plugin_result_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     )";
     if (sqlite3_prepare_v2(db_, sql, -1, &insert_stmt_, nullptr) != SQLITE_OK) {
         spdlog::error("ResponseStore: failed to prepare insert statement: {}", sqlite3_errmsg(db_));
@@ -251,6 +288,7 @@ void ResponseStore::store(const StoredResponse& resp) {
     // fallback for empty values.
     sqlite3_bind_text(insert_stmt_, 9, resp.execution_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(insert_stmt_, 10, received_ms);
+    sqlite3_bind_int(insert_stmt_, 11, resp.plugin_result_status);
 
     if (sqlite3_step(insert_stmt_) != SQLITE_DONE) {
         sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
@@ -298,7 +336,8 @@ void ResponseStore::store(const StoredResponse& resp) {
 
 ResponseStore::FinalizeResult ResponseStore::finalize_terminal_status(
     const std::string& instruction_id, const std::string& agent_id, int terminal_status,
-    const std::string& error_detail, const std::string& execution_id) {
+    const std::string& error_detail, const std::string& execution_id,
+    int plugin_result_status) {
     std::unique_lock lock(mtx_);
     if (!db_)
         return FinalizeResult::Error;
@@ -306,7 +345,7 @@ ResponseStore::FinalizeResult ResponseStore::finalize_terminal_status(
     sqlite3_stmt* stmt = nullptr;
     const char* sql = R"(
         UPDATE responses
-           SET status = ?, error_detail = ?
+           SET status = ?, error_detail = ?, plugin_result_status = ?
          WHERE instruction_id = ? AND agent_id = ? AND status = 0
            AND execution_id = ?
     )";
@@ -317,9 +356,10 @@ ResponseStore::FinalizeResult ResponseStore::finalize_terminal_status(
     }
     sqlite3_bind_int(stmt, 1, terminal_status);
     sqlite3_bind_text(stmt, 2, error_detail.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, instruction_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 5, execution_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 3, plugin_result_status);
+    sqlite3_bind_text(stmt, 4, instruction_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 6, execution_id.c_str(), -1, SQLITE_TRANSIENT);
 
     int rc = sqlite3_step(stmt);
     int changes = sqlite3_changes(db_);
@@ -348,7 +388,8 @@ std::vector<StoredResponse> ResponseStore::query(const std::string& instruction_
     std::string sql = "SELECT id, instruction_id, agent_id, timestamp, status, output, "
                       "error_detail, ttl_expires_at, COALESCE(plugin,''), "
                       "COALESCE(execution_id,''), "
-                      "COALESCE(received_at_ms, 0) FROM responses"
+                      "COALESCE(received_at_ms, 0), "
+                      "COALESCE(plugin_result_status, 0) FROM responses"
                       " WHERE instruction_id = ?";
     std::vector<std::string> bind_texts;
     // int64_binds: (param_index, value) pairs for integer parameters
@@ -419,6 +460,7 @@ std::vector<StoredResponse> ResponseStore::query(const std::string& instruction_
         if (ex)
             r.execution_id = reinterpret_cast<const char*>(ex);
         r.received_at_ms = sqlite3_column_int64(stmt, 10);
+        r.plugin_result_status = sqlite3_column_int(stmt, 11);
         results.push_back(std::move(r));
     }
     sqlite3_finalize(stmt);
@@ -461,7 +503,8 @@ std::vector<StoredResponse> ResponseStore::query_by_execution(const std::string&
     std::string sql = "SELECT id, instruction_id, agent_id, timestamp, status, output, "
                       "error_detail, ttl_expires_at, COALESCE(plugin,''), "
                       "COALESCE(execution_id,''), "
-                      "COALESCE(received_at_ms, 0) FROM responses"
+                      "COALESCE(received_at_ms, 0), "
+                      "COALESCE(plugin_result_status, 0) FROM responses"
                       " WHERE execution_id != '' AND execution_id = ?";
     std::vector<std::string> bind_texts;
     std::vector<std::pair<int, int64_t>> int_binds;
@@ -530,6 +573,7 @@ std::vector<StoredResponse> ResponseStore::query_by_execution(const std::string&
         if (ex)
             r.execution_id = reinterpret_cast<const char*>(ex);
         r.received_at_ms = sqlite3_column_int64(stmt, 10);
+        r.plugin_result_status = sqlite3_column_int(stmt, 11);
         results.push_back(std::move(r));
     }
     sqlite3_finalize(stmt);
@@ -909,7 +953,8 @@ ResponseStore::query_by_ids(const std::vector<int64_t>& response_ids) const {
     std::string sql = "SELECT id, instruction_id, agent_id, timestamp, status, output,"
                       " error_detail, ttl_expires_at, COALESCE(plugin,''),"
                       " COALESCE(execution_id,''),"
-                      " COALESCE(received_at_ms, 0) FROM responses"
+                      " COALESCE(received_at_ms, 0),"
+                      " COALESCE(plugin_result_status, 0) FROM responses"
                       " WHERE id IN (" +
                       in_list + ") ORDER BY id";
 
@@ -938,6 +983,7 @@ ResponseStore::query_by_ids(const std::vector<int64_t>& response_ids) const {
         if (ex)
             r.execution_id = reinterpret_cast<const char*>(ex);
         r.received_at_ms = sqlite3_column_int64(stmt, 10);
+        r.plugin_result_status = sqlite3_column_int(stmt, 11);
         results.push_back(std::move(r));
     }
     sqlite3_finalize(stmt);

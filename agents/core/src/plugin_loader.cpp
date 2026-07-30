@@ -410,8 +410,14 @@ std::expected<PluginHandle, LoadError> PluginHandle::load(const std::filesystem:
     // ABI v3+ includes sdk_version for diagnostics
     const char* sdk_ver =
         (desc->abi_version >= 3 && desc->sdk_version) ? desc->sdk_version : "unknown";
-    spdlog::info("Loaded plugin '{}' v{} (ABI={}, SDK={})", desc->name, desc->version,
-                 desc->abi_version, sdk_ver);
+    // ABI v4+ includes per-action capability declarations (#2204); ABI<4
+    // plugins (or an ABI4 plugin that simply never populated the array)
+    // report 0 here, which the capability-matrix generator reads as
+    // "undeclared" for every action rather than an error.
+    const std::size_t action_descriptor_count =
+        (desc->abi_version >= 4) ? desc->action_descriptor_count : 0;
+    spdlog::info("Loaded plugin '{}' v{} (ABI={}, SDK={}, capability declarations={})", desc->name,
+                 desc->version, desc->abi_version, sdk_ver, action_descriptor_count);
 
     PluginHandle ph;
     ph.handle_ = handle;
