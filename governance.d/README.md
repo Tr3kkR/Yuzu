@@ -73,9 +73,9 @@ second-copy drift the governance rule itself forbids.
 ## Reading the first fragment as a template
 
 `2619-ledger-provenance-prose-ownership.sW31cX.jsonl` is the first ledger written and will
-be copied. Two things in it are worth not copying.
+be copied. Three things in it are worth not copying.
 
-No finding in that run hit a policy floor — 28 rows record `policy_floor: null` and 5 omit
+No finding in that run hit a policy floor — 33 rows record `policy_floor: null` and 5 omit
 the key — so the fragment never exercises the floor-inheritance rule. Do not read its
 absence as a pattern.
 

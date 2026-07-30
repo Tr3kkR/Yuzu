@@ -1277,39 +1277,77 @@ Strategy:
    unstated convention means no reader can be right" that settled the row rule
    settles this one.
 
-   ### De-escalation is ONE rule, not a list of guarded fields
+   ### De-escalation — the guarded property is THE GATE, not a list of fields
 
-   **READ THE MERGED VIEW AT THE STRONGER OF ITS FACTS AND ITS LABEL.** If the merged
-   `impact`/`exposure`/`epistemic_status` derive a band above `severity_mapped`, the
-   derived band governs; if `severity_mapped` is above what the facts derive, IT
-   governs. A `policy_floor` present anywhere in a finding's history gates until it is
-   explicitly and adjudicatedly cleared. Disagreement between facts and label is not
-   resolved in the writer's favour — it is resolved upward, and it is itself a finding
-   about the ledger.
+   **READ THE MERGED VIEW AT THE STRONGER OF ITS FACTS AND ITS LABEL.** The label is
+   3-valued and bands are 5-valued, so each label denotes a SET:
+   `BLOCKING` = {CRITICAL, HIGH}, `SHOULD` = {MEDIUM}, `NICE` = {LOW, INFO}.
 
-   **Any supersession that lowers the effective band by ANY route requires an
-   `adjudicated_by` who is not the change's author, plus an `adjudication_rationale`.**
-   The route does not matter: restating `severity_mapped` downward, restating
-   `impact` or `exposure` to weaker values (note `E6` caps at LOW and dominates every
-   raise, so `exposure: ["E6"]` alone is a de-escalation), flipping
-   `epistemic_status` to `speculative`, flipping `provenance` to `pre-existing` (which
-   demotes two policy floors without touching a severity field), clearing
-   `policy_floor`, or a terminal `disposition` of `rejected` / `deferred-to-issue #N`
-   over a live gating row. Restating `severity_mapped` UNCHANGED alongside weakened
-   facts is a de-escalation too — the requirement was never "restate the label", it is
-   "do not lower the band unattended".
+   - Derived band INSIDE the label's set → they agree; the derived band governs.
+   - Derived band OUTSIDE it → they disagree. The finding is read at the stronger of
+     the derived band and the label's FLOOR (HIGH / MEDIUM / LOW respectively), and
+     the disagreement is itself reported.
 
-   **Why one rule and not a fifth guarded field.** This is the fourth round of this
-   defect. Round 2 hardened `refuted`; round 3 found supersession-by-`fixed` beside
-   it. Round 3 set precedence; round 4 found sparse rows de-gated by omission. Round 4
-   forbade lowering by omission; round 5 found explicit lowering unguarded. Round 5
-   guarded the label; a fact-only restatement walked between them, and a
-   rule-conforming reader reported ZERO violations on a fragment that de-gated a
-   BLOCKING finding. Each patch guarded a route and left the next one open, because
-   the guards were keyed to FIELDS while the property that matters is the BAND. This
-   is the same lesson the clock-guarded-retention row records — "the fix is the fact
-   set rather than a fourth patch". Do not add a sixth guarded field. If a new field
-   can move the band, it is already covered: the rule is about the band.
+   Comparing against the floor alone would be wrong, not merely conservative: an `I9`
+   finding labelled `NICE` derives INFO, which is below LOW, so a floor comparison
+   reports a disagreement on every correctly-recorded NICE row. Two rows in this
+   change's own ledger did exactly that. `impact: []` or a null fact set derives INFO.
+   A `policy_floor` present anywhere in a finding's history gates until explicitly and
+   adjudicatedly cleared.
+
+   Disagreement between facts and label is not resolved in the writer's favour — it
+   resolves upward, and it is itself a finding about the ledger. For a CONFORMING
+   writer the two can never disagree, because `severity_mapped` is defined as the
+   derived value; this rule exists for the non-conforming writer, and that is exactly
+   the case round 5 measured (a label restated unchanged beside weakened facts).
+   So: when the facts change, restate the label. A stale label is read at the stronger
+   value and is reported.
+
+   **Any supersession that WEAKENS THE GATE OR THE BAND requires an `adjudicated_by`
+   who is not the change's author, plus an `adjudication_rationale`.** The guarded
+   property is "would this row make the finding less likely to stop the merge" — the
+   band is the usual mechanism but it is NOT the only one, and the routes below
+   include three that are band-NEUTRAL. Known routes, non-exhaustive:
+
+   - `severity_mapped` restated downward
+   - `impact` or `exposure` restated to weaker values — note `E6` caps at LOW and
+     dominates every raise, so `exposure: ["E6"]` alone is a de-escalation
+   - `severity_mapped` restated UNCHANGED beside weakened facts. Band-neutral under
+     the stronger-of rule, and still a de-escalation attempt: it is the shape round 5
+     shipped, and the requirement was never "restate the label"
+   - `epistemic_status` flipped to `speculative` — band-neutral by design
+     (EPISTEMIC STATUS operates on the GATE, not the band) and it converts a blocker
+     into a deferred investigation, which is the whole point of guarding it
+   - `provenance` flipped to `pre-existing` — band-neutral, and it demotes two
+     policy floors
+   - `policy_floor` cleared — band-neutral, and it is the floor
+   - **a sentinel released**: `exposure` or `trigger` moved from `unresolved` to a
+     concrete value. Band-neutral, and it lifts a gate — unresolved EXPOSURE "GATES
+     pending adjudication", so supplying the resolution IS the adjudication and needs
+     the same independence. Defaulting an unknown to `E3` unattended is precisely
+     what the absences rule forbids
+   - a terminal `disposition` of `rejected` or `deferred-to-issue #N` over a live
+     gating row
+
+   **A new field, or a new route, must be tested against the PROPERTY** — does it
+   weaken the gate or the band — and added to this list when it does. The list is
+   openly incomplete; treating it as closed is what let round 5 ship.
+
+   **Why the property and not another guarded field.** Rounds 2–5 each hardened one
+   route and left the next open: round 2 hardened `refuted`, round 3 found
+   supersession-by-`fixed`; round 3 fixed precedence, round 4 found de-gating by
+   omission; round 4 forbade lowering by omission, round 5 found explicit lowering;
+   round 5 guarded the label, round 6 found the facts route — and a rule-conforming
+   reader reported ZERO violations on a fragment that de-gated a BLOCKING finding.
+   Round 6 named the band as the property, which closed that whole class provably
+   (weakening one leg is inert under stronger-of, so an attacker must weaken both, and
+   the second step is itself a band drop — closed under composition). But round 6 also
+   claimed the rule "enumerates no fields", and round 7 disproved it: three of round
+   6's own routes are band-neutral, and a sentinel release lifts a gate the band
+   cannot see. The property is the GATE. This is the same lesson the
+   clock-guarded-retention row records — "the fix is the fact set rather than a fourth
+   patch" — with the correction that naming a property does not excuse you from
+   checking whether it covers every mechanism.
 
    A supersession MAY correct `reporter` — a factual correction of a mis-recorded
    finder, not a re-attribution. `reporter` is immutable as to WHOM it names, not as
@@ -1399,11 +1437,11 @@ Strategy:
    | `pass_ordinal` | **which round.** Without it the final pass is indistinguishable from the first, and `caused_by` below presupposes a round identity the schema would otherwise lack. A row appended AFTER the run ends carries the `run_id` of the run it reviews and `pass_ordinal: 0` — round zero means "outside the run's rounds", and `recorded_at` says when |
    | `finding_id` | stable across rounds — `caused_by` is uncomputable without a join key |
    | `severity_native` | the REPORTER's own vocabulary, unmodified, or `null` if they gave none. A collaborator writing "nit" or nothing at all is normal; do not invent a band for them, and do not treat an unmapped human word as the "vocabulary does not map → gate it" case, which is addressed to reviewing agents |
-   | `severity_mapped` | BLOCKING / SHOULD / NICE, derived per the severity rule |
+   | `severity_mapped` | BLOCKING / SHOULD / NICE, derived per the severity rule — so for a conforming writer it always agrees with `impact`/`exposure`. Restate it whenever the facts change: a stale label is read at the stronger of the two and is itself reported |
    | `trigger` | the concrete input/state/config, or `unresolved` |
    | `impact` | every applicable `I1`…`I9` — a list; the strongest gives the band |
    | `exposure` | every applicable `E0`…`E6`, or `unresolved` — a list, not one value. `E6` is applied last and dominates every raise |
-   | `epistemic_status` | `verified` / `likely` / `speculative` |
+   | `epistemic_status` | `verified` / `likely` / `speculative`. Operates on the GATE, not the band — flipping it to `speculative` converts a blocker into a mandatory investigation without changing the derived band, which is why the de-escalation rule guards it |
    | `independent_reporters` | how many REPORTERS raised it WITHOUT having been shown it — downstream echoes are not confirmations. Counts reporters of every `source`, not agents only: a human colleague finding the same defect independently is the strongest confirmation available, and counting it zero inverts the signal |
    | `policy_floor` (nullable) | the floor hit, if the finding gates as a contract violation rather than by derivation. Null on an ordinary finding, which is most of them |
    | `provenance` | `introduced` / `newly-reachable` / `pre-existing`. **Adjudicated, not inferred from prose.** Default to `introduced` when contested |
@@ -1417,8 +1455,8 @@ Strategy:
    | `caused_by` (nullable) | did round N's fix create this round N+1 finding |
    | `waiver_rationale` (nullable) | *why* an unresolved gating finding was allowed to pass. A signature with no reasoning is content-free exception evidence |
 
-   Three of the nullable fields — `caused_by`, `waiver_rationale`, and `refuted_by`'s
-   pairing — exist so the schema is stable when the process that
+   `caused_by`, `waiver_rationale` and the `refuted_by` pair exist so the schema is
+   stable when the process that
    produces them lands. **Recording an `adjudicated_by`, `waiver_rationale`, or
    `refuted` disposition does NOT establish that a gating finding may be released** —
    no such merge contract is adopted here. Today's rule is unchanged: gating
