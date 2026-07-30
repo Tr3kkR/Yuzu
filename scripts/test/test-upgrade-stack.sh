@@ -318,10 +318,11 @@ fi
 
 # Seed the database actually created by the previous-release image. The old
 # stack has no agent service in this rig, so stop it, copy its inventory.db to
-# the host, add only the fixture row, then copy that same database back. This
-# catches released-schema drift that recreating the expected DDL here would
-# hide, while still proving path wiring, startup backfill, and rollback-file
-# retention end to end.
+# the host, add only the fixture row, then copy that same database back. Some
+# released images create the file without materialising the generic-inventory
+# table; in that case create the exact published SQLite v1 shape before adding
+# the row. Existing tables are left untouched, so released-schema drift still
+# makes the insert fail rather than being hidden by a replacement schema.
 LEGACY_INVENTORY_DB="$PHASE2_DIR/inventory.db"
 OLD_SERVER_ID=$(YUZU_VERSION="$OLD_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
     docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
@@ -340,7 +341,7 @@ if ! docker cp "${OLD_SERVER_ID}:/var/lib/yuzu/inventory.db" \
     record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "old inventory db missing"
     exit 1
 fi
-python3 - "$LEGACY_INVENTORY_DB" <<'PY'
+if ! python3 - "$LEGACY_INVENTORY_DB" <<'PY'
 import sqlite3, sys
 path = sys.argv[1]
 db = sqlite3.connect(path)
@@ -348,13 +349,28 @@ found = db.execute(
     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='inventory_data'"
 ).fetchone()
 if not found:
-    raise SystemExit("previous-release inventory.db has no inventory_data table")
+    db.executescript("""
+CREATE TABLE IF NOT EXISTS inventory_data (
+    agent_id TEXT NOT NULL,
+    plugin TEXT NOT NULL,
+    data_json TEXT NOT NULL DEFAULT '{}',
+    collected_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (agent_id, plugin)
+);
+CREATE INDEX IF NOT EXISTS idx_inventory_plugin ON inventory_data(plugin);
+CREATE INDEX IF NOT EXISTS idx_inventory_collected ON inventory_data(collected_at);
+""")
 db.execute("INSERT OR REPLACE INTO inventory_data "
            "(agent_id, plugin, data_json, collected_at) VALUES (?, ?, ?, ?)",
            ("upgrade-agent-generic", "upgrade_custom", '{"survived":true}', 1700000000))
 db.commit()
 db.close()
 PY
+then
+    fl "could not seed the published generic-inventory SQLite fixture"
+    record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "inventory seed failed"
+    exit 1
+fi
 # The copied-out file can be owned by root while the new image runs as the
 # unprivileged `yuzu` user. World-write is confined to this disposable test.
 chmod 666 "$LEGACY_INVENTORY_DB"
