@@ -586,7 +586,7 @@ this very change did exactly that while the commit message called it a worked ex
 The fix is a category correction: an attestation attaches to the ACT it approves, not to the
 finding, so it is row-scoped and exempt from the merge — never inherited, never cleared. To
 withdraw one you supersede the act, not the signature. Unlike the routes above, this class is
-closed by the schema: the attestation set is exactly those four fields.
+closed by the schema: the attestation set is exactly those four fields. (Round-8 narration, preserved as written — round 9 below records that this closure claim was false: `waiver_rationale` was a fifth.)
 
 Round 8 also had to correct two of its predecessor's own claims. `CLAUDE.md` still said the
 guard was on the band "not on a list of fields" — the sentence round 7's commit message calls

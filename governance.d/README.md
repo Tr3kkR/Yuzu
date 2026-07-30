@@ -87,15 +87,22 @@ three times, because a prose count of an append-only file goes stale the moment 
 appended — often in the very commit that updated the count. Compute counts from the
 fragment; never quote them from here.
 
-Four rows are wrong as written and correct only after supersession: `C2` at `pass_ordinal 2`
-recorded a human recorder in `reporter` with `source: "governance-agent"` and omitted
-`recorded_by`/`reviewed_at_sha`; `G8-1` and `G8-4` joined three reporters into one string;
-and the first `C2` correction described the error without restating the field, so under
-field-wise merge it changed nothing. They are left in place because superseding is the rule
-and rewriting is not — but **the merged view is the artefact**. Read it through the merge,
+Some rows are wrong as written and correct only after supersession (deliberately — no
+count, counts here went stale): a bare `deferred-to-issue` with no `#N`; a human recorder
+in `reporter` with `source: "governance-agent"` and missing `recorded_by`/`reviewed_at_sha`;
+reporters joined into one string; a correction that described an error without restating
+the field, which under field-wise merge changed nothing; and `COL-1`'s `reporter_ref`,
+free-text prose where the field demands a third-party-retrievable reference (the honest
+value was `unresolved`). They are left in place because superseding is the rule and
+rewriting is not — but **the merged view is the artefact**. Read it through the merge,
 never row by row.
 
-A third thing not to copy: two rows withdrew an adjudication by nulling
+One more caveat for evidence use: every adjudication and refutation in this fragment names
+a governance agent of the SAME authoring session. The skill itself says a subagent of the
+authoring session is not independent — these attestations stand on their recorded evidence
+(the refutation is an executed measurement), not on actor independence.
+
+Also not to copy: two rows withdrew an adjudication by nulling
 `adjudicated_by`/`adjudication_rationale`. That was wrong twice over — the adjudications
 were correct (an `I9` finding under a `SHOULD` label IS a genuine facts/label disagreement,
 so lowering the label was a real de-escalation), and nulling an attestation is not how you
