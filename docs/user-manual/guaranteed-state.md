@@ -176,6 +176,8 @@ Requires `GuaranteedState:Push`. Returns `202 Accepted`. Audits `guaranteed_stat
 
 The push is dispatched to in-scope agents; the `agents=<count>` field records how many were targeted. Delivery is best-effort for gateway-connected agents under an upstream outage (durable buffering is Guardian A3), so a non-zero `agents` count records **dispatch, not a per-agent delivery receipt**. SIEM correlation should treat the count as "push fanned out to N agents," and corroborate actual enforcement against the drift/sync records at `/api/v1/guaranteed-state/events`.
 
+> **Store degrade is fail-closed (ADR-0038).** Since the Guardian state store moved to PostgreSQL, a push (and the heartbeat reconcile) **aborts rather than fan out** if the rule store cannot be read — a `503` on the REST path, and no push on the reconcile path — instead of silently pushing an empty rule set (which would disarm every in-scope agent). If a push returns `503`, the store is unreachable/degraded, not "you have no rules"; retry once the store recovers. This is a behaviour change from the SQLite era, where a store read error could surface as an empty result.
+
 ### 5. Query events and status
 
 ```bash
