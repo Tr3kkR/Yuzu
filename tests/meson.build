@@ -486,6 +486,7 @@ if build_server
       'unit/server/test_device_ui.cpp',
       'unit/server/test_device_routes.cpp',
       'unit/server/test_inventory_routes.cpp',
+      'unit/server/test_inventory_store.cpp',
       'unit/server/test_sle_routes.cpp',
       'unit/server/test_inventory_ci_join.cpp',
       'unit/server/test_software_catalog_rollup.cpp',
