@@ -75,12 +75,11 @@ second-copy drift the governance rule itself forbids.
 `2619-ledger-provenance-prose-ownership.sW31cX.jsonl` is the first ledger written and will
 be copied. Several things in it are worth not copying.
 
-Exactly one finding in that run carries a `policy_floor` — `COL-1`, the collaborator row
-recording the operator's rejection of a proposal to skip a Gate 8 pass. Every other row
-records it null or omits it, so the fragment exercises floor inheritance exactly once, on a
-row that is itself unusual (a process violation rather than a code finding, and an averted
-one). Do not read the near-absence as a pattern, and do not take `COL-1` as the model for an
-ordinary floored finding.
+Few rows carry a `policy_floor`; compute which from the fragment — an earlier version of
+this paragraph said "exactly one" and was falsified by a row added in the same PR, which is
+the no-quoted-counts rule below demonstrating itself. `COL-1` is unusual (a process
+violation rather than a code finding, and an averted one) — do not take it as the model for
+an ordinary floored finding; `ADV-1` is the better model.
 
 This README quotes no row counts, deliberately: it stated them three times and was wrong
 three times, because a prose count of an append-only file goes stale the moment a row is
@@ -110,8 +109,8 @@ withdraw one. Attestation fields are row-scoped and exempt from the merge; you w
 attestation by superseding the act it approved. Both withdrawals are themselves superseded
 in the fragment.
 
-Its `recorded_at` values were hand-written and are illustrative: several postdate the commit
-that introduced them, which is physically impossible and would make the commit-time
+Its `recorded_at` values were hand-written and are illustrative: nearly every row written
+during the branch's own review rounds postdates the commit that introduced it, which is physically impossible and would make the commit-time
 cross-check reject every row. Real runs should stamp real times. The cross-check bounds
 `recorded_at` from above only, so it never catches the attack it is named for — an author
 appending a later-stamped row and committing it promptly is always "consistent".

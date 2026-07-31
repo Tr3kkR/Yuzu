@@ -80,10 +80,12 @@ That list governs; this file is a pointer and loses on conflict.
 Everything else in this file — the Documentation Domains, the deep-dive list, the
 bullets above, the Review Checklist — enumerates where to LOOK, not what is
 required. A gap you find there is a candidate finding, sized by derivation; it is a
-missing *required* doc only if it also lands in one of the six. The YAML
-InstructionDefinition, `yaml-dsl-spec.md` §14 and roadmap/capability-map cases
-usually do, via item 6 (a routed-concern row names them as an update obligation for
-that surface) — check, do not assume.
+missing *required* doc only if it also lands in one of the six. For the YAML
+InstructionDefinition, `yaml-dsl-spec.md` §14 and roadmap/capability-map cases,
+that means item 6: open `.claude/routed-concerns.md` and confirm a row names the
+file as an update obligation for the changed surface. Today none does — assume NOT
+required until a row says otherwise; the checklist entries above remain candidate
+findings sized by derivation.
 
 In-code prose never generates a missing-doc finding — an uncommented function is not
 an undocumented feature.

@@ -1,11 +1,11 @@
 # Tuning `/governance` for signal density
 
 **Status:** shipped — §3 and §8–§10 are live in `.claude/skills/governance/SKILL.md` and CLAUDE.md standing rules 1–4.
-**Rounds:** four documented here — §5 (adversarial review of the first draft), §7–§8 (colleague amendments), §9 (severity derivation, #2623), §10 (ledger provenance and prose ownership, #2619 + #2620) — plus the internal Gate 8 iterations on the #2619/#2620 change itself, recorded in §10. (No count of those here: two earlier counts both went stale.)
+**Rounds:** four documented here — §5 (adversarial review of the first draft), §8 (colleague amendments), §9 (severity derivation, #2623), §10 (ledger provenance and prose ownership, #2619 + #2620) — plus the internal Gate 8 iterations on the #2619/#2620 change itself, recorded in §10. (No count of those here: two earlier counts both went stale.)
 **Date:** 2026-07-28, last amended 2026-07-30
 **Adversarial review:** `enterprise-architect` (fable) and `gpt-5.6-sol` (codex), independently. **Both returned BLOCK on the first draft.** Their objections are recorded in §5 and have been folded in — the change set below is materially smaller than what was first proposed.
 
-**Second round (2026-07-28):** a colleague responded with a larger proposal (termination protocol, finding classification, triage, record design) plus a five-item amendment list for this PR. Four amendments were accepted, one refuted; both reviewers re-ran at maximum rigour to verify before anything was changed. §7 records that exchange. Three further defects **in this PR** were found during it and fixed.
+**Second round (2026-07-28):** a colleague responded with a larger proposal (termination protocol, finding classification, triage, record design) plus a five-item amendment list for this PR. Four amendments were accepted, one refuted; both reviewers re-ran at maximum rigour to verify before anything was changed. §8 records that exchange. Three further defects **in this PR** were found during it and fixed.
 
 ---
 
@@ -37,7 +37,7 @@ On #2580 the pipeline found **9 BLOCKING across two rounds**, roughly seven of t
 
 The skill asks every agent for BLOCKING/SHOULD/NICE and **never defines them**. Twelve agents invent twelve bars; the operator normalises by hand.
 
-Add one shared block, injected into every preamble. **Revised in round 2** (see §7): agents
+Add one shared block, injected into every preamble. **Revised in round 2** (see §8): agents
 keep their **native** vocabulary and the block calibrates the **threshold**, because telling
 every agent to use BLOCKING/SHOULD/NICE "exactly" contradicted `security-guardian`'s
 CRITICAL/HIGH/… brief and `docs-writer`'s BLOCKING/SHOULD-FIX/… brief.
@@ -52,7 +52,7 @@ CRITICAL/HIGH/… brief and `docs-writer`'s BLOCKING/SHOULD-FIX/… brief.
 
 *Changed after review.* The first draft said non-docs agents must **not report** wording. Both reviewers rejected that as inoperable: an agent must first classify text as descriptive or normative, and that classification is the disputed question. Sol produced two genuinely ambiguous examples from #2580's own code — a comment calling saturation the "safe failure direction" (explanatory, but it also states the clamp's safety property) and one describing a "fixed Prometheus outcome vocabulary" (descriptive-looking, but it defines cross-surface audit/metric parity).
 
-Revised rule. **Round 2 split this further** (see §7): routing prose to `docs-writer` alone
+Revised rule. **Round 2 split this further** (see §8): routing prose to `docs-writer` alone
 created an ownership gap, because its brief has no mandate over in-code text at all. Two
 questions, two owners:
 
@@ -68,13 +68,15 @@ Capping rather than prohibiting means a mis-classification costs a line of noise
 **Amended by #2620 — there are three categories, not two, and the cap has an owner.**
 Absence is neither wording nor contradiction: a *missing* required doc contradicts nothing,
 so the cap cannot reach it, and it is a truth finding derived as `I7`. "Required" is defined
-rather than judged — a routed-concern row names the doc for a changed path, or one of
-`docs-writer`'s numbered deep-dive checks matches the diff; in-code prose never qualifies,
+rather than judged — a closed six-item list (REST reference, user-manual section, changelog
+fragment, CLAUDE.md/routed-concern row for a new invariant, contract table, or a doc a
+routed-concern row names as an UPDATE OBLIGATION for the changed surface — never merely its
+reading list); in-code prose never qualifies,
 which is what stops a wording nit being re-filed as an absence to escape the cap. And the
 cap only consolidates if the other agents stop: wording is now `docs-writer`'s to file
 alone, whereas §3.2 as written above left every agent still reporting it. Both amendments
 land in the same commit that gave `docs-writer`'s Gate 2 brief a mandate over in-code prose
-— the gap §7 identified was closed in the prose-ownership section but not in the brief that
+— the gap §8 identified was closed in the prose-ownership section but not in the brief that
 implements it.
 
 ### 3.3 Fix the Gate 8 re-review roster
@@ -503,7 +505,7 @@ plausible-looking ledger.
 §3.2 above and §8 amendment 3 established that `docs-writer` owns wording including in-code
 prose. Its own Gate 2 brief was never updated: five checks, every one a documentation
 *file*, no mention of comments or log strings. An agent reading only its brief could not
-know the mandate had widened — the same shape as the gap §7 found, one layer down. The brief
+know the mandate had widened — the same shape as the gap §8 found, one layer down. The brief
 now carries it as check 6, scoped to prose the diff changes rather than every comment in a
 touched file, and `.claude/agents/docs-writer.md` was updated too: it still listed only
 documentation domains, and its Blocking Criteria still asserted the blanket BLOCKING that
@@ -626,9 +628,27 @@ operator-adjudicated rather than looped — this branch ran eight rounds, seven 
 shipped a blocking defect of their own, on a change that began as two documentation
 follow-ups.
 
-The branch stopped at operator direction. The severity derivation was calibrated against
+The branch stopped at operator direction — and the external pass that followed
+immediately found two more blockers (below), which is the strongest datum this branch
+produced for #2646. The severity derivation was calibrated against
 under-gating on security code (§"The corpus's own blind spot" above); applied to prose about
 an artefact with no writer and no reader, its ratchets — unmappable gates, unresolved gates,
 `I3` base HIGH — keep the marginal-finding supply above the loop threshold indefinitely,
 because prose has no compiler to discharge claims against. That interaction, not any single
 finding, is the most important thing this branch measured.
+
+### Round 10 — the adversarial pass
+
+After round 9 the branch went to an external adversarial review (Claude subagent + Codex,
+two-phase, cross-examined; committed under `docs/reviews/2647-adversarial-review/`). Both
+reviewers independently reproduced the same HIGH: the Gate 8 step-4 park check, met by this
+branch's own sparse-supersession write model in the dev merge, returned its documented CLEAN
+exit for a parked `I1` finding — a false-green in the pipeline's own machinery, of exactly
+the class nine internal rounds had been hunting. The second HIGH was a round-3 sentence in
+the Gate 2 preamble that survived the round-4 canonical fix — the missed-copy class again,
+inside one file. Both are recorded as `ADV-1`/`ADV-2` (`pass_ordinal: 0` — outside the run's
+rounds, which is why "eight rounds" above remains the internal count) and fixed in round 10.
+
+The lesson for #2646 is sharper than round 9 stated: the operator stop was right, AND the
+external pass still found blockers the same-family loop had not — the marginal instrument
+after convergence is a different reviewer, not another round.
