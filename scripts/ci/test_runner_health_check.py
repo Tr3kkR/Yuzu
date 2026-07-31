@@ -52,6 +52,13 @@ class QueryRunnersTests(unittest.TestCase):
         self.assertEqual(auth.state, runner_health.QueryState.AUTH_ERROR)
         self.assertEqual(api.state, runner_health.QueryState.API_ERROR)
 
+    def test_live_actions_admin_403_is_an_authentication_failure(self) -> None:
+        result = self.query(
+            returncode=1,
+            stderr="gh: Resource not accessible by integration (HTTP 403)",
+        )
+        self.assertEqual(result.state, runner_health.QueryState.AUTH_ERROR)
+
     def test_rate_limit_is_distinct_from_authentication_failure(self) -> None:
         result = self.query(returncode=1, stderr="HTTP 403: API rate limit exceeded")
         self.assertEqual(result.state, runner_health.QueryState.RATE_LIMIT)
@@ -329,6 +336,55 @@ class WorkflowWiringTests(unittest.TestCase):
         for workflow, name_line in expected.items():
             with self.subTest(workflow=workflow):
                 self.assertIn(name_line, self.job(workflow, "preflight"))
+
+    def test_automatic_fork_detection_comes_from_the_event_payload(self) -> None:
+        preflight = self.job("ci.yml", "preflight")
+        self.assertIn(
+            "GITHUB_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}",
+            preflight,
+        )
+        self.assertIn(
+            "github.event.pull_request.head.repo.full_name != github.repository",
+            preflight,
+        )
+        self.assertIn("steps.codegate.outputs.code_changed == 'true'", preflight)
+
+    def test_trusted_call_uses_its_input_and_always_verifies_checkout(self) -> None:
+        trusted_inputs = self.job("ci.yml", "trusted_inputs")
+        preflight = self.job("ci.yml", "preflight")
+        self.assertIn('if [[ -z "$APPROVED_SHA" ]]', trusted_inputs)
+        self.assertNotIn("EVENT_NAME", trusted_inputs)
+        self.assertIn("checkout_sha=$head_sha", trusted_inputs)
+        self.assertIn("trusted_execution=true", trusted_inputs)
+        self.assertIn("ref: ${{ github.workflow_sha }}", preflight)
+        self.assertIn("- name: Verify resolved checkout", preflight)
+        self.assertNotIn("if: github.event_name == 'workflow_call'", preflight)
+
+    def test_trusted_fork_secret_and_cache_boundaries_are_explicit(self) -> None:
+        wrapper = (ROOT / ".github" / "workflows" / "trusted-fork-ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("secrets: inherit", wrapper)
+        self.assertIn("TRUSTED_FORK_CI_GATE: ${{ secrets.TRUSTED_FORK_CI_GATE }}", wrapper)
+        self.assertIn("RUNNER_INVENTORY_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN }}", wrapper)
+
+        for job_name in ("linux", "windows"):
+            with self.subTest(job=job_name):
+                job = self.job("ci.yml", job_name)
+                self.assertIn(
+                    "clean: ${{ needs.preflight.outputs.trusted_execution == 'true' }}",
+                    job,
+                )
+                self.assertIn("VCPKG_BINARY_SOURCES=clear", job)
+                self.assertIn("CCACHE_DIR=$cache_root/ccache", job)
+                self.assertIn("Purge trusted-fork workspace", job)
+
+    def test_nightly_alert_does_not_open_a_merge_block_after_cancellation(self) -> None:
+        nightly = (ROOT / ".github" / "workflows" / "nightly.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            "if: ${{ !cancelled() && (failure() || needs.preflight.result == 'failure') }}",
+            nightly,
+        )
 
     def test_sentinel_opens_an_issue_for_untyped_failures(self) -> None:
         sentinel = (ROOT / ".github" / "workflows" / "runner-inventory-sentinel.yml").read_text(

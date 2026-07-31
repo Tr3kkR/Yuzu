@@ -80,7 +80,10 @@ gh workflow run trusted-fork-ci.yml --ref main \
 
 The trusted workflow validates that the PR is still open, the supplied SHA is
 still its current head, and the hosted review run matches the same PR and SHA.
-It executes the full reusable CI matrix with the normal repository secrets.
+It passes only `TRUSTED_FORK_CI_GATE` and `RUNNER_INVENTORY_TOKEN` into the
+reusable matrix. The PAT is used by a hosted base-revision control step before
+the fork checkout; build steps do not receive it. The trusted self-hosted legs
+use clean workspaces and private, no-share caches, then purge the checkout.
 This is an explicit trust decision: do not dispatch it for a fork revision that
 has not been statically reviewed. The `TRUSTED_FORK_CI_GATE` repository secret
 is an additional wrapper-only guard and must not be exposed to build steps.

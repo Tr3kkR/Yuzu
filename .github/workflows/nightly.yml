@@ -789,7 +789,9 @@ jobs:
   alert:
     name: "Open nightly-broken on failure"
     needs: [preflight, sanitize-asan, sanitize-tsan, windows-asan, coverage]
-    if: ${{ always() && (failure() || needs.preflight.result == 'failure') }}
+    # `always()` alone also runs after cancellation, which must not create a
+    # repository-wide merge block. Retain failure handling for preflight.
+    if: ${{ !cancelled() && (failure() || needs.preflight.result == 'failure') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

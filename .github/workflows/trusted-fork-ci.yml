@@ -90,4 +90,9 @@ jobs:
     with:
       pr_number: ${{ needs.validate-approval.outputs.pr_number }}
       head_sha: ${{ needs.validate-approval.outputs.head_sha }}
-    secrets: inherit # zizmor: ignore[secrets-inherit]
+    # Keep the called workflow's secret surface explicit. GITHUB_TOKEN is
+    # supplied automatically by Actions; the PAT is consumed only by the
+    # hosted, base-revision runner-control step before fork code is checked out.
+    secrets:
+      TRUSTED_FORK_CI_GATE: ${{ secrets.TRUSTED_FORK_CI_GATE }}
+      RUNNER_INVENTORY_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN }}

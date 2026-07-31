@@ -52,6 +52,9 @@ on:
       TRUSTED_FORK_CI_GATE:
         description: "Repository-only sentinel proving the trusted wrapper invoked this workflow"
         required: true
+      RUNNER_INVENTORY_TOKEN:
+        description: "Administration:read token used only by hosted runner-control preflight"
+        required: true
 
 # Scorecard Token-Permissions hardening: ci.yml builds and tests only —
 # no registry pushes, no release creation. contents:read is all that's
@@ -102,11 +105,12 @@ jobs:
     outputs:
       checkout_repository: ${{ steps.validate.outputs.checkout_repository }}
       checkout_ref: ${{ steps.validate.outputs.checkout_ref }}
+      checkout_sha: ${{ steps.validate.outputs.checkout_sha }}
       base_sha: ${{ steps.validate.outputs.base_sha }}
+      trusted_execution: ${{ steps.validate.outputs.trusted_execution }}
     steps:
       - id: validate
         env:
-          EVENT_NAME: ${{ github.event_name }}
           REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ inputs.pr_number }}
           APPROVED_SHA: ${{ inputs.head_sha }}
@@ -115,10 +119,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$EVENT_NAME" != "workflow_call" ]]; then
+          # A reusable workflow inherits the caller's github.event_name, so
+          # inputs.head_sha — which only the trusted wrapper supplies — is the
+          # call-boundary discriminator. Do not use github.event_name here.
+          if [[ -z "$APPROVED_SHA" ]]; then
             echo "checkout_repository=$REPOSITORY" >> "$GITHUB_OUTPUT"
             echo "checkout_ref=${GITHUB_REF}" >> "$GITHUB_OUTPUT"
-            if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            echo "checkout_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "trusted_execution=false" >> "$GITHUB_OUTPUT"
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
               echo "base_sha=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
             else
               echo "base_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
@@ -156,7 +165,9 @@ jobs:
           # the repository while still executing the approved fork revision.
           echo "checkout_repository=$REPOSITORY" >> "$GITHUB_OUTPUT"
           echo "checkout_ref=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "checkout_sha=$head_sha" >> "$GITHUB_OUTPUT"
           echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "trusted_execution=true" >> "$GITHUB_OUTPUT"
           echo "Trusted execution approved for $head_repo PR #$PR_NUMBER @ $head_sha"
 
   # ── Preflight: runner-health gate (PR-7 of CI overhaul plan) ──────────
@@ -211,27 +222,17 @@ jobs:
       code_changed: ${{ steps.codegate.outputs.code_changed }}
       checkout_repository: ${{ needs.trusted_inputs.outputs.checkout_repository }}
       checkout_ref: ${{ needs.trusted_inputs.outputs.checkout_ref }}
+      checkout_sha: ${{ needs.trusted_inputs.outputs.checkout_sha }}
+      trusted_execution: ${{ needs.trusted_inputs.outputs.trusted_execution }}
     steps:
+      # Control-plane code must come from the base workflow revision. In a
+      # trusted fork run, the runner-inventory PAT is exposed only to this
+      # hosted step, before any fork-controlled file is checked out.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: ${{ needs.trusted_inputs.outputs.checkout_repository }}
-          ref: ${{ needs.trusted_inputs.outputs.checkout_ref }}
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
-      - name: Verify trusted checkout
-        if: github.event_name == 'workflow_call'
-        env:
-          EXPECTED_SHA: ${{ needs.trusted_inputs.outputs.checkout_ref }}
-        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-      - name: Runner-health control tests
-        run: python3 scripts/ci/test_runner_health_check.py
-
-      # Hermetic shell-gate tests on the PR fast-path. The compose-version gate
-      # otherwise only runs at release time, so a regex regression would surface
-      # too late (after the full build matrix). No build deps — just bash.
-      - name: Shell gate tests
-        run: |
-          bash tests/shell/test_check_compose_versions.sh
-          bash tests/shell/test_detect_code_change.sh   # docs-only gate classifier (#1978)
 
       # ── Docs-only vs code gate (issue #1978) ───────────────────────────
       # Decide whether the heavy build matrix runs for this PR. The
@@ -280,11 +281,46 @@ jobs:
 
       - name: Probe runner health for code-bearing changes
         id: health
+        # Docs-only same-repository PRs do not depend on the build fleet.
+        # An automatic fork still runs this base-revision check and fails red
+        # before querying, so it can never claim a healthy self-hosted pool.
+        if: steps.codegate.outputs.code_changed == 'true' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
         env:
           GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: >-
           python3 scripts/ci/runner-health-check.py --mode preflight
           --require-pool bigtam --require-pool weetam
+
+      # The checkout below is deliberately after the only step that receives
+      # RUNNER_INVENTORY_TOKEN. A trusted fork may execute tests from this
+      # revision, but it must never receive that administration-scoped secret.
+      - name: Checkout requested revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.trusted_inputs.outputs.checkout_repository }}
+          ref: ${{ needs.trusted_inputs.outputs.checkout_ref }}
+          persist-credentials: false
+      - name: Verify resolved checkout
+        env:
+          EXPECTED_SHA: ${{ needs.trusted_inputs.outputs.checkout_sha }}
+        run: |
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$EXPECTED_SHA" || {
+            echo "::error::checkout mismatch: expected=$EXPECTED_SHA actual=$actual_sha"
+            exit 1
+          }
+
+      # Hermetic shell-gate tests on the PR fast-path. The compose-version gate
+      # otherwise only runs at release time, so a regex regression would surface
+      # too late (after the full build matrix). No build deps — just bash.
+      - name: Shell gate tests
+        run: |
+          bash tests/shell/test_check_compose_versions.sh
+          bash tests/shell/test_detect_code_change.sh   # docs-only gate classifier (#1978)
+          python3 scripts/ci/test_runner_health_check.py
 
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──
   # lint:
@@ -321,6 +357,8 @@ jobs:
           ref: ${{ needs.preflight.outputs.checkout_ref }}
           # Need history so buf can compare against the merge base
           fetch-depth: 0
+          # A trusted fork never reuses a prior self-hosted workspace.
+          clean: ${{ needs.preflight.outputs.trusted_execution == 'true' }}
           persist-credentials: false
       - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
         with:
@@ -329,6 +367,12 @@ jobs:
         run: buf lint proto
       - name: Check backward compatibility
         run: buf breaking proto --against '.git#subdir=proto,ref=origin/main'
+
+      - name: Purge trusted-fork workspace
+        if: ${{ always() && needs.preflight.outputs.trusted_execution == 'true' }}
+        run: |
+          git reset --hard
+          git clean -ffdx
 
   # ── Linux (GCC + Clang, self-hosted yuzu-bigtam-linux) ────────────────
   linux:
@@ -373,7 +417,9 @@ jobs:
           - compiler: ${{ github.event_name == 'pull_request' && 'clang-21' || 'NONE' }}
 
     steps:
-      # PR-5 of the CI overhaul plan: clean:false preserves build-linux/
+      # PR-5 of the CI overhaul plan: normal CI keeps clean:false to preserve
+      # build-linux/ across jobs. A maintainer-approved fork is the explicit
+      # exception: it starts clean and uses only run-private caches below.
       # across jobs so meson + ninja can be incremental across pushes.
       # The branch-switch sentinel below is the safety net — if the
       # previous job on this runner was on a different branch, the
@@ -408,8 +454,19 @@ jobs:
           # by the pre-checkout wipe step above; cache freshness is
           # handled by the vcpkg sentinel. Manual recovery: scripts/ci/
           # runner-reset.sh.
-          clean: false
+          clean: ${{ needs.preflight.outputs.trusted_execution == 'true' }}
           persist-credentials: false
+
+      - name: Isolate trusted-fork build caches
+        if: needs.preflight.outputs.trusted_execution == 'true'
+        run: |
+          cache_root="$RUNNER_TEMP/yuzu-trusted-fork-${GITHUB_RUN_ID}-${GITHUB_JOB}"
+          mkdir -p "$cache_root/ccache"
+          echo "CCACHE_DIR=$cache_root/ccache" >> "$GITHUB_ENV"
+          # Do not read or write runner.tool_cache. The trusted review is an
+          # explicit code-execution decision, not permission to poison a
+          # cache consumed by later normal CI jobs.
+          echo "VCPKG_BINARY_SOURCES=clear" >> "$GITHUB_ENV"
 
       # One DB per runner agent, below runner.tool_cache and therefore outside
       # the checkout. ci-telemetry exports YUZU_TEST_DB for later steps and
@@ -417,7 +474,7 @@ jobs:
       - name: Start persistent CI telemetry
         continue-on-error: true
         env:
-          YUZU_TEST_DB: ${{ runner.tool_cache }}/yuzu-test-runs/${{ runner.name }}/test-runs.db
+          YUZU_TEST_DB: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-test-runs-{1}.db', runner.temp, github.run_id) || format('{0}/yuzu-test-runs/{1}/test-runs.db', runner.tool_cache, runner.name) }}
         run: >-
           python3 scripts/ci/ci-telemetry.py start
           --job-name "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
@@ -535,7 +592,7 @@ jobs:
           # one cache means the first matrix variant pays the from-source
           # cost (~25 min) and the other three restore in seconds, vs.
           # 4× from-source under per-matrix scoping. Issue #569.
-          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-linux
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-vcpkg-{1}', runner.temp, github.run_id) || format('{0}/yuzu-vcpkg-binary-cache-linux', runner.tool_cache) }}
         run: |
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           ${{ github.workspace }}/vcpkg/vcpkg install \
@@ -677,7 +734,7 @@ jobs:
         if: always()
         continue-on-error: true
         env:
-          YUZU_TEST_DB: ${{ runner.tool_cache }}/yuzu-test-runs/${{ runner.name }}/test-runs.db
+          YUZU_TEST_DB: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-test-runs-{1}.db', runner.temp, github.run_id) || format('{0}/yuzu-test-runs/{1}/test-runs.db', runner.tool_cache, runner.name) }}
           YUZU_CI_CONCLUSION: ${{ job.status }}
         run: >-
           python3 scripts/ci/ci-telemetry.py finish
@@ -685,6 +742,14 @@ jobs:
           --triplet x64-linux
           --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
           --conclusion "$YUZU_CI_CONCLUSION"
+
+      - name: Purge trusted-fork workspace
+        if: ${{ always() && needs.preflight.outputs.trusted_execution == 'true' }}
+        run: |
+          # Keep this narrow to the Actions checkout. runner.tool_cache and
+          # the runner-local telemetry DB are deliberately outside this path.
+          git reset --hard
+          git clean -ffdx
 
   # ── Windows (MSVC, self-hosted Wee Tam pool) ────────────────────────────
   windows:
@@ -723,7 +788,7 @@ jobs:
           - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
 
     steps:
-      # PR-5 of the CI overhaul plan: clean:false on the persistent
+      # PR-5 of the CI overhaul plan: normal CI keeps clean:false on the persistent
       # yuzu-local-windows runner. Branch-switch sentinel runs in the
       # MSYS2 bash configured by `defaults.run.shell` above (so $GITHUB_*
       # env vars and bash test syntax both work).
@@ -766,15 +831,26 @@ jobs:
           submodules: recursive
           # clean:false — persist build-windows-{debug,release}/ +
           # vcpkg_installed/ between runs. Manual recovery: scripts/ci/runner-reset.sh.
-          clean: false
+          clean: ${{ needs.preflight.outputs.trusted_execution == 'true' }}
           persist-credentials: false
+
+      - name: Isolate trusted-fork build caches
+        if: needs.preflight.outputs.trusted_execution == 'true'
+        run: |
+          cache_root="$RUNNER_TEMP/yuzu-trusted-fork-${GITHUB_RUN_ID}-${GITHUB_JOB}"
+          mkdir -p "$cache_root/ccache"
+          echo "CCACHE_DIR=$cache_root/ccache" >> "$GITHUB_ENV"
+          # Do not read or write runner.tool_cache. The trusted review is an
+          # explicit code-execution decision, not permission to poison a
+          # cache consumed by later normal CI jobs.
+          echo "VCPKG_BINARY_SOURCES=clear" >> "$GITHUB_ENV"
 
       - name: Start persistent CI telemetry
         continue-on-error: true
         env:
           # Keep the workflow path identical to Start-PinnedRunner.ps1 even
           # before the next safe runner restart propagates its process env.
-          YUZU_TEST_DB: D:\ci\test-runs\${{ runner.name }}\test-runs.db
+          YUZU_TEST_DB: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-test-runs-{1}.db', runner.temp, github.run_id) || format('D:\\ci\\test-runs\\{0}\\test-runs.db', runner.name) }}
         run: >-
           python scripts/ci/ci-telemetry.py start
           --job-name "Windows MSVC ${{ matrix.build_type }}"
@@ -873,7 +949,7 @@ jobs:
           # triplet builds both variants in one port build (the
           # VCPKG_BUILD_TYPE override was removed in the LNK2038 fix), so
           # the zip filename is the same regardless of consumer build_type.
-          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-windows
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-vcpkg-{1}', runner.temp, github.run_id) || format('{0}/yuzu-vcpkg-binary-cache-windows', runner.tool_cache) }}
         run: |
           # Use $GITHUB_WORKSPACE (bash env var, runtime read) instead of
           # ${{ github.workspace }} (GHA source interpolation). On Windows
@@ -1019,7 +1095,7 @@ jobs:
         if: always()
         continue-on-error: true
         env:
-          YUZU_TEST_DB: D:\ci\test-runs\${{ runner.name }}\test-runs.db
+          YUZU_TEST_DB: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-test-runs-{1}.db', runner.temp, github.run_id) || format('D:\\ci\\test-runs\\{0}\\test-runs.db', runner.name) }}
           YUZU_CI_CONCLUSION: ${{ job.status }}
         run: >-
           python scripts/ci/ci-telemetry.py finish
@@ -1027,6 +1103,14 @@ jobs:
           --triplet x64-windows
           --builddir build-windows-${{ matrix.build_type }}
           --conclusion "$YUZU_CI_CONCLUSION"
+
+      - name: Purge trusted-fork workspace
+        if: ${{ always() && needs.preflight.outputs.trusted_execution == 'true' }}
+        run: |
+          # Keep this narrow to the Actions checkout. runner.tool_cache and
+          # the runner-local telemetry DB are deliberately outside this path.
+          git reset --hard
+          git clean -ffdx
 
   # ── macOS (Apple Clang) ────────────────────────────────────────────────
   macos:
@@ -1350,7 +1434,7 @@ jobs:
   detect-ci-changes:
     name: "Detect CI infrastructure changes"
     needs: [trusted_inputs]
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_call' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'pull_request' || inputs.head_sha != '' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     outputs:
@@ -1365,13 +1449,14 @@ jobs:
       - id: detect
         env:
           TRUSTED_BASE_SHA: ${{ needs.trusted_inputs.outputs.base_sha }}
+          TRUSTED_HEAD_SHA: ${{ inputs.head_sha }}
         run: |
           # PRs diff against the base ref; pushes diff against the SHA
           # before the push (`github.event.before`). For push-to-main
           # that's the previous main tip, which is exactly the boundary
           # we want — anything in this push that touched CI infra needs
           # to (re)warm the canary cache scope.
-          if [[ "${{ github.event_name }}" == "workflow_call" ]]; then
+          if [[ -n "$TRUSTED_HEAD_SHA" ]]; then
             base_sha="$TRUSTED_BASE_SHA"
           elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
             base_sha="${{ github.event.pull_request.base.sha }}"

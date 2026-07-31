@@ -93,8 +93,14 @@ The wrapper requires the PR to remain open, verifies that its current head is
 the supplied SHA, requires the hosted review run to match the same PR and SHA,
 and invokes the reusable `ci.yml` matrix. The reusable workflow also requires
 the repository-only `TRUSTED_FORK_CI_GATE` secret, so a fork cannot call it
-directly. Once this deliberate approval is made, the trusted run receives the
-normal CI secret set and executes the full PR gate on the approved revision.
+directly. The wrapper passes only that sentinel and `RUNNER_INVENTORY_TOKEN`;
+the PAT is consumed by a hosted, base-workflow-revision runner-control step
+before the approved fork revision is checked out. Trusted self-hosted jobs
+start from a clean workspace, use run-private ccache/test state, disable vcpkg
+binary sources, and purge the workspace afterwards. They never read or write
+the normal `runner.tool_cache` caches. This deliberate approval therefore
+executes the full PR gate without turning a reviewed fork into a cache-publisher
+or exposing the administration-scoped PAT to fork-controlled code.
 
 ## Gates outside the tier ladder
 
@@ -512,9 +518,12 @@ per-command error checks.
 
 ## Persistence and recovery
 
-Self-hosted checkouts use `clean: false`. Pre-checkout wipes `build-<os>/`
-ONLY on branch change; vcpkg state is invalidated by the sentinel above.
-`meson setup --reconfigure` when `meson-info/` exists. Manual recovery:
+Normal self-hosted checkouts use `clean: false`. Pre-checkout wipes
+`build-<os>/` ONLY on branch change; vcpkg state is invalidated by the
+sentinel above. A trusted fork execution is the intentional exception: it uses
+`clean: true`, private temporary ccache/test paths, `VCPKG_BINARY_SOURCES=clear`,
+and a final checkout-only purge. `meson setup --reconfigure` when
+`meson-info/` exists. Manual recovery:
 `bash scripts/ci/runner-reset.sh`
 (`git clean -fdx -e vcpkg/ -e vcpkg_installed/ -e build-*/`) — **the only
 sanctioned in-repo nuke path**; never `rm -rf` runner caches (memory
