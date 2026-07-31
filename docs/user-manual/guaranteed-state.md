@@ -178,6 +178,10 @@ The push is dispatched to in-scope agents; the `agents=<count>` field records ho
 
 > **Store degrade is fail-closed (ADR-0038).** Since the Guardian state store moved to PostgreSQL, a push (and the heartbeat reconcile) **aborts rather than fan out** if the rule store cannot be read — a `503` on the REST path, and no push on the reconcile path — instead of silently pushing an empty rule set (which would disarm every in-scope agent). If a push returns `503`, the store is unreachable/degraded, not "you have no rules"; retry once the store recovers. This is a behaviour change from the SQLite era, where a store read error could surface as an empty result.
 
+> **DEX reads degrade to empty, not error (interim, #2659).** The `/dex` analytic reads (crash/signal/app aggregations) currently return an *empty* result on a degraded PG connection rather than a 503 — a degraded dashboard can read as "0 crashes." Each such degrade is counted at `yuzu_server_guardian_read_degrade_total{reason,source}`; until #2659 widens these reads, alert on `rate(yuzu_server_guardian_read_degrade_total[5m]) > 0` and treat a zero DEX panel under that condition as "unknown," not "healthy."
+
+> **Retention reap cadence + ceiling (#2660).** Expired Guardian events/observations are reaped on a ~60-minute clock-guarded pass capped per pass; under a sustained high-write incident the backlog can drain slower than it accumulated. Alert on a stalled reaper with `absent_over_time(yuzu_server_guardian_reap_passes_total[75m])`; drain-rate tuning for large fleets is tracked in #2660.
+
 ### 5. Query events and status
 
 ```bash

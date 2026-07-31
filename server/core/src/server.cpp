@@ -2848,6 +2848,32 @@ public:
                         spdlog::warn("Guardian heartbeat reconcile: list_rules degraded ({}) — "
                                      "aborting re-push for agent_id={}",
                                      rules_result.error(), agent_id);
+                        // Gate 6 compliance: an aborted enforcement convergence for a
+                        // BEHIND agent is a security-relevant non-event — SIEM must see
+                        // it, not just a metric/log (the REST push twin audits `denied`;
+                        // the success re-push below audits `success`). This site is past
+                        // the per-agent rate-limit claim, so it inherits the same
+                        // at-most-one-row-per-agent-per-interval dedup as the success
+                        // path — no audit storm. (The earlier generation-nullopt gate is
+                        // pre-dedup and coarse — counter-only there, plus the persistent
+                        // degraded gauge tracked in #2662.)
+                        if (audit_store_ && audit_store_->is_open()) {
+                            AuditEvent ev;
+                            ev.timestamp =
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            ev.principal = "system";
+                            ev.action = "guaranteed_state.reconcile";
+                            ev.target_type = "GuaranteedState";
+                            ev.target_id = agent_id;
+                            ev.detail = "heartbeat reconcile ABORTED — rule store degraded (" +
+                                        rules_result.error() +
+                                        "); agent rules did not converge (generation " +
+                                        std::to_string(agent_gen) + ")";
+                            ev.result = "degraded";
+                            (void)audit_store_->log(ev);
+                        }
                         return;
                     }
                     // Per-agent filtering as the fan-out (M4): only rules that target
