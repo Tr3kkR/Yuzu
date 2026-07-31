@@ -48,7 +48,7 @@
 ///    dropped enforcement-history row is re-derivable from the agent's next
 ///    report cycle; ingest must never block the gRPC thread. Infra-level
 ///    drops (pool exhaustion / lease timeout / BEGIN-prepare-exec-commit
-///    failure) bump `yuzu_server_guardian_ingest_dropped_total{reason}` (ADR-0037
+///    failure) bump the existing `yuzu_server_guardian_events_{dropped,ingest_errors}_total` family (ADR-0037
 ///    label convention) IN ADDITION to the existing four-way
 ///    `EventInsertOutcome` classification + its per-outcome atomics below.
 ///  - **Status upserts — fail-soft with the same counter**; status READS stay
@@ -318,7 +318,7 @@ public:
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
     /// Wire a metrics registry for `yuzu_server_guardian_read_degrade_total{reason}`
-    /// (DEX/analytics reads) and `yuzu_server_guardian_ingest_dropped_total{reason}`
+    /// (DEX/analytics reads) and the existing `yuzu_server_guardian_events_{dropped,ingest_errors}_total` family
     /// (fail-soft ingest) and the reap-pass counter. Set ONCE during
     /// single-threaded startup, before serving — the pointer is read without
     /// synchronisation on serving threads. A null registry (default, e.g.
@@ -363,7 +363,7 @@ public:
     std::expected<std::vector<GuaranteedStateRuleRow>, std::string> list_rules() const;
 
     // Event ingest + query. FAIL-SOFT (ADR-0038): a lease/query/transaction
-    // failure is logged + counted (`yuzu_server_guardian_ingest_dropped_total` +
+    // failure is logged + counted (`yuzu_server_guardian_events_ingest_errors_total` +
     // `events_ingest_errors_total()`), never throws, never blocks the caller.
     //
     // insert_event_classified() is the primary ingest entry point: it returns the

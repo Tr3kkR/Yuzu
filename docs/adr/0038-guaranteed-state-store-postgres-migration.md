@@ -56,8 +56,9 @@ aggregate reads get the same composite indexes the SQLite store maintains.
 - **Event/observation ingest: FAIL-SOFT** (mirrors ADR-0037 ingest): a dropped
   enforcement-history row is re-derivable operational telemetry from the agent's next
   report cycle; ingest must never block the gRPC thread. Drops are counted
-  (`yuzu_server_guardian_ingest_dropped_total{reason}`, the ADR-0037 label conventions incl.
-  constants).
+  on the existing `yuzu_server_guardian_events_{dropped,ingest_errors}_total` family —
+  a dedicated ingest-dropped counter was dropped in review as a double-count, Gate 4
+  consistency SHOULD-1).
 - **Status upserts: fail-soft with the same counter** (reconcile heals on the next
   heartbeat), but status **reads** feeding the enforce-gate/dashboard stay
   degrade-distinguishable (empty ≠ unknown).
@@ -75,8 +76,11 @@ aggregate reads get the same composite indexes the SQLite store maintains.
   with this PR), amendable per-file. The `kDexCohortFloor` no-singling-out flooring stays
   where it lives today (model/route layer), untouched.
   The type-distinguishable set THIS PR: `list_rules` / `get_rule` / `rule_names` /
-  `rule_names_for` (Push/reconcile inputs) and `agent_rule_statuses` (enforce-gate/census
-  input) — the catastrophic-read set — plus all write paths.
+  `rule_names_for` (Push/reconcile inputs), `agent_rule_statuses` /
+  `agent_rule_statuses_for_agent` (enforce-gate/census input), and
+  `current_policy_generation` (`std::optional<uint64_t>`, nullopt-on-degrade — added in
+  the Gate-2 fold so a degraded generation read aborts the push/reconcile instead of
+  reading as generation 0) — the catastrophic-read set — plus all write paths.
 
 ### Backfill (ADR-0009) — mandatory, all five tables, one transaction
 

@@ -52,7 +52,6 @@ constexpr std::chrono::milliseconds kDexReadTimeout{3000};
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
-constexpr const char* kReasonConflict = "conflict"; // event_id collision, mismatched fields
 // JC-8 (coordinator review): label parity with InventoryStore's
 // yuzu_inventory_read_degrade_total{reason, source} family — a constant
 // "source" so a future second Guardian-adjacent read-degrade emitter
@@ -209,11 +208,6 @@ DegradeLog note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason,
     const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;
     const bool new_episode = prev == 0 || (now - prev) > kDegradeEpisodeGapSecs;
     return {new_episode || (n % kReadDegradeLogSample) == 0, n};
-}
-
-void note_ingest_dropped(yuzu::MetricsRegistry* metrics, const char* reason) {
-    if (metrics)
-        metrics->counter("yuzu_server_guardian_ingest_dropped_total", {{"reason", reason}}).increment();
 }
 
 // Increment the persisted policy generation via one atomic UPDATE ...
@@ -1396,16 +1390,19 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
         if (f->find('\0') != std::string::npos)
             return {EventInsertOutcome::Error, "event field contains an embedded NUL byte"};
 
-    const auto op_error = [this](std::string msg, const char* reason) {
+    // Transient ingest errors count on events_ingest_errors_total (the agent's
+    // durable journal redelivers) — NOT on a "dropped" counter; only a genuine
+    // conflict is a permanent drop (events_dropped_total). (Gate 4 consistency
+    // SHOULD-1: the earlier ingest_dropped_total double-counted this family and
+    // mislabelled transient errors as drops.)
+    const auto op_error = [this](std::string msg, const char* /*reason*/) {
         events_ingest_errors_.fetch_add(1, std::memory_order_relaxed);
-        note_ingest_dropped(metrics_, reason);
         return EventInsertResult{EventInsertOutcome::Error, std::move(msg)};
     };
 
     auto lease = pool_.try_acquire_for(kIngestTimeout);
     if (!lease) {
         events_ingest_errors_.fetch_add(1, std::memory_order_relaxed);
-        note_ingest_dropped(metrics_, kReasonPoolTimeout);
         return {EventInsertOutcome::Error, "no database connection: " + pool_.last_error()};
     }
     PGconn* conn = lease.get();
@@ -1458,7 +1455,6 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
                 return {EventInsertOutcome::Redelivered, {}};
             }
             events_dropped_.fetch_add(1, std::memory_order_relaxed);
-            note_ingest_dropped(metrics_, kReasonConflict);
             return {EventInsertOutcome::Conflict,
                     format_conflict("event_id '" + row.event_id +
                                     "' already exists with different fields")};
@@ -1585,6 +1581,17 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
                 } else {
                     pg::exec_params(conn, "RELEASE SAVEPOINT observation_projection", std::vector<std::string>{});
                 }
+            } else {
+                // cpp-safety Gate-3 SHOULD: mirror the single-event twin's
+                // observability — a failed SAVEPOINT leaves the txn about to
+                // abort on the next statement, so surface it rather than
+                // proceeding silently. (This batch path has no live caller
+                // today — the HARD CONSTRAINT above — but must not become the
+                // one ingest site that fails invisibly if a caller appears.)
+                observations_proj_failures_.fetch_add(1, std::memory_order_relaxed);
+                spdlog::error("GuaranteedStateStore: SAVEPOINT observation_projection failed in "
+                              "batch (event_id={}): {}",
+                              row.event_id, PQerrorMessage(conn));
             }
         }
     }
@@ -2811,12 +2818,20 @@ void GuaranteedStateStore::reap_expired() {
         // the PII projection must never outlive its parent event. Unconditional
         // per-pass cap on each (substrate-tuned: 10x ResultSetStore's cap for
         // this store's documented up-to-10k-events/s incident write volume).
+        // TIEBREAKER (governance UP-1): ttl_expires_at is second-granular, so a
+        // cap boundary landing inside a tied-ttl bucket would let the two
+        // independent capped DELETEs pick DIFFERENT subsets — an observation
+        // could then outlive its parent event. Ordering BOTH by
+        // (ttl_expires_at, event_id) with the SAME cap makes only the safe
+        // direction reachable: the events set's event_id domain is a superset
+        // of observations', so under a shared deterministic order an
+        // observation is never reaped later than its parent.
         pg::PgResult ev = pg::exec_params(
             conn,
             "DELETE FROM guaranteed_state_store.guaranteed_state_events WHERE event_id IN ("
             "SELECT event_id FROM guaranteed_state_store.guaranteed_state_events "
             "WHERE ttl_expires_at > 0 AND ttl_expires_at < $1::bigint "
-            "ORDER BY ttl_expires_at ASC LIMIT $2::bigint) RETURNING event_id",
+            "ORDER BY ttl_expires_at ASC, event_id ASC LIMIT $2::bigint) RETURNING event_id",
             std::vector<std::string>{std::to_string(now), std::to_string(kReapCapPerPass)});
         if (ev.status() != PGRES_TUPLES_OK) {
             spdlog::error("GuaranteedStateStore::reap_expired: events delete failed: {}",
@@ -2830,7 +2845,7 @@ void GuaranteedStateStore::reap_expired() {
             "DELETE FROM guaranteed_state_store.guardian_observations WHERE event_id IN ("
             "SELECT event_id FROM guaranteed_state_store.guardian_observations "
             "WHERE ttl_expires_at > 0 AND ttl_expires_at < $1::bigint "
-            "ORDER BY ttl_expires_at ASC LIMIT $2::bigint) RETURNING event_id",
+            "ORDER BY ttl_expires_at ASC, event_id ASC LIMIT $2::bigint) RETURNING event_id",
             std::vector<std::string>{std::to_string(now), std::to_string(kReapCapPerPass)});
         if (obs.status() != PGRES_TUPLES_OK) {
             spdlog::error("GuaranteedStateStore::reap_expired: observations delete failed: {}",

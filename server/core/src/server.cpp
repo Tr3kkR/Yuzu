@@ -1560,11 +1560,6 @@ public:
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
                           "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
-        metrics_.describe("yuzu_server_guardian_ingest_dropped_total",
-                          "Guardian event/observation ingest rows that did not persist, by "
-                          "reason. Ingest is fail-soft (ADR-0038) — the agent's next report "
-                          "re-derives them — so alert on a sustained rate, not presence.",
-                          "counter");
         metrics_.describe("yuzu_server_guardian_read_degrade_total",
                           "Guardian rules/status/DEX reads that returned degraded (could not "
                           "read) rather than a genuine result, by reason and source. A sampled "
@@ -11985,9 +11980,17 @@ private:
         // gauges. Borrows result_set_store_, execution_tracker_, response_store_
         // and metrics_, so it MUST be joined before any of them are torn down
         // (join sits next to the policy-eval join in stop()).
-        if (result_set_store_ && result_set_store_->is_open()) {
+        // Started if EITHER store is open (cpp-safety Gate-3 SHOULD / JC-6): the
+        // Guardian retention reap piggybacks this thread, and gating its
+        // existence on result_set_store health would silently stop enforcing
+        // guardian_observations PII TTL if that unrelated store were ever
+        // closed/optional. Both stores fail-closed together at boot today, so
+        // this is defensive against a future refactor; each unit of work below
+        // is independently gated on its own store's is_open().
+        if ((result_set_store_ && result_set_store_->is_open()) ||
+            (guaranteed_state_store_ && guaranteed_state_store_->is_open())) {
             result_set_maint_thread_ = std::thread([this]() {
-                spdlog::info("Result-set maintenance thread started (cadence=2s, GC=5m, "
+                spdlog::info("Result-set/Guardian maintenance thread started (cadence=2s, GC=5m, "
                              "Guardian reap=60m)");
                 constexpr int kGcEveryNTicks = 150;            // ~5 minutes at 2s/tick
                 // Guardian retention reap (ADR-0038): matches the old SQLite cleanup
@@ -12007,8 +12010,12 @@ private:
                                                 std::chrono::system_clock::now().time_since_epoch())
                                                 .count();
 
-                        // 1) Materialise terminal pending sets.
-                        for (const auto& p : result_set_store_->list_pending()) {
+                        // 1) Materialise terminal pending sets (result-set store
+                        // only; the thread may be running solely for the Guardian
+                        // reap — JC-6 decoupling).
+                        for (const auto& p : (result_set_store_ && result_set_store_->is_open())
+                                                 ? result_set_store_->list_pending()
+                                                 : std::vector<yuzu::server::PendingSet>{}) {
                             if (p.source_execution_id.empty())
                                 continue;
                             bool terminal = false;
@@ -12056,9 +12063,10 @@ private:
                             }
                         }
 
-                        // 2) GC sweep on the slow cadence.
+                        // 2) GC sweep on the slow cadence (result-set store only).
                         ++tick;
-                        if (tick % kGcEveryNTicks == 0) {
+                        if (result_set_store_ && result_set_store_->is_open() &&
+                            tick % kGcEveryNTicks == 0) {
                             int swept = result_set_store_->gc_sweep();
                             if (swept > 0) {
                                 metrics_.counter("yuzu_result_set_gc_total")
@@ -12068,18 +12076,21 @@ private:
                         }
 
                         // 2b) Guardian retention reap (ADR-0038) on its own, much
-                        // slower cadence — piggybacks on this thread's tick counter.
+                        // slower cadence — piggybacks on this thread's tick counter,
+                        // independently gated on the Guardian store's own health.
                         if (guaranteed_state_store_ && guaranteed_state_store_->is_open() &&
                             tick % kGuardianReapEveryNTicks == 0) {
                             guaranteed_state_store_->reap_expired();
                         }
 
-                        // 3) Refresh alive gauges.
-                        auto c = result_set_store_->counts();
-                        metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "true"}})
-                            .set(static_cast<double>(c.pinned));
-                        metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "false"}})
-                            .set(static_cast<double>(c.total - c.pinned));
+                        // 3) Refresh alive gauges (result-set store only).
+                        if (result_set_store_ && result_set_store_->is_open()) {
+                            auto c = result_set_store_->counts();
+                            metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "true"}})
+                                .set(static_cast<double>(c.pinned));
+                            metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "false"}})
+                                .set(static_cast<double>(c.total - c.pinned));
+                        }
                     } catch (const std::exception& e) {
                         spdlog::error("result_set_maint: tick threw ({}) — thread continuing",
                                       e.what());
