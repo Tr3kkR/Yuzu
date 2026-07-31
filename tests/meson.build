@@ -373,7 +373,15 @@ tar_test_exe = executable(
   cpp_args: tar_test_cpp_args,
   dependencies: tar_test_deps,
 )
-test('tar unit tests', tar_test_exe, suite: 'tar', timeout: 90)
+# Keep TAR as one 90-second deadline domain: splitting it would add process
+# startup and an `is_parallel: false` global barrier without Windows evidence
+# that either shard stays below budget. Fixed Catch2 order + seed remove random
+# case order as an input; deleting the opportunistic retention race removes its
+# measured host-speed-dependent workload entirely.
+tar_deterministic_args = ['--order', 'lex', '--rng-seed', '1']
+test('tar unit tests', tar_test_exe,
+     args: tar_deterministic_args,
+     suite: 'tar', timeout: 90)
 
 # ── Server unit tests ─────────────────────────────────────────────────────────
 if build_server
