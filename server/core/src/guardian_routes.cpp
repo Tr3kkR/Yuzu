@@ -1198,14 +1198,27 @@ void GuardianRoutes::deploy_baseline(const httplib::Request& req, httplib::Respo
     if (push_fn_)
         pushed = push_fn_(/*scope=*/"", /*full_sync=*/true);
 
+    // Gate 2 LOW2: -2 is "rule store degraded" (distinct from -1 "not wired /
+    // other push failure"). The Baseline IS persisted and the generation bumped,
+    // so reconcile converges once the store heals — but the operator/SIEM must
+    // not be told "deployed" when the fan-out was refused. Branch the audit
+    // result + toast on the degraded case.
+    const bool degraded = (pushed == -2);
     const std::string deploy = pushed >= 0 ? ("agents=" + std::to_string(pushed))
+                               : degraded  ? "store degraded — fan-out deferred to reconcile"
                                            : "push not wired/failed";
-    audit_fn_(req, "guaranteed_state.baseline.deploy", "success", "GuaranteedState", baseline_id,
+    audit_fn_(req, "guaranteed_state.baseline.deploy", degraded ? "degraded" : "success",
+              "GuaranteedState", baseline_id,
               b->name + " deployed fleet-wide (" + deploy +
                   ", members=" + std::to_string(baseline_store_->member_count(baseline_id)) + ")");
 
-    res.set_header("HX-Trigger",
-                   R"({"showToast":{"message":"Baseline deployed","level":"success"}})");
+    if (degraded)
+        res.set_header(
+            "HX-Trigger",
+            R"json({"showToast":{"message":"Baseline saved; fleet fan-out deferred - rule store degraded, reconcile will converge","level":"warning"}})json");
+    else
+        res.set_header("HX-Trigger",
+                       R"({"showToast":{"message":"Baseline deployed","level":"success"}})");
     // Detail is a full page now (/guardian/baseline/<id>) — there is no modal to
     // re-render. Just refresh both lists out-of-band (the baseline lifecycle badge
     // and the guards' "Deployed:" links both change on deploy). The Baselines-list

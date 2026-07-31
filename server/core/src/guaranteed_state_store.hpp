@@ -48,7 +48,7 @@
 ///    dropped enforcement-history row is re-derivable from the agent's next
 ///    report cycle; ingest must never block the gRPC thread. Infra-level
 ///    drops (pool exhaustion / lease timeout / BEGIN-prepare-exec-commit
-///    failure) bump `yuzu_guardian_ingest_dropped_total{reason}` (ADR-0037
+///    failure) bump `yuzu_server_guardian_ingest_dropped_total{reason}` (ADR-0037
 ///    label convention) IN ADDITION to the existing four-way
 ///    `EventInsertOutcome` classification + its per-outcome atomics below.
 ///  - **Status upserts — fail-soft with the same counter**; status READS stay
@@ -61,7 +61,7 @@
 ///    fans out to ~68 call sites across 5 consumer files and is tracked as a
 ///    follow-up (#2659), amendable per-file. What THIS PR lands at the store
 ///    seam: every such read counts+logs a degrade via
-///    `yuzu_guardian_read_degrade_total{reason}` + a sampled `DegradeSampler`
+///    `yuzu_server_guardian_read_degrade_total{reason}` + a sampled `DegradeSampler`
 ///    warn on store-not-open / lease-timeout / query-error, so the silent
 ///    empty is at least visible on `/metrics` even though the return type
 ///    does not yet distinguish it. None of these reads feeds an
@@ -317,8 +317,8 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
-    /// Wire a metrics registry for `yuzu_guardian_read_degrade_total{reason}`
-    /// (DEX/analytics reads) and `yuzu_guardian_ingest_dropped_total{reason}`
+    /// Wire a metrics registry for `yuzu_server_guardian_read_degrade_total{reason}`
+    /// (DEX/analytics reads) and `yuzu_server_guardian_ingest_dropped_total{reason}`
     /// (fail-soft ingest) and the reap-pass counter. Set ONCE during
     /// single-threaded startup, before serving — the pointer is read without
     /// synchronisation on serving threads. A null registry (default, e.g.
@@ -363,7 +363,7 @@ public:
     std::expected<std::vector<GuaranteedStateRuleRow>, std::string> list_rules() const;
 
     // Event ingest + query. FAIL-SOFT (ADR-0038): a lease/query/transaction
-    // failure is logged + counted (`yuzu_guardian_ingest_dropped_total` +
+    // failure is logged + counted (`yuzu_server_guardian_ingest_dropped_total` +
     // `events_ingest_errors_total()`), never throws, never blocks the caller.
     //
     // insert_event_classified() is the primary ingest entry point: it returns the
@@ -387,7 +387,7 @@ public:
     // ── DEX / analytics reads (ADR-0038 "deferred widening", #2659) ──────────
     // Plain value-type returns, empty-on-degrade — behavior-identical to the
     // SQLite store. Every degrade path (store not open / lease timeout / query
-    // error) counts `yuzu_guardian_read_degrade_total{reason}` + a sampled
+    // error) counts `yuzu_server_guardian_read_degrade_total{reason}` + a sampled
     // warn log via the store-local DegradeSampler (see the .cpp), so the loss
     // is visible on /metrics even though the type does not yet distinguish it.
 
@@ -471,7 +471,7 @@ public:
     // Monotonic policy generation — the version stamp of the rule SET, bumped
     // atomically on every create/update/delete. Persisted (survives restart)
     // and strictly increasing.
-    uint64_t current_policy_generation() const;
+    std::optional<uint64_t> current_policy_generation() const;
 
     // Bump the persisted policy generation WITHOUT mutating any rule (the
     // Baseline deploy path). Best-effort: logs on failure (mirrors the
@@ -498,7 +498,7 @@ public:
     /// outlive its parent event). One sweeping replica at a time via
     /// `pg_try_advisory_xact_lock`; a durable `gc_meta` reading +
     /// anomaly-fact-set guards against a skewed wall clock mass-expiring
-    /// live rows. Emits `yuzu_guardian_reap_passes_total{result=swept|noop|
+    /// live rows. Emits `yuzu_server_guardian_reap_passes_total{result=swept|noop|
     /// declined|failed|skipped_lock}`.
     void reap_expired();
 

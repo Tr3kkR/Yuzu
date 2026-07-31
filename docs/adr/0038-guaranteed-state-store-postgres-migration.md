@@ -56,7 +56,7 @@ aggregate reads get the same composite indexes the SQLite store maintains.
 - **Event/observation ingest: FAIL-SOFT** (mirrors ADR-0037 ingest): a dropped
   enforcement-history row is re-derivable operational telemetry from the agent's next
   report cycle; ingest must never block the gRPC thread. Drops are counted
-  (`yuzu_guardian_ingest_dropped_total{reason}`, the ADR-0037 label conventions incl.
+  (`yuzu_server_guardian_ingest_dropped_total{reason}`, the ADR-0037 label conventions incl.
   constants).
 - **Status upserts: fail-soft with the same counter** (reconcile heals on the next
   heartbeat), but status **reads** feeding the enforce-gate/dashboard stay
@@ -69,7 +69,7 @@ aggregate reads get the same composite indexes the SQLite store maintains.
   not a mechanical sweep, and none feeds an enforce/target decision (the playbook's
   deny-or-benign class; same deferral the ResultSetStore pilot recorded for
   `list_by_owner`/`members`/`lineage`). What this PR DOES land at the store seam:
-  `yuzu_guardian_read_degrade_total{reason}` + `DegradeSampler` logging on every DEX read
+  `yuzu_server_guardian_read_degrade_total{reason}` + `DegradeSampler` logging on every DEX read
   (a degrade is counted and visible even while the return stays empty). The
   `std::optional` widening + per-route degrade sweep is a tracked follow-up (issue filed
   with this PR), amendable per-file. The `kDexCohortFloor` no-singling-out flooring stays

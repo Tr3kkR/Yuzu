@@ -201,7 +201,7 @@ DegradeLog note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason,
                              DegradeSampler& s) {
     if (metrics)
         metrics
-            ->counter("yuzu_guardian_read_degrade_total",
+            ->counter("yuzu_server_guardian_read_degrade_total",
                       {{"reason", reason}, {"source", kDegradeSource}})
             .increment();
     const std::int64_t now = now_epoch();
@@ -213,7 +213,7 @@ DegradeLog note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason,
 
 void note_ingest_dropped(yuzu::MetricsRegistry* metrics, const char* reason) {
     if (metrics)
-        metrics->counter("yuzu_guardian_ingest_dropped_total", {{"reason", reason}}).increment();
+        metrics->counter("yuzu_server_guardian_ingest_dropped_total", {{"reason", reason}}).increment();
 }
 
 // Increment the persisted policy generation via one atomic UPDATE ...
@@ -237,7 +237,7 @@ void bump_policy_generation_on(PGconn* conn) {
 // follow-up #2659): acquire a bounded lease, run `body(conn)` (which executes
 // the query and returns the parsed result, or nullopt on a query-level
 // failure), and count+sampled-log a degrade on store-not-open / pool-timeout
-// / query-error via yuzu_guardian_read_degrade_total{reason}. A successful
+// / query-error via yuzu_server_guardian_read_degrade_total{reason}. A successful
 // EMPTY container is NOT a degrade — only body() returning nullopt is.
 template <typename Result, typename Body>
 Result dex_read(bool open, pg::PgPool& pool, yuzu::MetricsRegistry* metrics, const char* method,
@@ -1151,18 +1151,26 @@ void GuaranteedStateStore::bump_policy_generation() {
     bump_policy_generation_on(lease.get());
 }
 
-uint64_t GuaranteedStateStore::current_policy_generation() const {
+std::optional<uint64_t> GuaranteedStateStore::current_policy_generation() const {
+    // Type-distinguishable (governance Gate 2 LOW1, ADR-0038): a degraded read
+    // returns std::nullopt, NEVER 0. Collapsing degrade to 0 silently
+    // suppressed the heartbeat reconcile (every `agent_gen >= 0` is true, so a
+    // transient meta-read blip disabled reconcile fleet-wide) and stamped a
+    // push with a wrong generation → re-push churn. Both consumers (push /
+    // reconcile) treat nullopt as "abort this pass", the same posture list_rules
+    // uses. The seeded row means a healthy store always has a value; nullopt is
+    // strictly the not-open / lease-timeout / query-error path.
     if (!open_)
-        return 0;
+        return std::nullopt;
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return 0;
+        return std::nullopt;
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT value FROM guaranteed_state_store.guardian_meta WHERE key = 'policy_generation'",
         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
-        return 0;
+        return std::nullopt;
     return static_cast<uint64_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
 }
 
@@ -2660,7 +2668,7 @@ void GuaranteedStateStore::reap_expired() {
         return;
     const auto record_result = [this](const char* result) {
         if (metrics_)
-            metrics_->counter("yuzu_guardian_reap_passes_total", {{"result", result}}).increment();
+            metrics_->counter("yuzu_server_guardian_reap_passes_total", {{"result", result}}).increment();
     };
 
     int64_t events_deleted = 0;

@@ -1560,6 +1560,22 @@ public:
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
                           "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");
+        metrics_.describe("yuzu_server_guardian_ingest_dropped_total",
+                          "Guardian event/observation ingest rows that did not persist, by "
+                          "reason. Ingest is fail-soft (ADR-0038) — the agent's next report "
+                          "re-derives them — so alert on a sustained rate, not presence.",
+                          "counter");
+        metrics_.describe("yuzu_server_guardian_read_degrade_total",
+                          "Guardian rules/status/DEX reads that returned degraded (could not "
+                          "read) rather than a genuine result, by reason and source. A sampled "
+                          "warn accompanies each new degrade episode; the catastrophic reads "
+                          "(rules/status) abort the push/reconcile rather than fan out empty.",
+                          "counter");
+        metrics_.describe("yuzu_server_guardian_reap_passes_total",
+                          "Retention-reaper pass outcomes by result "
+                          "(swept/noop/declined/failed/skipped_lock) — the clock-guard "
+                          "observability the reaped counters lacked (ADR-0038, #2634).",
+                          "counter");
         metrics_.describe("yuzu_server_guardian_baselines_total",
                           "Total Guardian Baselines persisted", "gauge");
         // T12 (design doc §7): engine-credential overlap-pair rotation sweep.
@@ -2777,8 +2793,19 @@ public:
                 [this](std::string_view agent_id_sv, std::uint64_t agent_gen) {
                     if (!guaranteed_state_store_)
                         return;
-                    const std::uint64_t current =
+                    // Gate 2 LOW1: a degraded generation read aborts the reconcile
+                    // OBSERVABLY (counter) rather than collapsing to 0 — which made
+                    // every `agent_gen >= 0` true and silently suppressed reconcile.
+                    const auto current_opt =
                         guaranteed_state_store_->current_policy_generation();
+                    if (!current_opt) {
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "degraded"}})
+                            .increment();
+                        return;
+                    }
+                    const std::uint64_t current = *current_opt;
                     if (agent_gen >= current)
                         return;  // agent already at or ahead of current policy
                     const std::string agent_id(agent_id_sv);
@@ -13959,8 +13986,15 @@ private:
                 // store bumps the counter on rule mutations; we only read it here.
                 // Replaces wall-clock seconds, which could repeat or step backwards
                 // and wedge the heartbeat reconcile. (M6 / #1209.)
-                const std::uint64_t generation =
+                const auto generation_opt =
                     guaranteed_state_store_->current_policy_generation();
+                if (!generation_opt) {
+                    spdlog::warn("Guardian push: policy-generation read degraded — aborting "
+                                 "push (scope={})",
+                                 scope);
+                    return -2; // store degraded → 503, never a wrong-generation fan-out
+                }
+                const std::uint64_t generation = *generation_opt;
                 // list_rules is now type-distinguishable (ADR-0038 catastrophic-read
                 // set): a degraded read MUST abort the push, never fan out an empty
                 // rule set indistinguishable from "no rules configured" — a Guardian-
