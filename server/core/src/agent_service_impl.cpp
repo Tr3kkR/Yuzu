@@ -698,6 +698,11 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
 
     response->set_received(true);
 
+    // Reject abusive source-map cardinality before any typed store sees the
+    // report. The empty ack deliberately avoids a resend-amplification loop.
+    if (!validate_inventory_report_source_count(agent_id, *request, &metrics_))
+        return grpc::Status::OK;
+
     // Each typed source ingests through its own shared seam (ADR-0016 §5) — the SAME
     // seam the gateway ProxyInventory path uses — independently guarded + isolated, so
     // one store being down or one payload being bad can't fail the RPC into a retry

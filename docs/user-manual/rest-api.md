@@ -3632,7 +3632,7 @@ An action carries an inline `parameter_schema` **only** when it has a published 
 
 ### Inventory
 
-Inventory data is structured per-plugin telemetry collected from agents and stored server-side.
+Inventory data is structured per-plugin telemetry collected from agents and stored server-side. The generic store (`InventoryStore`, ADR-0037) is Postgres-backed with an AUTHORITATIVE read posture — a store/pool/query degrade returns **503**, never a silent empty result.
 
 #### `GET /api/v1/inventory/tables`
 
@@ -3656,6 +3656,23 @@ List all inventory tables (one per plugin that reports inventory data).
 }
 ```
 
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 503 | Inventory store unavailable or degraded |
+
+#### `POST /api/v1/result-sets/from-inventory-query`
+
+Creates an owner-scoped result set from an inventory query (scope-walking
+producer; see `docs/scope-walking-design.md` for the full result-set surface).
+One behavior worth calling out here: when the underlying inventory read hits
+the server row cap or 8 MiB aggregate payload cap, the route returns **503**
+("inventory query truncated ... refusing to materialise a partial result set") rather than
+persisting a silently-incomplete set — a fleet-targeting set is never silently
+narrowed.
+
 #### `GET /api/v1/inventory/{plugin}/{agent_id}`
 
 Get inventory data for a specific plugin and agent.
@@ -3678,6 +3695,13 @@ Get inventory data for a specific plugin and agent.
 
 The `data` field contains the plugin-specific structured inventory blob as parsed JSON (or a string if the blob is not valid JSON).
 
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 404 | No inventory data found for this agent+plugin |
+| 503 | Inventory store unavailable or degraded |
+
 #### `POST /api/v1/inventory/query`
 
 Query inventory data across agents with filters.
@@ -3694,7 +3718,16 @@ Query inventory data across agents with filters.
 | `until` | integer | No | Unix timestamp — only records collected before this time |
 | `limit` | integer | No | Max results (default 100, max 1000) |
 
-**Response:** List of inventory records matching the query.
+**Response:** List of inventory records matching the query, plus top-level
+`result_truncated_by_cap`. When that flag is `true`, the server's row or 8 MiB aggregate
+payload budget was reached and the returned fleet result is incomplete; callers must not
+interpret omitted rows as absence.
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 503 | Inventory store unavailable or degraded |
 
 #### `POST /api/v1/inventory/evaluate`
 
@@ -3736,9 +3769,22 @@ Each condition object:
 }
 ```
 
+`result_truncated_by_cap` (bool, optional) — emitted at the **top level of the
+envelope** (alongside `data`), present and `true` when the underlying inventory
+read hit its row cap (5,000 for this route) or 8 MiB aggregate payload cap:
+absent devices may simply not have
+been read rather than not matching. (The typed software route carries the same
+flag inside `data` — placement alignment is tracked with #2633.)
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 503 | Inventory store unavailable or degraded |
+
 #### `GET /api/v1/inventory/software`
 
-Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareInventoryStore`). **Distinct** from the generic `/inventory/*` routes above, which read the legacy blob store. This is the REST sibling of the `query_installed_software` MCP tool — same data, same scope contract.
+Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareInventoryStore`). **Distinct** from the generic `/inventory/*` routes above, which read the generic per-source blob store (`InventoryStore`, also Postgres-backed as of ADR-0037, but a separate schema/table). This is the REST sibling of the `query_installed_software` MCP tool — same data, same scope contract.
 
 **Permission:** `Inventory:Read`
 
@@ -6579,6 +6625,8 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `validate_scope` | Validate a scope expression |
 | `preview_scope_targets` | Preview which agents match a scope |
 | `list_pending_approvals` | List pending approval requests |
+
+`query_inventory`, `list_inventory_tables`, and `get_agent_inventory` read the Postgres-backed generic `InventoryStore` (ADR-0037) and now return a JSON-RPC internal-error response (code `-32603`) when the store is unavailable or degraded (previously a silent empty result).
 
 **Additional read-only tools (post-Phase-1).** Beyond the Phase 1 set the server also exposes the DEX signal/perf, network, and inventory read tools. The **application-performance-over-time** tools (this release) are:
 

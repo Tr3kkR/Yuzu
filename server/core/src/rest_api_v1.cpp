@@ -5059,14 +5059,19 @@ void RestApiV1::register_routes(
         }
 
         auto tables = inventory_store->list_tables();
+        if (!tables) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "inventory store degraded"), "application/json");
+            return;
+        }
         JArr arr;
-        for (const auto& t : tables) {
+        for (const auto& t : *tables) {
             arr.add(JObj()
                         .add("plugin", t.plugin)
                         .add("agent_count", t.agent_count)
                         .add("last_collected", t.last_collected));
         }
-        res.set_content(list_json(arr.str(), static_cast<int64_t>(tables.size())),
+        res.set_content(list_json(arr.str(), static_cast<int64_t>(tables->size())),
                         "application/json");
     });
 
@@ -5085,22 +5090,29 @@ void RestApiV1::register_routes(
                  auto plugin = req.matches[2].str();
 
                  auto record = inventory_store->get(agent_id, plugin);
-                 if (!record) {
+                 if (!record.has_value()) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "inventory store degraded"),
+                                     "application/json");
+                     return;
+                 }
+                 if (!record->has_value()) {
                      res.status = 404;
                      res.set_content(detail::a4_error(res, "no inventory data found"), "application/json");
                      return;
                  }
 
+                 const InventoryRecord& rec = **record;
                  // Embed data_json as raw JSON if valid, otherwise as a quoted string
-                 auto parsed = nlohmann::json::parse(record->data_json, nullptr, false);
+                 auto parsed = nlohmann::json::parse(rec.data_json, nullptr, false);
                  JObj data;
-                 data.add("agent_id", record->agent_id).add("plugin", record->plugin);
+                 data.add("agent_id", rec.agent_id).add("plugin", rec.plugin);
                  if (!parsed.is_discarded()) {
-                     data.raw("data", record->data_json);
+                     data.raw("data", rec.data_json);
                  } else {
-                     data.add("data", record->data_json);
+                     data.add("data", rec.data_json);
                  }
-                 data.add("collected_at", record->collected_at);
+                 data.add("collected_at", rec.collected_at);
                  res.set_content(ok_json(data.str()), "application/json");
              });
 
@@ -5130,9 +5142,15 @@ void RestApiV1::register_routes(
         if (q.limit > 1000)
             q.limit = 1000;
 
-        auto records = inventory_store->query(q);
+        bool inventory_truncated = false;
+        auto records = inventory_store->query(q, &inventory_truncated);
+        if (!records) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "inventory store degraded"), "application/json");
+            return;
+        }
         JArr arr;
-        for (const auto& r : records) {
+        for (const auto& r : *records) {
             auto parsed = nlohmann::json::parse(r.data_json, nullptr, false);
             JObj item;
             item.add("agent_id", r.agent_id).add("plugin", r.plugin);
@@ -5144,7 +5162,17 @@ void RestApiV1::register_routes(
             item.add("collected_at", r.collected_at);
             arr.add(item);
         }
-        res.set_content(list_json(arr.str(), static_cast<int64_t>(records.size())),
+        const auto pagination = JObj()
+                                    .add("total", static_cast<int64_t>(records->size()))
+                                    .add("start", int64_t{0})
+                                    .add("page_size", int64_t{50})
+                                    .str();
+        res.set_content(JObj()
+                            .raw("data", arr.str())
+                            .raw("pagination", pagination)
+                            .raw("meta", R"({"api_version":"v1"})")
+                            .add("result_truncated_by_cap", inventory_truncated)
+                            .str(),
                         "application/json");
     });
 
@@ -5754,6 +5782,12 @@ void RestApiV1::register_routes(
                   [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
                       if (!perm_fn(req, res, "Inventory", "Read"))
                           return;
+                      if (!inventory_store->is_open()) {
+                          res.status = 503;
+                          res.set_content(detail::a4_error(res, "inventory store not available"),
+                                          "application/json");
+                          return;
+                      }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
                       if (body.is_discarded()) {
                           res.status = 400;
@@ -5786,9 +5820,16 @@ void RestApiV1::register_routes(
                       if (!eval_req.agent_id.empty())
                           iq.agent_id = eval_req.agent_id;
                       iq.limit = 5000;
-                      auto records_raw = inventory_store->query(iq);
+                      bool inv_truncated = false;
+                      auto records_raw = inventory_store->query(iq, &inv_truncated);
+                      if (!records_raw) {
+                          res.status = 503;
+                          res.set_content(detail::a4_error(res, "inventory store degraded"),
+                                          "application/json");
+                          return;
+                      }
                       std::vector<std::pair<std::string, std::string>> records;
-                      for (const auto& r : records_raw) {
+                      for (const auto& r : *records_raw) {
                           records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
                       }
 
@@ -5801,6 +5842,26 @@ void RestApiV1::register_routes(
                                       .add("matched_value", r.matched_value)
                                       .add("plugin", r.plugin)
                                       .add("collected_at", r.collected_at));
+                      }
+                      // Governance M1: an evaluation computed over a CAPPED
+                      // inventory read is honest about it — absent agents may
+                      // simply not have been read (same flag name as the
+                      // typed-store route, result_truncated_by_cap). Same
+                      // data/pagination/meta shape as list_json, plus the flag.
+                      if (inv_truncated) {
+                          auto pag = JObj()
+                                         .add("total", static_cast<int64_t>(results.size()))
+                                         .add("start", int64_t{0})
+                                         .add("page_size", int64_t{50})
+                                         .str();
+                          res.set_content(JObj()
+                                              .raw("data", arr.str())
+                                              .add("result_truncated_by_cap", true)
+                                              .raw("pagination", pag)
+                                              .raw("meta", R"({"api_version":"v1"})")
+                                              .str(),
+                                          "application/json");
+                          return;
                       }
                       res.set_content(list_json(arr.str(), static_cast<int64_t>(results.size())),
                                       "application/json");
@@ -6181,6 +6242,15 @@ void RestApiV1::register_routes(
                       auto session = auth_fn(req, res);
                       if (!session)
                           return;
+                      const auto audit_failure = [&](std::string_view reason) {
+                          bool ok = true;
+                          if (audit_fn)
+                              ok = audit_fn(req, "result_set.create", "failure", "ResultSet", "",
+                                            "source_kind=inventory_query reason=" +
+                                                std::string(reason));
+                          if (!ok)
+                              res.set_header("Sec-Audit-Failed", "true");
+                      };
                       if (!inventory_store || !inventory_store->is_open()) {
                           rs_err(res, 503, "inventory store not available");
                           return;
@@ -6272,10 +6342,29 @@ void RestApiV1::register_routes(
 
                       InventoryQuery iq;
                       iq.limit = 5000;
-                      auto records_raw = inventory_store->query(iq);
+                      bool inv_truncated = false;
+                      auto records_raw = inventory_store->query(iq, &inv_truncated);
+                      if (!records_raw) {
+                          audit_failure("store_degraded");
+                          rs_err(res, 503, "inventory store degraded");
+                          return;
+                      }
+                      if (inv_truncated) {
+                          // Governance M1: a capped read must NEVER be
+                          // materialised as a targeting set — the missing tail
+                          // silently changes who gets acted on (#2500/#2492
+                          // dispatch-targeting invariant class). 503 rather
+                          // than a partial set; raising the cap / keyset
+                          // pagination is the tracked follow-up.
+                          audit_failure("query_truncated");
+                          rs_err(res, 503,
+                                 "inventory query truncated at the row or byte cap - refusing to "
+                                 "materialise a partial result set");
+                          return;
+                      }
                       std::vector<std::pair<std::string, std::string>> records;
-                      records.reserve(records_raw.size());
-                      for (const auto& r : records_raw)
+                      records.reserve(records_raw->size());
+                      for (const auto& r : *records_raw)
                           records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
 
                       auto results = evaluate_inventory(eval_req, records);

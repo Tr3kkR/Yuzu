@@ -19,6 +19,7 @@
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "rest_api_v1.hpp"
 #include "result_set_store.hpp"
@@ -46,12 +47,13 @@ namespace {
 
 // ResultSetStore is now a migrated Postgres store (ADR-0036) — shares the
 // "resultset" template key with test_result_set_store.cpp (identical setup).
-yuzu::test::PgTestTemplate result_set_tpl{"resultset", [](const std::string& dsn) {
-    PgPool pool{{.conninfo = dsn, .size = 1}};
-    ResultSetStore store{pool};
-    if (!store.is_open())
-        throw std::runtime_error("resultset template: store failed to migrate");
-}};
+yuzu::test::PgTestTemplate result_set_tpl{
+    "resultset", [](const std::string& dsn) {
+        PgPool pool{{.conninfo = dsn, .size = 1}};
+        ResultSetStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("resultset template: store failed to migrate");
+    }};
 
 struct DispatchCall {
     std::string plugin, action, scope_expr;
@@ -79,20 +81,22 @@ struct AsyncHarness {
     /// widening and has its own code path. Its handler 503s before any input
     /// validation when the store is unwired (dependency-before-validation is
     /// the convention on these routes), so reaching its parent_id guard at all
-    /// requires a real store.
-    yuzu::test::TempDbFile inv_db{std::string_view("rs-async-inv-")};
-    std::unique_ptr<InventoryStore> inventory;
+    /// requires a real store. Post-ADR-0037 that store is Postgres-backed, so
+    /// the one section that needs it injects a borrowed pointer. The caller
+    /// owns the store and must keep it alive longer than this harness.
+    InventoryStore* inventory{nullptr};
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
 
     // Fake-dispatch knobs / recording.
     std::vector<DispatchCall> calls;
-    int dispatch_sent{2};   // agents "reached" by each dispatch
+    int dispatch_sent{2}; // agents "reached" by each dispatch
     bool dispatch_throws{false};
     bool wire_dispatch{true}; // false → leave the callback empty (503 path)
 
-    explicit AsyncHarness(pg::PgPool& pool, bool with_dispatch = true)
-        : wire_dispatch(with_dispatch) {
+    explicit AsyncHarness(pg::PgPool& pool, bool with_dispatch = true,
+                          InventoryStore* inv = nullptr)
+        : inventory(inv), wire_dispatch(with_dispatch) {
         store = std::make_unique<ResultSetStore>(pool);
         REQUIRE(store->is_open());
 
@@ -103,9 +107,6 @@ struct AsyncHarness {
         instr = std::make_unique<InstructionStore>(":memory:");
         REQUIRE(instr->is_open());
 
-        inventory = std::make_unique<InventoryStore>(inv_db.path);
-        REQUIRE(inventory->is_open());
-
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -114,7 +115,9 @@ struct AsyncHarness {
             return s;
         };
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                          const std::string&) -> bool { return true; };
+                          const std::string&) -> bool {
+            return true;
+        };
         auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
                            const std::string&, const std::string&, const std::string&) -> bool {
             return true;
@@ -137,9 +140,10 @@ struct AsyncHarness {
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
                             /*quarantine_store=*/nullptr, /*response_store=*/nullptr, instr.get(),
-                            tracker.get(), /*schedule_engine=*/nullptr, /*approval_manager=*/nullptr,
+                            tracker.get(), /*schedule_engine=*/nullptr,
+                            /*approval_manager=*/nullptr,
                             /*tag_store=*/nullptr, /*audit_store=*/nullptr, /*service_group_fn=*/{},
-                            /*tag_push_fn=*/{}, inventory.get(),
+                            /*tag_push_fn=*/{}, inventory,
                             /*product_pack_store=*/nullptr, /*sw_deploy_store=*/nullptr,
                             /*device_token_store=*/nullptr, /*license_store=*/nullptr,
                             /*guaranteed_state_store=*/nullptr, &metrics, /*session_revoke_fn=*/{},
@@ -370,8 +374,12 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
         // Not covered by the run_async guard: this producer has its own
         // parent_id block and was missed by the first round of the fix. It is
         // synchronous, so the consequence was a READ across every device rather
-        // than a dispatch — narrower blast radius, same defect.
-        AsyncHarness h(pool);
+        // than a dispatch — narrower blast radius, same defect. Construct the
+        // inventory dependency only in this section; the invalid parent is
+        // rejected before the handler performs an inventory query.
+        InventoryStore inventory{pool};
+        REQUIRE(inventory.is_open());
+        AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
         int status = 0;
         h.post("/api/v1/result-sets/from-inventory-query", R"({"query":"os=linux","parent_id":""})",
                status);
@@ -380,6 +388,34 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
                   .counter("yuzu_server_dispatch_target_rejected_total",
                            {{"route", "result_set_parent"}, {"reason", "parent_id_empty"}})
                   .value() == 1.0);
+    }
+    SECTION("from-inventory-query refuses a byte-capped read without creating a set") {
+        InventoryStore inventory{pool};
+        REQUIRE(inventory.is_open());
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) "
+            "VALUES ('byte-agent', 'custom_large', repeat('x', 8388609), 1)",
+            std::vector<std::string>{});
+        REQUIRE(seeded.status() == PGRES_COMMAND_OK);
+        lease.reset();
+
+        AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+        int status = 0;
+        auto query = h.post("/api/v1/inventory/query", R"({"limit":10})", status);
+        REQUIRE(status == 200);
+        CHECK(query["result_truncated_by_cap"] == true);
+        REQUIRE(query["data"].is_array());
+        CHECK(query["data"].empty());
+
+        h.post("/api/v1/result-sets/from-inventory-query", R"({"name":"must-not-exist"})",
+               status);
+        REQUIRE(status == 503);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
     }
     SECTION("a non-object body is refused, not read as an absent parent_id") {
         AsyncHarness h(pool);
@@ -447,8 +483,9 @@ TEST_CASE("from-instruction-result: 202 pending with operator matcher persisted"
     AsyncHarness h(pool);
     auto iid = make_instruction(*h.instr);
     int status = 0;
-    std::string body = R"({"instruction_id":")" + iid +
-                       R"(","params":{"path":"/x"},"matcher":{"column":"sha256","op":"in","value_set":["bad"]}})";
+    std::string body =
+        R"({"instruction_id":")" + iid +
+        R"(","params":{"path":"/x"},"matcher":{"column":"sha256","op":"in","value_set":["bad"]}})";
     auto j = h.post("/api/v1/result-sets/from-instruction-result", body, status);
     REQUIRE(status == 202);
     REQUIRE(j["data"]["source_kind"] == "instruction_result");
@@ -470,8 +507,8 @@ TEST_CASE("from-instruction-result: unknown instruction_id 404s",
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     int status = 0;
-    h.post("/api/v1/result-sets/from-instruction-result",
-           R"({"instruction_id":"does-not-exist"})", status);
+    h.post("/api/v1/result-sets/from-instruction-result", R"({"instruction_id":"does-not-exist"})",
+           status);
     REQUIRE(status == 404);
     REQUIRE(h.calls.empty());
 }

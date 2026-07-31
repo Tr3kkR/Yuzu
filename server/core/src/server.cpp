@@ -790,8 +790,29 @@ public:
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error) and source "
-                          "(installed_software/device_ci). /readyz stays green under pure pool "
-                          "saturation, so this is the read-path degrade signal",
+                          "(installed_software/device_ci/software_licensing/product_registry/"
+                          "generic — generic is the ADR-0037 InventoryStore). /readyz stays "
+                          "green under pure pool saturation, so "
+                          "this is the read-path degrade signal",
+                          "counter");
+        // Generic InventoryStore observability (ADR-0037 hardening round).
+        metrics_.describe(
+            "yuzu_inventory_ingest_dropped_total",
+            "Generic InventoryStore upsert calls that did not persist, by reason "
+            "(store_not_open/pool_acquire_timeout/query_error/invalid_key/stale) — the next "
+            "changed/full report re-sends the blob (weekly full floor), but a sustained "
+            "non-zero rate means writes are silently not landing",
+            "counter");
+        // Closed reason dimension: seed every reachable path so an idle or
+        // newly-started server exports zeros and absent-series alerting remains
+        // distinguishable from a scrape/configuration failure.
+        for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error",
+                                  "invalid_key", "stale"})
+            metrics_.counter("yuzu_inventory_ingest_dropped_total", {{"reason", reason}});
+        metrics_.describe("yuzu_inventory_query_truncated_total",
+                          "Generic InventoryStore query() calls whose result hit the effective "
+                          "row limit or aggregate byte cap — more rows may exist past what was "
+                          "returned",
                           "counter");
         metrics_.describe("yuzu_inventory_stale_agents",
                           "Agents whose installed-software inventory has not synced within the "
@@ -2929,8 +2950,6 @@ public:
             agent_service_.set_webhook_store(webhook_store_.get());
         if (offload_target_store_)
             agent_service_.set_offload_target_store(offload_target_store_.get());
-        if (inventory_store_)
-            agent_service_.set_inventory_store(inventory_store_.get());
 
         // Initialize instruction store (Phase 2)
         {
@@ -3427,15 +3446,40 @@ public:
             offload_target_store_ = std::make_unique<OffloadTargetStore>(offload_db);
         }
 
-        // Phase 7: Inventory Store (Issue 7.17)
-        {
-            auto inv_db = cfg_.db_dir() / "inventory.db";
-            inventory_store_ = std::make_unique<InventoryStore>(inv_db);
-            if (inventory_store_ && inventory_store_->is_open()) {
-                spdlog::info("InventoryStore initialized at {}", inv_db.string());
+        // Phase 7: Inventory Store (Issue 7.17) — generic per-source blob store,
+        // migrated to Postgres (ADR-0006/0008/0009/0037, schema `inventory_store`).
+        // Coexists with the typed SoftwareInventoryStore below (that store's own
+        // migration, not this one). Fails closed like every PG store: a reachable
+        // database whose schema/backfill cannot complete must not serve degraded.
+        if (pg_pool_ && !startup_failed_) {
+            inventory_store_ = std::make_unique<InventoryStore>(*pg_pool_);
+            if (!inventory_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: generic inventory store migration/open "
+                              "failed (database reachable but the inventory_store schema could "
+                              "not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto inv_db = cfg_.db_dir() / "inventory.db";
+                if (!inventory_store_->migrate_from_sqlite(inv_db)) {
+                    spdlog::error("[PG] Refusing to start: generic inventory store backfill from "
+                                  "legacy {} failed (ADR-0009 fail-closed; see prior log lines). "
+                                  "Operator remediation: repair the file or quarantine it as an "
+                                  "operator-managed backup per ADR-0037 to skip "
+                                  "the backfill — gateway-connected live agents re-push generic "
+                                  "blobs on a changed/full report (weekly full floor); direct-"
+                                  "connected, offline, and decommissioned agents' "
+                                  "generic blobs need manual re-import (ADR-0037)",
+                                  inv_db.string());
+                    startup_failed_ = true;
+                } else {
+                    // Set-once before serving (race-free): wires the shared
+                    // read-degrade counter + the new ingest-drop/query-truncation
+                    // counters (governance IS3).
+                    inventory_store_->set_metrics(&metrics_);
+                    if (gateway_service_)
+                        gateway_service_->set_inventory_store(inventory_store_.get());
+                }
             }
-            if (gateway_service_)
-                gateway_service_->set_inventory_store(inventory_store_.get());
         }
 
         // Typed software-inventory projection — born-on-Postgres (ADR-0016).
@@ -4837,8 +4881,9 @@ public:
     /// rows (ADR-0024 Decision 11 — the GDPR-erasure path; the per-store
     /// `delete_agent` methods had no production caller before this). Best-effort
     /// in execution, ACCOUNTABLE in result, and null-tolerant: a store that is
-    /// not configured (e.g. no Postgres, so only the SQLite `InventoryStore` is
-    /// live) is skipped, and one store's failure never aborts the others — but
+    /// not configured (e.g. no Postgres reachable, so every per-agent store —
+    /// all born-on-PG — is absent) is skipped, and one store's failure never
+    /// aborts the others — but
     /// each `delete_agent` now reports its commit status, so a delete that did
     /// NOT commit is recorded `Failed` (not `Deleted`) and
     /// `DecommissionResult::ok()` confirms erasure across every configured store.
@@ -5106,6 +5151,17 @@ public:
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
         offline_endpoint_store_.reset();
+        // Generic InventoryStore (ADR-0037): same discipline as the typed PG
+        // stores below — null the borrowed pointer in the ingest service
+        // that actually borrows it (the gateway ProxyInventory path; the
+        // direct ReportInventory path has no generic-store loop and
+        // AgentServiceImpl's never-read/never-set pointer was deleted per
+        // governance LOW 2026-07-29), then drop the store, BEFORE the pool
+        // (governance IS1: this was previously the one PG store missing
+        // this unwire-then-reset step).
+        if (gateway_service_)
+            gateway_service_->set_inventory_store(nullptr);
+        inventory_store_.reset();
         // PreflightRunStore borrows pg_pool_ — drop before the pool (the runner
         // thread that leased it is already joined above).
         preflight_run_store_.reset();
@@ -7209,7 +7265,11 @@ private:
             // Cheap: in-memory agent registry count.
             auto online = registry_.agent_count();
 
-            // Store health — is_open() is a constant-time member check, no DB I/O.
+            // Store health — all checks are constant-time and perform no DB I/O.
+            // Match /readyz's non-lease-consuming Postgres reachability signal:
+            // valid() checks configuration and the breaker records real connect
+            // failures without treating a saturated-but-healthy pool as down.
+            bool pg_pool_ok = pg_pool_ && pg_pool_->valid() && !pg_pool_->connect_breaker_open();
             auto response_ok = response_store_ && response_store_->is_open();
             auto audit_ok = audit_store_ && audit_store_->is_open();
             auto instruction_ok = instruction_store_ && instruction_store_->is_open();
@@ -7247,15 +7307,20 @@ private:
             bool app_perf_fleet_ok = app_perf_fleet_store_ && app_perf_fleet_store_->is_open();
             bool device_inventory_ok =
                 device_inventory_store_ && device_inventory_store_->is_open();
+            // Generic InventoryStore (ADR-0037) — was wired into /readyz but missing
+            // here (governance IS2: the file's own comments document this exact
+            // readyz-vs-healthz drift as a previously-shipped bug for other stores).
+            bool inventory_ok = inventory_store_ && inventory_store_->is_open();
             // Load-bearing for the MCP write surface + REST approvals (sre-BLOCKING-1).
             bool approval_ok = approval_manager_ && approval_manager_->is_open();
 
             // Determine overall status
-            bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
-                                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
-                                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
-                                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok &&
-                                 approval_ok;
+            bool all_stores_ok =
+                pg_pool_ok && response_ok && audit_ok && instruction_ok && policy_ok &&
+                guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
+                offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
+                app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
+                approval_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -7263,7 +7328,8 @@ private:
                 {"uptime_seconds", uptime_sec},
                 {"agents", {{"online", online}}}, // pending added below for authed callers
                 {"stores",
-                 {{"responses", response_ok ? "ok" : "error"},
+                 {{"pg_pool", pg_pool_ok ? "ok" : "error"},
+                  {"responses", response_ok ? "ok" : "error"},
                   {"audit", audit_ok ? "ok" : "error"},
                   {"instructions", instruction_ok ? "ok" : "error"},
                   {"policies", policy_ok ? "ok" : "error"},
@@ -7276,7 +7342,8 @@ private:
                   {"vuln_finding_store", vuln_finding_ok ? "ok" : "error"},
                   {"app_perf_daily_store", app_perf_daily_ok ? "ok" : "error"},
                   {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"},
-                  {"device_inventory_store", device_inventory_ok ? "ok" : "error"}}},
+                  {"device_inventory_store", device_inventory_ok ? "ok" : "error"},
+                  {"inventory_store", inventory_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -11313,8 +11380,15 @@ private:
                 return;
             }
             auto tables = inventory_store_->list_tables();
+            if (!tables) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"inventory store degraded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& t : tables) {
+            for (const auto& t : *tables) {
                 arr.push_back({{"plugin", t.plugin},
                                {"agent_count", t.agent_count},
                                {"last_collected", t.last_collected}});
@@ -11338,23 +11412,31 @@ private:
             auto agent_id = req.matches[1].str();
             auto plugin = req.matches[2].str();
             auto record = inventory_store_->get(agent_id, plugin);
-            if (!record) {
+            if (!record.has_value()) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"inventory store degraded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            if (!record->has_value()) {
                 res.status = 404;
                 res.set_content(
                     R"({"error":{"code":404,"message":"no inventory data found"},"meta":{"api_version":"v1"}})",
                     "application/json");
                 return;
             }
+            const InventoryRecord& rec = **record;
             nlohmann::json data_obj;
             try {
-                data_obj = nlohmann::json::parse(record->data_json);
+                data_obj = nlohmann::json::parse(rec.data_json);
             } catch (...) {
-                data_obj = record->data_json;
+                data_obj = rec.data_json;
             }
-            res.set_content(nlohmann::json({{"agent_id", record->agent_id},
-                                            {"plugin", record->plugin},
+            res.set_content(nlohmann::json({{"agent_id", rec.agent_id},
+                                            {"plugin", rec.plugin},
                                             {"data", data_obj},
-                                            {"collected_at", record->collected_at}})
+                                            {"collected_at", rec.collected_at}})
                                 .dump(),
                             "application/json");
         });
@@ -11388,9 +11470,17 @@ private:
             if (q.limit > 1000)
                 q.limit = 1000;
 
-            auto records = inventory_store_->query(q);
+            bool inventory_truncated = false;
+            auto records = inventory_store_->query(q, &inventory_truncated);
+            if (!records) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"inventory store degraded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& r : records) {
+            for (const auto& r : *records) {
                 nlohmann::json data_obj;
                 try {
                     data_obj = nlohmann::json::parse(r.data_json);
@@ -11402,7 +11492,10 @@ private:
                                {"data", data_obj},
                                {"collected_at", r.collected_at}});
             }
-            res.set_content(nlohmann::json({{"results", arr}, {"count", arr.size()}}).dump(),
+            res.set_content(nlohmann::json({{"results", arr},
+                                            {"count", arr.size()},
+                                            {"result_truncated_by_cap", inventory_truncated}})
+                                .dump(),
                             "application/json");
         });
 
@@ -12857,6 +12950,10 @@ private:
         // DashboardRoutes — /fragments/results, /fragments/results/filter-bar,
         //                   /fragments/create-group-form, /api/dashboard/group-from-results
         dashboard_routes_ = std::make_unique<DashboardRoutes>();
+        // #2537: declare the external origins BEFORE register_routes — the
+        // handlers capture `this` at registration and read the member per
+        // request, so setting it afterwards would never reach a live route.
+        dashboard_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
         dashboard_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn, response_store_.get(),
             mgmt_group_store_.get(), &registry_, tag_store_.get(), &event_bus_,
@@ -13085,6 +13182,9 @@ private:
         // The publish-CRL callback captures `this`; like the agent-cert signer it
         // relies on the gRPC/web drain in stop() running before members destruct.
         ca_routes_ = std::make_unique<CaRoutes>();
+        // #2537: same ordering rule as DashboardRoutes above — register_routes
+        // copies the list into its handler captures, so it must be set first.
+        ca_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
         ca_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn, ca_store_.get(),
             [this]() -> std::optional<std::vector<std::uint8_t>> { return publish_crl(); },
