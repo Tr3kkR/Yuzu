@@ -586,10 +586,13 @@ one file is one PG-instance event, not a test bug.
 
 ## Workflow-PR canary
 
-`ci.yml`'s `detect-ci-changes` + `canary` jobs run only when a PR touches
-`.github/workflows/`, `.github/actions/`, or `scripts/ci/`. Canary mirrors
-the linux build on a fresh-disk GHA-hosted `ubuntu-24.04` with
-`actions/cache` for vcpkg — catches workflow regressions before main.
+`ci.yml`'s `detect-ci-changes` + `canary` jobs run when a PR or main push
+touches `.github/workflows/`, `.github/actions/`, or `scripts/ci/`. The named
+`ci-infrastructure` class in `scripts/ci/detect-code-change.sh` owns both the
+path rules and `git diff` error handling. If the diff cannot be established,
+it returns changed=true so the canary runs fail-closed. Canary mirrors the
+linux build on a fresh-disk GHA-hosted `ubuntu-24.04` with `actions/cache` for
+vcpkg — catches workflow regressions before main.
 
 ## Cache pruning + weekly maintenance
 

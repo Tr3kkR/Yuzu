@@ -97,6 +97,18 @@ fi
 # shellcheck source=scripts/test/_portable.sh
 . "$HERE/_portable.sh"
 
+# The api_token_count helper decides whether a token list is EMPTY or UNREADABLE,
+# and fixtures-verify reads "empty" as a PASS on a cutover edge. If that helper is
+# wrong, this whole phase's verdict is meaningless — so prove it before standing
+# anything up. <1s, no docker. (Only tests/test_changelog_order.py is wired into a
+# workflow today, by explicit name in docs-lint.yml; proper CI wiring for this one
+# is filed separately.)
+if ! python3 "$YUZU_ROOT/tests/test_api_token_count.py" >/dev/null 2>&1; then
+    echo "test-upgrade-stack: api_token_count table test FAILED — refusing to run Phase 2" >&2
+    python3 "$YUZU_ROOT/tests/test_api_token_count.py" >&2
+    exit 1
+fi
+
 # Phase 2 fundamentally needs a working dockerd — every step is docker
 # compose. If docker is missing/down, soft-skip with a SKIP gate row so
 # the rest of /test continues. The skill prompt warns operators on macOS
@@ -316,6 +328,85 @@ if [[ $FIXTURE_WRITE_OK -eq 0 ]]; then
     exit 1
 fi
 
+# Seed the database actually created by the previous-release image. The old
+# stack has no agent service in this rig, so stop it, copy its inventory.db to
+# the host, add only the fixture row, then copy that same database back. Some
+# released images create the file without materialising the generic-inventory
+# table; in that case create the exact published SQLite v1 shape before adding
+# the row. Existing tables are left untouched, so released-schema drift still
+# makes the insert fail rather than being hidden by a replacement schema.
+LEGACY_INVENTORY_DB="$PHASE2_DIR/inventory.db"
+OLD_SERVER_ID=$(YUZU_VERSION="$OLD_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+    docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+    --project-name "$PROJECT_NAME" ps -q server)
+if [[ -z "$OLD_SERVER_ID" ]]; then
+    fl "could not resolve old server container for inventory fixture"
+    record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "no old server container"
+    exit 1
+fi
+YUZU_VERSION="$OLD_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+    docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+    --project-name "$PROJECT_NAME" stop server >> "$LOG_FILE" 2>&1
+if ! docker cp "${OLD_SERVER_ID}:/var/lib/yuzu/inventory.db" \
+    "$LEGACY_INVENTORY_DB" >> "$LOG_FILE" 2>&1; then
+    fl "could not read previous-release inventory.db from the server volume"
+    record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "old inventory db missing"
+    exit 1
+fi
+if ! python3 - "$LEGACY_INVENTORY_DB" <<'PY'
+import sqlite3, sys
+path = sys.argv[1]
+db = sqlite3.connect(path)
+found = db.execute(
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='inventory_data'"
+).fetchone()
+if not found:
+    db.executescript("""
+CREATE TABLE IF NOT EXISTS inventory_data (
+    agent_id TEXT NOT NULL,
+    plugin TEXT NOT NULL,
+    data_json TEXT NOT NULL DEFAULT '{}',
+    collected_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (agent_id, plugin)
+);
+CREATE INDEX IF NOT EXISTS idx_inventory_plugin ON inventory_data(plugin);
+CREATE INDEX IF NOT EXISTS idx_inventory_collected ON inventory_data(collected_at);
+""")
+db.execute("INSERT OR REPLACE INTO inventory_data "
+           "(agent_id, plugin, data_json, collected_at) VALUES (?, ?, ?, ?)",
+           ("upgrade-agent-generic", "upgrade_custom", '{"survived":true}', 1700000000))
+db.commit()
+db.close()
+PY
+then
+    fl "could not seed the published generic-inventory SQLite fixture"
+    record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "inventory seed failed"
+    exit 1
+fi
+# The copied-out file can be owned by root while the new image runs as the
+# unprivileged `yuzu` user. World-write is confined to this disposable test.
+chmod 666 "$LEGACY_INVENTORY_DB"
+if ! docker cp "$LEGACY_INVENTORY_DB" \
+    "${OLD_SERVER_ID}:/var/lib/yuzu/inventory.db" >> "$LOG_FILE" 2>&1; then
+    fl "could not seed legacy inventory.db into the server volume"
+    record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "inventory seed failed"
+    exit 1
+fi
+# The stopped release can leave WAL/SHM sidecars in the named volume. The
+# locally closed fixture above is a complete, checkpointed main database; if
+# the old sidecars survive beside it, SQLite can replay their pre-fixture
+# snapshot and make the new row invisible to the HEAD backfill. Remove only
+# those transient sidecars while the old server remains stopped.
+if ! docker run --rm --volumes-from "$OLD_SERVER_ID" \
+    --entrypoint /bin/rm "ghcr.io/tr3kkr/yuzu-server:${OLD_VERSION}" \
+    -f /var/lib/yuzu/inventory.db-wal /var/lib/yuzu/inventory.db-shm \
+    >> "$LOG_FILE" 2>&1; then
+    fl "could not clear stale generic-inventory SQLite sidecars"
+    record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "inventory sidecar cleanup failed"
+    exit 1
+fi
+ok "legacy generic-inventory fixture seeded"
+
 # --- Step 4: image swap to NEW --------------------------------------------
 
 phase "step: image swap to NEW ${NEW_VERSION}"
@@ -392,18 +483,74 @@ if [[ $READY -ne 1 ]]; then
     else
         fl "/readyz never recovered after upgrade (waited ${WAITED}s)"
     fi
-    docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+    YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+        docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
         --project-name "$PROJECT_NAME" logs server | tail -100 >> "$LOG_FILE"
     record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "post-upgrade not ready"
     exit 1
 fi
 ok "/readyz ready after upgrade (waited ${WAITED}s)"
 
+# ADR-0009 inventory assertion: the real old SQLite file was discovered by
+# startup, its generic row landed in PostgreSQL, and the rollback copy stayed
+# byte-for-byte unchanged during backfill.
+PG_INVENTORY_JSON=$(docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+    --project-name "$PROJECT_NAME" exec -T postgres \
+    psql -U yuzu -d yuzu -Atc \
+    "SELECT data_json FROM inventory_store.inventory_data WHERE agent_id='upgrade-agent-generic' AND plugin='upgrade_custom'" \
+    2>/dev/null || true)
+if [[ "$PG_INVENTORY_JSON" != '{"survived":true}' ]]; then
+    fl "generic inventory SQLite→PostgreSQL upgrade assertion failed"
+    record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "inventory backfill missing"
+    exit 1
+fi
+INVENTORY_COOKIES="$PHASE2_DIR/inventory-verify.cookies"
+INVENTORY_LOGIN_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -c "$INVENTORY_COOKIES" \
+    --max-time 15 "$DASHBOARD_URL/login" \
+    -d "username=${USERNAME}&password=${PASSWORD}" 2>/dev/null || echo "000")
+INVENTORY_API_BODY=""
+if [[ "$INVENTORY_LOGIN_HTTP" =~ ^[23] ]]; then
+    INVENTORY_API_BODY=$(curl -s -b "$INVENTORY_COOKIES" --max-time 15 \
+        -H "Content-Type: application/json" -X POST \
+        "$DASHBOARD_URL/api/v1/inventory/query" \
+        -d '{"agent_id":"upgrade-agent-generic","plugin":"upgrade_custom","limit":10}' \
+        2>/dev/null || echo "")
+fi
+if ! printf '%s' "$INVENTORY_API_BODY" | python3 -c '
+import json, sys
+body = json.load(sys.stdin)
+rows = body.get("data", [])
+assert len(rows) == 1 and rows[0].get("data") == {"survived": True}
+assert body.get("result_truncated_by_cap") is False
+'; then
+    fl "authoritative inventory REST assertion failed after upgrade"
+    record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "inventory REST verify failed"
+    exit 1
+fi
+NEW_SERVER_ID=$(YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+    docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+    --project-name "$PROJECT_NAME" ps -q server)
+LEGACY_AFTER="$PHASE2_DIR/inventory-after.db"
+if ! docker cp "${NEW_SERVER_ID}:/var/lib/yuzu/inventory.db" "$LEGACY_AFTER" \
+    >> "$LOG_FILE" 2>&1 || ! cmp -s "$LEGACY_INVENTORY_DB" "$LEGACY_AFTER"; then
+    fl "legacy inventory.db was not retained unchanged for rollback"
+    record_gate "FAIL" "$(($(elapsed_ms "$GATE_START") / 1000))" "rollback copy changed"
+    exit 1
+fi
+ok "generic inventory survived upgrade; rollback copy retained unchanged"
+
 # --- Step 6: count migration runner events --------------------------------
 
 phase "step: count MigrationRunner events in server log"
-MIGR_COUNT=$(docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
-    --project-name "$PROJECT_NAME" logs server 2>/dev/null \
+# The env prefix is REQUIRED, not decorative: without YUZU_TEST_CONFIG the
+# compose file's cred bind-mount spec is `:/etc/yuzu/yuzu-server.cfg:ro`, which
+# compose rejects outright. `2>/dev/null` then swallows the error, `grep -c`
+# returns 0, and this step reports "no MigrationRunner events seen" having never
+# read a log line. That is the root cause of #2609's second, unexplained signal:
+# measured at 0 here, and 13 with the prefix restored against the same stack.
+MIGR_COUNT=$(YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+    docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+    --project-name "$PROJECT_NAME" logs server \
     | grep -c "MigrationRunner: .* migrated to v" || true)
 if (( MIGR_COUNT > 0 )); then
     ok "MigrationRunner events: $MIGR_COUNT (expected ~30)"
@@ -411,6 +558,55 @@ if (( MIGR_COUNT > 0 )); then
         --name "phase2_migration_events" --value "$MIGR_COUNT" --unit "count" >/dev/null || true
 else
     warn "no MigrationRunner events seen — maybe DB was already at HEAD schema?"
+fi
+
+# --- Step 6b: did THIS upgrade edge cross the ApiTokenStore cutover? -------
+#
+# ADR-0030 moved ApiTokenStore from SQLite to Postgres as a fresh-start cutover
+# with no migration, so whether API tokens SHOULD survive depends entirely on
+# which edge is under test — and `--old-version` FLOATS to GitHub's current
+# "Latest release". Today v0.13.0 (2026-07-11) predates the cutover (4a05df88,
+# 2026-07-15), so tokens are correctly invalidated. The moment a release
+# CONTAINING the cutover becomes Latest, Phase 2 becomes a Postgres->Postgres
+# edge over a `postgres-data` volume this compose file deliberately preserves
+# across the image swap: tokens survive, and a hardcoded "expect invalidated"
+# would fail the gate while announcing something false.
+#
+# So derive the arm from an OBSERVABLE rather than a version table. The new
+# server warns at boot when it finds a legacy api-tokens.db in the surviving
+# data volume (server.cpp: "[auth] Legacy SQLite api-tokens.db found at").
+# That fires if and only if this edge crossed the cutover, and it keeps working
+# unedited as releases move.
+#
+# The default is `preserved` — the SAFE direction. If the observable is absent
+# or the grep fails, we assert the stronger, NON-inverted contract, so an
+# unknown edge reads as a loud failure rather than a silent pass.
+
+phase "step: classify the API-token upgrade edge"
+API_TOKENS_EXPECT="preserved"
+# Probe the FILESYSTEM, not the boot log. The server does log a "Legacy SQLite
+# api-tokens.db found at" warning on a crossing edge, and an earlier revision of
+# this step grepped for it — but `docker compose logs` lags the process, so the
+# line is reliably present minutes later and intermittently absent at the moment
+# this step runs. A log grep here is a race; the file either exists in the
+# preserved data volume or it does not.
+PROBE_ERR=$(YUZU_VERSION="$NEW_VERSION" YUZU_TEST_CONFIG="$CONFIG_FILE" \
+    docker compose -f "$HERE/docker-compose.upgrade-test.yml" \
+    --project-name "$PROJECT_NAME" exec -T server \
+    test -f /var/lib/yuzu/api-tokens.db 2>&1)
+PROBE_RC=$?
+if (( PROBE_RC == 0 )); then
+    API_TOKENS_EXPECT="invalidated"
+    ok "edge CROSSES the ADR-0030 cutover — API tokens must be invalidated"
+elif (( PROBE_RC == 1 )) && [[ -z "$PROBE_ERR" ]]; then
+    # `test -f` writes nothing and exits 1 for a genuinely absent file. Anything
+    # else — 125/126/127, or any stderr — is the PROBE failing, not an answer.
+    ok "edge does NOT cross the ADR-0030 cutover — API tokens must be preserved"
+else
+    # Distinguished deliberately: falling through to `preserved` here is still the
+    # safe direction, but reporting it as "the edge does not cross the cutover"
+    # would be a confident wrong diagnosis — the #2581 defect in miniature.
+    warn "cutover probe FAILED (rc=$PROBE_RC): ${PROBE_ERR:-no stderr} — assuming 'preserved' (safe direction); a red api_tokens below may be this probe, not the data"
 fi
 
 # --- Step 7: fixtures-verify ----------------------------------------------
@@ -422,6 +618,7 @@ if bash "$HERE/test-fixtures-verify.sh" \
     --dashboard "$DASHBOARD_URL" \
     --user "$USERNAME" --password "$PASSWORD" \
     --state-file "$STATE_FILE" \
+    --api-tokens-expect "$API_TOKENS_EXPECT" \
     --report-file "$REPORT_FILE" >> "$LOG_FILE" 2>&1; then
     ok "fixtures verified"
     FIXTURE_VERIFY_OK=1
@@ -461,7 +658,7 @@ GATE_DURATION=$((($(now_ms) - GATE_START) / 1000))
 if [[ $FIXTURE_VERIFY_OK -eq 1 && $UAT_OK -eq 1 ]]; then
     ok "Phase 2 PASS"
     record_gate "PASS" "$GATE_DURATION" \
-        "fixtures preserved, /readyz green, ${MIGR_COUNT} migrations stamped"
+        "fixtures upheld (api_tokens=${API_TOKENS_EXPECT}), /readyz green, ${MIGR_COUNT} migrations stamped"
     exit 0
 else
     fl "Phase 2 FAIL (fixture_verify=$FIXTURE_VERIFY_OK uat=$UAT_OK)"

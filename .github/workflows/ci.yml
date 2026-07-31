@@ -1386,12 +1386,22 @@ jobs:
           if [[ "$base_sha" =~ ^0{40}$ ]]; then
             base_sha="HEAD~1"
           fi
-          if git diff --name-only "$base_sha"..HEAD \
-              | grep -qE '^\.github/(workflows|actions)/|^scripts/ci/'; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "CI infrastructure changes detected — canary will run."
+          # The shared classifier owns both diff establishment and the named
+          # CI-infrastructure path class. It reports true on a bad/missing base
+          # so uncertainty runs the clean-host canary instead of skipping it.
+          if ! changed=$(bash scripts/ci/detect-code-change.sh \
+                --class ci-infrastructure --git-diff "$base_sha" HEAD); then
+            changed=true
+            echo "Classifier errored — canary will run (fail-closed)."
+          fi
+          if [[ "$changed" != "true" && "$changed" != "false" ]]; then
+            echo "Unexpected classifier result '$changed' — canary will run (fail-closed)."
+            changed=true
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          if [[ "$changed" == "true" ]]; then
+            echo "CI infrastructure changes detected or diff uncertain — canary will run."
           else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "No CI infrastructure changes — canary skipped."
           fi
 

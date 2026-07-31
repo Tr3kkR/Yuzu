@@ -53,6 +53,25 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    reach for it without a specific reason; the per-store model is the one this ADR/playbook
    actually prescribes and the one `AuthDB` demonstrates. See ADR-0010's "Instance model" note
    for the full rationale.
+4. **Authoritative reads must be type-distinguishable (2026-07-25 program policy, ADR-0036).**
+   On an **authoritative** store, every read whose result can feed a grant/target/enforce/skip
+   decision MUST make a runtime DB error TYPE-DISTINGUISHABLE from "no rows" at the call site —
+   `std::expected<T, YourStoreError>` (an `unexpected` for the DB-error case), or
+   `std::optional<Container>` where `nullopt` means "degraded, could not read" and an
+   empty container means "read fine, genuinely nothing here". **Logging the error is never a
+   substitute** — the caller still sees the same empty/false value either way. The store exposes
+   the typed channel unconditionally; the *caller* then applies the reviewer test: **"if this
+   value were silently empty/false, could any downstream branch grant / target / enforce / skip
+   / invert (`NOT`) / report success? If yes, treat a DB error as fail-closed (abort the
+   operation / return 503) — never as an empty result."** Pure render/telemetry callers (a
+   dashboard preview, a metrics gauge) may legitimately render degraded with the error in hand —
+   they don't feed a decision. The concrete motivating bug (`ResultSetStore::member_set_owned`,
+   ADR-0036): a `NOT from_result_set:<id>` scope resolves a missing preload entry to "no match",
+   and `NOT` inverts "no match" to "matches every agent" — so a transient Postgres blip that used
+   to come back as a silently-empty membership set turned into a fleet-wide command-dispatch
+   fail-open, not a theoretical one. Reads whose failure mode is deny-or-benign (a sidebar list
+   comes back empty, a lineage breadcrumb trail is short) may defer widening to a follow-up — but
+   say so explicitly in the PR/issue, don't just leave it unstated.
 
 ---
 
@@ -141,8 +160,10 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   (SOC 2); skippable behind a flag only for purely TTL'd ephemeral stores (`response`).
 - **Secret columns transform, never copy** (ADR-0010): a backfill that touches secret material
   encrypts/hashes on the way in — a plain column copy of a secret is forbidden.
-- **Rollback window**: retain the legacy `<name>.db` read-only for exactly one release, then
-  remove it. The upgrade-test (`scripts/test/docker-compose.upgrade-test.yml`) must assert the
+- **Rollback window**: retain the legacy `<name>.db` for exactly one release, then remove it.
+  Backfill opens it read-only; a wired subject/device erasure path must delete that identity
+  from the rollback copy so rollback cannot resurrect erased data. The upgrade-test
+  (`scripts/test/docker-compose.upgrade-test.yml`) must assert the
   config/reference/audit data survives previous-release-SQLite → new-release-Postgres.
 - **Port the transaction owner**: `SqliteTxn`/`SqliteStmt` → `pool.with_txn` (multi-statement
   invariants) or a single autocommit statement (single-statement mutate-and-return).
