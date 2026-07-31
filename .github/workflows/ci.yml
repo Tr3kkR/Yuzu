@@ -320,6 +320,7 @@ jobs:
         run: |
           bash tests/shell/test_check_compose_versions.sh
           bash tests/shell/test_detect_code_change.sh   # docs-only gate classifier (#1978)
+          bash tests/shell/test_kimi_driver_substitution.sh  # patsub_replacement prompt corruption
           python3 scripts/ci/test_runner_health_check.py
 
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──

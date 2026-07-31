@@ -20,6 +20,14 @@
 
 set -euo pipefail
 
+# LOAD-BEARING — do not remove. Bash >= 5.2 defaults `patsub_replacement` ON, which
+# makes an unescaped `&` in a ${var//pat/repl} replacement expand to the MATCH. Every
+# `&` in an injected value then becomes the literal token being replaced, silently
+# corrupting `&&` in anchors, C++ reference types (`bool& x`) and URL query strings
+# in the text under review. The Codex driver carries the same guard; both render
+# their prompt with the same construct, so both need it.
+shopt -u patsub_replacement 2>/dev/null || true
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROMPT_TEMPLATE="$SCRIPT_DIR/review-prompt.md"
 
