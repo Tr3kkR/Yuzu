@@ -27,6 +27,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
+#include <sqlite3.h>
 
 #include <nlohmann/json.hpp>
 
@@ -101,6 +102,165 @@ GuaranteedStateEventRow make_event(std::string event_id, std::string rule_id,
 // local random_device variant — matches the CLAUDE.md test-helper mandate and
 // avoids the flake-#473 salt pitfalls (qa-S4 / #1209).
 using yuzu::test::TempDbFile;
+
+// Run a raw SQL statement against the test database on a second connection —
+// lets a test simulate a sibling replica / an aged ttl / a poisoned gc_meta
+// row that the public API deliberately cannot produce. Mirrors
+// test_result_set_store.cpp's exec_sql.
+void exec_sql(const std::string& dsn, const std::string& sql) {
+    pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    pg::PgResult r{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
+}
+
+// Scalar SELECT on a second connection — column 0, row 0, as text; "" when
+// the result set is genuinely empty. Mirrors test_result_set_store.cpp's
+// query_scalar.
+std::string query_scalar(const std::string& dsn, const std::string& sql) {
+    pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    pg::PgResult r{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
+    if (PQntuples(r.get()) == 0)
+        return "";
+    return PQgetvalue(r.get(), 0, 0);
+}
+
+// ── Backfill legacy-SQLite fixtures (ADR-0038's 5-table shape) ─────────────
+// The pre-migration SQLite schema `migrate_from_sqlite` reads: rules / meta /
+// status / events / observations. Raw sqlite3 C API — these target the
+// legacy reader, not the live store (which never opens SQLite post-
+// migration). Mirrors test_result_set_store.cpp's write_legacy_sqlite_db.
+const char* kLegacyGsstoreDdl =
+    "CREATE TABLE guaranteed_state_rules ("
+    "  rule_id TEXT PRIMARY KEY, name TEXT NOT NULL, yaml_source TEXT NOT NULL,"
+    "  version INTEGER NOT NULL DEFAULT 1, enabled INTEGER NOT NULL DEFAULT 1,"
+    "  enforcement_mode TEXT NOT NULL DEFAULT 'enforce',"
+    "  severity TEXT NOT NULL DEFAULT 'medium', os_target TEXT NOT NULL DEFAULT '',"
+    "  scope_expr TEXT NOT NULL DEFAULT '', signature BLOB,"
+    "  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,"
+    "  created_by TEXT NOT NULL DEFAULT '', updated_by TEXT NOT NULL DEFAULT '',"
+    "  spec_json TEXT NOT NULL DEFAULT '', prerequisites TEXT NOT NULL DEFAULT '');"
+    "CREATE TABLE guardian_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);"
+    "CREATE TABLE guardian_agent_rule_status ("
+    "  agent_id TEXT NOT NULL, rule_id TEXT NOT NULL, state TEXT NOT NULL,"
+    "  updated_at TEXT NOT NULL, PRIMARY KEY (agent_id, rule_id));"
+    "CREATE TABLE guaranteed_state_events ("
+    "  event_id TEXT PRIMARY KEY, rule_id TEXT NOT NULL, agent_id TEXT NOT NULL,"
+    "  event_type TEXT NOT NULL, severity TEXT NOT NULL, guard_type TEXT NOT NULL DEFAULT '',"
+    "  guard_category TEXT NOT NULL DEFAULT '', detected_value TEXT NOT NULL DEFAULT '',"
+    "  expected_value TEXT NOT NULL DEFAULT '', remediation_action TEXT NOT NULL DEFAULT '',"
+    "  remediation_success INTEGER, detection_latency_us INTEGER NOT NULL DEFAULT 0,"
+    "  remediation_latency_us INTEGER NOT NULL DEFAULT 0, timestamp TEXT NOT NULL,"
+    "  ttl_expires_at INTEGER NOT NULL DEFAULT 0, detail_json TEXT NOT NULL DEFAULT '');"
+    "CREATE TABLE guardian_observations ("
+    "  event_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, observed_at TEXT NOT NULL,"
+    "  obs_type TEXT NOT NULL, subject TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '',"
+    "  symbolic TEXT NOT NULL DEFAULT '', component TEXT NOT NULL DEFAULT '',"
+    "  metric REAL NOT NULL DEFAULT 0, platform TEXT NOT NULL DEFAULT '',"
+    "  version TEXT NOT NULL DEFAULT '', ttl_expires_at INTEGER NOT NULL DEFAULT 0);";
+
+void open_legacy_gsstore_db(const std::filesystem::path& path, sqlite3** out) {
+    REQUIRE(sqlite3_open(path.string().c_str(), out) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(*out, kLegacyGsstoreDdl, nullptr, nullptr, nullptr) == SQLITE_OK);
+}
+
+// Happy-path fixture: a few rows in each of the 5 tables.
+void write_legacy_gsstore_db(const std::filesystem::path& path) {
+    sqlite3* db = nullptr;
+    open_legacy_gsstore_db(path, &db);
+    const char* seed =
+        "INSERT INTO guaranteed_state_rules (rule_id, name, yaml_source, version, enabled, "
+        " enforcement_mode, severity, os_target, scope_expr, created_at, updated_at, created_by, "
+        " updated_by) VALUES "
+        "('legacy-rule-1', 'legacy-block-445', 'apiVersion: yuzu.io/v1alpha1', 2, 1, 'enforce', "
+        " 'high', 'windows', 'tag:all', '2026-04-19T12:00:00Z', '2026-04-19T12:00:00Z', 'alice', "
+        " 'alice');"
+        "INSERT INTO guardian_meta (key, value) VALUES ('policy_generation', 7);"
+        "INSERT INTO guardian_agent_rule_status (agent_id, rule_id, state, updated_at) VALUES "
+        "('agent-A', 'legacy-rule-1', 'compliant', '2026-04-19T12:00:00Z');"
+        "INSERT INTO guaranteed_state_events (event_id, rule_id, agent_id, event_type, severity, "
+        " timestamp, ttl_expires_at) VALUES "
+        "('legacy-evt-1', 'legacy-rule-1', 'agent-A', 'drift.remediated', 'high', "
+        " '2026-04-19T12:00:00Z', 0);"
+        "INSERT INTO guardian_observations (event_id, agent_id, observed_at, obs_type, "
+        " ttl_expires_at) VALUES "
+        "('legacy-obs-1', 'agent-A', '2026-04-19T12:00:00Z', 'process.crashed', 0);";
+    REQUIRE(sqlite3_exec(db, seed, nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(db);
+}
+
+// Two rules sharing the SAME `name` (distinct rule_id): the target table's
+// UNIQUE(name) constraint is not the ON CONFLICT(rule_id) target the
+// production INSERT dedups on, so the second row's insert genuinely fails
+// with 23505 — exercises backfill_row_strict's abort-the-whole-backfill path
+// (rules are operator-authored config, never skip-and-continue).
+void write_legacy_gsstore_db_dup_rule_name(const std::filesystem::path& path) {
+    sqlite3* db = nullptr;
+    open_legacy_gsstore_db(path, &db);
+    const char* seed =
+        "INSERT INTO guaranteed_state_rules (rule_id, name, yaml_source, created_at, updated_at) "
+        "VALUES "
+        "('legacy-rule-ok', 'clashing-name', 'apiVersion: yuzu.io/v1alpha1', "
+        " '2026-04-19T12:00:00Z', '2026-04-19T12:00:00Z'),"
+        "('legacy-rule-dup', 'clashing-name', 'apiVersion: yuzu.io/v1alpha1', "
+        " '2026-04-19T12:00:00Z', '2026-04-19T12:00:00Z');";
+    REQUIRE(sqlite3_exec(db, seed, nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(db);
+}
+
+// One events row with a genuinely malformed field: an invalid UTF-8 byte
+// sequence with no embedded NUL, so it survives SQLite's NUL-terminated
+// sqlite3_column_text() read intact (an embedded NUL would instead be
+// silently truncated at that read — not what a "malformed data" skip-row
+// case needs). Postgres's text-validation failure (SQLSTATE 22021
+// invalid_byte_sequence_for_encoding, class "22") is exactly the row-data
+// error class `backfill_row`'s skip-and-continue path exists to survive.
+void write_legacy_gsstore_db_bad_event(const std::filesystem::path& path) {
+    sqlite3* db = nullptr;
+    open_legacy_gsstore_db(path, &db);
+    const std::string bad_bytes = "\x80\x81\x82\x83"; // no valid UTF-8 leader byte, no NUL
+    const std::string seed =
+        "INSERT INTO guaranteed_state_events (event_id, rule_id, agent_id, event_type, severity, "
+        " guard_type, timestamp, ttl_expires_at) VALUES "
+        "('legacy-evt-good', 'legacy-rule-1', 'agent-A', 'drift.remediated', 'high', 'registry', "
+        " '2026-04-19T12:00:00Z', 0),"
+        "('legacy-evt-bad', 'legacy-rule-1', 'agent-A', 'drift.remediated', 'high', '" +
+        bad_bytes +
+        "', '2026-04-19T12:00:00Z', 0);"
+        "INSERT INTO guardian_observations (event_id, agent_id, observed_at, obs_type, "
+        " ttl_expires_at) VALUES "
+        "('legacy-obs-good', 'agent-A', '2026-04-19T12:00:00Z', 'process.crashed', 0);";
+    REQUIRE(sqlite3_exec(db, seed.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(db);
+}
+
+// Many events rows with long-ish ids — spans multiple SQLite pages so a
+// mid-file truncation corrupts the pager on the very first read (mirrors
+// test_result_set_store.cpp's write_legacy_sqlite_db_bulk / its H2 net).
+void write_legacy_gsstore_db_bulk(const std::filesystem::path& path, int row_count) {
+    sqlite3* db = nullptr;
+    open_legacy_gsstore_db(path, &db);
+    sqlite3_stmt* stmt = nullptr;
+    REQUIRE(sqlite3_prepare_v2(
+                db,
+                "INSERT INTO guaranteed_state_events (event_id, rule_id, agent_id, event_type, "
+                "severity, timestamp, ttl_expires_at) VALUES (?, 'legacy-rule-bulk', 'agent-A', "
+                "'drift.remediated', 'high', '2026-04-19T12:00:00Z', 0)",
+                -1, &stmt, nullptr) == SQLITE_OK);
+    for (int i = 0; i < row_count; ++i) {
+        std::string id = "legacy-evt-bulk-with-a-reasonably-long-identifier-padding-" +
+                         std::to_string(100000 + i);
+        REQUIRE(sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK);
+        REQUIRE(sqlite3_step(stmt) == SQLITE_DONE);
+        REQUIRE(sqlite3_reset(stmt) == SQLITE_OK);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+}
 
 } // namespace
 
@@ -1509,6 +1669,197 @@ TEST_CASE("GuaranteedStateStore: migration is idempotent across re-open",
     }
 }
 
+// ── Backfill (ADR-0038/#2496 shape: legacy SQLite → Postgres) ──────────────
+
+TEST_CASE("GuaranteedStateStore::migrate_from_sqlite copies a populated legacy file exactly once",
+          "[pg][guaranteed_state][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    auto legacy_path =
+        yuzu::test::unique_temp_path("yuzu_test_gsstore_populated") / "guaranteed-state.db";
+    std::filesystem::create_directories(legacy_path.parent_path());
+    write_legacy_gsstore_db(legacy_path);
+
+    REQUIRE(store.migrate_from_sqlite(legacy_path));
+
+    // Rules.
+    auto rule = store.get_rule("legacy-rule-1");
+    REQUIRE(rule.has_value());
+    REQUIRE(rule->has_value());
+    CHECK((*rule)->name == "legacy-block-445");
+    CHECK((*rule)->version == 2);
+    CHECK(store.rule_count() == 1);
+
+    // Meta — the legacy counter authoritatively OVERWRITES the migration's
+    // ('policy_generation', 0) seed row (unlike every other table's DO
+    // NOTHING — see the backfill implementation's comment on the meta loop).
+    auto gen = store.current_policy_generation();
+    REQUIRE(gen.has_value());
+    CHECK(*gen == 7);
+
+    // Status.
+    auto statuses = store.agent_rule_statuses("legacy-rule-1");
+    REQUIRE(statuses.has_value());
+    REQUIRE(statuses->size() == 1);
+    CHECK((*statuses)[0].agent_id == "agent-A");
+    CHECK((*statuses)[0].state == "compliant");
+
+    // Events + observations.
+    CHECK(store.event_count() == 1);
+    auto observations = store.query_observations();
+    REQUIRE(observations.size() == 1);
+    CHECK(observations[0].event_id == "legacy-obs-1");
+
+    // The sqlite_backfill marker is stamped with the per-table counts.
+    CHECK(query_scalar(db.dsn(), "SELECT rules_inserted FROM guaranteed_state_store.sqlite_backfill") ==
+          "1");
+    CHECK(query_scalar(db.dsn(),
+                       "SELECT events_inserted FROM guaranteed_state_store.sqlite_backfill") == "1");
+    CHECK(query_scalar(db.dsn(), "SELECT observations_inserted FROM "
+                                 "guaranteed_state_store.sqlite_backfill") == "1");
+    CHECK(query_scalar(db.dsn(),
+                       "SELECT status_inserted FROM guaranteed_state_store.sqlite_backfill") == "1");
+    CHECK(query_scalar(db.dsn(), "SELECT skipped_bad FROM guaranteed_state_store.sqlite_backfill") ==
+          "0");
+
+    // Second call against the SAME populated file is a no-op (marker
+    // idempotency) — must not error (e.g. on a duplicate-key conflict) and
+    // must not double the already-copied data.
+    REQUIRE(store.migrate_from_sqlite(legacy_path));
+    CHECK(store.rule_count() == 1);
+    CHECK(store.event_count() == 1);
+    CHECK(query_scalar(db.dsn(), "SELECT rules_inserted FROM guaranteed_state_store.sqlite_backfill") ==
+          "1");
+}
+
+// Strict-abort (ADR-0037 discrimination): `guaranteed_state_rules` /
+// `guardian_meta` / `guardian_agent_rule_status` use `backfill_row_strict` —
+// ANY row-level error aborts the whole backfill unstamped, never a silent
+// skip. A duplicate `name` is genuinely rejected (23505 on the table's
+// UNIQUE(name) constraint) because the production INSERT's `ON CONFLICT
+// (rule_id) DO NOTHING` only dedups on the PRIMARY KEY, not on `name`.
+TEST_CASE("GuaranteedStateStore::migrate_from_sqlite aborts unstamped when a legacy rule row "
+          "violates an authoritative-table constraint",
+          "[pg][guaranteed_state][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    auto legacy_path =
+        yuzu::test::unique_temp_path("yuzu_test_gsstore_dupname") / "guaranteed-state.db";
+    std::filesystem::create_directories(legacy_path.parent_path());
+    write_legacy_gsstore_db_dup_rule_name(legacy_path);
+
+    CHECK_FALSE(store.migrate_from_sqlite(legacy_path));
+
+    // Whole-txn rollback — NEITHER row of the clashing pair survives, not
+    // just the one that hit the constraint.
+    auto ok_rule = store.get_rule("legacy-rule-ok");
+    REQUIRE(ok_rule.has_value());
+    CHECK_FALSE(ok_rule->has_value());
+    auto dup_rule = store.get_rule("legacy-rule-dup");
+    REQUIRE(dup_rule.has_value());
+    CHECK_FALSE(dup_rule->has_value());
+    CHECK(store.rule_count() == 0);
+
+    // The marker was NOT stamped — a retry (e.g. against a corrected legacy
+    // file) is possible on next boot.
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store.sqlite_backfill") ==
+          "0");
+
+    // A re-run against a corrected (name-unique) legacy file at the SAME
+    // Postgres database succeeds — proving the aborted pass never stamped
+    // the marker (the marker check is the only thing that could have
+    // short-circuited this second call to a no-op).
+    auto fixed_path =
+        yuzu::test::unique_temp_path("yuzu_test_gsstore_dupname_fixed") / "guaranteed-state.db";
+    std::filesystem::create_directories(fixed_path.parent_path());
+    write_legacy_gsstore_db(fixed_path);
+    REQUIRE(store.migrate_from_sqlite(fixed_path));
+    CHECK(store.rule_count() == 1);
+}
+
+// Skip-bad-row (ADR-0037 discrimination, other half): `guaranteed_state_events`
+// / `guardian_observations` are bounded, agent-reported, re-derivable
+// telemetry — a single malformed row is skipped-and-counted, never an
+// abort-the-whole-backfill.
+TEST_CASE(
+    "GuaranteedStateStore::migrate_from_sqlite skips one malformed event row and lands the rest",
+    "[pg][guaranteed_state][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    auto legacy_path =
+        yuzu::test::unique_temp_path("yuzu_test_gsstore_badevent") / "guaranteed-state.db";
+    std::filesystem::create_directories(legacy_path.parent_path());
+    write_legacy_gsstore_db_bad_event(legacy_path);
+
+    REQUIRE(store.migrate_from_sqlite(legacy_path));
+
+    CHECK(store.event_count() == 1);
+    auto good = store.query_events();
+    REQUIRE(good.size() == 1);
+    CHECK(good[0].event_id == "legacy-evt-good");
+
+    auto observations = store.query_observations();
+    REQUIRE(observations.size() == 1);
+    CHECK(observations[0].event_id == "legacy-obs-good");
+
+    CHECK(query_scalar(db.dsn(), "SELECT skipped_bad FROM guaranteed_state_store.sqlite_backfill") ==
+          "1");
+    CHECK(query_scalar(db.dsn(),
+                       "SELECT events_inserted FROM guaranteed_state_store.sqlite_backfill") == "1");
+}
+
+// H2 net (mirrors test_result_set_store.cpp's mid-scan-truncation test): a
+// legacy SQLite file that dies MID-SCAN (a corrupt page / short read) must
+// abort the backfill without stamping the marker — never a spurious
+// SQLITE_DONE-with-zero-rows misread as "legitimately empty".
+TEST_CASE(
+    "GuaranteedStateStore::migrate_from_sqlite aborts unstamped on a mid-scan legacy read failure",
+    "[pg][guaranteed_state][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    auto legacy_path =
+        yuzu::test::unique_temp_path("yuzu_test_gsstore_truncated") / "guaranteed-state.db";
+    std::filesystem::create_directories(legacy_path.parent_path());
+    // 400 long-ish event rows reliably spans several SQLite pages at the
+    // default 4096-byte page size.
+    write_legacy_gsstore_db_bulk(legacy_path, 400);
+
+    auto full_size = std::filesystem::file_size(legacy_path);
+    REQUIRE(full_size > 8192); // sanity: really did span more than one page
+
+    // Cut the file to half its size — corrupts the pager's page-count
+    // cross-check from the very first read (same technique/rationale as
+    // test_result_set_store.cpp's H2 net).
+    std::filesystem::resize_file(legacy_path, full_size / 2);
+
+    CHECK_FALSE(store.migrate_from_sqlite(legacy_path));
+    CHECK(store.event_count() == 0);
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store.sqlite_backfill") ==
+          "0");
+
+    // A subsequent call against a freshly-written, INTACT file at the SAME
+    // Postgres database succeeds — proving the aborted pass never stamped
+    // the marker.
+    auto intact_path =
+        yuzu::test::unique_temp_path("yuzu_test_gsstore_intact") / "guaranteed-state.db";
+    std::filesystem::create_directories(intact_path.parent_path());
+    write_legacy_gsstore_db_bulk(intact_path, 10);
+    REQUIRE(store.migrate_from_sqlite(intact_path));
+    CHECK(store.event_count() == 10);
+}
+
 // ── #452 §7 — batch insert_events ────────────────────────────────────────
 
 TEST_CASE("GuaranteedStateStore: batch insert writes all rows transactionally",
@@ -1856,6 +2207,221 @@ TEST_CASE("GuaranteedStateStore: reap_expired is a no-op on a closed store",
     REQUIRE_FALSE(bad.is_open());
     bad.reap_expired();
     SUCCEED();
+}
+
+// gc_sweep cap (mirrors ResultSetStore's "GC sweep caps a large expired batch
+// at kGcSweepCapPerPass"): bulk-insert kReapCapPerPass(10000)+1 expired,
+// DISTINCT-ttl events (+ their observation projections, for lockstep parity)
+// directly via SQL — looping insert_event() 10001 times would make this test
+// the slow part of the whole suite. A `cap-live` (unexpired) row seeded
+// alongside keeps datable (10002) strictly greater than expiring (10001) so
+// part 1's would_wipe classifier (expiring >= datable) does NOT trip — that
+// shape is covered separately below. With no prior gc_meta row in a fresh
+// template clone (so big_step can't trip either), this pass classifies clean
+// (Anomaly::None) and the unconditional per-pass cap is the only thing
+// bounding the delete on EACH of the two lockstep DELETEs — exactly what
+// this test pins. Contract note: reap_expired() returns void — the cap is
+// observed via the cumulative events_reaped_total()/observations_reaped_total()
+// counters, not a return value (unlike ResultSetStore::gc_sweep(), which
+// returns the per-call count directly).
+TEST_CASE("GuaranteedStateStore: reap_expired caps a large expired batch at kReapCapPerPass",
+          "[pg][guaranteed_state_store][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool, /*retention_days=*/30);
+    REQUIRE(store.is_open());
+
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        // 10001 events, each with its OWN ttl_expires_at (1..10001, all
+        // strictly in the past) — distinct ttls so the cap boundary, not a
+        // tie, decides which rows land in the first pass's LIMIT.
+        auto ev = pg::exec_params(
+            conn.get(),
+            "INSERT INTO guaranteed_state_store.guaranteed_state_events "
+            "(event_id, rule_id, agent_id, event_type, severity, timestamp, ttl_expires_at) "
+            "SELECT 'cap-evt-' || lpad(g::text, 6, '0'), 'r', 'a', 'drift.remediated', 'high', "
+            "'2026-04-19T12:00:00Z', g "
+            "FROM generate_series(1, 10001) AS g",
+            std::vector<std::string>{});
+        REQUIRE(ev.status() == PGRES_COMMAND_OK);
+        auto obs = pg::exec_params(
+            conn.get(),
+            "INSERT INTO guaranteed_state_store.guardian_observations "
+            "(event_id, agent_id, observed_at, obs_type, ttl_expires_at) "
+            "SELECT 'cap-evt-' || lpad(g::text, 6, '0'), 'a', '2026-04-19T12:00:00Z', "
+            "'process.crashed', g "
+            "FROM generate_series(1, 10001) AS g",
+            std::vector<std::string>{});
+        REQUIRE(obs.status() == PGRES_COMMAND_OK);
+    }
+    REQUIRE(store.insert_event(make_event("cap-live", "r", "a"))); // 30d-ahead ttl, avoids would_wipe
+
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 10000);        // capped exactly at kReapCapPerPass
+    CHECK(store.observations_reaped_total() == 10000);   // lockstep: same cap, same outcome
+
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 10001);          // second pass drains the single remainder
+    CHECK(store.observations_reaped_total() == 10001);
+
+    CHECK(store.event_count() == 1); // only "cap-live" survives
+}
+
+// gc_sweep advisory-lock skip (mirrors ResultSetStore's "GC sweep skips
+// quietly when a sibling holds the advisory lock"): a sibling replica
+// already sweeping holds the fleet-wide try-advisory-xact-lock, so this pass
+// must skip quietly and never even reach the gc_meta read/stamp (which run
+// only after the try-lock succeeds), never mind the delete.
+TEST_CASE("GuaranteedStateStore: reap_expired skips quietly when a sibling holds the advisory "
+          "lock",
+          "[pg][guaranteed_state_store][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool, /*retention_days=*/30);
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.insert_event(make_event("locked-evt", "r", "a")));
+    exec_sql(db.dsn(), "UPDATE guaranteed_state_store.guaranteed_state_events SET "
+                       "ttl_expires_at = 1 WHERE event_id = 'locked-evt'");
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store.gc_meta WHERE key "
+                                 "= 'last_pass_now'") == "0");
+
+    pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    {
+        pg::PgResult begin{PQexec(locker.get(), "BEGIN")};
+        REQUIRE(begin.status() == PGRES_COMMAND_OK);
+        pg::PgResult lock{PQexec(
+            locker.get(),
+            "SELECT pg_advisory_xact_lock(hashtextextended('guaranteed_state_store:reap', 0))")};
+        REQUIRE(lock.status() == PGRES_TUPLES_OK);
+    }
+
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 0);
+    CHECK(store.event_count() == 1); // nothing deleted — the sibling held the lock
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store.gc_meta WHERE key "
+                                 "= 'last_pass_now'") == "0"); // never reached the stamp
+
+    pg::PgResult rollback{PQexec(locker.get(), "ROLLBACK")};
+    REQUIRE(rollback.status() == PGRES_COMMAND_OK);
+}
+
+// gc_sweep clock anomaly / prev_unusable (mirrors ResultSetStore's "GC sweep
+// declines once on a clock reading ahead of now"). CONTRACT SURPRISE vs. a
+// naive "same facts -> suppressed repeat" expectation: reap_expired() stamps
+// a FRESH, honest last_pass_now on EVERY pass (including a declining one)
+// BEFORE it even evaluates the anomaly (see the .cpp: the meta stamp runs
+// ahead of the probe/classify block) — so the poisoned reading is self-healed
+// by the very first call. Pass 2 reads pass 1's (now-valid) stamp,
+// prev_unusable comes back false, and the second pass is a genuinely CLEAN
+// pass (Anomaly::None), not a suppressed repeat of BadState — it still
+// drains, just via a different path than the would_wipe test above.
+TEST_CASE("GuaranteedStateStore: reap_expired declines once on a clock reading ahead of now",
+          "[pg][guaranteed_state_store][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool, /*retention_days=*/30);
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.insert_event(make_event("clock-a", "r", "a")));
+    REQUIRE(store.insert_event(make_event("clock-b", "r", "a")));
+    REQUIRE(store.insert_event(make_event("clock-live", "r", "a"))); // avoids would_wipe
+    exec_sql(db.dsn(), "UPDATE guaranteed_state_store.guaranteed_state_events SET "
+                       "ttl_expires_at = 1 WHERE event_id IN ('clock-a', 'clock-b')");
+    // Poison gc_meta with a wildly-future last_pass_now — no C++-side wall
+    // clock read needed, computed server-side from clock_timestamp().
+    exec_sql(db.dsn(),
+            "INSERT INTO guaranteed_state_store.gc_meta (key, value) VALUES ('last_pass_now', "
+            "(EXTRACT(EPOCH FROM clock_timestamp())::bigint + 999999)::text) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value");
+
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 0); // declined: prev_unusable (BadState)
+    CHECK(store.event_count() == 3);
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store.gc_meta WHERE key "
+                                 "= 'last_anomaly_facts'") == "1");
+
+    // Self-healed: the stamp reap_expired() just wrote is an honest reading,
+    // so this pass is clean, drains both expired rows, and clears the dedup
+    // row.
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 2);
+    CHECK(store.event_count() == 1);
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store.gc_meta WHERE key "
+                                 "= 'last_anomaly_facts'") == "0"); // consumed/cleared
+}
+
+// UP-1 tiebreaker: events and observations are reaped via TWO independently-
+// executed, independently-capped DELETEs, each ordered by (ttl_expires_at,
+// event_id) — a cohort sharing ONE tied ttl_expires_at second is exactly the
+// case where two separate ORDER BY/LIMIT statements could disagree on which
+// rows fall inside the limit unless the tiebreak column (event_id) makes the
+// order identical between the two tables. Forcing the cap boundary itself to
+// land INSIDE a tied group would need >kReapCapPerPass (10000) tied rows,
+// which the cap constant does not expose as injectable — this instead pins
+// the ordering GUARANTEE on a sub-cap tied cohort (the whole cohort drains in
+// one pass): every reaped event's observation is gone, and the untied,
+// unexpired survivor's observation is untouched.
+TEST_CASE("GuaranteedStateStore: reap_expired reaps a tied-ttl cohort of events and their "
+          "observations as one set (UP-1 tiebreaker)",
+          "[pg][guaranteed_state_store][dex][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool, /*retention_days=*/30);
+    REQUIRE(store.is_open());
+
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto ev = pg::exec_params(
+            conn.get(),
+            "INSERT INTO guaranteed_state_store.guaranteed_state_events "
+            "(event_id, rule_id, agent_id, event_type, severity, timestamp, ttl_expires_at) "
+            "SELECT 'tied-evt-' || lpad(g::text, 4, '0'), 'r', 'a', 'drift.remediated', 'high', "
+            "'2026-04-19T12:00:00Z', 1 " // ALL 25 rows share ttl_expires_at = 1 (tied second)
+            "FROM generate_series(1, 25) AS g",
+            std::vector<std::string>{});
+        REQUIRE(ev.status() == PGRES_COMMAND_OK);
+        auto obs = pg::exec_params(
+            conn.get(),
+            "INSERT INTO guaranteed_state_store.guardian_observations "
+            "(event_id, agent_id, observed_at, obs_type, ttl_expires_at) "
+            "SELECT 'tied-evt-' || lpad(g::text, 4, '0'), 'a', '2026-04-19T12:00:00Z', "
+            "'process.crashed', 1 "
+            "FROM generate_series(1, 25) AS g",
+            std::vector<std::string>{});
+        REQUIRE(obs.status() == PGRES_COMMAND_OK);
+        // Untied, unexpired survivor pair — a distinct future ttl so it
+        // never competes with the tied cohort's ORDER BY position.
+        auto ev_live = pg::exec_params(
+            conn.get(),
+            "INSERT INTO guaranteed_state_store.guaranteed_state_events "
+            "(event_id, rule_id, agent_id, event_type, severity, timestamp, ttl_expires_at) "
+            "VALUES ('tied-survivor', 'r', 'a', 'drift.remediated', 'high', "
+            "'2026-04-19T12:00:00Z', (EXTRACT(EPOCH FROM clock_timestamp())::bigint + 100000))",
+            std::vector<std::string>{});
+        REQUIRE(ev_live.status() == PGRES_COMMAND_OK);
+        auto obs_live = pg::exec_params(
+            conn.get(),
+            "INSERT INTO guaranteed_state_store.guardian_observations "
+            "(event_id, agent_id, observed_at, obs_type, ttl_expires_at) "
+            "VALUES ('tied-survivor', 'a', '2026-04-19T12:00:00Z', 'process.crashed', "
+            "(EXTRACT(EPOCH FROM clock_timestamp())::bigint + 100000))",
+            std::vector<std::string>{});
+        REQUIRE(obs_live.status() == PGRES_COMMAND_OK);
+    }
+
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 25);
+    CHECK(store.observations_reaped_total() == 25);
+    CHECK(store.event_count() == 1); // only "tied-survivor" left
+
+    auto survivors = store.query_observations();
+    REQUIRE(survivors.size() == 1);
+    CHECK(survivors[0].event_id == "tied-survivor");
 }
 
 TEST_CASE("GuaranteedStateStore: overview aggregations", "[pg][guaranteed_state_store][overview]") {
