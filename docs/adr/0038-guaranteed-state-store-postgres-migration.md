@@ -61,10 +61,22 @@ aggregate reads get the same composite indexes the SQLite store maintains.
 - **Status upserts: fail-soft with the same counter** (reconcile heals on the next
   heartbeat), but status **reads** feeding the enforce-gate/dashboard stay
   degrade-distinguishable (empty ≠ unknown).
-- **DEX analytic reads: degrade-distinguishable at the store seam**
-  (`std::optional<vector>`), consumers render degraded (dashboard) — they feed no
-  enforce/target decision. The `kDexCohortFloor` no-singling-out flooring stays where it
-  lives today (model/route layer), untouched.
+- **DEX analytic reads: deferred widening (explicit, playbook-sanctioned).** The ~20 DEX
+  aggregate reads keep their plain `std::vector<T>` signatures THIS PR (empty-on-degrade,
+  behavior-identical to the SQLite store today), because the type change fans out to ~68
+  call sites across five consumer files (dashboard fragments need the htmx 200+inline-note
+  convention, REST twins 503, MCP a third shape) — each an individually-reviewed decision,
+  not a mechanical sweep, and none feeds an enforce/target decision (the playbook's
+  deny-or-benign class; same deferral the ResultSetStore pilot recorded for
+  `list_by_owner`/`members`/`lineage`). What this PR DOES land at the store seam:
+  `yuzu_guardian_read_degrade_total{reason}` + `DegradeSampler` logging on every DEX read
+  (a degrade is counted and visible even while the return stays empty). The
+  `std::optional` widening + per-route degrade sweep is a tracked follow-up (issue filed
+  with this PR), amendable per-file. The `kDexCohortFloor` no-singling-out flooring stays
+  where it lives today (model/route layer), untouched.
+  The type-distinguishable set THIS PR: `list_rules` / `get_rule` / `rule_names` /
+  `rule_names_for` (Push/reconcile inputs) and `agent_rule_statuses` (enforce-gate/census
+  input) — the catastrophic-read set — plus all write paths.
 
 ### Backfill (ADR-0009) — mandatory, all five tables, one transaction
 
