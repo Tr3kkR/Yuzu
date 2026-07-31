@@ -298,8 +298,16 @@ std::string GuardianRoutes::render_status_fragment(const std::string& view) cons
     online.reserve(online_os.size());
     for (const auto& [aid, aos] : online_os) online.insert(aid);
 
-    const auto rules = store_->list_rules();
-    auto by_rule = rollup_by_rule(store_->agent_rule_statuses(), online);
+    // list_rules / agent_rule_statuses are now type-distinguishable (ADR-0038
+    // catastrophic-read set): a degraded read renders the same "store
+    // unavailable" empty-state as the !store_ guard above, never a silent
+    // empty/partial fleet view.
+    const auto rules_result = store_->list_rules();
+    const auto statuses_result = store_->agent_rule_statuses();
+    if (!rules_result || !statuses_result)
+        return empty_state("Guardian store degraded", "Check server /healthz.");
+    const auto& rules = *rules_result;
+    auto by_rule = rollup_by_rule(*statuses_result, online);
 
     // Deployed Baselines per rule (coverage + per-Guard "deployed"). Computed BEFORE
     // the not-implemented fold because the fold is gated on deployment (below).
@@ -740,8 +748,13 @@ std::string GuardianRoutes::render_guards_fragment(const std::string& status_fil
     // TODO(guardian-backend): fold in GET /api/v1/guaranteed-state/status per guard.
     bool used_real = false;
     if (store_ && store_->is_open()) {
-        auto rules = store_->list_rules();
-        if (!rules.empty()) {
+        // list_rules is now type-distinguishable (ADR-0038): a degrade (!rules_result)
+        // falls through to the mock demonstration render below — the same fallback
+        // this file already applies for `!store_`/`!is_open()` — rather than being
+        // treated as "zero authored rules" (which renders the honest empty state).
+        auto rules_result = store_->list_rules();
+        if (rules_result && !rules_result->empty()) {
+            const auto& rules = *rules_result;
             used_real = true;
             // Precompute, per guard rule_id, the DEPLOYED Baselines that contain it
             // (id + name) — one pass over deployed baselines rather than a query per
@@ -866,12 +879,15 @@ void GuardianRoutes::apply_guard_change(const httplib::Request& req, httplib::Re
 
     if (!store_ || !store_->is_open())
         return fail("Guardian store unavailable.");
+    // get_rule is now three-state (ADR-0038): found / genuinely absent / degraded.
     auto rule = store_->get_rule(rule_id);
     if (!rule)
+        return fail("Guardian store degraded.");
+    if (!*rule)
         return fail("No such Guard: " + rule_id);
 
-    rule->enabled = enabled;
-    if (auto r = store_->update_rule(*rule); !r)
+    (*rule)->enabled = enabled;
+    if (auto r = store_->update_rule(**rule); !r)
         return fail("Update failed: " + r.error());
 
     // STATE-ONLY (no push). A Guard's enabled flag is global state, not an
@@ -1032,7 +1048,7 @@ void GuardianRoutes::create_baseline_from_form(const httplib::Request& req,
     auto fail = [this, &res](const std::string& msg) {
         std::vector<std::string> names;
         if (store_ && store_->is_open())
-            for (const auto& r : store_->list_rules())
+            for (const auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{}))
                 names.push_back(r.name);
         const std::string banner = "<div class=\"gs-error-banner\" style=\"background:#3a1a1a;"
                                    "color:var(--red);padding:0.5rem 0.75rem;border-radius:0.4rem;"
@@ -1061,7 +1077,7 @@ void GuardianRoutes::create_baseline_from_form(const httplib::Request& req,
     std::vector<std::string> member_ids;
     if (store_ && store_->is_open()) {
         std::unordered_map<std::string, std::string> name_to_id;
-        for (const auto& r : store_->list_rules())
+        for (const auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{}))
             name_to_id.emplace(r.name, r.rule_id);
         std::string unknown;
         const size_t n = req.get_param_value_count("guards");
@@ -1232,7 +1248,7 @@ void GuardianRoutes::update_baseline_from_form(const httplib::Request& req, http
     std::vector<std::string> member_ids;
     if (store_ && store_->is_open()) {
         std::unordered_map<std::string, std::string> name_to_id;
-        for (const auto& r : store_->list_rules())
+        for (const auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{}))
             name_to_id.emplace(r.name, r.rule_id);
         std::string unknown;
         const size_t n = req.get_param_value_count("guards");
@@ -1348,7 +1364,7 @@ std::string GuardianRoutes::render_events_fragment(const std::string& type_filte
         // Resolve rule_id → human Guard name (events store the id) so rows read —
         // and the client-side search filters — by the name the operator knows.
         std::unordered_map<std::string, std::string> rule_name;
-        for (const auto& r : store_->list_rules())
+        for (const auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{}))
             rule_name[r.rule_id] = r.name;
         GuaranteedStateEventQuery q;
         q.limit = 20;
@@ -1510,14 +1526,16 @@ std::string GuardianRoutes::render_baseline_page_fragment(const std::string& bas
     online.reserve(online_os.size());
     for (const auto& [aid, aos] : online_os) online.insert(aid);
     const auto by_rule = (store_ && store_->is_open())
-                             ? rollup_by_rule(store_->agent_rule_statuses(), online)
+                             ? rollup_by_rule(store_->agent_rule_statuses().value_or(std::vector<GuardianAgentRuleStatus>{}), online)
                              : std::unordered_map<std::string, StateRollup>{};
 
     // One list_rules() into a rid->row map (reused for enforcement_mode + os_target +
     // the member labels below) so the page does not issue a get_rule() per member.
+    // .value_or({}) (ADR-0038): a degrade renders this baseline page with unresolved
+    // member labels (falls back to rule_id below), never a hard failure of the page.
     std::unordered_map<std::string, GuaranteedStateRuleRow> rule_by_id;
     if (store_ && store_->is_open())
-        for (auto& r : store_->list_rules()) {
+        for (auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{})) {
             const std::string id = r.rule_id;
             rule_by_id.emplace(id, std::move(r));
         }
@@ -1739,16 +1757,20 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
     std::string name = guard_id, severity, os = "all", os_target_raw = "windows", yaml, spec_json;
     bool real_rule = false, enabled = true, enforcing = false;
     if (store_ && store_->is_open()) {
-        if (auto r = store_->get_rule(guard_id)) {
+        // get_rule is now three-state (ADR-0038): found / genuinely absent / degraded.
+        // Both "not found" and "degraded" fall through to the same "Guard not found"
+        // placeholder below — a degrade here is a page-render failure either way.
+        if (auto r = store_->get_rule(guard_id); r && *r) {
+            const auto& rr = **r;
             real_rule = true;
-            name = r->name;
-            severity = r->severity;
-            enforcing = (r->enforcement_mode == "enforce");
-            enabled = r->enabled;
-            os_target_raw = r->os_target;  // raw (empty = all OSes), for os_target_matches
-            os = r->os_target.empty() ? "all" : r->os_target;
-            yaml = r->yaml_source;
-            spec_json = r->spec_json;
+            name = rr.name;
+            severity = rr.severity;
+            enforcing = (rr.enforcement_mode == "enforce");
+            enabled = rr.enabled;
+            os_target_raw = rr.os_target;  // raw (empty = all OSes), for os_target_matches
+            os = rr.os_target.empty() ? "all" : rr.os_target;
+            yaml = rr.yaml_source;
+            spec_json = rr.spec_json;
         }
     }
     if (!real_rule)
@@ -1800,7 +1822,7 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
                     }
         }
         std::unordered_set<std::string> seen;  // agent_ids that already have a status row
-        for (const auto& s : store_->agent_rule_statuses(guard_id)) {
+        for (const auto& s : store_->agent_rule_statuses(guard_id).value_or(std::vector<GuardianAgentRuleStatus>{})) {
             seen.insert(s.agent_id);
             DevRow d;
             d.online = hostname.count(s.agent_id) > 0;
@@ -1996,7 +2018,7 @@ std::string GuardianRoutes::render_baseline_form_fragment() const {
     // §6/§7). See guardian_form_render.cpp.
     std::vector<std::string> names;
     if (store_ && store_->is_open())
-        for (const auto& r : store_->list_rules())
+        for (const auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{}))
             names.push_back(r.name);
     return guardian::render_baseline_form(names);
 }
@@ -2004,7 +2026,7 @@ std::string GuardianRoutes::render_baseline_form_fragment() const {
 std::string GuardianRoutes::render_baseline_edit_form_fragment(const std::string& baseline_id) const {
     std::vector<std::string> names;
     if (store_ && store_->is_open())
-        for (const auto& r : store_->list_rules())
+        for (const auto& r : store_->list_rules().value_or(std::vector<GuaranteedStateRuleRow>{}))
             names.push_back(r.name);
 
     guardian::BaselineFormEdit ec;
@@ -2016,8 +2038,8 @@ std::string GuardianRoutes::render_baseline_edit_form_fragment(const std::string
         for (const auto& rid : baseline_store_->get_members(baseline_id)) {
             std::string nm = rid;
             if (store_ && store_->is_open())
-                if (auto r = store_->get_rule(rid); r && !r->name.empty())
-                    nm = r->name;
+                if (auto r = store_->get_rule(rid); r && *r && !(*r)->name.empty())
+                    nm = (*r)->name;
             ec.selected.push_back(nm);
         }
     }

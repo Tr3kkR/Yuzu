@@ -624,11 +624,23 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         (void)detail::emit_behavioral_audit(audit_fn_, req, res, "guardian.device.view", "success",
                                             "Agent", id,
                                             "device Guardian lens (per-guard compliance)");
+        // list_rules / agent_rule_statuses are now type-distinguishable (ADR-0038
+        // catastrophic-read set): a degraded read must render the same "store
+        // unavailable" placeholder as the `!store_` guard above, never a silent
+        // empty/partial guard list (which would misreport a device as having no
+        // guards, or drop live drift verdicts, for the operator viewing this lens).
+        auto rules_result = store_->list_rules();
+        auto statuses_result = store_->agent_rule_statuses();
+        if (!rules_result || !statuses_result) {
+            res.set_content(render_device_lens_placeholder("guardian", id, "Guardian store degraded."),
+                            "text/html; charset=utf-8");
+            return;
+        }
         std::unordered_map<std::string, std::string> rule_names;
-        for (const auto& r : store_->list_rules())
+        for (const auto& r : *rules_result)
             rule_names[r.rule_id] = r.name;
         std::vector<DeviceGuardRow> guards;
-        for (const auto& st : store_->agent_rule_statuses()) { // all; filter to this agent
+        for (const auto& st : *statuses_result) { // all; filter to this agent
             if (st.agent_id != id)
                 continue;
             DeviceGuardRow g;

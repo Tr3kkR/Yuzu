@@ -7325,11 +7325,19 @@ void RestApiV1::register_routes(
                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
+                 // list_rules is now type-distinguishable (ADR-0038 catastrophic-read
+                 // set): a degraded read must never render as an empty list.
                  auto rows = guaranteed_state_store->list_rules();
+                 if (!rows) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "guaranteed-state store degraded"),
+                                     "application/json");
+                     return;
+                 }
                  JArr arr;
-                 for (const auto& r : rows)
+                 for (const auto& r : *rows)
                      arr.add(rule_to_jobj(r));
-                 res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size())),
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(rows->size())),
                                  "application/json");
              });
 
@@ -7490,13 +7498,21 @@ void RestApiV1::register_routes(
                      return;
                  }
                  auto id = req.matches[1].str();
+                 // get_rule is now three-state (ADR-0038): found / genuinely absent /
+                 // degraded — a degrade must render 503, never collapse into 404.
                  auto row = guaranteed_state_store->get_rule(id);
                  if (!row) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "guaranteed-state store degraded"),
+                                     "application/json");
+                     return;
+                 }
+                 if (!*row) {
                      res.status = 404;
                      res.set_content(detail::a4_error(res, "rule not found"), "application/json");
                      return;
                  }
-                 res.set_content(ok_json(rule_to_jobj(*row).str()), "application/json");
+                 res.set_content(ok_json(rule_to_jobj(**row).str()), "application/json");
              });
 
     sink.Put(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
@@ -7521,13 +7537,23 @@ void RestApiV1::register_routes(
                      return;
                  }
                  auto id = req.matches[1].str();
+                 // get_rule is now three-state (ADR-0038): found / genuinely absent /
+                 // degraded — a degrade must render 503, never collapse into 404.
                  auto existing = guaranteed_state_store->get_rule(id);
                  if (!existing) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::error_json_a4(503, "guaranteed-state store degraded", cid),
+                         "application/json");
+                     return;
+                 }
+                 if (!*existing) {
                      res.status = 404;
                      res.set_content(detail::error_json_a4(404, "rule not found", cid),
                                      "application/json");
                      return;
                  }
+                 const GuaranteedStateRuleRow& existing_rule = **existing;
                  auto body = nlohmann::json::parse(req.body, nullptr, false);
                  if (body.is_discarded() || !body.is_object()) {
                      res.status = 400;
@@ -7543,7 +7569,7 @@ void RestApiV1::register_routes(
                               "invalid JSON body");
                      return;
                  }
-                 auto updated = *existing;
+                 auto updated = existing_rule;
                  // Use body.value<T>(k, default) rather than body["k"].get<T>()
                  // so a type-mismatched JSON field (e.g. {"enabled": "yes"})
                  // falls back to the existing value rather than throwing
@@ -7560,8 +7586,8 @@ void RestApiV1::register_routes(
                  // full-object PUT may echo the current mode, but changing it is a
                  // 400, not a silent flip: the operator must author a new Guard.
                  if (body.contains("enforcement_mode") &&
-                     body.value("enforcement_mode", existing->enforcement_mode) !=
-                         existing->enforcement_mode) {
+                     body.value("enforcement_mode", existing_rule.enforcement_mode) !=
+                         existing_rule.enforcement_mode) {
                      res.status = 400;
                      res.set_content(
                          detail::error_json_a4(
@@ -7573,11 +7599,11 @@ void RestApiV1::register_routes(
                               "attempt to change immutable enforcement_mode");
                      return;
                  }
-                 updated.enforcement_mode = existing->enforcement_mode;  // unchanged
+                 updated.enforcement_mode = existing_rule.enforcement_mode;  // unchanged
                  updated.severity = body.value("severity", updated.severity);
                  updated.os_target = body.value("os_target", updated.os_target);
                  updated.scope_expr = body.value("scope_expr", updated.scope_expr);
-                 updated.version = existing->version + 1;
+                 updated.version = existing_rule.version + 1;
 
                  // A structured body re-authors the Guard (contract §8): re-derive the
                  // canonical spec + yaml_source and re-validate the resilience policy
@@ -7762,6 +7788,17 @@ void RestApiV1::register_routes(
         int pushed = 0;
         if (guardian_push_fn) {
             pushed = guardian_push_fn(scope, full_sync);
+            // -2 is the ADR-0038 degraded-store sentinel (distinct from -1's
+            // "unparseable scope") — a guaranteed-state read degrade must render
+            // 503, never the misleading 400 "invalid scope expression".
+            if (pushed == -2) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "guaranteed-state store degraded"),
+                                "application/json");
+                audit_fn(req, "guaranteed_state.push", "denied", "GuaranteedState", "",
+                         "store degraded scope=\"" + sanitize_audit_string(scope) + "\"");
+                return;
+            }
             if (pushed < 0) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid scope expression"), "application/json");
@@ -9495,11 +9532,25 @@ void RestApiV1::register_routes(
             // catalogue — this is per-request on the fleet-polled device-compliance
             // path. Falls back to the rule_id when a snapshot member Guard has since
             // been deleted (absent from the map).
-            const auto rule_names = guaranteed_state_store->rule_names_for(guard_ids);
+            // rule_names_for / agent_rule_statuses_for_agent are now type-distinguishable
+            // (ADR-0038 catastrophic-read set — this route's compliance counts are an
+            // enforce-gate/census consumer): a degrade must render 503, never a silent
+            // "0 guards reported" that would misreport the device as compliant.
+            auto rule_names_result = guaranteed_state_store->rule_names_for(guard_ids);
+            auto statuses_result = guaranteed_state_store->agent_rule_statuses_for_agent(agent_id);
+            if (!rule_names_result || !statuses_result) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
+                                "application/json");
+                spdlog::warn("guardian.device.view store degraded (503) cid={} agent_id={}", cid,
+                             agent_id);
+                return;
+            }
+            const auto& rule_names = *rule_names_result;
 
             // rule_id -> last reported verdict for THIS device.
             std::unordered_map<std::string, GuardianAgentRuleStatus> dev;
-            for (auto& st : guaranteed_state_store->agent_rule_statuses_for_agent(agent_id))
+            for (auto& st : *statuses_result)
                 dev[st.rule_id] = std::move(st);
 
             int64_t compliant = 0, drifted = 0, errored = 0;

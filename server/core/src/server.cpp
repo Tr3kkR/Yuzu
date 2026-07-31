@@ -2813,14 +2813,29 @@ public:
                             .increment();
                         return;
                     }
+                    // list_rules is now type-distinguishable (ADR-0038 catastrophic-read
+                    // set): a degraded read MUST abort this reconcile rather than fan out
+                    // an empty rule set it cannot distinguish from "no rules configured" —
+                    // that would be a fleet-wide disarm for this agent.
+                    auto rules_result = guaranteed_state_store_->list_rules();
+                    if (!rules_result) {
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "degraded"}})
+                            .increment();
+                        spdlog::warn("Guardian heartbeat reconcile: list_rules degraded ({}) — "
+                                     "aborting re-push for agent_id={}",
+                                     rules_result.error(), agent_id);
+                        return;
+                    }
                     // Per-agent filtering as the fan-out (M4): only rules that target
                     // this agent's OS and name it in scope. Cache scope membership
                     // across rules sharing a scope_expr within this one reconcile.
                     // Baseline gate (docs/guardian-baseline-model.md): the rule source
                     // is the union of member Guards of *deployed* Baselines, so an
                     // enabled-but-undeployed Guard is never reconciled onto an agent.
-                    const auto rules = guardian::filter_deployed_members(
-                        guaranteed_state_store_->list_rules(), deployed_member_rule_ids());
+                    const auto rules =
+                        guardian::filter_deployed_members(*rules_result, deployed_member_rule_ids());
                     std::unordered_map<std::string, bool> scope_member;
                     auto push = guardian::build_agent_push(
                         rules, sess->os,
@@ -3278,18 +3293,42 @@ public:
             }
         }
 
-        // Guardian (Guaranteed State) rule + event store. REST/dashboard/push
-        // wiring lands in later PRs; this PR stands the store up with its
-        // retention reaper so the schema migration runs, the database file
-        // exists, and bounded growth is the default from day one (#452 §5).
-        {
-            auto gs_db = cfg_.db_dir() / "guaranteed-state.db";
-            guaranteed_state_store_ =
-                std::make_unique<GuaranteedStateStore>(gs_db, cfg_.guardian_event_retention_days);
-            if (guaranteed_state_store_ && guaranteed_state_store_->is_open()) {
-                guaranteed_state_store_->start_cleanup();
-                spdlog::info("GuaranteedStateStore initialized at {} (retention={}d)",
-                             gs_db.string(), cfg_.guardian_event_retention_days);
+        // Guardian (Guaranteed State) rule + event store. Migrated Postgres store
+        // (ADR-0006/0038, schema `guaranteed_state_store`) — construction fail-CLOSED
+        // per ADR-0012 §1 (same template as ResultSetStore above): a reachable
+        // database whose schema can't migrate/open is a fatal startup error, never a
+        // serve-degraded state. `migrate_from_sqlite` runs the one-time, idempotent
+        // legacy-`guaranteed-state.db` backfill (ADR-0009) — the rules/meta/status
+        // tables are AUTHORITATIVE/fail-hard, so a backfill failure is ALSO fatal
+        // (never serve on top of a partially-migrated rule set).
+        if (pg_pool_ && !startup_failed_) {
+            guaranteed_state_store_ = std::make_unique<GuaranteedStateStore>(
+                *pg_pool_, cfg_.guardian_event_retention_days);
+            if (!guaranteed_state_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: guaranteed-state store migration/open "
+                              "failed (database reachable but the guaranteed_state_store schema "
+                              "could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto gs_db = cfg_.db_dir() / "guaranteed-state.db";
+                if (!guaranteed_state_store_->migrate_from_sqlite(gs_db)) {
+                    spdlog::error(
+                        "[PG] Refusing to start: guaranteed-state legacy-SQLite backfill failed "
+                        "(see prior log lines) — rules/meta are authoritative and must not serve "
+                        "partially-migrated data. Operator remediation: repair {} or move it "
+                        "aside to skip the backfill (rules/events/observations in it will NOT "
+                        "carry over)",
+                        gs_db.string());
+                    startup_failed_ = true;
+                }
+            }
+            if (guaranteed_state_store_ && guaranteed_state_store_->is_open() &&
+                !startup_failed_) {
+                guaranteed_state_store_->set_metrics(&metrics_);
+                spdlog::info("GuaranteedStateStore initialized (schema guaranteed_state_store; "
+                             "retention={}d; legacy backfill source {})",
+                             cfg_.guardian_event_retention_days,
+                             (cfg_.db_dir() / "guaranteed-state.db").string());
                 // Step 5: ingest agent `__guard__` events arriving on the Subscribe
                 // stream → guaranteed_state_events. See docs/guardian-mvp-contract.md.
                 agent_service_.set_guaranteed_state_store(guaranteed_state_store_.get());
@@ -5026,8 +5065,9 @@ public:
             response_store_->stop_cleanup();
         if (audit_store_)
             audit_store_->stop_cleanup();
-        if (guaranteed_state_store_)
-            guaranteed_state_store_->stop_cleanup();
+        // GuaranteedStateStore no longer runs its own cleanup thread (ADR-0038):
+        // reap_expired() is ticked from the result-set maintenance thread below,
+        // which is joined before result_set_store_/guaranteed_state_store_ reset.
 
         // Stop cert reloader before web server (it holds a pointer to web_server_)
         if (cert_reloader_) {
@@ -5237,6 +5277,15 @@ public:
         // thread that leased it is already joined above; every HTTP/gRPC handler
         // holding the raw pointer is quiesced by the drains above.
         result_set_store_.reset();
+        // GuaranteedStateStore (ADR-0038): same discipline — null the borrowed
+        // pointers in both ingest services (Subscribe loop / gateway
+        // ForwardGuardianMessage), then drop the store, BEFORE the pool. The
+        // reap tick piggybacks on the result-set maintenance thread already
+        // joined above.
+        agent_service_.set_guaranteed_state_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_guaranteed_state_store(nullptr);
+        guaranteed_state_store_.reset();
         // Auth substrate (ADR-0006/0010) — destruct-before-pool, and in
         // dependency order. AuthDB owns a background reaper thread
         // (cleanup_provisional_mfa) that leases pg_pool_ via
@@ -7313,6 +7362,11 @@ private:
             bool inventory_ok = inventory_store_ && inventory_store_->is_open();
             // Load-bearing for the MCP write surface + REST approvals (sre-BLOCKING-1).
             bool approval_ok = approval_manager_ && approval_manager_->is_open();
+            // #2636: ResultSetStore was wired into /readyz but missing here — same
+            // readyz-vs-healthz drift class the InventoryStore row above documents.
+            // Fixed alongside the ADR-0038 GuaranteedStateStore migration since both
+            // land in the same PR.
+            bool result_set_ok = result_set_store_ && result_set_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -7320,7 +7374,7 @@ private:
                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
-                approval_ok;
+                approval_ok && result_set_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -7343,7 +7397,8 @@ private:
                   {"app_perf_daily_store", app_perf_daily_ok ? "ok" : "error"},
                   {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"},
                   {"device_inventory_store", device_inventory_ok ? "ok" : "error"},
-                  {"inventory_store", inventory_ok ? "ok" : "error"}}},
+                  {"inventory_store", inventory_ok ? "ok" : "error"},
+                  {"result_set_store", result_set_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -11905,8 +11960,14 @@ private:
         // (join sits next to the policy-eval join in stop()).
         if (result_set_store_ && result_set_store_->is_open()) {
             result_set_maint_thread_ = std::thread([this]() {
-                spdlog::info("Result-set maintenance thread started (cadence=2s, GC=5m)");
+                spdlog::info("Result-set maintenance thread started (cadence=2s, GC=5m, "
+                             "Guardian reap=60m)");
                 constexpr int kGcEveryNTicks = 150;            // ~5 minutes at 2s/tick
+                // Guardian retention reap (ADR-0038): matches the old SQLite cleanup
+                // thread's 60-minute default cadence (cleanup_interval_min). Piggybacks
+                // on this thread rather than running its own — the reap is a single
+                // guarded/advisory-locked pass regardless of which thread calls it.
+                constexpr int kGuardianReapEveryNTicks = 1800; // ~60 minutes at 2s/tick
                 constexpr int64_t kPendingTimeoutSeconds = 300; // give up waiting after 5m
                 int tick = 0;
                 while (!stop_requested_.load(std::memory_order_acquire)) {
@@ -11969,13 +12030,21 @@ private:
                         }
 
                         // 2) GC sweep on the slow cadence.
-                        if (++tick % kGcEveryNTicks == 0) {
+                        ++tick;
+                        if (tick % kGcEveryNTicks == 0) {
                             int swept = result_set_store_->gc_sweep();
                             if (swept > 0) {
                                 metrics_.counter("yuzu_result_set_gc_total")
                                     .increment(static_cast<double>(swept));
                                 spdlog::info("result-set GC swept {} expired set(s)", swept);
                             }
+                        }
+
+                        // 2b) Guardian retention reap (ADR-0038) on its own, much
+                        // slower cadence — piggybacks on this thread's tick counter.
+                        if (guaranteed_state_store_ && guaranteed_state_store_->is_open() &&
+                            tick % kGuardianReapEveryNTicks == 0) {
+                            guaranteed_state_store_->reap_expired();
                         }
 
                         // 3) Refresh alive gauges.
@@ -13892,11 +13961,23 @@ private:
                 // and wedge the heartbeat reconcile. (M6 / #1209.)
                 const std::uint64_t generation =
                     guaranteed_state_store_->current_policy_generation();
+                // list_rules is now type-distinguishable (ADR-0038 catastrophic-read
+                // set): a degraded read MUST abort the push, never fan out an empty
+                // rule set indistinguishable from "no rules configured" — a Guardian-
+                // wide disarm. Sentinel -2 (distinct from -1's "unparseable scope")
+                // lets the REST caller map this to 503 rather than 400.
+                auto rules_result = guaranteed_state_store_->list_rules();
+                if (!rules_result) {
+                    spdlog::warn("Guardian push: list_rules degraded ({}) — aborting push "
+                                 "(scope={})",
+                                 rules_result.error(), scope);
+                    return -2;
+                }
                 // Baseline gate: push only Guards that are members of a *deployed*
                 // Baseline (docs/guardian-baseline-model.md). With nothing deployed
                 // the set is empty and a full_sync converges agents to zero guards.
-                const auto rules = guardian::filter_deployed_members(
-                    guaranteed_state_store_->list_rules(), deployed_member_rule_ids());
+                const auto rules =
+                    guardian::filter_deployed_members(*rules_result, deployed_member_rule_ids());
 
                 // Resolve the agent set this push is ADDRESSED to. H1 scopes a single
                 // toggle to the affected rule's scope_expr (was the whole fleet); an
@@ -14844,6 +14925,14 @@ private:
     // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
     // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by
     // which point it is set.
+    //
+    // Return-value sentinel contract (ADR-0038): >= 0 is the count of agents the
+    // push was addressed to; -1 = unparseable scope expression (REST maps this to
+    // 400); -2 = the guaranteed-state store's `list_rules()` degraded — the push
+    // was aborted rather than fan out a rule set indistinguishable from "no rules
+    // configured" (REST maps this to 503, distinctly from -1's 400). The two
+    // guardian_routes.cpp dashboard-toggle call sites do not need to distinguish
+    // -1 from -2 — both already collapse to "push not wired/failed" there.
     std::function<int(const std::string&, bool)> guardian_push_fn_;
 
     // Guardian heartbeat-reconcile per-agent rate limit (#1209 hardening:

@@ -31,6 +31,7 @@
 #include "baseline_store.hpp"
 #include "guardian_routes.hpp"
 #include "guaranteed_state_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -52,6 +53,18 @@
 using namespace yuzu::server;
 
 namespace {
+
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): every
+// Harness below constructs its own GuaranteedStateStore against a clone of
+// this schema (ADR-0038 migration). Shared key "guardianstate" with every
+// other GuaranteedStateStore test file — same setup callback shape, so the
+// shared-key REPLAY verification (test_helpers.hpp) passes.
+yuzu::test::PgTestTemplate guardianstate_tpl{"guardianstate", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    GuaranteedStateStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("guardianstate template: store failed to migrate");
+}};
 
 GuaranteedStateRuleRow make_rule(std::string rule_id, std::string name) {
     GuaranteedStateRuleRow r;
@@ -83,11 +96,17 @@ struct PushCall {
     bool full_sync;
 };
 
-// Harness: real GuaranteedStateStore + BaselineStore behind GuardianRoutes,
-// dispatched through TestRouteSink. TempDbFile members come FIRST so they
-// outlive (and clean up after) the stores even if construction throws.
+// Harness: real GuaranteedStateStore (Postgres, ADR-0038) + BaselineStore
+// (still SQLite) behind GuardianRoutes, dispatched through TestRouteSink.
+// `gs_db_pg`/`gs_pool` come FIRST (before `store`) so they outlive it even if
+// construction throws. Mirrors AuthDbPg's shape exactly
+// (test_auth_db_pg_helper.hpp): `gs_db_pg` stays `std::optional` and is
+// `.emplace()`d only AFTER the Harness() body's own SKIP check — constructing
+// PostgresTestDb unconditionally (e.g. via a default member-initializer) would
+// touch Postgres before the SKIP-when-unconfigured check runs.
 struct Harness {
-    yuzu::test::TempDbFile gs_db{std::string_view{"guardian-routes-gs-"}};
+    std::optional<yuzu::test::PostgresTestDb> gs_db_pg;
+    std::optional<yuzu::server::pg::PgPool> gs_pool;
     yuzu::test::TempDbFile bl_db{std::string_view{"guardian-routes-bl-"}};
 
     std::unique_ptr<GuaranteedStateStore> store;
@@ -110,7 +129,16 @@ struct Harness {
     yuzu::server::test::TestRouteSink sink;
 
     Harness() {
-        store = std::make_unique<GuaranteedStateStore>(gs_db.path);
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
+        gs_db_pg.emplace(guardianstate_tpl);
+        INFO("[Harness] guaranteed-state fixture status (blank == database came up OK): "
+             << gs_db_pg->error());
+        REQUIRE(gs_db_pg->available());
+        gs_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = gs_db_pg->dsn(), .size = 4});
+        REQUIRE(gs_pool->valid());
+        store = std::make_unique<GuaranteedStateStore>(*gs_pool);
         REQUIRE(store->is_open());
         baselines = std::make_unique<BaselineStore>(bl_db.path);
         REQUIRE(baselines->is_open());
@@ -186,7 +214,7 @@ constexpr const char* kBaselinesPath = "/fragments/guardian/baselines";
 } // namespace
 
 TEST_CASE("create_baseline_from_form persists the Baseline + members + audit",
-          "[guardian_routes][baseline][create]") {
+          "[pg][guardian_routes][baseline][create]") {
     Harness h;
     h.seed_guard("g1", "GuardOne");
     h.seed_guard("g2", "GuardTwo");
@@ -206,7 +234,7 @@ TEST_CASE("create_baseline_from_form persists the Baseline + members + audit",
 }
 
 TEST_CASE("create_baseline_from_form reports a duplicate name without a second row",
-          "[guardian_routes][baseline][create][conflict]") {
+          "[pg][guardian_routes][baseline][create][conflict]") {
     Harness h;
     auto path = std::string(kBaselinesPath) + "?name=Dupe";
     REQUIRE(h.sink.dispatch("POST", path, "", "application/x-www-form-urlencoded") != nullptr);
@@ -220,7 +248,7 @@ TEST_CASE("create_baseline_from_form reports a duplicate name without a second r
 }
 
 TEST_CASE("create_baseline_from_form is gated on GuaranteedState:Write",
-          "[guardian_routes][baseline][create][rbac]") {
+          "[pg][guardian_routes][baseline][create][rbac]") {
     Harness h;
     h.denied = {"GuaranteedState:Write"};
 
@@ -233,7 +261,7 @@ TEST_CASE("create_baseline_from_form is gated on GuaranteedState:Write",
 }
 
 TEST_CASE("deploy_baseline marks deployed, writes the snapshot, and pushes fleet-wide",
-          "[guardian_routes][baseline][deploy]") {
+          "[pg][guardian_routes][baseline][deploy]") {
     Harness h;
     h.seed_guard("g1", "GuardOne");
     h.seed_baseline("bl1", "BL1", {"g1"});
@@ -257,7 +285,7 @@ TEST_CASE("deploy_baseline marks deployed, writes the snapshot, and pushes fleet
 }
 
 TEST_CASE("deploy_baseline is gated on GuaranteedState:Push (no push when denied)",
-          "[guardian_routes][baseline][deploy][rbac]") {
+          "[pg][guardian_routes][baseline][deploy][rbac]") {
     Harness h;
     h.seed_guard("g1", "GuardOne");
     h.seed_baseline("bl1", "BL1", {"g1"});
@@ -276,7 +304,7 @@ TEST_CASE("deploy_baseline is gated on GuaranteedState:Push (no push when denied
 }
 
 TEST_CASE("editing a deployed Baseline does not change what the fleet enforces until re-deploy",
-          "[guardian_routes][baseline][snapshot][security]") {
+          "[pg][guardian_routes][baseline][snapshot][security]") {
     Harness h;
     h.seed_guard("g1", "GuardOne");
     h.seed_guard("g2", "GuardTwo");
@@ -318,7 +346,7 @@ TEST_CASE("editing a deployed Baseline does not change what the fleet enforces u
 }
 
 TEST_CASE("delete_baseline_action removes a deployed Baseline and converges the fleet",
-          "[guardian_routes][baseline][delete]") {
+          "[pg][guardian_routes][baseline][delete]") {
     Harness h;
     h.seed_guard("g1", "GuardOne");
     h.seed_baseline("bl1", "BL1", {"g1"});
@@ -338,7 +366,7 @@ TEST_CASE("delete_baseline_action removes a deployed Baseline and converges the 
 }
 
 TEST_CASE("delete_baseline_action is gated on GuaranteedState:Delete",
-          "[guardian_routes][baseline][delete][rbac]") {
+          "[pg][guardian_routes][baseline][delete][rbac]") {
     Harness h;
     h.seed_baseline("bl1", "BL1", {});
     h.denied = {"GuaranteedState:Delete"};
@@ -352,7 +380,7 @@ TEST_CASE("delete_baseline_action is gated on GuaranteedState:Delete",
 }
 
 TEST_CASE("update_baseline_from_form is gated on GuaranteedState:Write",
-          "[guardian_routes][baseline][update][rbac]") {
+          "[pg][guardian_routes][baseline][update][rbac]") {
     Harness h;
     h.seed_guard("g1", "GuardOne");
     h.seed_baseline("bl1", "BL1", {"g1"});
@@ -369,7 +397,7 @@ TEST_CASE("update_baseline_from_form is gated on GuaranteedState:Write",
 }
 
 TEST_CASE("create_baseline_from_form rejects an unknown member Guard name",
-          "[guardian_routes][baseline][create]") {
+          "[pg][guardian_routes][baseline][create]") {
     Harness h;
     h.seed_guard("g1", "GuardOne");
 
@@ -388,7 +416,7 @@ TEST_CASE("create_baseline_from_form rejects an unknown member Guard name",
 //    shell auth-redirect are the access-control properties these lock). ─────────
 
 TEST_CASE("guard/baseline /page fragments are gated on GuaranteedState:Read",
-          "[guardian_routes][page][rbac]") {
+          "[pg][guardian_routes][page][rbac]") {
     Harness h;
     h.seed_guard("g1", "GuardOne");
     h.seed_baseline("bl1", "BL1", {"g1"});
@@ -403,7 +431,7 @@ TEST_CASE("guard/baseline /page fragments are gated on GuaranteedState:Read",
 }
 
 TEST_CASE("guard/baseline /page fragments render a seeded id",
-          "[guardian_routes][page][render]") {
+          "[pg][guardian_routes][page][render]") {
     Harness h;
     h.seed_guard("g1", "GuardOne");
     h.seed_baseline("bl1", "BL1", {"g1"});
@@ -422,7 +450,7 @@ TEST_CASE("guard/baseline /page fragments render a seeded id",
 }
 
 TEST_CASE("guard/baseline /page fragments return a graceful stub for an unknown id",
-          "[guardian_routes][page][notfound]") {
+          "[pg][guardian_routes][page][notfound]") {
     Harness h;
     auto g = h.sink.dispatch("GET", "/fragments/guardian/guard/nope/page", "", "");
     REQUIRE(g != nullptr);
@@ -436,7 +464,7 @@ TEST_CASE("guard/baseline /page fragments return a graceful stub for an unknown 
 }
 
 TEST_CASE("guard/baseline detail page shells redirect an unauthenticated request",
-          "[guardian_routes][page][auth]") {
+          "[pg][guardian_routes][page][auth]") {
     Harness h;
     h.session_user = ""; // unauthenticated → auth_fn returns nullopt
 
@@ -452,7 +480,7 @@ TEST_CASE("guard/baseline detail page shells redirect an unauthenticated request
 }
 
 TEST_CASE("guard/baseline detail page shells serve the shell with the fragment URL substituted",
-          "[guardian_routes][page][auth]") {
+          "[pg][guardian_routes][page][auth]") {
     Harness h;
     auto g = h.sink.dispatch("GET", "/guardian/guard/g1", "", "");
     REQUIRE(g != nullptr);
@@ -468,7 +496,7 @@ TEST_CASE("guard/baseline detail page shells serve the shell with the fragment U
 // A hostile severity (seeded straight into the store, bypassing create-time enum
 // validation) must be html-escaped at the output, never reflected raw.
 TEST_CASE("guard /page escapes a hostile severity in the class attribute",
-          "[guardian_routes][page][security]") {
+          "[pg][guardian_routes][page][security]") {
     Harness h;
     auto r = make_rule("g1", "GuardOne");
     r.severity = "\"><img src=x onerror=alert(1)>";
@@ -502,7 +530,7 @@ void deploy_via_baseline(Harness& h, const std::string& guard_id, const std::str
 } // namespace
 
 TEST_CASE("overview reports macOS agents as not-implemented, never compliant",
-          "[guardian_routes][platform][notimpl]") {
+          "[pg][guardian_routes][platform][notimpl]") {
     Harness h;
     // A Guard that targets ALL OSes (empty os_target) so it also targets the Mac,
     // delivered by a DEPLOYED Baseline (not-implemented is gated on deployment).
@@ -538,7 +566,7 @@ TEST_CASE("overview reports macOS agents as not-implemented, never compliant",
 }
 
 TEST_CASE("an UNDEPLOYED all-OS Guard does not inflate the not-implemented census",
-          "[guardian_routes][platform][notimpl]") {
+          "[pg][guardian_routes][platform][notimpl]") {
     Harness h;
     auto rule = make_rule("g1", "GuardOne");
     rule.os_target = "";  // targets macOS…
@@ -563,7 +591,7 @@ TEST_CASE("an UNDEPLOYED all-OS Guard does not inflate the not-implemented censu
 }
 
 TEST_CASE("a deployed Windows-only Guard does not list connected macOS agents",
-          "[guardian_routes][platform][notimpl]") {
+          "[pg][guardian_routes][platform][notimpl]") {
     Harness h;
     auto rule = make_rule("g1", "WinGuard");  // make_rule sets os_target = "windows"
     REQUIRE(h.store->create_rule(rule));

@@ -18,10 +18,15 @@
  */
 
 #include "guaranteed_state_store.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "store_errors.hpp"
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <libpq-fe.h>
 
 #include <nlohmann/json.hpp>
 
@@ -33,8 +38,21 @@
 #include <thread>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgPool;
+namespace pg = yuzu::server::pg;
 
 namespace {
+
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): every test
+// below constructs its own GuaranteedStateStore against a clone of this schema
+// (ADR-0038 migration). Shared key "guardianstate" — SAME spelling as every
+// other GuaranteedStateStore test file's template.
+yuzu::test::PgTestTemplate guardianstate_tpl{"guardianstate", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    GuaranteedStateStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("guardianstate template: store failed to migrate");
+}};
 
 GuaranteedStateRuleRow make_rule(std::string rule_id, std::string name) {
     GuaranteedStateRuleRow r;
@@ -89,8 +107,10 @@ using yuzu::test::TempDbFile;
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
 TEST_CASE("GuaranteedStateStore: opens in-memory and runs migrations",
-          "[guaranteed_state_store][db]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][guaranteed_state_store][db]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
     CHECK(store.rule_count() == 0);
     CHECK(store.event_count() == 0);
@@ -99,8 +119,10 @@ TEST_CASE("GuaranteedStateStore: opens in-memory and runs migrations",
 // ── M6 / #1209: monotonic policy generation ─────────────────────────────────
 
 TEST_CASE("GuaranteedStateStore: policy_generation bumps monotonically on mutations",
-          "[guaranteed_state_store][generation]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][guaranteed_state_store][generation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     CHECK(store.current_policy_generation() == 0);  // seeded at 0
 
     REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
@@ -121,55 +143,76 @@ TEST_CASE("GuaranteedStateStore: policy_generation bumps monotonically on mutati
 }
 
 TEST_CASE("GuaranteedStateStore: policy_generation persists across reopen",
-          "[guaranteed_state_store][generation]") {
-    TempDbFile tmp;
+          "[pg][guaranteed_state_store][generation]") {
+    // Postgres redesign (ADR-0038): "reopen the same SQLite file" has no direct
+    // analogue — the persisted state lives in the shared database, not a
+    // process-local handle. The equivalent behaviour is a SECOND store
+    // constructed against the SAME dsn (a fresh PgPool, a fresh
+    // GuaranteedStateStore instance, same underlying schema) — the generation
+    // counter must be visible to it exactly as an agent talking to a
+    // server restarted (or load-balanced to a second replica) would see it.
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
     {
-        GuaranteedStateStore store(tmp.path);
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        GuaranteedStateStore store(pool);
         REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
         CHECK(store.current_policy_generation() == 1);
     }
-    // Reopen: the counter is persisted, not reset — an agent that applied
-    // generation 1 before a server restart must not look stale afterwards.
-    GuaranteedStateStore reopened(tmp.path);
+    // Second store, same dsn: the counter is persisted in Postgres, not reset
+    // — an agent that applied generation 1 before a server restart must not
+    // look stale afterwards.
+    PgPool pool2{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore reopened(pool2);
     CHECK(reopened.current_policy_generation() == 1);
 }
 
 // ── Rule CRUD ──────────────────────────────────────────────────────────────
 
-TEST_CASE("GuaranteedStateStore: rule round-trip", "[guaranteed_state_store][rules]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("GuaranteedStateStore: rule round-trip", "[pg][guaranteed_state_store][rules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto rule = make_rule("rule-1", "block-smb-445");
 
     REQUIRE(store.create_rule(rule));
     REQUIRE(store.rule_count() == 1);
 
+    // get_rule is three-state (ADR-0038): REQUIRE the outer expected (not
+    // degraded), then the inner optional (genuinely found).
     auto fetched = store.get_rule("rule-1");
     REQUIRE(fetched.has_value());
-    CHECK(fetched->name == "block-smb-445");
-    CHECK(fetched->enforcement_mode == "enforce");
-    CHECK(fetched->os_target == "windows");
-    CHECK(fetched->signature == rule.signature);
-    CHECK(fetched->scope_expr == "tag:workstations");
-    CHECK(fetched->created_by == "alice");
-    CHECK(fetched->updated_by == "alice");
+    REQUIRE(fetched->has_value());
+    CHECK((*fetched)->name == "block-smb-445");
+    CHECK((*fetched)->enforcement_mode == "enforce");
+    CHECK((*fetched)->os_target == "windows");
+    CHECK((*fetched)->signature == rule.signature);
+    CHECK((*fetched)->scope_expr == "tag:workstations");
+    CHECK((*fetched)->created_by == "alice");
+    CHECK((*fetched)->updated_by == "alice");
 }
 
 TEST_CASE("GuaranteedStateStore: list returns all rules ordered by name",
-          "[guaranteed_state_store][rules]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][guaranteed_state_store][rules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     REQUIRE(store.create_rule(make_rule("r-2", "bravo")));
     REQUIRE(store.create_rule(make_rule("r-1", "alpha")));
     REQUIRE(store.create_rule(make_rule("r-3", "charlie")));
 
+    // list_rules is type-distinguishable (ADR-0038 catastrophic-read set).
     auto rules = store.list_rules();
-    REQUIRE(rules.size() == 3);
-    CHECK(rules[0].name == "alpha");
-    CHECK(rules[1].name == "bravo");
-    CHECK(rules[2].name == "charlie");
+    REQUIRE(rules.has_value());
+    REQUIRE(rules->size() == 3);
+    CHECK((*rules)[0].name == "alpha");
+    CHECK((*rules)[1].name == "bravo");
+    CHECK((*rules)[2].name == "charlie");
 }
 
-TEST_CASE("GuaranteedStateStore: update mutates row", "[guaranteed_state_store][rules]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("GuaranteedStateStore: update mutates row", "[pg][guaranteed_state_store][rules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto rule = make_rule("rule-1", "name-v1");
     REQUIRE(store.create_rule(rule));
 
@@ -182,17 +225,20 @@ TEST_CASE("GuaranteedStateStore: update mutates row", "[guaranteed_state_store][
 
     auto fetched = store.get_rule("rule-1");
     REQUIRE(fetched.has_value());
-    CHECK(fetched->name == "name-v2");
-    CHECK(fetched->version == 2);
-    CHECK(fetched->enforcement_mode == "audit");
+    REQUIRE(fetched->has_value());
+    CHECK((*fetched)->name == "name-v2");
+    CHECK((*fetched)->version == 2);
+    CHECK((*fetched)->enforcement_mode == "audit");
     // created_by stays immutable; updated_by records the new principal.
-    CHECK(fetched->created_by == "alice");
-    CHECK(fetched->updated_by == "bob");
+    CHECK((*fetched)->created_by == "alice");
+    CHECK((*fetched)->updated_by == "bob");
 }
 
 TEST_CASE("GuaranteedStateStore: update of unknown rule returns error",
-          "[guaranteed_state_store][rules]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][guaranteed_state_store][rules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto rule = make_rule("does-not-exist", "ghost");
     auto r = store.update_rule(rule);
     REQUIRE_FALSE(r.has_value());
@@ -200,19 +246,27 @@ TEST_CASE("GuaranteedStateStore: update of unknown rule returns error",
     CHECK(r.error().find("not found") != std::string::npos);
 }
 
-TEST_CASE("GuaranteedStateStore: delete removes row", "[guaranteed_state_store][rules]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("GuaranteedStateStore: delete removes row", "[pg][guaranteed_state_store][rules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     REQUIRE(store.create_rule(make_rule("rule-1", "to-remove")));
     REQUIRE(store.delete_rule("rule-1"));
-    CHECK_FALSE(store.get_rule("rule-1").has_value());
+    // Three-state (ADR-0038): the outer expected still has_value() (the read
+    // succeeded) — genuinely-deleted is the INNER optional being empty.
+    auto after_delete = store.get_rule("rule-1");
+    REQUIRE(after_delete.has_value());
+    CHECK_FALSE(after_delete->has_value());
     auto second = store.delete_rule("rule-1");
     REQUIRE_FALSE(second.has_value());
     CHECK(second.error().find("not found") != std::string::npos);
 }
 
 TEST_CASE("GuaranteedStateStore: duplicate name rejected with kConflictPrefix",
-          "[guaranteed_state_store][rules][conflict]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][guaranteed_state_store][rules][conflict]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     REQUIRE(store.create_rule(make_rule("rule-1", "same-name")));
     auto dup = store.create_rule(make_rule("rule-2", "same-name"));
     REQUIRE_FALSE(dup.has_value());
@@ -224,8 +278,10 @@ TEST_CASE("GuaranteedStateStore: duplicate name rejected with kConflictPrefix",
 }
 
 TEST_CASE("GuaranteedStateStore: duplicate rule_id rejected with kConflictPrefix",
-          "[guaranteed_state_store][rules][conflict]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][guaranteed_state_store][rules][conflict]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     REQUIRE(store.create_rule(make_rule("same-id", "name-one")));
     auto dup = store.create_rule(make_rule("same-id", "name-two"));
     REQUIRE_FALSE(dup.has_value());
@@ -236,8 +292,10 @@ TEST_CASE("GuaranteedStateStore: duplicate rule_id rejected with kConflictPrefix
 }
 
 TEST_CASE("GuaranteedStateStore: update into an existing name is a conflict",
-          "[guaranteed_state_store][rules][conflict]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][guaranteed_state_store][rules][conflict]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     REQUIRE(store.create_rule(make_rule("a", "alpha")));
     REQUIRE(store.create_rule(make_rule("b", "bravo")));
 
@@ -250,9 +308,10 @@ TEST_CASE("GuaranteedStateStore: update into an existing name is a conflict",
 
 // ── Events ─────────────────────────────────────────────────────────────────
 
-TEST_CASE("GuaranteedStateStore: event insert + query", "[guaranteed_state_store][events]") {
-    GuaranteedStateStore store(":memory:");
-
+TEST_CASE("GuaranteedStateStore: event insert + query", "[pg][guaranteed_state_store][events]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     REQUIRE(store.insert_event(make_event("evt-1", "rule-1", "agent-A")));
     REQUIRE(store.insert_event(make_event("evt-2", "rule-1", "agent-B", "medium")));
     REQUIRE(store.insert_event(make_event("evt-3", "rule-2", "agent-A")));
@@ -281,9 +340,10 @@ TEST_CASE("GuaranteedStateStore: event insert + query", "[guaranteed_state_store
 }
 
 TEST_CASE("GuaranteedStateStore: mismatched-payload event_id collision is dropped + counted (#1414)",
-          "[guaranteed_state_store][events]") {
-    GuaranteedStateStore store(":memory:");
-
+          "[pg][guaranteed_state_store][events]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     REQUIRE(store.insert_event(make_event("evt-dup", "rule-1", "agent-A")));
     CHECK(store.events_written_total() == 1);
     CHECK(store.events_dropped_total() == 0);
@@ -302,14 +362,15 @@ TEST_CASE("GuaranteedStateStore: mismatched-payload event_id collision is droppe
 }
 
 TEST_CASE("GuaranteedStateStore: matching-fields redelivery is quiet + counted apart (item-7)",
-          "[guaranteed_state_store][events][redelivery]") {
+          "[pg][guaranteed_state_store][events][redelivery]") {
     // The durable agent lifecycle journal re-sends on every reconnect, so a
     // matching-fields event_id redelivery is EXPECTED + idempotent: NOT re-written,
     // reported as Redelivered (so ingest skips the DEX observers), counted on the
     // quiet redelivered metric. A SAME event_id with a DIFFERENT immutable field is a
     // loud Conflict; a server-enriched severity change is EXCLUDED from the match.
-    GuaranteedStateStore store(":memory:");
-
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto e = make_event("evt-r", "rule-1", "agent-A");
     CHECK(store.insert_event_classified(e).outcome == EventInsertOutcome::Inserted);
 
@@ -339,13 +400,14 @@ TEST_CASE("GuaranteedStateStore: matching-fields redelivery is quiet + counted a
 }
 
 TEST_CASE("GuaranteedStateStore: an embedded-NUL event field is rejected as malformed (item-7)",
-          "[guaranteed_state_store][events][redelivery]") {
+          "[pg][guaranteed_state_store][events][redelivery]") {
     // A NUL would be silently truncated by SQLite's -1 text binds and corrupt both the
     // event_id PK dedup and the redelivery compare — reject it as Error (malformed),
     // never store-truncate it, and never count it as a collision. Guardian fields are
     // structured text / JSON and never legitimately carry a NUL.
-    GuaranteedStateStore store(":memory:");
-
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto e = make_event("evt-nul", "rule-1", "agent-A");
     e.detected_value = std::string("a\0b", 3); // embedded NUL
     CHECK(store.insert_event_classified(e).outcome == EventInsertOutcome::Error);
@@ -361,13 +423,14 @@ TEST_CASE("GuaranteedStateStore: an embedded-NUL event field is rejected as malf
 }
 
 TEST_CASE("GuaranteedStateStore: every compared field triggers a Conflict when it differs (item-7)",
-          "[guaranteed_state_store][events][redelivery]") {
+          "[pg][guaranteed_state_store][events][redelivery]") {
     // A same-event_id re-insert that differs in ANY ONE immutable compared field must be
     // a loud Conflict, not a quiet Redelivered — this pins the whole compare column set so
     // a column-index off-by-one in stored_event_matches_locked is caught (qa-S2). severity
     // is EXCLUDED (server-enriched) and is asserted to stay a Redelivery.
-    GuaranteedStateStore store(":memory:");
-
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto base = make_event("evt-f", "rule-1", "agent-A");
     base.detail_json = R"({"k":"v"})";
     REQUIRE(store.insert_event_classified(base).outcome == EventInsertOutcome::Inserted);
@@ -404,7 +467,7 @@ TEST_CASE("GuaranteedStateStore: every compared field triggers a Conflict when i
 }
 
 TEST_CASE("GuaranteedStateStore: ruleless crash observation skips the compliance census",
-          "[guaranteed_state_store][events][crash]") {
+          "[pg][guaranteed_state_store][events][crash]") {
     // Guardian DEX slice 1: a fleet-wide process crash is RULELESS — sentinel
     // rule_id "__observation__" + event_type "process.crashed". It must insert
     // (rule_id is NOT NULL — the sentinel satisfies it), keep its agent-set
@@ -412,8 +475,9 @@ TEST_CASE("GuaranteedStateStore: ruleless crash observation skips the compliance
     // (process.crashed is not a compliance state). A normal drift event in the
     // same store still updates the census — proving the skip is crash-specific.
     // Pins the ruleless path the agent crash recorder relies on.
-    GuaranteedStateStore store(":memory:");
-
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     // A normal rule-bound drift (drift.remediated) -> updates the census.
     REQUIRE(store.insert_event(make_event("evt-drift", "rule-1", "agent-A")));
 
@@ -440,20 +504,27 @@ TEST_CASE("GuaranteedStateStore: ruleless crash observation skips the compliance
     CHECK(crashes[0].guard_category.empty());
 
     // The census has the drift's (agent,rule) row but NONE for the sentinel.
-    CHECK(store.agent_rule_statuses().size() == 1);
-    CHECK(store.agent_rule_statuses("__observation__").empty());
+    // agent_rule_statuses is type-distinguishable (ADR-0038); REQUIRE the
+    // outer expected then assert on the container.
+    auto census_all = store.agent_rule_statuses();
+    REQUIRE(census_all.has_value());
+    CHECK(census_all->size() == 1);
+    auto census_sentinel = store.agent_rule_statuses("__observation__");
+    REQUIRE(census_sentinel.has_value());
+    CHECK(census_sentinel->empty());
 }
 
 TEST_CASE("GuaranteedStateStore: a reserved sentinel rule_id never updates the census",
-          "[guaranteed_state_store][events][crash][security]") {
+          "[pg][guaranteed_state_store][events][crash][security]") {
     // Security hardening (Gate-2 LOW → enforced): the "__observation__" sentinel is
     // reserved for ruleless observations and has no live rule. A (mis)behaving agent
     // could pair it with a COMPLIANCE event_type (drift.detected) to mint a phantom
     // per-(agent,rule) census row keyed to the reserved id. The store must skip the
     // census for ANY reserved __…__ rule_id regardless of event_type — not just for
     // process.crashed.
-    GuaranteedStateStore store(":memory:");
-
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     GuaranteedStateEventRow abuse;
     abuse.event_id = "__observation__-abuse-1";
     abuse.rule_id = "__observation__";
@@ -468,8 +539,12 @@ TEST_CASE("GuaranteedStateStore: a reserved sentinel rule_id never updates the c
     q.rule_id = "__observation__";
     REQUIRE(store.query_events(q).size() == 1);
     // …but it creates NO census row for the reserved id.
-    CHECK(store.agent_rule_statuses().empty());
-    CHECK(store.agent_rule_statuses("__observation__").empty());
+    auto census_all = store.agent_rule_statuses();
+    REQUIRE(census_all.has_value());
+    CHECK(census_all->empty());
+    auto census_sentinel = store.agent_rule_statuses("__observation__");
+    REQUIRE(census_sentinel.has_value());
+    CHECK(census_sentinel->empty());
 
     // Regression guard: the skip is EXACT-match, NOT a "__"-prefix. A legitimately
     // authored guard whose name slugifies to a "__"-prefixed rule_id (e.g. "__foo-<hex>")
@@ -482,17 +557,20 @@ TEST_CASE("GuaranteedStateStore: a reserved sentinel rule_id never updates the c
     real.severity = "high";
     real.timestamp = "2026-06-09T12:01:00Z";
     REQUIRE(store.insert_event(real));
-    CHECK(store.agent_rule_statuses("__foo-abc123").size() == 1);
+    auto census_real = store.agent_rule_statuses("__foo-abc123");
+    REQUIRE(census_real.has_value());
+    CHECK(census_real->size() == 1);
 }
 
 TEST_CASE("GuaranteedStateStore: observation projects uniform detail_json keys",
-          "[guaranteed_state_store][events][crash][dex]") {
+          "[pg][guaranteed_state_store][events][crash][dex]") {
     // A ruleless observation projects its UNIFORM detail_json facts
     // (subject/reason/symbolic/component/metric) into the guardian_observations
     // read model — generically, for every signal type. A plain drift event must
     // NOT project — the projection is observations-only.
-    GuaranteedStateStore store(":memory:");
-
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     REQUIRE(store.insert_event(make_event("evt-drift", "rule-1", "agent-A")));
     CHECK(store.query_observations().empty()); // drift does not project
 
@@ -525,11 +603,13 @@ TEST_CASE("GuaranteedStateStore: observation projects uniform detail_json keys",
 }
 
 TEST_CASE("GuaranteedStateStore: dex_device_top_apps splits crashes/hangs by version",
-          "[guaranteed_state_store][events][crash][dex]") {
+          "[pg][guaranteed_state_store][events][crash][dex]") {
     // Slice 2b: the per-device app-reliability query groups by (subject, version)
     // so "did THIS build crash more" is answerable. A missing version buckets
     // under "". Crashes on a DIFFERENT device must not leak into the count.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto crash = [&](const char* id, const char* agent, const char* subject, const char* version,
                      const char* type, const char* ts) {
         GuaranteedStateEventRow e;
@@ -577,11 +657,13 @@ TEST_CASE("GuaranteedStateStore: dex_device_top_apps splits crashes/hangs by ver
 }
 
 TEST_CASE("GuaranteedStateStore: dex_device_top_apps honors time-fence, ranking and limit",
-          "[guaranteed_state_store][events][crash][dex]") {
+          "[pg][guaranteed_state_store][events][crash][dex]") {
     // quality SHOULD-2: the prior test shares one timestamp band, so the
     // `observed_at >= ?` fence, the ORDER BY rank, and the LIMIT cap were all
     // unexercised — a regression dropping any of the three would pass. Pin them.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     int n = 0;
     auto crash = [&](const char* subject, const char* ts) {
         GuaranteedStateEventRow e;
@@ -615,12 +697,14 @@ TEST_CASE("GuaranteedStateStore: dex_device_top_apps honors time-fence, ranking 
 }
 
 TEST_CASE("GuaranteedStateStore: projection RE-CANONICALIZES the agent version (UP-4)",
-          "[guaranteed_state_store][events][crash][dex][security]") {
+          "[pg][guaranteed_state_store][events][crash][dex][security]") {
     // UP-4: the server must never trust the agent's version string. Re-running
     // canon_version at the projection boundary guarantees guardian_observations
     // .version is always a clean 4-group quad or "" — closing the latent
     // stored-XSS surface and the arity join, regardless of agent behaviour.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto project_version = [&](const char* id, const std::string& sent) -> std::string {
         GuaranteedStateEventRow e;
         e.event_id = id;
@@ -644,11 +728,13 @@ TEST_CASE("GuaranteedStateStore: projection RE-CANONICALIZES the agent version (
 }
 
 TEST_CASE("GuaranteedStateStore: legacy slice-1 crash keys still project (fallback)",
-          "[guaranteed_state_store][events][crash][dex]") {
+          "[pg][guaranteed_state_store][events][crash][dex]") {
     // PR #1311 transition compat: an agent still emitting the slice-1 crash keys
     // (process/exception_code/faulting_module) must keep projecting — the
     // projection falls back to them when the uniform keys are absent.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     GuaranteedStateEventRow crash;
     crash.event_id = "__observation__-legacy-1";
     crash.rule_id = "__observation__";
@@ -669,8 +755,10 @@ TEST_CASE("GuaranteedStateStore: legacy slice-1 crash keys still project (fallba
 }
 
 TEST_CASE("GuaranteedStateStore: metric projects for numeric payloads, rejects garbage",
-          "[guaranteed_state_store][events][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][guaranteed_state_store][events][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto boot = [&](const std::string& id, const std::string& json) {
         GuaranteedStateEventRow e;
         e.event_id = id;
@@ -692,13 +780,14 @@ TEST_CASE("GuaranteedStateStore: metric projects for numeric payloads, rejects g
 }
 
 TEST_CASE("GuaranteedStateStore: redelivered crash event_id does not double-count the projection",
-          "[guaranteed_state_store][events][crash][dex]") {
+          "[pg][guaranteed_state_store][events][crash][dex]") {
     // The event journal is at-least-once. The projection INSERT lives inside the
     // event INSERT's transaction, so a duplicate event_id fails the event PK and
     // rolls back BOTH — the projection inherits the dedup and never double-counts.
     // A plain round-trip test would miss this (the catch the advisor flagged).
-    GuaranteedStateStore store(":memory:");
-
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     GuaranteedStateEventRow crash;
     crash.event_id = "__observation__-dup-1";
     crash.rule_id = "__observation__";
@@ -725,12 +814,13 @@ TEST_CASE("GuaranteedStateStore: redelivered crash event_id does not double-coun
 }
 
 TEST_CASE("GuaranteedStateStore: malformed crash detail_json still records the observation",
-          "[guaranteed_state_store][events][crash][dex]") {
+          "[pg][guaranteed_state_store][events][crash][dex]") {
     // detail_json is parsed defensively: a malformed blob must NOT drop the crash
     // (the event itself is still valuable). The observation lands with empty crash
     // fields rather than failing the insert.
-    GuaranteedStateStore store(":memory:");
-
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     GuaranteedStateEventRow crash;
     crash.event_id = "__observation__-bad-json-1";
     crash.rule_id = "__observation__";
@@ -747,11 +837,13 @@ TEST_CASE("GuaranteedStateStore: malformed crash detail_json still records the o
     CHECK(obs[0].subject.empty()); // degraded, not dropped
 }
 
-TEST_CASE("GuaranteedStateStore: DEX crash aggregations", "[guaranteed_state_store][crash][dex]") {
+TEST_CASE("GuaranteedStateStore: DEX crash aggregations", "[pg][guaranteed_state_store][crash][dex]") {
     // Slice 2: crash-scoped GROUP BY over the projection. Known dataset with
     // verifiable counts, blast radius (distinct devices), tie-break, by-OS, by-day,
     // and the since-cutoff.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto crash = [&](const std::string& id, const std::string& agent, const std::string& proc,
                      const std::string& mod, const std::string& plat, const std::string& ts) {
         GuaranteedStateEventRow c;
@@ -821,10 +913,12 @@ TEST_CASE("GuaranteedStateStore: DEX crash aggregations", "[guaranteed_state_sto
 }
 
 TEST_CASE("GuaranteedStateStore: generic per-obs_type drill-down + OS scope",
-          "[guaranteed_state_store][dex][signals]") {
+          "[pg][guaranteed_state_store][dex][signals]") {
     // The catalogue View-3 read-model: subjects / OS-split / devices / trend for
     // ANY obs_type (not crash-scoped), plus per-OS coverage scope.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto obs = [&](const std::string& id, const std::string& agent, const std::string& type,
                    const std::string& subject, const std::string& plat, const std::string& ts) {
         GuaranteedStateEventRow r;
@@ -889,12 +983,14 @@ TEST_CASE("GuaranteedStateStore: generic per-obs_type drill-down + OS scope",
 }
 
 TEST_CASE("GuaranteedStateStore: DEX crash + signal aggregations are OS-scopable (C-DEX-1)",
-          "[guaranteed_state_store][dex][signals][crash]") {
+          "[pg][guaranteed_state_store][dex][signals][crash]") {
     // process.crashed now arrives from BOTH Windows and macOS agents. The
     // crash-free headline is Windows-denominated, and the Catalogue drilldown
     // honours a single-OS lens, so both must be scopable by platform — the
     // default (empty platform) stays all-OS.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto obs = [&](const std::string& id, const std::string& agent, const std::string& type,
                    const std::string& subject, const std::string& plat, const std::string& ts) {
         GuaranteedStateEventRow r;
@@ -963,8 +1059,10 @@ TEST_CASE("GuaranteedStateStore: DEX crash + signal aggregations are OS-scopable
     }
 }
 
-TEST_CASE("GuaranteedStateStore: DEX drill-down aggregations", "[guaranteed_state_store][crash][dex]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("GuaranteedStateStore: DEX drill-down aggregations", "[pg][guaranteed_state_store][crash][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto crash = [&](const std::string& id, const std::string& agent, const std::string& proc,
                      const std::string& mod, const std::string& plat, const std::string& ts) {
         GuaranteedStateEventRow c;
@@ -1022,11 +1120,13 @@ TEST_CASE("GuaranteedStateStore: DEX drill-down aggregations", "[guaranteed_stat
 }
 
 TEST_CASE("GuaranteedStateStore: multi-signal summary, hang-aware apps, boot stats",
-          "[guaranteed_state_store][dex][signals]") {
+          "[pg][guaranteed_state_store][dex][signals]") {
     // The multi-signal read model: mixed signal types land in ONE projection;
     // dex_signal_summary rolls up per type; dex_top_apps pivots crash+hang; the
     // boot aggregations read the metric column; the device history is unified.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto sig = [&](const std::string& id, const std::string& agent, const std::string& type,
                    const std::string& json, const std::string& ts) {
         GuaranteedStateEventRow e;
@@ -1110,13 +1210,15 @@ TEST_CASE("GuaranteedStateStore: multi-signal summary, hang-aware apps, boot sta
 
 TEST_CASE("GuaranteedStateStore: dex_signal_summary(platform) scopes to one OS; "
           "empty stays all-OS (#1746)",
-          "[guaranteed_state_store][dex][signals]") {
+          "[pg][guaranteed_state_store][dex][signals]") {
     // The Catalogue's single-OS filter needs its own signal rollup, not the
     // all-fleet composite read under a Linux/macOS heading. `platform` is an
     // ADDITIVE filter on top of the existing GROUP BY obs_type — proven here on
     // both a type shared across all three platforms (process.crashed) and a type
     // exclusive to one (network.wifi_drop, macOS-only).
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto sig = [&](const std::string& id, const std::string& agent, const std::string& type,
                    const std::string& plat, const std::string& ts) {
         GuaranteedStateEventRow e;
@@ -1200,8 +1302,10 @@ TEST_CASE("GuaranteedStateStore: dex_signal_summary(platform) scopes to one OS; 
 }
 
 TEST_CASE("GuaranteedStateStore: event query honours limit/offset",
-          "[guaranteed_state_store][events]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][guaranteed_state_store][events]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     for (int i = 0; i < 10; ++i) {
         auto e = make_event("evt-" + std::to_string(i), "rule-1", "agent-A");
         REQUIRE(store.insert_event(e));
@@ -1218,8 +1322,10 @@ TEST_CASE("GuaranteedStateStore: event query honours limit/offset",
 }
 
 TEST_CASE("GuaranteedStateStore: event round-trip preserves all fields",
-          "[guaranteed_state_store][events]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][guaranteed_state_store][events]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto in = make_event("evt-1", "rule-1", "agent-X");
     in.detail_json = R"({"process":"notepad.exe","pid":1234})"; // route a' structured companion
     REQUIRE(store.insert_event(in));
@@ -1244,8 +1350,10 @@ TEST_CASE("GuaranteedStateStore: event round-trip preserves all fields",
 }
 
 TEST_CASE("GuaranteedStateStore: duplicate event_id rejected with kConflictPrefix",
-          "[guaranteed_state_store][events][conflict]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][guaranteed_state_store][events][conflict]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     REQUIRE(store.insert_event(make_event("evt-same", "rule-1", "agent-A")));
     auto dup = store.insert_event(make_event("evt-same", "rule-1", "agent-B"));
     REQUIRE_FALSE(dup.has_value());
@@ -1256,25 +1364,30 @@ TEST_CASE("GuaranteedStateStore: duplicate event_id rejected with kConflictPrefi
 // ── Regression tests carried forward from PR 1 governance ──────────────────
 
 TEST_CASE("GuaranteedStateStore: empty signature round-trip stays empty",
-          "[guaranteed_state_store][rules]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][guaranteed_state_store][rules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto r = make_rule("r-empty", "sig-empty");
     r.signature.clear();
     REQUIRE(store.create_rule(r));
 
     auto fetched = store.get_rule("r-empty");
     REQUIRE(fetched.has_value());
-    CHECK(fetched->signature.empty());
+    REQUIRE(fetched->has_value());
+    CHECK((*fetched)->signature.empty());
 
     auto listed = store.list_rules();
-    REQUIRE(listed.size() == 1);
-    CHECK(listed[0].signature.empty());
+    REQUIRE(listed.has_value());
+    REQUIRE(listed->size() == 1);
+    CHECK((*listed)[0].signature.empty());
 }
 
 TEST_CASE("GuaranteedStateStore: event query tie-breaks by event_id on equal timestamp",
-          "[guaranteed_state_store][events]") {
-    GuaranteedStateStore store(":memory:");
-
+          "[pg][guaranteed_state_store][events]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     REQUIRE(store.insert_event(
         make_event("older", "rule-1", "agent-A", "high", "2026-04-19T12:00:00Z")));
     REQUIRE(store.insert_event(
@@ -1285,7 +1398,11 @@ TEST_CASE("GuaranteedStateStore: event query tie-breaks by event_id on equal tim
     CHECK(out[0].event_id == "newer");
     CHECK(out[1].event_id == "older");
 
-    GuaranteedStateStore tie_store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db2, guardianstate_tpl);
+
+    PgPool pool2{{.conninfo = db2.dsn(), .size = 4}};
+
+    GuaranteedStateStore tie_store(pool2);
     const std::string same_ts = "2026-04-19T12:00:00Z";
     REQUIRE(tie_store.insert_event(make_event("evt-A", "r", "a", "high", same_ts)));
     REQUIRE(tie_store.insert_event(make_event("evt-Z", "r", "a", "high", same_ts)));
@@ -1299,11 +1416,15 @@ TEST_CASE("GuaranteedStateStore: event query tie-breaks by event_id on equal tim
 }
 
 TEST_CASE("GuaranteedStateStore: query_events limit is clamped and semantically consistent",
-          "[guaranteed_state_store][events]") {
+          "[pg][guaranteed_state_store][events]") {
     static_assert(kMaxEventsLimit == 10'000,
                   "kMaxEventsLimit changed — update REST layer cap + docs");
 
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+
+    GuaranteedStateStore store(pool);
     for (int i = 0; i < 5; ++i) {
         REQUIRE(store.insert_event(make_event("evt-" + std::to_string(i), "r", "a")));
     }
@@ -1323,16 +1444,28 @@ TEST_CASE("GuaranteedStateStore: query_events limit is clamped and semantically 
 
 TEST_CASE("GuaranteedStateStore: bad path yields closed store with sentinel returns",
           "[guaranteed_state_store][db]") {
-    GuaranteedStateStore bad("/no/such/directory/guaranteed-state.db");
+    // Postgres redesign (ADR-0038): "bad file path" has no analogue — the
+    // equivalent closed-store condition is an unreachable/invalid DSN, which
+    // PgPool detects at construction (valid() == false, every acquire fails).
+    // No live rig needed for this one (deliberately NOT gated behind
+    // YUZU_REQUIRE_PG_DB_TPL) — an unroutable address fails fast everywhere.
+    PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    GuaranteedStateStore bad(bad_pool);
     CHECK_FALSE(bad.is_open());
 
     CHECK_FALSE(bad.create_rule(make_rule("x", "x")));
     CHECK_FALSE(bad.update_rule(make_rule("x", "x")));
     CHECK_FALSE(bad.delete_rule("x"));
+    // get_rule is three-state (ADR-0038): a closed store degrades (unexpected),
+    // never a bare "not found" — CHECK_FALSE(...has_value()) on the OUTER
+    // expected is the correct closed-store assertion here.
     CHECK_FALSE(bad.get_rule("x").has_value());
-    CHECK(bad.list_rules().empty());
+    // list_rules is type-distinguishable: closed store -> std::unexpected, not
+    // a silent empty vector (the catastrophic-read posture this ADR exists
+    // for) — assert on the outer expected, not .empty().
+    CHECK_FALSE(bad.list_rules().has_value());
     CHECK_FALSE(bad.insert_event(make_event("e", "r", "a")));
-    CHECK(bad.query_events().empty());
+    CHECK(bad.query_events().empty()); // DEX/analytics read: plain empty-on-degrade
     CHECK(bad.rule_count() == 0);
     CHECK(bad.event_count() == 0);
     // Batch insert on a closed store is also a graceful error.
@@ -1341,11 +1474,17 @@ TEST_CASE("GuaranteedStateStore: bad path yields closed store with sentinel retu
 }
 
 TEST_CASE("GuaranteedStateStore: migration is idempotent across re-open",
-          "[guaranteed_state_store][db]") {
-    TempDbFile tmp;
+          "[pg][guaranteed_state_store][db]") {
+    // Postgres redesign (ADR-0038): "re-open the same file" -> a second store
+    // against the SAME dsn (see the policy_generation-persists-across-reopen
+    // test above for the same pattern). Exercises PgMigrationRunner's
+    // idempotency (the second construction's migration pass is a no-op
+    // against the already-applied schema_meta version).
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
 
     {
-        GuaranteedStateStore s1(tmp.path);
+        PgPool pool1{{.conninfo = db.dsn(), .size = 4}};
+        GuaranteedStateStore s1(pool1);
         REQUIRE(s1.is_open());
         REQUIRE(s1.create_rule(make_rule("rule-1", "survives-reopen")));
         REQUIRE(s1.insert_event(make_event("evt-1", "rule-1", "agent-A")));
@@ -1354,14 +1493,16 @@ TEST_CASE("GuaranteedStateStore: migration is idempotent across re-open",
     }
 
     {
-        GuaranteedStateStore s2(tmp.path);
+        PgPool pool2{{.conninfo = db.dsn(), .size = 4}};
+        GuaranteedStateStore s2(pool2);
         REQUIRE(s2.is_open());
         CHECK(s2.rule_count() == 1);
         CHECK(s2.event_count() == 1);
 
         auto r = s2.get_rule("rule-1");
         REQUIRE(r.has_value());
-        CHECK(r->name == "survives-reopen");
+        REQUIRE(r->has_value());
+        CHECK((*r)->name == "survives-reopen");
 
         REQUIRE(s2.insert_event(make_event("evt-2", "rule-1", "agent-B")));
         CHECK(s2.event_count() == 2);
@@ -1371,9 +1512,10 @@ TEST_CASE("GuaranteedStateStore: migration is idempotent across re-open",
 // ── #452 §7 — batch insert_events ────────────────────────────────────────
 
 TEST_CASE("GuaranteedStateStore: batch insert writes all rows transactionally",
-          "[guaranteed_state_store][events][batch]") {
-    GuaranteedStateStore store(":memory:");
-
+          "[pg][guaranteed_state_store][events][batch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     std::vector<GuaranteedStateEventRow> batch;
     for (int i = 0; i < 50; ++i) {
         batch.push_back(make_event("evt-" + std::to_string(i), "rule-1", "agent-A"));
@@ -1387,11 +1529,13 @@ TEST_CASE("GuaranteedStateStore: batch insert writes all rows transactionally",
 }
 
 TEST_CASE("GuaranteedStateStore: batch insert with duplicate rolls back whole batch",
-          "[guaranteed_state_store][events][batch][conflict]") {
+          "[pg][guaranteed_state_store][events][batch][conflict]") {
     // Confirm the transactional contract: any failing row invalidates the
     // whole batch, so REST handlers never have to reason about partial
     // commits. First write a row that will collide with the batch.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     REQUIRE(store.insert_event(make_event("evt-collision", "rule-1", "agent-A")));
     CHECK(store.event_count() == 1);
 
@@ -1420,8 +1564,10 @@ TEST_CASE("GuaranteedStateStore: batch insert with duplicate rolls back whole ba
 }
 
 TEST_CASE("GuaranteedStateStore: batch insert of empty vector is a no-op",
-          "[guaranteed_state_store][events][batch]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][guaranteed_state_store][events][batch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto r = store.insert_events({});
     REQUIRE(r.has_value());
     CHECK(*r == 0);
@@ -1429,12 +1575,14 @@ TEST_CASE("GuaranteedStateStore: batch insert of empty vector is a no-op",
 }
 
 TEST_CASE("GuaranteedStateStore: insert_events batch projects only observations",
-          "[guaranteed_state_store][events][dex]") {
+          "[pg][guaranteed_state_store][events][dex]") {
     // Governance qa-B1: the batch path also projects ruleless observations into
     // guardian_observations. A mixed batch (drift + observations) must project
     // exactly the observation rows — and a projection failure must NOT roll back
     // the batch (degrade-don't-destroy, UP-1).
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     std::vector<GuaranteedStateEventRow> batch;
     auto obs = [](const std::string& id, const std::string& proc) {
         GuaranteedStateEventRow e;
@@ -1461,14 +1609,16 @@ TEST_CASE("GuaranteedStateStore: insert_events batch projects only observations"
 }
 
 TEST_CASE("GuaranteedStateStore: batch ingest never pollutes the census with the sentinel",
-          "[guaranteed_state_store][events][dex][security]") {
+          "[pg][guaranteed_state_store][events][dex][security]") {
     // Adversarial-review F1: the batch insert_events path (the preferred gRPC
     // GuaranteedStatePush ingest) must apply the SAME sentinel guard as the
     // single-row path — a batch carrying rule_id="__observation__" with a
     // census-mapping event_type (drift.detected) must NOT mint a phantom
     // (agent, __observation__) census row (§24). Enforce server-side, never trust
     // the agent to pair the sentinel with a non-census event_type.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     std::vector<GuaranteedStateEventRow> batch;
     // A real rule's drift (SHOULD create a census row) + a hostile sentinel row
     // with a census-mapping event_type (must NOT) in the same batch.
@@ -1485,17 +1635,23 @@ TEST_CASE("GuaranteedStateStore: batch ingest never pollutes the census with the
     REQUIRE(n.has_value());
     CHECK(*n == 2); // both events recorded (the sentinel event itself is valid)
     // The real rule got its census row…
-    CHECK(store.agent_rule_statuses("rule-real").size() == 1);
+    auto census_real = store.agent_rule_statuses("rule-real");
+    REQUIRE(census_real.has_value());
+    CHECK(census_real->size() == 1);
     // …but the sentinel minted NONE (this is the F1 regression assertion).
-    CHECK(store.agent_rule_statuses("__observation__").empty());
+    auto census_sentinel = store.agent_rule_statuses("__observation__");
+    REQUIRE(census_sentinel.has_value());
+    CHECK(census_sentinel->empty());
 }
 
 TEST_CASE("GuaranteedStateStore: projected fields are length-clamped (server-side)",
-          "[guaranteed_state_store][dex][security]") {
+          "[pg][guaranteed_state_store][dex][security]") {
     // Governance sec-M1: the server must not trust an enrolled agent to clip —
     // an oversized subject is clamped (256 B) so it cannot bloat the projection
     // or the dashboard. UTF-8-safe so the clamp never tears a codepoint.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     const std::string huge(5000, 'A');
     GuaranteedStateEventRow c;
     c.event_id = "big-1";
@@ -1511,16 +1667,18 @@ TEST_CASE("GuaranteedStateStore: projected fields are length-clamped (server-sid
     CHECK(obs[0].subject.size() <= 256);
 }
 
-TEST_CASE("GuaranteedStateStore: reaper deletes observations in lockstep with events",
-          "[guaranteed_state_store][dex][retention]") {
-    // Governance qa-B2: a stale observation (projected via insert_event, so it
-    // carries the parent event's ttl) is reaped; a fresh one survives. Drives the
-    // production observation-DELETE inline via a second connection (the same
-    // pattern the events-reaper test uses, since the cron thread's first tick
-    // outlasts the test budget) — exercising the real predicate against rows the
-    // real projection path created.
-    TempDbFile tmp;
-    GuaranteedStateStore store(tmp.path, /*retention_days=*/30);
+TEST_CASE("GuaranteedStateStore: reap_expired reaps observations in lockstep with events",
+          "[pg][guaranteed_state_store][dex][retention]") {
+    // Governance qa-B2, ported to reap_expired()'s #2496 gc_sweep shape
+    // (ADR-0038): a stale observation (projected via insert_event, so it
+    // carries the parent event's ttl) is reaped in the SAME guarded pass as
+    // its parent event; a fresh one survives. Ages both rows via a second
+    // connection (the real projection sets both ttl_expires_at columns
+    // identically at insert; this simulates wall-clock passing, not a
+    // production code path) then calls the real reap_expired().
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool, /*retention_days=*/30);
     auto obs = [&](const std::string& id) {
         GuaranteedStateEventRow e;
         e.event_id = id;
@@ -1537,30 +1695,31 @@ TEST_CASE("GuaranteedStateStore: reaper deletes observations in lockstep with ev
     REQUIRE(store.query_observations().size() == 2);
 
     {
-        sqlite3* h = nullptr;
-        REQUIRE(sqlite3_open_v2(tmp.path.string().c_str(), &h, SQLITE_OPEN_READWRITE, nullptr) ==
-                SQLITE_OK);
-        // Age the stale projection row, then run the production observation reap SQL.
-        REQUIRE(sqlite3_exec(
-                    h, "UPDATE guardian_observations SET ttl_expires_at = 1 WHERE event_id='stale'",
-                    nullptr, nullptr, nullptr) == SQLITE_OK);
-        sqlite3_stmt* st = nullptr;
-        REQUIRE(sqlite3_prepare_v2(h,
-                                   "DELETE FROM guardian_observations "
-                                   "WHERE ttl_expires_at > 0 AND ttl_expires_at < ?",
-                                   -1, &st, nullptr) == SQLITE_OK);
-        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                             std::chrono::system_clock::now().time_since_epoch())
-                             .count();
-        sqlite3_bind_int64(st, 1, now);
-        REQUIRE(sqlite3_step(st) == SQLITE_DONE);
-        CHECK(sqlite3_changes(h) == 1); // only the stale projection row
-        sqlite3_finalize(st);
-        sqlite3_close(h);
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        // Age BOTH the event and its observation projection — the lockstep
+        // invariant means reap_expired()'s probe/decline decision reads the
+        // EVENTS table, so only the event's ttl actually gates the sweep; the
+        // observation row is aged too for parity with how the real projection
+        // always writes them equal.
+        auto r1 = pg::exec_params(
+            conn.get(),
+            "UPDATE guaranteed_state_store.guaranteed_state_events SET ttl_expires_at = 1 "
+            "WHERE event_id = 'stale'",
+            std::vector<std::string>{});
+        REQUIRE(r1.status() == PGRES_COMMAND_OK);
+        auto r2 = pg::exec_params(
+            conn.get(),
+            "UPDATE guaranteed_state_store.guardian_observations SET ttl_expires_at = 1 "
+            "WHERE event_id = 'stale'",
+            std::vector<std::string>{});
+        REQUIRE(r2.status() == PGRES_COMMAND_OK);
     }
 
-    GuaranteedStateStore reopened(tmp.path, /*retention_days=*/30);
-    auto survivors = reopened.query_observations();
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 1);
+    CHECK(store.observations_reaped_total() == 1);
+    auto survivors = store.query_observations();
     REQUIRE(survivors.size() == 1);
     CHECK(survivors[0].event_id == "fresh");
 }
@@ -1568,121 +1727,141 @@ TEST_CASE("GuaranteedStateStore: reaper deletes observations in lockstep with ev
 // ── #452 §5 — retention reaper ────────────────────────────────────────────
 
 TEST_CASE("GuaranteedStateStore: retention_days=0 disables TTL",
-          "[guaranteed_state_store][retention]") {
+          "[pg][guaranteed_state_store][retention]") {
     // Sentinel contract: non-positive retention parks ttl_expires_at at 0
     // so the reaper's partial index and WHERE predicate skip every row.
-    GuaranteedStateStore store(":memory:", /*retention_days=*/0);
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool, /*retention_days=*/0);
     for (int i = 0; i < 5; ++i) {
         REQUIRE(store.insert_event(make_event("evt-" + std::to_string(i), "r", "a")));
     }
-    // Explicit reap pass: nothing eligible, event_count stays put.
-    store.start_cleanup();
-    store.stop_cleanup();
+    // Explicit reap pass (ADR-0038: reap_expired() replaces the old background
+    // cleanup thread's start_cleanup()/stop_cleanup()): nothing eligible
+    // (ttl_expires_at parked at 0), event_count stays put.
+    store.reap_expired();
     CHECK(store.event_count() == 5);
     CHECK(store.events_reaped_total() == 0);
 }
 
-TEST_CASE("GuaranteedStateStore: reaper DELETE removes rows past ttl_expires_at",
-          "[guaranteed_state_store][retention]") {
-    // Use a real temp DB so we can poke the schema directly and exercise
-    // the same DELETE the background thread issues, without relying on
-    // a wall-clock sleep.
-    TempDbFile tmp;
-    GuaranteedStateStore store(tmp.path, /*retention_days=*/30);
+TEST_CASE("GuaranteedStateStore: reap_expired deletes rows past ttl_expires_at, keeps fresh ones",
+          "[pg][guaranteed_state_store][retention]") {
+    // Ported to reap_expired()'s #2496 gc_sweep shape (ADR-0038) — a real PG
+    // database so a second connection can poke ttl_expires_at directly and
+    // exercise the same DELETE the guarded pass issues, without relying on a
+    // wall-clock sleep or a background thread (reap_expired() is synchronous
+    // now — no start_cleanup()/stop_cleanup() to drain).
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool, /*retention_days=*/30);
 
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 3; ++i)
         REQUIRE(store.insert_event(make_event("fresh-" + std::to_string(i), "r", "a")));
-    }
-
-    // Force three rows to have an expired ttl by opening a second connection
-    // to the same file and rewriting ttl_expires_at. Keeps the production
-    // code path single-sourced without test-only hooks.
-    {
-        sqlite3* handle = nullptr;
-        REQUIRE(sqlite3_open_v2(tmp.path.string().c_str(), &handle,
-                                SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK);
-        for (int i = 0; i < 3; ++i) {
-            const std::string id = "stale-" + std::to_string(i);
-            auto e = make_event(id, "r", "a");
-            // Stale rows get ttl_expires_at = 1 (epoch 1s), which any current
-            // clock comfortably exceeds.
-            const std::string sql =
-                "INSERT INTO guaranteed_state_events "
-                "(event_id, rule_id, agent_id, event_type, severity, guard_type, "
-                "guard_category, detected_value, expected_value, remediation_action, "
-                "remediation_success, detection_latency_us, remediation_latency_us, "
-                "timestamp, ttl_expires_at) VALUES "
-                "(?, 'r', 'a', 'drift.remediated', 'high', 'registry', 'event', "
-                "'0', '1', 'registry-write', 1, 0, 0, '2026-04-19T12:00:00Z', 1);";
-            sqlite3_stmt* stmt = nullptr;
-            REQUIRE(sqlite3_prepare_v2(handle, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK);
-            sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-            REQUIRE(sqlite3_step(stmt) == SQLITE_DONE);
-            sqlite3_finalize(stmt);
-        }
-        sqlite3_close(handle);
-    }
-
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(store.insert_event(make_event("stale-" + std::to_string(i), "r", "a")));
     CHECK(store.event_count() == 6);
 
-    // Run the reaper with a 1-min interval — we want it to sleep briefly,
-    // tick, reap, and then let stop_cleanup drain it.
-    store.start_cleanup();
-    // Give the reaper enough wall-clock to complete one DELETE cycle.
-    // The background thread checks stop_requested every 1s; with a 1-min
-    // interval the first pass fires after ~60s, too slow for the test. We
-    // instead invoke the DELETE directly via a short loop that matches the
-    // reaper's SQL — exercises the same WHERE clause the production thread
-    // uses so a predicate regression here is a test failure.
-    store.stop_cleanup();
-
-    // Since the background thread's sleep outlasts the test budget, drive
-    // the same DELETE inline to verify the schema + predicate + counter
-    // are wired correctly. This is a stand-in for the cron tick.
+    // Age only the "stale-*" rows via a second connection — mirrors the
+    // sqlite3-second-handle trick the original test used, ported to libpq.
     {
-        sqlite3* handle = nullptr;
-        REQUIRE(sqlite3_open_v2(tmp.path.string().c_str(), &handle,
-                                SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK);
-        sqlite3_stmt* stmt = nullptr;
-        REQUIRE(sqlite3_prepare_v2(
-                    handle,
-                    "DELETE FROM guaranteed_state_events "
-                    "WHERE ttl_expires_at > 0 AND ttl_expires_at < ?",
-                    -1, &stmt, nullptr) == SQLITE_OK);
-        // Pass "now" — the identical threshold the production reaper uses.
-        // Fresh rows (ttl = now + 30d) survive; stale rows (ttl = 1) match.
-        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                             std::chrono::system_clock::now().time_since_epoch())
-                             .count();
-        sqlite3_bind_int64(stmt, 1, now);
-        REQUIRE(sqlite3_step(stmt) == SQLITE_DONE);
-        CHECK(sqlite3_changes(handle) == 3);
-        sqlite3_finalize(stmt);
-        sqlite3_close(handle);
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto r = pg::exec_params(
+            conn.get(),
+            "UPDATE guaranteed_state_store.guaranteed_state_events SET ttl_expires_at = 1 "
+            "WHERE event_id LIKE 'stale-%'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
     }
 
-    GuaranteedStateStore reopened(tmp.path, /*retention_days=*/30);
-    CHECK(reopened.event_count() == 3);  // only the three "fresh" survivors
-    auto out = reopened.query_events();
-    for (const auto& e : out) {
+    // expiring(3) < datable(6): not would_wipe — a clean pass drains immediately.
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 3);
+    CHECK(store.event_count() == 3); // only the three "fresh" survivors
+    auto out = store.query_events();
+    for (const auto& e : out)
         CHECK(e.event_id.starts_with("fresh-"));
-    }
 }
 
-TEST_CASE("GuaranteedStateStore: start_cleanup is a no-op on a closed store",
+// reap_expired would_wipe decline-once (#2496 shape, mirrors ResultSetStore's
+// gc_sweep test of the same name): when EVERY datable row is expired, part 1's
+// would_wipe classifier trips — the pass reports the anomaly, records it in
+// gc_meta, and declines to delete anything. An identical next pass (same fact
+// set) is a suppressed repeat: the report is skipped, but the (capped) drain
+// proceeds — a legitimately all-expired table still ages out, one pass later.
+TEST_CASE("GuaranteedStateStore: reap_expired declines once on an all-expired "
+          "(would_wipe) table, then drains",
+          "[pg][guaranteed_state_store][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool, /*retention_days=*/30);
+    REQUIRE(store.is_open());
+
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(store.insert_event(make_event("wipe-" + std::to_string(i), "r", "a")));
+
+    // Every row in the table is aged into the past — no live row survives, so
+    // expiring == datable (would_wipe: expiring >= datable).
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto r = pg::exec_params(
+            conn.get(),
+            "UPDATE guaranteed_state_store.guaranteed_state_events SET ttl_expires_at = 1",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+
+    auto gc_meta_anomaly_count = [&]() -> std::string {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto r = pg::exec_params(
+            conn.get(),
+            "SELECT COUNT(*) FROM guaranteed_state_store.gc_meta WHERE key = "
+            "'last_anomaly_facts'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return std::string(PQgetvalue(r.get(), 0, 0));
+    };
+
+    // First pass: declines (would_wipe) — nothing reaped, the anomaly recorded.
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 0);
+    CHECK(store.event_count() == 3); // still present — the decline held
+    CHECK(gc_meta_anomaly_count() == "1");
+
+    // Second pass: suppressed repeat (same fact set) — drains, capped.
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 3);
+    CHECK(store.event_count() == 0);
+    // The anomaly-dedup row is NOT cleared by a suppressed-repeat drain — it
+    // is cleared only by a genuinely clean pass (asserted next), same as
+    // ResultSetStore's gc_sweep test.
+    CHECK(gc_meta_anomaly_count() == "1");
+
+    REQUIRE(store.insert_event(make_event("fresh", "r", "a")));
+    store.reap_expired(); // clean pass: nothing expired
+    CHECK(store.events_reaped_total() == 3); // unchanged — nothing new reaped
+    CHECK(gc_meta_anomaly_count() == "0");   // consumed/cleared
+}
+
+TEST_CASE("GuaranteedStateStore: reap_expired is a no-op on a closed store",
           "[guaranteed_state_store][retention]") {
-    // Prevent the background thread from ever launching against a null db_
-    // — without the is_open() guard, stop_cleanup on a store that failed to
-    // open would dereference db_ in the reaper loop.
-    GuaranteedStateStore bad("/no/such/directory/guaranteed-state.db");
-    bad.start_cleanup();
-    bad.stop_cleanup();
+    // ADR-0038: reap_expired() replaces the old background-thread start_cleanup()/
+    // stop_cleanup(); it must be safe to call directly on a closed store (guarded
+    // by is_open() at its own top, same as every other method) — an unroutable
+    // DSN closed-store condition, same as the bad-path test above.
+    PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    GuaranteedStateStore bad(bad_pool);
+    REQUIRE_FALSE(bad.is_open());
+    bad.reap_expired();
     SUCCEED();
 }
 
-TEST_CASE("GuaranteedStateStore: overview aggregations", "[guaranteed_state_store][overview]") {
-    yuzu::test::TempDbFile db{std::string_view{"gs-agg-"}};
-    GuaranteedStateStore store{db.path, 30, 60};
+TEST_CASE("GuaranteedStateStore: overview aggregations", "[pg][guaranteed_state_store][overview]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store{pool, /*retention_days=*/30};
     REQUIRE(store.is_open());
 
     auto ev = [&](std::string id, std::string rule, std::string agent, std::string type,
@@ -1725,9 +1904,10 @@ TEST_CASE("GuaranteedStateStore: overview aggregations", "[guaranteed_state_stor
 }
 
 TEST_CASE("GuaranteedStateStore: per-(agent,rule) compliance census (Slice B)",
-          "[guaranteed_state_store][census]") {
-    yuzu::test::TempDbFile db{std::string_view{"gs-census-"}};
-    GuaranteedStateStore store{db.path, 30, 60};
+          "[pg][guaranteed_state_store][census]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store{pool, /*retention_days=*/30};
     REQUIRE(store.is_open());
 
     auto ev = [&](std::string id, std::string rule, std::string agent, std::string type,
@@ -1736,9 +1916,14 @@ TEST_CASE("GuaranteedStateStore: per-(agent,rule) compliance census (Slice B)",
         e.event_type = std::move(type);
         return e;
     };
+    // agent_rule_statuses is now type-distinguishable (ADR-0038 catastrophic-
+    // read set) — REQUIRE the outer expected here; a degrade is a genuine
+    // test-infra failure, not a scenario under test.
     auto census = [&] {
         std::map<std::pair<std::string, std::string>, std::string> m;
-        for (auto& s : store.agent_rule_statuses())
+        auto rows = store.agent_rule_statuses();
+        REQUIRE(rows.has_value());
+        for (auto& s : *rows)
             m[{s.agent_id, s.rule_id}] = s.state;
         return m;
     };
@@ -1781,12 +1966,19 @@ TEST_CASE("GuaranteedStateStore: per-(agent,rule) compliance census (Slice B)",
     }
     SECTION("rule-filtered status returns only that guard's per-device rows (Slice C drill-down)") {
         auto r1 = store.agent_rule_statuses("r1");
-        CHECK(r1.size() == 2); // a1 + a2
-        for (const auto& s : r1)
+        REQUIRE(r1.has_value());
+        CHECK(r1->size() == 2); // a1 + a2
+        for (const auto& s : *r1)
             CHECK(s.rule_id == "r1");
-        CHECK(store.agent_rule_statuses("r2").size() == 1);   // a1 only
-        CHECK(store.agent_rule_statuses("nope").empty());     // unknown rule
-        CHECK(store.agent_rule_statuses().size() == 3);       // unfiltered = whole fleet
+        auto r2 = store.agent_rule_statuses("r2");
+        REQUIRE(r2.has_value());
+        CHECK(r2->size() == 1); // a1 only
+        auto nope = store.agent_rule_statuses("nope");
+        REQUIRE(nope.has_value());
+        CHECK(nope->empty()); // unknown rule
+        auto all = store.agent_rule_statuses();
+        REQUIRE(all.has_value());
+        CHECK(all->size() == 3); // unfiltered = whole fleet
     }
     SECTION("deleting a rule drops its status rows (no orphan census inflation)") {
         GuaranteedStateRuleRow r;

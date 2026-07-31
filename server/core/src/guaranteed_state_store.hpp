@@ -1,17 +1,88 @@
 #pragma once
 
-#include <sqlite3.h>
+/// @file guaranteed_state_store.hpp
+/// Server-side storage for Yuzu Guardian — the "Guaranteed State" system.
+/// Migrated to PostgreSQL (ADR-0006/0008/0009/0038, schema
+/// `guaranteed_state_store`); was `guaranteed-state.db` (SQLite). See
+/// docs/yuzu-guardian-design-v1.1.md §9.1 for the schema design and
+/// docs/adr/0038-guaranteed-state-store-postgres-migration.md for the
+/// migration's posture decisions (this header follows that ADR verbatim).
+///
+/// Responsibilities:
+///   - Persist GuaranteedStateRule definitions (yaml_source is authoritative;
+///     the denormalised columns are for indexing / listing / RBAC filtering).
+///     Caller (REST handler) is responsible for deriving the denormalised
+///     fields (severity / os_target / scope_expr) from yaml_source atomically
+///     on create/update — the store does NOT re-parse.
+///   - Persist GuaranteedStateEvent rows reported by agents (drift detected,
+///     drift remediated, guard unhealthy, resilience escalated, etc.).
+///   - Reap expired events + their DEX projection via `reap_expired()`, called
+///     from the server's maintenance tick (the #2496 `gc_sweep` clock-guarded
+///     shape — see the .cpp) so multi-GB/day ingest during a fleet-wide
+///     incident does not grow the database unbounded.
+///
+/// Events are an **immutable audit-style log** — intentionally no foreign key
+/// from `guaranteed_state_events.rule_id` to `guaranteed_state_rules(rule_id)`.
+/// When a rule is deleted, its historical events remain for forensic review.
+/// Time-based expiry is the single retention mechanism.
+///
+/// ── Posture (ADR-0012 §1 / ADR-0038), split by table family ─────────────────
+///  - **Rules + meta reads — AUTHORITATIVE, type-distinguishable** (the
+///    catastrophic read): `list_rules` / `rule_names` / `rule_names_for`
+///    return `std::expected<std::vector<T>, std::string>`; `get_rule` keeps a
+///    three-state `std::expected<std::optional<Row>, GuaranteedStateReadError>`
+///    (found / genuinely-absent / degraded — mirrors
+///    `DeviceInventoryStore::CiReadError`). `agent_rule_statuses` /
+///    `agent_rule_statuses_for_agent` (enforce-gate/census input) are the same
+///    `std::expected<std::vector<T>, std::string>` shape. A degraded read
+///    collapsing to silent empty would push an EMPTY rule set to the fleet —
+///    a Guardian-wide disarm — so every push/reconcile consumer MUST abort
+///    (503 / no-op push) on `!result`, never fan out an empty container it
+///    cannot distinguish from "no rules configured".
+///  - **Rule/meta writes — fail-hard**: `create_rule`/`update_rule`/
+///    `delete_rule` stay `std::expected<void, std::string>`, surfaced to the
+///    REST caller. `bump_policy_generation` is one atomic
+///    `UPDATE ... RETURNING` (cross-process state on Postgres; the SQLite
+///    read-modify-write idiom does not port).
+///  - **Event/observation ingest — FAIL-SOFT** (mirrors ADR-0037 ingest): a
+///    dropped enforcement-history row is re-derivable from the agent's next
+///    report cycle; ingest must never block the gRPC thread. Infra-level
+///    drops (pool exhaustion / lease timeout / BEGIN-prepare-exec-commit
+///    failure) bump `yuzu_guardian_ingest_dropped_total{reason}` (ADR-0037
+///    label convention) IN ADDITION to the existing four-way
+///    `EventInsertOutcome` classification + its per-outcome atomics below.
+///  - **Status upserts — fail-soft with the same counter**; status READS stay
+///    type-distinguishable (see above).
+///  - **DEX analytic reads — deferred widening (ADR-0038, follow-up #2659).**
+///    The ~20 `dex_*` aggregate reads plus `query_events` / `rule_activity` /
+///    `daily_remediations` / `query_observations` KEEP their plain
+///    `std::vector<T>` / value-type signatures this PR (empty-on-degrade,
+///    behavior-identical to the SQLite store) — the `std::optional` widening
+///    fans out to ~68 call sites across 5 consumer files and is tracked as a
+///    follow-up (#2659), amendable per-file. What THIS PR lands at the store
+///    seam: every such read counts+logs a degrade via
+///    `yuzu_guardian_read_degrade_total{reason}` + a sampled `DegradeSampler`
+///    warn on store-not-open / lease-timeout / query-error, so the silent
+///    empty is at least visible on `/metrics` even though the return type
+///    does not yet distinguish it. None of these reads feeds an
+///    enforce/target decision (playbook's deny-or-benign class).
 
 #include <atomic>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <optional>
-#include <shared_mutex>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
+
+namespace yuzu {
+class MetricsRegistry;
+}
+
+namespace yuzu::server::pg {
+class PgPool;
+}
 
 namespace yuzu::server {
 
@@ -24,46 +95,17 @@ namespace yuzu::server {
 // shared wire convention.
 inline constexpr const char* kObservationRuleId = "__observation__";
 
-// Server-side storage for Yuzu Guardian — the "Guaranteed State" system.
-// See docs/yuzu-guardian-design-v1.1.md §9.1 for the schema design.
-//
-// Responsibilities:
-//   - Persist GuaranteedStateRule definitions (yaml_source is authoritative;
-//     the denormalised columns are for indexing / listing / RBAC filtering).
-//     Caller (REST handler in PR 2+) is responsible for deriving the
-//     denormalised fields (severity / os_target / scope_expr) from
-//     yaml_source atomically on create/update — the store does NOT re-parse.
-//   - Persist GuaranteedStateEvent rows reported by agents (drift detected,
-//     drift remediated, guard unhealthy, resilience escalated, etc.).
-//   - Reap expired events via a background cleanup thread (mirrors
-//     AuditStore) so multi-GB/day ingest during a fleet-wide incident does
-//     not fill the data directory.
-//
-// Events are an **immutable audit-style log** — intentionally no foreign key
-// from `guaranteed_state_events.rule_id` to `guaranteed_state_rules(rule_id)`.
-// When a rule is deleted, its historical events remain for forensic review
-// (matches `audit_store`'s retention discipline). Time-based expiry is the
-// single retention mechanism — operators control lifetime with the
-// `retention_days` constructor argument, not rule deletion cascades.
-//
-// This store is intentionally write-heavy on events and read-heavy on rules.
-// SQLite full-mutex + WAL is the same pattern the other stores use.
-
 struct GuaranteedStateRuleRow {
     std::string rule_id;           // UUID
     std::string name;              // unique, human-authored
     std::string yaml_source;       // human-readable rendering (generated; see spec_json)
-    // Canonical structured JSON of the Guard (spark/assertion/remediation) — the
-    // AUTHORITATIVE form the agent enforces from and that the push proto is built
-    // from. yaml_source is rendered one-way from this. See
-    // docs/guardian-mvp-contract.md decisions 1-2. Empty for pre-migration rows.
+    // Canonical structured JSON of the Guard (spark/assertion/remediation) —
+    // the AUTHORITATIVE form the agent enforces from and that the push proto is
+    // built from. yaml_source is rendered one-way from this.
     std::string spec_json;
     // RESERVED (stored, not yet evaluated): the Guard's Prerequisites — a Scope
     // expression over device facts that must hold for the Guard to apply on a
-    // device, finer than a Baseline's management-group assignment. Authoring +
-    // live agent-side evaluation are engine-dependent and MVP-deferred (the
-    // scope engine must become a shared server+agent lib first); see
-    // docs/guardian-baseline-model.md. Empty for rules with no Prerequisites.
+    // device, finer than a Baseline's management-group assignment.
     std::string prerequisites;
     int64_t version{1};
     bool enabled{true};
@@ -76,8 +118,8 @@ struct GuaranteedStateRuleRow {
     std::string updated_at;        // ISO-8601
     // Principal who authored the rule (created_by) and who last modified it
     // (updated_by). Required for SOC 2 audit-chain reconstruction alongside
-    // audit_events — the REST handler in PR 2 populates both from the
-    // session principal; the store is a plain passthrough.
+    // audit_events — the REST handler populates both from the session
+    // principal; the store is a plain passthrough.
     std::string created_by;
     std::string updated_by;
 };
@@ -92,10 +134,10 @@ struct GuaranteedStateEventRow {
     std::string guard_category;    // "event" | "condition"
     std::string detected_value;
     std::string expected_value;
-    // Structured, machine-readable detail (JSON, keyed by event_type; route a').
-    // Companion to the human `detected_value`, not a replacement. For DEX
-    // observations (process.crashed) it carries the projectable crash facts; "" for
-    // plain drift. The DEX read model projects this into indexed columns.
+    // Structured, machine-readable detail (JSON, keyed by event_type). Companion
+    // to the human `detected_value`, not a replacement. For DEX observations
+    // (process.crashed) it carries the projectable crash facts; "" for plain
+    // drift. The DEX read model projects this into indexed columns.
     std::string detail_json;
     std::string remediation_action;
     bool remediation_success{false};
@@ -113,8 +155,6 @@ struct GuaranteedStateEventQuery {
 };
 
 // ── Overview aggregation result types (Slice A dashboard overview) ───────────
-// Per-rule event activity within a window — powers the per-Guard table + the
-// fleet effectiveness rollup. Counts cover the supplied ISO-8601 `since` cutoff.
 struct GuardianRuleActivity {
     std::string rule_id;
     int64_t detected{0};        // drift.detected
@@ -125,18 +165,12 @@ struct GuardianRuleActivity {
     std::string last_activity;  // max timestamp in window ("" if none)
 };
 
-// One day's remediation outcomes — for the overview's 7-day trend.
 struct GuardianDayCount {
     std::string day;        // YYYY-MM-DD
     int64_t remediated{0};
     int64_t failed{0};
 };
 
-// One agent's CURRENT compliance state for one rule (Slice B compliance census).
-// Maintained by insert_event_classified from the agent's on-change status feed (guard.compliant
-// / drift.detected / drift.remediated / remediation.failed / guard.unhealthy). The
-// route folds in agent liveness (offline → "unknown") at query time — this row is the
-// last state the agent REPORTED, not a live probe.
 struct GuardianAgentRuleStatus {
     std::string agent_id;
     std::string rule_id;
@@ -144,14 +178,6 @@ struct GuardianAgentRuleStatus {
     std::string updated_at;  // ISO-8601 of the event that set it
 };
 
-// One DEX observation projected from a ruleless signal event (the
-// guardian_observations read model). DERIVED from guaranteed_state_events: written
-// atomically with the event so it inherits the event_id dedup, reaped in lockstep.
-// Promotes the detail_json UNIFORM facts into queryable columns the DEX
-// aggregations GROUP BY. Column semantics are generic across the 110-signal
-// catalogue (docs/dex-signal-catalog.md): subject = the failing entity (app,
-// service, printer, update title, SSID…), reason = failure code, component =
-// secondary entity (faulting module, NIC…), metric = numeric payload (boot ms).
 struct GuardianObservationRow {
     std::string event_id;          // shares the event journal dedup key
     std::string agent_id;
@@ -167,13 +193,6 @@ struct GuardianObservationRow {
 };
 
 // ── DEX read-model aggregations over guardian_observations ───────────────────
-// Crash-scoped aggregations keep obs_type='process.crashed' (the headline rate
-// stays a crash rate); app aggregations span crash+hang; the signal summary
-// spans the whole catalogue. Each takes an ISO-8601 `since` cutoff (empty = all
-// retained), aggregated in SQL (GROUP BY, no row materialisation). These provide
-// the NUMERATORS; the crash-free-% / per-1k-device-days RATES compose these with
-// the fleet-size DENOMINATOR from the agent registry at the route layer
-// (cross-store) — deliberately not here.
 struct DexCrashSummary {
     int64_t total_crashes{0};
     int64_t distinct_devices{0};   // devices impacted (crash-free numerator)
@@ -255,55 +274,97 @@ struct DexDeviceBoot {             // slowest-booting devices
     int64_t boots{0};
 };
 
-// Hard upper bound on `GuaranteedStateEventQuery::limit`. Defence-in-depth
-// against a misconfigured or malicious caller: materialising millions of
-// event rows into a std::vector would produce a GB-scale RSS spike. The
-// REST layer (PR 2) may apply a tighter clamp on top.
+// Hard upper bound on `GuaranteedStateEventQuery::limit` and every DEX
+// `limit` parameter. Defence-in-depth: materialising millions of rows into a
+// std::vector would produce a GB-scale RSS spike.
 inline constexpr int kMaxEventsLimit = 10'000;
 
-// Default retention for `guaranteed_state_events`. Per the design's stated
-// 10k events/s during a fleet-wide incident (~864M rows/day), unbounded
-// retention fills the data directory within a day. 30 days matches the
-// default for `audit_store` and is documented in the data inventory under
-// workstream E. Override via the GuaranteedStateStore constructor.
+// Default retention for `guaranteed_state_events` (+ its lockstep
+// `guardian_observations` projection). 30 days matches `audit_store`.
+// Override via the GuaranteedStateStore constructor.
 inline constexpr int kDefaultEventRetentionDays = 30;
 
-// Outcome of a single-event ingest (item-7 durable lifecycle journal, PR-Sv). The
-// agent journal re-sends on every reconnect, so a matching-fields event_id
-// redelivery is EXPECTED + idempotent — it must be quiet and counted apart from a
-// genuine collision (same event_id but MISMATCHED immutable fields: a forged-id
-// pre-claim #1360, or an agent event_seq_ reset / clock skew carrying a different
-// payload). Ingest runs the DEX blast-radius + alert observers ONLY on `Inserted`;
-// Redelivered / Conflict / Error all return before the observers.
+// Outcome of a single-event ingest. The agent journal re-sends on every
+// reconnect, so a matching-fields event_id redelivery is EXPECTED + idempotent
+// — it must be quiet and counted apart from a genuine collision (same
+// event_id but MISMATCHED immutable fields). Ingest runs the DEX blast-radius
+// + alert observers ONLY on `Inserted`; Redelivered / Conflict / Error all
+// return before the observers.
 enum class EventInsertOutcome { Inserted, Redelivered, Conflict, Error };
 struct EventInsertResult {
     EventInsertOutcome outcome{EventInsertOutcome::Error};
     std::string error; // set for Conflict (mismatch detail) + Error (db message); empty otherwise
 };
 
+// Error surface for the type-distinguishable single-object read (`get_rule`).
+// The success type is `std::optional<GuaranteedStateRuleRow>`: a value ==
+// found, `std::nullopt` == genuinely no row for this rule_id.
+// `std::unexpected(kDegraded)` == store/pool/query failure — the caller shows
+// a degrade banner/503, never treats it as absent (mirrors
+// `DeviceInventoryStore::CiReadError` / `InventoryReadError` exactly).
+enum class GuaranteedStateReadError { kDegraded };
+
 class GuaranteedStateStore {
 public:
-    explicit GuaranteedStateStore(const std::filesystem::path& db_path,
-                                   int retention_days = kDefaultEventRetentionDays,
-                                   int cleanup_interval_min = 60);
-    ~GuaranteedStateStore();
+    /// Borrows the shared pool and runs the `guaranteed_state_store` schema
+    /// migration on a pinned lease. `is_open()` is false if the lease was
+    /// empty or the migration failed.
+    explicit GuaranteedStateStore(pg::PgPool& pool,
+                                   int retention_days = kDefaultEventRetentionDays);
 
     GuaranteedStateStore(const GuaranteedStateStore&) = delete;
     GuaranteedStateStore& operator=(const GuaranteedStateStore&) = delete;
 
-    bool is_open() const;
+    [[nodiscard]] bool is_open() const noexcept { return open_; }
 
-    // Rule CRUD. Mutating methods return `std::expected<void, std::string>`.
-    // Duplicate-UNIQUE collisions (name or rule_id) are reported as an error
-    // prefixed with `kConflictPrefix` so REST handlers map them to HTTP 409
-    // via `is_conflict_error()` — see `server/core/src/store_errors.hpp`.
+    /// Wire a metrics registry for `yuzu_guardian_read_degrade_total{reason}`
+    /// (DEX/analytics reads) and `yuzu_guardian_ingest_dropped_total{reason}`
+    /// (fail-soft ingest) and the reap-pass counter. Set ONCE during
+    /// single-threaded startup, before serving — the pointer is read without
+    /// synchronisation on serving threads. A null registry (default, e.g.
+    /// unit tests) disables emission; every emit site is null-guarded.
+    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
+    /// One-time, idempotent legacy-SQLite backfill (ADR-0009/0038). Call once
+    /// at server startup, before serving, after construction proved the
+    /// Postgres schema is open. All FIVE tables (rules, guardian_meta,
+    /// guardian_agent_rule_status, guaranteed_state_events,
+    /// guardian_observations) in ONE transaction, idempotent via a dedicated
+    /// `sqlite_backfill` marker row (never row-count-inferred — the reaper
+    /// legitimately empties the event/observation tables over the store's
+    /// lifetime). Per-row SAVEPOINT + SQLSTATE discrimination exactly as
+    /// ADR-0037 settled it (22xxx/23xxx/54xxx = skip + counted in
+    /// `skipped_bad`; anything else aborts UNSTAMPED — the next boot
+    /// retries). TTL-expired legacy event/observation rows are skipped AT
+    /// SCAN TIME (never migrated-then-reaped). FAILS CLOSED on any
+    /// infrastructure error (initial connection, the backfill transaction's
+    /// own BEGIN/SAVEPOINT/COMMIT, a non-row-data SQLSTATE, or a failed
+    /// ROLLBACK TO SAVEPOINT) — the caller MUST treat `false` as fatal
+    /// (`startup_failed_ = true` in server.cpp), same as `!is_open()`.
+    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
+
+    // Rule CRUD. Mutating methods return `std::expected<void, std::string>`
+    // (fail-hard — ADR-0038 posture). Duplicate-UNIQUE collisions (name or
+    // rule_id) are reported as an error prefixed with `kConflictPrefix` so
+    // REST handlers map them to HTTP 409 (see `store_errors.hpp`).
     std::expected<void, std::string> create_rule(const GuaranteedStateRuleRow& row);
     std::expected<void, std::string> update_rule(const GuaranteedStateRuleRow& row);
     std::expected<void, std::string> delete_rule(const std::string& rule_id);
-    std::optional<GuaranteedStateRuleRow> get_rule(const std::string& rule_id) const;
-    std::vector<GuaranteedStateRuleRow> list_rules() const;
+    /// Three-state read (ADR-0038 catastrophic-read set): found / genuinely
+    /// absent (`std::nullopt`) / degraded (`std::unexpected`). Callers MUST
+    /// treat a degrade as "cannot verify" (503), never as "not found" (404).
+    std::expected<std::optional<GuaranteedStateRuleRow>, GuaranteedStateReadError>
+    get_rule(const std::string& rule_id) const;
+    /// AUTHORITATIVE, type-distinguishable (ADR-0038 catastrophic-read set):
+    /// `std::unexpected` on a store/pool/query degrade, NEVER a silent empty
+    /// vector — the Push fan-out / reconcile / baseline-deploy consumers MUST
+    /// abort (503 / no-op push) on `!result`, never fan out an empty set they
+    /// cannot distinguish from "no rules configured".
+    std::expected<std::vector<GuaranteedStateRuleRow>, std::string> list_rules() const;
 
-    // Event ingest + query.
+    // Event ingest + query. FAIL-SOFT (ADR-0038): a lease/query/transaction
+    // failure is logged + counted (`yuzu_guardian_ingest_dropped_total` +
+    // `events_ingest_errors_total()`), never throws, never blocks the caller.
     //
     // insert_event_classified() is the primary ingest entry point: it returns the
     // four-way EventInsertResult so the caller gates DEX observers on `Inserted`,
@@ -312,45 +373,31 @@ public:
     // back-compat convenience wrapper (Inserted/Redelivered -> ok; Conflict/Error ->
     // unexpected) for callers that don't distinguish redelivery (tests, batch seed).
     // [[nodiscard]]: the four-way outcome is what the caller gates the DEX observers on
-    // (only `Inserted` may run them). Silently ignoring it re-opens the false-blast-radius
-    // bug this method exists to prevent, so the type system enforces the check.
+    // (only `Inserted` may run them).
     [[nodiscard]] EventInsertResult insert_event_classified(const GuaranteedStateEventRow& row);
     std::expected<void, std::string> insert_event(const GuaranteedStateEventRow& row);
 
-    // Batch ingest: wraps all rows in a single transaction. At 10–50x the
-    // per-row throughput (one fsync per batch instead of one per row), this
-    // is the preferred path for the gRPC `GuaranteedStatePush` handler in
-    // PR 2. On failure, the whole batch is rolled back — there is no
-    // partial-success state. Returns the number of rows written on success.
+    /// Batch ingest: wraps all rows in a single transaction. On failure, the
+    /// whole batch is rolled back — see the HARD CONSTRAINT note on the .cpp
+    /// definition (no live caller today; must not be used for redelivery-prone
+    /// ingress).
     std::expected<std::size_t, std::string>
     insert_events(const std::vector<GuaranteedStateEventRow>& rows);
 
+    // ── DEX / analytics reads (ADR-0038 "deferred widening", #2659) ──────────
+    // Plain value-type returns, empty-on-degrade — behavior-identical to the
+    // SQLite store. Every degrade path (store not open / lease timeout / query
+    // error) counts `yuzu_guardian_read_degrade_total{reason}` + a sampled
+    // warn log via the store-local DegradeSampler (see the .cpp), so the loss
+    // is visible on /metrics even though the type does not yet distinguish it.
+
     std::vector<GuaranteedStateEventRow> query_events(const GuaranteedStateEventQuery& q = {}) const;
 
-    // DEX read model — all projected observations, newest first (slice 1B). A
-    // foundation read for tests + the dashboard; the GROUP BY aggregations (top
-    // apps / modules / by-OS / blast radius) land in slice 2. Bounded by
-    // kMaxEventsLimit for the same RSS defence as query_events.
     std::vector<GuardianObservationRow> query_observations(int limit = kMaxEventsLimit) const;
 
-    // DEX aggregations — GROUP BY over guardian_observations. `since` = ISO-8601
-    // cutoff ('' = all). `limit` clamped to kMaxEventsLimit. Rates (crash-free-%,
-    // /1k device-days) are composed with the agent-registry fleet size at the
-    // route layer, not here. Crash-scoped unless noted.
-    // `platform` narrows the crash aggregation to one OS (lowercase
-    // windows/linux/macos; empty = all-OS). The overview's crash-free-% /
-    // crashes-per-1k tiles are Windows-denominated, so they pass "windows" —
-    // otherwise all-OS crashes (macOS now emits process.crashed too) would be
-    // divided by the Windows fleet size, inflating the rate (#C-DEX-1).
     DexCrashSummary dex_crash_summary(const std::string& since = "",
                                       const std::string& platform = "") const;
-    // Spans process.crashed + process.hung (the app-reliability table).
     std::vector<DexAppCrashCount> dex_top_apps(const std::string& since = "", int limit = 20) const;
-    // Per-DEVICE app reliability, split by VERSION (slice 2b) — the per-(app,
-    // version) crash/hang counts on ONE device, joinable to that device's
-    // procperf (name, version) for the perf+stability-by-version drill. Rows with
-    // an unknown version ("") bucket together. distinct_devices is always 1 here
-    // (single agent) — kept for struct reuse. blast radius lives in dex_top_apps.
     std::vector<DexAppCrashCount> dex_device_top_apps(const std::string& agent_id,
                                                       const std::string& since = "",
                                                       int limit = 50) const;
@@ -358,28 +405,12 @@ public:
     std::vector<DexDeviceCrashCount> dex_top_devices(const std::string& since = "", int limit = 20) const;
     std::vector<DexOsCrashCount> dex_crashes_by_os(const std::string& since = "") const;
     std::vector<DexDayCrashCount> dex_crashes_by_day(const std::string& since = "") const;
-    // Whole-catalogue rollup: every obs_type present in the window, with count +
-    // blast radius — the overview's "all signals" panel. One GROUP BY pass.
-    // `platform` narrows to one OS's own signals (empty = the all-OS composite,
-    // unchanged) — the Catalogue's single-OS filter uses this so a family's score
-    // is honest for the selected OS instead of borrowing the all-fleet rollup.
     std::vector<DexSignalCount> dex_signal_summary(const std::string& since = "",
                                                     const std::string& platform = "") const;
-    // Boot performance (os.boot, metric = ms; rows with metric<=0 excluded).
     DexBootStats dex_boot_stats(const std::string& since = "") const;
     std::vector<DexDeviceBoot> dex_slowest_boots(const std::string& since = "",
                                                  int limit = 10) const;
 
-    // Generic per-obs_type drill-down (catalogue signal-detail, View 3) — these
-    // are the dex_top_apps/_devices/_by_os/_by_day family GENERALISED over any
-    // obs_type, not crash-scoped. The "crashes" field on the reused structs holds
-    // the generic event count. `dex_os_signal_scope` is the per-OS coverage (how
-    // many distinct types each OS collects) — drives the live cross-OS captions
-    // that replace the mockups' stale "macOS 6 of 103".
-    // `platform` (lowercase windows/linux/macos; empty = all-OS) OS-scopes the
-    // drilldown so a single-OS Catalogue filter doesn't show cross-OS events
-    // (#C-DEX-1). dex_signal_by_os is deliberately NOT scoped — it IS the cross-OS
-    // breakdown, so it always spans every OS regardless of the selected lens.
     std::vector<DexSubjectCount> dex_signal_subjects(const std::string& obs_type,
                                                      const std::string& since = "",
                                                      int limit = 20,
@@ -394,13 +425,8 @@ public:
                                                     const std::string& since = "",
                                                     const std::string& platform = "") const;
     std::vector<DexOsScope> dex_os_signal_scope(const std::string& since = "") const;
-    // The (day, obs_type, count) matrix — aggregated to family×day in the route
-    // for the Trends small-multiples + heatmap. One GROUP BY pass.
     std::vector<DexDaySignal> dex_signal_day_matrix(const std::string& since = "") const;
 
-    // DEX drill-downs — single-entity scope. App summaries span crash+hang;
-    // device summary + history span ALL signal types.
-    // Per-app (process_name = the observation subject):
     DexEntitySummary dex_app_summary(const std::string& process_name,
                                      const std::string& since = "") const;
     std::vector<DexModuleCrashCount> dex_app_modules(const std::string& process_name,
@@ -412,179 +438,87 @@ public:
     std::vector<DexDeviceCrashCount> dex_app_devices(const std::string& process_name,
                                                      const std::string& since = "",
                                                      int limit = 20) const;
-    // Per-device (agent_id):
     DexEntitySummary dex_device_summary(const std::string& agent_id,
                                         const std::string& since = "") const;
     std::vector<GuardianObservationRow> dex_device_history(const std::string& agent_id,
                                                            const std::string& since = "",
                                                            int limit = 100) const;
-    // Single projected observation by event_id — the per-event detail drill (the
-    // device-history row click target). std::nullopt if the id is unknown. The
-    // caller binds it to a scoped agent_id before rendering, so a guessed id can
-    // never reveal another device's row.
     std::optional<GuardianObservationRow> dex_observation(const std::string& event_id) const;
-    // Per-device obs_type rollup — the per-device analog of dex_signal_summary
-    // (one GROUP BY pass, indexed by agent_id). Drives the per-device DEX score.
     std::vector<DexSignalCount> dex_device_signal_summary(const std::string& agent_id,
                                                           const std::string& since = "") const;
 
-    // ── Overview aggregations (read-only GROUP BY; no event materialisation) ──
-    // Each takes an ISO-8601 `since` cutoff (empty = all retained events) and
-    // aggregates in SQL — kind to RAM/CPU at fleet scale. See the result structs.
     std::vector<GuardianRuleActivity> rule_activity(const std::string& since = "") const;
     std::vector<GuardianDayCount> daily_remediations(const std::string& since = "") const;
 
-    // Every (agent, rule) current compliance state from the pruning-immune status
-    // table (Slice B census). One row per pair; the caller buckets by `state` and
-    // applies its own liveness policy (offline agent → "unknown"). Unlike the event
-    // log this survives retention reaping, so a long-quiet compliant guard stays
-    // visible. Pass a `rule_id` to get just that Guard's per-device rows (the Slice C
-    // drill-down, served by idx_gars_rule); empty = the whole fleet. Read-only.
-    std::vector<GuardianAgentRuleStatus> agent_rule_statuses(const std::string& rule_id = "") const;
-
-    // One agent's current per-rule compliance verdicts (every rule it has reported
-    // on) — the per-agent analog of agent_rule_statuses(rule_id), read via the
-    // (agent_id, rule_id) PK index. Backs the baseline-anchored per-device status
-    // REST view; the caller intersects the returned rule_ids with a Baseline's
-    // deployed members. Read-only (last-reported state, not a live probe).
-    std::vector<GuardianAgentRuleStatus>
+    // ── Status + name lookups (ADR-0038 catastrophic-read set) ───────────────
+    /// AUTHORITATIVE, type-distinguishable: feeds the enforce-gate/dashboard
+    /// census — empty must stay distinguishable from "could not read".
+    std::expected<std::vector<GuardianAgentRuleStatus>, std::string>
+    agent_rule_statuses(const std::string& rule_id = "") const;
+    std::expected<std::vector<GuardianAgentRuleStatus>, std::string>
     agent_rule_statuses_for_agent(const std::string& agent_id) const;
 
-    // rule_id -> name for the whole catalogue, reading ONLY the two small columns
-    // (not yaml_source / spec_json / signature blobs that list_rules() materializes).
-    // For per-request name resolution on read paths like the baseline-anchored
-    // per-device status route, where the full rule body is never needed.
-    std::unordered_map<std::string, std::string> rule_names() const;
-    // Bounded variant of rule_names(): resolve names ONLY for the given rule_ids
-    // (e.g. a baseline's deployed members) via WHERE rule_id IN (?,…), so the
-    // fleet-polled per-device read path does not materialize the whole authored
-    // catalogue per request. Empty input → empty map.
-    std::unordered_map<std::string, std::string>
+    /// rule_id -> name for the whole catalogue (Push/reconcile input set).
+    std::expected<std::unordered_map<std::string, std::string>, std::string> rule_names() const;
+    /// Bounded variant of rule_names(): resolve names ONLY for the given
+    /// rule_ids. Empty input -> empty map (success, not degrade).
+    std::expected<std::unordered_map<std::string, std::string>, std::string>
     rule_names_for(const std::vector<std::string>& rule_ids) const;
 
     std::size_t rule_count() const;
     std::size_t event_count() const;
 
     // Monotonic policy generation — the version stamp of the rule SET, bumped
-    // atomically on every create/update/delete (see bump_policy_generation_locked).
-    // The Guardian push proto carries this so an agent can tell a newer push from
-    // a stale one; the heartbeat reconcile (M5) compares an agent's applied
-    // generation against this value to decide whether it has fallen behind.
-    // Persisted (survives restart) and strictly increasing — unlike the prior
-    // wall-clock seconds, which could repeat or step backwards (M6 / #1209).
-    // A *reconcile* re-push reads this value WITHOUT bumping it, so catching one
-    // lagging agent up never makes the rest of the fleet look stale.
+    // atomically on every create/update/delete. Persisted (survives restart)
+    // and strictly increasing.
     uint64_t current_policy_generation() const;
 
-    // Bump the persisted policy generation WITHOUT mutating any rule. The
-    // Baseline deploy path calls this: deploying (or undeploying) a Baseline
-    // changes which Guards are active on the fleet — the desired set — without
-    // editing any rule, and the heartbeat reconcile keys off the generation to
-    // decide an agent is stale. Takes the write lock (do NOT call while holding
-    // it). The rule-mutation methods bump internally via the _locked variant.
+    // Bump the persisted policy generation WITHOUT mutating any rule (the
+    // Baseline deploy path). Best-effort: logs on failure (mirrors the
+    // original SQLite contract — callers do not currently consume a result).
     void bump_policy_generation();
 
     // Observability — lock-free cumulative counters for Prometheus scraping.
-    // Cover the counts that a Prometheus alert on ingest health wants (bytes
-    // or rows written, reaper activity) without forcing the collector to
-    // issue a SQL `COUNT(*)` every scrape.
     uint64_t events_written_total() const noexcept { return events_written_.load(); }
     uint64_t events_reaped_total() const noexcept { return events_reaped_.load(); }
-    // DEX projection health (governance UP-1): projection failures degrade to
-    // event-only commits and are counted here so the read-model loss is
-    // alertable; the reap counter is the disposal-evidence twin of
-    // events_reaped_ for the guardian_observations table (compliance WS-E).
     uint64_t observations_proj_failures_total() const noexcept {
         return observations_proj_failures_.load();
     }
     uint64_t observations_reaped_total() const noexcept { return observations_reaped_.load(); }
-    // A single-row insert_event event_id PK/UNIQUE conflict is classified (item-7
-    // PR-Sv). MATCHING immutable fields => `Redelivered` (the durable agent journal's
-    // expected at-least-once retry): quiet, counted in events_redelivered_total().
-    // MISMATCHED immutable fields => `Conflict` (a forged event_id pre-claim #1360, or
-    // an agent event_seq_ reset / clock skew carrying a DIFFERENT payload): the event
-    // is NOT written, counted here — the CC7.3 evidence signal (#1414) distinguishing
-    // "no drift observed" from "drift observed but silently discarded". The batch
-    // insert_events path is excluded by design — it aborts the whole batch loudly.
     uint64_t events_dropped_total() const noexcept { return events_dropped_.load(); }
-    // Cumulative idempotent redeliveries (matching-fields event_id conflict) — the
-    // agent journal's expected at-least-once retries. High is normal after outages;
-    // it is NOT a loss signal (that is events_dropped_total()).
     uint64_t events_redelivered_total() const noexcept { return events_redelivered_.load(); }
-    // Cumulative OPERATIONAL ingest faults (a failed BEGIN/prepare/insert/commit, or a
-    // compare SELECT that could not run). A sustained rate means the ingest machinery is
-    // broken and conflicts are going UNCLASSIFIED — a genuine collision can then escape
-    // events_dropped_total(), so this is itself alertable (sec-M2). Excludes malformed
-    // (embedded-NUL) input, which is attacker-drivable and must not inflate this.
     uint64_t events_ingest_errors_total() const noexcept { return events_ingest_errors_.load(); }
 
-    void start_cleanup();
-    void stop_cleanup();
+    /// Clock-guarded retention sweep (#2496 `gc_sweep` shape — ADR-0038,
+    /// replaces the SQLite background cleanup thread). Called from the
+    /// server's maintenance tick (~60-minute cadence, matching the old
+    /// thread's default `cleanup_interval_min`). Reaps
+    /// `guaranteed_state_events` AND its lockstep `guardian_observations`
+    /// projection in the SAME guarded pass (the PII projection must never
+    /// outlive its parent event). One sweeping replica at a time via
+    /// `pg_try_advisory_xact_lock`; a durable `gc_meta` reading +
+    /// anomaly-fact-set guards against a skewed wall clock mass-expiring
+    /// live rows. Emits `yuzu_guardian_reap_passes_total{result=swept|noop|
+    /// declined|failed|skipped_lock}`.
+    void reap_expired();
 
 private:
-    sqlite3* db_{nullptr};
+    pg::PgPool& pool_;
+    bool open_{false};
     int retention_days_;
-    int cleanup_interval_min_;
-    mutable std::shared_mutex mtx_;
+    yuzu::MetricsRegistry* metrics_{nullptr};
 
     std::atomic<uint64_t> events_written_{0};
     std::atomic<uint64_t> events_reaped_{0};
     std::atomic<uint64_t> observations_proj_failures_{0};
     std::atomic<uint64_t> observations_reaped_{0};
-    std::atomic<uint64_t> events_dropped_{0};      // #1414: event_id conflict, MISMATCHED payload
-    std::atomic<uint64_t> events_redelivered_{0};  // item-7: event_id conflict, MATCHING payload
-    std::atomic<uint64_t> events_ingest_errors_{0}; // item-7/sec-M2: operational ingest fault
-
-#ifdef __cpp_lib_jthread
-    std::jthread cleanup_thread_;
-#else
-    std::thread cleanup_thread_;
-    std::atomic<bool> stop_requested_{false};
-#endif
-
-    void create_tables();
-#ifdef __cpp_lib_jthread
-    void run_cleanup(std::stop_token stop);
-#else
-    void run_cleanup();
-#endif
-
-    // Increment the persisted policy generation. Caller MUST hold mtx_ as a
-    // unique_lock (called from within the rule-mutation methods, which already
-    // hold it). Single fixed UPDATE — no sqlite3_changes() read, so it does not
-    // add a #1033 race site.
-    void bump_policy_generation_locked();
-
-    // Upsert one (agent, rule) compliance state into guardian_agent_rule_status.
-    // Caller MUST hold mtx_ as a unique_lock (called from insert_event / insert_events
-    // inside their existing lock + transaction). The ON CONFLICT clause is guarded by
-    // `excluded.updated_at >= existing.updated_at` so a late-arriving older event
-    // cannot regress a newer state. No sqlite3_changes() read (not a #1033 site).
-    void upsert_rule_status_locked(const std::string& agent_id, const std::string& rule_id,
-                                   const char* state, const std::string& updated_at);
-
-    // Project one ruleless DEX observation into guardian_observations. Caller MUST
-    // hold mtx_ AND have an OPEN transaction (called from insert_event / insert_events
-    // right after the event INSERT) so the projection is atomic with the event and
-    // inherits its event_id dedup — a redelivered crash fails the event PK and rolls
-    // back both, so the projection never double-counts. `detail_json` is parsed
-    // defensively (malformed → empty crash fields, never drops the observation);
-    // `ttl` is the parent event's expiry so the reaper sweeps both in lockstep.
-    std::expected<void, std::string>
-    project_observation_locked(const GuaranteedStateEventRow& row, int64_t ttl);
-
-    // On an event_id PK conflict, compare the STORED row against the incoming event
-    // across every immutable agent-supplied field — EXCLUDING server-enriched severity
-    // and the receipt-derived ttl_expires_at. true => an idempotent redelivery (quiet);
-    // false => a genuine collision (kept loud); std::unexpected => the compare itself
-    // could not run (operational error — mapped to Error, never a false collision).
-    // Caller MUST hold mtx_ (unique) with the ingest transaction open.
-    std::expected<bool, std::string>
-    stored_event_matches_locked(const GuaranteedStateEventRow& incoming) const;
+    std::atomic<uint64_t> events_dropped_{0};      // event_id conflict, MISMATCHED payload
+    std::atomic<uint64_t> events_redelivered_{0};  // event_id conflict, MATCHING payload
+    std::atomic<uint64_t> events_ingest_errors_{0}; // operational ingest fault
 
     // Compute ttl_expires_at = now + retention_days*86400 in epoch seconds;
     // retention_days <= 0 means "never expire" (returns 0, the sentinel the
-    // reaper's `WHERE ttl_expires_at > 0` clause excludes).
+    // reaper's `ttl_expires_at > 0` predicate excludes).
     int64_t compute_ttl_epoch() const;
 };
 

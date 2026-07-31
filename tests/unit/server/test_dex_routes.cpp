@@ -11,7 +11,10 @@
  */
 #include "dex_routes.hpp"
 #include "guaranteed_state_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "test_route_sink.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -26,8 +29,19 @@
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgPool;
 
 namespace {
+
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): every test
+// below constructs its own GuaranteedStateStore against a clone of this schema
+// (ADR-0038 migration).
+yuzu::test::PgTestTemplate guardian_pg_tpl{"guardianstate", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    GuaranteedStateStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("guardianstate template: store failed to migrate");
+}};
 void seed_signal(GuaranteedStateStore& store, const std::string& id, const std::string& agent,
                  const std::string& type, const std::string& detail_json, const std::string& ts) {
     GuaranteedStateEventRow e;
@@ -122,7 +136,7 @@ TEST_CASE("DEX overview: null store renders no-data placeholder", "[dex][routes]
 }
 
 TEST_CASE("DEX catalogue: family fragments surface ALL 114 monitored types, quiet ones too",
-          "[dex][routes][catalogue]") {
+          "[pg][dex][routes][catalogue]") {
     // Visibility contract (Dave 2026-06-10): operators must see what the fleet
     // is MONITORING, not just what fired — every catalogued type renders inside
     // its family, quiet ones as muted real-zero rows. Zeros are facts, not mock
@@ -130,7 +144,9 @@ TEST_CASE("DEX catalogue: family fragments surface ALL 114 monitored types, quie
     // retired), so the contract now lives on the Catalogue: rendering all 12
     // family fragments must surface every label. This list mirrors kAllObsTypes
     // in test_dex_signals.cpp — the two-sided drift net for catalogue additions.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     // Raw family names (literal '&') match dex_signal_groups(); a wrong name
     // would render "Unknown family" and its labels would go missing below.
     std::string html;
@@ -196,8 +212,10 @@ TEST_CASE("DEX catalogue: family fragments surface ALL 114 monitored types, quie
     CHECK(html.find("<td class=\"gp-num\">0</td>") != std::string::npos);
 }
 
-TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[dex][routes][catalogue]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[pg][dex][routes][catalogue]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     // windows connected → all 114 catalogue types are monitored (coverage-first).
     const auto html =
         render_dex_catalogue_fragment(&store, "", 7, DexFleet{2, 2, {"windows"}}, "all");
@@ -216,8 +234,10 @@ TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[dex][routes][
 
 TEST_CASE("DEX catalogue: single-OS filter scores its OWN denominator + signals, "
           "no cross-OS bleed (#1746)",
-          "[dex][routes][catalogue]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes][catalogue]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     // network.wifi_drop (Network family) is monitored on both windows+macos
     // (dex_obs_platforms); seed it macOS-only so the family's macOS-scoped rollup
     // has exactly one signal, with a KNOWN max_signal_devices.
@@ -278,13 +298,15 @@ TEST_CASE("DEX catalogue: single-OS filter scores its OWN denominator + signals,
 
 TEST_CASE("DEX catalogue: os=windows lens matches the unchanged 'all' composite "
           "(no regression, #1746)",
-          "[dex][routes][catalogue]") {
+          "[pg][dex][routes][catalogue]") {
     // A Windows-only fleet reporting Windows-only signals: the "all" lens (kept
     // byte-unchanged by #1746) and the "windows" lens now compute off the SAME
     // denominator (windows_online) and the SAME signals (nothing else to scope
     // away), so they must render the identical score — proving the per-OS
     // refactor didn't regress the pre-existing Windows-denominated composite.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "c1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayB + "T10:00:00Z");
     seed_crash(store, "c2", "WS-2", "chrome.exe", "ntdll.dll", "windows", kDayB + "T10:05:00Z");
     seed_hang(store, "h1", "WS-3", "chrome.exe", kDayB + "T10:10:00Z");
@@ -309,11 +331,13 @@ TEST_CASE("DEX catalogue: os=windows lens matches the unchanged 'all' composite 
 
 TEST_CASE("DEX catalogue grid: linux lens scores off linux_online, not macos/windows_online "
           "(differential, #1746 follow-up QE-a)",
-          "[dex][routes][catalogue]") {
+          "[pg][dex][routes][catalogue]") {
     // A fleet with three DISTINCT positive per-OS online counts, so a regression
     // that borrowed macos_online or windows_online instead of linux_online can't
     // hide behind an accidental equal denominator.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_signal(store, "l1", "LNX-1", "process.crashed",
                 R"({"subject":"x","platform":"linux"})", kDayB + "T10:00:00Z");
     seed_signal(store, "l2", "LNX-2", "process.crashed",
@@ -351,8 +375,10 @@ TEST_CASE("DEX catalogue grid: linux lens scores off linux_online, not macos/win
 
 TEST_CASE("DEX catalogue grid: macos_online=0 suppresses the score even with macOS "
           "signals seeded (divide-by-zero guard, QE-b)",
-          "[dex][routes][catalogue]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes][catalogue]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     // network.wifi_drop (Network family) IS macOS-collected (dex_obs_platforms),
     // so this family is MONITORED under the macos lens — the suppression below
     // must come from the N==0 guard, not from "nothing collects this".
@@ -386,13 +412,15 @@ TEST_CASE("DEX catalogue grid: macos_online=0 suppresses the score even with mac
 
 TEST_CASE("DEX catalogue grid: \"all\" lens pins to windows_online + the COMBINED "
           "all-OS signal set on a differentiating fleet (QE-d)",
-          "[dex][routes][catalogue]") {
+          "[pg][dex][routes][catalogue]") {
     // windows_online(7) != total_online(14) so a regression to total_online can't
     // hide behind an accidental equality; the seeded signal spans THREE distinct
     // windows agents + TWO distinct linux agents so a regression that scoped the
     // "all" lens down to windows-only signals (instead of the combined all-OS
     // set) produces a different max_signal_devices too.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_signal(store, "w1", "WIN-1", "process.crashed",
                 R"({"subject":"x","platform":"windows"})", kDayB + "T10:00:00Z");
     seed_signal(store, "w2", "WIN-2", "process.crashed",
@@ -439,8 +467,10 @@ TEST_CASE("DEX catalogue grid: \"all\" lens pins to windows_online + the COMBINE
 }
 
 TEST_CASE("DEX catalogue family lists its signals; unknown family is escaped",
-          "[dex][routes][catalogue]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes][catalogue]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     // Windows connected → the Windows-collected Network types are MONITORED.
     const DexFleet win{1, 1, {"windows"}};
     const auto net = render_dex_catalogue_group_fragment(&store, "", 7, "Network", win);
@@ -465,7 +495,7 @@ TEST_CASE("DEX catalogue family lists its signals; unknown family is escaped",
 
 TEST_CASE("DEX catalogue drill-down: single-OS filter scores its OWN denominator + "
           "signals, no cross-OS bleed (BR-001, #1746 follow-up)",
-          "[dex][routes][catalogue]") {
+          "[pg][dex][routes][catalogue]") {
     // BR-001 (Codex branch review, Architect-confirmed): the grid (View 1) scores
     // per-OS under a single-OS filter (see the "#1746" test above), but the family
     // drill-down (View 2) still read the all-OS signal set and scored with
@@ -473,7 +503,9 @@ TEST_CASE("DEX catalogue drill-down: single-OS filter scores its OWN denominator
     // Windows-denominated all-OS score under the same os= label. Same signal
     // shape as the grid's #1746 test, replayed against
     // render_dex_catalogue_group_fragment.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_signal(store, "m1", "MAC-1", "network.wifi_drop",
                 R"({"subject":"x","platform":"macos"})", kDayB + "T10:00:00Z");
     seed_signal(store, "m2", "MAC-2", "network.wifi_drop",
@@ -535,13 +567,15 @@ TEST_CASE("DEX catalogue drill-down: single-OS filter scores its OWN denominator
 
 TEST_CASE("DEX catalogue routes: os=macos param survives route dispatch into both the "
           "grid and drill-down renderers (QE-handler)",
-          "[dex][routes][catalogue]") {
+          "[pg][dex][routes][catalogue]") {
     // The #1746/BR-001 tests above prove the RENDER fns are per-OS-honest when
     // called directly; this exercises the actual ROUTE handlers (query-string
     // parsing → fleet_fn → render) so a regression that dropped `os=` on the way
     // in — e.g. a route that stopped reading req.get_param_value("os") — would
     // fail here even though the render fns themselves are still correct.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_signal(store, "m1", "MAC-1", "network.wifi_drop",
                 R"({"subject":"x","platform":"macos"})", kDayB + "T10:00:00Z");
     seed_signal(store, "m2", "MAC-2", "network.wifi_drop",
@@ -595,8 +629,10 @@ TEST_CASE("DEX catalogue routes: os=macos param survives route dispatch into bot
 }
 
 TEST_CASE("DEX catalogue signal drill-down: subjects + live OS split; type escaped",
-          "[dex][routes][catalogue]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes][catalogue]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto obs = [&](const std::string& id, const std::string& agent, const std::string& subject,
                    const std::string& plat) {
         GuaranteedStateEventRow r;
@@ -642,11 +678,13 @@ TEST_CASE("dex_normalize_os_filter maps a caller os param to a store-ready platf
 }
 
 TEST_CASE("DEX catalogue signal drill-down: single-OS lens scopes the subject list (C-DEX-1)",
-          "[dex][routes][catalogue]") {
+          "[pg][dex][routes][catalogue]") {
     // A single-OS Catalogue filter must scope the drilldown's subject/device/day
     // lists to that OS — no cross-OS bleed. (by_os stays cross-OS; that's the
     // split chart, exercised elsewhere.)
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto obs = [&](const std::string& id, const std::string& agent, const std::string& subject,
                    const std::string& plat) {
         GuaranteedStateEventRow r;
@@ -684,8 +722,10 @@ TEST_CASE("DEX catalogue signal drill-down: single-OS lens scopes the subject li
 }
 
 TEST_CASE("DEX health score: transparent composite, decomposition, suppression",
-          "[dex][routes][health]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes][health]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto obs = [&](const std::string& id, const std::string& agent, const std::string& type,
                    const std::string& plat) {
         GuaranteedStateEventRow r;
@@ -724,8 +764,10 @@ TEST_CASE("DEX health score: transparent composite, decomposition, suppression",
 }
 
 TEST_CASE("DEX trends: cross-OS cards (live scope), small-multiples, heatmap",
-          "[dex][routes][trends]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes][trends]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto obs = [&](const std::string& id, const std::string& agent, const std::string& type,
                    const std::string& plat, const std::string& day) {
         GuaranteedStateEventRow r;
@@ -758,8 +800,10 @@ TEST_CASE("DEX trends: cross-OS cards (live scope), small-multiples, heatmap",
 }
 
 TEST_CASE("DEX overview hub: explore cards link into the three deep pages",
-          "[dex][routes][hub]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes][hub]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     DexFleet fleet;
     fleet.windows_online = 5;
     const auto html = render_dex_overview_fragment(&store, "", 7, fleet);
@@ -779,8 +823,10 @@ TEST_CASE("DEX overview hub: explore cards link into the three deep pages",
     CHECK(sup.find("suppressed") != std::string::npos);
 }
 
-TEST_CASE("DEX overview: renders real multi-signal aggregations", "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX overview: renders real multi-signal aggregations", "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
     seed_crash(store, "e2", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T11:00:00Z");
     seed_hang(store, "e3", "WS-2", "chrome.exe", kDayB + "T09:00:00Z");
@@ -811,11 +857,13 @@ TEST_CASE("DEX overview: renders real multi-signal aggregations", "[dex][routes]
 }
 
 TEST_CASE("DEX catalogue: unknown obs_type falls back to the raw label under 'Other'",
-          "[dex][routes][catalogue]") {
+          "[pg][dex][routes][catalogue]") {
     // Forward-compat: a signal added agent-side renders with NO server change.
     // The slimmed hub no longer carries the per-type rollup, so the "Other"
     // (uncatalogued) fallback now surfaces on the Catalogue.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_signal(store, "e1", "WS-1", "future.signal_type",
                 R"({"subject":"thing","platform":"windows"})", kDayB + "T10:00:00Z");
     auto html = render_dex_catalogue_fragment(&store, "", 7, DexFleet{}, "all");
@@ -824,8 +872,10 @@ TEST_CASE("DEX catalogue: unknown obs_type falls back to the raw label under 'Ot
 }
 
 TEST_CASE("DEX per-device score: clean 100; failures deduct; benign don't; null=-1",
-          "[dex][score]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][score]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     // Null store → n/a sentinel.
     CHECK(dex_device_score(nullptr, "WS-1", "") == -1);
     // A device with no observations is a clean 100.
@@ -850,8 +900,10 @@ TEST_CASE("DEX per-device score: clean 100; failures deduct; benign don't; null=
 }
 
 TEST_CASE("DEX overview: Experience hero — per-device distribution + D/A/N; crashes demoted",
-          "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_signal(store, "e1", "WS-1", "process.crashed",
                 R"({"subject":"chrome.exe","platform":"windows"})", kDayA + "T10:00:00Z");
     // 2 connected Windows agents: WS-1 crashed (<100), WS-2 clean (100).
@@ -865,8 +917,10 @@ TEST_CASE("DEX overview: Experience hero — per-device distribution + D/A/N; cr
 }
 
 TEST_CASE("DEX overview: crash-free rate from fleet denominator; none → honest no-data",
-          "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
 
     // 1 device impacted of 4 reporting Windows agents → crash-free 75.0%.
@@ -882,13 +936,15 @@ TEST_CASE("DEX overview: crash-free rate from fleet denominator; none → honest
 }
 
 TEST_CASE("DEX overview: crash-free rate is Windows-scoped — a macOS crash can't move it (C-DEX-1)",
-          "[dex][routes]") {
+          "[pg][dex][routes]") {
     // process.crashed now arrives from macOS agents too. The crash-free tile is
     // denominated over reporting WINDOWS agents, so a macOS crash must NOT lower
     // it. This guards a future edit that drops the "windows" scope from
     // dex_crash_summary in render_dex_overview_fragment — that regression would
     // count MAC-1 as impacted (2 of 4 → 50.0%) instead of the correct 75.0%.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "w1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
     seed_crash(store, "m1", "MAC-1", "Safari", "", "macos", kDayA + "T11:00:00Z");
 
@@ -898,17 +954,21 @@ TEST_CASE("DEX overview: crash-free rate is Windows-scoped — a macOS crash can
 }
 
 TEST_CASE("DEX overview: hangs alone keep the crash-free rate honest (100%)",
-          "[dex][routes]") {
+          "[pg][dex][routes]") {
     // A hang is not a crash: the headline crash-free rate must stay crash-scoped.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_hang(store, "e1", "WS-1", "Teams.exe", kDayB + "T09:00:00Z");
     auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{4, 5});
     CHECK(html.find("100.0%") != std::string::npos);    // 0 crash-impacted of 4
     CHECK(html.find("Teams.exe") != std::string::npos); // the hung app still surfaces (Hangs col)
 }
 
-TEST_CASE("DEX overview: escapes nasty subjects (no XSS)", "[dex][routes][security]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX overview: escapes nasty subjects (no XSS)", "[pg][dex][routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "e1", "WS-1", "<img src=x onerror=alert(1)>", "ntdll.dll", "windows",
                kDayA + "T10:00:00Z");
     auto html = render_dex_overview_fragment(&store, "", 7, DexFleet{10, 12});
@@ -917,8 +977,10 @@ TEST_CASE("DEX overview: escapes nasty subjects (no XSS)", "[dex][routes][securi
 }
 
 TEST_CASE("DEX app drill-down: blast radius + hangs + modules + exceptions + devices",
-          "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
     seed_crash(store, "e2", "WS-2", "chrome.exe", "chrome.dll", "windows", kDayB + "T10:00:00Z");
     seed_hang(store, "e3", "WS-2", "chrome.exe", kDayB + "T11:00:00Z");
@@ -935,15 +997,19 @@ TEST_CASE("DEX app drill-down: blast radius + hangs + modules + exceptions + dev
     CHECK(html.find("/fragments/dex/device?id=WS-1") != std::string::npos); // drill to device
 }
 
-TEST_CASE("DEX app drill-down: unknown app → no-crashes placeholder", "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX app drill-down: unknown app → no-crashes placeholder", "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto html = render_dex_app_fragment(&store, "nope.exe", "all");
     CHECK(html.find("No crashes") != std::string::npos);
 }
 
 TEST_CASE("DEX device drill-down: friendly multi-signal history (UP-4)",
-          "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "e1", "WS-7", "AcmeCRM.exe", "AcmeCRM.dll", "windows",
                kDayA + "T10:00:00Z");
     seed_signal(store, "e2", "WS-7", "service.crashed",
@@ -965,8 +1031,10 @@ TEST_CASE("DEX device drill-down: friendly multi-signal history (UP-4)",
 }
 
 TEST_CASE("DEX device drill-down: escapes agent_id + subject (no XSS)",
-          "[dex][routes][security]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "e1", "<b>evil</b>", "<img src=x>", "ntdll.dll", "windows",
                kDayA + "T10:00:00Z");
     auto html = render_dex_device_fragment(&store, "<b>evil</b>", "all");
@@ -974,8 +1042,10 @@ TEST_CASE("DEX device drill-down: escapes agent_id + subject (no XSS)",
     CHECK(html.find("&lt;b&gt;evil") != std::string::npos);
 }
 
-TEST_CASE("DEX single-observation detail: store lookup + render", "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX single-observation detail: store lookup + render", "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_signal(store, "ev-100", "WS-7", "app.staterepo_error",
                 R"({"subject":"app state repository","reason":"sr-100",)"
                 R"("symbolic":"STATEREPO_ERROR","platform":"windows"})",
@@ -1001,8 +1071,10 @@ TEST_CASE("DEX single-observation detail: store lookup + render", "[dex][routes]
 }
 
 TEST_CASE("DEX single-observation detail: escapes fields (no XSS)",
-          "[dex][routes][security]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_signal(store, "ev-x", "WS-7", "process.crashed",
                 R"({"subject":"<img src=x>","reason":"0x1",)"
                 R"("symbolic":"<b>evil</b>","platform":"windows"})",
@@ -1095,8 +1167,10 @@ TEST_CASE("DEX observation render: metric is unit-formatted per obs_type (polymo
     CHECK(render("os.boot", 1e300).find("Metric</span><code>&mdash;</code>") != std::string::npos);
 }
 
-TEST_CASE("DEX device history rows drill to the observation detail", "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX device history rows drill to the observation detail", "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "ev-1", "WS-7", "AcmeCRM.exe", "AcmeCRM.dll", "windows",
                kDayA + "T10:00:00Z");
     auto html = render_dex_device_fragment(&store, "WS-7", "all");
@@ -1106,8 +1180,10 @@ TEST_CASE("DEX device history rows drill to the observation detail", "[dex][rout
     CHECK(html.find("id=\"dex-obs-detail\"") != std::string::npos);
 }
 
-TEST_CASE("DEX apps list: ranks apps by crashes+hangs, drillable", "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX apps list: ranks apps by crashes+hangs, drillable", "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "c1", "WS-1", "AcmeCRM.exe", "AcmeCRM.dll", "windows", kDayA + "T10:00:00Z");
     seed_crash(store, "c2", "WS-2", "AcmeCRM.exe", "ntdll.dll", "windows", kDayA + "T11:00:00Z");
     seed_hang(store, "h1", "WS-1", "chrome.exe", kDayA + "T12:00:00Z");
@@ -1121,14 +1197,18 @@ TEST_CASE("DEX apps list: ranks apps by crashes+hangs, drillable", "[dex][routes
     CHECK(html.find("/fragments/dex/apps") != std::string::npos);
 }
 
-TEST_CASE("DEX apps list: empty store → no-data placeholder", "[dex][routes]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX apps list: empty store → no-data placeholder", "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto html = render_dex_apps_fragment(&store, "", 7);
     CHECK(html.find("No data") != std::string::npos);
 }
 
-TEST_CASE("DEX routes: auth/perm gating + dispatch", "[dex][routes][rbac]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX routes: auth/perm gating + dispatch", "[pg][dex][routes][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     seed_crash(store, "e1", "WS-1", "chrome.exe", "ntdll.dll", "windows", kDayA + "T10:00:00Z");
 
     auto okAuth = [](const httplib::Request&, httplib::Response&) {
@@ -1569,8 +1649,10 @@ TEST_CASE("DEX perf panel: sparklines + now/min/max; empty input is honest",
     CHECK(html.find("hx-on") == std::string::npos); // CSP rule: never hx-on
 }
 
-TEST_CASE("DEX device fragment embeds the CLICK-to-load perf panel", "[dex][perf][render]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("DEX device fragment embeds the CLICK-to-load perf panel", "[pg][dex][perf][render]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     // With signals AND without - a quiet device still has perf history.
     const auto quiet = render_dex_device_fragment(&store, "WS-9", "7d");
     CHECK(quiet.find("/fragments/dex/device/perf?agent_id=WS-9") != std::string::npos);
@@ -1587,8 +1669,10 @@ TEST_CASE("DEX device fragment embeds the CLICK-to-load perf panel", "[dex][perf
 }
 
 TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
-          "[dex][perf][routes][rbac]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][perf][routes][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto okAuth = [](const httplib::Request&, httplib::Response&) {
         return std::optional<auth::Session>(auth::Session{});
     };
@@ -1881,8 +1965,10 @@ TEST_CASE("dex coverage map matches the emitted signal set (Linux + macOS)",
 }
 
 TEST_CASE("DEX device app-perf drill: gating, audit verb, and three read states",
-          "[dex][app_perf][routes][rbac]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][dex][app_perf][routes][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto okAuth = [](const httplib::Request&, httplib::Response&) {
         return std::optional<auth::Session>(auth::Session{});
     };

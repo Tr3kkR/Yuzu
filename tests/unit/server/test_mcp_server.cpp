@@ -1894,6 +1894,17 @@ TEST_CASE("MCP: all five discover_* tools are advertised in tools/list",
 // — behavioral) and ADDITIONALLY emits dex.signal.view, so one SIEM filter
 // catches the dashboard, REST and MCP behavioral-access surfaces alike.
 
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): every MCP DEX
+// test below constructs its own GuaranteedStateStore against a clone of this
+// schema (ADR-0038 migration).
+static yuzu::test::PgTestTemplate mcp_guardian_pg_tpl{
+    "guardianstate", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        GuaranteedStateStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("guardianstate template: store failed to migrate");
+    }};
+
 // Seed one ruleless DEX observation (the __observation__ projection the DEX
 // aggregations read) — subject + platform land in detail_json.
 static void mcp_seed_obs(GuaranteedStateStore& store, const std::string& id,
@@ -1912,8 +1923,10 @@ static void mcp_seed_obs(GuaranteedStateStore& store, const std::string& id,
 }
 
 TEST_CASE("MCP DEX: list_dex_signals returns the rollup, audits only the tool call",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     mcp_seed_obs(store, "o2", "WS-2", "process.crashed", "chrome.exe", "windows",
@@ -1946,8 +1959,10 @@ TEST_CASE("MCP DEX: list_dex_signals returns the rollup, audits only the tool ca
 }
 
 TEST_CASE("MCP DEX: list_dex_signals os filter scopes the catalogue rollup (A1 parity)",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "w1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     mcp_seed_obs(store, "m1", "MAC-1", "storage.low", "disk", "macos", "2026-06-10T11:00:00Z");
@@ -1972,8 +1987,10 @@ TEST_CASE("MCP DEX: list_dex_signals os filter scopes the catalogue rollup (A1 p
 }
 
 TEST_CASE("MCP DEX: get_dex_signal_scope returns per-OS coverage, not audited as a view",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     mcp_seed_obs(store, "o2", "MB-1", "process.crashed", "Safari", "macos", "2026-06-10T11:00:00Z");
@@ -2000,8 +2017,10 @@ TEST_CASE("MCP DEX: get_dex_signal_scope returns per-OS coverage, not audited as
 }
 
 TEST_CASE("MCP DEX: get_dex_signal_detail returns the shape AND emits dex.signal.view",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     mcp_seed_obs(store, "o2", "WS-2", "process.crashed", "chrome.exe", "windows",
@@ -2034,8 +2053,10 @@ TEST_CASE("MCP DEX: get_dex_signal_detail returns the shape AND emits dex.signal
 }
 
 TEST_CASE("MCP DEX: get_dex_signal_detail os filter scopes subjects/devices (A1 parity)",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "w1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     mcp_seed_obs(store, "w2", "WS-2", "process.crashed", "outlook.exe", "windows",
@@ -2071,8 +2092,10 @@ TEST_CASE("MCP DEX: get_dex_signal_detail os filter scopes subjects/devices (A1 
 // dropped row via audit_persisted:false. MCP set-and-proceeds (parity with the
 // query_responses #1550 and revoke_certificate #1240 siblings — no header channel).
 TEST_CASE("MCP DEX: get_dex_signal_detail dropped audit row surfaces audit_persisted:false (#1647)",
-          "[mcp][integration][dex][audit]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     McpTestServer ts;
@@ -2096,8 +2119,10 @@ TEST_CASE("MCP DEX: get_dex_signal_detail dropped audit row surfaces audit_persi
 // MCP path (the bool was discarded). The shared kernel catches it → audit_persisted:false,
 // still serves (MCP set-and-proceed), and never lets the throw escape the handler.
 TEST_CASE("MCP DEX: get_dex_signal_detail throwing audit_fn is caught → audit_persisted:false",
-          "[mcp][integration][dex][audit]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     McpTestServer ts;
@@ -2116,8 +2141,10 @@ TEST_CASE("MCP DEX: get_dex_signal_detail throwing audit_fn is caught → audit_
 }
 
 TEST_CASE("MCP DEX: get_dex_signal_detail rejects a malformed obs_type without auditing the view",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     McpTestServer ts;
     ts.guaranteed_state_store_for_test = &store;
     ts.start("readonly");
