@@ -1,15 +1,46 @@
 #pragma once
 
-#include <sqlite3.h>
+/// @file management_group_store.hpp
+/// Management-group CONFINEMENT hierarchy — group definitions (static +
+/// dynamic scope-expression), the parent/child tree, group membership
+/// (agents), and group→role assignments. Born on SQLite
+/// (`management-groups.db`), migrated to PostgreSQL (ADR-0006/0007/0008/0009/
+/// 0012, schema `management_group_store`; migration ADR-0042).
+///
+/// This is the CONFINEMENT SUBSTRATE — RbacStore's `authorize_list_read`
+/// (ADR-0017 World A) and `resolve_perm_groups`/`check_scoped_permission`
+/// resolve an operator's visible agent set through this store. A migration
+/// defect here is a cross-management-group disclosure (a confinement bypass),
+/// so the confinement-feeding reads are DEGRADE-DISTINGUISHABLE (ADR-0042):
+/// they return `std::optional`/`std::expected` and yield `nullopt`/`unexpected`
+/// on store-not-open / pool-acquire timeout / query error — NEVER a silent
+/// empty. RbacStore consumes a degrade as `DenyAll` (fail-closed). The reason a
+/// silent empty is unacceptable: a DENY-set read (`get_member_agents_in_subtrees`
+/// on the deny groups) degrading to empty denies nothing, so the operator sees
+/// MORE than their confinement allows — a fail-OPEN over-disclosure. Reporting
+/// the degrade lets the caller fail closed instead.
+///
+/// Substrate contract (ADR-0008/0012): holds a `pg::PgPool&`, migrates at
+/// construction on a pinned lease, schema-qualifies every runtime statement
+/// (`management_group_store.management_groups`). No `sqlite3_changes()` (#1033)
+/// — mutators use `RETURNING` / `PQcmdTuples`.
 
+#include <atomic>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <functional>
 #include <optional>
 #include <string>
-#include <shared_mutex>
 #include <vector>
+
+namespace yuzu {
+class MetricsRegistry;
+}
+
+namespace yuzu::server::pg {
+class PgPool;
+}
 
 namespace yuzu::server {
 
@@ -41,15 +72,33 @@ struct GroupRoleAssignment {
 
 class ManagementGroupStore {
 public:
-    explicit ManagementGroupStore(const std::filesystem::path& db_path);
+    /// Borrows the shared pool and runs the `management_group_store` schema
+    /// migration on a pinned lease. `is_open()` is false if the lease was empty
+    /// or the migration failed — construction FAIL-CLOSED (ADR-0007/0012 §1):
+    /// the server sets `startup_failed_` and refuses to boot rather than serve
+    /// a confinement substrate that cannot answer.
+    explicit ManagementGroupStore(pg::PgPool& pool);
     ~ManagementGroupStore();
 
     ManagementGroupStore(const ManagementGroupStore&) = delete;
     ManagementGroupStore& operator=(const ManagementGroupStore&) = delete;
 
-    bool is_open() const;
+    [[nodiscard]] bool is_open() const noexcept { return open_; }
 
-    // ── Group CRUD ───────────────────────────────────────────────────────
+    /// Wire the Prometheus registry for the read-degrade + backfill counters.
+    /// Optional; a null registry makes the counters no-ops.
+    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
+    /// MANDATORY one-time backfill (ADR-0009/0042) from the legacy
+    /// `management-groups.db`: groups + members + role assignments. Idempotent
+    /// (durable marker), resumable, row-count reconciled, fail-CLOSED; the
+    /// legacy file is moved aside after a verified backfill. Management-group
+    /// config is irreducible operator intent (confinement scope) that cannot be
+    /// re-derived — a silent drop is a fail-open. Returns false on any failure
+    /// (the server then refuses to boot).
+    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
+
+    // ── Group CRUD (deny-or-benign display class — may stay plain) ───────────
     std::expected<std::string, std::string> create_group(const ManagementGroup& group);
     std::optional<ManagementGroup> get_group(const std::string& id) const;
     std::optional<ManagementGroup> find_group_by_name(const std::string& name) const;
@@ -64,15 +113,27 @@ public:
     std::expected<void, std::string> remove_member(const std::string& group_id,
                                                    const std::string& agent_id);
     std::vector<ManagementGroupMember> get_members(const std::string& group_id) const;
-    std::vector<std::string> get_agent_groups(const std::string& agent_id) const;
+
+    /// CONFINEMENT read (ADR-0042): the management groups an agent belongs to.
+    /// Feeds `RbacStore::check_scoped_permission`'s reachable-set build. Returns
+    /// `nullopt` on store-not-open / pool-acquire timeout / query error so the
+    /// caller fails closed (a silent empty would drop the agent's reachable
+    /// groups and mis-decide the scoped check).
+    std::optional<std::vector<std::string>> get_agent_groups(const std::string& agent_id) const;
 
     /// Replace dynamic membership for a group (used after scope expression evaluation).
     void refresh_dynamic_membership(const std::string& group_id,
                                     const std::vector<std::string>& matching_agent_ids);
 
-    // ── Hierarchy ────────────────────────────────────────────────────────
-    std::vector<std::string> get_ancestor_ids(const std::string& group_id) const;
-    std::vector<std::string> get_descendant_ids(const std::string& group_id) const;
+    // ── Hierarchy (CONFINEMENT reads, ADR-0042) ──────────────────────────
+    /// Ancestor-ward walk (parent, grandparent, …), bounded recursive CTE with
+    /// a depth cap so a corrupt parent cycle TERMINATES (does not spin) and the
+    /// outer `DISTINCT` drops phantom cycle IDs. `nullopt` on degrade →
+    /// fail-closed at the caller.
+    std::optional<std::vector<std::string>> get_ancestor_ids(const std::string& group_id) const;
+    /// Descendant-ward walk, same bounded/cycle-safe recursive CTE. `nullopt`
+    /// on degrade.
+    std::optional<std::vector<std::string>> get_descendant_ids(const std::string& group_id) const;
 
     // ── Group-scoped role assignments ────────────────────────────────────
     std::expected<void, std::string> assign_role(const GroupRoleAssignment& assignment);
@@ -86,14 +147,11 @@ public:
     /// every `GroupRoleAssignment` whose principal is the user directly
     /// (`principal_type='user' AND principal_id=user`) OR one of the user's
     /// RBAC groups (`principal_type='group' AND principal_id IN rbac_groups`).
-    /// This is the union both `RbacStore::check_scoped_permission` and the
-    /// ADR-0017 list-read primitives resolve over, replacing the per-group
-    /// `get_group_roles` N+1 walk. Fail-closed (ADR-0017 INV-1/INV-5):
-    /// `unexpected(msg)` on a closed store, prepare failure, or a mid-scan step
-    /// error, so a read failure denies rather than silently narrowing to
-    /// nothing — which, for a principal carrying a DENY assignment, would fail
-    /// OPEN (an unseen deny → an un-suppressed agent). A value (possibly empty)
-    /// is a genuine, fully-read result.
+    /// Fail-closed (ADR-0017 INV-1/INV-5): `unexpected(msg)` on a closed store,
+    /// pool-acquire timeout, or a query error, so a read failure denies rather
+    /// than silently narrowing to nothing — which, for a principal carrying a
+    /// DENY assignment, would fail OPEN (an unseen deny → an un-suppressed
+    /// agent). A value (possibly empty) is a genuine, fully-read result.
     std::expected<std::vector<GroupRoleAssignment>, std::string>
     get_assignments_for_principal(const std::string& user,
                                   const std::vector<std::string>& rbac_groups) const;
@@ -101,48 +159,32 @@ public:
     /// Distinct member agent_ids of `seed_groups` AND every descendant group,
     /// resolved in ONE recursive-CTE query (ADR-0017 INV-4 descendant-ward,
     /// INV-10 batched). A role grant on a group applies downward to its
-    /// descendants (the mirror of `check_scoped_permission`'s ancestor-ward
-    /// admit), so the visible/denied agent set for a set of perm-holding groups
-    /// is the union of their subtrees' members. Fail-closed (INV-1/INV-5):
-    /// `unexpected(msg)` on any failure, so a partial walk can never
-    /// under-compute a DENY set (which would over-disclose). Empty `seed_groups`
-    /// yields an empty result without a query. `UNION` (not `UNION ALL`) dedups,
-    /// so a cyclic `parent_id` chain terminates rather than looping.
+    /// descendants, so the visible/denied agent set for a set of perm-holding
+    /// groups is the union of their subtrees' members. Fail-closed
+    /// (INV-1/INV-5): `unexpected(msg)` on any failure, so a partial walk can
+    /// never under-compute a DENY set (which would over-disclose). Empty
+    /// `seed_groups` yields an empty result without a query.
     std::expected<std::vector<std::string>, std::string>
     get_member_agents_in_subtrees(const std::vector<std::string>& seed_groups) const;
 
     /// Which agents can a user see based on group-scoped role assignments?
+    /// CONFINEMENT read (ADR-0042): `nullopt` on degrade → the caller shows no
+    /// agents (fail-closed).
     ///
     /// PRECONDITION: the caller must have already authenticated the session.
-    /// This method performs NO authentication and, when RBAC is not actively
-    /// enforced (below), returns the full enrolled set for ANY username — the
-    /// route-layer session/permission check is the access boundary.
-    ///
-    /// When RBAC enforcement is globally DISABLED (the default posture, and the
-    /// UAT rig), no per-user `management_group_roles` rows exist, so the
-    /// role-scoped inner join would return an empty set and hide every agent
-    /// from the legacy-admin superuser — even though it has full effective
-    /// access everywhere else (#1453). In that case this returns the full
-    /// enrolled set instead (every agent is auto-added to the root "All
-    /// Devices" group at enrollment). The branch is gated on the injected
-    /// `rbac_enabled_probe_`: when the probe reports RBAC ENABLED the exact
-    /// role-scoped semantics are preserved unchanged, so the fallback can never
-    /// widen visibility WHILE RBAC IS ON. When the probe is UNSET it also fails
-    /// CLOSED (role-scoped join only). The widened set is returned only when the
-    /// probe affirmatively reports RBAC off — which, consistent with the rest of
-    /// the dashboard (`check_permission`, `/api/me`), is the same posture under
-    /// which every authenticated user is a legacy superuser. (How a *failed*
-    /// RbacStore load should be treated — legacy-open vs fail-closed — is a
-    /// system-wide question tracked separately, not specific to visibility.)
-    std::vector<std::string> get_visible_agents(const std::string& username) const;
+    /// When RBAC enforcement is globally DISABLED (probe reports off), returns
+    /// the full enrolled set for ANY username (#1453 — the legacy-admin
+    /// superuser posture). When the probe is UNSET or reports RBAC ENABLED, the
+    /// exact role-scoped semantics are preserved (the fallback can never widen
+    /// visibility while RBAC is on).
+    std::optional<std::vector<std::string>> get_visible_agents(const std::string& username) const;
 
     /// Inject a predicate reporting whether RBAC enforcement is globally
-    /// enabled, wired once at startup from `RbacStore::is_rbac_enabled()`
-    /// (before the web server accepts requests). If never set,
-    /// `get_visible_agents` fails CLOSED — role-scoped inner join only.
+    /// enabled, wired once at startup. If never set, `get_visible_agents` fails
+    /// CLOSED — role-scoped inner join only.
     void set_rbac_enabled_probe(std::function<bool()> probe);
 
-    // ── Counting (for metrics / UI) ───────────────────────────────────────
+    // ── Counting (for metrics / UI — benign display class) ────────────────
     size_t count_groups() const;
     size_t count_all_members() const;
     size_t count_members(const std::string& group_id) const;
@@ -151,21 +193,17 @@ public:
     static constexpr const char* kRootGroupId = "000000000000";
 
 private:
-    sqlite3* db_{nullptr};
-    mutable std::shared_mutex mtx_; // protects db_ access (G3-ARCH-003)
+    pg::PgPool& pool_;
+    bool open_{false};
+    yuzu::MetricsRegistry* metrics_{nullptr};
     // Reports whether RBAC enforcement is globally enabled (see
-    // set_rbac_enabled_probe). Read by get_visible_agents to choose between the
-    // role-scoped inner join (RBAC on / probe unset) and the full enrolled set
-    // (RBAC off). Set once at startup before any request, so the unsynchronised
-    // read in get_visible_agents races nothing.
+    // set_rbac_enabled_probe). Set once at startup before any request.
     std::function<bool()> rbac_enabled_probe_;
 
-    void create_tables();
     std::string generate_id() const;
     // Full enrolled set: every agent that is a member of any management group.
-    // Every agent is auto-added to the root group at enrollment, so this is the
-    // RBAC-disabled "visible to the legacy-admin superuser" set (#1453).
-    std::vector<std::string> all_member_agents() const;
+    // CONFINEMENT read — `nullopt` on degrade (propagated by get_visible_agents).
+    std::optional<std::vector<std::string>> all_member_agents() const;
 };
 
 } // namespace yuzu::server

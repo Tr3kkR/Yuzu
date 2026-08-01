@@ -9,6 +9,7 @@
 #include "management_group_store.hpp"
 #include "mcp_server_testonly.hpp" // rbac_ops/securables_for_test (#2383 mirror binding)
 #include "migration_runner.hpp"
+#include "pg/pg_pool.hpp"
 #include "rbac_store.hpp"
 
 #include "../test_helpers.hpp"
@@ -1183,28 +1184,33 @@ TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rb
 // ── check_scoped_permission ──────────────────────────────────────────────────
 
 namespace {
-// Per-test SQLite temp file for the on-disk ManagementGroupStore — the fixed
-// "test_scoped_rbac.db" name was a cross-JOB shared resource on the
-// shared-identity CI pools (#1883); TempDbFile also picks up the -wal/-shm
-// cleanup the old fixture missed.
-struct ScopedTestDb : yuzu::test::TempDbFile {
-    ScopedTestDb() : TempDbFile("yuzu_test_scoped_rbac-") {}
-};
+// The ManagementGroupStore is now a Postgres store (ADR-0042); the scoped-
+// permission tests below wire the SQLite RbacStore to a PG-backed mgmt store.
+// Pre-migrated template cloned per test (see PgTestTemplate in test_helpers.hpp).
+yuzu::test::PgTestTemplate scoped_mgmt_tpl{"rbacscopedmgmt", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    ManagementGroupStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("rbacscopedmgmt template: mgmt store failed to migrate");
+}};
 } // namespace
 
-TEST_CASE("RbacStore: check_scoped_permission global allow bypasses scoping", "[rbac_store]") {
+TEST_CASE("RbacStore: check_scoped_permission global allow bypasses scoping",
+          "[pg][rbac_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore mgmt{pool};
     RbacStore rbac(":memory:");
-    ScopedTestDb tmp;
-    ManagementGroupStore mgmt(tmp.path);
 
     rbac.assign_role({"user", "admin_user", "Administrator"});
     CHECK(rbac.check_scoped_permission("admin_user", "Tag", "Write", "agent-1", &mgmt));
 }
 
-TEST_CASE("RbacStore: check_scoped_permission group-scoped allow", "[rbac_store]") {
+TEST_CASE("RbacStore: check_scoped_permission group-scoped allow", "[pg][rbac_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore mgmt{pool};
     RbacStore rbac(":memory:");
-    ScopedTestDb tmp;
-    ManagementGroupStore mgmt(tmp.path);
 
     // Create a management group and add agent to it
     ManagementGroup g;
@@ -1227,10 +1233,11 @@ TEST_CASE("RbacStore: check_scoped_permission group-scoped allow", "[rbac_store]
     CHECK(rbac.check_scoped_permission("alice", "Execution", "Execute", "agent-crm-1", &mgmt));
 }
 
-TEST_CASE("RbacStore: check_scoped_permission denied without scope", "[rbac_store]") {
+TEST_CASE("RbacStore: check_scoped_permission denied without scope", "[pg][rbac_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore mgmt{pool};
     RbacStore rbac(":memory:");
-    ScopedTestDb tmp;
-    ManagementGroupStore mgmt(tmp.path);
 
     // alice has ITServiceOwner on CRM group, but agent-other is not in it
     ManagementGroup g;

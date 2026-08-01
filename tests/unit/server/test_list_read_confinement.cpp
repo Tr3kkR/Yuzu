@@ -15,6 +15,7 @@
 
 #include "management_group_store.hpp"
 #include "rbac_store.hpp"
+#include "test_mgmt_group_pg_helper.hpp" // PG-backed ManagementGroupStore (ADR-0042)
 
 #include "../test_helpers.hpp"
 
@@ -45,8 +46,11 @@ bool contains(const std::vector<std::string>& v, const std::string& x) {
 /// Members: a_p∈P, a_c1∈C1, a_c2∈C2, a_s∈S.
 struct Rig {
     RbacStore rbac{":memory:"};
-    yuzu::test::TempDbFile mgmt_db{"yuzu_test_lrc_mgmt-"};
-    ManagementGroupStore mgmt{mgmt_db.path};
+    // ManagementGroupStore is a PG store (ADR-0042); the bundle SKIPs the
+    // TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset — so every case that
+    // constructs a Rig carries the [pg] tag.
+    yuzu::test::ManagementGroupStorePg mgmt_bundle;
+    ManagementGroupStore& mgmt = *mgmt_bundle;
     std::string gP, gC1, gC2, gS;
 
     Rig() {
@@ -87,7 +91,7 @@ struct Rig {
 
 // ── #1715(b): a global ALLOW overrides any group deny → AdmitAll ──────────────
 
-TEST_CASE("authorize_list_read: global allow ⇒ AdmitAll", "[list_read][rbac][1715]") {
+TEST_CASE("authorize_list_read: global allow ⇒ AdmitAll", "[pg][list_read][rbac][1715]") {
     Rig r;
     REQUIRE(r.rbac.assign_role({"user", "bob", "RespReader"}).has_value()); // GLOBAL allow
     r.group_assign(r.gC2, "bob", "RespDenier"); // a group deny must NOT carve out
@@ -99,7 +103,7 @@ TEST_CASE("authorize_list_read: global allow ⇒ AdmitAll", "[list_read][rbac][1
 // ── #1715(a): a global DENY does NOT override a group allow (additive) ────────
 
 TEST_CASE("authorize_list_read: global deny + group allow ⇒ AdmitScoped (additive)",
-          "[list_read][rbac][1715]") {
+          "[pg][list_read][rbac][1715]") {
     Rig r;
     REQUIRE(r.rbac.assign_role({"user", "carol", "RespDenier"}).has_value()); // GLOBAL deny
     r.group_assign(r.gP, "carol", "RespReader");                              // group allow
@@ -112,7 +116,7 @@ TEST_CASE("authorize_list_read: global deny + group allow ⇒ AdmitScoped (addit
 
 // ── DenyAll: no grant anywhere ────────────────────────────────────────────────
 
-TEST_CASE("authorize_list_read: no grant ⇒ DenyAll", "[list_read][rbac]") {
+TEST_CASE("authorize_list_read: no grant ⇒ DenyAll", "[pg][list_read][rbac]") {
     Rig r;
     auto d = r.rbac.authorize_list_read("nobody", "Response", "Read", &r.mgmt);
     CHECK(d.decision == ListReadDecision::DenyAll);
@@ -122,7 +126,7 @@ TEST_CASE("authorize_list_read: no grant ⇒ DenyAll", "[list_read][rbac]") {
 // ── INV-2: holds via a group but sees nothing ⇒ AdmitScoped({}), not DenyAll ──
 
 TEST_CASE("authorize_list_read: allow on an empty group ⇒ AdmitScoped empty (INV-2)",
-          "[list_read][rbac][inv2]") {
+          "[pg][list_read][rbac][inv2]") {
     Rig r;
     auto empty = r.make_group("Empty", ""); // no members
     r.group_assign(empty, "dave", "RespReader");
@@ -136,7 +140,7 @@ TEST_CASE("authorize_list_read: allow on an empty group ⇒ AdmitScoped empty (I
 // ── INV-4: descendant-ward expansion + deny-override subtraction ──────────────
 
 TEST_CASE("authorize_list_read: descendant-ward visible set with a deny branch (INV-4)",
-          "[list_read][rbac][inv4]") {
+          "[pg][list_read][rbac][inv4]") {
     Rig r;
     r.group_assign(r.gP, "alice", "RespReader");  // allow on P (covers P,C1,C2)
     r.group_assign(r.gC2, "alice", "RespDenier"); // deny on the C2 branch
@@ -153,7 +157,7 @@ TEST_CASE("authorize_list_read: descendant-ward visible set with a deny branch (
 // ── INV-7: the set-equivalence property + one-resolver cross-check ────────────
 
 TEST_CASE("authorize_list_read: visible set == {a : check_scoped_permission} (INV-7)",
-          "[list_read][rbac][inv7]") {
+          "[pg][list_read][rbac][inv7]") {
     Rig r;
     r.group_assign(r.gP, "alice", "RespReader");
     r.group_assign(r.gC2, "alice", "RespDenier");
@@ -183,10 +187,10 @@ TEST_CASE("authorize_list_read: visible set == {a : check_scoped_permission} (IN
 
 // ── Legacy-open: RBAC loaded-and-disabled ⇒ AdmitAll (behaviour-neutral) ──────
 
-TEST_CASE("authorize_list_read: RBAC disabled ⇒ AdmitAll (legacy-open)", "[list_read][rbac]") {
+TEST_CASE("authorize_list_read: RBAC disabled ⇒ AdmitAll (legacy-open)", "[pg][list_read][rbac]") {
     RbacStore rbac{":memory:"}; // is_open() && !is_rbac_enabled() → legacy-open
-    yuzu::test::TempDbFile mgmt_db{"yuzu_test_lrc_legacy-"};
-    ManagementGroupStore mgmt{mgmt_db.path};
+    yuzu::test::ManagementGroupStorePg mgmt_bundle;
+    ManagementGroupStore& mgmt = *mgmt_bundle;
 
     auto d = rbac.authorize_list_read("anyone", "Response", "Read", &mgmt);
     CHECK(d.decision == ListReadDecision::AdmitAll);
@@ -203,7 +207,7 @@ TEST_CASE("authorize_list_read: null mgmt store under enforcement ⇒ DenyAll (I
 }
 
 TEST_CASE("authorize_list_read: corrupt rbac.db ⇒ DenyAll, never AdmitAll (INV-1)",
-          "[list_read][rbac][inv1]") {
+          "[pg][list_read][rbac][inv1]") {
     yuzu::test::TempDbFile bad_db{"yuzu_test_lrc_corrupt-"};
     {
         std::ofstream f(bad_db.path, std::ios::binary);
@@ -212,8 +216,8 @@ TEST_CASE("authorize_list_read: corrupt rbac.db ⇒ DenyAll, never AdmitAll (INV
     RbacStore bad{bad_db.path};
     REQUIRE(!bad.is_open()); // precondition: migrations failed → store not open
 
-    yuzu::test::TempDbFile mgmt_db{"yuzu_test_lrc_corrupt_mgmt-"};
-    ManagementGroupStore mgmt{mgmt_db.path};
+    yuzu::test::ManagementGroupStorePg mgmt_bundle;
+    ManagementGroupStore& mgmt = *mgmt_bundle;
 
     // rbac_enforcement_in_effect(!is_open()) == true (enforce), so this must NOT
     // take the legacy-open AdmitAll branch — a corrupt store fails CLOSED.
@@ -224,7 +228,7 @@ TEST_CASE("authorize_list_read: corrupt rbac.db ⇒ DenyAll, never AdmitAll (INV
 // ── check_scoped_permission behaviour preserved by the INV-7 refactor ─────────
 
 TEST_CASE("check_scoped_permission: preserved through the shared-resolver refactor",
-          "[list_read][rbac][refactor]") {
+          "[pg][list_read][rbac][refactor]") {
     Rig r;
     r.group_assign(r.gP, "alice", "RespReader");
     r.group_assign(r.gC2, "alice", "RespDenier");
@@ -248,7 +252,7 @@ TEST_CASE("check_scoped_permission: preserved through the shared-resolver refact
 //   R(allow) ── DP ──┬── DC1(deny) ── DGC          members: a_R,a_dp,a_dc1,a_dgc,a_dc2
 //                    └── DC2
 TEST_CASE("authorize_list_read: INV-7 holds over a 4-level tree with a mid-tree deny",
-          "[list_read][rbac][inv7]") {
+          "[pg][list_read][rbac][inv7]") {
     Rig r; // reuses RespReader/RespDenier roles + RBAC-enabled store
     auto R = r.make_group("R", "");
     auto DP = r.make_group("DP", R);
@@ -296,7 +300,7 @@ TEST_CASE("authorize_list_read: INV-7 holds over a 4-level tree with a mid-tree 
 // RBAC-group membership (get_assignments_for_principal's group OR-arm). Was
 // entirely untested (quality-engineer SHOULD).
 TEST_CASE("authorize_list_read: grant via an RBAC group (principal_type='group')",
-          "[list_read][rbac][group-principal]") {
+          "[pg][list_read][rbac][group-principal]") {
     Rig r;
     REQUIRE(r.rbac.create_group({"soc-team", "", "local", "", 0}).has_value());
     REQUIRE(r.rbac.add_group_member("soc-team", "teamuser").has_value());
@@ -322,7 +326,7 @@ TEST_CASE("authorize_list_read: grant via an RBAC group (principal_type='group')
 // subtracts the deny subtree, so its members are excluded despite the allow
 // (quality-engineer SHOULD — INV-4 tests only used different groups).
 TEST_CASE("authorize_list_read: same group allow+deny roles ⇒ AdmitScoped empty (deny wins)",
-          "[list_read][rbac][inv7]") {
+          "[pg][list_read][rbac][inv7]") {
     Rig r;
     r.group_assign(r.gP, "split", "RespReader");
     r.group_assign(r.gP, "split", "RespDenier");
