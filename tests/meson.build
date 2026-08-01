@@ -72,6 +72,15 @@ invalid_name_fixture_plugin = shared_library(
   install: false,
 )
 
+# PLAN-08: test_native_raii.cpp (PR1.3) includes <IOKit/IOKitLib.h> and
+# <CoreFoundation/CoreFoundation.h> for the ScopedIOObject/ScopedCFRef vectors;
+# agents/core links no IOKit on darwin, so the test exe must pull the frameworks
+# itself. Darwin-only; empty elsewhere.
+agent_test_native_deps = []
+if host_machine.system() == 'darwin'
+  agent_test_native_deps += dependency('appleframeworks', modules: ['IOKit', 'CoreFoundation'])
+endif
+
 # ── Agent unit tests ──────────────────────────────────────────────────────────
 #
 # Proto-dep choice is platform-conditional (#572 + Windows MSVC follow-up):
@@ -201,6 +210,7 @@ agent_test_exe = executable(
     'unit/agent/test_msi_macos.cpp',          # C-1.21: pkgutil --pkg-info parser (P8)
     'unit/agent/test_bitlocker_macos.cpp',    # A-1.16: diskutil apfs list parser (P8)
     'unit/test_subprocess_runner.cpp',        # #2273: agent-core bounded subprocess runner (POSIX deadline/reap)
+    'unit/test_native_raii.cpp',              # PR1.3: ScopedCFRef/ScopedIOObject/ScopedFd RAII
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
     'unit/test_users_macos_last.cpp',         # qe-M1: pure `last -y` timestamp/weekday parsers
@@ -238,7 +248,7 @@ agent_test_exe = executable(
   # only way to exercise KvStore's fallible-read branches end to end rather than through
   # an injected stand-in. Already a transitive dep of yuzu_agent_core; naming it here is
   # what puts sqlite3.h on the test TU's include path (same shape as tar_test_deps).
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep],
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep] + agent_test_native_deps,
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],

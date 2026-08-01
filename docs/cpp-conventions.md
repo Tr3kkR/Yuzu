@@ -75,6 +75,16 @@ Governance is stricter than style guidance: every C++ diff must prove ownership 
 
 New or touched C++ code should use a small RAII owner, `std::unique_ptr` with a deleter, or a local scope guard. Manual cleanup is a governance finding unless the code documents why a wrapper is impossible or would be less safe. Check every early return between acquisition and release.
 
+The repo's shared owners live in `agents/core/include/yuzu/agent/` — reach for these before writing a new one:
+
+| Wrapper | Owns | Header |
+|---|---|---|
+| `ScopedFd` | a POSIX file descriptor | `scoped_fd.hpp` |
+| `ScopedCFRef<T>` | a CoreFoundation `+1` reference (macOS) | `scoped_cfref.hpp` |
+| `ScopedIOObject` | an IOKit `io_object_t` / Mach send right (macOS) | `scoped_ioobject.hpp` |
+
+All three are move-only and release exactly once. The `reset()` contract differs by resource, and the difference is deliberate. For the two REFCOUNTED owners (`ScopedCFRef`, `ScopedIOObject`) the argument is an **owned `+1`** consumed **even when it shares identity with the current value**, because a same-identity `+1` is a distinct release obligation — an equality early-return leaks it, and `reset(get())` is caller misuse, not a no-op. `ScopedFd` keeps an `fd == fd_` early-return and is right to: a descriptor is a value, not a refcount, so two live owning claims on one number cannot coexist, and dropping the guard would close the fd and then retain the closed number. Objective-C++/ARC specifics are in `docs/native-objcpp-conventions.md`.
+
 Resource owner types must be non-copyable when copying would double-release. Prefer move-only wrappers with explicit transfer semantics; any use of `release()` must immediately hand the resource to another named owner.
 
 Borrowed data is allowed only when its source lifetime is obvious at the call site. Do not store `std::string_view`, `std::span`, raw plugin contexts, or callback user data beyond the lifetime of the object they view. If a C ABI trampoline stores or returns a pointer, document who owns the context and who frees output strings.

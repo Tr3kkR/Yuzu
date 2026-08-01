@@ -395,9 +395,19 @@ if host_os == 'darwin'
   # keeps Objective-C object lifetimes ARC-managed (see
   # docs/native-objcpp-conventions.md) — there is no manual-retain-count
   # variant to opt out into.
+  # xplat-A5: the native file's `cpp_args = ['-mmacosx-version-min=13.3']`
+  # (meson/native/macos-appleclang.ini) is a cpp-language setting and never
+  # reaches an objcpp TU (objcpp is its own Meson language, per the comment
+  # above) — without repeating it here every .mm target silently compiles
+  # against the build host's SDK default deployment target instead of the
+  # project's pinned 13.3 floor. Keep this literal in sync with the native
+  # file's cpp_args/cpp_link_args value.
   _apple_objcpp = meson.get_compiler('objcpp')
   _apple_objcpp_std = _apple_objcpp.has_argument('-std=c++23') ? '-std=c++23' : '-std=c++2b'
-  apple_objcpp_args = [_apple_objcpp_std, '-fvisibility=hidden', '-fobjc-arc']
+  apple_objcpp_args = [
+    _apple_objcpp_std, '-fvisibility=hidden', '-fobjc-arc',
+    '-mmacosx-version-min=13.3',
+  ]
 endif
 
 # ── Proto codegen ─────────────────────────────────────────────────────────────

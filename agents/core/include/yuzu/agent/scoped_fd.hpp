@@ -20,6 +20,26 @@
  * the deleter is a fixed `close()` call, not a template parameter -- a small
  * dedicated type reads clearer at every call site than a custom-deleter
  * `unique_ptr<int, ...>` would.
+ *
+ * THREE reset() contracts coexist across this codebase's RAII owners, and
+ * they are NOT interchangeable -- read the relevant one before assuming any
+ * of them generalizes:
+ *   - THIS type (POSIX fd, close()-based): reset(fd) is a no-op when
+ *     `fd == fd_` (self-reset would close a fd this instance is still
+ *     supposed to own, then leave fd_ pointing at whatever the kernel
+ *     recycles that number to -- see the self-reset guard below).
+ *   - ScopedCFRef<T>/ScopedIOObject (scoped_cfref.hpp/scoped_ioobject.hpp,
+ *     CF Create/Copy Rule): the OPPOSITE -- reset(ref) is NEVER a same-
+ *     identity no-op, because a same-identity +1 reference is a genuinely
+ *     DISTINCT retain obligation the caller must still discharge (CDX-004:
+ *     an earlier same-identity guard there LEAKED a ref for exactly this
+ *     reason). See those headers' own reset() comments for the full
+ *     reasoning.
+ *   - subprocess_runner.cpp's file-local `UniqueFd`/Windows `UniqueHandle`:
+ *     NEITHER guard -- they are never called with their own current value in
+ *     that file, so the question never arises there; do not port that
+ *     shape elsewhere without re-deriving which of the two contracts above
+ *     actually applies to the resource in question.
  */
 
 #ifndef _WIN32
@@ -30,22 +50,22 @@ namespace yuzu::agent {
 
 /// Owns exactly one POSIX file descriptor; closes it on destruction, move, or
 /// an explicit reset() -- never double-closes, never leaks past an exception.
-class scoped_fd {
+class ScopedFd {
 public:
-    scoped_fd() = default;
-    explicit scoped_fd(int fd) noexcept : fd_(fd) {}
+    ScopedFd() = default;
+    explicit ScopedFd(int fd) noexcept : fd_(fd) {}
 
-    scoped_fd(const scoped_fd&) = delete;
-    scoped_fd& operator=(const scoped_fd&) = delete;
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
 
-    scoped_fd(scoped_fd&& other) noexcept : fd_(other.release()) {}
-    scoped_fd& operator=(scoped_fd&& other) noexcept {
+    ScopedFd(ScopedFd&& other) noexcept : fd_(other.release()) {}
+    ScopedFd& operator=(ScopedFd&& other) noexcept {
         if (this != &other)
             reset(other.release());
         return *this;
     }
 
-    ~scoped_fd() { reset(); }
+    ~ScopedFd() { reset(); }
 
     /// The raw fd, or -1 if this instance owns nothing. Ownership is retained.
     [[nodiscard]] int get() const noexcept { return fd_; }
@@ -63,6 +83,9 @@ public:
     /// Close the currently-owned fd (if any) and take ownership of `fd`
     /// instead (default -1: own nothing).
     void reset(int fd = -1) noexcept {
+        if (fd == fd_)
+            return; // self-reset: closing then re-storing the same fd would
+                    // leave the owner holding a closed/recycled descriptor (BR-008)
         if (fd_ >= 0)
             ::close(fd_);
         fd_ = fd;

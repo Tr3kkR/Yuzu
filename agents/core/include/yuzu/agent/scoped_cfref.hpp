@@ -25,6 +25,11 @@
  * `CFArrayGetValueAtIndex`-style getter) is a different contract and is not
  * this type -- adding one is out of scope here (genuinely-absent primitive,
  * not a redesign of CF ownership handling).
+ *
+ * On reset()'s same-identity behaviour: this type's contract is the OPPOSITE
+ * of ScopedFd's (scoped_fd.hpp) -- see reset() below, and that header's own
+ * doc comment for the full three-way cross-reference (ScopedFd / this type &
+ * ScopedIOObject / subprocess_runner.cpp's file-local UniqueFd).
  */
 
 #if defined(__APPLE__)
@@ -73,6 +78,14 @@ public:
     /// instead (default nullptr: own nothing). `ref`, like the constructor
     /// argument, must already be a +1 owning reference.
     void reset(T ref = nullptr) noexcept {
+        // `ref` is a +1 OWNED reference — the caller transfers ownership. It is
+        // consumed even when it shares object identity with the current ref_,
+        // because a same-identity +1 is a DISTINCT retain obligation: an earlier
+        // self-reset guard that returned early on `ref == ref_` (BR-008) LEAKED
+        // that +1 (CDX-004, reproduced — `CFRetain(obj); reset(obj)` left the
+        // retain count at 2, not 1). A bare `reset(get())` is caller misuse —
+        // `get()` is a BORROWED reference, not a +1 — and is a precondition
+        // violation, not something this method silently absorbs.
         if (ref_ != nullptr)
             CFRelease(ref_);
         ref_ = ref;

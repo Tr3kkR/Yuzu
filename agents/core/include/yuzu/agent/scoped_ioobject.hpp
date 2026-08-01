@@ -26,6 +26,12 @@
  * skips that close step, leaving the user client instantiated in the
  * kernel even though the local reference is gone. A connection needs a
  * distinct owner with `IOServiceClose` as its deleter, not this wrapper.
+ *
+ * On reset()'s same-identity behaviour: this type's contract mirrors
+ * ScopedCFRef's and is the OPPOSITE of ScopedFd's (scoped_fd.hpp) -- see
+ * reset() below, and scoped_fd.hpp's own doc comment for the full three-way
+ * cross-reference (ScopedFd / ScopedCFRef & this type / subprocess_runner.cpp's
+ * file-local UniqueFd).
  */
 
 #if defined(__APPLE__)
@@ -74,6 +80,13 @@ public:
     /// Release the currently-owned object (if any) and adopt `obj` instead
     /// (default IO_OBJECT_NULL: own nothing).
     void reset(io_object_t obj = IO_OBJECT_NULL) noexcept {
+        // `obj` is a +1 OWNED reference — the caller transfers ownership. It is
+        // consumed even when it shares identity with the current obj_, because a
+        // same-identity +1 is a DISTINCT retain obligation: an earlier self-reset
+        // guard that returned early on `obj == obj_` (BR-008) LEAKED that +1
+        // (CDX-004, the IOObjectRetain twin of the reproduced CFRetain leak). A
+        // bare `reset(get())` is caller misuse — `get()` is a BORROWED reference,
+        // not a +1 — and is a precondition violation, not silently absorbed.
         if (obj_ != IO_OBJECT_NULL)
             IOObjectRelease(obj_);
         obj_ = obj;
