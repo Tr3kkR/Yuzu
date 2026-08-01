@@ -54,7 +54,6 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
-#include <fstream>
 #include <functional>
 #include <memory>
 #include <set>
@@ -578,6 +577,22 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
 #include <memory>
 #include <stdexcept>
 #include <vector>
+
+namespace {
+// Pre-migrated template for RbacStore (PG port). Shares the "rbacstore" key
+// with test_rbac_store.cpp's own template (identical setup, replay-verified
+// — docs/postgres-store-playbook.md step 7). Every TEST_CASE below just
+// needs an OPEN RbacStore to satisfy the #1717 fail-closed guard, not RBAC
+// behavior itself.
+yuzu::test::PgTestTemplate mcp_rbac_tpl{"rbacstore", [](const std::string& dsn) {
+                                            yuzu::server::pg::PgPool pool{
+                                                {.conninfo = dsn, .size = 1}};
+                                            yuzu::server::RbacStore store{pool};
+                                            if (!store.is_open())
+                                                throw std::runtime_error(
+                                                    "rbac template: store failed to migrate/seed");
+                                        }};
+} // namespace
 
 namespace {
 
@@ -1759,8 +1774,12 @@ TEST_CASE("MCP Integration: discover_routes matches the OpenAPI-derived catalog"
     CHECK(got.value("source", "") == "openapi");
 }
 
-TEST_CASE("MCP Integration: discover_permissions wired vs unwired", "[mcp][integration][discovery]") {
-    yuzu::server::RbacStore rbac(":memory:");
+TEST_CASE("MCP Integration: discover_permissions wired vs unwired",
+          "[mcp][integration][discovery][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool};
     REQUIRE(rbac.is_open());
 
     McpTestServer ts;
@@ -5893,12 +5912,15 @@ yuzu::server::AgentLicenseRow sle_pii_row() {
 } // namespace
 
 TEST_CASE("MCP query_software_licenses: scope gate unwired → fail closed (never legacy-open)",
-          "[mcp][sle]") {
+          "[mcp][sle][pg]") {
     // No scoped_perm_fn wired (default empty). The twin must REFUSE, not fall through
     // to a global/legacy-open read of per-agent licence facts — parity with the REST
     // drill's sle_gate_usable fail-closed posture.
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ the #1717 guard passes (it targets a
-    REQUIRE(rbac.is_open());                  // CORRUPT db; see the dedicated fail-close test)
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool}; // open ⇒ the #1717 guard passes (it targets a
+    REQUIRE(rbac.is_open());                 // CORRUPT db; see the dedicated fail-close test)
     McpTestServer ts; // no scoped gate, no store
     ts.rbac_store_for_test = &rbac;
     ts.start();
@@ -5935,24 +5957,18 @@ TEST_CASE("MCP query_software_licenses: authorization subsystem unavailable → 
 }
 
 TEST_CASE("MCP query_software_licenses: corrupt rbac.db (non-null, closed) → #1717 fail closed",
-          "[mcp][sle]") {
+          "[mcp][sle][pg]") {
     // The OTHER arm of the #1717 guard (`rbac_store && rbac_store->is_open()`):
     // the sibling test above leaves the store null; this one hands the twin a
-    // NON-NULL store whose backing file is garbage bytes, so sqlite3_open_v2
-    // succeeds but the schema migration hits SQLITE_NOTADB and RbacStore
-    // closes db_ — the literal #1717 corrupt-but-openable scenario. Both arms
-    // collapse into one boolean today, so only this case would catch a future
-    // null-prefix refactor (`if (rbac_store && ...)`) breaking the corrupt
-    // arm (#2104).
-    yuzu::test::TempDbFile db{"yuzu_test_mcp_rbac_corrupt-"};
-    {
-        // NON-empty garbage: SQLite treats a zero-byte file as a valid fresh
-        // database, which would open cleanly and defeat the test.
-        std::ofstream f(db.path, std::ios::binary | std::ios::trunc);
-        REQUIRE(f.is_open());
-        f << "not a valid sqlite database";
-    }
-    yuzu::server::RbacStore broken(db.path);
+    // NON-NULL store whose backing substrate never connects, so is_open()
+    // stays false — the PG analogue of the #1717 corrupt-but-openable
+    // scenario (an unroutable DSN leaves migration never having run). Both
+    // arms collapse into one boolean today, so only this case would catch a
+    // future null-prefix refactor (`if (rbac_store && ...)`) breaking the
+    // unusable-but-non-null arm (#2104).
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore broken{bad_pool};
     REQUIRE_FALSE(broken.is_open());
 
     McpTestServer ts;
@@ -5974,8 +5990,11 @@ TEST_CASE("MCP query_software_licenses: corrupt rbac.db (non-null, closed) → #
     CHECK(saw_failure);
 }
 
-TEST_CASE("MCP query_software_licenses: missing agent_id → invalid params", "[mcp][sle]") {
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+TEST_CASE("MCP query_software_licenses: missing agent_id → invalid params", "[mcp][sle][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool}; // open ⇒ #1717 guard passes
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -5993,12 +6012,15 @@ TEST_CASE("MCP query_software_licenses: missing agent_id → invalid params", "[
 }
 
 TEST_CASE("MCP query_software_licenses: out-of-scope agent is 403'd by the scoped gate",
-          "[mcp][sle]") {
+          "[mcp][sle][pg]") {
     // The per-device confinement (ADR-0017): a group-scoped operator reading an agent
     // OUTSIDE their management group is 403'd by the same scoped gate the REST drill
     // takes — the licence facts are never served, and no store read is attempted.
     std::vector<std::string> calls;
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool}; // open ⇒ #1717 guard passes
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -6025,10 +6047,14 @@ TEST_CASE("MCP query_software_licenses: out-of-scope agent is 403'd by the scope
     CHECK(res->body.find("store unavailable") == std::string::npos);
 }
 
-TEST_CASE("MCP query_software_licenses: store unavailable → A4 internal error", "[mcp][sle]") {
+TEST_CASE("MCP query_software_licenses: store unavailable → A4 internal error",
+          "[mcp][sle][pg]") {
     // Scope gate PASSES (in-scope agent) but no store is configured on this deployment.
     // The twin must return the A4 error envelope, never success+empty.
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool}; // open ⇒ #1717 guard passes
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -6065,7 +6091,7 @@ TEST_CASE("MCP query_software_licenses: success shape + user_ref/user_scope OMIT
     REQUIRE(store.is_open());
     REQUIRE(store.replace_agent_licenses("agent-in", {sle_pii_row()}, "rawhash-1", "hash"));
 
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    yuzu::server::RbacStore rbac{pool}; // open ⇒ #1717 guard passes (shares the SLE pool)
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -6126,7 +6152,7 @@ TEST_CASE("MCP query_software_licenses: a degraded store errors, never success+[
         REQUIRE(drop.status() == PGRES_COMMAND_OK);
     }
 
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    yuzu::server::RbacStore rbac{pool}; // open ⇒ #1717 guard passes (shares the SLE pool)
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -6168,7 +6194,7 @@ TEST_CASE("MCP query_software_licenses: dropped audit row surfaces audit_persist
     REQUIRE(store.is_open());
     REQUIRE(store.replace_agent_licenses("agent-in", {sle_pii_row()}, "rawhash-1", "hash"));
 
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    yuzu::server::RbacStore rbac{pool}; // open ⇒ #1717 guard passes (shares the SLE pool)
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -6213,7 +6239,7 @@ TEST_CASE("MCP query_software_licenses: throwing audit_fn is caught → audit_pe
     REQUIRE(store.is_open());
     REQUIRE(store.replace_agent_licenses("agent-in", {sle_pii_row()}, "rawhash-1", "hash"));
 
-    yuzu::server::RbacStore rbac(":memory:");
+    yuzu::server::RbacStore rbac{pool}; // shares the SLE pool
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;

@@ -65,6 +65,14 @@ public:
     [[nodiscard]] EnginePrincipalStore* get() const noexcept { return store_.get(); }
     EnginePrincipalStore* operator->() const noexcept { return store_.get(); }
 
+    /// Direct access to the pool backing this store — this class builds a
+    /// fresh, per-instance clone database (unlike the shared/process-wide
+    /// EnginePrincipalStorePg variants in test_engine_principal_integration.cpp
+    /// / test_engine_principal_lifecycle.cpp), so it's safe for a sibling
+    /// store (RbacStore, below) to coexist on the SAME pool/database without
+    /// any cross-TEST_CASE contamination risk.
+    [[nodiscard]] yuzu::server::pg::PgPool& pool() noexcept { return *pool_; }
+
 private:
     std::optional<yuzu::test::PostgresTestDb> db_;
     std::optional<yuzu::server::pg::PgPool> pool_;
@@ -72,9 +80,12 @@ private:
 };
 
 struct McpEngineRolesHarness {
-    yuzu::test::TempDbFile rbac_db_file{"yuzu_test_mcp_engine_roles_rbac-"};
-    RbacStore rbac_store{rbac_db_file.path};
+    // engine_store declared FIRST: rbac_store's default member initializer
+    // constructs it on engine_store's pool (both stores' schemas coexist in
+    // that one fresh-per-instance database), and reverse-declaration-order
+    // destruction then closes rbac_store before engine_store's pool goes away.
     EnginePrincipalStorePg engine_store;
+    RbacStore rbac_store{engine_store.pool()};
 
     bool read_only_mode{false};
     bool mcp_disabled{false};

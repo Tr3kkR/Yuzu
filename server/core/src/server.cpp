@@ -3111,10 +3111,35 @@ public:
             }
         }
 
-        // Initialize Phase 3: Security & RBAC stores
-        {
-            auto rbac_db = cfg_.db_dir() / "rbac.db";
-            rbac_store_ = std::make_unique<RbacStore>(rbac_db);
+        // Initialize Phase 3: Security & RBAC stores (PostgreSQL, ADR-0041).
+        // The authorization substrate — construction fail-closed (ADR-0007): a
+        // failed open/migration refuses boot rather than serve with authz off.
+        // `migrate_from_sqlite` runs the MANDATORY one-time legacy-`rbac.db`
+        // backfill (ADR-0009/0041) — a failure there is ALSO fatal (never serve
+        // on top of a partially-migrated authorization config; losing a grant or
+        // the enabled flag is a fleet-wide authorization change nobody authored).
+        if (pg_pool_ && !startup_failed_) {
+            rbac_store_ = std::make_unique<RbacStore>(*pg_pool_);
+            if (!rbac_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: RbacStore (authorization substrate) "
+                              "migration/open failed — fail-closed (ADR-0007/0041)");
+                startup_failed_ = true;
+            } else {
+                rbac_store_->set_metrics(&metrics_);
+                auto rbac_db = cfg_.db_dir() / "rbac.db";
+                if (!rbac_store_->migrate_from_sqlite(rbac_db)) {
+                    spdlog::error("[PG] Refusing to start: RbacStore legacy-SQLite backfill from {} "
+                                  "failed (see prior log lines) — the authorization substrate is "
+                                  "authoritative and must not serve partially-migrated grants or a "
+                                  "lost rbac_enabled flag (mandatory backfill, ADR-0009/0041)",
+                                  rbac_db.string());
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("RbacStore initialized (schema rbac_store; legacy backfill source "
+                                 "{})",
+                                 rbac_db.string());
+                }
+            }
         }
 
         // Engine-principal namespace collision-scan preflight (design doc
@@ -5237,6 +5262,16 @@ public:
         // thread that leased it is already joined above; every HTTP/gRPC handler
         // holding the raw pointer is quiesced by the drains above.
         result_set_store_.reset();
+        // RbacStore (authorization substrate, ADR-0041) borrows pg_pool_ — drop
+        // before the pool. Every HTTP/gRPC/MCP handler holding the raw pointer is
+        // quiesced by the drains above; the ManagementGroupStore's
+        // set_rbac_enabled_probe captures `this` and reads rbac_store_.get() only
+        // at request time, so after the drains a now-null pointer is never
+        // dereferenced, and rbac_enforcement_in_effect(nullptr) fails CLOSED
+        // regardless. (Its declaration precedes mgmt_group_store_ so pure
+        // destruction order is also safe — this proactive reset keeps stop()'s
+        // destruct-before-pool discipline explicit.)
+        rbac_store_.reset();
         // Auth substrate (ADR-0006/0010) — destruct-before-pool, and in
         // dependency order. AuthDB owns a background reaper thread
         // (cleanup_provisional_mfa) that leases pg_pool_ via
@@ -7313,6 +7348,11 @@ private:
             bool inventory_ok = inventory_store_ && inventory_store_->is_open();
             // Load-bearing for the MCP write surface + REST approvals (sre-BLOCKING-1).
             bool approval_ok = approval_manager_ && approval_manager_->is_open();
+            // RbacStore (authorization substrate, ADR-0041) — now born-on-PG and
+            // load-bearing for every RBAC/authz check. It was in /readyz but not
+            // here; a degraded rbac_store fails authz reads CLOSED (denies), so a
+            // "healthy" report over a dead authz store would be misleading.
+            bool rbac_ok = rbac_store_ && rbac_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -7320,7 +7360,7 @@ private:
                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
-                approval_ok;
+                approval_ok && rbac_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -7343,7 +7383,8 @@ private:
                   {"app_perf_daily_store", app_perf_daily_ok ? "ok" : "error"},
                   {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"},
                   {"device_inventory_store", device_inventory_ok ? "ok" : "error"},
-                  {"inventory_store", inventory_ok ? "ok" : "error"}}},
+                  {"inventory_store", inventory_ok ? "ok" : "error"},
+                  {"rbac_store", rbac_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.

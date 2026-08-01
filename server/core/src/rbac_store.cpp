@@ -1,9 +1,16 @@
 #include "rbac_store.hpp"
 
 #include "management_group_store.hpp"
-#include "migration_runner.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_migration_runner.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "sqlite_raii.hpp"
+#include "utf8_sanitize.hpp"
 
+#include <yuzu/metrics.hpp>
+
+#include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
@@ -11,8 +18,11 @@
 #include <array>
 #include <cctype>
 #include <chrono>
-#include <shared_mutex>
+#include <cstring>
+#include <functional>
+#include <optional>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -21,36 +31,33 @@ namespace yuzu::server {
 
 namespace {
 
-/// Single source of truth for the identity-provider `source` values
-/// `reconcile_idp_memberships` / `namespaced_group_name` recognize. Adding a
-/// future IdP (e.g. "okta") here is the ONLY edit required to also reserve
-/// its `okta:` prefix from local-group creation below — `kReservedIdpPrefixes`
-/// is derived from this list, never maintained as a second parallel array.
-/// #1832 hardening sec-L2.
+constexpr const char* kStoreName = "rbac_store";
+
+// Bounded acquires (ADR-0012 §2(a)). Reads back interactive REST/dashboard/MCP
+// callers; writes get a slightly wider budget. Backfill runs single-threaded at
+// construction before serving, so a wide deadline is fine.
+constexpr std::chrono::milliseconds kReadTimeout{2000};
+constexpr std::chrono::milliseconds kWriteTimeout{4000};
+constexpr std::chrono::milliseconds kBackfillTxnTimeout{60000};
+
+// Cross-replica permission-cache coherence (ADR-0041): re-validate the durable
+// generation token at most this often on the read hot path.
+constexpr std::int64_t kRbacGenerationRefreshMs = 1000;
+
+// Read-degrade reason labels (ADR-0037 convention). A !open_ store fails boot
+// closed (never serves), so only the pool-timeout / query-error hot-path
+// degrades are counted here.
+constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
+constexpr const char* kReasonQueryError = "query_error";
+constexpr std::uint64_t kReadDegradeLogSample = 100;
+constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
+
+// ── IdP / engine namespace guards (ported verbatim from the SQLite store) ────
+
 constexpr std::array<std::string_view, 3> kRecognizedIdpSources = {"entra", "saml", "ad"};
-
-/// "local:" is reserved too even though "local" itself is never a
-/// `reconcile_idp_memberships` source (rejected outright — see UP-6 below):
-/// a local group literally named "local:x" is confusing enough to preclude
-/// pre-emptively, and doing so costs nothing.
 constexpr std::string_view kLocalPrefix = "local:";
-
-/// The reserved engine-principal namespace (auth-engine-principals design
-/// §3.3 / decision log #3). Deliberately NOT folded into
-/// `kRecognizedIdpSources` above: "engine" is not an identity-provider
-/// source — no engine-principal role assignment is ever asserted via
-/// `reconcile_idp_memberships`, and adding it to that array would wrongly
-/// imply otherwise. Kept as its own guard instead, same shape as
-/// `kLocalPrefix`. Also reused by `RbacStore::validate_assignment` below —
-/// single literal, not re-derived per call site.
 constexpr std::string_view kEnginePrefix = "engine:";
 
-/// A `source=='local'` group create is rejected if `name` starts with one of
-/// `kRecognizedIdpSources` + ':' (or `kLocalPrefix`/`kEnginePrefix`) — it
-/// would otherwise be indistinguishable from (and could be used to pre-seed
-/// roles for) a same-named IdP group, or collide with the reserved engine
-/// namespace (§3.3: "the same rejection applies to locally created RBAC
-/// group names"). #1832; engine reservation is PR 4.2.
 bool has_reserved_idp_prefix(std::string_view name) {
     if (name.size() >= kLocalPrefix.size() && name.compare(0, kLocalPrefix.size(), kLocalPrefix) == 0)
         return true;
@@ -65,50 +72,175 @@ bool has_reserved_idp_prefix(std::string_view name) {
     return false;
 }
 
-/// Whitespace-only or empty (UP-9 input validation) — an asserted IdP group
-/// entry with a blank `external_id` would otherwise create a garbage
-/// `<source>:` or `<source>:   ` group row.
 bool is_blank(std::string_view s) {
     for (unsigned char c : s) {
         if (!std::isspace(c))
             return false;
     }
-    return true; // empty also counts as blank
+    return true;
 }
 
-/// Upper bound on a single asserted `external_id`'s length. Generous relative
-/// to any real IdP group-id format (Entra object IDs are 36-char GUIDs); this
-/// is defense-in-depth against a malformed/hostile assertion, not a format
-/// constraint. #1832 hardening UP-9.
 constexpr size_t kMaxExternalIdLength = 512;
 
 /// Built-in role names an engine-principal assignment must never receive —
 /// `RbacStore::validate_assignment`'s "no admin, ever" bar (design §4.2).
-/// "Administrator" is RBAC's own full-access system role, seeded below with
-/// description "Full access to all operations" and granted CRUD across
-/// every securable type in `seed_defaults()`; it is also the RBAC-role name
-/// legacy `auth::Role::admin` is displayed/mapped as at every existing
-/// legacy-role↔RBAC-role site (e.g. `session->role == auth::Role::admin ?
-/// "Administrator" : "Viewer"` in rest_api_v1.cpp/server.cpp), so barring
-/// this one name closes both "the admin legacy role" and "any built-in
-/// wildcard role" from §4.2 — today there is exactly one built-in
-/// (`is_system`) role that is provably unrestricted. The literal "admin" is
-/// barred too, as defense-in-depth against a caller ever threading the raw
-/// legacy role string through this path instead of an RBAC role name.
-/// EXTEND this set — never fork a second bar elsewhere (matches the
-/// `dangerous_enforce_in_spec` single-chokepoint pattern used for Guardian's
-/// analogous enforce-promotion bar) — if a future built-in role is ever
-/// seeded with comparably unrestricted access. Decision log #13 additionally
-/// names an independent auditor-runnable verification query (PR 4.3/4.4) so
-/// this write-path bar is never the sole evidence of the invariant.
-///
-/// "Elevation-eligibility role" (§4.2's third bar) has no entry here: JIT
-/// elevation eligibility is the per-user `users.elevation_eligible` column
-/// (auth_db.cpp) — it has no RBAC-role representation to reject, and an
-/// engine principal is never a `users` table row in the first place
-/// (`EnginePrincipalStore` is a separate substrate), so the bar is
-/// structurally satisfied without a check here.
+/// EXTEND this set — never fork a second bar elsewhere.
 constexpr std::array<std::string_view, 2> kEngineDisallowedRoles = {"admin", "Administrator"};
+
+std::int64_t now_secs() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+std::int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+std::int64_t to_i64(const char* s) {
+    if (s == nullptr || s[0] == '\0')
+        return 0;
+    return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
+}
+std::uint64_t to_u64(const char* s) {
+    if (s == nullptr || s[0] == '\0')
+        return 0;
+    return static_cast<std::uint64_t>(std::strtoull(s, nullptr, 10));
+}
+bool to_bool(const char* s) { return s != nullptr && (s[0] == 't' || s[0] == 'T' || s[0] == '1'); }
+
+std::string text_col(PGresult* res, int row, int col) {
+    if (PQgetisnull(res, row, col))
+        return {};
+    return std::string(PQgetvalue(res, row, col),
+                       static_cast<std::size_t>(PQgetlength(res, row, col)));
+}
+
+// sanitize_utf8_strict scrubs invalid UTF-8 to U+FFFD but keeps embedded NUL (a
+// valid ASCII byte). PostgreSQL TEXT cannot store a NUL and libpq's text-format
+// bind C-string-truncates at the first one. So after the UTF-8 scrub, replace
+// every NUL with U+FFFD too. Ported verbatim from audit_store.cpp (ADR-0040) —
+// applied to every free-text column, INCLUDING the backfill path (a bad byte
+// at-rest in a legacy rbac.db must not brick the MANDATORY backfill).
+std::string sanitize_pg_text(std::string_view s) {
+    std::string out = sanitize_utf8_strict(s);
+    std::size_t pos = 0;
+    while ((pos = out.find('\0', pos)) != std::string::npos) {
+        out.replace(pos, 1, "\xEF\xBF\xBD");
+        pos += 3;
+    }
+    return out;
+}
+
+// ── Read-degrade observability (mirrors AuditStore/InventoryStore) ───────────
+struct DegradeSampler {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::int64_t> last_ts{0};
+};
+
+bool note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason, DegradeSampler& s) {
+    if (metrics)
+        metrics->counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}}).increment();
+    const std::int64_t now = now_secs();
+    const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
+    const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool new_episode = prev == 0 || (now - prev) > kDegradeEpisodeGapSecs;
+    return new_episode || (n % kReadDegradeLogSample) == 0;
+}
+
+// ── PostgreSQL schema (ADR-0041): the final column set of the SQLite store's
+// four migrations, collapsed into one v1. Migrations v3/v4 were data cleanups
+// against a live rbac.db — a fresh PG database needs neither (nothing to clean),
+// and backfill copies an already-cleaned legacy DB, so they are not replayed.
+// Unqualified DDL — the runner sets search_path to `rbac_store`; runtime
+// statements below schema-qualify explicitly. `is_system` is BOOLEAN in PG.
+const std::vector<pg::PgMigration>& migrations() {
+    static const std::vector<pg::PgMigration> kMigrations = {
+        {1, R"(
+            CREATE TABLE securable_types (
+                name        TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                is_system   BOOLEAN NOT NULL DEFAULT FALSE
+            );
+
+            CREATE TABLE operations (
+                id          TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                is_system   BOOLEAN NOT NULL DEFAULT FALSE
+            );
+
+            CREATE TABLE roles (
+                name        TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                is_system   BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at  BIGINT NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE role_permissions (
+                role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
+                securable_type  TEXT NOT NULL REFERENCES securable_types(name),
+                operation       TEXT NOT NULL REFERENCES operations(id),
+                effect          TEXT NOT NULL DEFAULT 'allow',
+                PRIMARY KEY (role_name, securable_type, operation)
+            );
+
+            CREATE TABLE principal_roles (
+                principal_type  TEXT NOT NULL,
+                principal_id    TEXT NOT NULL,
+                role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
+                PRIMARY KEY (principal_type, principal_id, role_name)
+            );
+            CREATE INDEX idx_principal_roles_lookup
+                ON principal_roles(principal_type, principal_id);
+
+            CREATE TABLE groups (
+                name        TEXT PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                source      TEXT NOT NULL DEFAULT 'local',
+                external_id TEXT,
+                created_at  BIGINT NOT NULL DEFAULT 0
+            );
+            CREATE INDEX idx_groups_source ON groups(source);
+
+            CREATE TABLE group_members (
+                group_name  TEXT NOT NULL REFERENCES groups(name) ON DELETE CASCADE,
+                username    TEXT NOT NULL,
+                PRIMARY KEY (group_name, username)
+            );
+            CREATE INDEX idx_group_members_username ON group_members(username);
+
+            -- Durable k/v (ADR-0041): the global `rbac_enabled` flag AND the
+            -- cross-replica `write_generation` counter (bumped in the same txn
+            -- as every mutation), plus the one-time `backfill_complete` marker.
+            CREATE TABLE rbac_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+        )"},
+    };
+    return kMigrations;
+}
+
+// ── Legacy (SQLite) introspection for the backfill ───────────────────────────
+bool legacy_has_table(sqlite3* db, const char* table) {
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", -1,
+                           s.addr(), nullptr) != SQLITE_OK)
+        return false;
+    sqlite3_bind_text(s.get(), 1, table, -1, SQLITE_STATIC);
+    return sqlite3_step(s.get()) == SQLITE_ROW;
+}
+
+std::string sqlite_text(sqlite3_stmt* s, int col) {
+    const auto* v = sqlite3_column_text(s, col);
+    return v ? std::string(reinterpret_cast<const char*>(v),
+                           static_cast<std::size_t>(sqlite3_column_bytes(s, col)))
+             : std::string{};
+}
+
+// Bind the SQL boolean literal for a legacy INTEGER is_system value.
+const char* bool_lit(std::int64_t v) { return v != 0 ? "true" : "false"; }
 
 } // namespace
 
@@ -120,647 +252,310 @@ std::string namespaced_group_name(const std::string& source, const std::string& 
 
 // ── Construction / teardown ──────────────────────────────────────────────────
 
-RbacStore::RbacStore(const std::filesystem::path& db_path) {
-    int rc = sqlite3_open_v2(db_path.string().c_str(), &db_,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                             nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("RbacStore: failed to open {}: {}", db_path.string(), sqlite3_errmsg(db_));
-        if (db_) {
-            sqlite3_close(db_);
-            db_ = nullptr;
-        }
+RbacStore::RbacStore(pg::PgPool& pool) : pool_(pool) {
+    auto lease = pool_.acquire();
+    if (!lease) {
+        spdlog::error("RbacStore: no database connection at construction ({}) — authorization "
+                      "substrate disabled (fail-closed: every authz read will DENY)",
+                      pool_.last_error());
         return;
     }
-
-    sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db_, "PRAGMA foreign_keys=ON;", nullptr, nullptr, nullptr);
-    create_tables();
-    if (!db_)
+    if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
+        spdlog::error("RbacStore: schema migration failed — authorization substrate disabled "
+                      "(fail-closed)");
         return;
+    }
+    lease.reset(); // seed_defaults/load_enabled_flag re-acquire their own leases
+    open_ = true;
     seed_defaults();
     load_enabled_flag();
-    spdlog::info("RbacStore: opened {}", db_path.string());
+    spdlog::info("RbacStore initialized (schema {})", kStoreName);
 }
 
-RbacStore::~RbacStore() {
-    if (db_)
-        sqlite3_close(db_);
-}
+RbacStore::~RbacStore() = default;
 
-bool RbacStore::is_open() const {
-    return db_ != nullptr;
-}
-
-// ── DDL ──────────────────────────────────────────────────────────────────────
-
-void RbacStore::create_tables() {
-    static const std::vector<Migration> kMigrations = {
-        {1, R"(
-            CREATE TABLE IF NOT EXISTS securable_types (
-                name        TEXT PRIMARY KEY,
-                description TEXT NOT NULL DEFAULT '',
-                is_system   INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS operations (
-                id          TEXT PRIMARY KEY,
-                description TEXT NOT NULL DEFAULT '',
-                is_system   INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS roles (
-                name        TEXT PRIMARY KEY,
-                description TEXT NOT NULL DEFAULT '',
-                is_system   INTEGER NOT NULL DEFAULT 0,
-                created_at  INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS role_permissions (
-                role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
-                securable_type  TEXT NOT NULL REFERENCES securable_types(name),
-                operation       TEXT NOT NULL REFERENCES operations(id),
-                effect          TEXT NOT NULL DEFAULT 'allow',
-                PRIMARY KEY (role_name, securable_type, operation)
-            );
-
-            CREATE TABLE IF NOT EXISTS principal_roles (
-                principal_type  TEXT NOT NULL,
-                principal_id    TEXT NOT NULL,
-                role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
-                PRIMARY KEY (principal_type, principal_id, role_name)
-            );
-            CREATE INDEX IF NOT EXISTS idx_principal_roles_lookup
-                ON principal_roles(principal_type, principal_id);
-
-            CREATE TABLE IF NOT EXISTS groups (
-                name        TEXT PRIMARY KEY,
-                description TEXT NOT NULL DEFAULT '',
-                source      TEXT NOT NULL DEFAULT 'local',
-                external_id TEXT,
-                created_at  INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS group_members (
-                group_name  TEXT NOT NULL REFERENCES groups(name) ON DELETE CASCADE,
-                username    TEXT NOT NULL,
-                PRIMARY KEY (group_name, username)
-            );
-
-            CREATE TABLE IF NOT EXISTS rbac_config (
-                key     TEXT PRIMARY KEY,
-                value   TEXT NOT NULL
-            );
-        )"},
-        // #1832 — additive only: no PK/schema change, no data rewrite. Speeds
-        // up reconcile_idp_memberships' source-scoped lookups (the stale-
-        // membership DELETE's `groups WHERE source = ?` subquery and the
-        // per-login `group_members WHERE username = ?` scans), which now run
-        // on every OIDC/SAML login rather than only from the admin UI.
-        {2, R"(
-            CREATE INDEX IF NOT EXISTS idx_groups_source ON groups(source);
-            CREATE INDEX IF NOT EXISTS idx_group_members_username ON group_members(username);
-        )"},
-        // #1837 — purge orphaned display-name-keyed IdP memberships. Before
-        // this migration, OIDC-sourced `group_members` rows were keyed on
-        // the (mutable) display name; SSO sessions now key on the stable
-        // `oidc:<iss>#<sub>` principal instead (auth.cpp
-        // create_oidc_session). Left in place, these rows would become BOTH
-        // orphaned (never re-referenced by the new stable-keyed principal)
-        // AND a resurrected confused-deputy hazard: a LOCAL user who
-        // happens to share the old display name would silently inherit
-        // whatever roles the stale IdP-sourced group grants. Deleting every
-        // `group_members` row whose group is IdP-sourced (`groups.source !=
-        // 'local'`) is additive/safe — it only removes membership rows;
-        // `groups`/`roles`/`role_permissions`/local memberships are
-        // untouched, and IdP membership re-populates (under the new stable
-        // key) on the user's next SSO login via `reconcile_idp_memberships`.
-        {3, R"(
-            DELETE FROM group_members
-            WHERE group_name IN (SELECT name FROM groups WHERE source != 'local');
-        )"},
-        // Periodic Access Reviews (#2324 review round) — retire the
-        // now-superseded AuditLog:Read/AuditLog:Attest grants an earlier
-        // (pre-fix) version of this PR seeded for access-review gating,
-        // now replaced by the dedicated AccessReview securable. `INSERT OR
-        // IGNORE` in `seed_defaults()` only ever ADDS rows, so a dev/UAT
-        // rbac.db that was seeded under the earlier scheme would otherwise
-        // keep these three retired grants forever — a Reviewer created
-        // before the flip would still carry the live AuditLog:Read op that
-        // a fresh-install Reviewer never gets, and Administrator would
-        // carry a stray AuditLog:Attest op that was only ever added for
-        // this feature. Scoped to EXACTLY these three (role, securable,
-        // operation) tuples — Administrator's other AuditLog ops
-        // (Read/Write/Delete/etc.) and every other role's AuditLog:Read
-        // (Operator/PlatformEngineer/Viewer — unrelated, still legitimate)
-        // are untouched. Safe no-op on a fresh DB (rows never existed).
-        // One-way cleanup: like any data migration it is version-gated and
-        // runs exactly once, but restoring a pre-v4 backup and re-booting
-        // re-applies it — so an operator who DELIBERATELY re-grants one of
-        // these three tuples (e.g. Reviewer:AuditLog:Read to let reviewers
-        // also browse the audit trail) after v4 has run keeps it, but would
-        // lose it on such a restore. That grant belongs on a separate role
-        // or a distinct securable, not these retired access-review tuples.
-        {4, R"(
-            DELETE FROM role_permissions
-            WHERE (role_name, securable_type, operation) IN (
-                ('Administrator', 'AuditLog', 'Attest'),
-                ('Reviewer', 'AuditLog', 'Read'),
-                ('Reviewer', 'AuditLog', 'Attest')
-            );
-        )"},
-    };
-    if (!MigrationRunner::run(db_, "rbac_store", kMigrations)) {
-        spdlog::error("RbacStore: schema migration failed, closing database");
-        sqlite3_close(db_);
-        db_ = nullptr;
-    }
-}
-
-// ── Seed data ────────────────────────────────────────────────────────────────
+// ── Seed data (idempotent — ON CONFLICT DO NOTHING) ──────────────────────────
 
 void RbacStore::seed_defaults() {
-    if (!db_)
+    if (!open_)
         return;
-
-    // Config default
-    sqlite3_exec(db_, "INSERT OR IGNORE INTO rbac_config VALUES ('enabled', 'false');", nullptr,
-                 nullptr, nullptr);
-
-    // Securable types
-    const char* types[] = {"Infrastructure",
-                           "UserManagement",
-                           "InstructionDefinition",
-                           "InstructionSet",
-                           "Execution",
-                           "Schedule",
-                           "Approval",
-                           "Tag",
-                           "AuditLog",
-                           "Response",
-                           "ManagementGroup",
-                           "ApiToken",
-                           "Security",
-                           "Policy",
-                           "DeviceToken",
-                           "SoftwareDeployment",
-                           "License",
-                           "FileRetrieval",
-                           "GuaranteedState",
-                           "Inventory",
-                           // Periodic Access Reviews (SOC 2 CC6.2): dedicated narrow
-                           // securable for the fleet-wide grant export + attestation-
-                           // campaign lifecycle — deliberately separate from AuditLog so
-                           // AuditLog:Read holders (e.g. Operator, PlatformEngineer) do
-                           // NOT also get the grant-graph export. Seeded to
-                           // Administrator (via the CRUD loop below) + the Reviewer role
-                           // (Read + Attest, see the explicit grants further down).
-                           "AccessReview",
-                           // SLE (ADR-0024 Decision 9). DISTINCT from the existing
-                           // `License` securable (Yuzu's OWN product licence, §22.3) —
-                           // this gates the /api/v1/sle/* discovery reads + the erasure
-                           // DELETE. (No SLE page ships yet — ADR-0024 D9 places the
-                           // Licences view in-server, but it is not built; the compliance
-                           // sub-views are the SAM UCE module's.) Seeding it here
-                           // also grants Administrator full CRUD via the loop below.
-                           "SoftwareLicensing"};
-    for (auto* t : types) {
-        sqlite3_stmt* s = nullptr;
-        sqlite3_prepare_v2(db_,
-                           "INSERT OR IGNORE INTO securable_types (name, is_system) VALUES (?, 1);",
-                           -1, &s, nullptr);
-        sqlite3_bind_text(s, 1, t, -1, SQLITE_TRANSIENT);
-        sqlite3_step(s);
-        sqlite3_finalize(s);
+    auto lease = pool_.acquire();
+    if (!lease) {
+        spdlog::error("RbacStore: seed_defaults: no connection ({})", pool_.last_error());
+        return;
     }
-    // R18 (ADR-0024 Decision 9): the SoftwareLicensing securable's seeded
-    // description DEFUSES its name — it does NOT gate the /inventory installed-
-    // software catalog (that stays under Inventory:Read). Set it when empty (a
-    // fresh boot inserts the row above with an empty description; an upgrade
-    // inserts the new type fresh) — `AND description = ''` keeps this idempotent
-    // and never clobbers an operator-set value, matching the INSERT OR IGNORE
-    // seed-once posture of the rest of seed_defaults().
-    sqlite3_exec(db_,
-                 "UPDATE securable_types SET description = "
-                 "'gates the /api/v1/sle/* detected-licence reads and the agent-decommission "
-                 "erasure; the /inventory software catalog "
-                 "remains under Inventory:Read' "
-                 "WHERE name = 'SoftwareLicensing' AND description = '';",
-                 nullptr, nullptr, nullptr);
+    PGconn* c = lease.get();
 
-    // Operations. "Push" is Guardian-specific — distributes a rule set to
-    // scoped agents (design doc §9.2). It is a first-class operation in
-    // the catalogue (every role can be granted Push explicitly) but the
-    // Administrator and ITServiceOwner cross-type seed loops below use
-    // `crud_ops` (no Push) so future handlers that accidentally check
-    // `perm_fn(..., "Push")` on a non-Guardian securable do not silently
-    // succeed against a seeded allow. Only the Guardian REST handlers
-    // consult Push; grant it explicitly per role and per type.
-    //
-    // "Attest" is Periodic-Access-Review-specific (SOC 2 CC6.2) — recording a
-    // reviewer's attested/flagged-revoke decision on an access-review
-    // campaign row. Same treatment as Push: a first-class operation in the
-    // catalogue, but deliberately EXCLUDED from `crud_ops` so the
-    // Administrator/ITServiceOwner/Viewer cross-type loops below never widen
-    // it onto an unrelated securable — it is granted explicitly, only on
-    // AccessReview, only to Administrator and the new Reviewer role.
-    const char* ops[] = {"Read", "Write", "Execute", "Delete", "Approve", "Push", "Attest"};
-    const char* crud_ops[] = {"Read", "Write", "Execute", "Delete", "Approve"};
-    for (auto* o : ops) {
-        sqlite3_stmt* s = nullptr;
-        sqlite3_prepare_v2(db_, "INSERT OR IGNORE INTO operations (id, is_system) VALUES (?, 1);",
-                           -1, &s, nullptr);
-        sqlite3_bind_text(s, 1, o, -1, SQLITE_TRANSIENT);
-        sqlite3_step(s);
-        sqlite3_finalize(s);
-    }
-
-    auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                   std::chrono::system_clock::now().time_since_epoch())
-                   .count();
-
-    // Built-in roles
-    struct RoleSeed {
-        const char* name;
-        const char* desc;
+    const auto exec = [&](const char* sql,
+                          const std::vector<std::string>& params = {}) -> bool {
+        pg::PgResult r = pg::exec_params(c, sql, params);
+        if (!r.ok()) {
+            spdlog::error("RbacStore: seed_defaults statement failed: {}", PQerrorMessage(c));
+            return false;
+        }
+        return true;
     };
-    RoleSeed roles[] = {
-        {"Administrator", "Full access to all operations"},
+
+    // Durable meta defaults — never clobber a migrated value (DO NOTHING).
+    exec("INSERT INTO rbac_store.rbac_meta (key, value) VALUES ('rbac_enabled','false') "
+         "ON CONFLICT (key) DO NOTHING");
+    exec("INSERT INTO rbac_store.rbac_meta (key, value) VALUES ('write_generation','0') "
+         "ON CONFLICT (key) DO NOTHING");
+
+    // Securable types.
+    const std::array<std::string_view, 22> types = {
+        "Infrastructure",  "UserManagement",  "InstructionDefinition",
+        "InstructionSet",  "Execution",       "Schedule",
+        "Approval",        "Tag",             "AuditLog",
+        "Response",        "ManagementGroup", "ApiToken",
+        "Security",        "Policy",          "DeviceToken",
+        "SoftwareDeployment", "License",      "FileRetrieval",
+        "GuaranteedState", "Inventory",       "AccessReview",
+        "SoftwareLicensing"};
+    for (auto t : types)
+        exec("INSERT INTO rbac_store.securable_types (name, is_system) VALUES ($1, TRUE) "
+             "ON CONFLICT (name) DO NOTHING",
+             {std::string(t)});
+    // R18 (ADR-0024 Decision 9): defuse the SoftwareLicensing name (does NOT
+    // gate the /inventory catalog). Set only when empty — never clobber an
+    // operator-set value.
+    exec("UPDATE rbac_store.securable_types SET description = "
+         "'gates the /api/v1/sle/* detected-licence reads and the agent-decommission erasure; "
+         "the /inventory software catalog remains under Inventory:Read' "
+         "WHERE name = 'SoftwareLicensing' AND description = ''");
+
+    // Operations.
+    const std::array<std::string_view, 7> ops = {"Read",    "Write", "Execute", "Delete",
+                                                 "Approve", "Push",  "Attest"};
+    for (auto o : ops)
+        exec("INSERT INTO rbac_store.operations (id, is_system) VALUES ($1, TRUE) "
+             "ON CONFLICT (id) DO NOTHING",
+             {std::string(o)});
+    const std::array<std::string_view, 5> crud_ops = {"Read", "Write", "Execute", "Delete",
+                                                      "Approve"};
+
+    const std::int64_t now = now_secs();
+
+    struct RoleSeed {
+        std::string_view name;
+        std::string_view desc;
+    };
+    const std::array<RoleSeed, 7> roles = {
+        RoleSeed{"Administrator", "Full access to all operations"},
         {"PlatformEngineer", "Author and manage YAML instruction definitions, sets, and schemas"},
         {"Operator", "Execute and manage instructions, schedules, and tags"},
         {"ApiTokenManager", "Create, revoke, and manage API tokens for programmatic access"},
         {"ITServiceOwner", "Admin control over devices tagged with the same IT Service"},
         {"Viewer", "Read-only access to operational data"},
-        // Periodic Access Reviews (SOC 2 CC6.2): a reviewer who can read the
-        // grant-graph evidence and record attestation decisions on an
-        // access-review campaign, without holding any of Administrator's
-        // broader write access. AccessReview:Read + AccessReview:Attest only
-        // — see the grants below.
-        {"Reviewer", "Read audit evidence and attest/flag access-review grants (SOC 2 CC6.2)"},
+        {"Reviewer", "Read audit evidence and attest/flag access-review grants (SOC 2 CC6.2)"}};
+    for (const auto& r : roles)
+        exec("INSERT INTO rbac_store.roles (name, description, is_system, created_at) "
+             "VALUES ($1, $2, TRUE, $3::bigint) ON CONFLICT (name) DO NOTHING",
+             {std::string(r.name), std::string(r.desc), std::to_string(now)});
+
+    const auto grant = [&](std::string_view role, std::string_view type, std::string_view op) {
+        exec("INSERT INTO rbac_store.role_permissions (role_name, securable_type, operation, "
+             "effect) VALUES ($1, $2, $3, 'allow') ON CONFLICT DO NOTHING",
+             {std::string(role), std::string(type), std::string(op)});
     };
-    for (auto& [name, desc] : roles) {
-        sqlite3_stmt* s = nullptr;
-        sqlite3_prepare_v2(db_,
-                           "INSERT OR IGNORE INTO roles (name, description, is_system, created_at) "
-                           "VALUES (?, ?, 1, ?);",
-                           -1, &s, nullptr);
-        sqlite3_bind_text(s, 1, name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s, 2, desc, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(s, 3, now);
-        sqlite3_step(s);
-        sqlite3_finalize(s);
-    }
 
-    // Administrator: CRUD on everything + Push on GuaranteedState only.
-    // Seeding Push cross-type would be a latent privilege grant that any
-    // future handler reading `perm_fn(..., "Push")` on a non-Guardian
-    // securable would silently accept, so Push lives as a targeted grant
-    // outside the main loop.
-    for (auto* t : types) {
-        for (auto* o : crud_ops) {
-            sqlite3_stmt* s = nullptr;
-            sqlite3_prepare_v2(
-                db_,
-                "INSERT OR IGNORE INTO role_permissions VALUES ('Administrator', ?, ?, 'allow');",
-                -1, &s, nullptr);
-            sqlite3_bind_text(s, 1, t, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(s, 2, o, -1, SQLITE_TRANSIENT);
-            sqlite3_step(s);
-            sqlite3_finalize(s);
-        }
-    }
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Administrator', 'GuaranteedState', 'Push', 'allow');",
-        nullptr, nullptr, nullptr);
-    // Administrator: Attest on AccessReview (Periodic Access Reviews, SOC 2
-    // CC6.2) — same targeted-grant treatment as the Push grant above; Attest
-    // is deliberately excluded from `crud_ops` so it is never seeded
-    // cross-type by the loop.
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Administrator', 'AccessReview', 'Attest', "
-        "'allow');",
-        nullptr, nullptr, nullptr);
+    // Administrator: CRUD on everything + targeted Push + Attest.
+    for (auto t : types)
+        for (auto o : crud_ops)
+            grant("Administrator", t, o);
+    grant("Administrator", "GuaranteedState", "Push");
+    grant("Administrator", "AccessReview", "Attest");
 
-    // PlatformEngineer: full CRUD on definitions, sets, and read on related types
-    const char* pe_full_types[] = {"InstructionDefinition", "InstructionSet"};
-    const char* pe_full_ops[] = {"Read", "Write", "Execute", "Delete"};
-    for (auto* t : pe_full_types) {
-        for (auto* o : pe_full_ops) {
-            sqlite3_stmt* s = nullptr;
-            sqlite3_prepare_v2(db_,
-                               "INSERT OR IGNORE INTO role_permissions VALUES ('PlatformEngineer', "
-                               "?, ?, 'allow');",
-                               -1, &s, nullptr);
-            sqlite3_bind_text(s, 1, t, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(s, 2, o, -1, SQLITE_TRANSIENT);
-            sqlite3_step(s);
-            sqlite3_finalize(s);
-        }
-    }
-    // PlatformEngineer: read on operational types for context (incl. SLE —
-    // ADR-0024 Decision 9 D-9 matrix: PlatformEngineer Read).
-    const char* pe_read_types[] = {"Execution", "Schedule", "Approval",         "Tag",
-                                   "AuditLog",  "Response",  "SoftwareLicensing", "Inventory"};
-    for (auto* t : pe_read_types) {
-        sqlite3_stmt* s = nullptr;
-        sqlite3_prepare_v2(db_,
-                           "INSERT OR IGNORE INTO role_permissions VALUES ('PlatformEngineer', ?, "
-                           "'Read', 'allow');",
-                           -1, &s, nullptr);
-        sqlite3_bind_text(s, 1, t, -1, SQLITE_TRANSIENT);
-        sqlite3_step(s);
-        sqlite3_finalize(s);
-    }
-    // PlatformEngineer: read + write + delete on Policy
-    {
-        const char* pe_policy_ops[] = {"Read", "Write", "Delete"};
-        for (auto* o : pe_policy_ops) {
-            sqlite3_stmt* s = nullptr;
-            sqlite3_prepare_v2(db_,
-                               "INSERT OR IGNORE INTO role_permissions VALUES ('PlatformEngineer', "
-                               "'Policy', ?, 'allow');",
-                               -1, &s, nullptr);
-            sqlite3_bind_text(s, 1, o, -1, SQLITE_TRANSIENT);
-            sqlite3_step(s);
-            sqlite3_finalize(s);
-        }
-    }
+    // PlatformEngineer.
+    for (std::string_view t : {"InstructionDefinition", "InstructionSet"})
+        for (std::string_view o : {"Read", "Write", "Execute", "Delete"})
+            grant("PlatformEngineer", t, o);
+    for (std::string_view t : {"Execution", "Schedule", "Approval", "Tag", "AuditLog", "Response",
+                               "SoftwareLicensing", "Inventory"})
+        grant("PlatformEngineer", t, "Read");
+    for (std::string_view o : {"Read", "Write", "Delete"})
+        grant("PlatformEngineer", "Policy", o);
+    for (std::string_view o : {"Read", "Write", "Delete", "Push"})
+        grant("PlatformEngineer", "GuaranteedState", o);
 
-    // Operator: read/write/execute on operational types, read on audit/response
-    const char* op_rwe_types[] = {"InstructionDefinition", "InstructionSet", "Execution",
-                                  "Schedule", "Tag"};
-    const char* op_rwe_ops[] = {"Read", "Write", "Execute"};
-    for (auto* t : op_rwe_types) {
-        for (auto* o : op_rwe_ops) {
-            sqlite3_stmt* s = nullptr;
-            sqlite3_prepare_v2(
-                db_, "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', ?, ?, 'allow');",
-                -1, &s, nullptr);
-            sqlite3_bind_text(s, 1, t, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(s, 2, o, -1, SQLITE_TRANSIENT);
-            sqlite3_step(s);
-            sqlite3_finalize(s);
-        }
+    // Operator.
+    for (std::string_view t : {"InstructionDefinition", "InstructionSet", "Execution", "Schedule",
+                               "Tag"}) {
+        for (std::string_view o : {"Read", "Write", "Execute", "Delete"})
+            grant("Operator", t, o);
     }
-    // Operator: delete on operational types
-    for (auto* t : op_rwe_types) {
-        sqlite3_stmt* s = nullptr;
-        sqlite3_prepare_v2(
-            db_,
-            "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', ?, 'Delete', 'allow');", -1,
-            &s, nullptr);
-        sqlite3_bind_text(s, 1, t, -1, SQLITE_TRANSIENT);
-        sqlite3_step(s);
-        sqlite3_finalize(s);
+    grant("Operator", "Approval", "Read");
+    grant("Operator", "Approval", "Approve");
+    grant("Operator", "AuditLog", "Read");
+    grant("Operator", "Response", "Read");
+    grant("Operator", "Policy", "Read");
+    grant("Operator", "Policy", "Execute");
+    grant("Operator", "SoftwareDeployment", "Read");
+    grant("Operator", "SoftwareDeployment", "Execute");
+    grant("Operator", "DeviceToken", "Read");
+    grant("Operator", "License", "Read");
+    grant("Operator", "Inventory", "Read");
+    grant("Operator", "SoftwareLicensing", "Read");
+    grant("Operator", "SoftwareLicensing", "Write");
+    grant("Operator", "FileRetrieval", "Read");
+    grant("Operator", "FileRetrieval", "Write");
+    grant("Operator", "GuaranteedState", "Read");
+    grant("Operator", "GuaranteedState", "Push");
+
+    // ApiTokenManager.
+    for (std::string_view o : {"Read", "Write", "Delete"})
+        grant("ApiTokenManager", "ApiToken", o);
+
+    // ITServiceOwner.
+    for (std::string_view t : {"Infrastructure", "InstructionDefinition", "InstructionSet",
+                               "Execution", "Schedule", "Approval", "Tag", "AuditLog", "Response",
+                               "ManagementGroup", "Policy", "DeviceToken", "SoftwareDeployment",
+                               "License", "FileRetrieval", "GuaranteedState", "Inventory",
+                               "SoftwareLicensing"}) {
+        for (auto o : crud_ops)
+            grant("ITServiceOwner", t, o);
     }
-    // Operator: approve on Approval
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'Approval', 'Read', 'allow');",
-        nullptr, nullptr, nullptr);
-    sqlite3_exec(db_,
-                 "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'Approval', "
-                 "'Approve', 'allow');",
-                 nullptr, nullptr, nullptr);
-    // Operator: read on AuditLog, Response
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'AuditLog', 'Read', 'allow');",
-        nullptr, nullptr, nullptr);
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'Response', 'Read', 'allow');",
-        nullptr, nullptr, nullptr);
-    // Operator: read + execute on Policy
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'Policy', 'Read', 'allow');",
-        nullptr, nullptr, nullptr);
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'Policy', 'Execute', 'allow');",
-        nullptr, nullptr, nullptr);
-    // Operator: read + execute on SoftwareDeployment
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'SoftwareDeployment', 'Read', 'allow');",
-        nullptr, nullptr, nullptr);
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'SoftwareDeployment', 'Execute', 'allow');",
-        nullptr, nullptr, nullptr);
-    // Operator: read on DeviceToken
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'DeviceToken', 'Read', 'allow');",
-        nullptr, nullptr, nullptr);
-    // Operator: read on License
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'License', 'Read', 'allow');",
-        nullptr, nullptr, nullptr);
-    // Operator: read on Inventory — triaging a device includes seeing its
-    // installed software (ADR-0016).
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'Inventory', 'Read', 'allow');",
-        nullptr, nullptr, nullptr);
-    // Operator: read + write on SoftwareLicensing (ADR-0024 Decision 9 D-9 matrix:
-    // Operator Read + Write). Write is granted now even though PR1a ships no write
-    // endpoints — the matrix is seeded ONCE; entitlement CRUD arrives in PR2. NOT
-    // Execute/Delete/Approve (that is ITServiceOwner's full-CRUD tier).
-    sqlite3_exec(db_,
-                 "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', "
-                 "'SoftwareLicensing', 'Read', 'allow');",
-                 nullptr, nullptr, nullptr);
-    sqlite3_exec(db_,
-                 "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', "
-                 "'SoftwareLicensing', 'Write', 'allow');",
-                 nullptr, nullptr, nullptr);
-    // Operator: read + write on FileRetrieval
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'FileRetrieval', 'Read', 'allow');",
-        nullptr, nullptr, nullptr);
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'FileRetrieval', 'Write', 'allow');",
-        nullptr, nullptr, nullptr);
+    grant("ITServiceOwner", "GuaranteedState", "Push");
 
-    // Operator: read + push on GuaranteedState — they can distribute an
-    // existing rule set but cannot author or delete rules. Authoring is
-    // privileged and lives with PlatformEngineer / Administrator.
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'GuaranteedState', 'Read', 'allow');",
-        nullptr, nullptr, nullptr);
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'GuaranteedState', 'Push', 'allow');",
-        nullptr, nullptr, nullptr);
+    // Viewer: read on all except Infrastructure.
+    for (std::string_view t : {"UserManagement", "InstructionDefinition", "InstructionSet",
+                               "Execution", "Schedule", "Approval", "Tag", "AuditLog", "Response",
+                               "ManagementGroup", "ApiToken", "Security", "Policy", "DeviceToken",
+                               "SoftwareDeployment", "License", "FileRetrieval", "GuaranteedState",
+                               "Inventory", "SoftwareLicensing"})
+        grant("Viewer", t, "Read");
 
-    // PlatformEngineer: full CRUD + Push on GuaranteedState. Mirrors the
-    // pattern they have for InstructionDefinition — they author the rules
-    // and need to push the set to fleet for testing.
-    {
-        const char* gs_ops[] = {"Read", "Write", "Delete", "Push"};
-        for (auto* o : gs_ops) {
-            sqlite3_stmt* s = nullptr;
-            sqlite3_prepare_v2(db_,
-                               "INSERT OR IGNORE INTO role_permissions VALUES ('PlatformEngineer', "
-                               "'GuaranteedState', ?, 'allow');",
-                               -1, &s, nullptr);
-            sqlite3_bind_text(s, 1, o, -1, SQLITE_TRANSIENT);
-            sqlite3_step(s);
-            sqlite3_finalize(s);
-        }
-    }
-
-    // ApiTokenManager: read + write + delete on ApiToken
-    const char* atm_ops[] = {"Read", "Write", "Delete"};
-    for (auto* o : atm_ops) {
-        sqlite3_stmt* s = nullptr;
-        sqlite3_prepare_v2(
-            db_,
-            "INSERT OR IGNORE INTO role_permissions VALUES ('ApiTokenManager', 'ApiToken', ?, "
-            "'allow');",
-            -1, &s, nullptr);
-        sqlite3_bind_text(s, 1, o, -1, SQLITE_TRANSIENT);
-        sqlite3_step(s);
-        sqlite3_finalize(s);
-    }
-
-    // ITServiceOwner: broad access on operational types (excludes UserManagement, Security,
-    // ApiToken)
-    const char* itso_types[] = {"Infrastructure",
-                                "InstructionDefinition",
-                                "InstructionSet",
-                                "Execution",
-                                "Schedule",
-                                "Approval",
-                                "Tag",
-                                "AuditLog",
-                                "Response",
-                                "ManagementGroup",
-                                "Policy",
-                                "DeviceToken",
-                                "SoftwareDeployment",
-                                "License",
-                                "FileRetrieval",
-                                "GuaranteedState",
-                                "Inventory",
-                                // SLE full CRUD (ADR-0024 Decision 9 D-9 matrix:
-                                // ITServiceOwner full CRUD, as for its other
-                                // operational securables).
-                                "SoftwareLicensing"};
-    // Same Push-restriction rationale as Administrator above: CRUD cross-type,
-    // Push only on GuaranteedState where it is actually consulted.
-    for (auto* t : itso_types) {
-        for (auto* o : crud_ops) {
-            sqlite3_stmt* s = nullptr;
-            sqlite3_prepare_v2(
-                db_,
-                "INSERT OR IGNORE INTO role_permissions VALUES ('ITServiceOwner', ?, ?, 'allow');",
-                -1, &s, nullptr);
-            sqlite3_bind_text(s, 1, t, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(s, 2, o, -1, SQLITE_TRANSIENT);
-            sqlite3_step(s);
-            sqlite3_finalize(s);
-        }
-    }
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('ITServiceOwner', 'GuaranteedState', 'Push', 'allow');",
-        nullptr, nullptr, nullptr);
-
-    // Viewer: read on all except Infrastructure
-    const char* viewer_types[] = {"UserManagement",
-                                  "InstructionDefinition",
-                                  "InstructionSet",
-                                  "Execution",
-                                  "Schedule",
-                                  "Approval",
-                                  "Tag",
-                                  "AuditLog",
-                                  "Response",
-                                  "ManagementGroup",
-                                  "ApiToken",
-                                  "Security",
-                                  "Policy",
-                                  "DeviceToken",
-                                  "SoftwareDeployment",
-                                  "License",
-                                  "FileRetrieval",
-                                  "GuaranteedState",
-                                  "Inventory",
-                                  // SLE Read (ADR-0024 Decision 9 D-9 matrix: Viewer
-                                  // Read). R18 upgrade note: deployments restricting
-                                  // entitlement-cost visibility deny/remove this Viewer
-                                  // grant before enabling the SLE sources (deny-override
-                                  // wins) — see the seeded securable description.
-                                  "SoftwareLicensing"};
-    for (auto* t : viewer_types) {
-        sqlite3_stmt* s = nullptr;
-        sqlite3_prepare_v2(
-            db_, "INSERT OR IGNORE INTO role_permissions VALUES ('Viewer', ?, 'Read', 'allow');",
-            -1, &s, nullptr);
-        sqlite3_bind_text(s, 1, t, -1, SQLITE_TRANSIENT);
-        sqlite3_step(s);
-        sqlite3_finalize(s);
-    }
-
-    // Reviewer (Periodic Access Reviews, SOC 2 CC6.2): AccessReview:Read
-    // (browse the evidence trail) + AccessReview:Attest (record a decision
-    // on a campaign row). Deliberately NOT crud_ops — a reviewer must not
-    // gain Write/Delete/Approve on AccessReview, only the ability to read
-    // and attest.
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Reviewer', 'AccessReview', 'Read', "
-        "'allow');",
-        nullptr, nullptr, nullptr);
-    sqlite3_exec(
-        db_,
-        "INSERT OR IGNORE INTO role_permissions VALUES ('Reviewer', 'AccessReview', 'Attest', "
-        "'allow');",
-        nullptr, nullptr, nullptr);
+    // Reviewer.
+    grant("Reviewer", "AccessReview", "Read");
+    grant("Reviewer", "AccessReview", "Attest");
 }
 
 void RbacStore::load_enabled_flag() {
-    if (!db_)
+    if (!open_)
         return;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT value FROM rbac_config WHERE key='enabled';", -1, &s,
-                           nullptr) == SQLITE_OK) {
-        if (sqlite3_step(s) == SQLITE_ROW) {
-            auto* v = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
-            rbac_enabled_.store(v && std::string(v) == "true");
+    auto lease = pool_.acquire();
+    if (!lease)
+        return;
+    pg::PgResult r = pg::exec_params(
+        lease.get(), "SELECT value FROM rbac_store.rbac_meta WHERE key='rbac_enabled'",
+        std::vector<std::string>{});
+    if (r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) == 1)
+        rbac_enabled_.store(text_col(r.get(), 0, 0) == "true", std::memory_order_relaxed);
+    // Anchor the generation cache from the durable counter so the first read
+    // does not immediately re-query.
+    pg::PgResult g = pg::exec_params(
+        lease.get(), "SELECT value FROM rbac_store.rbac_meta WHERE key='write_generation'",
+        std::vector<std::string>{});
+    std::lock_guard lock(cache_mtx_);
+    if (g.status() == PGRES_TUPLES_OK && PQntuples(g.get()) == 1) {
+        cached_generation_ = to_u64(PQgetvalue(g.get(), 0, 0));
+        generation_valid_ = true;
+    }
+    last_generation_refresh_ms_ = now_ms();
+}
+
+// ── Durable generation token (ADR-0041 cross-replica coherence) ──────────────
+
+void RbacStore::maybe_refresh_generation() const {
+    if (!open_)
+        return;
+    {
+        std::lock_guard lock(cache_mtx_);
+        if ((now_ms() - last_generation_refresh_ms_) < kRbacGenerationRefreshMs)
+            return;
+    }
+    // Read the durable generation + enabled flag WITHOUT holding cache_mtx_.
+    std::optional<std::uint64_t> durable_gen;
+    std::optional<bool> durable_enabled;
+    if (auto lease = pool_.try_acquire_for(kReadTimeout)) {
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "SELECT key, value FROM rbac_store.rbac_meta WHERE key IN "
+            "('write_generation','rbac_enabled')",
+            std::vector<std::string>{});
+        if (r.status() == PGRES_TUPLES_OK) {
+            for (int i = 0; i < PQntuples(r.get()); ++i) {
+                const std::string k = text_col(r.get(), i, 0);
+                if (k == "write_generation")
+                    durable_gen = to_u64(PQgetvalue(r.get(), i, 1));
+                else if (k == "rbac_enabled")
+                    durable_enabled = (text_col(r.get(), i, 1) == "true");
+            }
         }
-        sqlite3_finalize(s);
+    }
+    std::lock_guard lock(cache_mtx_);
+    last_generation_refresh_ms_ = now_ms();
+    if (!durable_gen) {
+        // Fail toward "assume changed": drop the cache and stop trusting it. Do
+        // NOT touch rbac_enabled_ — flipping it to disabled would be fail-open.
+        perm_cache_.clear();
+        generation_valid_ = false;
+        return;
+    }
+    if (durable_enabled)
+        rbac_enabled_.store(*durable_enabled, std::memory_order_relaxed);
+    if (!generation_valid_ || *durable_gen != cached_generation_) {
+        perm_cache_.clear();
+        cached_generation_ = *durable_gen;
+        generation_valid_ = true;
     }
 }
+
+void RbacStore::apply_local_generation(std::uint64_t new_gen) const {
+    std::lock_guard lock(cache_mtx_);
+    perm_cache_.clear();
+    cached_generation_ = new_gen;
+    generation_valid_ = true;
+    last_generation_refresh_ms_ = now_ms();
+}
+
+namespace {
+// Bump `write_generation` inside an already-open txn on `c`; return the new
+// value, or nullopt on any error. The mutation and this bump commit atomically
+// (ADR-0041: the durable counter advances in the SAME txn as the write).
+std::optional<std::uint64_t> bump_generation_in_txn(PGconn* c) {
+    pg::PgResult r = pg::exec_params(
+        c,
+        "INSERT INTO rbac_store.rbac_meta (key, value) VALUES ('write_generation','1') "
+        "ON CONFLICT (key) DO UPDATE SET value = "
+        "(rbac_store.rbac_meta.value::bigint + 1)::text RETURNING value::bigint",
+        std::vector<std::string>{});
+    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1)
+        return std::nullopt;
+    return to_u64(PQgetvalue(r.get(), 0, 0));
+}
+} // namespace
 
 // ── Global toggle ────────────────────────────────────────────────────────────
 
 bool RbacStore::is_rbac_enabled() const {
-    return rbac_enabled_.load();
+    maybe_refresh_generation();
+    return rbac_enabled_.load(std::memory_order_relaxed);
 }
 
 void RbacStore::set_rbac_enabled(bool enabled) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, "INSERT OR REPLACE INTO rbac_config VALUES ('enabled', ?);", -1, &s,
-                           nullptr) == SQLITE_OK) {
-        sqlite3_bind_text(s, 1, enabled ? "true" : "false", -1, SQLITE_TRANSIENT);
-        sqlite3_step(s);
-        sqlite3_finalize(s);
-        rbac_enabled_.store(enabled);
+    std::optional<std::uint64_t> new_gen;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult r = pg::exec_params(
+            c,
+            "INSERT INTO rbac_store.rbac_meta (key, value) VALUES ('rbac_enabled', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            std::vector<std::string>{enabled ? "true" : "false"});
+        if (r.status() != PGRES_COMMAND_OK) {
+            spdlog::error("RbacStore::set_rbac_enabled: write failed: {}", PQerrorMessage(c));
+            return false;
+        }
+        new_gen = bump_generation_in_txn(c);
+        return new_gen.has_value();
+    });
+    if (!ok) {
+        spdlog::error("RbacStore::set_rbac_enabled: transaction failed; flag unchanged");
+        return;
     }
+    rbac_enabled_.store(enabled, std::memory_order_relaxed);
+    apply_local_generation(*new_gen);
 }
 
 bool rbac_enforcement_in_effect(const RbacStore* store) noexcept {
@@ -773,395 +568,387 @@ bool rbac_enforcement_in_effect(const RbacStore* store) noexcept {
 // ── Roles CRUD ───────────────────────────────────────────────────────────────
 
 std::vector<RbacRole> RbacStore::list_roles() const {
-    std::shared_lock lock(mtx_);
     std::vector<RbacRole> result;
-    if (!db_)
+    if (!open_)
         return result;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT name, description, is_system, created_at FROM roles ORDER BY "
-                           "is_system DESC, name;",
-                           -1, &s, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return result;
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        RbacRole r;
-        r.name = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
-        r.description = reinterpret_cast<const char*>(sqlite3_column_text(s, 1));
-        r.is_system = sqlite3_column_int(s, 2) != 0;
-        r.created_at = sqlite3_column_int64(s, 3);
-        result.push_back(std::move(r));
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT name, description, is_system, created_at FROM rbac_store.roles "
+        "ORDER BY is_system DESC, name",
+        std::vector<std::string>{});
+    if (r.status() != PGRES_TUPLES_OK)
+        return result;
+    for (int i = 0; i < PQntuples(r.get()); ++i) {
+        RbacRole role;
+        role.name = text_col(r.get(), i, 0);
+        role.description = text_col(r.get(), i, 1);
+        role.is_system = to_bool(PQgetvalue(r.get(), i, 2));
+        role.created_at = to_i64(PQgetvalue(r.get(), i, 3));
+        result.push_back(std::move(role));
     }
-    sqlite3_finalize(s);
     return result;
 }
 
 std::optional<RbacRole> RbacStore::get_role(const std::string& name) const {
-    std::shared_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::nullopt;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(
-            db_, "SELECT name, description, is_system, created_at FROM roles WHERE name = ?;", -1,
-            &s, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return std::nullopt;
-    sqlite3_bind_text(s, 1, name.c_str(), -1, SQLITE_TRANSIENT);
-    std::optional<RbacRole> result;
-    if (sqlite3_step(s) == SQLITE_ROW) {
-        RbacRole r;
-        r.name = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
-        r.description = reinterpret_cast<const char*>(sqlite3_column_text(s, 1));
-        r.is_system = sqlite3_column_int(s, 2) != 0;
-        r.created_at = sqlite3_column_int64(s, 3);
-        result = std::move(r);
-    }
-    sqlite3_finalize(s);
-    return result;
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT name, description, is_system, created_at FROM rbac_store.roles WHERE name = $1",
+        std::vector<std::string>{name});
+    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1)
+        return std::nullopt;
+    RbacRole role;
+    role.name = text_col(r.get(), 0, 0);
+    role.description = text_col(r.get(), 0, 1);
+    role.is_system = to_bool(PQgetvalue(r.get(), 0, 2));
+    role.created_at = to_i64(PQgetvalue(r.get(), 0, 3));
+    return role;
 }
 
 std::expected<void, std::string> RbacStore::create_role(const RbacRole& role) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
     if (role.name.empty())
         return std::unexpected("role name cannot be empty");
-
-    auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                   std::chrono::system_clock::now().time_since_epoch())
-                   .count();
-
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(
-            db_,
-            "INSERT INTO roles (name, description, is_system, created_at) VALUES (?, ?, 0, ?);", -1,
-            &s, nullptr) != SQLITE_OK)
-        return std::unexpected(sqlite3_errmsg(db_));
-    sqlite3_bind_text(s, 1, role.name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, role.description.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 3, now);
-    int rc = sqlite3_step(s);
-    sqlite3_finalize(s);
-    if (rc != SQLITE_DONE)
-        return std::unexpected(std::string("role already exists or DB error: ") +
-                               sqlite3_errmsg(db_));
+    const std::int64_t now = now_secs();
+    std::optional<std::uint64_t> new_gen;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult r = pg::exec_params(
+            c,
+            "INSERT INTO rbac_store.roles (name, description, is_system, created_at) "
+            "VALUES ($1, $2, FALSE, $3::bigint)",
+            std::vector<std::string>{sanitize_pg_text(role.name),
+                                     sanitize_pg_text(role.description), std::to_string(now)});
+        if (r.status() != PGRES_COMMAND_OK) {
+            err = std::string("role already exists or DB error: ") + PQerrorMessage(c);
+            return false;
+        }
+        new_gen = bump_generation_in_txn(c);
+        return new_gen.has_value();
+    });
+    if (!ok)
+        return std::unexpected(err.empty() ? "role create failed" : err);
+    apply_local_generation(*new_gen);
     return {};
 }
 
 std::expected<void, std::string> RbacStore::update_role(const std::string& name,
                                                         const std::string& description) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, "UPDATE roles SET description = ? WHERE name = ?;", -1, &s,
-                           nullptr) != SQLITE_OK)
-        return std::unexpected(sqlite3_errmsg(db_));
-    sqlite3_bind_text(s, 1, description.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
-    if (sqlite3_changes(db_) == 0)
+    std::optional<std::uint64_t> new_gen;
+    bool not_found = false;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult r = pg::exec_params(
+            c, "UPDATE rbac_store.roles SET description = $1 WHERE name = $2 RETURNING name",
+            std::vector<std::string>{sanitize_pg_text(description), name});
+        if (r.status() != PGRES_TUPLES_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        if (PQntuples(r.get()) == 0) {
+            not_found = true;
+            return false; // roll back — nothing changed, no generation bump
+        }
+        new_gen = bump_generation_in_txn(c);
+        return new_gen.has_value();
+    });
+    if (not_found)
         return std::unexpected("role not found");
+    if (!ok)
+        return std::unexpected(err.empty() ? "role update failed" : err);
+    apply_local_generation(*new_gen);
     return {};
 }
 
 std::expected<void, std::string> RbacStore::delete_role(const std::string& name) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
-
-    // Check system role protection inline (avoid calling get_role which takes its own lock)
-    {
-        sqlite3_stmt* chk = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT is_system FROM roles WHERE name = ?;", -1, &chk,
-                               nullptr) != SQLITE_OK)
-            return std::unexpected(sqlite3_errmsg(db_));
-        sqlite3_bind_text(chk, 1, name.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(chk) != SQLITE_ROW) {
-            sqlite3_finalize(chk);
-            return std::unexpected("role not found");
+    std::optional<std::uint64_t> new_gen;
+    bool not_found = false;
+    bool is_system = false;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult chk = pg::exec_params(
+            c, "SELECT is_system FROM rbac_store.roles WHERE name = $1",
+            std::vector<std::string>{name});
+        if (chk.status() != PGRES_TUPLES_OK) {
+            err = PQerrorMessage(c);
+            return false;
         }
-        bool is_sys = sqlite3_column_int(chk, 0) != 0;
-        sqlite3_finalize(chk);
-        if (is_sys)
-            return std::unexpected("cannot delete system role");
-    }
-
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, "DELETE FROM roles WHERE name = ? AND is_system = 0;", -1, &s,
-                           nullptr) != SQLITE_OK)
-        return std::unexpected(sqlite3_errmsg(db_));
-    sqlite3_bind_text(s, 1, name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
+        if (PQntuples(chk.get()) == 0) {
+            not_found = true;
+            return false;
+        }
+        if (to_bool(PQgetvalue(chk.get(), 0, 0))) {
+            is_system = true;
+            return false;
+        }
+        pg::PgResult del = pg::exec_params(
+            c, "DELETE FROM rbac_store.roles WHERE name = $1 AND is_system = FALSE",
+            std::vector<std::string>{name});
+        if (del.status() != PGRES_COMMAND_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        new_gen = bump_generation_in_txn(c);
+        return new_gen.has_value();
+    });
+    if (not_found)
+        return std::unexpected("role not found");
+    if (is_system)
+        return std::unexpected("cannot delete system role");
+    if (!ok)
+        return std::unexpected(err.empty() ? "role delete failed" : err);
+    apply_local_generation(*new_gen);
     return {};
 }
 
 // ── Permissions CRUD ─────────────────────────────────────────────────────────
 
+namespace {
+Permission read_perm(PGresult* r, int i) {
+    Permission p;
+    p.role_name = text_col(r, i, 0);
+    p.securable_type = text_col(r, i, 1);
+    p.operation = text_col(r, i, 2);
+    p.effect = text_col(r, i, 3);
+    return p;
+}
+} // namespace
+
 std::vector<Permission> RbacStore::get_role_permissions(const std::string& role_name) const {
-    std::shared_lock lock(mtx_);
     std::vector<Permission> result;
-    if (!db_)
+    if (!open_)
         return result;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(
-            db_,
-            "SELECT role_name, securable_type, operation, effect "
-            "FROM role_permissions WHERE role_name = ? ORDER BY securable_type, operation;",
-            -1, &s, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return result;
-    sqlite3_bind_text(s, 1, role_name.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        Permission p;
-        p.role_name = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
-        p.securable_type = reinterpret_cast<const char*>(sqlite3_column_text(s, 1));
-        p.operation = reinterpret_cast<const char*>(sqlite3_column_text(s, 2));
-        p.effect = reinterpret_cast<const char*>(sqlite3_column_text(s, 3));
-        result.push_back(std::move(p));
-    }
-    sqlite3_finalize(s);
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT role_name, securable_type, operation, effect FROM rbac_store.role_permissions "
+        "WHERE role_name = $1 ORDER BY securable_type, operation",
+        std::vector<std::string>{role_name});
+    if (r.status() != PGRES_TUPLES_OK)
+        return result;
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        result.push_back(read_perm(r.get(), i));
     return result;
 }
 
 std::expected<std::vector<Permission>, std::string>
 RbacStore::get_role_permissions_checked(const std::string& role_name) const {
-    std::shared_lock lock(mtx_);
-    std::vector<Permission> result;
-    if (!db_)
+    if (!open_)
         return std::unexpected("rbac store not open");
-    SqliteStmt s;
-    if (sqlite3_prepare_v2(
-            db_,
-            "SELECT role_name, securable_type, operation, effect "
-            "FROM role_permissions WHERE role_name = ? ORDER BY securable_type, operation;",
-            -1, s.addr(), nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-    sqlite3_bind_text(s.get(), 1, role_name.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = SQLITE_OK;
-    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
-        Permission p;
-        p.role_name = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
-        p.securable_type = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1));
-        p.operation = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2));
-        p.effect = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 3));
-        result.push_back(std::move(p));
-    }
-    s.reset();
-    if (rc != SQLITE_DONE)
-        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected("pool acquire timeout");
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT role_name, securable_type, operation, effect FROM rbac_store.role_permissions "
+        "WHERE role_name = $1 ORDER BY securable_type, operation",
+        std::vector<std::string>{role_name});
+    if (r.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    std::vector<Permission> result;
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        result.push_back(read_perm(r.get(), i));
     return result;
 }
 
 std::expected<std::vector<Permission>, std::string>
 RbacStore::list_all_role_permissions_checked() const {
-    std::shared_lock lock(mtx_);
-    std::vector<Permission> result;
-    if (!db_)
+    if (!open_)
         return std::unexpected("rbac store not open");
-    SqliteStmt s;
-    if (sqlite3_prepare_v2(
-            db_,
-            "SELECT role_name, securable_type, operation, effect "
-            "FROM role_permissions ORDER BY role_name, securable_type, operation;",
-            -1, s.addr(), nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-    int rc = SQLITE_OK;
-    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
-        Permission p;
-        p.role_name = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
-        p.securable_type = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1));
-        p.operation = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2));
-        p.effect = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 3));
-        result.push_back(std::move(p));
-    }
-    s.reset();
-    if (rc != SQLITE_DONE)
-        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected("pool acquire timeout");
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT role_name, securable_type, operation, effect FROM rbac_store.role_permissions "
+        "ORDER BY role_name, securable_type, operation",
+        std::vector<std::string>{});
+    if (r.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    std::vector<Permission> result;
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        result.push_back(read_perm(r.get(), i));
     return result;
 }
 
 std::expected<void, std::string> RbacStore::set_permission(const Permission& perm) {
     if (perm.effect != "allow" && perm.effect != "deny")
         return std::unexpected("effect must be 'allow' or 'deny'");
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "INSERT OR REPLACE INTO role_permissions (role_name, securable_type, "
-                           "operation, effect) "
-                           "VALUES (?, ?, ?, ?);",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return std::unexpected(sqlite3_errmsg(db_));
-    sqlite3_bind_text(s, 1, perm.role_name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, perm.securable_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 3, perm.operation.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 4, perm.effect.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(s);
-    sqlite3_finalize(s);
-    if (rc != SQLITE_DONE)
-        return std::unexpected(sqlite3_errmsg(db_));
-    invalidate_perm_cache();
+    std::optional<std::uint64_t> new_gen;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult r = pg::exec_params(
+            c,
+            "INSERT INTO rbac_store.role_permissions (role_name, securable_type, operation, effect) "
+            "VALUES ($1, $2, $3, $4) ON CONFLICT (role_name, securable_type, operation) "
+            "DO UPDATE SET effect = EXCLUDED.effect",
+            std::vector<std::string>{sanitize_pg_text(perm.role_name),
+                                     sanitize_pg_text(perm.securable_type),
+                                     sanitize_pg_text(perm.operation), perm.effect});
+        if (r.status() != PGRES_COMMAND_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        new_gen = bump_generation_in_txn(c);
+        return new_gen.has_value();
+    });
+    if (!ok)
+        return std::unexpected(err.empty() ? "set_permission failed" : err);
+    apply_local_generation(*new_gen);
     return {};
 }
 
 std::expected<void, std::string> RbacStore::remove_permission(const std::string& role_name,
                                                               const std::string& securable_type,
                                                               const std::string& operation) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "DELETE FROM role_permissions WHERE role_name = ? AND securable_type = "
-                           "? AND operation = ?;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return std::unexpected(sqlite3_errmsg(db_));
-    sqlite3_bind_text(s, 1, role_name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, securable_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 3, operation.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
-    invalidate_perm_cache();
+    std::optional<std::uint64_t> new_gen;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult r = pg::exec_params(
+            c,
+            "DELETE FROM rbac_store.role_permissions WHERE role_name = $1 AND securable_type = $2 "
+            "AND operation = $3",
+            std::vector<std::string>{role_name, securable_type, operation});
+        if (r.status() != PGRES_COMMAND_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        new_gen = bump_generation_in_txn(c);
+        return new_gen.has_value();
+    });
+    if (!ok)
+        return std::unexpected(err.empty() ? "remove_permission failed" : err);
+    apply_local_generation(*new_gen);
     return {};
 }
 
 // ── Principal-role assignments ───────────────────────────────────────────────
 
+namespace {
+PrincipalRole read_pr(PGresult* r, int i) {
+    PrincipalRole pr;
+    pr.principal_type = text_col(r, i, 0);
+    pr.principal_id = text_col(r, i, 1);
+    pr.role_name = text_col(r, i, 2);
+    return pr;
+}
+} // namespace
+
 std::vector<PrincipalRole> RbacStore::get_principal_roles(const std::string& principal_type,
                                                           const std::string& principal_id) const {
-    std::shared_lock lock(mtx_);
     std::vector<PrincipalRole> result;
-    if (!db_)
+    if (!open_)
         return result;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT principal_type, principal_id, role_name FROM principal_roles "
-                           "WHERE principal_type = ? AND principal_id = ? ORDER BY role_name;",
-                           -1, &s, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return result;
-    sqlite3_bind_text(s, 1, principal_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, principal_id.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        PrincipalRole pr;
-        pr.principal_type = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
-        pr.principal_id = reinterpret_cast<const char*>(sqlite3_column_text(s, 1));
-        pr.role_name = reinterpret_cast<const char*>(sqlite3_column_text(s, 2));
-        result.push_back(std::move(pr));
-    }
-    sqlite3_finalize(s);
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT principal_type, principal_id, role_name FROM rbac_store.principal_roles "
+        "WHERE principal_type = $1 AND principal_id = $2 ORDER BY role_name",
+        std::vector<std::string>{principal_type, principal_id});
+    if (r.status() != PGRES_TUPLES_OK)
+        return result;
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        result.push_back(read_pr(r.get(), i));
     return result;
 }
 
 std::expected<std::vector<PrincipalRole>, std::string>
 RbacStore::get_principal_roles_checked(const std::string& principal_type,
                                        const std::string& principal_id) const {
-    std::shared_lock lock(mtx_);
-    std::vector<PrincipalRole> result;
-    if (!db_)
+    if (!open_)
         return std::unexpected("rbac store not open");
-    SqliteStmt s;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT principal_type, principal_id, role_name FROM principal_roles "
-                           "WHERE principal_type = ? AND principal_id = ? ORDER BY role_name;",
-                           -1, s.addr(), nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-    sqlite3_bind_text(s.get(), 1, principal_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s.get(), 2, principal_id.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = SQLITE_OK;
-    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
-        PrincipalRole pr;
-        pr.principal_type = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
-        pr.principal_id = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1));
-        pr.role_name = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2));
-        result.push_back(std::move(pr));
-    }
-    s.reset();
-    if (rc != SQLITE_DONE)
-        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected("pool acquire timeout");
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT principal_type, principal_id, role_name FROM rbac_store.principal_roles "
+        "WHERE principal_type = $1 AND principal_id = $2 ORDER BY role_name",
+        std::vector<std::string>{principal_type, principal_id});
+    if (r.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    std::vector<PrincipalRole> result;
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        result.push_back(read_pr(r.get(), i));
     return result;
 }
 
 std::expected<std::vector<PrincipalRole>, std::string>
 RbacStore::list_all_principal_roles_checked() const {
-    std::shared_lock lock(mtx_);
-    std::vector<PrincipalRole> result;
-    if (!db_)
+    if (!open_)
         return std::unexpected("rbac store not open");
-    SqliteStmt s;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT principal_type, principal_id, role_name FROM principal_roles "
-                           "ORDER BY principal_type, principal_id, role_name;",
-                           -1, s.addr(), nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-    int rc = SQLITE_OK;
-    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
-        PrincipalRole pr;
-        pr.principal_type = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
-        pr.principal_id = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1));
-        pr.role_name = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2));
-        result.push_back(std::move(pr));
-    }
-    s.reset();
-    if (rc != SQLITE_DONE)
-        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected("pool acquire timeout");
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT principal_type, principal_id, role_name FROM rbac_store.principal_roles "
+        "ORDER BY principal_type, principal_id, role_name",
+        std::vector<std::string>{});
+    if (r.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    std::vector<PrincipalRole> result;
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        result.push_back(read_pr(r.get(), i));
     return result;
 }
 
 std::vector<PrincipalRole> RbacStore::get_role_members(const std::string& role_name) const {
-    std::shared_lock lock(mtx_);
     std::vector<PrincipalRole> result;
-    if (!db_)
+    if (!open_)
         return result;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT principal_type, principal_id, role_name FROM principal_roles "
-                           "WHERE role_name = ? ORDER BY principal_type, principal_id;",
-                           -1, &s, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return result;
-    sqlite3_bind_text(s, 1, role_name.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        PrincipalRole pr;
-        pr.principal_type = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
-        pr.principal_id = reinterpret_cast<const char*>(sqlite3_column_text(s, 1));
-        pr.role_name = reinterpret_cast<const char*>(sqlite3_column_text(s, 2));
-        result.push_back(std::move(pr));
-    }
-    sqlite3_finalize(s);
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT principal_type, principal_id, role_name FROM rbac_store.principal_roles "
+        "WHERE role_name = $1 ORDER BY principal_type, principal_id",
+        std::vector<std::string>{role_name});
+    if (r.status() != PGRES_TUPLES_OK)
+        return result;
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        result.push_back(read_pr(r.get(), i));
     return result;
 }
 
 std::expected<void, std::string> RbacStore::validate_assignment(const std::string& principal_type,
-                                                                 const std::string& principal_id,
-                                                                 const std::string& role_name) {
-    // F2 (Hermes pass-2 MEDIUM, worst finding): an `engine:`-prefixed
-    // principal_id must ONLY ever be assigned under principal_type=="engine".
-    // Without this, a caller could mint a shadow row
-    // `('user', 'engine:x', role)` that `collect_roles_locked`'s user arm
-    // would happily match at role-resolution time — silently attributing an
-    // engine identity's permissions to whatever attacker-controlled "user"
-    // lookup produces that principal_id, entirely bypassing the engine-only
-    // checks below. Reject regardless of principal_type.
+                                                                const std::string& principal_id,
+                                                                const std::string& role_name) {
+    // F2: an `engine:`-prefixed principal_id must ONLY be assigned under
+    // principal_type=="engine" (else a shadow ('user','engine:x',role) row
+    // would attribute an engine identity's perms to a user lookup).
     if (principal_type != "engine" && principal_id.starts_with(kEnginePrefix))
         return std::unexpected(
             "principal_id in the reserved 'engine:' namespace may only be assigned under "
             "principal_type=\"engine\"");
 
-    // Also reject any principal_type outside the recognized set — this
-    // function is the single validation chokepoint for assign_role, so an
-    // unrecognized principal_type (typo, or an attacker probing for an
-    // unvalidated arm) must fail closed here rather than silently falling
-    // through to the `{}` return below.
     if (principal_type != "user" && principal_type != "group" && principal_type != "engine")
         return std::unexpected("unrecognized principal_type '" + principal_type + "'");
 
-    // user/group assignment behavior is completely unchanged — a hard
-    // invariant, exercised by every pre-existing caller of assign_role.
     if (principal_type != "engine")
         return {};
 
-    // Matches engine_principal_store.cpp::create's own prefix check exactly
-    // (`starts_with` + non-empty-slug), so the two guards can never drift.
     if (!principal_id.starts_with(kEnginePrefix) || principal_id.size() == kEnginePrefix.size())
         return std::unexpected(
             "engine principal_id must be in the reserved 'engine:<slug>' namespace with a "
@@ -1177,332 +964,296 @@ std::expected<void, std::string> RbacStore::validate_assignment(const std::strin
 }
 
 std::expected<void, std::string> RbacStore::assign_role(const PrincipalRole& pr) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
     if (auto v = validate_assignment(pr.principal_type, pr.principal_id, pr.role_name); !v)
         return std::unexpected(v.error());
 
-    // F1 (Hermes pass-1 H1, downgraded MEDIUM by architect): generalize the
-    // "no admin, ever" bar to "no built-in role, ever" for engine
-    // principals. `validate_assignment` is `static` and has no DB handle, so
-    // it can only bar the two hardcoded literal role names
-    // (`kEngineDisallowedRoles`) — that's a manual-extend footgun for any
-    // future `is_system` role (see the comment on that array). This
-    // fleet-wide path DOES have DB access, so query the role's own
-    // `is_system` flag (same idiom as `delete_role`'s system-role-protection
-    // check above) and reject any built-in role outright. The literal check
-    // in `validate_assignment` stays as defense-in-depth (the legacy "admin"
-    // string isn't itself a `roles` row, so it wouldn't be caught here).
-    // Residual: a custom (`is_system=0`) role that happens to be granted
-    // fleet-wide/unrestricted permissions is NOT caught by this bar — that
-    // is closed by the independent auditor-runnable verification query
-    // (decision log #13, PR 4.3/4.4), never by trying to enumerate
-    // "dangerous" permission combinations here (trivially bypassable and
-    // falsely advertises completeness).
-    if (pr.principal_type == "engine") {
-        sqlite3_stmt* chk = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT is_system FROM roles WHERE name = ?;", -1, &chk,
-                               nullptr) != SQLITE_OK)
-            return std::unexpected(sqlite3_errmsg(db_));
-        sqlite3_bind_text(chk, 1, pr.role_name.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(chk) == SQLITE_ROW) {
-            bool is_sys = sqlite3_column_int(chk, 0) != 0;
-            sqlite3_finalize(chk);
-            if (is_sys)
-                return std::unexpected(
-                    "engine principals cannot be granted a built-in system role '" +
-                    pr.role_name + "' — no built-in role, ever (design §4.2)");
-        } else {
-            sqlite3_finalize(chk);
+    std::optional<std::uint64_t> new_gen;
+    bool builtin_reject = false;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        // F1: for an engine principal, reject ANY built-in (is_system) role via
+        // its own `is_system` flag — generalizes the static "no admin, ever"
+        // bar to "no built-in role, ever" for the fleet-wide path.
+        if (pr.principal_type == "engine") {
+            pg::PgResult chk = pg::exec_params(
+                c, "SELECT is_system FROM rbac_store.roles WHERE name = $1",
+                std::vector<std::string>{pr.role_name});
+            if (chk.status() != PGRES_TUPLES_OK) {
+                err = PQerrorMessage(c);
+                return false;
+            }
+            if (PQntuples(chk.get()) == 1 && to_bool(PQgetvalue(chk.get(), 0, 0))) {
+                builtin_reject = true;
+                return false;
+            }
         }
-    }
-
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(
-            db_,
-            "INSERT OR IGNORE INTO principal_roles (principal_type, principal_id, role_name) "
-            "VALUES (?, ?, ?);",
-            -1, &s, nullptr) != SQLITE_OK)
-        return std::unexpected(sqlite3_errmsg(db_));
-    sqlite3_bind_text(s, 1, pr.principal_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, pr.principal_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 3, pr.role_name.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(s);
-    sqlite3_finalize(s);
-    if (rc != SQLITE_DONE)
-        return std::unexpected(sqlite3_errmsg(db_));
-    invalidate_perm_cache();
+        pg::PgResult r = pg::exec_params(
+            c,
+            "INSERT INTO rbac_store.principal_roles (principal_type, principal_id, role_name) "
+            "VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            std::vector<std::string>{sanitize_pg_text(pr.principal_type),
+                                     sanitize_pg_text(pr.principal_id),
+                                     sanitize_pg_text(pr.role_name)});
+        if (r.status() != PGRES_COMMAND_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        new_gen = bump_generation_in_txn(c);
+        return new_gen.has_value();
+    });
+    if (builtin_reject)
+        return std::unexpected("engine principals cannot be granted a built-in system role '" +
+                               pr.role_name + "' — no built-in role, ever (design §4.2)");
+    if (!ok)
+        return std::unexpected(err.empty() ? "assign_role failed" : err);
+    apply_local_generation(*new_gen);
     return {};
 }
 
 std::expected<void, std::string> RbacStore::unassign_role(const std::string& principal_type,
                                                           const std::string& principal_id,
                                                           const std::string& role_name) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "DELETE FROM principal_roles WHERE principal_type = ? AND principal_id "
-                           "= ? AND role_name = ?;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return std::unexpected(sqlite3_errmsg(db_));
-    sqlite3_bind_text(s, 1, principal_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, principal_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 3, role_name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
-    invalidate_perm_cache();
+    std::optional<std::uint64_t> new_gen;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult r = pg::exec_params(
+            c,
+            "DELETE FROM rbac_store.principal_roles WHERE principal_type = $1 AND principal_id = $2 "
+            "AND role_name = $3",
+            std::vector<std::string>{principal_type, principal_id, role_name});
+        if (r.status() != PGRES_COMMAND_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        new_gen = bump_generation_in_txn(c);
+        return new_gen.has_value();
+    });
+    if (!ok)
+        return std::unexpected(err.empty() ? "unassign_role failed" : err);
+    apply_local_generation(*new_gen);
     return {};
 }
 
 // ── Groups CRUD ──────────────────────────────────────────────────────────────
 
 std::vector<RbacGroup> RbacStore::list_groups() const {
-    std::shared_lock lock(mtx_);
     std::vector<RbacGroup> result;
-    if (!db_)
+    if (!open_)
         return result;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(
-            db_,
-            "SELECT name, description, source, external_id, created_at FROM groups ORDER BY name;",
-            -1, &s, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return result;
-    while (sqlite3_step(s) == SQLITE_ROW) {
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT name, description, source, external_id, created_at FROM rbac_store.groups "
+        "ORDER BY name",
+        std::vector<std::string>{});
+    if (r.status() != PGRES_TUPLES_OK)
+        return result;
+    for (int i = 0; i < PQntuples(r.get()); ++i) {
         RbacGroup g;
-        g.name = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
-        g.description = reinterpret_cast<const char*>(sqlite3_column_text(s, 1));
-        g.source = reinterpret_cast<const char*>(sqlite3_column_text(s, 2));
-        auto* eid = reinterpret_cast<const char*>(sqlite3_column_text(s, 3));
-        g.external_id = eid ? eid : "";
-        g.created_at = sqlite3_column_int64(s, 4);
+        g.name = text_col(r.get(), i, 0);
+        g.description = text_col(r.get(), i, 1);
+        g.source = text_col(r.get(), i, 2);
+        g.external_id = text_col(r.get(), i, 3); // NULL → ""
+        g.created_at = to_i64(PQgetvalue(r.get(), i, 4));
         result.push_back(std::move(g));
     }
-    sqlite3_finalize(s);
     return result;
 }
 
 std::expected<std::vector<RbacGroup>, std::string> RbacStore::list_groups_checked() const {
-    std::shared_lock lock(mtx_);
-    std::vector<RbacGroup> result;
-    if (!db_)
+    if (!open_)
         return std::unexpected("rbac store not open");
-    SqliteStmt s;
-    if (sqlite3_prepare_v2(
-            db_,
-            "SELECT name, description, source, external_id, created_at FROM groups ORDER BY name;",
-            -1, s.addr(), nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-    int rc = SQLITE_OK;
-    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected("pool acquire timeout");
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT name, description, source, external_id, created_at FROM rbac_store.groups "
+        "ORDER BY name",
+        std::vector<std::string>{});
+    if (r.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    std::vector<RbacGroup> result;
+    for (int i = 0; i < PQntuples(r.get()); ++i) {
         RbacGroup g;
-        g.name = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
-        g.description = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1));
-        g.source = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2));
-        auto* eid = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 3));
-        g.external_id = eid ? eid : "";
-        g.created_at = sqlite3_column_int64(s.get(), 4);
+        g.name = text_col(r.get(), i, 0);
+        g.description = text_col(r.get(), i, 1);
+        g.source = text_col(r.get(), i, 2);
+        g.external_id = text_col(r.get(), i, 3);
+        g.created_at = to_i64(PQgetvalue(r.get(), i, 4));
         result.push_back(std::move(g));
     }
-    s.reset();
-    if (rc != SQLITE_DONE)
-        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
     return result;
 }
 
 std::optional<std::vector<std::string>>
 RbacStore::find_local_groups_with_prefix(const std::string& prefix) const {
-    std::shared_lock lock(mtx_);
-    std::vector<std::string> result;
-    // A closed/unopened store is a scan FAILURE, not "nothing to match" —
-    // signal it distinctly (nullopt) so the T8 preflight fails closed
-    // instead of trusting an engaged-but-empty result.
-    if (!db_)
+    // A closed/unopened store, a pool timeout, or a query error is a scan
+    // FAILURE, not "nothing to match" — signal it distinctly (nullopt) so the T8
+    // preflight fails closed instead of trusting an engaged-but-empty result.
+    if (!open_)
         return std::nullopt;
-    // `prefix` is code-controlled (e.g. `kEnginePrefix`), never user input —
-    // fail closed (empty result) rather than trust the caller if it ever
-    // carries a LIKE metacharacter, matching audit_store.cpp's action-prefix
-    // guard (`%`/`_`/`\` would otherwise widen the match).
+    // `prefix` is code-controlled — fail closed (empty result) if it ever
+    // carries a LIKE metacharacter.
     if (prefix.empty() || prefix.find_first_of("%_\\") != std::string::npos)
-        return result;
-    // Scoped to `source = 'local'` — an IdP-sourced group asserting a
-    // same-prefixed name is disambiguated by `principal_type` at the
-    // resolution site (§3.3) and is not the namespace collision a LOCAL
-    // group of that name would be; this backs the T8 startup collision
-    // preflight (decision log #3), which only needs to find LOCAL create
-    // paths that predate the `has_reserved_idp_prefix` guard above.
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT name FROM groups WHERE source = 'local' AND name LIKE ?;",
-                           -1, &s, nullptr) != SQLITE_OK) {
-        // G3: a prepare failure is a scan error, not "no rows" — signal it
-        // distinctly so the T8 preflight fails closed instead of booting.
-        spdlog::error("find_local_groups_with_prefix: failed to prepare scan statement: {}",
-                     sqlite3_errmsg(db_));
+        return std::vector<std::string>{};
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return std::nullopt;
-    }
-    std::string pattern = prefix + "%";
-    sqlite3_bind_text(s, 1, pattern.c_str(), -1, SQLITE_TRANSIENT);
-    int rc;
-    while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
-        // Explicit length, not implicit strlen() via the NUL-terminated
-        // char* — matches scim_store.cpp's row_to_resource text_col idiom
-        // (a group name could in principle carry an embedded NUL from a
-        // pre-hardening write path; a collision scan must not silently
-        // truncate what it reports).
-        const unsigned char* t = sqlite3_column_text(s, 0);
-        if (t) {
-            result.emplace_back(reinterpret_cast<const char*>(t),
-                                static_cast<std::size_t>(sqlite3_column_bytes(s, 0)));
-        }
-    }
-    sqlite3_finalize(s);
-    // G3 (UP-2, cpp-safety): a mid-scan SQLite error (rc != SQLITE_DONE)
-    // previously fell through silently, returning whatever rows had been
-    // collected so far as if the scan had completed cleanly — the T8 boot
-    // preflight would then read a partial (possibly empty) result as
-    // "no collision" and boot with a live namespace collision undetected.
-    // Signal the error distinctly via nullopt so the caller can fail closed.
-    if (rc != SQLITE_DONE) {
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT name FROM rbac_store.groups WHERE source = 'local' AND name LIKE $1",
+        std::vector<std::string>{prefix + "%"});
+    if (r.status() != PGRES_TUPLES_OK) {
         spdlog::error("find_local_groups_with_prefix: scan of prefix '{}' failed: {}", prefix,
-                     sqlite3_errmsg(db_));
+                      PQerrorMessage(lease.get()));
         return std::nullopt;
     }
+    std::vector<std::string> result;
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        result.push_back(text_col(r.get(), i, 0));
     return result;
 }
 
 std::expected<void, std::string> RbacStore::create_group(const RbacGroup& group) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
     if (group.name.empty())
         return std::unexpected("group name cannot be empty");
-    // #1832 confused-deputy guard: a source='local' create can't claim an
-    // IdP namespace prefix — IdP-sourced creates (reconcile_idp_memberships,
-    // or a future non-local caller of this API) are exempt since they never
-    // present source=='local'.
     if (group.source == "local" && has_reserved_idp_prefix(group.name))
         return std::unexpected(
             "group name uses a reserved identity-provider or engine-principal namespace prefix "
             "(local:/entra:/saml:/ad:/engine:)");
-    auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                   std::chrono::system_clock::now().time_since_epoch())
-                   .count();
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "INSERT INTO groups (name, description, source, external_id, "
-                           "created_at) VALUES (?, ?, ?, ?, ?);",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return std::unexpected(sqlite3_errmsg(db_));
-    sqlite3_bind_text(s, 1, group.name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, group.description.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 3, group.source.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 4, group.external_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 5, now);
-    int rc = sqlite3_step(s);
-    sqlite3_finalize(s);
-    if (rc != SQLITE_DONE)
-        return std::unexpected(std::string("group already exists or DB error: ") +
-                               sqlite3_errmsg(db_));
+    const std::int64_t now = now_secs();
+    std::optional<std::uint64_t> new_gen;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult r = pg::exec_params(
+            c,
+            "INSERT INTO rbac_store.groups (name, description, source, external_id, created_at) "
+            "VALUES ($1, $2, $3, $4, $5::bigint)",
+            std::vector<std::string>{sanitize_pg_text(group.name),
+                                     sanitize_pg_text(group.description),
+                                     sanitize_pg_text(group.source),
+                                     sanitize_pg_text(group.external_id), std::to_string(now)});
+        if (r.status() != PGRES_COMMAND_OK) {
+            err = std::string("group already exists or DB error: ") + PQerrorMessage(c);
+            return false;
+        }
+        new_gen = bump_generation_in_txn(c);
+        return new_gen.has_value();
+    });
+    if (!ok)
+        return std::unexpected(err.empty() ? "create_group failed" : err);
+    apply_local_generation(*new_gen);
     return {};
 }
 
 std::expected<void, std::string> RbacStore::delete_group(const std::string& name) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, "DELETE FROM groups WHERE name = ?;", -1, &s, nullptr) != SQLITE_OK)
-        return std::unexpected(sqlite3_errmsg(db_));
-    sqlite3_bind_text(s, 1, name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
+    std::optional<std::uint64_t> new_gen;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult r =
+            pg::exec_params(c, "DELETE FROM rbac_store.groups WHERE name = $1",
+                            std::vector<std::string>{name});
+        if (r.status() != PGRES_COMMAND_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        new_gen = bump_generation_in_txn(c);
+        return new_gen.has_value();
+    });
+    if (!ok)
+        return std::unexpected(err.empty() ? "delete_group failed" : err);
+    apply_local_generation(*new_gen);
     return {};
 }
 
 std::vector<std::string> RbacStore::get_group_members(const std::string& group_name) const {
-    std::shared_lock lock(mtx_);
     std::vector<std::string> result;
-    if (!db_)
+    if (!open_)
         return result;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(
-            db_, "SELECT username FROM group_members WHERE group_name = ? ORDER BY username;", -1,
-            &s, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return result;
-    sqlite3_bind_text(s, 1, group_name.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(s) == SQLITE_ROW)
-        result.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-    sqlite3_finalize(s);
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT username FROM rbac_store.group_members WHERE group_name = $1 ORDER BY username",
+        std::vector<std::string>{group_name});
+    if (r.status() != PGRES_TUPLES_OK)
+        return result;
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        result.push_back(text_col(r.get(), i, 0));
     return result;
 }
 
 std::expected<void, std::string> RbacStore::add_group_member(const std::string& group_name,
                                                              const std::string& username) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
-    // G5 (governance hardening, UP-5): this method has zero route callers
-    // today, but the group-resolution arm of role lookup would hand an
-    // `engine:`-named member any role the group holds — the same shadow-
-    // attribution hazard `validate_assignment`'s F2 guard closes for direct
-    // role assignment (see that comment). Defense-in-depth per UP-11:
-    // reject an `engine:`-prefixed username at this write surface too.
+    // G5: reject an `engine:`-prefixed username at this write surface too
+    // (the group-resolution arm would otherwise hand it the group's roles).
     if (username.starts_with(kEnginePrefix))
         return std::unexpected(
             "principal_id in the reserved 'engine:' namespace cannot be added as a group member");
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(
-            db_, "INSERT OR IGNORE INTO group_members (group_name, username) VALUES (?, ?);", -1,
-            &s, nullptr) != SQLITE_OK)
-        return std::unexpected(sqlite3_errmsg(db_));
-    sqlite3_bind_text(s, 1, group_name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, username.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
+    std::optional<std::uint64_t> new_gen;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult r = pg::exec_params(
+            c,
+            "INSERT INTO rbac_store.group_members (group_name, username) VALUES ($1, $2) "
+            "ON CONFLICT DO NOTHING",
+            std::vector<std::string>{sanitize_pg_text(group_name), sanitize_pg_text(username)});
+        if (r.status() != PGRES_COMMAND_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        new_gen = bump_generation_in_txn(c);
+        return new_gen.has_value();
+    });
+    if (!ok)
+        return std::unexpected(err.empty() ? "add_group_member failed" : err);
+    apply_local_generation(*new_gen);
     return {};
 }
 
 std::expected<void, std::string> RbacStore::remove_group_member(const std::string& group_name,
                                                                 const std::string& username) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, "DELETE FROM group_members WHERE group_name = ? AND username = ?;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return std::unexpected(sqlite3_errmsg(db_));
-    sqlite3_bind_text(s, 1, group_name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, username.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
+    std::optional<std::uint64_t> new_gen;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult r = pg::exec_params(
+            c, "DELETE FROM rbac_store.group_members WHERE group_name = $1 AND username = $2",
+            std::vector<std::string>{group_name, username});
+        if (r.status() != PGRES_COMMAND_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        new_gen = bump_generation_in_txn(c);
+        return new_gen.has_value();
+    });
+    if (!ok)
+        return std::unexpected(err.empty() ? "remove_group_member failed" : err);
+    apply_local_generation(*new_gen);
     return {};
 }
 
 std::expected<ReconcileResult, std::string> RbacStore::reconcile_idp_memberships(
     const std::string& username, const std::string& source,
     const std::vector<std::pair<std::string, std::string>>& asserted) {
-    // Cap check runs BEFORE the lock/transaction — an over-cap call mutates
-    // nothing, per the documented contract.
     if (asserted.size() > kMaxIdpGroupsPerLogin)
         return std::unexpected("group_count_exceeded");
 
-    // UP-6: the stale-membership DELETE below is scoped to
-    // `groups.source = ?` and is safe ONLY because every real caller passes
-    // an IdP source ("entra"/"saml"/"ad"). A miswired call with "local" (or
-    // an empty source) would mass-DELETE every local group membership
-    // fleet-wide on the very next reconcile. Reject outright, before the
-    // lock/transaction — no mutation on this rejection either.
-    //
-    // F3 (Hermes pass-2 H2): reject any source that isn't a recognized IdP
-    // source outright, not just "local"/empty. Without this, a caller
-    // passing source="engine" (or any other unrecognized string) could mint
-    // `engine:`-prefixed "IdP" groups that bypass `has_reserved_idp_prefix`
-    // (which only rejects `source == "local"` writes into the reserved
-    // namespace) and the collision scan below — this path never checks the
-    // reserved-prefix at all. Fail closed on anything outside the
-    // allowlist.
     bool recognized_source = false;
     for (auto s : kRecognizedIdpSources) {
         if (source == s) {
@@ -1513,86 +1264,42 @@ std::expected<ReconcileResult, std::string> RbacStore::reconcile_idp_memberships
     if (!recognized_source)
         return std::unexpected("invalid_source");
 
-    // UP-9: drop asserted entries whose external_id can't produce a sane
-    // group name — blank/whitespace-only, or implausibly long (a
-    // malformed/hostile assertion). Filtering happens BEFORE `namespaced` is
-    // computed so the upsert loop and the stale-membership NOT-IN list agree
-    // on exactly what "asserted" means (same invariant the original code
-    // preserved for duplicate external_ids).
+    // UP-9: drop asserted entries whose external_id can't produce a sane group
+    // name — blank/whitespace-only or implausibly long.
     std::vector<std::pair<std::string, std::string>> valid;
     valid.reserve(asserted.size());
     for (const auto& a : asserted) {
         if (is_blank(a.first)) {
-            spdlog::warn(
-                "reconcile_idp_memberships: skipping asserted entry with blank external_id "
-                "(user='{}', source='{}')",
-                username, source);
+            spdlog::warn("reconcile_idp_memberships: skipping asserted entry with blank "
+                         "external_id (user='{}', source='{}')",
+                         username, source);
             continue;
         }
         if (a.first.size() > kMaxExternalIdLength) {
-            spdlog::warn(
-                "reconcile_idp_memberships: skipping asserted external_id exceeding {} bytes "
-                "(user='{}', source='{}')",
-                kMaxExternalIdLength, username, source);
+            spdlog::warn("reconcile_idp_memberships: skipping asserted external_id exceeding {} "
+                         "bytes (user='{}', source='{}')",
+                         kMaxExternalIdLength, username, source);
             continue;
         }
         valid.push_back(a);
     }
 
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
 
-    auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                   std::chrono::system_clock::now().time_since_epoch())
-                   .count();
+    const std::int64_t now = now_secs();
 
-    // Namespaced names computed once: reused for the upsert loop below AND
-    // for the stale-membership DELETE's NOT IN list, so the two agree on
-    // exactly what "asserted" means even if a caller passes duplicate
-    // external_ids.
+    // Namespaced names computed once: reused for the upsert loop AND the
+    // stale-membership DELETE's NOT IN list.
     std::vector<std::string> namespaced;
     namespaced.reserve(valid.size());
     for (const auto& a : valid)
         namespaced.push_back(namespaced_group_name(source, a.first));
 
-    if (sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("begin failed: ") + sqlite3_errmsg(db_));
-    // Rolls back on every early return (incl. an exception) until commit()
-    // succeeds; SqliteStmt owners below finalize first (reverse destruction
-    // order) so the rollback never runs against a connection with live
-    // statements.
-    SqliteTxn txn(db_);
-
     ReconcileResult result;
-
-    {
-        SqliteStmt ins_group;
-        if (sqlite3_prepare_v2(db_,
-                               "INSERT OR IGNORE INTO groups (name, description, source, "
-                               "external_id, created_at) VALUES (?, ?, ?, ?, ?);",
-                               -1, ins_group.addr(), nullptr) != SQLITE_OK)
-            return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-        // sec-L1: verify the (possibly pre-existing) group row's source
-        // before joining a membership to it. `INSERT OR IGNORE` above never
-        // overwrites a pre-existing row, so a name collision with a
-        // DIFFERENT-source row (e.g. a local group literally named
-        // `entra:<gid>`, created before the `create_group` reserved-prefix
-        // guard existed) leaves that row exactly as it was — this check is
-        // what stops the membership INSERT that follows from joining it.
-        SqliteStmt check_source;
-        if (sqlite3_prepare_v2(db_, "SELECT source FROM groups WHERE name = ?;", -1,
-                               check_source.addr(), nullptr) != SQLITE_OK)
-            return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-        // RETURNING (not sqlite3_changes()) carries the "was a NEW row
-        // inserted" signal in the step result itself — #1033.
-        SqliteStmt ins_member;
-        if (sqlite3_prepare_v2(db_,
-                               "INSERT OR IGNORE INTO group_members (group_name, username) "
-                               "VALUES (?, ?) RETURNING 1;",
-                               -1, ins_member.addr(), nullptr) != SQLITE_OK)
-            return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-
+    std::optional<std::uint64_t> new_gen;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
         for (size_t i = 0; i < valid.size(); ++i) {
             const auto& external_id = valid[i].first;
             const auto& display = valid[i].second;
@@ -1600,126 +1307,107 @@ std::expected<ReconcileResult, std::string> RbacStore::reconcile_idp_memberships
             const auto description = std::string("IdP-provisioned group (") + source + "): " +
                                      (display.empty() ? external_id : display);
 
-            sqlite3_reset(ins_group.get());
-            sqlite3_bind_text(ins_group.get(), 1, name.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(ins_group.get(), 2, description.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(ins_group.get(), 3, source.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(ins_group.get(), 4, external_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(ins_group.get(), 5, now);
-            if (sqlite3_step(ins_group.get()) != SQLITE_DONE)
-                return std::unexpected(std::string("group upsert failed: ") + sqlite3_errmsg(db_));
+            pg::PgResult ins_group = pg::exec_params(
+                c,
+                "INSERT INTO rbac_store.groups (name, description, source, external_id, created_at) "
+                "VALUES ($1, $2, $3, $4, $5::bigint) ON CONFLICT (name) DO NOTHING",
+                std::vector<std::string>{sanitize_pg_text(name), sanitize_pg_text(description),
+                                         sanitize_pg_text(source), sanitize_pg_text(external_id),
+                                         std::to_string(now)});
+            if (ins_group.status() != PGRES_COMMAND_OK) {
+                err = std::string("group upsert failed: ") + PQerrorMessage(c);
+                return false;
+            }
 
-            sqlite3_reset(check_source.get());
-            sqlite3_bind_text(check_source.get(), 1, name.c_str(), -1, SQLITE_TRANSIENT);
+            // sec-L1: verify the (possibly pre-existing) row's source before
+            // joining a membership — never leak a different-source group's roles.
+            pg::PgResult chk = pg::exec_params(
+                c, "SELECT source FROM rbac_store.groups WHERE name = $1",
+                std::vector<std::string>{sanitize_pg_text(name)});
+            if (chk.status() != PGRES_TUPLES_OK) {
+                err = std::string("group source check failed: ") + PQerrorMessage(c);
+                return false;
+            }
             bool source_mismatch = false;
-            if (sqlite3_step(check_source.get()) == SQLITE_ROW) {
-                const auto* existing =
-                    reinterpret_cast<const char*>(sqlite3_column_text(check_source.get(), 0));
-                if (existing && source != existing)
+            if (PQntuples(chk.get()) == 1) {
+                const std::string existing = text_col(chk.get(), 0, 0);
+                if (source != existing)
                     source_mismatch = true;
             }
             if (source_mismatch) {
-                spdlog::warn(
-                    "reconcile_idp_memberships: NOT joining '{}' to pre-existing group '{}' — "
-                    "row source differs from reconcile source '{}' (confused-deputy guard)",
-                    username, name, source);
+                spdlog::warn("reconcile_idp_memberships: NOT joining '{}' to pre-existing group "
+                             "'{}' — row source differs from reconcile source '{}' "
+                             "(confused-deputy guard)",
+                             username, name, source);
                 continue;
             }
 
-            sqlite3_reset(ins_member.get());
-            sqlite3_bind_text(ins_member.get(), 1, name.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(ins_member.get(), 2, username.c_str(), -1, SQLITE_TRANSIENT);
-            int rc = sqlite3_step(ins_member.get());
-            if (rc == SQLITE_ROW) {
-                ++result.added;
-            } else if (rc != SQLITE_DONE) {
-                return std::unexpected(std::string("membership upsert failed: ") +
-                                       sqlite3_errmsg(db_));
+            pg::PgResult ins_member = pg::exec_params(
+                c,
+                "INSERT INTO rbac_store.group_members (group_name, username) VALUES ($1, $2) "
+                "ON CONFLICT DO NOTHING RETURNING 1",
+                std::vector<std::string>{sanitize_pg_text(name), sanitize_pg_text(username)});
+            if (ins_member.status() != PGRES_TUPLES_OK) {
+                err = std::string("membership upsert failed: ") + PQerrorMessage(c);
+                return false;
             }
+            if (PQntuples(ins_member.get()) == 1)
+                ++result.added;
         }
-    }
 
-    // Remove stale IdP memberships: any group_members row for this user whose
-    // group is owned by THIS source and was NOT re-asserted this login. The
-    // `group_name IN (SELECT name FROM groups WHERE source = ?)` scoping is
-    // what makes this DELETE structurally incapable of touching a
-    // source='local' membership — see the "local membership untouched"
-    // unit test. An empty `asserted` (IdP now reports zero groups for this
-    // user) removes ALL of the user's source-scoped memberships, which is the
-    // deprovisioning-bypass fix: the next SSO login after a full IdP-group
-    // removal drops every role that flowed through that source. #1832.
-    // RETURNING (not sqlite3_changes()) carries the removed-row count in the
-    // step results — #1033.
-    {
-        std::string sql = "DELETE FROM group_members "
-                          "WHERE username = ? "
-                          "AND group_name IN (SELECT name FROM groups WHERE source = ?)";
+        // Remove stale IdP memberships: any group_members row for this user
+        // whose group is owned by THIS source and was NOT re-asserted.
+        std::string sql = "DELETE FROM rbac_store.group_members WHERE username = $1 "
+                          "AND group_name IN (SELECT name FROM rbac_store.groups WHERE source = $2)";
+        std::vector<std::string> params{username, source};
         if (!namespaced.empty()) {
             sql += " AND group_name NOT IN (";
-            for (size_t i = 0; i < namespaced.size(); ++i)
-                sql += (i == 0 ? "?" : ",?");
+            for (size_t i = 0; i < namespaced.size(); ++i) {
+                sql += (i == 0 ? "$" : ",$") + std::to_string(3 + i);
+                params.push_back(sanitize_pg_text(namespaced[i]));
+            }
             sql += ")";
         }
-        sql += " RETURNING group_name;";
+        sql += " RETURNING group_name";
+        pg::PgResult del = pg::exec_params(c, sql.c_str(), params);
+        if (del.status() != PGRES_TUPLES_OK) {
+            err = std::string("stale-membership delete failed: ") + PQerrorMessage(c);
+            return false;
+        }
+        result.removed = static_cast<size_t>(PQntuples(del.get()));
 
-        SqliteStmt del;
-        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, del.addr(), nullptr) != SQLITE_OK)
-            return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-        sqlite3_bind_text(del.get(), 1, username.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(del.get(), 2, source.c_str(), -1, SQLITE_TRANSIENT);
-        int idx = 3;
-        for (const auto& name : namespaced)
-            sqlite3_bind_text(del.get(), idx++, name.c_str(), -1, SQLITE_TRANSIENT);
-        int rc;
-        while ((rc = sqlite3_step(del.get())) == SQLITE_ROW)
-            ++result.removed;
-        if (rc != SQLITE_DONE)
-            return std::unexpected(std::string("stale-membership delete failed: ") +
-                                   sqlite3_errmsg(db_));
-    }
-
-    if (txn.commit() != SQLITE_OK)
-        return std::unexpected(std::string("commit failed: ") + sqlite3_errmsg(db_));
-
-    invalidate_perm_cache();
+        new_gen = bump_generation_in_txn(c);
+        return new_gen.has_value();
+    });
+    if (!ok)
+        return std::unexpected(err.empty() ? "reconcile transaction failed" : err);
+    apply_local_generation(*new_gen);
     return result;
 }
 
 // ── Authorization check ──────────────────────────────────────────────────────
 
-std::vector<std::string> RbacStore::collect_roles_locked(const std::string& username) const {
+std::vector<std::string> RbacStore::collect_roles(void* conn, const std::string& username) const {
     std::vector<std::string> roles;
-    if (!db_)
-        return roles;
-
-    sqlite3_stmt* s = nullptr;
-    // Three-way UNION: direct user grant, group-membership grant, and (PR
-    // 4.2, design §4.1) direct engine-principal grant. The first two
-    // branches are BYTE-IDENTICAL to their pre-PR-4.2 form — a hard
-    // invariant — because the third branch is purely additive and safe:
-    // an `engine:` principal_id can never match a human username (§3.3
-    // reserves the namespace at every creation surface) and a human/group
-    // name never carries the `engine:` prefix, so this UNION arm can only
-    // ever contribute rows for an actual `principal_type='engine'` caller.
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT role_name FROM principal_roles "
-                           "WHERE principal_type = 'user' AND principal_id = ? "
-                           "UNION "
-                           "SELECT pr.role_name FROM principal_roles pr "
-                           "JOIN group_members gm ON pr.principal_type = 'group' AND "
-                           "pr.principal_id = gm.group_name "
-                           "WHERE gm.username = ? "
-                           "UNION "
-                           "SELECT role_name FROM principal_roles "
-                           "WHERE principal_type = 'engine' AND principal_id = ?;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return roles;
-    sqlite3_bind_text(s, 1, username.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, username.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 3, username.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(s) == SQLITE_ROW)
-        roles.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-    sqlite3_finalize(s);
+    auto* c = static_cast<PGconn*>(conn);
+    // Three-way UNION: direct user grant, group-membership grant, and (§4.1)
+    // direct engine-principal grant. $1 reused for all three arms.
+    pg::PgResult r = pg::exec_params(
+        c,
+        "SELECT role_name FROM rbac_store.principal_roles "
+        "WHERE principal_type = 'user' AND principal_id = $1 "
+        "UNION "
+        "SELECT pr.role_name FROM rbac_store.principal_roles pr "
+        "JOIN rbac_store.group_members gm ON pr.principal_type = 'group' AND "
+        "pr.principal_id = gm.group_name WHERE gm.username = $1 "
+        "UNION "
+        "SELECT role_name FROM rbac_store.principal_roles "
+        "WHERE principal_type = 'engine' AND principal_id = $1",
+        std::vector<std::string>{username});
+    if (r.status() != PGRES_TUPLES_OK)
+        return roles; // fail-closed: empty role set → deny
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        roles.push_back(text_col(r.get(), i, 0));
     return roles;
 }
 
@@ -1728,148 +1416,140 @@ std::string RbacStore::perm_cache_key(const std::string& user, const std::string
     return user + ":" + type + ":" + op;
 }
 
-void RbacStore::invalidate_perm_cache() {
-    std::lock_guard lock(cache_mtx_);
-    perm_cache_.clear();
-    ++write_generation_;
-}
-
 bool RbacStore::check_permission(const std::string& username, const std::string& securable_type,
                                  const std::string& operation) const {
-    // Fast path: check permission cache (G3-PERF-004)
-    auto key = perm_cache_key(username, securable_type, operation);
+    if (!open_)
+        return false; // fail-closed
+
+    maybe_refresh_generation();
+
+    const auto key = perm_cache_key(username, securable_type, operation);
+    std::uint64_t gen_at_check = 0;
+    bool gen_ok = false;
     {
-        std::lock_guard cache_lock(cache_mtx_);
-        if (cache_generation_ == write_generation_) {
+        std::lock_guard lock(cache_mtx_);
+        gen_ok = generation_valid_;
+        gen_at_check = cached_generation_;
+        if (gen_ok) {
             auto it = perm_cache_.find(key);
             if (it != perm_cache_.end())
                 return it->second;
-        } else {
-            // Mutations happened since last cache read — clear stale entries
-            perm_cache_.clear();
-            cache_generation_ = write_generation_;
         }
     }
 
-    std::shared_lock lock(mtx_);
-    if (!db_)
-        return false;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn("RbacStore::check_permission: pool acquire timed out — DENY");
+        return false; // fail-closed
+    }
+    PGconn* conn = lease.get();
 
-    auto roles = collect_roles_locked(username);
+    const auto roles = collect_roles(conn, username);
     if (roles.empty())
         return false;
 
-    // Build a parameterized IN clause for the collected roles
-    std::string placeholders;
+    std::string sql = "SELECT effect FROM rbac_store.role_permissions "
+                      "WHERE securable_type = $1 AND operation = $2 AND role_name IN (";
+    std::vector<std::string> params{securable_type, operation};
     for (size_t i = 0; i < roles.size(); ++i) {
-        if (i > 0)
-            placeholders += ',';
-        placeholders += '?';
+        sql += (i == 0 ? "$" : ",$") + std::to_string(3 + i);
+        params.push_back(roles[i]);
     }
+    sql += ")";
 
-    std::string sql = "SELECT effect FROM role_permissions "
-                      "WHERE securable_type = ? AND operation = ? AND role_name IN (" +
-                      placeholders + ");";
-
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
-        return false;
-
-    sqlite3_bind_text(s, 1, securable_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, operation.c_str(), -1, SQLITE_TRANSIENT);
-    for (size_t i = 0; i < roles.size(); ++i)
-        sqlite3_bind_text(s, static_cast<int>(3 + i), roles[i].c_str(), -1, SQLITE_TRANSIENT);
-
+    pg::PgResult r = pg::exec_params(conn, sql.c_str(), params);
+    if (r.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("RbacStore::check_permission: query failed: {} — DENY",
+                         PQerrorMessage(conn));
+        return false; // fail-closed
+    }
     bool has_allow = false;
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        auto* effect = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
-        if (effect && std::string(effect) == "deny") {
-            sqlite3_finalize(s);
+    for (int i = 0; i < PQntuples(r.get()); ++i) {
+        const std::string effect = text_col(r.get(), i, 0);
+        if (effect == "deny")
             return false; // deny overrides everything
-        }
-        if (effect && std::string(effect) == "allow")
+        if (effect == "allow")
             has_allow = true;
     }
-    sqlite3_finalize(s);
 
-    // Store result in cache
+    // Store only if the generation we validated against is still current — a
+    // mutation racing this read (local or cross-replica) must not persist a
+    // stale verdict under the new generation.
     {
-        std::lock_guard cache_lock(cache_mtx_);
-        if (cache_generation_ == write_generation_)
+        std::lock_guard lock(cache_mtx_);
+        if (generation_valid_ && gen_ok && cached_generation_ == gen_at_check)
             perm_cache_[key] = has_allow;
     }
     return has_allow;
 }
 
 std::vector<Permission> RbacStore::get_effective_permissions(const std::string& username) const {
-    std::shared_lock lock(mtx_);
     std::vector<Permission> result;
-    if (!db_)
+    if (!open_)
         return result;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return result;
+    PGconn* conn = lease.get();
 
-    auto roles = collect_roles_locked(username);
+    const auto roles = collect_roles(conn, username);
     if (roles.empty())
         return result;
 
-    std::string placeholders;
+    std::string sql =
+        "SELECT role_name, securable_type, operation, effect FROM rbac_store.role_permissions "
+        "WHERE role_name IN (";
+    std::vector<std::string> params;
     for (size_t i = 0; i < roles.size(); ++i) {
-        if (i > 0)
-            placeholders += ',';
-        placeholders += '?';
+        sql += (i == 0 ? "$" : ",$") + std::to_string(1 + i);
+        params.push_back(roles[i]);
     }
+    sql += ") ORDER BY securable_type, operation";
 
-    std::string sql = "SELECT role_name, securable_type, operation, effect FROM role_permissions "
-                      "WHERE role_name IN (" +
-                      placeholders + ") ORDER BY securable_type, operation;";
-
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
+    pg::PgResult r = pg::exec_params(conn, sql.c_str(), params);
+    if (r.status() != PGRES_TUPLES_OK)
         return result;
-
-    for (size_t i = 0; i < roles.size(); ++i)
-        sqlite3_bind_text(s, static_cast<int>(1 + i), roles[i].c_str(), -1, SQLITE_TRANSIENT);
-
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        Permission p;
-        p.role_name = reinterpret_cast<const char*>(sqlite3_column_text(s, 0));
-        p.securable_type = reinterpret_cast<const char*>(sqlite3_column_text(s, 1));
-        p.operation = reinterpret_cast<const char*>(sqlite3_column_text(s, 2));
-        p.effect = reinterpret_cast<const char*>(sqlite3_column_text(s, 3));
-        result.push_back(std::move(p));
-    }
-    sqlite3_finalize(s);
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        result.push_back(read_perm(r.get(), i));
     return result;
 }
 
 // ── Reference data ───────────────────────────────────────────────────────────
 
 std::vector<std::string> RbacStore::list_securable_types() const {
-    std::shared_lock lock(mtx_);
     std::vector<std::string> result;
-    if (!db_)
+    if (!open_)
         return result;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT name FROM securable_types ORDER BY name;", -1, &s,
-                           nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return result;
-    while (sqlite3_step(s) == SQLITE_ROW)
-        result.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-    sqlite3_finalize(s);
+    pg::PgResult r = pg::exec_params(
+        lease.get(), "SELECT name FROM rbac_store.securable_types ORDER BY name",
+        std::vector<std::string>{});
+    if (r.status() != PGRES_TUPLES_OK)
+        return result;
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        result.push_back(text_col(r.get(), i, 0));
     return result;
 }
 
 std::vector<std::string> RbacStore::list_operations() const {
-    std::shared_lock lock(mtx_);
     std::vector<std::string> result;
-    if (!db_)
+    if (!open_)
         return result;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT id FROM operations ORDER BY id;", -1, &s, nullptr) !=
-        SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return result;
-    while (sqlite3_step(s) == SQLITE_ROW)
-        result.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-    sqlite3_finalize(s);
+    pg::PgResult r = pg::exec_params(lease.get(), "SELECT id FROM rbac_store.operations ORDER BY id",
+                                     std::vector<std::string>{});
+    if (r.status() != PGRES_TUPLES_OK)
+        return result;
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        result.push_back(text_col(r.get(), i, 0));
     return result;
 }
 
@@ -1877,14 +1557,9 @@ std::vector<std::string> RbacStore::list_operations() const {
 
 bool RbacStore::check_scoped_permission(const std::string& username,
                                         const std::string& securable_type,
-                                        const std::string& operation,
-                                        const std::string& agent_id,
+                                        const std::string& operation, const std::string& agent_id,
                                         const ManagementGroupStore* mgmt_store) const {
-    // Note: does NOT hold its own lock. Delegates to check_permission /
-    // resolve_perm_groups / the mgmt-store, which each acquire their own lock.
-
-    // 1. Global permission first (honors a global deny → false). A global ALLOW
-    //    short-circuits — matches #1715(b): a global allow overrides a group deny.
+    // 1. Global permission first (a global ALLOW short-circuits, #1715(b)).
     if (check_permission(username, securable_type, operation))
         return true;
 
@@ -1892,12 +1567,9 @@ bool RbacStore::check_scoped_permission(const std::string& username,
     if (!mgmt_store || agent_id.empty())
         return false;
 
-    // 3. Resolve the user's allow/deny groups ONCE via the shared INV-7 resolver
-    //    (the SAME classification the ADR-0017 list-read primitives use), then
-    //    intersect with the agent's reachable groups (its groups + ancestors —
-    //    ancestor-ward admit). A matching DENY anywhere in that set overrides
-    //    (deny wins within the agent's scoped set); else a matching ALLOW admits.
-    //    Fail-closed: any store error → false, never a silent admit.
+    // 3. Resolve allow/deny groups via the shared INV-7 resolver, intersect
+    //    with the agent's reachable groups. Deny wins within the scoped set.
+    //    Fail-closed: any store error → false.
     auto pg = resolve_perm_groups(username, securable_type, operation, mgmt_store);
     if (!pg)
         return false;
@@ -1914,7 +1586,7 @@ bool RbacStore::check_scoped_permission(const std::string& username,
 
     for (const auto& g : pg->deny_groups)
         if (reachable.contains(g))
-            return false; // deny overrides within the agent's scoped set
+            return false;
     for (const auto& g : pg->allow_groups)
         if (reachable.contains(g))
             return true;
@@ -1925,55 +1597,48 @@ bool RbacStore::check_scoped_permission(const std::string& username,
 
 std::expected<std::vector<std::string>, std::string>
 RbacStore::user_rbac_group_names(const std::string& username) const {
-    std::shared_lock lock(mtx_);
     std::vector<std::string> groups;
-    if (!db_)
+    if (!open_)
         return std::unexpected("rbac store not open");
-    SqliteStmt s;
-    if (sqlite3_prepare_v2(db_, "SELECT group_name FROM group_members WHERE username = ?;", -1,
-                           s.addr(), nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-    sqlite3_bind_text(s.get(), 1, username.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = SQLITE_OK;
-    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
-        if (auto* g = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0)))
-            groups.emplace_back(g);
-    }
-    s.reset();
-    if (rc != SQLITE_DONE)
-        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected("pool acquire timeout");
+    pg::PgResult r = pg::exec_params(
+        lease.get(), "SELECT group_name FROM rbac_store.group_members WHERE username = $1",
+        std::vector<std::string>{username});
+    if (r.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        groups.push_back(text_col(r.get(), i, 0));
     return groups;
 }
 
 std::expected<std::unordered_map<std::string, int>, std::string>
 RbacStore::role_effects_for(const std::string& securable_type, const std::string& operation) const {
-    std::shared_lock lock(mtx_);
     std::unordered_map<std::string, int> role_effect; // -1 deny (wins), 1 allow, 0 none
-    if (!db_)
+    if (!open_)
         return std::unexpected("rbac store not open");
-    SqliteStmt s;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT role_name, effect FROM role_permissions "
-                           "WHERE securable_type = ? AND operation = ?;",
-                           -1, s.addr(), nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-    sqlite3_bind_text(s.get(), 1, securable_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s.get(), 2, operation.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = SQLITE_OK;
-    while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
-        const auto* role = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
-        const auto* effect = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1));
-        if (!role || !effect)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected("pool acquire timeout");
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT role_name, effect FROM rbac_store.role_permissions "
+        "WHERE securable_type = $1 AND operation = $2",
+        std::vector<std::string>{securable_type, operation});
+    if (r.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    for (int i = 0; i < PQntuples(r.get()); ++i) {
+        const std::string role = text_col(r.get(), i, 0);
+        const std::string effect = text_col(r.get(), i, 1);
+        if (role.empty())
             continue;
         int& e = role_effect[role];
-        if (std::string_view(effect) == "deny")
-            e = -1; // deny wins within a role, regardless of order
-        else if (std::string_view(effect) == "allow" && e == 0)
+        if (effect == "deny")
+            e = -1;
+        else if (effect == "allow" && e == 0)
             e = 1;
     }
-    s.reset();
-    if (rc != SQLITE_DONE)
-        return std::unexpected(std::string("query failed: ") + sqlite3_errmsg(db_));
     return role_effect;
 }
 
@@ -1992,10 +1657,6 @@ RbacStore::resolve_perm_groups(const std::string& username, const std::string& s
     if (!assignments)
         return std::unexpected(assignments.error());
 
-    // Per-role deny-wins verdict for THIS (sec,op) via ONE targeted query
-    // (ADR-0017 perf F5) — resolve_perm_groups runs per-agent in fleet-list
-    // loops, so materializing the whole role_permissions table per call was a
-    // hot-path regression.
     auto role_effect_r = role_effects_for(securable_type, operation);
     if (!role_effect_r)
         return std::unexpected(role_effect_r.error());
@@ -2073,11 +1734,9 @@ ListReadAuthorization RbacStore::authorize_list_read(const std::string& username
                                                      const ManagementGroupStore* mgmt_store) const {
     ListReadAuthorization out; // DenyAll by default — the INV-1 fail-closed default.
 
-    // Legacy-open: RBAC loaded AND explicitly disabled → full-fleet read (every
-    // authenticated user is a legacy superuser under RBAC-off). A null / load-
-    // failed store returns true from rbac_enforcement_in_effect (enforce) and
-    // falls through to the RBAC path, which denies — never AdmitAll on a corrupt
-    // store (INV-1).
+    // Legacy-open: RBAC loaded AND explicitly disabled → full-fleet read. A
+    // null / load-failed store returns true from rbac_enforcement_in_effect and
+    // falls through to the RBAC path, which denies (INV-1).
     if (!rbac_enforcement_in_effect(this)) {
         out.decision = ListReadDecision::AdmitAll;
         return out;
@@ -2108,9 +1767,12 @@ ListReadAuthorization RbacStore::authorize_list_read(const std::string& username
 bool RbacStore::check_role_has_permission(const std::string& role_name,
                                           const std::string& securable_type,
                                           const std::string& operation) const {
-    // Delegates to get_role_permissions which acquires its own shared_lock
-    auto perms = get_role_permissions(role_name);
-    for (const auto& p : perms) {
+    // Uses the fail-closed authoritative read: on a store error the checked
+    // variant returns unexpected → DENY (never a false allow).
+    auto perms = get_role_permissions_checked(role_name);
+    if (!perms)
+        return false;
+    for (const auto& p : *perms) {
         if (p.securable_type == securable_type && p.operation == operation) {
             if (p.effect == "deny")
                 return false;
@@ -2119,6 +1781,422 @@ bool RbacStore::check_role_has_permission(const std::string& role_name,
         }
     }
     return false;
+}
+
+// ── Backfill (ADR-0009 MANDATORY class / ADR-0041) ───────────────────────────
+
+bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path) {
+    if (!open_)
+        return false;
+
+    const auto backfill_metric = [this](const char* result) {
+        if (metrics_)
+            metrics_->counter("yuzu_server_rbac_backfill_total", {{"result", result}}).increment();
+    };
+
+    const auto stamp_complete = [&]() -> bool {
+        return pool_.with_txn_for(kBackfillTxnTimeout, [](PGconn* c) -> bool {
+            pg::PgResult mk = pg::exec_params(
+                c,
+                "INSERT INTO rbac_store.rbac_meta (key, value) VALUES ('backfill_complete', $1) "
+                "ON CONFLICT (key) DO NOTHING",
+                std::vector<std::string>{std::to_string(now_secs())});
+            if (mk.status() != PGRES_COMMAND_OK) {
+                spdlog::error("RbacStore: migrate_from_sqlite: marker stamp failed: {}",
+                              PQerrorMessage(c));
+                return false;
+            }
+            return true;
+        });
+    };
+
+    // 1. Idempotency marker (short-lived lease released before any legacy I/O).
+    {
+        auto lease = pool_.acquire();
+        if (!lease) {
+            spdlog::error("RbacStore: migrate_from_sqlite: no database connection ({})",
+                          pool_.last_error());
+            backfill_metric("failed");
+            return false;
+        }
+        pg::PgResult mk = pg::exec_params(
+            lease.get(), "SELECT 1 FROM rbac_store.rbac_meta WHERE key='backfill_complete'",
+            std::vector<std::string>{});
+        if (mk.status() != PGRES_TUPLES_OK) {
+            spdlog::error("RbacStore: migrate_from_sqlite: marker lookup failed: {}",
+                          PQerrorMessage(lease.get()));
+            backfill_metric("failed");
+            return false;
+        }
+        if (PQntuples(mk.get()) > 0) {
+            spdlog::debug("RbacStore: migrate_from_sqlite already completed, skipping");
+            return true;
+        }
+    }
+
+    // 2. Legacy present?
+    std::error_code ec;
+    const bool legacy_exists = std::filesystem::exists(legacy_db_path, ec);
+    if (ec) {
+        spdlog::error("RbacStore: migrate_from_sqlite: cannot stat legacy path {}: {}",
+                      legacy_db_path.string(), ec.message());
+        backfill_metric("failed");
+        return false;
+    }
+    if (!legacy_exists) {
+        // Fresh install — the seeded default rbac_enabled='false' is correct.
+        if (!stamp_complete()) {
+            backfill_metric("failed");
+            return false;
+        }
+        spdlog::info("RbacStore: migrate_from_sqlite: no legacy rbac.db at {}; marking backfill "
+                     "complete (fresh install)",
+                     legacy_db_path.string());
+        backfill_metric("fresh");
+        return true;
+    }
+
+    // 3. Open legacy read-only.
+    SqliteDb legacy;
+    if (sqlite3_open_v2(legacy_db_path.string().c_str(), legacy.addr(), SQLITE_OPEN_READONLY,
+                        nullptr) != SQLITE_OK) {
+        spdlog::error("RbacStore: migrate_from_sqlite: failed to open legacy db {}: {}",
+                      legacy_db_path.string(),
+                      legacy ? sqlite3_errmsg(legacy.get()) : "open failed");
+        backfill_metric("failed");
+        return false;
+    }
+    sqlite3_exec(legacy.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
+    // Corruption probe: a non-empty, non-SQLite file opens lazily under
+    // READONLY, then the first real query fails with SQLITE_NOTADB. Distinguish
+    // that (fail CLOSED — an unreadable legacy DB must NOT be silently skipped,
+    // which would drop every operator-authored grant) from a genuine fresh/other
+    // DB where the query succeeds and merely finds no `roles` table.
+    {
+        SqliteStmt probe;
+        if (sqlite3_prepare_v2(legacy.get(), "SELECT count(*) FROM sqlite_master", -1, probe.addr(),
+                               nullptr) != SQLITE_OK ||
+            sqlite3_step(probe.get()) != SQLITE_ROW) {
+            spdlog::error("RbacStore: migrate_from_sqlite: legacy db {} is unreadable/corrupt ({}); "
+                          "refusing backfill (fail-closed — never silently drop operator RBAC "
+                          "config)",
+                          legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
+            backfill_metric("failed");
+            return false;
+        }
+    }
+    if (!legacy_has_table(legacy.get(), "roles")) {
+        if (!stamp_complete()) {
+            backfill_metric("failed");
+            return false;
+        }
+        spdlog::warn("RbacStore: migrate_from_sqlite: legacy db {} has no roles table; marking "
+                     "backfill complete",
+                     legacy_db_path.string());
+        backfill_metric("fresh");
+        return true;
+    }
+
+    // 4. CRITICAL — the rbac_enabled flag FIRST, read-back-verified. Losing it
+    // silently reverts the fleet to RBAC-off (catastrophic fail-open). The
+    // seeded default 'false' is a placeholder legacy intent must OVERRIDE, so
+    // this is DO UPDATE (not DO NOTHING).
+    std::string legacy_enabled = "false";
+    if (legacy_has_table(legacy.get(), "rbac_config")) {
+        SqliteStmt s;
+        if (sqlite3_prepare_v2(legacy.get(),
+                               "SELECT value FROM rbac_config WHERE key='enabled'", -1, s.addr(),
+                               nullptr) == SQLITE_OK &&
+            sqlite3_step(s.get()) == SQLITE_ROW) {
+            legacy_enabled = (sqlite_text(s.get(), 0) == "true") ? "true" : "false";
+        }
+    }
+    {
+        const bool ok = pool_.with_txn_for(kBackfillTxnTimeout, [&](PGconn* c) -> bool {
+            pg::PgResult up = pg::exec_params(
+                c,
+                "INSERT INTO rbac_store.rbac_meta (key, value) VALUES ('rbac_enabled', $1) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                std::vector<std::string>{legacy_enabled});
+            if (up.status() != PGRES_COMMAND_OK) {
+                spdlog::error("RbacStore: migrate_from_sqlite: rbac_enabled write failed: {}",
+                              PQerrorMessage(c));
+                return false;
+            }
+            // Read-back-after-write verification IN THE SAME TXN.
+            pg::PgResult rb = pg::exec_params(
+                c, "SELECT value FROM rbac_store.rbac_meta WHERE key='rbac_enabled'",
+                std::vector<std::string>{});
+            if (rb.status() != PGRES_TUPLES_OK || PQntuples(rb.get()) != 1 ||
+                text_col(rb.get(), 0, 0) != legacy_enabled) {
+                spdlog::error("RbacStore: migrate_from_sqlite: rbac_enabled read-back verification "
+                              "FAILED — refusing backfill (fail-closed; losing this flag is "
+                              "catastrophic fail-open)");
+                return false;
+            }
+            return true;
+        });
+        if (!ok) {
+            backfill_metric("failed");
+            return false;
+        }
+        rbac_enabled_.store(legacy_enabled == "true", std::memory_order_relaxed);
+        spdlog::info("RbacStore: migrate_from_sqlite: rbac_enabled migrated + verified as '{}'",
+                     legacy_enabled);
+    }
+
+    // 5. Backfill config tables. Small, authoritative sets — one transaction,
+    // whole-table reads, ON CONFLICT DO NOTHING (idempotent + crash-resumable
+    // by re-run). securable_types/operations are backfilled too (defensive:
+    // keeps role_permissions FKs satisfiable even for a hypothetical custom
+    // type). Legacy is already migration-cleaned, so v3/v4 cleanups are not
+    // replayed. Reconciliation counts are gathered here for the assert below.
+    struct TableCounts {
+        std::int64_t roles{0}, perms{0}, principals{0}, groups{0}, members{0};
+    };
+    TableCounts legacy_counts;
+    const auto count_legacy = [&](const char* table) -> std::int64_t {
+        if (!legacy_has_table(legacy.get(), table))
+            return 0;
+        SqliteStmt s;
+        const std::string q = std::string("SELECT COUNT(*) FROM ") + table;
+        if (sqlite3_prepare_v2(legacy.get(), q.c_str(), -1, s.addr(), nullptr) != SQLITE_OK ||
+            sqlite3_step(s.get()) != SQLITE_ROW)
+            return -1;
+        return sqlite3_column_int64(s.get(), 0);
+    };
+    legacy_counts.roles = count_legacy("roles");
+    legacy_counts.perms = count_legacy("role_permissions");
+    legacy_counts.principals = count_legacy("principal_roles");
+    legacy_counts.groups = count_legacy("groups");
+    legacy_counts.members = count_legacy("group_members");
+    if (legacy_counts.roles < 0 || legacy_counts.perms < 0 || legacy_counts.principals < 0 ||
+        legacy_counts.groups < 0 || legacy_counts.members < 0) {
+        spdlog::error("RbacStore: migrate_from_sqlite: legacy count failed: {}",
+                      sqlite3_errmsg(legacy.get()));
+        backfill_metric("failed");
+        return false;
+    }
+
+    // Read every legacy row into memory (config tables are small) BEFORE the PG
+    // txn, so no two leases are held at once.
+    struct LRole {
+        std::string name, description;
+        std::int64_t is_system{0}, created_at{0};
+    };
+    struct LType {
+        std::string name, description;
+        std::int64_t is_system{0};
+    };
+    struct LPerm {
+        std::string role_name, securable_type, operation, effect;
+    };
+    struct LPrincipal {
+        std::string principal_type, principal_id, role_name;
+    };
+    struct LGroup {
+        std::string name, description, source;
+        std::optional<std::string> external_id;
+        std::int64_t created_at{0};
+    };
+    struct LMember {
+        std::string group_name, username;
+    };
+    std::vector<LType> types;
+    std::vector<std::pair<std::string, std::string>> ops; // (id, description) is_system implied
+    std::vector<LRole> roles;
+    std::vector<LPerm> perms;
+    std::vector<LPrincipal> principals;
+    std::vector<LGroup> groups;
+    std::vector<LMember> members;
+
+    const auto read_all = [&](const char* sql, const std::function<void(sqlite3_stmt*)>& row)
+        -> bool {
+        SqliteStmt s;
+        if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK)
+            return false;
+        int rc;
+        while ((rc = sqlite3_step(s.get())) == SQLITE_ROW)
+            row(s.get());
+        return rc == SQLITE_DONE;
+    };
+
+    bool read_ok = true;
+    if (legacy_has_table(legacy.get(), "securable_types"))
+        read_ok &= read_all("SELECT name, description, is_system FROM securable_types",
+                            [&](sqlite3_stmt* s) {
+                                types.push_back({sqlite_text(s, 0), sqlite_text(s, 1),
+                                                 sqlite3_column_int64(s, 2)});
+                            });
+    if (legacy_has_table(legacy.get(), "operations"))
+        read_ok &= read_all("SELECT id, description FROM operations", [&](sqlite3_stmt* s) {
+            ops.emplace_back(sqlite_text(s, 0), sqlite_text(s, 1));
+        });
+    read_ok &= read_all("SELECT name, description, is_system, created_at FROM roles",
+                       [&](sqlite3_stmt* s) {
+                           roles.push_back({sqlite_text(s, 0), sqlite_text(s, 1),
+                                            sqlite3_column_int64(s, 2), sqlite3_column_int64(s, 3)});
+                       });
+    read_ok &= read_all("SELECT role_name, securable_type, operation, effect FROM role_permissions",
+                       [&](sqlite3_stmt* s) {
+                           perms.push_back({sqlite_text(s, 0), sqlite_text(s, 1), sqlite_text(s, 2),
+                                            sqlite_text(s, 3)});
+                       });
+    read_ok &= read_all("SELECT principal_type, principal_id, role_name FROM principal_roles",
+                       [&](sqlite3_stmt* s) {
+                           principals.push_back(
+                               {sqlite_text(s, 0), sqlite_text(s, 1), sqlite_text(s, 2)});
+                       });
+    if (legacy_has_table(legacy.get(), "groups"))
+        read_ok &= read_all("SELECT name, description, source, external_id, created_at FROM groups",
+                           [&](sqlite3_stmt* s) {
+                               LGroup g{sqlite_text(s, 0), sqlite_text(s, 1), sqlite_text(s, 2),
+                                        std::nullopt, sqlite3_column_int64(s, 4)};
+                               if (sqlite3_column_type(s, 3) != SQLITE_NULL)
+                                   g.external_id = sqlite_text(s, 3);
+                               groups.push_back(std::move(g));
+                           });
+    if (legacy_has_table(legacy.get(), "group_members"))
+        read_ok &= read_all("SELECT group_name, username FROM group_members", [&](sqlite3_stmt* s) {
+            members.push_back({sqlite_text(s, 0), sqlite_text(s, 1)});
+        });
+    if (!read_ok) {
+        spdlog::error("RbacStore: migrate_from_sqlite: legacy read failed: {}",
+                      sqlite3_errmsg(legacy.get()));
+        backfill_metric("failed");
+        return false;
+    }
+
+    const bool insert_ok = pool_.with_txn_for(kBackfillTxnTimeout, [&](PGconn* c) -> bool {
+        const auto run = [&](const char* sql, const std::vector<std::string>& p) -> bool {
+            pg::PgResult r = pg::exec_params(c, sql, p);
+            if (r.status() != PGRES_COMMAND_OK) {
+                spdlog::error("RbacStore: migrate_from_sqlite: insert failed: {}", PQerrorMessage(c));
+                return false;
+            }
+            return true;
+        };
+        for (const auto& t : types)
+            if (!run("INSERT INTO rbac_store.securable_types (name, description, is_system) "
+                     "VALUES ($1, $2, $3::boolean) ON CONFLICT (name) DO NOTHING",
+                     {sanitize_pg_text(t.name), sanitize_pg_text(t.description),
+                      bool_lit(t.is_system)}))
+                return false;
+        for (const auto& o : ops)
+            if (!run("INSERT INTO rbac_store.operations (id, description, is_system) "
+                     "VALUES ($1, $2, TRUE) ON CONFLICT (id) DO NOTHING",
+                     {sanitize_pg_text(o.first), sanitize_pg_text(o.second)}))
+                return false;
+        for (const auto& r : roles)
+            if (!run("INSERT INTO rbac_store.roles (name, description, is_system, created_at) "
+                     "VALUES ($1, $2, $3::boolean, $4::bigint) ON CONFLICT (name) DO NOTHING",
+                     {sanitize_pg_text(r.name), sanitize_pg_text(r.description),
+                      bool_lit(r.is_system), std::to_string(r.created_at)}))
+                return false;
+        for (const auto& p : perms)
+            if (!run("INSERT INTO rbac_store.role_permissions (role_name, securable_type, "
+                     "operation, effect) VALUES ($1, $2, $3, $4) "
+                     "ON CONFLICT (role_name, securable_type, operation) DO NOTHING",
+                     {sanitize_pg_text(p.role_name), sanitize_pg_text(p.securable_type),
+                      sanitize_pg_text(p.operation), sanitize_pg_text(p.effect)}))
+                return false;
+        for (const auto& p : principals)
+            if (!run("INSERT INTO rbac_store.principal_roles (principal_type, principal_id, "
+                     "role_name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+                     {sanitize_pg_text(p.principal_type), sanitize_pg_text(p.principal_id),
+                      sanitize_pg_text(p.role_name)}))
+                return false;
+        for (const auto& g : groups) {
+            pg::PgResult r = pg::exec_params(
+                c,
+                "INSERT INTO rbac_store.groups (name, description, source, external_id, created_at) "
+                "VALUES ($1, $2, $3, $4, $5::bigint) ON CONFLICT (name) DO NOTHING",
+                std::vector<std::optional<std::string>>{
+                    sanitize_pg_text(g.name), sanitize_pg_text(g.description),
+                    sanitize_pg_text(g.source),
+                    g.external_id ? std::optional<std::string>(sanitize_pg_text(*g.external_id))
+                                  : std::nullopt,
+                    std::to_string(g.created_at)});
+            if (r.status() != PGRES_COMMAND_OK) {
+                spdlog::error("RbacStore: migrate_from_sqlite: group insert failed: {}",
+                              PQerrorMessage(c));
+                return false;
+            }
+        }
+        for (const auto& m : members)
+            if (!run("INSERT INTO rbac_store.group_members (group_name, username) VALUES ($1, $2) "
+                     "ON CONFLICT DO NOTHING",
+                     {sanitize_pg_text(m.group_name), sanitize_pg_text(m.username)}))
+                return false;
+        return true;
+    });
+    if (!insert_ok) {
+        backfill_metric("failed");
+        return false;
+    }
+
+    // 6. Row-count reconciliation — PG must hold at least the legacy counts
+    // (PG also holds seeded system rows; DO NOTHING never drops a legacy row).
+    {
+        auto lease = pool_.acquire();
+        if (!lease) {
+            backfill_metric("failed");
+            return false;
+        }
+        const auto pg_count = [&](const char* table) -> std::int64_t {
+            pg::PgResult r = pg::exec_params(
+                lease.get(), (std::string("SELECT COUNT(*) FROM rbac_store.") + table).c_str(),
+                std::vector<std::string>{});
+            if (r.status() != PGRES_TUPLES_OK)
+                return -1;
+            return to_i64(PQgetvalue(r.get(), 0, 0));
+        };
+        const std::int64_t pr = pg_count("roles"), pp = pg_count("role_permissions"),
+                           ppr = pg_count("principal_roles"), pg_ = pg_count("groups"),
+                           pm = pg_count("group_members");
+        if (pr < 0 || pp < 0 || ppr < 0 || pg_ < 0 || pm < 0) {
+            spdlog::error("RbacStore: migrate_from_sqlite: reconciliation count failed");
+            backfill_metric("failed");
+            return false;
+        }
+        if (pr < legacy_counts.roles || pp < legacy_counts.perms ||
+            ppr < legacy_counts.principals || pg_ < legacy_counts.groups ||
+            pm < legacy_counts.members) {
+            spdlog::error("RbacStore: migrate_from_sqlite: reconciliation FAILED — legacy "
+                          "(roles={},perms={},principals={},groups={},members={}) vs PG "
+                          "(roles={},perms={},principals={},groups={},members={}); refusing marker",
+                          legacy_counts.roles, legacy_counts.perms, legacy_counts.principals,
+                          legacy_counts.groups, legacy_counts.members, pr, pp, ppr, pg_, pm);
+            backfill_metric("failed");
+            return false;
+        }
+        spdlog::info("RbacStore: migrate_from_sqlite: reconciled — legacy "
+                     "(roles={},perms={},principals={},groups={},members={}), PG "
+                     "(roles={},perms={},principals={},groups={},members={})",
+                     legacy_counts.roles, legacy_counts.perms, legacy_counts.principals,
+                     legacy_counts.groups, legacy_counts.members, pr, pp, ppr, pg_, pm);
+    }
+
+    // 7. Stamp the one-time marker.
+    if (!stamp_complete()) {
+        backfill_metric("failed");
+        return false;
+    }
+
+    // 8. Move the verified legacy file aside (non-fatal on failure).
+    std::error_code mv_ec;
+    auto aside = legacy_db_path;
+    aside += ".migrated-" + std::to_string(now_secs());
+    std::filesystem::rename(legacy_db_path, aside, mv_ec);
+    if (mv_ec)
+        spdlog::warn("RbacStore: migrate_from_sqlite: backfill complete but could not move legacy "
+                     "{} aside ({}); it is safe to archive/remove manually",
+                     legacy_db_path.string(), mv_ec.message());
+    else
+        spdlog::info("RbacStore: migrate_from_sqlite: moved legacy rbac db to {}", aside.string());
+
+    backfill_metric("completed");
+    return true;
 }
 
 } // namespace yuzu::server

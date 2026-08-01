@@ -37,6 +37,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -156,6 +157,17 @@ bool role_can(RbacStore& s, const std::string& role, const std::string& type,
             return true;
     return false;
 }
+
+// Pre-migrated + seeded template (RbacStore construction runs the migration AND
+// seed_defaults). Every store-behaviour case clones this instead of
+// re-migrating/re-seeding per test (docs/postgres-store-playbook.md step 7).
+yuzu::test::PgTestTemplate rbac_tpl{"rbacstore", [](const std::string& dsn) {
+                                        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+                                        RbacStore store{pool};
+                                        if (!store.is_open())
+                                            throw std::runtime_error(
+                                                "rbac template: store failed to migrate/seed");
+                                    }};
 
 } // namespace
 
@@ -382,8 +394,12 @@ TEST_CASE("sle erase: a non-throwing Failed store → 500 partial, never a false
 
 // ─────────────────────────── SoftwareLicensing securable D-9 matrix ──────────────
 
-TEST_CASE("SoftwareLicensing securable seeds the D-9 matrix EXACTLY", "[sle][rbac]") {
-    RbacStore s(":memory:");
+TEST_CASE("SoftwareLicensing securable seeds the D-9 matrix EXACTLY", "[sle][rbac][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool_{{.conninfo = rbac_db_.dsn(), .size = 4}};
+    REQUIRE(rbac_pool_.valid());
+    RbacStore s{rbac_pool_};
+    REQUIRE(s.is_open());
 
     // Viewer: Read only.
     CHECK(role_can(s, "Viewer", "SoftwareLicensing", "Read"));
@@ -424,15 +440,23 @@ TEST_CASE("SoftwareLicensing securable seeds the D-9 matrix EXACTLY", "[sle][rba
 // an INJECTED gate closure, so the production wiring (server.cpp's sle_gate_usable →
 // require_scoped_permission, branched on this predicate) is exercised at the
 // server.cpp boundary. Assert the primitive's fail-closed contract directly.
-TEST_CASE("SLE gate uses the fail-closed enforcement primitive (G-1 / #1717)", "[sle][adr0017]") {
+TEST_CASE("SLE gate uses the fail-closed enforcement primitive (G-1 / #1717)",
+          "[sle][adr0017][pg]") {
     CHECK(rbac_enforcement_in_effect(nullptr)); // null store → enforcement in effect (deny, not legacy-open)
 
-    RbacStore disabled(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(rbac_disabled_db_, rbac_tpl);
+    yuzu::server::pg::PgPool rbac_disabled_pool_{{.conninfo = rbac_disabled_db_.dsn(), .size = 4}};
+    REQUIRE(rbac_disabled_pool_.valid());
+    RbacStore disabled{rbac_disabled_pool_};
     REQUIRE(disabled.is_open());
     REQUIRE_FALSE(disabled.is_rbac_enabled());
     CHECK_FALSE(rbac_enforcement_in_effect(&disabled)); // loaded + explicitly disabled → legacy-open
 
-    RbacStore enabled(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(rbac_enabled_db_, rbac_tpl);
+    yuzu::server::pg::PgPool rbac_enabled_pool_{{.conninfo = rbac_enabled_db_.dsn(), .size = 4}};
+    REQUIRE(rbac_enabled_pool_.valid());
+    RbacStore enabled{rbac_enabled_pool_};
+    REQUIRE(enabled.is_open());
     enabled.set_rbac_enabled(true);
     CHECK(rbac_enforcement_in_effect(&enabled)); // enabled → enforcement in effect
 }

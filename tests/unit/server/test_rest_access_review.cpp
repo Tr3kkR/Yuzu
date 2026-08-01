@@ -31,9 +31,9 @@
  * metrics (REST-only — the MCP twins are deliberately NOT double-counted,
  * per server.cpp's own wiring comment).
  *
- * PG-gated: EnginePrincipalStore + AccessReviewStore are both born-on-
- * Postgres (ADR-0006/0012). Skips when YUZU_TEST_POSTGRES_DSN is unset,
- * fails when set but broken (test_helpers.hpp skip-vs-fail contract).
+ * PG-gated: EnginePrincipalStore, AccessReviewStore, AND RbacStore are all
+ * born-on-Postgres (ADR-0006/0012). Skips when YUZU_TEST_POSTGRES_DSN is
+ * unset, fails when set but broken (test_helpers.hpp skip-vs-fail contract).
  */
 
 #include "access_review_store.hpp"
@@ -76,6 +76,12 @@ void setup_access_review_rest_pg_template(const std::string& dsn) {
     if (!ars.is_open())
         throw std::runtime_error("access_review rest template: access review store failed to "
                                  "migrate");
+    // RbacStore (ADR-0006) now coexists in the SAME database, in its own
+    // `rbac_store` schema — AccessReviewHarness shares acc_rev_shared().pool
+    // for all three stores rather than standing up a fourth PG database.
+    RbacStore rbac{pool};
+    if (!rbac.is_open())
+        throw std::runtime_error("access_review rest template: rbac store failed to migrate");
 }
 
 yuzu::test::PgTestTemplate access_review_rest_tpl{"accrevresttx",
@@ -105,11 +111,19 @@ AccRevShared& acc_rev_shared() {
     return s;
 }
 
-// Restore the shared clone to its fresh state: both stores' tables in one
-// TRUNCATE (engine_principals is referenced by attest flows; RESTART IDENTITY
-// keeps any serial ids deterministic per test). public.schema_meta is
-// deliberately untouched — the clone stays migrated, so the per-harness store
-// ctors find the schema current and skip migration.
+// Restore the shared clone to its fresh state: all three stores' tables in
+// one TRUNCATE (engine_principals is referenced by attest flows; RESTART
+// IDENTITY keeps any serial ids deterministic per test). The RbacStore
+// tables that tests actually write (roles/role_permissions/principal_roles/
+// groups/group_members) are truncated too — every AccessReviewHarness
+// re-constructs its own RbacStore on this same shared pool, and its
+// constructor's seed_defaults() re-seeds the system roles on an empty
+// table, so this reproduces the same fully-fresh-RBAC-state-per-test
+// guarantee the old per-harness SQLite file gave. rbac_store.securable_types
+// /operations/rbac_meta are static seed data no test mutates, so they're
+// deliberately left alone (mirrors public.schema_meta below). public
+// .schema_meta is deliberately untouched — the clone stays migrated, so the
+// per-harness store ctors find the schema current and skip migration.
 void acc_rev_reset() {
     auto lease = acc_rev_shared().pool->acquire();
     REQUIRE(lease);
@@ -117,7 +131,9 @@ void acc_rev_reset() {
         lease.get(),
         "TRUNCATE engine_principal_store.engine_principals, "
         "access_review_store.access_review_campaign, "
-        "access_review_store.access_review_attestation RESTART IDENTITY CASCADE",
+        "access_review_store.access_review_attestation, "
+        "rbac_store.principal_roles, rbac_store.group_members, rbac_store.groups, "
+        "rbac_store.role_permissions, rbac_store.roles RESTART IDENTITY CASCADE",
         std::vector<std::string>{});
     INFO("[acc_rev_reset] " << PQresultErrorMessage(trunc.get()));
     REQUIRE(trunc.status() == PGRES_COMMAND_OK);
@@ -139,9 +155,7 @@ struct AccessReviewHarness {
 
     yuzu::test::AuthDbPgShared auth_db;
 
-    yuzu::test::TempDbFile rbac_file{"yuzu_test_access_review_rest_rbac-"};
-    RbacStore rbac{rbac_file.path};
-
+    std::unique_ptr<RbacStore> rbac;
     std::unique_ptr<EnginePrincipalStore> eps;
     std::unique_ptr<AccessReviewStore> access_review_store;
 
@@ -181,12 +195,20 @@ struct AccessReviewHarness {
     /// without needing a third harness type — mirrors `auth_db_available`
     /// above.
     explicit AccessReviewHarness(bool auth_db_available = true, bool store_available = true) {
-        REQUIRE(rbac.is_open());
-
+        // Redundant with AuthDbPgShared's own SKIP above (both gate on the
+        // same env var) — kept as a defence-in-depth guard directly on this
+        // fixture's own PG dependencies (RbacStore + EnginePrincipalStore +
+        // AccessReviewStore, all on acc_rev_shared().pool).
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
         acc_rev_reset();
+        // RbacStore coexists in the SAME shared database as EnginePrincipalStore
+        // /AccessReviewStore (own `rbac_store` schema) — acc_rev_reset() above
+        // TRUNCATEs its user-data tables too, so each harness still gets fully
+        // fresh RBAC state (the old per-harness SQLite file's guarantee).
+        rbac = std::make_unique<RbacStore>(*acc_rev_shared().pool);
+        REQUIRE(rbac->is_open());
         eps = std::make_unique<EnginePrincipalStore>(*acc_rev_shared().pool);
         REQUIRE(eps->is_open());
         access_review_store = std::make_unique<AccessReviewStore>(*acc_rev_shared().pool);
@@ -232,7 +254,7 @@ struct AccessReviewHarness {
         api.set_engine_principal_store(eps.get());
 
         api.register_routes(sink, rest_auth_fn, rest_perm_fn, rest_audit_fn,
-                            /*rbac_store=*/&rbac,
+                            /*rbac_store=*/rbac.get(),
                             /*mgmt_store=*/nullptr,
                             /*token_store=*/nullptr,
                             /*quarantine_store=*/nullptr,
@@ -309,7 +331,7 @@ struct AccessReviewHarness {
         mcp_handler = mcp.build_handler(
             std::move(mcp_auth_fn), std::move(mcp_perm_fn), std::move(mcp_audit_fn),
             std::move(agents_fn),
-            /*rbac_store=*/&rbac,
+            /*rbac_store=*/rbac.get(),
             /*instruction_store=*/nullptr,
             /*execution_tracker=*/nullptr,
             /*response_store=*/nullptr,
@@ -548,9 +570,9 @@ TEST_CASE("access-reviews: a Reviewer-equivalent grant (AccessReview:Read + "
     h.perm_override = [](const std::string& t, const std::string& op) {
         return t == "AccessReview" && (op == "Read" || op == "Attest");
     };
-    REQUIRE(h.rbac.create_role({.name = "ReviewerAllowRole", .description = "d"}).has_value());
+    REQUIRE(h.rbac->create_role({.name = "ReviewerAllowRole", .description = "d"}).has_value());
     REQUIRE(h.auth_db->upsert_user("revallow", "hash", "salt", auth::Role::user).has_value());
-    REQUIRE(h.rbac.assign_role({"user", "revallow", "ReviewerAllowRole"}).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "revallow", "ReviewerAllowRole"}).has_value());
 
     auto export_res = h.sink.Get("/api/v1/access-reviews/export");
     REQUIRE(export_res);
@@ -593,9 +615,9 @@ TEST_CASE("MCP: a Reviewer-equivalent grant (AccessReview:Read + AccessReview:At
     h.perm_override = [](const std::string& t, const std::string& op) {
         return t == "AccessReview" && (op == "Read" || op == "Attest");
     };
-    REQUIRE(h.rbac.create_role({.name = "McpReviewerAllowRole", .description = "d"}).has_value());
+    REQUIRE(h.rbac->create_role({.name = "McpReviewerAllowRole", .description = "d"}).has_value());
     REQUIRE(h.auth_db->upsert_user("mcprevallow", "hash", "salt", auth::Role::user).has_value());
-    REQUIRE(h.rbac.assign_role({"user", "mcprevallow", "McpReviewerAllowRole"}).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "mcprevallow", "McpReviewerAllowRole"}).has_value());
 
     auto export_res = h.mcp_call_tool("export_access_review", nlohmann::json::object());
     REQUIRE(export_res);
@@ -762,10 +784,10 @@ TEST_CASE("access-reviews: an audit-persist failure on open/attest/close still c
 
     SECTION("attest") {
         AccessReviewHarness h;
-        REQUIRE(h.rbac.create_role({.name = "AuditFailRole", .description = "d"}).has_value());
+        REQUIRE(h.rbac->create_role({.name = "AuditFailRole", .description = "d"}).has_value());
         REQUIRE(
             h.auth_db->upsert_user("auditfailuser", "hash", "salt", auth::Role::user).has_value());
-        REQUIRE(h.rbac.assign_role({"user", "auditfailuser", "AuditFailRole"}).has_value());
+        REQUIRE(h.rbac->assign_role({"user", "auditfailuser", "AuditFailRole"}).has_value());
         const auto cid = h.open_campaign_rest("audit fail attest");
 
         h.audit_fail_action = "access_review.attested";
@@ -897,10 +919,10 @@ TEST_CASE("attestations: decision=flagged_revoke records evidence only — the u
           "is never mutated",
           "[pg][access_review][rest][flag]") {
     AccessReviewHarness h;
-    REQUIRE(h.rbac.create_role({.name = "SomeRole", .description = "d"}).has_value());
+    REQUIRE(h.rbac->create_role({.name = "SomeRole", .description = "d"}).has_value());
     REQUIRE(h.auth_db->upsert_user("alice", "hash", "salt", auth::Role::user).has_value());
-    REQUIRE(h.rbac.assign_role({"user", "alice", "SomeRole"}).has_value());
-    REQUIRE_FALSE(h.rbac.get_principal_roles("user", "alice").empty());
+    REQUIRE(h.rbac->assign_role({"user", "alice", "SomeRole"}).has_value());
+    REQUIRE_FALSE(h.rbac->get_principal_roles("user", "alice").empty());
 
     const auto cid = h.open_campaign_rest("flag test");
 
@@ -917,7 +939,7 @@ TEST_CASE("attestations: decision=flagged_revoke records evidence only — the u
 
     // The grant is UNCHANGED — no unassign_role side effect. flagged_revoke is
     // evidence-only; acting on it is a separate, explicit operator write.
-    auto roles_after = h.rbac.get_principal_roles("user", "alice");
+    auto roles_after = h.rbac->get_principal_roles("user", "alice");
     REQUIRE(roles_after.size() == 1);
     CHECK(roles_after[0].role_name == "SomeRole");
 
@@ -958,9 +980,9 @@ TEST_CASE("attest/get/close on an unknown campaign_id -> 404, not 503",
 TEST_CASE("access-reviews: export/attest/flag emit their own self-audit rows",
           "[pg][access_review][rest][audit]") {
     AccessReviewHarness h;
-    REQUIRE(h.rbac.create_role({.name = "AuditRole", .description = "d"}).has_value());
+    REQUIRE(h.rbac->create_role({.name = "AuditRole", .description = "d"}).has_value());
     REQUIRE(h.auth_db->upsert_user("bob", "hash", "salt", auth::Role::user).has_value());
-    REQUIRE(h.rbac.assign_role({"user", "bob", "AuditRole"}).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "bob", "AuditRole"}).has_value());
 
     auto export_res = h.sink.Get("/api/v1/access-reviews/export");
     REQUIRE(export_res);
@@ -1056,9 +1078,9 @@ TEST_CASE("MCP: export_access_review / open_access_review / get_access_review / 
           "list_access_reviews / close_access_review happy paths, end to end",
           "[pg][access_review][mcp][happy]") {
     AccessReviewHarness h;
-    REQUIRE(h.rbac.create_role({.name = "McpRole", .description = "d"}).has_value());
+    REQUIRE(h.rbac->create_role({.name = "McpRole", .description = "d"}).has_value());
     REQUIRE(h.auth_db->upsert_user("mcpuser", "hash", "salt", auth::Role::user).has_value());
-    REQUIRE(h.rbac.assign_role({"user", "mcpuser", "McpRole"}).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "mcpuser", "McpRole"}).has_value());
 
     // export_access_review — the granted principal appears in the export.
     {
@@ -1286,9 +1308,9 @@ TEST_CASE("access-reviews: the 4 new metrics are wired with the documented names
     CHECK(h.metrics.histogram("yuzu_access_review_export_duration_seconds").snapshot().count == 2);
 
     // A grant to freeze, so the attestation write below lands on a real row.
-    REQUIRE(h.rbac.create_role({.name = "MetricsRole", .description = "d"}).has_value());
+    REQUIRE(h.rbac->create_role({.name = "MetricsRole", .description = "d"}).has_value());
     REQUIRE(h.auth_db->upsert_user("metricsuser", "hash", "salt", auth::Role::user).has_value());
-    REQUIRE(h.rbac.assign_role({"user", "metricsuser", "MetricsRole"}).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "metricsuser", "MetricsRole"}).has_value());
 
     // open_campaign increments campaigns_opened_total.
     const auto cid = h.open_campaign_rest("metrics test");

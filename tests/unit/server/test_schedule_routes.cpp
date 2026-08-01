@@ -26,6 +26,7 @@
 #include "api_token_store.hpp"
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "oidc_provider.hpp"
+#include "pg/pg_pool.hpp"
 #include "rbac_store.hpp"
 #include "schedule_engine.hpp"
 #include <yuzu/server/auth.hpp>
@@ -40,7 +41,9 @@
 
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -58,6 +61,19 @@ struct TestDb {
     }
 };
 
+// Pre-migrated template for RbacStore (PG port). Shares the "rbacstore" key
+// with test_rbac_store.cpp's own template (identical setup, replay-verified
+// — docs/postgres-store-playbook.md step 7). ScheduleRouteHarness needs a
+// REAL RbacStore (not just an open one) — H-01's permission-gate assertions
+// exercise create_role/set_permission/assign_role for real.
+yuzu::test::PgTestTemplate schedule_rbac_tpl{
+    "rbacstore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::RbacStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("rbac template: store failed to migrate/seed");
+    }};
+
 /// Real AuthRoutes + real RbacStore + real ScheduleEngine, wired so
 /// handle_create_schedule's permission-gate ordering has genuine end-to-end
 /// coverage — no stubbed require_permission that could pass regardless of
@@ -65,7 +81,13 @@ struct TestDb {
 struct ScheduleRouteHarness {
     Config cfg{};
     auth::AuthManager auth_mgr{};
-    RbacStore rbac{":memory:"};
+    // rbac_db/rbac_pool must outlive rbac (declaration order = destruction
+    // order); std::optional so the PG SKIP-if-no-DSN check can run before
+    // any of them are constructed (RbacStore is neither movable nor
+    // copyable, so they can't be built as locals and moved in).
+    std::optional<yuzu::test::PostgresTestDb> rbac_db;
+    std::optional<yuzu::server::pg::PgPool> rbac_pool;
+    std::optional<RbacStore> rbac;
     TestDb sdb;
     ScheduleEngine schedule_engine{sdb.db};
     yuzu::test::TempDir tmp;
@@ -80,8 +102,25 @@ struct ScheduleRouteHarness {
     std::unique_ptr<AuthRoutes> auth_routes;
 
     ScheduleRouteHarness() {
+        // Manual equivalent of YUZU_REQUIRE_PG_DB_TPL (test_helpers.hpp) — the
+        // macro declares a local, non-movable PostgresTestDb, so it can't be
+        // used directly to populate a data member; emplace() constructs
+        // rbac_db/rbac_pool/rbac in place instead.
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
+        rbac_db.emplace(schedule_rbac_tpl);
+        INFO("[ScheduleRouteHarness rbac fixture] status (blank == came up OK): "
+             << rbac_db->error());
+        REQUIRE(rbac_db->available());
+        rbac_pool.emplace(
+            yuzu::server::pg::PgPool::Options{.conninfo = rbac_db->dsn(), .size = 4});
+        REQUIRE(rbac_pool->valid());
+        rbac.emplace(*rbac_pool);
+        REQUIRE(rbac->is_open());
+
         schedule_engine.create_tables();
-        rbac.set_rbac_enabled(true);
+        rbac->set_rbac_enabled(true);
 
         // TempDir only computes a unique path; it does not create the
         // directory (see test_helpers.hpp), so create it before any store
@@ -91,7 +130,7 @@ struct ScheduleRouteHarness {
         analytics = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
 
         auth_routes = std::make_unique<AuthRoutes>(
-            cfg, auth_mgr, &rbac, /*api_token_store=*/nullptr,
+            cfg, auth_mgr, &*rbac, /*api_token_store=*/nullptr,
             /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr,
             /*tag_store=*/nullptr, analytics.get(), oidc_mu, oidc_provider);
     }
@@ -103,17 +142,17 @@ struct ScheduleRouteHarness {
     session_request_for(const std::string& username, const std::string& role_name,
                         const std::vector<std::pair<std::string, std::string>>& perms) {
         REQUIRE(auth_mgr.upsert_user(username, username + "-password1", auth::Role::user));
-        REQUIRE(rbac.create_role({.name = role_name}).has_value());
+        REQUIRE(rbac->create_role({.name = role_name}).has_value());
         for (const auto& [type, op] : perms) {
-            REQUIRE(rbac.set_permission({.role_name = role_name,
-                                        .securable_type = type,
-                                        .operation = op,
-                                        .effect = "allow"})
+            REQUIRE(rbac->set_permission({.role_name = role_name,
+                                         .securable_type = type,
+                                         .operation = op,
+                                         .effect = "allow"})
                         .has_value());
         }
-        REQUIRE(rbac.assign_role({.principal_type = "user",
-                                  .principal_id = username,
-                                  .role_name = role_name})
+        REQUIRE(rbac->assign_role({.principal_type = "user",
+                                   .principal_id = username,
+                                   .role_name = role_name})
                     .has_value());
 
         auto cookie = auth_mgr.authenticate(username, username + "-password1");
@@ -127,7 +166,7 @@ struct ScheduleRouteHarness {
 } // namespace
 
 TEST_CASE("POST /api/schedules: Schedule:Write alone is rejected without Execution:Execute (H-01)",
-          "[server][schedule][h01][rest]") {
+          "[server][schedule][h01][rest][pg]") {
     ScheduleRouteHarness h;
     auto req = h.session_request_for("sched-writer", "ScheduleOnly", {{"Schedule", "Write"}});
     req.body = R"({"name":"nightly-scan","definition_id":"def-1","frequency_type":"daily"})";
@@ -140,7 +179,7 @@ TEST_CASE("POST /api/schedules: Schedule:Write alone is rejected without Executi
 }
 
 TEST_CASE("POST /api/schedules: Execution:Execute alone is rejected without Schedule:Write",
-          "[server][schedule][h01][rest]") {
+          "[server][schedule][h01][rest][pg]") {
     ScheduleRouteHarness h;
     auto req = h.session_request_for("exec-only", "ExecuteOnly", {{"Execution", "Execute"}});
     req.body = R"({"name":"nightly-scan","definition_id":"def-1","frequency_type":"daily"})";
@@ -153,7 +192,7 @@ TEST_CASE("POST /api/schedules: Execution:Execute alone is rejected without Sche
 }
 
 TEST_CASE("POST /api/schedules: Schedule:Write + Execution:Execute together create the schedule",
-          "[server][schedule][h01][rest]") {
+          "[server][schedule][h01][rest][pg]") {
     ScheduleRouteHarness h;
     auto req = h.session_request_for("sched-op", "ScheduleAndExecute",
                                      {{"Schedule", "Write"}, {"Execution", "Execute"}});

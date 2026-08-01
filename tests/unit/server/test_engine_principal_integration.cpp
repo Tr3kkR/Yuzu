@@ -9,10 +9,9 @@
  * together the way server.cpp actually wires them.
  *
  * PG-gated where PG stores are involved (ApiTokenStore, EnginePrincipalStore,
- * and — since the ADR-0006 substrate migration — AuthDB itself): skips when
- * YUZU_TEST_POSTGRES_DSN is unset, fails when it is set but broken
- * (test_helpers.hpp skip-vs-fail contract). The RBAC-only namespace-collision
- * coverage stays plain SQLite and needs no PG gate.
+ * AuthDB, and — since the RbacStore Postgres port — RbacStore itself): skips
+ * when YUZU_TEST_POSTGRES_DSN is unset, fails when it is set but broken
+ * (test_helpers.hpp skip-vs-fail contract).
  */
 
 #include "auth_routes.hpp"
@@ -38,7 +37,6 @@
 #include <httplib.h>
 
 #include <libpq-fe.h>
-#include <sqlite3.h>
 
 #include <chrono>
 #include <filesystem>
@@ -134,7 +132,53 @@ std::int64_t now_epoch() {
         .count();
 }
 
+// ── file-local RbacStore fixture, mirroring test_rbac_store.cpp's RBAC_STORE
+// macro exactly. Every TEST_CASE below that needs an RbacStore isolated from
+// the shared EnginePrincipalStore/ApiTokenStore pools gets its own fresh
+// clone via this template — those shared pools (ep_integ_shared() above,
+// ApiTokenStorePgShared) are process-wide singletons with no per-test
+// RBAC-table reset, so reusing them here would leak custom roles/assignments
+// across TEST_CASEs.
+void setup_rbac_store_pg_integ_template(const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    RbacStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("rbac (integration) template: store failed to migrate/seed");
+}
+
+// Distinct name from test_rbac_store.cpp's own "rbacstore" template — separate
+// PgTestTemplate registry entries, no shared-state risk (mirrors this file's
+// own "engineprincipal_integ" vs "engineprincipal" precedent above).
+yuzu::test::PgTestTemplate rbac_store_integ_template{"rbacstore_integ",
+                                                      &setup_rbac_store_pg_integ_template};
+
+// Seed a group row DIRECTLY (bypassing create_group's reserved-prefix guard)
+// on an already-migrated pool, to reproduce a legacy artifact that predates
+// the guard — copied from test_rbac_store.cpp's seed_group_raw.
+void seed_group_raw(yuzu::server::pg::PgPool& pool, const std::string& name,
+                    const std::string& description, const std::string& source,
+                    const std::string& external_id) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
+        lease.get(),
+        "INSERT INTO rbac_store.groups (name, description, source, external_id, created_at) "
+        "VALUES ($1, $2, $3, $4, 0)",
+        std::vector<std::string>{name, description, source, external_id});
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+
 } // namespace
+
+// Fresh-clone RbacStore fixture macro (file scope — macros aren't namespace-
+// scoped). Must lead a block: expands to statements incl. the SKIP-if-no-DSN
+// guard, mirroring test_rbac_store.cpp's RBAC_STORE macro.
+#define RBAC_STORE(store_var)                                                                     \
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_fx_, rbac_store_integ_template);                                \
+    yuzu::server::pg::PgPool rbac_pool_fx_{{.conninfo = rbac_db_fx_.dsn(), .size = 4}};            \
+    REQUIRE(rbac_pool_fx_.valid());                                                                \
+    RbacStore store_var{rbac_pool_fx_};                                                            \
+    REQUIRE(store_var.is_open())
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 1. Engine session synthesis (AuthRoutes + wired EnginePrincipalStore + an
@@ -338,10 +382,8 @@ TEST_CASE("Engine stream re-validation end-to-end: first tick authoritative, nex
 // ═══════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("RBAC engine resolution: assignment, default-deny, and the admin bar",
-          "[engine_principal][integration][rbac]") {
-    auto db = yuzu::test::TempDbFile{"engine-rbac-integ-"};
-    RbacStore store(db.path);
-    REQUIRE(store.is_open());
+          "[pg][engine_principal][integration][rbac]") {
+    RBAC_STORE(store);
 
     REQUIRE(store.create_role({.name = "EngineReader", .description = "d"}).has_value());
     REQUIRE(store.set_permission({"EngineReader", "Inventory", "Read", "allow"}).has_value());
@@ -434,10 +476,8 @@ TEST_CASE("RBAC engine resolution: assignment, default-deny, and the admin bar",
 // ═══════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("Engine namespace: local group create inside 'engine:' is rejected",
-          "[engine_principal][integration][rbac]") {
-    auto db = yuzu::test::TempDbFile{"engine-ns-group-"};
-    RbacStore store(db.path);
-    REQUIRE(store.is_open());
+          "[pg][engine_principal][integration][rbac]") {
+    RBAC_STORE(store);
 
     RbacGroup g{.name = "engine:x", .description = "", .source = "local", .external_id = ""};
     auto r = store.create_group(g);
@@ -472,29 +512,14 @@ TEST_CASE("Engine namespace: the T8 startup collision-scan preflight finds pre-e
 
     // ── RbacStore side: seed a local group row that predates the reservation.
     // create_group() now rejects this shape outright (previous TEST_CASE), so
-    // simulate a pre-existing row the same way test_auth_sso_identity.cpp
-    // seeds a pre-migration users row: a second raw connection, closed before
-    // RbacStore reopens the same file (required on Windows).
-    auto rbac_path = yuzu::test::unique_temp_path("engine-ns-groups-");
-    {
-        RbacStore seed(rbac_path); // runs migrations + seed_defaults, then closes
-        REQUIRE(seed.is_open());
-    }
-    {
-        sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open_v2(rbac_path.string().c_str(), &raw,
-                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr) ==
-               SQLITE_OK);
-        char* err = nullptr;
-        int rc = sqlite3_exec(raw,
-                              "INSERT INTO groups (name, description, source, external_id, "
-                              "created_at) VALUES ('engine:legacy-group', '', 'local', '', 0)",
-                              nullptr, nullptr, &err);
-        REQUIRE(rc == SQLITE_OK);
-        sqlite3_close(raw);
-    }
-    RbacStore rbac_store(rbac_path);
+    // simulate a pre-existing row the same way test_rbac_store.cpp's
+    // seed_group_raw does: construct the store FIRST — on the SAME pool as
+    // auth_db above, so RbacStore's own `rbac_store` schema coexists with
+    // `auth.*` in one database, no second database needed — then insert the
+    // row directly via a second lease on that pool.
+    RbacStore rbac_store{auth_db.pool()};
     REQUIRE(rbac_store.is_open());
+    seed_group_raw(auth_db.pool(), "engine:legacy-group", "", "local", "");
 
     SECTION("both scanners individually find the seeded collisions") {
         auto colliding_users = auth_db->find_reserved_prefix_users("engine:");
@@ -521,8 +546,7 @@ TEST_CASE("Engine namespace: the T8 startup collision-scan preflight finds pre-e
     SECTION("a clean database has no collisions and would NOT fail closed") {
         yuzu::test::AuthDbPg clean_auth_db;
 
-        auto clean_rbac_path = yuzu::test::unique_temp_path("engine-ns-groups-clean-");
-        RbacStore clean_rbac(clean_rbac_path);
+        RbacStore clean_rbac{clean_auth_db.pool()};
         REQUIRE(clean_rbac.is_open());
 
         auto colliding_users = clean_auth_db->find_reserved_prefix_users("engine:");
@@ -742,9 +766,7 @@ TEST_CASE("require_permission — engine principal denied Read when RBAC is disa
           "(no legacy fallback, Blocker 1)",
           "[pg][engine_principal][integration][auth_routes][rbac]") {
     EngineRbacGateFixture fix;
-    auto db = yuzu::test::TempDbFile{"engine-rbac-gate-off-"};
-    RbacStore rbac_store(db.path);
-    REQUIRE(rbac_store.is_open());
+    RBAC_STORE(rbac_store);
     REQUIRE_FALSE(rbac_store.is_rbac_enabled()); // default-off — the hazard scenario
 
     AuthRoutes ar(fix.cfg, fix.auth_mgr, &rbac_store, fix.api_tokens.get(),
@@ -769,9 +791,7 @@ TEST_CASE("require_permission — engine principal denied Read on EVERY general 
           "RBAC is off (Blocker 1 class, default posture)",
           "[pg][engine_principal][integration][auth_routes][rbac]") {
     EngineRbacGateFixture fix;
-    auto db = yuzu::test::TempDbFile{"engine-rbac-gate-spread-"};
-    RbacStore rbac_store(db.path);
-    REQUIRE(rbac_store.is_open());
+    RBAC_STORE(rbac_store);
     REQUIRE_FALSE(rbac_store.is_rbac_enabled()); // default-off — the hazard scenario
 
     AuthRoutes ar(fix.cfg, fix.auth_mgr, &rbac_store, fix.api_tokens.get(),
@@ -822,9 +842,7 @@ TEST_CASE("require_permission — engine principal with an explicit RBAC assignm
           "allowed (Blocker 1)",
           "[pg][engine_principal][integration][auth_routes][rbac]") {
     EngineRbacGateFixture fix;
-    auto db = yuzu::test::TempDbFile{"engine-rbac-gate-on-"};
-    RbacStore rbac_store(db.path);
-    REQUIRE(rbac_store.is_open());
+    RBAC_STORE(rbac_store);
     rbac_store.set_rbac_enabled(true);
     REQUIRE(rbac_store.create_role({.name = "EngineReader", .description = "d"}).has_value());
     REQUIRE(rbac_store.set_permission({"EngineReader", "Inventory", "Read", "allow"}).has_value());
@@ -850,9 +868,7 @@ TEST_CASE("require_scoped_permission — engine principal is RBAC-only too (mirr
           "require_permission, Blocker 1)",
           "[pg][engine_principal][integration][auth_routes][rbac]") {
     EngineRbacGateFixture fix;
-    auto db = yuzu::test::TempDbFile{"engine-rbac-gate-scoped-"};
-    RbacStore rbac_store(db.path);
-    REQUIRE(rbac_store.is_open());
+    RBAC_STORE(rbac_store);
 
     AuthRoutes ar(fix.cfg, fix.auth_mgr, &rbac_store, fix.api_tokens.get(),
                  /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,

@@ -44,12 +44,13 @@
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
 #include <httplib.h>
-#include <sqlite3.h>
+#include <libpq-fe.h>
 
 #include <chrono>
 #include <filesystem>
@@ -150,6 +151,26 @@ std::int64_t now_epoch() {
         .count();
 }
 
+// ── RbacStore PgTestTemplate for RestEngineHarness — a fresh clone per
+// harness instance (one per TEST_CASE), NOT the file's shared
+// EnginePrincipalStore/ApiTokenStore pools: those are process-wide
+// singletons TRUNCATE-reset only for their OWN tables, and several TEST_CASEs
+// below create the SAME custom role name ("EngineReader") on a fresh
+// RbacStore, which would collide if the rbac_store schema's rows persisted
+// across TEST_CASEs.
+void setup_rbac_store_pg_lifecycle_template(const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    RbacStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("rbac (lifecycle) template: store failed to migrate/seed");
+}
+
+// Distinct name from test_rbac_store.cpp's "rbacstore" and
+// test_engine_principal_integration.cpp's "rbacstore_integ" — separate
+// PgTestTemplate registry entries, no shared-state risk.
+yuzu::test::PgTestTemplate rbac_store_lifecycle_template{"rbacstore_lc",
+                                                         &setup_rbac_store_pg_lifecycle_template};
+
 struct AuditCall {
     std::string action;
     std::string result;
@@ -164,10 +185,16 @@ struct AuditCall {
 // set_user_exists_fn called BEFORE register_routes(). auth_fn/perm_fn/
 // step_up_fn are mocks driven by public toggles so a single harness
 // instance can act as different principals / permission states across
-// SECTIONs without rebuilding the fixture. A real (SQLite) RbacStore is
-// wired too — cheap, and the no-admin auditor route needs one.
+// SECTIONs without rebuilding the fixture. A real (Postgres-backed) RbacStore
+// is wired too — its own fresh clone per harness instance (see
+// rbac_store_lifecycle_template above) — and the no-admin auditor route needs
+// one.
 struct RestEngineHarness {
-    yuzu::test::TempDbFile rbac_db_file{"yuzu_test_engine_lifecycle_rbac-"};
+    // Declared BEFORE rbac_store so it destructs AFTER (reverse declaration
+    // order): the store must close before its pool, and the pool before the
+    // ephemeral database is dropped.
+    std::optional<yuzu::test::PostgresTestDb> rbac_db;
+    std::optional<yuzu::server::pg::PgPool> rbac_pool;
 
     EnginePrincipalStorePg engine_store;
     yuzu::test::ApiTokenStorePgShared token_store;
@@ -191,7 +218,16 @@ struct RestEngineHarness {
     std::vector<AuditCall> audit_log;
 
     RestEngineHarness() {
-        rbac_store = std::make_unique<RbacStore>(rbac_db_file.path);
+        // By this point every member above (engine_store, in particular) has
+        // already constructed, so the "PG DSN unset -> SKIP" gate has already
+        // fired if needed — no separate guard required here.
+        rbac_db.emplace(rbac_store_lifecycle_template);
+        INFO("[RestEngineHarness] rbac db status (blank == database came up OK): "
+             << rbac_db->error());
+        REQUIRE(rbac_db->available());
+        rbac_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = rbac_db->dsn(), .size = 4});
+        REQUIRE(rbac_pool->valid());
+        rbac_store = std::make_unique<RbacStore>(*rbac_pool);
         REQUIRE(rbac_store->is_open());
 
         // Wire the SAME referential-integrity resolver server.cpp installs
@@ -727,33 +763,27 @@ TEST_CASE("Engine-principal REST: no-admin auditor query flags a seeded admin "
     // query exists precisely as the defense-in-depth catch for a row that
     // predates that bar, or a future write path that doesn't route through
     // assign_role's validation (a direct migration/backfill, a corrupted
-    // restore). Simulate that shape the same way the T8 collision-scan
-    // test seeds a pre-existing row: a raw INSERT via a second connection,
-    // closed before the harness's RbacStore reopens the same file.
+    // restore). Simulate that shape the same way the T8 collision-scan test
+    // (test_engine_principal_integration.cpp) seeds a pre-existing row: a
+    // raw INSERT via a second lease on the harness's own rbac_pool — the
+    // schema already exists (RbacStore's ctor migrated it), so this landing
+    // directly in the table is exactly the "predates the write-path bar"
+    // shape being simulated.
     RestEngineHarness h;
     auto [principal_id, raw] = h.create_and_mint("admin-audit");
     (void)raw;
 
     // Direct INSERT bypassing assign_role's F1 bar — see the comment above.
-    // A second sqlite3 connection to the SAME file the harness's RbacStore
-    // already has open — SQLite's default journal mode tolerates a second
-    // writer connection from the same process for a single synchronous
-    // INSERT+close (unlike the T8 collision-scan test, which sequences a
-    // WAL-mode store's raw seed BEFORE the persistent open specifically to
-    // dodge Windows single-writer contention on a long-lived handle; here
-    // the raw connection opens, writes, and closes immediately).
-    sqlite3* conn = nullptr;
-    REQUIRE(sqlite3_open_v2(h.rbac_db_file.path.string().c_str(), &conn,
-                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr) == SQLITE_OK);
-    char* err = nullptr;
-    std::string sql = "INSERT INTO principal_roles (principal_type, principal_id, role_name) "
-                      "VALUES ('engine', '" +
-                      principal_id + "', 'Administrator')";
-    int rc = sqlite3_exec(conn, sql.c_str(), nullptr, nullptr, &err);
-    if (err != nullptr)
-        sqlite3_free(err);
-    REQUIRE(rc == SQLITE_OK);
-    sqlite3_close(conn);
+    {
+        auto lease = h.rbac_pool->acquire();
+        REQUIRE(lease);
+        auto ins = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO rbac_store.principal_roles (principal_type, principal_id, role_name) "
+            "VALUES ('engine', $1, 'Administrator')",
+            std::vector<std::string>{principal_id});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+    }
 
     auto res = h.no_admin_audit();
     REQUIRE(res);
@@ -774,10 +804,9 @@ TEST_CASE("Engine-principal REST: no-admin auditor fails CLOSED (503) when the "
     // has zero rows in either, so empty means resolution failed, and the
     // route must report "cannot verify" (503), NEVER a silently-vacuous
     // {"ok":true}. Simulate that degraded state the SAME way the
-    // seeded-admin test above simulates a pre-existing row: a raw DELETE via
-    // a second sqlite3 connection to the harness's already-open RbacStore
-    // file, opened/written/closed immediately (tolerated by SQLite's
-    // default journal mode for a single synchronous statement).
+    // seeded-admin test above simulates a pre-existing row: a raw DELETE,
+    // via a second lease on the harness's own rbac_pool, against the schema
+    // the harness's already-open RbacStore migrated.
     RestEngineHarness h;
     REQUIRE(h.rbac_store->create_role({.name = "EngineReader", .description = "d"}).has_value());
 
@@ -785,16 +814,23 @@ TEST_CASE("Engine-principal REST: no-admin auditor fails CLOSED (503) when the "
     (void)raw;
     REQUIRE(h.rbac_store->assign_role({"engine", principal_id, "EngineReader"}).has_value());
 
-    sqlite3* conn = nullptr;
-    REQUIRE(sqlite3_open_v2(h.rbac_db_file.path.string().c_str(), &conn,
-                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr) == SQLITE_OK);
-    char* err = nullptr;
-    int rc = sqlite3_exec(conn, "DELETE FROM securable_types; DELETE FROM operations;", nullptr,
-                          nullptr, &err);
-    if (err != nullptr)
-        sqlite3_free(err);
-    REQUIRE(rc == SQLITE_OK);
-    sqlite3_close(conn);
+    {
+        auto lease = h.rbac_pool->acquire();
+        REQUIRE(lease);
+        // pg::exec_params is single-statement (PQexecParams) — several calls.
+        // role_permissions REFERENCES securable_types(name) AND operations(id),
+        // so under PG's enforced FKs the referenced rows cannot be deleted until
+        // role_permissions is cleared first (unlike the old raw-SQLite path).
+        auto del0 = yuzu::server::pg::exec_params(
+            lease.get(), "DELETE FROM rbac_store.role_permissions", std::vector<std::string>{});
+        REQUIRE(del0.status() == PGRES_COMMAND_OK);
+        auto del1 = yuzu::server::pg::exec_params(
+            lease.get(), "DELETE FROM rbac_store.securable_types", std::vector<std::string>{});
+        REQUIRE(del1.status() == PGRES_COMMAND_OK);
+        auto del2 = yuzu::server::pg::exec_params(lease.get(), "DELETE FROM rbac_store.operations",
+                                                  std::vector<std::string>{});
+        REQUIRE(del2.status() == PGRES_COMMAND_OK);
+    }
 
     // Sanity: the degrade actually took — list_securable_types()/
     // list_operations() now read back empty on the harness's own (already-

@@ -26,9 +26,12 @@
 #include "discover_routes.hpp"
 #include "event_bus.hpp"
 #include "instruction_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "rbac_store.hpp"
 #include "scope_engine.hpp"
 #include "test_route_sink.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -40,6 +43,8 @@
 #include "agent.pb.h"
 
 #include <algorithm>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -49,12 +54,25 @@ using yuzu::server::detail::EventBus;
 namespace agent_pb = ::yuzu::agent::v1;
 
 namespace {
+// Pre-migrated template for RbacStore (PG port). Shares the "rbacstore" key
+// with test_rbac_store.cpp's own template (identical setup, replay-verified
+// — docs/postgres-store-playbook.md step 7). DiscoverHarness just needs an
+// OPEN RbacStore to wire into DiscoverRoutes; no RBAC behavior exercised.
+yuzu::test::PgTestTemplate discovery_rbac_tpl{
+    "rbacstore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::RbacStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("rbac template: store failed to migrate/seed");
+    }};
 
 // ── Harness ─────────────────────────────────────────────────────────────────
 
 struct DiscoverHarness {
     yuzu::server::test::TestRouteSink sink;
 
+    std::optional<yuzu::test::PostgresTestDb> rbac_db;
+    std::optional<yuzu::server::pg::PgPool> rbac_pool;
     std::unique_ptr<RbacStore> rbac;
     std::unique_ptr<InstructionStore> instr;
 
@@ -71,7 +89,20 @@ struct DiscoverHarness {
     // null store/registry pointer, exercising the 503 degrade branch.
     explicit DiscoverHarness(bool wire_rbac = true, bool wire_instr = true,
                              bool wire_registry = true, bool grant_instr_read = false) {
-        rbac = std::make_unique<RbacStore>(":memory:");
+        // Manual equivalent of YUZU_REQUIRE_PG_DB_TPL (test_helpers.hpp) — the
+        // macro declares a local, non-movable PostgresTestDb, so it can't be
+        // used directly to populate a data member; emplace() constructs
+        // rbac_db/rbac_pool in place instead.
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
+        rbac_db.emplace(discovery_rbac_tpl);
+        INFO("[DiscoverHarness rbac fixture] status (blank == came up OK): " << rbac_db->error());
+        REQUIRE(rbac_db->available());
+        rbac_pool.emplace(
+            yuzu::server::pg::PgPool::Options{.conninfo = rbac_db->dsn(), .size = 4});
+        REQUIRE(rbac_pool->valid());
+        rbac = std::make_unique<RbacStore>(*rbac_pool);
         REQUIRE(rbac->is_open());
         instr = std::make_unique<InstructionStore>(":memory:");
         REQUIRE(instr->is_open());
@@ -139,7 +170,7 @@ InstructionDefinition make_def(const std::string& name, bool enabled,
 
 // ── /discover/permissions ────────────────────────────────────────────────────
 
-TEST_CASE("discover.permissions: shape + ETag revalidation", "[discovery][permissions]") {
+TEST_CASE("discover.permissions: shape + ETag revalidation", "[discovery][permissions][pg]") {
     DiscoverHarness h;
     auto res = h.sink.Get("/api/v1/discover/permissions");
     REQUIRE(res);
@@ -181,7 +212,7 @@ TEST_CASE("discover.permissions: shape + ETag revalidation", "[discovery][permis
     CHECK(cached->status == 304);
 }
 
-TEST_CASE("discover.permissions: null RbacStore -> 503", "[discovery][permissions]") {
+TEST_CASE("discover.permissions: null RbacStore -> 503", "[discovery][permissions][pg]") {
     DiscoverHarness h(/*wire_rbac=*/false);
     auto res = h.sink.Get("/api/v1/discover/permissions");
     REQUIRE(res);
@@ -189,7 +220,7 @@ TEST_CASE("discover.permissions: null RbacStore -> 503", "[discovery][permission
 }
 
 TEST_CASE("discover.permissions: permission denied -> 403, no body leak",
-          "[discovery][permissions]") {
+          "[discovery][permissions][pg]") {
     DiscoverHarness h;
     h.grant_perms = false;
     auto res = h.sink.Get("/api/v1/discover/permissions");
@@ -200,7 +231,7 @@ TEST_CASE("discover.permissions: permission denied -> 403, no body leak",
 // ── /discover/instructions ───────────────────────────────────────────────────
 
 TEST_CASE("discover.instructions: enabled-only subset with parsed parameter_schema",
-          "[discovery][instructions]") {
+          "[discovery][instructions][pg]") {
     DiscoverHarness h;
     auto enabled_id =
         h.instr->create_definition(make_def(
@@ -264,7 +295,8 @@ TEST_CASE("discover.instructions: enabled-only subset with parsed parameter_sche
     CHECK(cached->status == 304);
 }
 
-TEST_CASE("discover.instructions: null InstructionStore -> 503", "[discovery][instructions]") {
+TEST_CASE("discover.instructions: null InstructionStore -> 503",
+          "[discovery][instructions][pg]") {
     DiscoverHarness h(/*wire_rbac=*/true, /*wire_instr=*/false);
     auto res = h.sink.Get("/api/v1/discover/instructions");
     REQUIRE(res);
@@ -274,7 +306,7 @@ TEST_CASE("discover.instructions: null InstructionStore -> 503", "[discovery][in
 // ── /discover/routes ─────────────────────────────────────────────────────────
 
 TEST_CASE("discover.routes: subsets the OpenAPI document, honesty fields present",
-          "[discovery][routes]") {
+          "[discovery][routes][pg]") {
     DiscoverHarness h;
     auto res = h.sink.Get("/api/v1/discover/routes");
     REQUIRE(res);
@@ -308,7 +340,7 @@ TEST_CASE("discover.routes: subsets the OpenAPI document, honesty fields present
 
 // ── /discover/scope-kinds ────────────────────────────────────────────────────
 
-TEST_CASE("discover.scope-kinds: static catalog shape", "[discovery][scope_kinds]") {
+TEST_CASE("discover.scope-kinds: static catalog shape", "[discovery][scope_kinds][pg]") {
     DiscoverHarness h;
     auto res = h.sink.Get("/api/v1/discover/scope-kinds");
     REQUIRE(res);
@@ -461,7 +493,7 @@ TEST_CASE("CROSS-CHECK: comp_op_catalog covers every CompOp value (G9-style drif
 // ── /discover/plugins ────────────────────────────────────────────────────────
 
 TEST_CASE("discover.plugins: wraps AgentRegistry::help_json with a limitation note",
-          "[discovery][plugins]") {
+          "[discovery][plugins][pg]") {
     DiscoverHarness h;
     auto info = make_agent_info("agent-1", "windows", "WIN-TESTBOX");
     auto* p = info.add_plugins();
@@ -509,7 +541,7 @@ TEST_CASE("discover.plugins: wraps AgentRegistry::help_json with a limitation no
 // holding InstructionDefinition:Read -> the action carries its parameter_schema
 // inline and actions_enriched_with_schema counts it (the self-orientation win).
 TEST_CASE("discover.plugins: parameter_schema enriched when caller holds InstructionDefinition:Read",
-          "[discovery][plugins][enrich]") {
+          "[discovery][plugins][enrich][pg]") {
     DiscoverHarness h(/*wire_rbac=*/true, /*wire_instr=*/true, /*wire_registry=*/true,
                       /*grant_instr_read=*/true);
     h.instr->create_definition(make_def(
@@ -547,7 +579,7 @@ TEST_CASE("discover.plugins: parameter_schema enriched when caller holds Instruc
 // -> enrichment is withheld; the catalog is name+description only. This proves the
 // InstructionDefinition:Read content is not leaked through the Infrastructure gate.
 TEST_CASE("discover.plugins: enrichment withheld when caller lacks InstructionDefinition:Read",
-          "[discovery][plugins][enrich]") {
+          "[discovery][plugins][enrich][pg]") {
     DiscoverHarness h(/*wire_rbac=*/true, /*wire_instr=*/true, /*wire_registry=*/true,
                       /*grant_instr_read=*/false);
     h.instr->create_definition(make_def(
@@ -572,7 +604,7 @@ TEST_CASE("discover.plugins: enrichment withheld when caller lacks InstructionDe
     }
 }
 
-TEST_CASE("discover.plugins: null AgentRegistry -> 503", "[discovery][plugins]") {
+TEST_CASE("discover.plugins: null AgentRegistry -> 503", "[discovery][plugins][pg]") {
     DiscoverHarness h(/*wire_rbac=*/true, /*wire_instr=*/true, /*wire_registry=*/false);
     auto res = h.sink.Get("/api/v1/discover/plugins");
     REQUIRE(res);

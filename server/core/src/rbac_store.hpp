@@ -1,6 +1,44 @@
 #pragma once
 
-#include <sqlite3.h>
+/// @file rbac_store.hpp
+/// Authorization substrate — role definitions, role→permission grants,
+/// principal→role assignments, RBAC groups + membership, and the global
+/// `rbac_enabled` flag. Born on SQLite (`rbac.db`), migrated to PostgreSQL
+/// (ADR-0006/0007/0008/0009/0012, schema `rbac_store`; migration ADR-0041).
+/// The LARGEST and highest-blast-radius store on the ladder: a migration
+/// defect here is a FLEET-WIDE authorization failure.
+///
+/// Substrate contract (ADR-0008/0012): holds a `pg::PgPool&`, migrates at
+/// construction on a pinned lease, schema-qualifies every runtime statement
+/// (`rbac_store.roles`). No `sqlite3_changes()` (#1033) — mutators use
+/// `RETURNING` / `PQcmdTuples`.
+///
+/// Failure posture (ADR-0041), the load-bearing invariant:
+///  - **Authz reads FAIL CLOSED.** `check_permission` /
+///    `check_scoped_permission` / `holds_permission_via_any_group` /
+///    `check_role_has_permission` keep their `bool`/DENY-on-error contract: a
+///    store-not-open, pool-acquire timeout, or query error returns `false`
+///    (deny), NEVER `true`. The list/scope reads return the empty /
+///    most-restrictive result on degrade. Callers that must distinguish
+///    "denied" from "store degraded" (403 vs 503) use the `_checked`
+///    (`std::expected`) accessors — the plain `bool`/vector paths stay
+///    deny-on-error so no chokepoint can regress to fail-open.
+///  - **Permission cache → shared durable generation token.** The
+///    process-local `write_generation_` becomes a durable
+///    `rbac_meta.write_generation` counter bumped IN THE SAME TXN as every
+///    mutation. Each replica keeps its in-process `perm_cache_` but validates
+///    it against the durable generation, refreshed at most once per
+///    `kRbacGenerationRefreshMs`; on a generation change (a mutation on ANY
+///    replica) or on ANY generation-read error it clears the cache (fail
+///    toward "assume changed", never extend trust). Bounds cross-replica
+///    stale-allow to the refresh interval.
+///  - **Backfill: MANDATORY (ADR-0009/0041).** RBAC state is irreducible
+///    operator intent (custom roles, every grant, groups, membership) that
+///    cannot be re-derived — `migrate_from_sqlite` seeds defaults then
+///    backfills operator rows (`ON CONFLICT DO NOTHING`), idempotent /
+///    resumable / row-count reconciled, and boot FAILS CLOSED on failure. The
+///    `rbac_enabled` flag is migrated FIRST and read-back-verified — losing it
+///    silently reverts the fleet to RBAC-off (catastrophic fail-open).
 
 #include <atomic>
 #include <cstdint>
@@ -8,10 +46,17 @@
 #include <filesystem>
 #include <mutex>
 #include <optional>
-#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+namespace yuzu {
+class MetricsRegistry;
+}
+
+namespace yuzu::server::pg {
+class PgPool;
+}
 
 namespace yuzu::server {
 
@@ -72,13 +117,36 @@ struct ListReadAuthorization {
 
 class RbacStore {
 public:
-    explicit RbacStore(const std::filesystem::path& db_path);
+    /// Borrows the shared pool and runs the `rbac_store` schema migration on a
+    /// pinned lease, then seeds defaults + loads the durable enabled flag.
+    /// `is_open()` is false if the lease was empty or the migration failed
+    /// (fail-closed — every authz read then DENIES, the right posture for the
+    /// authorization substrate).
+    explicit RbacStore(pg::PgPool& pool);
     ~RbacStore();
 
     RbacStore(const RbacStore&) = delete;
     RbacStore& operator=(const RbacStore&) = delete;
+    RbacStore(RbacStore&&) = delete;
+    RbacStore& operator=(RbacStore&&) = delete;
 
-    bool is_open() const;
+    [[nodiscard]] bool is_open() const noexcept { return open_; }
+
+    /// Wire a metrics registry for `yuzu_server_rbac_read_degrade_total{reason}`
+    /// and the backfill counter. Set ONCE during single-threaded startup before
+    /// serving; read without synchronisation on serving threads. Null (the
+    /// default, e.g. unit tests) disables emission; every emit site is guarded.
+    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
+    /// MANDATORY backfill (ADR-0009/0041). On first boot against an empty
+    /// `rbac_store` with a legacy `rbac.db` present, migrates the `rbac_enabled`
+    /// flag FIRST (read-back-verified — losing it is catastrophic fail-open),
+    /// then backfills custom roles / role_permissions / principal_roles /
+    /// groups / group_members via `ON CONFLICT DO NOTHING`, reconciles row
+    /// counts, and stamps a one-time marker. Returns TRUE on success or when
+    /// already complete; FALSE on any failure — the caller MUST refuse boot
+    /// (fail-closed). The verified-migrated legacy file is moved aside.
+    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     // ── Global toggle ────────────────────────────────────────────────────
     bool is_rbac_enabled() const;
@@ -98,25 +166,16 @@ public:
     /// Authoritative variant of `get_role_permissions` (ADR-0012 read
     /// posture) for bulk-read consumers — e.g. the periodic-access-review
     /// export (`access_review_model.cpp`) — that must distinguish "this role
-    /// genuinely grants no permissions" from "the query failed". A bare
+    /// genuinely grants no permissions" from "the store degraded". A bare
     /// vector conflates the two; `unexpected(msg)` here is a closed store,
-    /// prepare failure, or a step that terminated on anything other than
-    /// `SQLITE_DONE`. A value (possibly empty) is a genuine, fully-read
-    /// result.
+    /// pool-acquire timeout, or a query error. A value (possibly empty) is a
+    /// genuine, fully-read result.
     std::expected<std::vector<Permission>, std::string>
     get_role_permissions_checked(const std::string& role_name) const;
 
     /// Bulk variant of `get_role_permissions_checked` — every row in
-    /// `role_permissions`, for every role, in ONE query. Added for the
-    /// grant-table-driven periodic-access-review export
-    /// (`access_review_model.cpp`, governance UP-1): the export memoizes this
-    /// single read into a `role_name -> permission set` map once, rather than
-    /// re-querying per role per principal (the N×M fan-out the prior
-    /// per-principal-type walk incurred). Same fail-closed posture as the
-    /// other `_checked` accessors: `unexpected(msg)` on a closed store,
-    /// prepare failure, or a step that terminated on anything other than
-    /// `SQLITE_DONE`; a value (possibly empty) is a genuine, fully-read
-    /// result.
+    /// `role_permissions`, for every role, in ONE query. Same fail-closed
+    /// posture as the other `_checked` accessors.
     std::expected<std::vector<Permission>, std::string>
     list_all_role_permissions_checked() const;
 
@@ -130,51 +189,32 @@ public:
                                                    const std::string& principal_id) const;
 
     /// Authoritative variant of `get_principal_roles` — same posture as
-    /// `get_role_permissions_checked` above. `unexpected(msg)` is a closed
-    /// store or a mid-scan SQLite error; a value (possibly empty) is a
-    /// genuine, fully-read result (the principal really has no role grants).
+    /// `get_role_permissions_checked`.
     std::expected<std::vector<PrincipalRole>, std::string>
     get_principal_roles_checked(const std::string& principal_type,
                                 const std::string& principal_id) const;
 
     /// Bulk variant of `get_principal_roles_checked` — EVERY `(principal_type,
     /// principal_id, role_name)` grant row on record, across all three
-    /// principal types, in ONE query. This is the authoritative set: the
-    /// grant table, not any roster (`users`/`groups`/engine-principal list),
-    /// is the source of truth for "who currently holds a role" — a roster
-    /// walk can silently miss a since-deleted user, a stale IdP-provisioned
-    /// row, or an OIDC/SSO principal (`oidc:<iss>#<sub>`) that was never
-    /// materialized into a roster. Added for the grant-table-driven
-    /// periodic-access-review export (`access_review_model.cpp`, governance
-    /// UP-1), which pivots to this call as its spine instead of walking the
-    /// rosters and asking RBAC per member. Same fail-closed posture as the
-    /// other `_checked` accessors: `unexpected(msg)` on a closed store,
-    /// prepare failure, or a step that terminated on anything other than
-    /// `SQLITE_DONE`; a value (possibly empty) is a genuine, fully-read
-    /// result (no grants exist at all).
+    /// principal types, in ONE query. This is the authoritative set: the grant
+    /// table, not any roster, is the source of truth for "who currently holds
+    /// a role". Same fail-closed posture as the other `_checked` accessors.
     std::expected<std::vector<PrincipalRole>, std::string>
     list_all_principal_roles_checked() const;
 
     std::vector<PrincipalRole> get_role_members(const std::string& role_name) const;
 
     /// Shared assignment guard called by BOTH `RbacStore::assign_role` AND
-    /// `ManagementGroupStore::assign_role` (which includes this header to
-    /// reach it) — a single chokepoint per design §4.2 "no admin, ever" so a
-    /// future assignment call site can never re-derive its own, possibly
-    /// looser, copy. Deliberately static/DB-independent (name-based, not an
-    /// `is_system` lookup): `ManagementGroupStore` has no RbacStore
-    /// connection to query the `roles` table against.
+    /// `ManagementGroupStore::assign_role` — a single chokepoint per design
+    /// §4.2 "no admin, ever" so a future assignment call site can never
+    /// re-derive its own, possibly looser, copy. Deliberately static/
+    /// DB-independent (name-based, not an `is_system` lookup).
     ///
-    /// - Any `principal_type` other than `"engine"` is a no-op pass —
-    ///   existing user/group assignment behavior is completely unchanged.
+    /// - Any `principal_type` other than `"engine"` is a no-op pass.
     /// - `principal_type == "engine"` REQUIRES `principal_id` to carry the
-    ///   reserved `"engine:<slug>"` namespace (§3.3); anything else is
-    ///   rejected as a malformed engine assignment.
+    ///   reserved `"engine:<slug>"` namespace (§3.3).
     /// - `principal_type == "engine"` REJECTS `role_name` naming a built-in
-    ///   full-access role ("Administrator" — RBAC's legacy-admin-equivalent
-    ///   system role — or the literal "admin"). See the `.cpp`
-    ///   `kEngineDisallowedRoles` doc for the full rationale, including why
-    ///   elevation eligibility needs no entry here.
+    ///   full-access role ("Administrator" or the literal "admin").
     static std::expected<void, std::string> validate_assignment(const std::string& principal_type,
                                                                  const std::string& principal_id,
                                                                  const std::string& role_name);
@@ -188,36 +228,23 @@ public:
     std::vector<RbacGroup> list_groups() const;
 
     /// Authoritative variant of `list_groups` — same posture as
-    /// `get_role_permissions_checked` above. `unexpected(msg)` is a closed
-    /// store, prepare failure, or a step that terminated on anything other
-    /// than `SQLITE_DONE`; a value (possibly empty) is a genuine, fully-read
-    /// result (no groups exist yet). Added for the periodic-access-review
-    /// export (`access_review_model.cpp`), which must never export a
-    /// partial grant set as if it were complete.
+    /// `get_role_permissions_checked`. Added for the periodic-access-review
+    /// export, which must never export a partial grant set as if complete.
     std::expected<std::vector<RbacGroup>, std::string> list_groups_checked() const;
 
     /// Rejects a `source=="local"` create whose `name` collides with a reserved
     /// IdP or engine-principal namespace prefix (`local:`/`entra:`/`saml:`/
-    /// `ad:`/`engine:`) — see `namespaced_group_name` below. An IdP-sourced
-    /// create (any other `source`) is exempt: `reconcile_idp_memberships`
-    /// writes IdP groups directly (not via this method) and always passes a
-    /// namespaced name, but the exemption also covers any future caller that
-    /// legitimately creates an IdP-sourced group through this API. #1832;
-    /// `engine:` reservation is design §3.3 / PR 4.2.
+    /// `ad:`/`engine:`). An IdP-sourced create (any other `source`) is exempt.
     std::expected<void, std::string> create_group(const RbacGroup& group);
     std::expected<void, std::string> delete_group(const std::string& name);
 
     /// Read-only prefix scan over LOCALLY-sourced group names — backs the T8
-    /// startup collision-scan preflight (decision log #3: "The PR 4.2
-    /// migration itself scans for pre-existing colliding names rather than
-    /// allowing silent coexistence"). `prefix` must be a code-controlled
-    /// literal (e.g. `"engine:"`) — see the `.cpp` for the LIKE-metacharacter
-    /// fail-closed guard.
+    /// startup collision-scan preflight. `prefix` must be a code-controlled
+    /// literal (e.g. `"engine:"`).
     ///
-    /// G3 (governance hardening, UP-2): returns `std::nullopt` on a scan
-    /// error (statement prepare failure, or `sqlite3_step` terminating on
-    /// anything other than `SQLITE_DONE`) so a mid-scan SQLite error can
-    /// never be misread as "no collisions found" by the boot preflight — an
+    /// G3 (governance hardening, UP-2): returns `std::nullopt` on a scan error
+    /// (store not open, pool-acquire timeout, or query error) so a scan failure
+    /// can never be misread as "no collisions found" by the boot preflight — an
     /// empty-but-`has_value()` result means the scan genuinely completed and
     /// found nothing. Callers MUST treat `nullopt` as fail-closed.
     std::optional<std::vector<std::string>>
@@ -230,110 +257,56 @@ public:
 
     /// Upper bound on the number of IdP-asserted groups reconciled for a single
     /// login. Defends `reconcile_idp_memberships` against a malicious/compromised
-    /// IdP response (or claims-inflation bug) turning one login into an
-    /// unbounded write storm. #1832.
+    /// IdP response turning one login into an unbounded write storm. #1832.
     static constexpr size_t kMaxIdpGroupsPerLogin = 200;
 
     /// Reconcile the IdP-asserted group memberships for `username` under
-    /// `source` ("entra"/"saml"/"ad" — never "local"/empty, rejected below)
-    /// against what `group_members` currently records for that (user,
-    /// source) pair.
-    ///
-    /// In one transaction:
-    ///   1. Skips any asserted entry whose `external_id` is empty/whitespace-
-    ///      only or longer than 512 bytes (defends against a malformed/hostile
-    ///      assertion seeding a garbage group; #1832 hardening UP-9).
-    ///   2. For each remaining `{external_id, display}`: upserts a namespaced
-    ///      group (`namespaced_group_name(source, id)`, `INSERT OR IGNORE` so
-    ///      a pre-existing row's `source`/description is never overwritten),
-    ///      then — ONLY if that group row's `source` matches this call's
-    ///      `source` — upserts the membership row. A namespaced name that
-    ///      collides with a PRE-EXISTING row of a DIFFERENT source (e.g. a
-    ///      local group literally named `entra:<gid>`, created before the
-    ///      `create_group` reserved-prefix guard existed) is never joined —
-    ///      that would leak the local group's already-granted roles to the
-    ///      IdP-authenticated user (#1832 hardening sec-L1).
-    ///   3. Deletes any of the user's memberships in a `source`-owned group
-    ///      that was NOT in the (filtered) asserted set — this is what makes
-    ///      IdP-group removal (deprovisioning) take effect on next login
-    ///      instead of accumulating stale grants forever.
-    /// Local memberships (`groups.source == 'local'`) are never touched: the
-    /// stale-membership DELETE is scoped to `groups.source = ?` (the caller's
-    /// `source`), so a user's local group memberships survive every IdP login.
-    ///
-    /// Returns `unexpected("group_count_exceeded")` WITHOUT mutating anything
-    /// if `asserted.size() > kMaxIdpGroupsPerLogin`, and
-    /// `unexpected("invalid source: ...")` WITHOUT mutating anything if
-    /// `source` is empty or `"local"` — the source-scoped stale-membership
-    /// DELETE is only safe for IdP sources; a miswired caller passing
-    /// `"local"` would mass-delete every local group membership fleet-wide
-    /// (#1832 hardening UP-6). Callers (the OIDC/SAML callback handlers) MUST
-    /// treat any `unexpected` result as fail-closed: deny the login rather
-    /// than mint a session with unreconciled/stale roles. On success, returns
-    /// the `{added, removed}` membership counts so a no-op login (nothing
-    /// added or removed) can skip writing a provisioning audit row. #1832.
+    /// `source` ("entra"/"saml"/"ad" — never "local"/empty) against what
+    /// `group_members` currently records. See the .cpp for the full contract
+    /// (#1832). Returns `unexpected` WITHOUT mutating on an over-cap or
+    /// invalid-source call; callers MUST treat any `unexpected` as fail-closed.
     std::expected<ReconcileResult, std::string>
     reconcile_idp_memberships(const std::string& username, const std::string& source,
                               const std::vector<std::pair<std::string, std::string>>& asserted);
 
     // ── Authorization check ──────────────────────────────────────────────
+    /// FAIL-CLOSED: false (deny) on store-not-open / pool timeout / query error.
     bool check_permission(const std::string& username, const std::string& securable_type,
                           const std::string& operation) const;
 
-    /// Scoped permission check: first tries global, then checks group-scoped roles.
+    /// Scoped permission check: first tries global, then checks group-scoped
+    /// roles. FAIL-CLOSED: false on any store error.
     bool check_scoped_permission(const std::string& username, const std::string& securable_type,
                                  const std::string& operation, const std::string& agent_id,
                                  const ManagementGroupStore* mgmt_store) const;
 
     // ── ADR-0017 admit-then-filter list gate ─────────────────────────────
     /// The single chokepoint for list/fan-out reads of per-agent data under
-    /// management-group confinement (ADR-0017; resolves #1714 World A). Returns
-    /// a discriminated decision the transport wrappers (`require_list_read` and
-    /// its MCP/dashboard twins) render into 403 / unfiltered read / scoped read:
-    ///   * `AdmitAll`  — the caller holds `<securable>:<op>` globally, OR RBAC
-    ///     enforcement is loaded-and-explicitly-disabled (legacy-open); read the
-    ///     whole fleet, no per-agent filter.
-    ///   * `AdmitScoped(visible_agents)` — a management-group-confined caller;
-    ///     read ONLY `visible_agents` (empty set ⇒ zero rows, INV-2).
-    ///   * `DenyAll` — no grant anywhere; 403 (REST) / empty (dashboard).
-    /// FAIL-CLOSED (INV-1/INV-5): any `rbac.db`/mgmt-store error, `!is_open()`,
-    /// or unresolvable scope yields `DenyAll`, never `AdmitAll`. Keys on
-    /// `rbac_enforcement_in_effect()`. #1715 combining lattice: a global ALLOW
-    /// overrides a group deny (→ `AdmitAll`); a global DENY does NOT override a
-    /// group allow (additive) — deny-overrides applies only within a group's own
-    /// assignments. This is the ONE resolver that `check_scoped_permission`,
-    /// `holds_permission_via_any_group`, and `visible_agents_for_permission` all
-    /// share (INV-7), pinned by a cross-check test.
+    /// management-group confinement (ADR-0017). FAIL-CLOSED (INV-1/INV-5): any
+    /// store/mgmt-store error, `!is_open()`, or unresolvable scope yields
+    /// `DenyAll`, never `AdmitAll`.
     ListReadAuthorization authorize_list_read(const std::string& username,
                                               const std::string& securable_type,
                                               const std::string& operation,
                                               const ManagementGroupStore* mgmt_store) const;
 
-    /// "Does this user hold `<securable>:<op>` via ANY management group?" — the
-    /// list-admit computation (ADR-0017), for a gate with no single `agent_id`
-    /// to pass to `check_scoped_permission`. True iff the user has at least one
-    /// group ALLOW assignment for the permission (a global grant is handled
-    /// separately by `authorize_list_read`'s `AdmitAll`). Fail-closed: false on
-    /// any store error.
+    /// "Does this user hold `<securable>:<op>` via ANY management group?"
+    /// FAIL-CLOSED: false on any store error.
     bool holds_permission_via_any_group(const std::string& username,
                                         const std::string& securable_type,
                                         const std::string& operation,
                                         const ManagementGroupStore* mgmt_store) const;
 
-    /// The permission-specific visible set (ADR-0017 INV-4, descendant-ward):
-    /// every agent the confined `username` may see for `<securable>:<op>`. The
-    /// INV-7 set-equivalence invariant (pinned by a property test):
-    ///   `visible_agents_for_permission(u,s,o) == { a : check_scoped_permission(u,s,o,a) }`
-    /// for a non-global caller. Computed batched as
-    /// `members(allow-groups ∪ descendants) \ members(deny-groups ∪ descendants)`.
-    /// Fail-closed (INV-1/INV-5): `unexpected(msg)` on any store error, so a
-    /// partial read never over-discloses (an unseen deny would).
+    /// The permission-specific visible set (ADR-0017 INV-4). FAIL-CLOSED
+    /// (INV-1/INV-5): `unexpected(msg)` on any store error, so a partial read
+    /// never over-discloses.
     std::expected<std::vector<std::string>, std::string>
     visible_agents_for_permission(const std::string& username, const std::string& securable_type,
                                   const std::string& operation,
                                   const ManagementGroupStore* mgmt_store) const;
 
-    /// Check if a specific role grants a permission (for service-scoped token validation).
+    /// Check if a specific role grants a permission (for service-scoped token
+    /// validation). FAIL-CLOSED: false on any store error.
     bool check_role_has_permission(const std::string& role_name, const std::string& securable_type,
                                    const std::string& operation) const;
 
@@ -345,28 +318,25 @@ public:
     std::vector<std::string> list_operations() const;
 
 private:
-    sqlite3* db_{nullptr};
-    mutable std::atomic<bool> rbac_enabled_{false};
-    mutable std::shared_mutex mtx_;
+    pg::PgPool& pool_;
+    bool open_{false};
+    yuzu::MetricsRegistry* metrics_{nullptr};
 
-    void create_tables();
-    void seed_defaults();
-    void load_enabled_flag();
+    // Durable-generation-validated view of the global enabled flag. The atomic
+    // is the hot-path answer; `maybe_refresh_generation()` re-reads the durable
+    // `rbac_meta.rbac_enabled` at most once per refresh interval and updates it
+    // (never flips it to disabled on a read error — that would be fail-open).
+    mutable std::atomic<bool> rbac_enabled_{false};
+
+    void seed_defaults();     // idempotent (ON CONFLICT DO NOTHING)
+    void load_enabled_flag(); // seed rbac_enabled_ from the durable row
 
     /// Collect all role names for a principal (direct user grant + via group
-    /// membership + PR 4.2 direct engine-principal grant, §4.1). `username`
-    /// is also the identity key for an `engine:`-prefixed caller — the
-    /// namespace reservation (§3.3) is what keeps the three UNION arms from
-    /// ever colliding. Caller must hold at least a shared lock on mtx_.
-    std::vector<std::string> collect_roles_locked(const std::string& username) const;
+    /// membership + direct engine-principal grant, §4.1) using `conn`. Returns
+    /// empty on a query error (fail-closed: an empty role set denies).
+    std::vector<std::string> collect_roles(void* conn, const std::string& username) const;
 
     // ── ADR-0017 shared list-gate resolver (INV-7) ───────────────────────
-    /// {groups where the user holds an ALLOW for (sec,op)} and {groups where a
-    /// DENY}. The ONE shared classification behind `check_scoped_permission`,
-    /// `holds_permission_via_any_group`, `visible_agents_for_permission`, and
-    /// `authorize_list_read` (INV-7). Fail-closed: `unexpected(msg)` on any
-    /// store error, so a read failure denies rather than silently dropping a
-    /// deny (→ over-disclosure).
     struct PermGroups {
         std::vector<std::string> allow_groups;
         std::vector<std::string> deny_groups;
@@ -375,62 +345,49 @@ private:
         const std::string& username, const std::string& securable_type,
         const std::string& operation, const ManagementGroupStore* mgmt_store) const;
 
-    /// `members(allow ∪ descendants) \ members(deny ∪ descendants)`, sorted +
-    /// deduped. Fail-closed: propagates any subtree-read error.
     std::expected<std::vector<std::string>, std::string>
     expand_visible_set(const PermGroups& pg, const ManagementGroupStore* mgmt_store) const;
 
-    /// The user's RBAC group names (`group_members`), error-propagating so a
-    /// read failure fails the whole resolution closed (INV-5).
     std::expected<std::vector<std::string>, std::string>
     user_rbac_group_names(const std::string& username) const;
 
-    /// Deny-wins (sec,op) verdict per role, from ONE targeted query
-    /// (`WHERE securable_type=? AND operation=?`) rather than materializing the
-    /// whole `role_permissions` table client-side — the ADR-0017 perf-F5 hot-path
-    /// fix (resolve_perm_groups runs per-agent in fleet-list loops). Map values:
-    /// -1 deny (wins), 1 allow, 0 none. Fail-closed: unexpected on store error.
     std::expected<std::unordered_map<std::string, int>, std::string>
     role_effects_for(const std::string& securable_type, const std::string& operation) const;
 
-    // Permission cache (G3-PERF-004): avoids 2+ SQL queries per REST request.
-    // Invalidated by incrementing cache_generation_ on any permission/role mutation.
+    // ── Permission cache — durable generation token (ADR-0041) ───────────
     mutable std::mutex cache_mtx_;
     mutable std::unordered_map<std::string, bool> perm_cache_; // "user:type:op" -> allow/deny
-    mutable uint64_t cache_generation_{0};
-    uint64_t write_generation_{0}; // bumped on mutations; cache cleared when mismatch
+    mutable uint64_t cached_generation_{0};   // durable generation perm_cache_ is valid for
+    mutable bool generation_valid_{false};    // false ⇒ assume-changed, do not trust cache
+    mutable int64_t last_generation_refresh_ms_{0};
 
-    void invalidate_perm_cache();
+    /// At most once per `kRbacGenerationRefreshMs`, re-read the durable
+    /// `write_generation` + `rbac_enabled` in ONE query; on a generation change
+    /// clear `perm_cache_`; on ANY error clear the cache and mark it invalid
+    /// (assume-changed — never extend trust). Leaves `rbac_enabled_` unchanged
+    /// on a read error (never flips to disabled/fail-open).
+    void maybe_refresh_generation() const;
+
+    /// Apply a locally-committed durable generation: clear `perm_cache_`, set
+    /// `cached_generation_`, mark valid, and re-anchor the refresh clock (the
+    /// writing replica is immediately coherent with itself).
+    void apply_local_generation(uint64_t new_gen) const;
+
     std::string perm_cache_key(const std::string& user, const std::string& type,
                                const std::string& op) const;
 };
 
-/// Visibility policy for device-listing call sites (e.g. the TAR fleet scan via
-/// ManagementGroupStore::get_visible_agents) that fall back to the full enrolled
-/// fleet when RBAC enforcement is OFF.
-///
-/// Returns true when RBAC enforcement is IN EFFECT — the caller must use its
-/// role-scoped path, which fails closed (an unroled caller sees nothing).
-/// Returns false only to PERMIT the full-fleet fallback, and only for a store
-/// that is loaded AND explicitly disabled (`is_open() && !is_rbac_enabled()`).
-///
-/// #1498 — a null `store`, or one that failed to load (open/migration failure
-/// leaves `db_` null, so `is_open()` is false while the default-false enabled
-/// flag would otherwise be indistinguishable from an intentional disable),
-/// returns true and so fails CLOSED. A corrupt rbac.db can never widen
-/// fleet-scan visibility to the whole fleet.
+/// Visibility policy for device-listing call sites that fall back to the full
+/// enrolled fleet when RBAC enforcement is OFF. Returns true when RBAC
+/// enforcement is IN EFFECT (caller must use its role-scoped, fail-closed
+/// path); false only for a store that is loaded AND explicitly disabled
+/// (`is_open() && !is_rbac_enabled()`). A null / load-failed store returns true
+/// and so fails CLOSED (#1498).
 [[nodiscard]] bool rbac_enforcement_in_effect(const RbacStore* store) noexcept;
 
-/// Build the `groups.name` used for an IdP-sourced group: `source:external_id`
-/// (e.g. `entra:8f3c...`). `source == "local"` groups are NOT namespaced —
-/// this returns `external_id` unchanged in that case (matches how local
-/// groups are created directly by name, with no `external_id` concept).
-///
-/// This is the confused-deputy fix for #1832: an operator-created local group
-/// named e.g. "admins" and an IdP group asserting the same raw id "admins" are
-/// two DIFFERENT rows (`admins` vs `entra:admins`) once every IdP membership
-/// write goes through this helper, so a same-named IdP group can never assume
-/// a local group's already-granted roles (or vice versa).
+/// Build the `groups.name` used for an IdP-sourced group: `source:external_id`.
+/// `source == "local"` groups are NOT namespaced — returns `external_id`
+/// unchanged. The confused-deputy fix for #1832.
 [[nodiscard]] std::string namespaced_group_name(const std::string& source,
                                                 const std::string& external_id);
 

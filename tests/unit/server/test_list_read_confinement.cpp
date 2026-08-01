@@ -14,6 +14,7 @@
  */
 
 #include "management_group_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "rbac_store.hpp"
 
 #include "../test_helpers.hpp"
@@ -21,18 +22,31 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
-#include <fstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
+namespace pg = yuzu::server::pg;
+using pg::PgPool;
 
 namespace {
 
 bool contains(const std::vector<std::string>& v, const std::string& x) {
     return std::find(v.begin(), v.end(), x) != v.end();
 }
+
+// Pre-migrated + seeded template (RbacStore construction runs the migration AND
+// seed_defaults). Every store-behaviour case clones this instead of
+// re-migrating/re-seeding per test (docs/postgres-store-playbook.md step 7).
+yuzu::test::PgTestTemplate rbac_tpl{"rbacstore", [](const std::string& dsn) {
+                                        PgPool pool{{.conninfo = dsn, .size = 1}};
+                                        RbacStore store{pool};
+                                        if (!store.is_open())
+                                            throw std::runtime_error(
+                                                "rbac template: store failed to migrate/seed");
+                                    }};
 
 /// A two-store rig with a small management-group tree, custom allow/deny
 /// Response:Read roles, and RBAC enforcement ON so authorize_list_read runs
@@ -44,12 +58,15 @@ bool contains(const std::vector<std::string>& v, const std::string& x) {
 ///
 /// Members: a_p∈P, a_c1∈C1, a_c2∈C2, a_s∈S.
 struct Rig {
-    RbacStore rbac{":memory:"};
+    PgPool pool;
+    RbacStore rbac;
     yuzu::test::TempDbFile mgmt_db{"yuzu_test_lrc_mgmt-"};
     ManagementGroupStore mgmt{mgmt_db.path};
     std::string gP, gC1, gC2, gS;
 
-    Rig() {
+    explicit Rig(const std::string& dsn) : pool{{.conninfo = dsn, .size = 4}}, rbac{pool} {
+        REQUIRE(pool.valid());
+        REQUIRE(rbac.is_open());
         rbac.set_rbac_enabled(true); // enforcement in effect
 
         REQUIRE(rbac.create_role({"RespReader", "", false, 0}).has_value());
@@ -87,8 +104,9 @@ struct Rig {
 
 // ── #1715(b): a global ALLOW overrides any group deny → AdmitAll ──────────────
 
-TEST_CASE("authorize_list_read: global allow ⇒ AdmitAll", "[list_read][rbac][1715]") {
-    Rig r;
+TEST_CASE("authorize_list_read: global allow ⇒ AdmitAll", "[list_read][rbac][1715][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    Rig r{rbac_db_.dsn()};
     REQUIRE(r.rbac.assign_role({"user", "bob", "RespReader"}).has_value()); // GLOBAL allow
     r.group_assign(r.gC2, "bob", "RespDenier"); // a group deny must NOT carve out
 
@@ -99,8 +117,9 @@ TEST_CASE("authorize_list_read: global allow ⇒ AdmitAll", "[list_read][rbac][1
 // ── #1715(a): a global DENY does NOT override a group allow (additive) ────────
 
 TEST_CASE("authorize_list_read: global deny + group allow ⇒ AdmitScoped (additive)",
-          "[list_read][rbac][1715]") {
-    Rig r;
+          "[list_read][rbac][1715][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    Rig r{rbac_db_.dsn()};
     REQUIRE(r.rbac.assign_role({"user", "carol", "RespDenier"}).has_value()); // GLOBAL deny
     r.group_assign(r.gP, "carol", "RespReader");                              // group allow
 
@@ -112,8 +131,9 @@ TEST_CASE("authorize_list_read: global deny + group allow ⇒ AdmitScoped (addit
 
 // ── DenyAll: no grant anywhere ────────────────────────────────────────────────
 
-TEST_CASE("authorize_list_read: no grant ⇒ DenyAll", "[list_read][rbac]") {
-    Rig r;
+TEST_CASE("authorize_list_read: no grant ⇒ DenyAll", "[list_read][rbac][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    Rig r{rbac_db_.dsn()};
     auto d = r.rbac.authorize_list_read("nobody", "Response", "Read", &r.mgmt);
     CHECK(d.decision == ListReadDecision::DenyAll);
     CHECK(d.visible_agents.empty());
@@ -122,8 +142,9 @@ TEST_CASE("authorize_list_read: no grant ⇒ DenyAll", "[list_read][rbac]") {
 // ── INV-2: holds via a group but sees nothing ⇒ AdmitScoped({}), not DenyAll ──
 
 TEST_CASE("authorize_list_read: allow on an empty group ⇒ AdmitScoped empty (INV-2)",
-          "[list_read][rbac][inv2]") {
-    Rig r;
+          "[list_read][rbac][inv2][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    Rig r{rbac_db_.dsn()};
     auto empty = r.make_group("Empty", ""); // no members
     r.group_assign(empty, "dave", "RespReader");
 
@@ -136,8 +157,9 @@ TEST_CASE("authorize_list_read: allow on an empty group ⇒ AdmitScoped empty (I
 // ── INV-4: descendant-ward expansion + deny-override subtraction ──────────────
 
 TEST_CASE("authorize_list_read: descendant-ward visible set with a deny branch (INV-4)",
-          "[list_read][rbac][inv4]") {
-    Rig r;
+          "[list_read][rbac][inv4][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    Rig r{rbac_db_.dsn()};
     r.group_assign(r.gP, "alice", "RespReader");  // allow on P (covers P,C1,C2)
     r.group_assign(r.gC2, "alice", "RespDenier"); // deny on the C2 branch
 
@@ -153,8 +175,9 @@ TEST_CASE("authorize_list_read: descendant-ward visible set with a deny branch (
 // ── INV-7: the set-equivalence property + one-resolver cross-check ────────────
 
 TEST_CASE("authorize_list_read: visible set == {a : check_scoped_permission} (INV-7)",
-          "[list_read][rbac][inv7]") {
-    Rig r;
+          "[list_read][rbac][inv7][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    Rig r{rbac_db_.dsn()};
     r.group_assign(r.gP, "alice", "RespReader");
     r.group_assign(r.gC2, "alice", "RespDenier");
 
@@ -183,8 +206,12 @@ TEST_CASE("authorize_list_read: visible set == {a : check_scoped_permission} (IN
 
 // ── Legacy-open: RBAC loaded-and-disabled ⇒ AdmitAll (behaviour-neutral) ──────
 
-TEST_CASE("authorize_list_read: RBAC disabled ⇒ AdmitAll (legacy-open)", "[list_read][rbac]") {
-    RbacStore rbac{":memory:"}; // is_open() && !is_rbac_enabled() → legacy-open
+TEST_CASE("authorize_list_read: RBAC disabled ⇒ AdmitAll (legacy-open)", "[list_read][rbac][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    PgPool rbac_pool_{{.conninfo = rbac_db_.dsn(), .size = 4}};
+    REQUIRE(rbac_pool_.valid());
+    RbacStore rbac{rbac_pool_}; // is_open() && !is_rbac_enabled() → legacy-open
+    REQUIRE(rbac.is_open());
     yuzu::test::TempDbFile mgmt_db{"yuzu_test_lrc_legacy-"};
     ManagementGroupStore mgmt{mgmt_db.path};
 
@@ -195,21 +222,26 @@ TEST_CASE("authorize_list_read: RBAC disabled ⇒ AdmitAll (legacy-open)", "[lis
 // ── INV-1/INV-5: fail-closed is total ────────────────────────────────────────
 
 TEST_CASE("authorize_list_read: null mgmt store under enforcement ⇒ DenyAll (INV-1)",
-          "[list_read][rbac][inv1]") {
-    RbacStore rbac{":memory:"};
+          "[list_read][rbac][inv1][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    PgPool rbac_pool_{{.conninfo = rbac_db_.dsn(), .size = 4}};
+    REQUIRE(rbac_pool_.valid());
+    RbacStore rbac{rbac_pool_};
+    REQUIRE(rbac.is_open());
     rbac.set_rbac_enabled(true); // enforcement in effect, but no global grant
     auto d = rbac.authorize_list_read("alice", "Response", "Read", /*mgmt=*/nullptr);
     CHECK(d.decision == ListReadDecision::DenyAll); // never AdmitAll
 }
 
 TEST_CASE("authorize_list_read: corrupt rbac.db ⇒ DenyAll, never AdmitAll (INV-1)",
-          "[list_read][rbac][inv1]") {
-    yuzu::test::TempDbFile bad_db{"yuzu_test_lrc_corrupt-"};
-    {
-        std::ofstream f(bad_db.path, std::ios::binary);
-        f << "this is not a sqlite database at all, migrations will fail\n";
-    }
-    RbacStore bad{bad_db.path};
+          "[list_read][rbac][inv1][pg]") {
+    // The PG analogue of the SQLite corrupt-file fail-closed test: a pool
+    // whose DSN never connects leaves the store's construction lease empty,
+    // so migration never runs and is_open()==false — the same state a
+    // corrupt/unreachable rbac substrate produces.
+    PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    RbacStore bad{bad_pool};
     REQUIRE(!bad.is_open()); // precondition: migrations failed → store not open
 
     yuzu::test::TempDbFile mgmt_db{"yuzu_test_lrc_corrupt_mgmt-"};
@@ -224,8 +256,9 @@ TEST_CASE("authorize_list_read: corrupt rbac.db ⇒ DenyAll, never AdmitAll (INV
 // ── check_scoped_permission behaviour preserved by the INV-7 refactor ─────────
 
 TEST_CASE("check_scoped_permission: preserved through the shared-resolver refactor",
-          "[list_read][rbac][refactor]") {
-    Rig r;
+          "[list_read][rbac][refactor][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    Rig r{rbac_db_.dsn()};
     r.group_assign(r.gP, "alice", "RespReader");
     r.group_assign(r.gC2, "alice", "RespDenier");
 
@@ -248,8 +281,9 @@ TEST_CASE("check_scoped_permission: preserved through the shared-resolver refact
 //   R(allow) ── DP ──┬── DC1(deny) ── DGC          members: a_R,a_dp,a_dc1,a_dgc,a_dc2
 //                    └── DC2
 TEST_CASE("authorize_list_read: INV-7 holds over a 4-level tree with a mid-tree deny",
-          "[list_read][rbac][inv7]") {
-    Rig r; // reuses RespReader/RespDenier roles + RBAC-enabled store
+          "[list_read][rbac][inv7][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    Rig r{rbac_db_.dsn()}; // reuses RespReader/RespDenier roles + RBAC-enabled store
     auto R = r.make_group("R", "");
     auto DP = r.make_group("DP", R);
     auto DC1 = r.make_group("DC1", DP);
@@ -296,8 +330,9 @@ TEST_CASE("authorize_list_read: INV-7 holds over a 4-level tree with a mid-tree 
 // RBAC-group membership (get_assignments_for_principal's group OR-arm). Was
 // entirely untested (quality-engineer SHOULD).
 TEST_CASE("authorize_list_read: grant via an RBAC group (principal_type='group')",
-          "[list_read][rbac][group-principal]") {
-    Rig r;
+          "[list_read][rbac][group-principal][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    Rig r{rbac_db_.dsn()};
     REQUIRE(r.rbac.create_group({"soc-team", "", "local", "", 0}).has_value());
     REQUIRE(r.rbac.add_group_member("soc-team", "teamuser").has_value());
     // Role granted to the RBAC GROUP on P, not to teamuser directly.
@@ -322,8 +357,9 @@ TEST_CASE("authorize_list_read: grant via an RBAC group (principal_type='group')
 // subtracts the deny subtree, so its members are excluded despite the allow
 // (quality-engineer SHOULD — INV-4 tests only used different groups).
 TEST_CASE("authorize_list_read: same group allow+deny roles ⇒ AdmitScoped empty (deny wins)",
-          "[list_read][rbac][inv7]") {
-    Rig r;
+          "[list_read][rbac][inv7][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    Rig r{rbac_db_.dsn()};
     r.group_assign(r.gP, "split", "RespReader");
     r.group_assign(r.gP, "split", "RespDenier");
 
