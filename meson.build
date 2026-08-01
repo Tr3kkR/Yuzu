@@ -356,6 +356,12 @@ subdir('proto')
 # ── SDK ───────────────────────────────────────────────────────────────────────
 subdir('sdk')
 
+# ── Component contracts ──────────────────────────────────────────────────────
+# Framework-neutral JSON/API contracts shared by Core, Presentation, and
+# headless engines (ADR-0031). This target must remain independent of every
+# component implementation and transport framework.
+subdir('contracts/adr31')
+
 # ── Agent ─────────────────────────────────────────────────────────────────────
 if build_agent
   subdir('agents/core')

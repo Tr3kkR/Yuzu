@@ -50,6 +50,16 @@ else
   catch2_nomain_dep = dependency('Catch2', modules: ['Catch2::Catch2'], method: 'cmake', required: true, include_type: 'system')
 endif
 
+# ── ADR-0031 component-contract tests ────────────────────────────────────────
+# Kept in a small standalone binary so every provider/consumer can run the
+# same framework-neutral fixtures without linking the fused server.
+contract_test_exe = executable(
+  'yuzu_adr31_contract_tests',
+  files('unit/contracts/test_contract_version.cpp'),
+  dependencies: [yuzu_adr31_contracts_dep, catch2_dep],
+)
+test('ADR31 contract tests', contract_test_exe, suite: ['server', 'contracts'], timeout: 30)
+
 # ── Test fixture: plugin with a reserved name (#453) ─────────────────────────
 # Built only when tests are enabled; test_plugin_loader.cpp scans against this
 # shared library to verify the reserved-name rejection path.
