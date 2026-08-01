@@ -141,6 +141,14 @@ struct SubprocessOptions {
     // real state (e.g. mid-dpkg/rpm transaction) a chance to unwind instead
     // of being SIGKILLed mid-write. Never applied to a stop_after_max_lines
     // stop (that path is a clean "got what we asked for", not an interrupt).
+    //
+    // xplat-A2 (Windows): soft-terminate is delivered via
+    // GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, ...), which requires the
+    // target process group to share the caller's console. yuzu-agent runs as
+    // a Windows SERVICE with no console at all, so the call reliably fails
+    // there and this grace is effectively UNSUPPORTED for a service-hosted
+    // agent -- a failed delivery escalates straight to the hard kill rather
+    // than waiting out the grace for a signal that can never arrive.
     std::chrono::milliseconds soft_terminate_grace{0};
 
     // B3: optional per-invocation resource caps, OFF (nullopt) by default --
@@ -164,10 +172,15 @@ struct SubprocessOptions {
     // When enabled, argv[0] is opened O_NOFOLLOW, fstat-verified (regular
     // file, root-owned if require_root_owned, not group/other-writable, and
     // -- if expected_size is set -- exactly that size) and then exec'd via
-    // that SAME fd (Linux: an fd-based exec syscall; macOS/Windows: the
-    // fstat-verify still runs, but the exec itself falls back to the path,
-    // an honestly-documented residual since neither platform offers an
-    // equivalent fd-exec primitive here).
+    // that SAME fd via an fd-based exec syscall on Linux (execveat(), NEVER
+    // glibc's fexecve() wrapper -- see subprocess_runner.cpp's comment on
+    // why). macOS/BSD (and any Linux build without SYS_execveat) has no
+    // equivalent fd-exec primitive to close the final TOCTOU gap between the
+    // fstat-verify and the exec, so enabling this there FAILS CLOSED
+    // (spawn_error) exactly like Windows (sec-8/BR-004) rather than falling
+    // back to an unverified, re-resolving execve(path, ...). On WINDOWS the
+    // verification is not yet implemented, so enabling it FAILS CLOSED
+    // (spawn_error) rather than launching unverified (BR-004).
     struct ExecVerification {
         bool enabled = false;
         bool require_root_owned = true;

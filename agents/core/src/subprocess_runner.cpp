@@ -240,6 +240,11 @@ void reap_async(pid_t pid) {
 // destruction unless reset()/released first. Guards against leaking a pipe
 // end if an allocating operation (e.g. std::bad_alloc from a string/vector
 // op while collecting output) throws past this function.
+//
+// reset() has NO same-value guard, unlike yuzu/agent/scoped_fd.hpp's
+// ScopedFd (see that header's doc comment for the three-way reset()-contract
+// cross-reference across this codebase) -- never called with its own current
+// value anywhere in this file, so the question never arises here.
 class UniqueFd {
 public:
     UniqueFd() = default;
@@ -383,6 +388,11 @@ long resolve_fd_ceiling() {
 // arrived" then stays inconclusive (tool_ran stays false) rather than
 // assuming success.
 [[noreturn]] void report_setup_failure_and_exit(int err_fd, int err) {
+    // cpp-safety F3: reinterpret_cast to unsigned char* is the one aliasing
+    // exception the standard itself carves out ([basic.lval]) -- reading any
+    // object's representation through unsigned char* (or char*/std::byte*) is
+    // always well-defined, regardless of `err`'s actual type, so this cast is
+    // not UB.
     const auto* bytes = reinterpret_cast<const unsigned char*>(&err);
     std::size_t sent = 0;
     while (sent < sizeof(err)) {
@@ -457,18 +467,22 @@ void sweep_fd_range_cloexec_fallback(long ceiling) {
             report_setup_failure_and_exit(err_fd, e);
         }
 #else
-        // macOS/BSD: no fd-based exec primitive (no fexecve()/execveat()).
-        // The fstat-verify above is the strongest guarantee available on
-        // this platform; the exec itself still re-resolves the path -- an
-        // honestly-documented residual (see SubprocessOptions::ExecVerification).
+        // sec-8: macOS/BSD (and any Linux build without SYS_execveat) has no
+        // fd-based exec primitive here -- no execveat(), and glibc's
+        // fexecve() is deliberately not used either (see this function's
+        // header comment above). close(fd) followed by execve(path, ...)
+        // would release the just-verified inode and let the kernel
+        // RE-RESOLVE argv[0] from the filesystem, reopening exactly the
+        // TOCTOU window the fstat-verify above exists to close: a swap of
+        // the target between that verify and this exec is still
+        // exploitable. Windows already fails CLOSED for the identical gap
+        // (BR-004 -- the spec.exec_verify.enabled check ahead of
+        // CreateProcessW in the Windows backend below). Match that here: a
+        // security control that silently degrades to an unverified exec is
+        // worse than an honest refusal, so report a setup failure instead of
+        // ever calling execve() on this platform.
         close(fd);
-        execve(c_argv[0], c_argv, c_envp);
-        if (errno == ETXTBSY && attempt + 1 < kMaxRetries) {
-            struct timespec ts{0, 20'000'000L * (attempt + 1)};
-            nanosleep(&ts, nullptr);
-            continue;
-        }
-        report_setup_failure_and_exit(err_fd, errno);
+        report_setup_failure_and_exit(err_fd, ENOSYS);
 #endif
     }
     report_setup_failure_and_exit(err_fd, ETXTBSY);
@@ -527,10 +541,19 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     launch_opts.merge_stderr = opts.merge_stderr;
     if (const char* tz = std::getenv("TZ"))
         launch_opts.tz = std::string(tz);
-    launch_opts.rlimits = {opts.rlimits.cpu_seconds, opts.rlimits.address_space_bytes,
-                            opts.rlimits.fsize_bytes, opts.rlimits.nofile_count};
-    launch_opts.exec_verify = {opts.exec_verify.enabled, opts.exec_verify.require_root_owned,
-                               opts.exec_verify.expected_size};
+    // DESIGNATED, not positional: SubprocessOptions::RlimitCaps and
+    // LaunchOptions' rlimits are field-identical but SEPARATE types (the
+    // launch-spec header is deliberately independent of the runner header), so
+    // a positional brace-init silently mis-maps if either side is ever
+    // reordered. Designators must appear in declaration order, so a reorder
+    // becomes a COMPILE ERROR here instead of a wrong rlimit at runtime.
+    launch_opts.rlimits = {.cpu_seconds = opts.rlimits.cpu_seconds,
+                           .address_space_bytes = opts.rlimits.address_space_bytes,
+                           .fsize_bytes = opts.rlimits.fsize_bytes,
+                           .nofile_count = opts.rlimits.nofile_count};
+    launch_opts.exec_verify = {.enabled = opts.exec_verify.enabled,
+                               .require_root_owned = opts.exec_verify.require_root_owned,
+                               .expected_size = opts.exec_verify.expected_size};
 
     LaunchSpec spec = build_launch_spec(argv, launch_opts);
     if (spec.error != LaunchSpecError::none)
@@ -668,43 +691,55 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         // A4: always-on core-dump suppression -- one syscall, prevents a
         // tool segfault from dumping a core built from the daemon's
         // COW-shared secret heap.
+        // A4 core-dump suppression is a security control (a segfault must never
+        // dump the daemon's COW-shared secret heap), so a failure to apply it is
+        // load-bearing: fail closed over the exec-error pipe rather than run a
+        // child that could core. (BR-009)
         {
             struct rlimit core_limit{0, 0};
-            setrlimit(RLIMIT_CORE, &core_limit);
+            if (setrlimit(RLIMIT_CORE, &core_limit) != 0)
+                report_setup_failure_and_exit(err_write_fd.get(), errno);
         }
 
-        // B3: optional per-invocation resource caps, OFF unless the caller
-        // set them on SubprocessOptions::rlimits (surfaced here via `spec`).
+        // B3: optional per-invocation resource caps, OFF unless the caller set
+        // them on SubprocessOptions::rlimits (surfaced here via `spec`). When a
+        // cap IS requested, honoring it is the contract -- a failure fails closed
+        // rather than silently running the child uncapped. (BR-009)
         if (spec.rlimits.cpu_seconds) {
             struct rlimit r{*spec.rlimits.cpu_seconds, *spec.rlimits.cpu_seconds};
-            setrlimit(RLIMIT_CPU, &r);
+            if (setrlimit(RLIMIT_CPU, &r) != 0)
+                report_setup_failure_and_exit(err_write_fd.get(), errno);
         }
         if (spec.rlimits.address_space_bytes) {
 #if defined(RLIMIT_AS)
             struct rlimit r{*spec.rlimits.address_space_bytes, *spec.rlimits.address_space_bytes};
-            setrlimit(RLIMIT_AS, &r);
+            if (setrlimit(RLIMIT_AS, &r) != 0)
+                report_setup_failure_and_exit(err_write_fd.get(), errno);
 #elif defined(RLIMIT_DATA)
             struct rlimit r{*spec.rlimits.address_space_bytes, *spec.rlimits.address_space_bytes};
-            setrlimit(RLIMIT_DATA, &r);
+            if (setrlimit(RLIMIT_DATA, &r) != 0)
+                report_setup_failure_and_exit(err_write_fd.get(), errno);
 #endif
         }
         if (spec.rlimits.fsize_bytes) {
             struct rlimit r{*spec.rlimits.fsize_bytes, *spec.rlimits.fsize_bytes};
-            setrlimit(RLIMIT_FSIZE, &r);
+            if (setrlimit(RLIMIT_FSIZE, &r) != 0)
+                report_setup_failure_and_exit(err_write_fd.get(), errno);
         }
         if (spec.rlimits.nofile_count) {
             struct rlimit r{*spec.rlimits.nofile_count, *spec.rlimits.nofile_count};
-            setrlimit(RLIMIT_NOFILE, &r);
+            if (setrlimit(RLIMIT_NOFILE, &r) != 0)
+                report_setup_failure_and_exit(err_write_fd.get(), errno);
         }
 
         // A6: restrictive umask + a known-safe cwd (blunts DLL/`.so`
-        // side-loading and world-writable-drop attacks). Best-effort, like
-        // setsid() above -- a failed chdir degrades to "whatever cwd we
-        // already had", it never aborts a run that could otherwise succeed.
+        // side-loading and world-writable-drop attacks). The header contract
+        // promises the child NEVER runs in the daemon's own cwd, so a failed
+        // chdir is load-bearing: fail closed rather than silently degrade to the
+        // inherited (possibly attacker-influenced) directory. (BR-009)
         umask(0077);
-        if (chdir(spec.working_dir.c_str()) != 0) {
-            // no-op: intentionally not load-bearing, see comment above.
-        }
+        if (chdir(spec.working_dir.c_str()) != 0)
+            report_setup_failure_and_exit(err_write_fd.get(), errno);
 
         // Both dup2s below ARE the plumbing that makes this invocation's
         // captured output/exit-code contract correct, so a failure here is
@@ -716,38 +751,32 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
             if (dup2_retry(write_fd.get(), STDERR_FILENO) == -1)
                 report_setup_failure_and_exit(err_write_fd.get(), errno);
         } else {
+            // CDX-006: silencing stderr to /dev/null is part of the runner's
+            // stdio-isolation contract, so a failure to open or dup2 it is
+            // load-bearing: fail closed rather than leave the child writing to
+            // the daemon's own inherited stderr (its service log / controlling
+            // terminal). We already own the exec-error pipe, so reporting is
+            // possible -- treating it as best-effort was a policy choice, not an
+            // inability.
             int devnull = open("/dev/null", O_WRONLY);
-            if (devnull >= 0) {
-                // Best-effort: the dup2's result is checked (rather than
-                // silently discarded) but, like the open() above, its
-                // failure is not load-bearing -- stderr is simply left
-                // wherever it was rather than silenced, which cannot
-                // corrupt the captured stdout/exit-code result, unlike the
-                // dup2s above that ARE checked-and-fatal.
-                if (dup2_retry(devnull, STDERR_FILENO) == -1) {
-                    // no-op: intentionally not load-bearing, see comment above.
-                }
-                close(devnull);
-            }
-            // else: open() itself failed -- also not load-bearing, stderr
-            // is simply left wherever it was (checked via the >= 0 guard
-            // above, no report_setup_failure_and_exit for the same reason).
+            if (devnull < 0)
+                report_setup_failure_and_exit(err_write_fd.get(), errno);
+            if (dup2_retry(devnull, STDERR_FILENO) == -1)
+                report_setup_failure_and_exit(err_write_fd.get(), errno);
+            close(devnull);
         }
 
-        // ADR-3002 stdio policy: stdin -> /dev/null by default. Best-effort
-        // like the stderr open() above -- a spawned CLI reading from a
-        // still-open stdin inherited from the agent daemon (its gRPC
-        // connection's controlling terminal, if any) is the concern; a
-        // failure here degrades to "whatever stdin already was", never a
-        // fatal setup error.
+        // ADR-3002 stdio policy: stdin -> /dev/null. CDX-006: also load-bearing
+        // for the same reason -- a spawned CLI must not inherit and read the
+        // agent daemon's stdin (consuming its input or blocking on it). Fail
+        // closed if /dev/null cannot be wired to fd 0.
         {
             int devnull_in = open("/dev/null", O_RDONLY);
-            if (devnull_in >= 0) {
-                if (dup2_retry(devnull_in, STDIN_FILENO) == -1) {
-                    // no-op: intentionally not load-bearing.
-                }
-                close(devnull_in);
-            }
+            if (devnull_in < 0)
+                report_setup_failure_and_exit(err_write_fd.get(), errno);
+            if (dup2_retry(devnull_in, STDIN_FILENO) == -1)
+                report_setup_failure_and_exit(err_write_fd.get(), errno);
+            close(devnull_in);
         }
 
         close(read_fd.get());
@@ -828,16 +857,17 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     int flags = fcntl(read_fd.get(), F_GETFL, 0);
     if (flags == -1 || fcntl(read_fd.get(), F_SETFL, flags | O_NONBLOCK) == -1) {
         // Fail closed: without a confirmed non-blocking pipe fd, the read()
-        // below could block indefinitely before any deadline check ever
-        // runs. Treat this as an honest timeout with no collected output --
-        // the still-armed guard above kills the child when it unwinds.
-        result.timed_out = true;
+        // below could block indefinitely. The still-armed guard above kills
+        // the child when it unwinds. CDX-P2-014: report this as a spawn_error
+        // ONLY, never timed_out -- a setup failure is not a deadline breach,
+        // and conflating the two misleads an autonomous caller's retry choice.
+        result.timed_out = false;
         result.termination_reason = TerminationReason::spawn_error;
         return result;
     }
     int err_flags = fcntl(err_read_fd.get(), F_GETFL, 0);
     if (err_flags == -1 || fcntl(err_read_fd.get(), F_SETFL, err_flags | O_NONBLOCK) == -1) {
-        result.timed_out = true;
+        result.timed_out = false; // spawn_error, not a timeout (CDX-P2-014)
         result.termination_reason = TerminationReason::spawn_error;
         return result;
     }
@@ -859,7 +889,6 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     // successful exec would, so EOF alone cannot be trusted once a kill is
     // already in flight.
     bool exec_confirmed_ok = false;
-    std::chrono::steady_clock::time_point kill_time{};
 
     // ADR-3002 termination-reason bookkeeping: at most one of these becomes
     // true (all three guarded by `!killed` at the moment they'd be set), and
@@ -878,7 +907,7 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     // 0 by default): when set, a deadline/cancel trigger sends SIGTERM to the
     // process group and waits up to the grace period before escalating to
     // the UNMODIFIED hard SIGKILL path below. hard_kill_sent/hard_kill_time
-    // (rather than killed/kill_time) drive the kDrainGrace break check, so
+    // (rather than merely `killed`) drive the kDrainGrace break check, so
     // the grace period itself is never mistaken for the post-kill drain
     // window -- with soft_terminate_grace == 0 (every existing caller),
     // hard_kill_sent is set in the very same branch as killed, at the same
@@ -889,6 +918,12 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     std::chrono::steady_clock::time_point hard_kill_time{};
 
     std::string line_buf;
+    // CDX-P2-005: bytes already committed to result.lines. When max_lines is
+    // unarmed (0 == unlimited) this is the backstop that keeps the STORED lines
+    // bounded by output_cap now that line materialization runs over every
+    // drained byte (so on_line stays an uncapped streaming primitive) rather
+    // than only the blob-cap-admitted prefix.
+    std::size_t stored_line_bytes = 0;
     std::array<char, 512> buf{};
     // Set once opts.stop_after_max_lines is armed and result.lines has just
     // reached opts.max_lines -- triggers a clean early kill+reap below,
@@ -901,12 +936,29 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         if (line.empty())
             return;
         // ADR-3002 streaming primitive: every completed line reaches the
-        // caller's callback (if any), uncapped by max_lines -- unlike
-        // result.lines, which stays bounded by the collect-at-end contract
-        // below.
+        // caller's callback (if any) UNCAPPED -- neither max_lines nor the
+        // output_cap blob budget gates it (CDX-P2-005: the caller's live
+        // stream must not silently stop when stored capture saturates).
         if (opts.on_line)
             opts.on_line(line);
-        if (opts.max_lines == 0 || result.lines.size() < opts.max_lines) {
+        // result.lines (the collect-at-end snapshot) STAYS bounded: by
+        // max_lines when armed, else by the output_cap byte budget -- so an
+        // unlimited-max_lines run past the blob cap can't grow it without end.
+        // sec-7: the output_cap byte budget applies REGARDLESS of whether
+        // max_lines is armed -- previously an armed max_lines consulted ONLY
+        // the count cap, so stored_line_bytes was never checked and
+        // result.lines could grow up to max_lines * output_cap (each stored
+        // line is separately capped at output_cap bytes by the line_buf
+        // accumulator below), independent of the output_cap budget this same
+        // cap is supposed to enforce on result.output. Both caps now apply
+        // together whenever max_lines is armed.
+        const bool line_room =
+            stored_line_bytes < output_cap && (opts.max_lines == 0 || result.lines.size() < opts.max_lines);
+        if (line_room) {
+            // +1 for the terminating newline: count the SOURCE bytes the line
+            // consumed, matching output_cap's blob accounting so result.lines
+            // stays bounded by the same cap as result.output (BR-001).
+            stored_line_bytes += line.size() + 1;
             result.lines.push_back(std::move(line));
             if (opts.stop_after_max_lines && opts.max_lines != 0 &&
                 result.lines.size() >= opts.max_lines)
@@ -1002,7 +1054,6 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         if (deadline_hit || cancel_hit) {
             result.timed_out = true;
             killed = true;
-            kill_time = now;
             killed_by_deadline = deadline_hit;
             killed_by_cancel = !deadline_hit && cancel_hit;
             if (opts.soft_terminate_grace.count() > 0 && !child_reaped) {
@@ -1045,7 +1096,6 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
             // falls through to `exited` with the child's real exit code
             // instead).
             killed = true;
-            kill_time = now;
             killed_by_line_cap = !child_reaped;
             if (child_reaped) {
                 (void)kill(-pid, SIGKILL);
@@ -1054,12 +1104,23 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
             }
             hard_kill_sent = true;
             hard_kill_time = now;
-        } else if (soft_terminating && !child_reaped && now >= soft_term_deadline) {
-            // Grace elapsed and the child still hasn't exited on its own --
-            // escalate to the SAME unmodified hard kill this runner has
-            // always sent.
+        } else if (soft_terminating && now >= soft_term_deadline) {
+            // Grace elapsed -- escalate to the hard kill REGARDLESS of whether the
+            // leader has already been reaped (CDX-002; the POSIX twin of the
+            // Windows BR-003 fix). A mutating CLI can handle SIGTERM and exit
+            // during the grace while a descendant that ignores it inherits and
+            // holds the stdout pipe: pipe_eof then never arrives and, with the
+            // old `!child_reaped` guard, no hard kill was ever armed, so neither
+            // loop-exit condition could fire and the worker hung indefinitely.
+            // Signal the whole process GROUP so a surviving descendant is reached;
+            // once the leader is reaped its pid may be recycled, so target the
+            // group directly rather than kill_child_or_group's direct-child
+            // fallback (BR-002 lineage). Arming hard_kill_sent bounds the drain.
             soft_terminating = false;
-            kill_child_or_group(pid);
+            if (child_reaped)
+                (void)kill(-pid, SIGKILL);
+            else
+                kill_child_or_group(pid);
             hard_kill_sent = true;
             hard_kill_time = now;
         }
@@ -1077,7 +1138,18 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
             // Nothing left to read, but the child isn't confirmed reaped
             // yet (or the exec outcome isn't resolved yet) -- keep polling
             // above without spinning on read().
-            wait_for_activity(read_fd.get(), err_read_fd.get(), pidfd_owner.get(), 5'000'000L);
+            //
+            // K-07/M-d: do NOT poll read_fd here. A pipe at EOF reports
+            // POLLHUP permanently, so poll() returns IMMEDIATELY every
+            // iteration -- on the Linux pidfd fast path (pidfd >= 0) that is a
+            // 100% CPU busy-spin until the child exits or the deadline fires
+            // (a per-call, fleet-wide amplifiable DoS for a root daemon). Poll
+            // only the still-open err pipe (if any) and the pidfd; pass -1 for
+            // any EOF'd/closed fd so poll() skips it. With neither pollable and
+            // no pidfd, wait_for_activity falls back to a brief sleep (the
+            // macOS path, which never spun).
+            wait_for_activity(-1, err_pipe_open ? err_read_fd.get() : -1,
+                              pidfd_owner.get(), 5'000'000L);
             continue;
         }
 
@@ -1089,13 +1161,10 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
             // err-pipe EOF check above.
             exec_confirmed_ok = true;
 
-            // Cap capture at output_cap total (ADR-3002: caller-configurable,
-            // clamped to [1, 16MiB] -- see output_cap's computation above),
-            // applied per-append (never overshoots by up to one read's
-            // worth) and uniformly to both the blob and the
-            // not-yet-newline-terminated line accumulator -- a
-            // newline-free or adversarially long stream must not grow
-            // either one unboundedly before the deadline fires.
+            // Cap the STORED blob at output_cap total (ADR-3002: caller-
+            // configurable, clamped to [1, 16MiB] -- see output_cap above),
+            // applied per-append so it never overshoots by up to one read's
+            // worth. This bound governs result.output only.
             const auto avail =
                 result.output.size() < output_cap ? output_cap - result.output.size() : std::size_t{0};
             const auto take = static_cast<std::size_t>(n) < avail ? static_cast<std::size_t>(n) : avail;
@@ -1104,12 +1173,14 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
             if (take < static_cast<std::size_t>(n))
                 result.output_truncated = true;
 
-            // Line materialization only ever sees the `take` prefix admitted
-            // above -- once the blob cap is hit (take == 0), no further
-            // bytes reach store_line/line_buf even though the read loop
-            // keeps draining (and discarding) the rest of the pipe, so
-            // result.lines stays bounded by the same cap as result.output.
-            for (ssize_t i = 0; i < static_cast<ssize_t>(take); ++i) {
+            // CDX-P2-005: materialize lines over EVERY drained byte (all `n`,
+            // not just the `take` prefix admitted to the blob) so on_line -- a
+            // streaming primitive -- keeps firing after the blob cap saturates.
+            // The line accumulator is separately bounded to output_cap with
+            // explicit per-line truncation, and store_line keeps result.lines
+            // bounded (see its byte budget), so neither grows without bound on
+            // a newline-free or adversarially long stream.
+            for (ssize_t i = 0; i < n; ++i) {
                 char ch = buf[static_cast<std::size_t>(i)];
                 if (ch == '\n') {
                     store_line(std::move(line_buf));
@@ -1123,8 +1194,13 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         } else if (n == 0) {
             pipe_eof = true; // EOF: writer(s) closed their end
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            wait_for_activity(read_fd.get(), err_read_fd.get(), pidfd_owner.get(),
-                               killed ? 5'000'000L : 10'000'000L);
+            // K-03/CDX-R4-07: exclude the err pipe from the poll once it has
+            // resolved to EOF -- a HUP'd fd polls ready forever and would busy-
+            // spin the pidfd fast path here exactly as it did on the pipe_eof
+            // branch (M-d). read_fd is still live (we just got EAGAIN on it), so
+            // it stays in the set; pass -1 for the closed err pipe.
+            wait_for_activity(read_fd.get(), err_pipe_open ? err_read_fd.get() : -1,
+                              pidfd_owner.get(), killed ? 5'000'000L : 10'000'000L);
             continue;
         } else if (errno == EINTR) {
             continue;
@@ -1159,15 +1235,20 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     // "unknown" rather than a guess.
     result.tool_ran = exec_confirmed_ok && !exec_failed;
 
-    // ADR-3002: the explicit termination reason. Priority mirrors the
-    // mutually-exclusive kill branches above (at most one of
-    // killed_by_line_cap/killed_by_cancel/killed_by_deadline is ever true);
-    // natural_signaled is checked only once none of those killed-by-us
-    // reasons apply. Deliberately NOT fabricating an exit_code=0 for the
-    // line_cap case (the removed pre-ADR-3002 sentinel fixup) -- callers
-    // distinguish "deliberate clean stop" from "failure" via this field,
-    // never via a synthesized exit code.
-    if (!result.tool_ran) {
+    // ADR-3002: the explicit termination reason. A GENUINE spawn failure is
+    // exec_failed (the child positively reported a failed execve() on the
+    // error pipe) -- that is checked first and always wins. A deliberate
+    // kill by us (line_cap/cancel/deadline; mutually exclusive) is then
+    // classified by its reason EVEN IF exec was never positively confirmed:
+    // when a pre-armed cancel or a tight deadline kills the child on the very
+    // first poll, poll_err_pipe() has not yet seen the CLOEXEC-on-exec EOF, so
+    // exec_confirmed_ok (hence tool_ran) is still false -- but that is a
+    // cancellation/deadline, NOT a spawn failure. Only once none of those
+    // apply does a still-unconfirmed exec fall through to spawn_error.
+    // Deliberately NOT fabricating an exit_code=0 for the line_cap case (the
+    // removed pre-ADR-3002 sentinel fixup) -- callers distinguish "deliberate
+    // clean stop" from "failure" via this field, never via a synthesized code.
+    if (exec_failed) {
         result.termination_reason = TerminationReason::spawn_error;
     } else if (killed_by_line_cap) {
         result.termination_reason = TerminationReason::line_limit;
@@ -1175,6 +1256,10 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         result.termination_reason = TerminationReason::cancelled;
     } else if (killed_by_deadline) {
         result.termination_reason = TerminationReason::deadline;
+    } else if (!result.tool_ran) {
+        // exec never positively confirmed and we did not deliberately kill it
+        // -- a real spawn failure the error pipe could not attribute.
+        result.termination_reason = TerminationReason::spawn_error;
     } else if (natural_signaled) {
         result.termination_reason = TerminationReason::signaled;
     } else {
@@ -1202,8 +1287,13 @@ std::string probe_tool_path(const std::vector<std::string>& candidates) {
 
 #include <psapi.h>
 
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (CDX-R4-05, #1681)
+
 #include <algorithm>
 #include <array>
+#include <cctype> // std::toupper in the env-sort comparator below -- <cwctype>
+                  // supplies towupper, NOT toupper, and this branch is compiled
+                  // only by MSVC, which no reviewer on a POSIX host can check.
 #include <cstdint>
 #include <cwctype>
 
@@ -1215,6 +1305,10 @@ namespace {
 // RAII destructor, fired on any early return OR an exception unwinding
 // through this function) terminates the process -- no separate guard class
 // is needed on this platform.
+//
+// reset() has NO same-value guard, exactly like its POSIX UniqueFd twin
+// above -- see yuzu/agent/scoped_fd.hpp's doc comment for the three-way
+// reset()-contract cross-reference across this codebase.
 class UniqueHandle {
 public:
     UniqueHandle() = default;
@@ -1247,15 +1341,12 @@ private:
     HANDLE h_ = nullptr;
 };
 
+// CDX-R4-05: delegate to the canonical shared helper rather than re-rolling
+// MultiByteToWideChar (docs/cpp-conventions.md "Windows string conversion"),
+// so a future fix in win_str.hpp reaches the subprocess backend too. Same
+// precedent as dex_observer.cpp.
 std::wstring utf8_to_wide(const std::string& s) {
-    if (s.empty())
-        return {};
-    int len = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    if (len <= 0)
-        return {};
-    std::wstring w(static_cast<std::size_t>(len), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), len);
-    return w;
+    return yuzu::win::to_wide(s);
 }
 
 } // namespace
@@ -1283,15 +1374,34 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
             }
         }
     }
-    launch_opts.rlimits = {opts.rlimits.cpu_seconds, opts.rlimits.address_space_bytes,
-                            opts.rlimits.fsize_bytes, opts.rlimits.nofile_count};
-    launch_opts.exec_verify = {opts.exec_verify.enabled, opts.exec_verify.require_root_owned,
-                               opts.exec_verify.expected_size};
+    // DESIGNATED, not positional: SubprocessOptions::RlimitCaps and
+    // LaunchOptions' rlimits are field-identical but SEPARATE types (the
+    // launch-spec header is deliberately independent of the runner header), so
+    // a positional brace-init silently mis-maps if either side is ever
+    // reordered. Designators must appear in declaration order, so a reorder
+    // becomes a COMPILE ERROR here instead of a wrong rlimit at runtime.
+    launch_opts.rlimits = {.cpu_seconds = opts.rlimits.cpu_seconds,
+                           .address_space_bytes = opts.rlimits.address_space_bytes,
+                           .fsize_bytes = opts.rlimits.fsize_bytes,
+                           .nofile_count = opts.rlimits.nofile_count};
+    launch_opts.exec_verify = {.enabled = opts.exec_verify.enabled,
+                               .require_root_owned = opts.exec_verify.require_root_owned,
+                               .expected_size = opts.exec_verify.expected_size};
 
     LaunchSpec spec = build_launch_spec(argv, launch_opts);
     if (spec.error != LaunchSpecError::none)
         return result; // relative argv[0], embedded NUL, or a banned .bat/.cmd/.com
                         // argv[0] (CVE-2024-24576; ADR-3002:537-606)
+
+    // BR-004: the Windows TOCTOU-safe exec verification (share-mode open +
+    // Authenticode/size check before CreateProcessW) is NOT implemented yet.
+    // A security control that silently no-ops is worse than an honest refusal,
+    // so fail closed when a caller enables it on Windows rather than launching
+    // unverified. (No in-tree caller enables it in this PR.)
+    if (spec.exec_verify.enabled) {
+        result.termination_reason = TerminationReason::spawn_error;
+        return result;
+    }
 
     const std::size_t output_cap = std::clamp<std::size_t>(opts.output_cap_bytes, 1, 16 * 1024 * 1024);
 
@@ -1300,8 +1410,24 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
 
     // A5: explicit lpEnvironment built from the SAME allow-list
     // build_launch_spec assembled -- never NULL/never inherited.
+    //
+    // K-10/L-d: a CreateProcess environment block MUST be sorted (MSDN:
+    // "the block must be sorted alphabetically by name, case-insensitively, as
+    // in Unicode order"). build_launch_spec emits the allow-list in a fixed but
+    // not-necessarily-sorted order, so sort a copy by upper-cased key here
+    // before serializing. The keys are unique (allow-list), so a stable name
+    // sort is total.
+    std::vector<EnvVar> sorted_env(spec.env.begin(), spec.env.end());
+    std::sort(sorted_env.begin(), sorted_env.end(), [](const EnvVar& a, const EnvVar& b) {
+        auto up = [](std::string s) {
+            for (char& c : s)
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            return s;
+        };
+        return up(a.key) < up(b.key);
+    });
     std::wstring env_block;
-    for (const auto& e : spec.env) {
+    for (const auto& e : sorted_env) {
         env_block += utf8_to_wide(e.key + "=" + e.value);
         env_block += L'\0';
     }
@@ -1312,29 +1438,81 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     const std::wstring cwd =
         spec.working_dir == "/" ? std::wstring(L"C:\\Windows\\System32") : utf8_to_wide(spec.working_dir);
 
-    // Output pipe: only the WRITE end is inheritable, and only it is named
-    // in the handle allow-list below (A1) -- the read end must never be.
+    // Output pipe: only the WRITE end must ever be inheritable, and only it is
+    // named in the handle allow-list below (A1) -- the read end must never be.
+    //
+    // xplat-A3: CreatePipe takes exactly ONE SECURITY_ATTRIBUTES that applies
+    // to BOTH handles it returns -- there is no way to ask for one end
+    // inheritable and the other not in the same call. Creating the pipe with
+    // bInheritHandle=TRUE and then de-inheriting read_h with a SEPARATE,
+    // later SetHandleInformation call (as this used to) leaves a real window
+    // between the two calls where BOTH ends are inheritable: a concurrent
+    // CreateProcess(bInheritHandles=TRUE) on another thread -- one that does
+    // NOT restrict inheritance via its own PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+    // -- could inherit read_h into an unrelated child in that gap. Instead,
+    // create BOTH ends non-inheritable (read_h therefore never passes
+    // through an inheritable state at all) and produce the one inheritable
+    // handle this invocation needs via DuplicateHandle, dropping the
+    // non-inheritable original -- there is no window in which read_h is ever
+    // inheritable.
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
+    sa.bInheritHandle = FALSE;
     HANDLE read_raw = nullptr;
     HANDLE write_raw = nullptr;
     if (!CreatePipe(&read_raw, &write_raw, &sa, 0))
         return result;
     UniqueHandle read_h(read_raw);
-    UniqueHandle write_h(write_raw);
-    if (!SetHandleInformation(read_h.get(), HANDLE_FLAG_INHERIT, 0))
+    UniqueHandle write_noninherit_h(write_raw);
+    HANDLE write_inheritable_raw = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), write_noninherit_h.get(), GetCurrentProcess(),
+                          &write_inheritable_raw, 0, /*bInheritHandle=*/TRUE, DUPLICATE_SAME_ACCESS))
         return result;
+    write_noninherit_h.reset(); // the non-inheritable original is no longer needed
+    UniqueHandle write_h(write_inheritable_raw);
+
+    // H3 / CDX-P2-002: stdin and (when unmerged) stderr must be backed by REAL
+    // NUL handles, not null HANDLEs. Under STARTF_USESTDHANDLES a null handle is
+    // NOT the NUL device -- a child that reads stdin or writes unmerged stderr
+    // then sees invalid-handle behavior instead of the POSIX-equivalent
+    // EOF/discard the ADR-3002 stdio policy promises. Open inheritable handles to
+    // "NUL" and fail closed on error (the POSIX twin fail-closes on /dev/null).
+    SECURITY_ATTRIBUTES nul_sa{};
+    nul_sa.nLength = sizeof(nul_sa);
+    nul_sa.bInheritHandle = TRUE;
+    UniqueHandle nul_in(CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    &nul_sa, OPEN_EXISTING, 0, nullptr));
+    if (nul_in.get() == INVALID_HANDLE_VALUE)
+        return result; // spawn_error, tool_ran false
+    UniqueHandle nul_out;
+    if (!spec.merge_stderr) {
+        nul_out.reset(CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  &nul_sa, OPEN_EXISTING, 0, nullptr));
+        if (nul_out.get() == INVALID_HANDLE_VALUE)
+            return result;
+    }
 
     // A1: STARTUPINFOEXW + PROC_THREAD_ATTRIBUTE_HANDLE_LIST naming ONLY the
-    // handle build_launch_spec's WindowsHandlePolicy marks -- never a
-    // blanket "everything inheritable" pattern. merge_stderr shares the SAME
-    // pipe as stdout (one named handle either way, per spec.windows_handles).
+    // handles this launch actually inherits -- the stdout pipe plus the NUL std
+    // handles above -- never a blanket "everything inheritable" pattern.
+    // merge_stderr shares the SAME pipe as stdout.
+    std::vector<HANDLE> inherit_list;
+    inherit_list.push_back(write_h.get());
+    inherit_list.push_back(nul_in.get());
+    if (!spec.merge_stderr)
+        inherit_list.push_back(nul_out.get());
+
     SIZE_T attr_size = 0;
     InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
     if (attr_size == 0)
         return result;
     std::vector<unsigned char> attr_buf(attr_size);
+    // cpp-safety F4: attr_buf.data() is guaranteed aligned to at least
+    // alignof(std::max_align_t) -- the standard's guarantee for any
+    // std::vector's dynamically-allocated storage, the same guarantee
+    // malloc()/operator new make -- which meets or exceeds
+    // PROC_THREAD_ATTRIBUTE_LIST's own alignment requirement, so this
+    // reinterpret_cast never yields a misaligned pointer.
     auto* attr_list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data());
     if (!InitializeProcThreadAttributeList(attr_list, 1, 0, &attr_size))
         return result;
@@ -1343,18 +1521,17 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         ~AttrListGuard() { DeleteProcThreadAttributeList(list); }
     } attr_guard{attr_list};
 
-    HANDLE inherit_list[1] = {write_h.get()};
-    if (!UpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit_list,
-                                    sizeof(inherit_list), nullptr, nullptr))
+    if (!UpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                    inherit_list.data(), inherit_list.size() * sizeof(HANDLE),
+                                    nullptr, nullptr))
         return result;
 
     STARTUPINFOEXW si{};
     si.StartupInfo.cb = sizeof(si);
     si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     si.StartupInfo.hStdOutput = write_h.get();
-    si.StartupInfo.hStdError = spec.merge_stderr ? write_h.get() : nullptr;
-    si.StartupInfo.hStdInput = nullptr; // stdio policy: no stdin inherited -- the nearest
-                                         // Windows equivalent of POSIX's stdin -> /dev/null
+    si.StartupInfo.hStdError = spec.merge_stderr ? write_h.get() : nul_out.get();
+    si.StartupInfo.hStdInput = nul_in.get(); // stdio policy: stdin -> NUL (POSIX /dev/null twin)
     si.lpAttributeList = attr_list;
 
     PROCESS_INFORMATION pi{};
@@ -1405,12 +1582,39 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         jeli.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
         jeli.ProcessMemoryLimit = static_cast<SIZE_T>(*spec.rlimits.address_space_bytes);
     }
-    SetInformationJobObject(job_h.get(), JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+    // K-10/L-d: honour the rest of the rlimit request Windows CAN enforce rather
+    // than silently dropping it (POSIX applies all four). cpu_seconds maps to the
+    // Job Object per-process user-time limit (100 ns units), the documented
+    // Windows analogue of RLIMIT_CPU. fsize_bytes (RLIMIT_FSIZE) and nofile_count
+    // (RLIMIT_NOFILE) have NO Job Object equivalent -- Windows offers no
+    // per-process write-size or handle-count cap here -- so they are not
+    // enforceable on this backend; this is documented rather than pretended.
+    if (spec.rlimits.cpu_seconds) {
+        jeli.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_TIME;
+        jeli.BasicLimitInformation.PerProcessUserTimeLimit.QuadPart =
+            static_cast<LONGLONG>(*spec.rlimits.cpu_seconds) * 10'000'000LL; // s -> 100 ns
+    }
+    // BR-003: without kill-on-close the Job cannot guarantee descendant cleanup
+    // (and the deadline path below relies on TerminateJobObject reaching a
+    // descendant that outlives the leader), so a failure to configure it is
+    // load-bearing -- fail closed rather than launch an uncontained child.
+    if (!SetInformationJobObject(job_h.get(), JobObjectExtendedLimitInformation, &jeli,
+                                 sizeof(jeli))) {
+        TerminateProcess(process_h.get(), 1);
+        return result; // termination_reason stays spawn_error, tool_ran false
+    }
     if (!AssignProcessToJobObject(job_h.get(), process_h.get())) {
         TerminateProcess(process_h.get(), 1);
         return result;
     }
-    ResumeThread(thread_h.get()); // suspended -> assigned -> resumed, in that exact order
+    // CDX-007: a ResumeThread failure (returns DWORD(-1)) would leave the child
+    // suspended until the deadline killed the Job, misreporting a launch failure
+    // as `deadline`. Check it and fail closed as spawn_error, consistent with the
+    // Job creation/config/assign checks above.
+    if (ResumeThread(thread_h.get()) == static_cast<DWORD>(-1)) { // suspended -> assigned -> resumed, in that exact order
+        TerminateJobObject(job_h.get(), 1);
+        return result; // termination_reason stays spawn_error, tool_ran false
+    }
     thread_h.reset();
 
     constexpr auto kDrainGrace = std::chrono::milliseconds(2000);
@@ -1428,16 +1632,36 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     bool process_exited = false;
     bool line_cap_stop = false;
     std::string line_buf;
-    std::array<char, 512> buf{};
+    // CDX-P2-005: see the POSIX loop -- byte budget that keeps STORED lines
+    // bounded by output_cap when max_lines is unarmed, now that line
+    // materialization runs over every drained byte.
+    std::size_t stored_line_bytes = 0;
+    // K-03/M-c: a 64 KiB drain buffer (vs the old 512 B) reads a full pipe's
+    // worth per ReadFile so a high-output child drains in far fewer iterations.
+    std::array<char, 65536> buf{};
 
     auto store_line = [&](std::string line) {
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
         if (line.empty())
             return;
+        // Uncapped streaming primitive (CDX-P2-005): every completed line
+        // reaches the callback regardless of max_lines or the blob cap.
         if (opts.on_line)
             opts.on_line(line);
-        if (opts.max_lines == 0 || result.lines.size() < opts.max_lines) {
+        // result.lines stays bounded: by max_lines when armed, else by the
+        // output_cap byte budget. sec-7: the byte budget applies REGARDLESS
+        // of whether max_lines is armed -- see the POSIX loop's store_line
+        // for the full reasoning (an armed max_lines used to skip the
+        // stored_line_bytes check entirely, letting result.lines grow up to
+        // max_lines * output_cap).
+        const bool line_room =
+            stored_line_bytes < output_cap && (opts.max_lines == 0 || result.lines.size() < opts.max_lines);
+        if (line_room) {
+            // +1 for the terminating newline: count the SOURCE bytes the line
+            // consumed, matching output_cap's blob accounting so result.lines
+            // stays bounded by the same cap as result.output (BR-001).
+            stored_line_bytes += line.size() + 1;
             result.lines.push_back(std::move(line));
             if (opts.stop_after_max_lines && opts.max_lines != 0 &&
                 result.lines.size() >= opts.max_lines)
@@ -1461,34 +1685,63 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
             killed = true;
             killed_by_deadline = deadline_hit;
             killed_by_cancel = !deadline_hit && cancel_hit;
-            if (opts.soft_terminate_grace.count() > 0 && !process_exited) {
+            if (opts.soft_terminate_grace.count() > 0 && !process_exited &&
+                GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pi.dwProcessId)) {
                 // Windows twin of POSIX's SIGTERM soft-terminate: CTRL_BREAK
                 // to the whole process group (CREATE_NEW_PROCESS_GROUP
                 // above), giving a mutating tool a chance to unwind before
                 // the hard job-close kill below.
-                GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pi.dwProcessId);
                 soft_terminating = true;
                 soft_term_deadline = now + opts.soft_terminate_grace;
-            } else if (!process_exited) {
-                TerminateProcess(process_h.get(), 1);
+            } else {
+                // xplat-A2: reached either because no soft-terminate grace was
+                // requested, or because GenerateConsoleCtrlEvent just FAILED.
+                // The latter is not hypothetical: CTRL_BREAK_EVENT delivery
+                // requires the target process group to share the caller's
+                // console, and yuzu-agent runs as a Windows SERVICE with no
+                // console at all -- the call reliably fails there, and
+                // soft-terminate is UNSUPPORTED for a service-hosted agent
+                // (documented limitation, not something to work around).
+                // Previously the return value was discarded, so a failed
+                // call still set soft_terminating/soft_term_deadline and
+                // burned the ENTIRE grace window waiting for a signal that
+                // could never arrive before falling through to the hard kill
+                // anyway. Escalate immediately instead.
+                // BR-003: terminate the whole Job, NOT just the leader. A
+                // descendant that inherited the stdout pipe can outlive the
+                // leader and keep the pipe open, so PeekNamedPipe never reports
+                // EOF; if the leader has already exited the old
+                // `!process_exited`-guarded TerminateProcess did nothing and the
+                // loop span forever. TerminateJobObject reaps every process
+                // still in the job even when the leader is gone, and arming
+                // hard_kill_sent bounds the drain via kDrainGrace.
+                TerminateJobObject(job_h.get(), 1);
                 hard_kill_sent = true;
                 hard_kill_time = now;
             }
         } else if (!killed && line_cap_stop) {
             killed = true;
             killed_by_line_cap = !process_exited;
-            if (!process_exited)
-                TerminateProcess(process_h.get(), 1);
+            TerminateJobObject(job_h.get(), 1); // whole job, see BR-003 above
             hard_kill_sent = true;
             hard_kill_time = now;
-        } else if (soft_terminating && !process_exited && now >= soft_term_deadline) {
+        } else if (soft_terminating && now >= soft_term_deadline) {
+            // Escalate regardless of process_exited: the leader may have unwound
+            // during the grace while a descendant still holds the pipe. (BR-003)
             soft_terminating = false;
-            TerminateProcess(process_h.get(), 1);
+            TerminateJobObject(job_h.get(), 1);
             hard_kill_sent = true;
             hard_kill_time = now;
         }
 
         // Drain whatever is available without blocking.
+        // K-03/M-c: track whether this iteration actually drained bytes so the
+        // Sleep below fires ONLY when the pipe was empty. The old unconditional
+        // Sleep(10) after a 512-byte read throttled Windows capture to ~50 KB/s,
+        // so any child emitting more than ~500 KB inside the default 10 s
+        // deadline was job-killed and falsely reported `deadline`/`timed_out`
+        // though it ran fine (and script_exec's 16 MiB cap was unreachable).
+        bool drained = false;
         DWORD avail_bytes = 0;
         bool have_peek =
             PeekNamedPipe(read_h.get(), nullptr, 0, nullptr, &avail_bytes, nullptr) != 0;
@@ -1496,6 +1749,7 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
             DWORD to_read = static_cast<DWORD>(std::min<std::size_t>(buf.size(), avail_bytes));
             DWORD n = 0;
             if (ReadFile(read_h.get(), buf.data(), to_read, &n, nullptr) && n > 0) {
+                drained = true;
                 const auto avail = result.output.size() < output_cap ? output_cap - result.output.size()
                                                                       : std::size_t{0};
                 const auto take = static_cast<std::size_t>(n) < avail ? static_cast<std::size_t>(n) : avail;
@@ -1503,7 +1757,10 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
                     result.output.append(buf.data(), take);
                 if (take < static_cast<std::size_t>(n))
                     result.output_truncated = true;
-                for (std::size_t i = 0; i < take; ++i) {
+                // CDX-P2-005: materialize over every drained byte (all `n`, not
+                // the `take` blob prefix) so on_line keeps streaming past the
+                // blob cap; store_line + the line_buf bound keep storage capped.
+                for (std::size_t i = 0; i < static_cast<std::size_t>(n); ++i) {
                     char ch = buf[i];
                     if (ch == '\n') {
                         store_line(std::move(line_buf));
@@ -1526,7 +1783,10 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         if (hard_kill_sent && now - hard_kill_time >= kDrainGrace)
             break;
 
-        Sleep(killed ? 5 : 10);
+        // Only idle-sleep when the pipe was empty this iteration; when data is
+        // flowing, loop immediately to keep draining at full speed (K-03/M-c).
+        if (!drained)
+            Sleep(killed ? 5 : 10);
     }
 
     if (!line_buf.empty())
@@ -1560,14 +1820,31 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     if (GetProcessMemoryInfo(process_h.get(), &pmc, sizeof(pmc)))
         result.child_max_rss_kb = static_cast<std::uint64_t>(pmc.PeakWorkingSetSize) / 1024;
 
-    if (!result.tool_ran) {
-        result.termination_reason = TerminationReason::spawn_error;
-    } else if (killed_by_line_cap) {
+    // Same ordering as the POSIX chain: a deliberate kill (line_cap/cancel/
+    // deadline) is classified by its reason even if the process never
+    // confirmed output before we killed it (a pre-armed cancel racing the
+    // launch). Genuine launch failures (CreateProcessW failure, banned
+    // extension, argv validation) return spawn_error early, above -- so
+    // reaching here with !tool_ran and no kill is the only residual
+    // spawn_error case.
+    if (killed_by_line_cap) {
         result.termination_reason = TerminationReason::line_limit;
     } else if (killed_by_cancel) {
         result.termination_reason = TerminationReason::cancelled;
     } else if (killed_by_deadline) {
         result.termination_reason = TerminationReason::deadline;
+    } else if (!result.tool_ran) {
+        result.termination_reason = TerminationReason::spawn_error;
+    } else if (!killed && (exit_code_raw & 0xF0000000u) == 0xC0000000u) {
+        // CDX-P2-014: an unhandled exception terminates the process with its
+        // NTSTATUS exception code as the exit code -- severity ERROR, high
+        // nibble 0xC (e.g. STATUS_ACCESS_VIOLATION 0xC0000005,
+        // STATUS_STACK_OVERFLOW 0xC00000FD). That is a crash, not an ordinary
+        // exit; classify it `signaled` to match the POSIX chain, which reports
+        // a signal death distinctly so a caller can tell a crash (do not retry
+        // blindly) from an ordinary nonzero rc. The raw code stays in
+        // result.exit_code for callers that want the specific status.
+        result.termination_reason = TerminationReason::signaled;
     } else {
         result.termination_reason = TerminationReason::exited;
     }

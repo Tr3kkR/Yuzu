@@ -31,6 +31,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef> // std::size_t/std::ptrdiff_t (cpp-expert A2: transitive-only via
+                   // other headers today; included explicitly since this header
+                   // uses both directly)
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -187,6 +190,41 @@ inline bool is_banned_windows_extension(const std::string& path) {
 
 } // namespace detail
 
+/// A5 clear-and-allow-list env, built from nothing for the target OS
+/// (`windows == true` selects the Windows allow-list). Pure and host-agnostic
+/// so both branches are unit-testable on any host -- build_launch_spec() calls
+/// it with the compile target.
+///
+/// CDX-P2-008: Windows children must NOT receive the POSIX `PATH`
+/// (`/usr/bin:...`) or `LC_ALL=C` -- those are meaningless there and a migrated
+/// tool that consults PATH/locale/temp would observe nonsense. The Windows list
+/// is the minimal deterministic system set: `SystemRoot`/`windir` (required by
+/// many Win32 APIs), the canonical system search `PATH`, and a machine-wide
+/// `TEMP`/`TMP`. Values are the canonical defaults (a `C:` system volume); a
+/// future real Windows caller that must honour a relocated system root threads
+/// the actual paths through `opts` rather than reading the parent environment
+/// (which A5's clear-slate forbids). Locale is left to the system default -- no
+/// LC_ALL analogue is imposed.
+inline std::vector<EnvVar> default_launch_env(bool windows,
+                                              const std::optional<std::string>& tz) {
+    std::vector<EnvVar> env;
+    if (windows) {
+        env.push_back({"SystemRoot", "C:\\Windows"});
+        env.push_back({"windir", "C:\\Windows"});
+        env.push_back({"PATH", "C:\\Windows\\system32;C:\\Windows;C:\\Windows\\System32\\Wbem"});
+        env.push_back({"TEMP", "C:\\Windows\\Temp"});
+        env.push_back({"TMP", "C:\\Windows\\Temp"});
+    } else {
+        // LD_*/DYLD_*/IFS/BASH_ENV/GCONV_PATH are stripped by construction
+        // (never added, so there is nothing to strip from).
+        env.push_back({"PATH", "/usr/bin:/bin:/usr/sbin:/sbin"});
+        env.push_back({"LC_ALL", "C"});
+    }
+    if (tz && !tz->empty())
+        env.push_back({"TZ", *tz});
+    return env;
+}
+
 /**
  * Colascione backslash-before-quote argv-element quoting: the algorithm the
  * Microsoft CRT's own command-line parser (and every parser that follows its
@@ -269,13 +307,15 @@ inline LaunchSpec build_launch_spec(const std::vector<std::string>& argv, const 
     spec.rlimits = opts.rlimits;
     spec.exec_verify = opts.exec_verify;
 
-    // A5: clear-and-allow-list env, built here from nothing -- LD_*/DYLD_*/
-    // IFS/BASH_ENV/GCONV_PATH are stripped by construction (never added, so
-    // there is nothing to strip from).
-    spec.env.push_back({"PATH", "/usr/bin:/bin:/usr/sbin:/sbin"});
-    spec.env.push_back({"LC_ALL", "C"});
-    if (opts.tz && !opts.tz->empty())
-        spec.env.push_back({"TZ", *opts.tz});
+    // A5: clear-and-allow-list env, built here from nothing for the compile
+    // target (CDX-P2-008: Windows must not inherit the POSIX shape). The
+    // per-OS list lives in the pure, host-testable default_launch_env().
+#ifdef _WIN32
+    constexpr bool kWindowsEnv = true;
+#else
+    constexpr bool kWindowsEnv = false;
+#endif
+    spec.env = default_launch_env(kWindowsEnv, opts.tz);
 
     for (std::size_t i = 0; i < spec.argv.size(); ++i) {
         if (i)

@@ -201,6 +201,7 @@ agent_test_exe = executable(
     'unit/agent/test_msi_macos.cpp',          # C-1.21: pkgutil --pkg-info parser (P8)
     'unit/agent/test_bitlocker_macos.cpp',    # A-1.16: diskutil apfs list parser (P8)
     'unit/test_subprocess_runner.cpp',        # #2273: agent-core bounded subprocess runner (POSIX deadline/reap)
+    'unit/test_subprocess_launch_spec.cpp',   # PR1.2: host-agnostic pure launch-spec tests (run on Windows too)
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
     'unit/test_users_macos_last.cpp',         # qe-M1: pure `last -y` timestamp/weekday parsers
@@ -773,6 +774,21 @@ test('flake-retry selftest',
   suite: 'docs',
   timeout: 30,
 )
+
+# PR1.2 (ADR-3002 Decision-10a): pure-logic selftest of the lexical spawn gate —
+# a seeded raw-spawn fixture must fail and the sanctioned-runner allowlist case
+# must pass. Wired here so the gate's own matcher is enforced on every platform
+# with bash, mirroring the flake-retry selftest above. Guarded so Windows (no
+# bash) skips cleanly rather than erroring at configure.
+_bash_test = find_program('bash', required: false)
+if _bash_test.found()
+  test('plugin-spawn lexical gate selftest',
+    _bash_test,
+    args: [files('../scripts/ci/check-plugin-spawn-lexical.sh'), '--selftest'],
+    suite: 'docs',
+    timeout: 60,
+  )
+endif
 
 # End-to-end fake-Meson contract. In particular, an expired/malformed flake
 # registry must fail before the real test runner could be invoked. The script

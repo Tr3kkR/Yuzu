@@ -104,6 +104,28 @@ or exposing the administration-scoped PAT to fork-controlled code.
 
 ## Gates outside the tier ladder
 
+### Plugin spawn lexical gate (`plugin-spawn-gate.yml`, ADR-3002 decision 10a)
+
+A per-PR grep over `agents/plugins/*` and `agents/core` for a raw
+process-spawn token (the `fork`/`exec` family, `system`, `popen`,
+`CreateProcess` family, ...) outside the registered allowlist —
+`scripts/ci/check-plugin-spawn-lexical.sh` carries the full
+token/allowlist contract in its own header. It is tier (a) of a
+two-tier enforcement scheme; a scheduled, call-identity-aware CodeQL
+query is tier (b), the deep net for what a lexical scan can't see. See
+`docs/adr/3002-acquisition-ladder.md:459-488` for why neither tier
+alone is sufficient.
+
+It runs as its **own workflow**, not folded into `ci.yml`: a source
+grep needs no build, so it doesn't share `ci.yml`'s build-dependent
+PR fast-path or `changes`-job path filtering — there is nothing
+expensive to skip, so the workflow simply always runs on every PR and
+push to `main`/`dev`. A failing lexical scan is a **merge-blocking**
+required check; remediation is either moving the call into the
+registered allowlist (if it is a legitimate, reviewed acquisition
+path) or removing the raw spawn in favour of the sanctioned subprocess
+runner.
+
 ### Docker healthcheck invariants (`docker-healthcheck-invariants.yml`, #751)
 
 The five Yuzu **application** images' compose healthchecks depend on a tool baked

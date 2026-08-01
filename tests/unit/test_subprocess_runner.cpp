@@ -14,11 +14,14 @@
  * a handful of sequential real-child iterations per thread run concurrently
  * across threads, a few seconds total -- rather than by a single deadline.
  *
- * POSIX only (subprocess_runner.hpp's implementation is itself
- * `#ifndef _WIN32`-gated) -- this file is still registered unconditionally
- * in the agent test binary, and its body compiles to nothing observable on
- * Windows because every TEST_CASE here is gated on the same macro.
- * macOS/Linux, per the boundary.
+ * TWO platform blocks, never interleaved. The first (`#ifndef _WIN32`) holds
+ * the POSIX fork/execve vectors -- the bulk of this file, and the only place
+ * POSIX-only fixtures (FIFOs, /dev/fd, RLIMIT_NOFILE) appear. The second
+ * (`#ifdef _WIN32`, after that block's `#endif`) holds the Windows real-child
+ * vectors for the CreateProcessW backend (CDX-FV-05): before they existed the
+ * MSVC CI leg compiled this file and ran NOTHING against that backend, so a
+ * broken suspended-create / Job-Object-assign / ResumeThread / deadline-kill
+ * path could ship green. Neither block is even parsed on the other platform.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -46,6 +49,9 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/syscall.h> // SYS_execveat -- gates the sec-8 exec_verify tests below
+#endif
 
 using namespace yuzu::agent;
 using namespace std::chrono_literals;
@@ -89,6 +95,24 @@ TEST_CASE("run_bounded_subprocess caps stored lines at max_lines but still drain
     // max_lines bounds the STORED lines only -- output is the raw captured
     // blob and is not truncated by it (a separate, much larger sanity cap).
     CHECK(result.output == "a\nb\nc\nd\n");
+}
+
+TEST_CASE("run_bounded_subprocess: the output_cap byte budget bounds result.lines even when max_lines "
+          "is armed (sec-7)",
+          "[subprocess][output_cap]") {
+    // Before the fix, an armed max_lines consulted ONLY the count cap and
+    // never checked stored_line_bytes -- so a caller-set max_lines could
+    // store up to max_lines lines with NO byte ceiling, independent of
+    // output_cap_bytes. Here max_lines (1000) is set far higher than what a
+    // tiny output_cap (32 bytes) can ever admit: /usr/bin/yes emits an
+    // endless stream of 2-byte lines ("x\n"), so with the byte budget
+    // correctly enforced, result.lines must stop growing once ~16 lines'
+    // worth of bytes (32 / 2) are stored, never reaching anywhere near 1000.
+    SubprocessResult result = run_bounded_subprocess(
+        {"/usr/bin/yes", "x"},
+        SubprocessOptions{.deadline = 300ms, .max_lines = 1000, .output_cap_bytes = 32});
+    CHECK(result.lines.size() <= 16);
+    CHECK(result.lines.size() < 1000);
 }
 
 TEST_CASE("run_bounded_subprocess kills, reaps, and returns partial output + timed_out on a hung child",
@@ -481,7 +505,13 @@ TEST_CASE("run_bounded_subprocess with stop_after_max_lines cleanly stops at exa
     CHECK_FALSE(result.output_truncated);
     REQUIRE(result.lines.size() == kLines);
     CHECK(result.lines[0] == "x");
-    CHECK(result.exit_code == 0);
+    // A clean bounded stop is signalled by termination_reason == line_limit,
+    // NOT by a fabricated exit_code. The runner SIGKILLs `yes` to stop it, so
+    // exit_code stays the honest -1 sentinel (the removed pre-ADR-3002 fixup
+    // used to synthesize 0 here -- exactly the dishonesty the sentinel fix
+    // eliminates; see subprocess_runner.hpp stop_after_max_lines contract).
+    CHECK(result.termination_reason == TerminationReason::line_limit);
+    CHECK(result.exit_code == -1);
 }
 
 namespace {
@@ -799,7 +829,31 @@ TEST_CASE("run_bounded_subprocess: soft_terminate_grace escalates to the unmodif
     CHECK(elapsed < 10s);
 }
 
-TEST_CASE("exec_verify (B6) accepts a correctly-sized target and execs it via the verified path",
+TEST_CASE("run_bounded_subprocess: soft_terminate escalates via the process GROUP even after the leader "
+          "is reaped, so a descendant holding stdout cannot hang the runner (CDX-002)",
+          "[subprocess][soft_terminate]") {
+    const auto start = std::chrono::steady_clock::now();
+    // The reproduced hang: a leader that traps SIGTERM and exits fast, plus a
+    // descendant that IGNORES SIGTERM and keeps the inherited stdout pipe open.
+    // The old grace escalation was guarded by `!child_reaped`, so once the leader
+    // was reaped no hard kill was ever armed and — with the pipe never reaching
+    // EOF — the runner spun past deadline+grace+drain indefinitely. The fix
+    // escalates to a process-GROUP SIGKILL regardless of leader reap.
+    SubprocessResult r = run_bounded_subprocess(
+        {"/bin/sh", "-c",
+         "sh -c 'trap \"\" TERM; while :; do sleep 0.05; done' & trap 'exit 0' TERM; "
+         "while :; do sleep 0.05; done"},
+        SubprocessOptions{.deadline = 200ms, .soft_terminate_grace = 300ms});
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    CHECK(r.timed_out);
+    CHECK(r.termination_reason == TerminationReason::deadline);
+    // Load-bearing: it RETURNS (bounded) rather than hanging on the descendant.
+    CHECK(elapsed < 10s);
+}
+
+#if defined(__linux__) && defined(SYS_execveat)
+TEST_CASE("exec_verify (B6) accepts a correctly-sized target and execs it via the verified path "
+          "(Linux execveat -- an atomic fd-based exec primitive exists here)",
           "[subprocess][exec_verify]") {
     struct stat st{};
     REQUIRE(::stat("/bin/echo", &st) == 0);
@@ -811,6 +865,28 @@ TEST_CASE("exec_verify (B6) accepts a correctly-sized target and execs it via th
     CHECK(r.tool_ran);
     CHECK(r.exit_code == 0);
 }
+#else
+TEST_CASE("exec_verify (B6) fails CLOSED on this platform even for a fully-matching target -- no "
+          "atomic fd-exec primitive exists here to close the TOCTOU gap (sec-8)",
+          "[subprocess][exec_verify]") {
+    // macOS/BSD (and any Linux build without SYS_execveat): every fstat check
+    // this run requests passes -- regular file, size matches exactly,
+    // ownership check waived -- so before the sec-8 fix this still exec'd via
+    // close(fd); execve(path, ...), which re-resolves argv[0] from the
+    // filesystem and reopens the exact TOCTOU window the verify exists to
+    // close. It must now fail closed instead, matching Windows' BR-004
+    // rather than degrading to an unverified exec.
+    struct stat st{};
+    REQUIRE(::stat("/bin/echo", &st) == 0);
+    SubprocessOptions opts{.deadline = 5000ms};
+    opts.exec_verify.enabled = true;
+    opts.exec_verify.require_root_owned = false;
+    opts.exec_verify.expected_size = static_cast<std::uint64_t>(st.st_size); // matches exactly
+    SubprocessResult r = run_bounded_subprocess({"/bin/echo", "hi"}, opts);
+    CHECK_FALSE(r.tool_ran);
+    CHECK(r.termination_reason == TerminationReason::spawn_error);
+}
+#endif
 
 TEST_CASE("exec_verify (B6) fails CLOSED on a size mismatch instead of exec'ing anyway",
           "[subprocess][exec_verify]") {
@@ -845,88 +921,11 @@ public:
 };
 } // namespace
 
-TEST_CASE("build_launch_spec rejects the same things run_bounded_subprocess rejects at runtime (B1)",
-          "[subprocess][launch_spec]") {
-    using yuzu::agent::build_launch_spec;
-    using yuzu::agent::LaunchOptions;
-    using yuzu::agent::LaunchSpecError;
-
-    CHECK(build_launch_spec({}, LaunchOptions{}).error == LaunchSpecError::empty_argv);
-    CHECK(build_launch_spec({"relative/bin"}, LaunchOptions{}).error == LaunchSpecError::relative_argv0);
-    CHECK(build_launch_spec({"/bin/echo", std::string("a\0b", 3)}, LaunchOptions{}).error ==
-          LaunchSpecError::embedded_nul);
-    CHECK(build_launch_spec({"/path/tool.bat"}, LaunchOptions{}).error ==
-          LaunchSpecError::banned_windows_extension);
-    CHECK(build_launch_spec({"/path/TOOL.CMD"}, LaunchOptions{}).error ==
-          LaunchSpecError::banned_windows_extension); // case-insensitive
-    CHECK(build_launch_spec({"/path/tool.com"}, LaunchOptions{}).error ==
-          LaunchSpecError::banned_windows_extension);
-    CHECK(build_launch_spec({"C:\\tools\\thing.exe"}, LaunchOptions{}).error ==
-          LaunchSpecError::none); // a valid Windows-absolute argv[0]
-}
-
-TEST_CASE("build_launch_spec assembles the A5 clear-and-allow-list env with no LD_/DYLD_ leakage (B1)",
-          "[subprocess][launch_spec]") {
-    using namespace yuzu::agent;
-    LaunchOptions opts;
-    opts.tz = std::string("UTC");
-    LaunchSpec spec = build_launch_spec({"/bin/echo", "hi"}, opts);
-    REQUIRE(spec.error == LaunchSpecError::none);
-
-    bool has_path = false;
-    bool has_lc_all = false;
-    bool has_tz = false;
-    for (const auto& e : spec.env) {
-        CHECK(e.key.substr(0, 3) != "LD_");
-        CHECK(e.key.substr(0, 5) != "DYLD_");
-        CHECK(e.key != "IFS");
-        CHECK(e.key != "BASH_ENV");
-        CHECK(e.key != "GCONV_PATH");
-        if (e.key == "PATH")
-            has_path = true;
-        if (e.key == "LC_ALL") {
-            has_lc_all = true;
-            CHECK(e.value == "C");
-        }
-        if (e.key == "TZ") {
-            has_tz = true;
-            CHECK(e.value == "UTC");
-        }
-    }
-    CHECK(has_path);
-    CHECK(has_lc_all);
-    CHECK(has_tz);
-}
-
-TEST_CASE("quote_windows_arg follows the Colascione backslash-before-quote algorithm (A2)",
-          "[subprocess][launch_spec]") {
-    using yuzu::agent::quote_windows_arg;
-    CHECK(quote_windows_arg("") == "\"\"");
-    CHECK(quote_windows_arg("simple") == "simple");
-    CHECK(quote_windows_arg("a b c") == "\"a b c\"");
-    CHECK(quote_windows_arg("ab\"c") == "\"ab\\\"c\"");
-    CHECK(quote_windows_arg("a\\b") == "a\\b"); // no space/quote -> unquoted, backslash untouched
-    CHECK(quote_windows_arg("a\\b c") == "\"a\\b c\""); // quoted for the space; a lone backslash
-                                                          // not preceding a quote/end is NOT doubled
-    CHECK(quote_windows_arg("a b\\") == "\"a b\\\\\""); // trailing backslash IS doubled before the
-                                                          // closing quote we add
-}
-
-TEST_CASE("build_launch_spec precomputes the Windows handle policy from merge_stderr (A1/B1)",
-          "[subprocess][launch_spec]") {
-    using namespace yuzu::agent;
-    LaunchOptions merged_opts;
-    merged_opts.merge_stderr = true;
-    LaunchSpec merged_spec = build_launch_spec({"/bin/echo"}, merged_opts);
-    REQUIRE(merged_spec.error == LaunchSpecError::none);
-    CHECK(merged_spec.windows_handles.inherit_stdout_write);
-    CHECK(merged_spec.windows_handles.inherit_stderr_write);
-
-    LaunchSpec default_spec = build_launch_spec({"/bin/echo"}, LaunchOptions{});
-    REQUIRE(default_spec.error == LaunchSpecError::none);
-    CHECK(default_spec.windows_handles.inherit_stdout_write);
-    CHECK_FALSE(default_spec.windows_handles.inherit_stderr_write);
-}
+// NOTE: the host-agnostic PURE launch-spec tests (build_launch_spec validation,
+// the A5 allow-list env, default_launch_env, quote_windows_arg, and the Windows
+// handle policy) moved to test_subprocess_launch_spec.cpp so they run on EVERY
+// platform including Windows (K-10/CDX-R2-004) rather than being compiled out by
+// this file's `#ifndef _WIN32` real-child guard.
 
 TEST_CASE("the Spawner interface is independently injectable/testable without spawning a process (B1)",
           "[subprocess][launch_spec]") {
@@ -943,3 +942,160 @@ TEST_CASE("the Spawner interface is independently injectable/testable without sp
 }
 
 #endif // !_WIN32
+
+#ifdef _WIN32
+
+// ---------------------------------------------------------------------------
+// CDX-FV-05: Windows real-child vectors for the CreateProcessW backend.
+//
+// Everything above compiles to nothing on Windows, which left the MSVC CI leg
+// with ZERO real-child coverage of the backend this branch introduces:
+// CreateProcessW with CREATE_SUSPENDED, Job Object assignment before resume,
+// handle allowlisting via PROC_THREAD_ATTRIBUTE_HANDLE_LIST, ResumeThread
+// failure handling, and deadline Job termination (BR-003, H3, L1, M-c, L-d,
+// CDX-007). The pure launch-spec tests in test_subprocess_launch_spec.cpp run
+// on every platform but cannot detect a broken CreateProcessW or a failed Job
+// assignment -- only a real child can.
+//
+// Deliberately small and conservative, mirroring the assertion shape of the
+// POSIX twins above: only the public run_bounded_subprocess /
+// SubprocessOptions / SubprocessResult / CancellationToken surface is used (no
+// windows.h in a test body), and every command is one guaranteed present on
+// any Windows Server / Windows 10+ image. Bounded exactly as the POSIX cases
+// are -- one deadline plus the runner's internal 2s drain grace -- so a
+// backend that fails to kill its child fails loudly instead of hanging CI.
+// ---------------------------------------------------------------------------
+
+#include <yuzu/agent/subprocess_runner.hpp>
+
+#include <chrono>
+#include <memory>
+#include <string>
+#include <vector>
+
+using namespace yuzu::agent;
+using namespace std::chrono_literals;
+
+namespace {
+
+// argv[0] MUST be absolute -- run_bounded_subprocess never PATH-searches
+// (subprocess_runner.hpp) -- and neither of these carries a banned
+// .bat/.cmd/.com extension. These are the same canonical system paths the
+// runner's own Windows backend already assumes for the child's working
+// directory ("C:\\Windows\\System32", subprocess_runner.cpp) and its A5
+// environment allow-list (SystemRoot/windir = "C:\\Windows",
+// subprocess_launch_spec.hpp default_launch_env).
+//
+// Every argv token below is passed as its OWN element, so the Colascione
+// quoter never has to quote anything: the child sees a bare
+// `cmd.exe /d /c <verb> <arg>` command line, keeping cmd.exe's /C
+// quote-stripping rules entirely out of play. `/d` disables the registry
+// AutoRun hook, so a machine-local `Command Processor\AutoRun` value on a CI
+// image can neither inject output into the captured stream nor change the
+// child's exit code -- these assertions describe the runner, not the host.
+constexpr const char* kCmdExe = "C:\\Windows\\System32\\cmd.exe";
+
+// `ping -n 30 127.0.0.1` is the portable Windows sleep: ~29s of one-second
+// intervals, far longer than any deadline asserted below, with no PowerShell
+// and no real network dependency (loopback ICMP is serviced locally, and even
+// a blocked ICMP path only makes it take LONGER, never shorter).
+constexpr const char* kPingExe = "C:\\Windows\\System32\\ping.exe";
+
+} // namespace
+
+TEST_CASE("run_bounded_subprocess (Windows) runs a real child through CreateProcessW to a clean exit",
+          "[subprocess][windows]") {
+    // The end-to-end proof that the suspended-create -> Job-assign ->
+    // ResumeThread sequence actually works: a child that never resumed would
+    // sit suspended until the deadline killed the Job and report
+    // timed_out/deadline instead of exited/0 (CDX-007).
+    SubprocessResult result = run_bounded_subprocess(
+        {kCmdExe, "/d", "/c", "exit", "0"}, SubprocessOptions{.deadline = 10000ms});
+
+    CHECK_FALSE(result.timed_out);
+    CHECK(result.tool_ran);
+    CHECK(result.exit_code == 0);
+    CHECK(result.termination_reason == TerminationReason::exited);
+}
+
+TEST_CASE("run_bounded_subprocess (Windows) captures a real nonzero exit code from a child that "
+          "runs to completion",
+          "[subprocess][windows]") {
+    SubprocessResult result = run_bounded_subprocess(
+        {kCmdExe, "/d", "/c", "exit", "3"}, SubprocessOptions{.deadline = 10000ms});
+
+    CHECK_FALSE(result.timed_out);
+    CHECK(result.tool_ran);
+    CHECK(result.exit_code == 3);
+    CHECK(result.termination_reason == TerminationReason::exited);
+}
+
+TEST_CASE("run_bounded_subprocess (Windows) captures child stdout through the allowlisted pipe handle",
+          "[subprocess][windows]") {
+    // Load-bearing for the A1 handle allowlist (H3/L1): the stdout write end is
+    // the one handle named in PROC_THREAD_ATTRIBUTE_HANDLE_LIST, so if the list
+    // were wrong -- or the STARTF_USESTDHANDLES wiring broken -- the child would
+    // produce no capturable output at all and this would come back empty.
+    SubprocessResult result = run_bounded_subprocess(
+        {kCmdExe, "/d", "/c", "echo", "hi"}, SubprocessOptions{.deadline = 10000ms});
+
+    CHECK_FALSE(result.timed_out);
+    CHECK(result.tool_ran);
+    CHECK(result.exit_code == 0);
+    CHECK(result.termination_reason == TerminationReason::exited);
+    // cmd.exe emits CRLF; the runner strips the trailing '\r' per line, so the
+    // stored line is exactly "hi" while the raw blob keeps what was written.
+    REQUIRE(result.lines.size() == 1);
+    CHECK(result.lines[0] == "hi");
+    CHECK(result.output.find("hi") != std::string::npos);
+}
+
+TEST_CASE("run_bounded_subprocess (Windows) terminates the Job at the deadline and returns partial, "
+          "honest results instead of waiting out the child",
+          "[subprocess][windows]") {
+    // BR-003: the deadline path terminates the whole Job Object, not just the
+    // leader. A child that outran the deadline by ~29s must be dead and the call
+    // returned long before its natural end.
+    const auto start = std::chrono::steady_clock::now();
+
+    SubprocessResult result = run_bounded_subprocess({kPingExe, "-n", "30", "127.0.0.1"},
+                                                       SubprocessOptions{.deadline = 500ms});
+
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    CHECK(result.timed_out);
+    CHECK(result.tool_ran); // CreateProcessW succeeded before the kill
+    // A killed child is never given a fabricated exit status -- not even
+    // TerminateJobObject's own exit value (same contract as the POSIX twin).
+    CHECK(result.exit_code == -1);
+    CHECK(result.termination_reason == TerminationReason::deadline);
+    // Bounded proof: the runner's documented worst case here is deadline (500ms)
+    // plus one drain grace (2000ms). 15s is a generous CI-noise margin that is
+    // still well under the child's own ~29s natural runtime, so a Job that
+    // failed to terminate fails this loudly rather than passing slowly.
+    CHECK(elapsed < 15s);
+}
+
+TEST_CASE("run_bounded_subprocess (Windows) honours a pre-armed per-invocation CancellationToken",
+          "[subprocess][windows]") {
+    // Pre-armed, so the very first poll of the wait loop must notice it. The
+    // deadline (60s) is set well beyond both the child's own ~29s runtime and
+    // the bound asserted below, so a pass can only mean the CANCEL -- never the
+    // deadline -- ended the run.
+    auto token = std::make_shared<CancellationToken>();
+    token->cancel();
+
+    const auto start = std::chrono::steady_clock::now();
+
+    SubprocessResult result =
+        run_bounded_subprocess({kPingExe, "-n", "30", "127.0.0.1"},
+                                SubprocessOptions{.deadline = 60000ms, .cancel_token = token});
+
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    CHECK(result.timed_out);
+    CHECK(result.termination_reason == TerminationReason::cancelled);
+    CHECK(elapsed < 15s);
+}
+
+#endif // _WIN32
