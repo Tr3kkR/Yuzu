@@ -23,8 +23,20 @@ enabled = true
 > `ITServiceOwner` role on the root "All Devices" group; see
 > [`management-groups.md`](management-groups.md) for the delegation API.
 
-> **RBAC store integrity (fail-closed).** If the RBAC store cannot open or
-> migrate (e.g. a corrupt `rbac.db`), the server fails **closed**: device
+> **Storage (ADR-0041).** RBAC configuration — roles, grants, principal→role
+> assignments, groups + membership, and the global `rbac_enabled` flag — lives in
+> the server's **PostgreSQL** substrate, schema `rbac_store` (it moved off the
+> legacy SQLite `rbac.db` file). It is a single shared database across all server
+> replicas, so administer it with one `psql`, not per-node.
+>
+> **RBAC store integrity (fail-closed / deny-on-degrade).** The `rbac_store`
+> substrate fails **closed at boot** — an unreachable PostgreSQL (or an
+> unreadable durable `rbac_enabled` flag) makes the server refuse to start,
+> rather than serving RBAC-off on a fleet that enabled it. At runtime, an
+> authorization read that cannot resolve (pool-acquire timeout, query error)
+> **denies** rather than allowing (deny-on-degrade, ADR-0041 — this closes the
+> prior "corrupt `rbac.db` fails open" behavior); watch the
+> `yuzu_server_rbac_read_degrade_total` metric. In that degraded state, device
 > visibility falls back to the role-scoped path for every caller, so agents stop
 > appearing in the dashboard list, `/api/agents`, and TAR fleet scans rather than
 > the whole fleet being exposed. **The same fail-closed posture covers MOST
@@ -35,11 +47,12 @@ enabled = true
 > fleet-wide read. **Not yet covered (#1634 follow-up — these still fail OPEN on a
 > corrupt store):** the dashboard `/fragments/results/…` table and the workflow
 > executions-drawer reader have no per-agent filter and will expose the whole
-> fleet's responses on a corrupt `rbac.db`. So a corrupt store looks like "no
+> fleet's responses when the RBAC store is degraded. So a degraded store looks like "no
 > agents in scope" / "no responses" **on the covered surfaces, but is a visibility
 > leak via those two uncovered ones** — check the server startup log for `RbacStore`
-> errors and the `/health` store status, then restore or remove the file and
-> restart immediately. (If Grafana panels or scripted aggregate consumers show zero
+> errors, the `/health` store status, and `yuzu_server_rbac_read_degrade_total`,
+> then restore PostgreSQL (`rbac_store`) availability
+> immediately. (If Grafana panels or scripted aggregate consumers show zero
 > rows after an upgrade or restart, check for `RbacStore` open/migrate errors first.)
 >
 > **Note (#1634):** the per-agent filter on the covered response readers is, under

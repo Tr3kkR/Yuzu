@@ -575,8 +575,9 @@ current membership. Mirrors the break-glass metric/audit treatment above.
   source; a miswired call passing `"local"` would mass-delete every local
   group membership fleet-wide.
 - **Fail-closed on the login.** An over-cap assertion or a reconcile-store
-  failure (e.g. a locked/corrupt `rbac.db`) denies the login outright before a
-  session is minted — a heavily-loaded or unhealthy `rbac.db` degrades
+  failure (e.g. an unreachable/degraded PostgreSQL `rbac_store` — pool-acquire
+  timeout or query error, ADR-0041) denies the login outright before a
+  session is minted — a heavily-loaded or unhealthy `rbac_store` degrades
   availability (SSO logins fail) rather than integrity (a session with
   stale/unreconciled roles). The break-glass/local-password escape hatch
   (`/login`, hardened-mode) is unaffected — it never calls `/auth/callback`
@@ -1643,8 +1644,10 @@ resulting latency bounds.
   to the legacy pre-RBAC path or the MCP-tier/service-scoped resolution used
   for human and agent sessions. An engine session's authority is resolved
   **exclusively** against `RbacStore`:
-  - `rbac_store_` null/unopened → **`503`** (cannot evaluate authority;
-    retryable, never a silent allow).
+  - `rbac_store_` unavailable — null/unopened, or a runtime degrade of the
+    PostgreSQL `rbac_store` substrate (pool-acquire timeout / query error,
+    ADR-0041) — → **`503`** (cannot evaluate authority; retryable, never a
+    silent allow — the deny-on-degrade contract).
   - RBAC disabled, or no matching `(principal="engine:<slug>", role, scope)`
     grant → **`403`**.
   - A matching grant → allowed.
@@ -1665,9 +1668,10 @@ resulting latency bounds.
 - **Reserved-namespace fail-closed guards.** `find_local_groups_with_prefix`
   returns `std::nullopt` (not an engaged-empty optional) when the RBAC store
   can't be read, and the `server.cpp` boot-time `engine:`-collision preflight
-  requires `rbac_store_->is_open()` before trusting a clean scan — a corrupt
-  `rbac.db` now fails the boot closed rather than booting "clean" past a
-  reserved-namespace collision it could not actually see. `upsert_sso_identity`
+  requires `rbac_store_->is_open()` before trusting a clean scan — a degraded
+  or unreachable `rbac_store` (PostgreSQL substrate, ADR-0041) now fails the
+  boot closed rather than booting "clean" past a reserved-namespace collision
+  it could not actually see. `upsert_sso_identity`
   separately rejects any `engine:`-prefixed write at the SSO identity-sync
   surface (design §3.3), sharing the `kEngineReservedPrefix` constant with the
   store's own create-path guard.
@@ -2159,3 +2163,83 @@ MFA fail-closed on secret-read failure, cleanup cadence, snapshot-and-release
 publishing) live in `.claude/agents/authdb.md` — the AuthDB review agent
 loads them on any change to `auth_db.{hpp,cpp}` / `auth_routes.{hpp,cpp}` /
 `auth.{hpp,cpp}`.
+
+## RbacStore — the authorization substrate (Postgres, ADR-0041 — SQLite `rbac.db` retired)
+
+`RbacStore` (`server/core/src/rbac_store.{hpp,cpp}`) is the **authorization
+substrate**: role definitions, role→permission grants, principal→role
+assignments, RBAC groups + membership, and the global `rbac_enabled` flag.
+`require_permission` / `require_scoped_permission` / `authorize_list_read`
+(World-A confinement, ADR-0017) / the engine-principal default-deny path
+(ADR-0031) all resolve through it. It moved from the SQLite `rbac.db` file to
+the server's PostgreSQL substrate in the ADR-0041 (Wave 2.1) migration, schema
+**`rbac_store`**, born-on-Postgres on the shared server `PgPool` with
+fail-closed construction (`!is_open()` → the server refuses to start,
+ADR-0007/0012 §1). It is the **highest-blast-radius store** on the migration
+ladder — a defect here is a fleet-wide authorization failure — and reuses the
+shared pool, so it adds **no new flag or environment variable**.
+
+**Reads FAIL CLOSED — deny-on-degrade (the load-bearing invariant).** Every
+authz read keeps its `bool`/deny-on-error contract: a store-not-open,
+pool-acquire timeout, or query error returns **deny** (`false` for the
+`check_permission` / `check_scoped_permission` / `holds_permission_via_any_group`
+/ `check_role_has_permission` bool checks; the empty/most-restrictive result for
+the list/scope reads), NEVER allow. Where a caller needs to distinguish "denied"
+from "store degraded" for a 403-vs-503 decision (e.g. `authorize_list_read`),
+that is exposed via a **separate** tri-state / `std::expected` accessor — the
+plain `bool` path stays deny-on-error so no existing chokepoint can regress to
+fail-open. This **closes the prior "fails open on a corrupt `rbac.db`" hole**:
+under SQLite a corrupt/unreadable RBAC store could fall through to an engaged
+allow at some call sites; the PostgreSQL `rbac_store` now denies on any degrade.
+
+**Cross-replica coherence — durable generation token.** Each replica keeps its
+in-process permission cache (`perm_cache_`) but validates it against a **durable
+`rbac_meta.write_generation` counter** bumped in the same transaction as every
+mutation (`assign_role`, `unassign_role`, `set_permission`, role/group changes,
+`set_rbac_enabled`). A read refreshes its cached view of the durable generation
+at most once per `kRbacGenerationRefreshMs` (1000 ms — one cheap indexed
+single-row `SELECT`, not a permission re-query) and clears `perm_cache_` on a
+change; a local mutation bumps the counter and clears its own cache immediately.
+This bounds cross-replica staleness to the refresh interval: a revoke on replica
+A is visible on replica B within ≤1 s. A failed generation refresh does NOT
+extend trust — it is treated as "assume changed" (clear cache) and counted as a
+`generation_refresh_failed` degrade. **The `rbac_enabled` flag propagates on the
+same durable path.** The ~1 s bounded stale-allow window is an **accepted,
+gate-recorded residual risk** (well inside the fleet's minutes-scale
+revocation-latency envelope); `LISTEN/NOTIFY` (window → 0) is the named
+follow-up.
+
+**Fail-closed BOOT on the `rbac_enabled` flag.** The `rbac_enabled` flag is
+durable in `rbac_meta`. An unreadable flag at boot **refuses to start** — the
+server never serves RBAC-**off** on a fleet that had enabled it (which would
+silently make every confined operator fleet-wide-authorized: a catastrophic
+fail-open).
+
+**Mandatory backfill (ADR-0009/0041).** Unlike the AuthDB fresh-start cutover,
+RBAC state is irreducible operator-authored config that **cannot be
+re-derived** — custom roles, every principal→role grant, groups, and
+membership — so the migration performs a one-time streamed, idempotent,
+resumable, reconciled, **fail-CLOSED** backfill from the legacy `rbac.db`
+(seed defaults first, then backfill operator rows via `ON CONFLICT DO NOTHING`;
+operator edits to seeded permissions are preserved via `DO UPDATE`).
+Reconciliation counts roles + grants + groups + members and refuses the
+completion marker on any shortfall (fail-closed → refuse boot, retry next
+start). **The `rbac_enabled` flag is migrated first and read-back-verified**
+before the store is considered open (losing it is the single most dangerous
+outcome); a flag-backfill failure fails the whole backfill closed. The legacy
+`rbac.db` is moved aside only after a verified backfill.
+
+**Metrics.** `yuzu_server_rbac_read_degrade_total{reason}` (reason ∈
+`pool_acquire_timeout` / `query_error` / `generation_refresh_failed`) — a
+degrade denies authz fleet-wide, so a non-zero rate is a fleet-wide
+authorization-availability event; and `yuzu_server_rbac_backfill_total{result}`
+(result ∈ `fresh` / `completed` / `failed`). See
+`docs/user-manual/metrics.md` and the `YuzuRbacReadDegraded` alert in
+`docs/prometheus/yuzu-alerts.yml`.
+
+**Read split for reviewers.** The plain `bool` authz checks fail closed
+(deny-on-error) so no chokepoint can regress to fail-open; the tri-state
+`_checked` / `std::expected` accessors are the ONLY place a caller may learn
+"degraded" (503) as distinct from "denied" (403). A new read must land on the
+correct side of this split — see ADR-0041 and
+`docs/adr/0017-management-group-confinement-list-reads.md`.

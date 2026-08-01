@@ -971,6 +971,45 @@ yuzu_server_group_members_total / yuzu_server_management_groups_total
 yuzu_server_management_groups_total == 0
 ```
 
+## RBAC store metrics (authorization substrate, ADR-0041)
+
+The `RbacStore` — the PostgreSQL authorization substrate (schema `rbac_store`)
+that backs `require_permission` / `require_scoped_permission` /
+`authorize_list_read` — exports two counters. Authorization reads **fail closed
+(deny-on-degrade)**: when the store cannot answer, it **denies** rather than
+allowing, so a degrade is a **fleet-wide authorization-availability event**, not
+a silent partial outage.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `yuzu_server_rbac_read_degrade_total` | counter | `reason` | An authorization read could not resolve against `rbac_store` and therefore **denied**. `reason` ∈ `pool_acquire_timeout` (no PG connection available in time), `query_error` (the authz query failed), `generation_refresh_failed` (the durable cross-replica cache-coherence token could not be re-read — treated as "assume changed", cache cleared). A non-zero rate means callers are being denied because the substrate is unhealthy. |
+| `yuzu_server_rbac_backfill_total` | counter | `result` | Outcome of the one-time legacy-`rbac.db` → PostgreSQL backfill at boot. `result` ∈ `fresh` (empty legacy store — nothing to migrate), `completed` (backfill reconciled and committed), `failed` (backfill could not complete — the server **fails the boot closed** and retries on the next start). |
+
+**Example output:**
+
+```
+# HELP yuzu_server_rbac_read_degrade_total RBAC authorization reads that denied due to a store degrade
+# TYPE yuzu_server_rbac_read_degrade_total counter
+yuzu_server_rbac_read_degrade_total{reason="pool_acquire_timeout"} 0
+yuzu_server_rbac_read_degrade_total{reason="query_error"} 0
+yuzu_server_rbac_read_degrade_total{reason="generation_refresh_failed"} 0
+
+# HELP yuzu_server_rbac_backfill_total Outcome of the RbacStore Postgres backfill at boot
+# TYPE yuzu_server_rbac_backfill_total counter
+yuzu_server_rbac_backfill_total{result="completed"} 1
+```
+
+**Suggested alert (a degrade denies authz fleet-wide):**
+
+```promql
+# Any RBAC read degrade is a fleet-wide authorization-availability event:
+# every affected call is being DENIED because the store cannot answer.
+sum(rate(yuzu_server_rbac_read_degrade_total[5m])) by (reason) > 0
+```
+
+The shipped rule is `YuzuRbacReadDegraded` (plus the optional
+`YuzuRbacBackfillFailing`) in `docs/prometheus/yuzu-alerts.yml`.
+
 ## Useful PromQL queries
 
 ### Fleet overview

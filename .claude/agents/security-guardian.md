@@ -89,9 +89,12 @@ new kind of actor:
   fallback — and prove allow/deny/step-up at each. **List/fan-out reads
   of per-agent data are a DISTINCT chokepoint** — they MUST use the
   admit-then-filter `authorize_list_read` (World A, ADR-0017), never a
-  bare global `require_permission` (inert for a confined operator, fails
-  *open* on a corrupt `rbac.db`); a carve-out that gets single-target
-  checks right but leaks a fleet-wide list is the same failure as #2202.
+  bare global `require_permission` (inert for a confined operator — the
+  World A gap; the `rbac_store` substrate itself now DENIES on any
+  degrade — PostgreSQL, deny-on-degrade, ADR-0041 — so the residual risk
+  is fleet-wide *disclosure* to a global-permission holder, no longer a
+  fail-*open* on a corrupt/degraded store); a carve-out that gets
+  single-target checks right but leaks a fleet-wide list is the same failure as #2202.
   A carve-out on only the new routes (or only where a sibling guard
   already sits) is the #2202 gap. Grep the chokepoints (incl.
   `authorize_list_read`/`require_list_read`).

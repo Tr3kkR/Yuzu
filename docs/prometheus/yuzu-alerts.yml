@@ -143,6 +143,57 @@ groups:
             the proxy. Diagnose via the throttled [ADR-1005] warn lines.
           runbook_url: "https://docs.yuzu.io/runbooks/onbehalf-rejected"
 
+      - alert: YuzuRbacReadDegraded
+        # An authorization read against the PostgreSQL rbac_store (ADR-0041)
+        # could not resolve and therefore DENIED (reads fail closed —
+        # deny-on-degrade). Because require_permission / authorize_list_read all
+        # route through this store, a degrade denies authorization FLEET-WIDE —
+        # it is an availability event, not a silent partial outage. /readyz stays
+        # green under pure pool saturation (it trips only on connection failure,
+        # to avoid false LB evictions), so this is otherwise dashboard-invisible.
+        # reason = pool_acquire_timeout | query_error | generation_refresh_failed.
+        expr: |
+          sum(rate(yuzu_server_rbac_read_degrade_total[5m])) by (reason) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RBAC authorization reads degrading — callers being denied ({{ $labels.reason }})"
+          description: >-
+            yuzu_server_rbac_read_degrade_total{reason="{{ $labels.reason }}"} is
+            non-zero: authorization reads against the PostgreSQL rbac_store are
+            failing and therefore DENYING (fail-closed / deny-on-degrade,
+            ADR-0041). Because require_permission / require_scoped_permission /
+            authorize_list_read all resolve through this store, operators and
+            agentic callers are being denied fleet-wide. pool_acquire_timeout /
+            query_error correlate with yuzu_pg_* saturation or outage;
+            generation_refresh_failed means the cross-replica cache-coherence
+            token could not be re-read. Check Postgres availability and the
+            server RbacStore warnings. See docs/auth-architecture.md
+            "RbacStore — the authorization substrate".
+          runbook_url: "https://docs.yuzu.io/runbooks/rbac-read-degraded"
+
+      - alert: YuzuRbacBackfillFailing
+        # The one-time legacy-rbac.db -> PostgreSQL backfill at boot could not
+        # complete. The server fails the boot CLOSED and retries on next start,
+        # so this pairs with a server that will not come up — surfaced here for
+        # the case where a scrape catches the failed counter before exit.
+        expr: |
+          increase(yuzu_server_rbac_backfill_total{result="failed"}[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "RBAC store Postgres backfill failed — server refusing to boot"
+          description: >-
+            yuzu_server_rbac_backfill_total{result="failed"} moved: the
+            RbacStore migration backfill (legacy rbac.db -> PostgreSQL rbac_store,
+            ADR-0041) could not reconcile/commit, so the server fails the boot
+            closed rather than running on a partial authorization config. It
+            retries on the next start. Check Postgres availability, the
+            rbac_store schema, and the presence/readability of the legacy
+            rbac.db backfill source in the server log.
+          runbook_url: "https://docs.yuzu.io/runbooks/rbac-read-degraded"
+
   - name: yuzu-mcp
     rules:
       - alert: YuzuMcpProgressBridgeAtCapacity

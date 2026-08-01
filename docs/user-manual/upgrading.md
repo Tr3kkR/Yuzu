@@ -315,17 +315,22 @@ collision check above). At boot, the server now scans for any pre-existing
 it finds one — silently coexisting with (or being shadowed by) a real engine
 principal is not an acceptable outcome, so this fails closed rather than
 booting into an ambiguous state (decision log #3). Before upgrading, run
-against both stores. Note they live on different substrates: local users are in
-Postgres (`auth.users`), while local RBAC groups are still SQLite (`rbac.db`):
+against both stores.
+
+> **Superseded by the RbacStore → PostgreSQL migration (ADR-0041):** the
+> per-node `sqlite3 rbac.db` query below is a HISTORICAL artifact from the era
+> when local RBAC groups were SQLite. RBAC config is now a **single shared
+> PostgreSQL** `rbac_store` schema, so run **one** `psql` query, **not**
+> per-node `sqlite3`. Both queries below target Postgres:
 
 ```bash
 # Local users — Postgres.
 psql "$YUZU_POSTGRES_DSN" -c \
   "SELECT username FROM auth.users WHERE username LIKE 'engine:%';"
 
-# Local RBAC groups — SQLite, per-node. Run on every node.
-sqlite3 /var/lib/yuzu/rbac.db \
-  "SELECT name FROM groups WHERE source = 'local' AND name LIKE 'engine:%';"
+# Local RBAC groups — PostgreSQL (shared; one query, not per-node — ADR-0041).
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT name FROM rbac_store.groups WHERE source = 'local' AND name LIKE 'engine:%';"
 ```
 
 If either query returns rows, rename or remove those users/groups **before**
@@ -466,6 +471,61 @@ What to expect / do:
 - **Back up `<ca-dir>/default-ca.key` (0600) and the new `ca.db`** in `--data-dir`
   — losing the CA key forces a full fleet re-enrollment.
 - Relocate the cert directory with `--ca-dir` (e.g. a dedicated container volume).
+
+## RBAC store moves to PostgreSQL — config preserved by mandatory backfill (RbacStore → Postgres, ADR-0041)
+
+`RbacStore` — the authorization substrate holding **role definitions,
+role→permission grants, principal→role assignments, RBAC groups + membership,
+and the global `rbac_enabled` flag** — moves from the SQLite `rbac.db` file to
+the server's PostgreSQL substrate in this release (ADR-0041, Wave 2.1), schema
+`rbac_store`. **Unlike the AuthDB/ScimStore cutover below, this is NOT a
+fresh-start reset — your RBAC configuration is preserved by a mandatory
+backfill.** No new flag or environment variable is added (it reuses the shared
+server `PgPool`).
+
+**What happens on first PG boot:**
+
+- A one-time, idempotent, **fail-closed** backfill copies every role, grant,
+  group, and membership out of the legacy `rbac.db` into `rbac_store`. Operator
+  edits to seeded permissions are preserved. The backfill reconciles counts
+  (roles + grants + groups + members) and **refuses the completion marker on any
+  shortfall** — if it cannot complete, the server **fails the boot closed** and
+  retries on the next start (it never boots on a partial authorization config).
+- **CRITICAL — the `rbac_enabled` flag is preserved and read-back-verified.** It
+  is migrated first, so an operator who had RBAC **enabled** stays enabled after
+  upgrade. (Losing this flag would silently boot the fleet RBAC-**off**, making
+  every confined operator fleet-wide-authorized — the migration is engineered
+  specifically to prevent that.) An unreadable durable flag also refuses boot.
+- The legacy `rbac.db` file is **moved aside** only after the backfill is
+  verified. It is never read again; keep the moved-aside copy until you have
+  confirmed RBAC behaves as expected, then remove it.
+
+**What to expect / do:**
+
+- **Widened startup budget on large RBAC datasets.** A fleet with many custom
+  roles / grants / groups will see a longer first-boot while the backfill
+  streams; this is one-time. Budget for it in the maintenance window and do not
+  kill the server mid-backfill (it is resumable, but let it finish).
+- **Reads now FAIL CLOSED (deny-on-degrade).** A degraded or unreachable
+  `rbac_store` (pool-acquire timeout, query error) now **denies** authorization
+  rather than falling through to an allow — this **closes** the prior
+  "corrupt `rbac.db` fails open" behavior. Watch the new
+  `yuzu_server_rbac_read_degrade_total` metric and the `YuzuRbacReadDegraded`
+  alert after upgrade; a degrade denies authz fleet-wide.
+- **Multi-replica staleness caveat.** If you run multiple server replicas, a
+  role/permission/enabled-flag change on one replica is visible on the others
+  within a bounded **~1 s** window (a durable generation token, refreshed at most
+  once per second). A revoke is therefore not strictly instantaneous
+  cross-replica — well inside the fleet's existing revocation-latency envelope
+  (heartbeat + session/token TTLs measured in minutes), and an accepted residual
+  risk (`LISTEN/NOTIFY` is the named follow-up).
+- Confirm on first boot: the backfill completion log line, no `RbacStore`
+  open/migrate errors, and that RBAC is still enabled if you had enabled it
+  (Settings → RBAC, or check that confined operators still see only their
+  scoped fleet).
+
+See `docs/auth-architecture.md` § "RbacStore — the authorization substrate" and
+[ADR-0041](../adr/0041-rbac-store-postgres-migration.md) for the full design.
 
 ## ⚠️ Breaking: local accounts + MFA enrolments reset (AuthDB/ScimStore → Postgres, ADR-0006)
 
