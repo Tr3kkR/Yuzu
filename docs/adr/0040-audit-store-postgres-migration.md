@@ -111,6 +111,21 @@ lease makes "N × 25k" impossible), so the calibration stays valid.
 durable fact folded into the same `audit_retention_meta` state, so it is not lost when a
 different replica runs the first post-boot pass.
 
+**Deliberate dedup-semantics change (multi-process correctness).** The SQLite guard had an
+`is_event` exemption: a clock *movement* (a `Step`, or a `BadState` accompanied by a clock event)
+re-reported **every** pass even against an identical prior report, because in a single process a
+second movement is a genuinely new incident. That exemption does NOT port: with the dedup state
+now **durable and shared across replicas**, "always re-report an event" would make each of N
+processes re-announce the *same* incident every tick — double-counting an anomaly rather than
+deduplicating it. The PG guard therefore uses the ResponseStore fact-set model uniformly: report
+once per distinct serialized `Facts` set, stand down when it clears. The catastrophic protection
+is fully preserved — the dead-CMOS-then-NTP sequence flips `would_wipe`, which is a *different*
+fact set, so it still reports (the failure the original `is_event` logic was added to stop was an
+enum-collapse comparison, which the whole-fact-set string never had). The only thing lost is a
+second *identical-magnitude* clock step re-emitting `clock_anomaly_skips`; that is an
+alerting-granularity trade accepted in exchange for correct cross-replica deduplication, and is
+called out here for the consistency/security gates.
+
 ### Untrusted byte columns (UTF-8 + NUL)
 
 `detail`, `user_agent`, `source_ip`, `principal`, `session_id` and friends are client- or
