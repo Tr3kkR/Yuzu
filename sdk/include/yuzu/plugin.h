@@ -137,7 +137,13 @@ typedef struct {
  * The struct must remain valid for the lifetime of the plugin (i.e. static).
  */
 typedef struct {
-    /** Must equal YUZU_PLUGIN_ABI_VERSION. Checked at load time. */
+    /**
+     * Must lie within [YUZU_PLUGIN_ABI_VERSION_MIN, YUZU_PLUGIN_ABI_VERSION]
+     * (checked at load time — PluginHandle::load(), plugin_loader.cpp).
+     * Set this to YUZU_PLUGIN_ABI_VERSION when building against the current
+     * SDK; a plugin built against an older ABI within the range keeps
+     * loading, per the append-only convention above.
+     */
     uint32_t abi_version;
 
     /** Short unique identifier (e.g. "inventory", "patch"). */
@@ -277,11 +283,16 @@ YUZU_EXPORT void yuzu_ctx_report_progress(YuzuCommandContext* ctx, int percent);
  * overwrites the earlier one.
  *
  * @param ctx           Command context passed into execute().
- * @param status        Typed outcome; see YuzuResultStatus.
+ * @param status        Typed outcome; see YuzuResultStatus. A value outside
+ *                      YuzuResultStatus's declared range is stored as
+ *                      YUZU_RESULT_STATUS_UNDECLARED rather than kept raw.
  * @param completeness  How complete the result is; see YuzuResultCompleteness.
  * @param provenance    Optional short string identifying the source of the
  *                      status (e.g. a mechanism or sub-component name).
- *                      NULL if not applicable.
+ *                      NULL if not applicable. The host copies this string
+ *                      synchronously before the call returns — the plugin
+ *                      does not need to keep the pointed-to memory alive
+ *                      past this call.
  */
 YUZU_EXPORT void yuzu_ctx_set_result_status(YuzuCommandContext* ctx, YuzuResultStatus status,
                                             YuzuResultCompleteness completeness,

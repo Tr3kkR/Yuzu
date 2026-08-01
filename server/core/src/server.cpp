@@ -7479,8 +7479,13 @@ private:
                 // AND the underlying instr_db_pool_ explicitly, so a
                 // pool-open failure surfaces as /readyz=503 rather than a
                 // silent no-op on every response.
-                {"execution_tracker",
-                 execution_tracker_ != nullptr && instr_db_pool_ && instr_db_pool_->is_open()},
+                // gov B-1: ALSO probe schema_ok(). The store shares this pool,
+                // so a FAILED MIGRATION leaves the pool open and this row green
+                // while every execution-status write fails against a missing
+                // column — every execution wedged at `dispatched`, /readyz ready.
+                {"execution_tracker", execution_tracker_ != nullptr && instr_db_pool_ &&
+                                          instr_db_pool_->is_open() &&
+                                          execution_tracker_->schema_ok()},
                 // gov R3 HC-1: FleetTopologyStore became load-bearing for
                 // /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology.
                 // Pure in-memory store with no is_open(); pointer-not-null is

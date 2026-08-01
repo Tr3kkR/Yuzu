@@ -22,6 +22,7 @@
  */
 
 #include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/agent/updater.hpp> // current_executable_path() — exe-relative fixture lookup (BR-007)
 #include <yuzu/plugin.h>
 
 #include <catch2/catch_test_macros.hpp>
@@ -58,6 +59,18 @@ namespace yuzu::agent {
 // CC-07 declared-vs-observable fallback pulled out of execute_command_task
 // specifically so this suite can pin its behavior without a live gRPC stream.
 YuzuResultStatus derive_effective_result_status(YuzuResultStatus reported, int rc);
+
+// cpp-expert A4 test seam, defined in agent.cpp right after
+// dispatch_with_capture: drives `status` through the REAL
+// yuzu_ctx_set_result_status() entry point and returns the RAW value stored
+// afterward — see the mutation-bound test below for why this must be the
+// raw stored value, not a proto mapping or a return code.
+YuzuResultStatus set_result_status_and_read_back(YuzuResultStatus status);
+
+// plugin B2 test seam, defined in agents/core/src/plugin_loader.cpp
+// immediately above PluginHandle::load(): the single source of truth for
+// gating action_descriptor_count to ABI v4+ descriptors.
+std::size_t gated_action_descriptor_count(const YuzuPluginDescriptor* desc);
 } // namespace yuzu::agent
 
 namespace {
@@ -86,6 +99,17 @@ fs::path find_abi3_fixture() {
     const std::string lib_name = std::string{"abi3_fixture_plugin"} + kPluginExt;
 
     std::vector<fs::path> candidates;
+    // BR-007: the fixture is built into the SAME directory as this test exe
+    // (<builddir>/tests/), so an exe-relative lookup resolves under ANY
+    // invocation — `meson test` (which sets MESON_BUILD_ROOT and cwd), a direct
+    // run, AND scripts/run-tests.sh (the standing Darwin gate, which runs the
+    // binary from the source root with neither set). Tried first for that reason.
+    {
+        std::error_code ec;
+        auto exe = yuzu::agent::current_executable_path();
+        if (!exe.empty())
+            candidates.emplace_back(exe.parent_path() / lib_name);
+    }
     if (auto* build_root = std::getenv("MESON_BUILD_ROOT")) {
         candidates.emplace_back(fs::path{build_root} / "tests" / lib_name);
     }
@@ -200,6 +224,29 @@ TEST_CASE("yuzu_ctx_set_result_status: null context is a safe no-op",
     SUCCEED("no crash");
 }
 
+// cpp-expert A4: an out-of-range status crosses the C ABI from a third-party
+// plugin as a bare int, with nothing upstream guaranteeing it names one of
+// the five declared enumerators. This MUST be observed via the RAW stored
+// value (set_result_status_and_read_back(), agent.cpp), never via
+// to_proto_result_status() or a return code: that switch already falls
+// through any unmatched value to PLUGIN_RESULT_UNDECLARED regardless of
+// whether the clamp below exists, so a proto-level assertion is a false
+// green that would pass identically whether or not the clamp is reverted —
+// exactly the false-green class this run exists to bounce.
+TEST_CASE("yuzu_ctx_set_result_status: out-of-range status clamps to UNDECLARED (raw stored value)",
+         "[capability][cc07]") {
+    CHECK(yuzu::agent::set_result_status_and_read_back(static_cast<YuzuResultStatus>(99)) ==
+          YUZU_RESULT_STATUS_UNDECLARED);
+    CHECK(yuzu::agent::set_result_status_and_read_back(static_cast<YuzuResultStatus>(-1)) ==
+          YUZU_RESULT_STATUS_UNDECLARED);
+    // In-range values must still pass through unchanged — the clamp must not
+    // over-reach and rewrite legitimate reports.
+    CHECK(yuzu::agent::set_result_status_and_read_back(YUZU_RESULT_STATUS_CONSTRAINED) ==
+          YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(yuzu::agent::set_result_status_and_read_back(YUZU_RESULT_STATUS_OK) ==
+          YUZU_RESULT_STATUS_OK);
+}
+
 // ── REAL ABI3 backward compatibility (frozen old-layout fixture) ───────────
 
 TEST_CASE("ABI3 fixture: real old-layout plugin loads and its int-only execute() works",
@@ -242,6 +289,22 @@ TEST_CASE("ABI3 fixture: real old-layout plugin loads and its int-only execute()
         CHECK(d->abi_version <= YUZU_PLUGIN_ABI_VERSION);
     }
 
+    // plugin B2(a): sdk_version is the field immediately BEFORE the ABI4
+    // append point (action_descriptors/action_descriptor_count) in the
+    // CURRENT sdk/include/yuzu/plugin.h struct. The ABI3 fixture is compiled
+    // against the FROZEN tests/fixtures/abi3/plugin_abi3.h layout, which
+    // simply ends at sdk_version — nothing is appended there. `d` above is
+    // typed as the CURRENT (wider) YuzuPluginDescriptor, so reading
+    // d->sdk_version back through it proves the append-only convention
+    // actually holds for the field adjacent to the append: its byte offset
+    // is identical in both layouts, so the value the ABI3 fixture set
+    // (YUZU_PLUGIN_SDK_VERSION, frozen at "0.1.0" in plugin_abi3.h) reads
+    // back correctly through the wider view.
+    SECTION("sdk_version (field adjacent to the ABI4 append) reads correctly through the wider view") {
+        REQUIRE(d->sdk_version != nullptr);
+        CHECK(std::string_view{d->sdk_version} == "0.1.0");
+    }
+
     SECTION("int-only execute() path works end to end") {
         REQUIRE(d->execute != nullptr);
         int rc_ok = d->execute(nullptr, "ping", nullptr, 0);
@@ -281,4 +344,57 @@ TEST_CASE("ABI3 fixture: PluginHandle::load() (production loader) accepts it",
 
     REQUIRE(d->execute != nullptr);
     CHECK(d->execute(nullptr, "ping", nullptr, 0) == 0);
+}
+
+// plugin B2(b): the REAL hazard is not a display nit, it is memory safety —
+// action_descriptors/action_descriptor_count do not exist at all in the
+// fixture's actual ABI3-frozen allocation (tests/fixtures/abi3/
+// plugin_abi3.h ends at sdk_version), so a consumer that reads
+// action_descriptor_count off this descriptor without the ABI gate reads
+// past the end of the real object. gated_action_descriptor_count()
+// (agents/core/src/plugin_loader.cpp, called from PluginHandle::load()'s
+// diagnostic log line) is the single place that gate lives — this test
+// binds it directly through the production loader path.
+TEST_CASE("plugin B2: ABI3 descriptor yields action_descriptor_count 0 through the loader's gate",
+         "[capability][abi3][loader]") {
+    auto fixture_path = find_abi3_fixture();
+    if (fixture_path.empty()) {
+        FAIL("abi3_fixture_plugin" << kPluginExt
+                                   << " not found under tests/ — see the earlier test case's "
+                                      "message.");
+    }
+
+    auto result = yuzu::agent::PluginHandle::load(fixture_path);
+    REQUIRE(result.has_value());
+
+    const YuzuPluginDescriptor* d = result->descriptor();
+    REQUIRE(d != nullptr);
+    REQUIRE(d->abi_version == 3);
+
+    CHECK(yuzu::agent::gated_action_descriptor_count(d) == 0);
+}
+
+// plugin B2, deterministic complement to the test above: whether reading
+// action_descriptor_count off the REAL frozen ABI3 fixture past its actual
+// (shorter) allocation happens to come back as 0 or as garbage depends on
+// whatever bytes the linker placed after that fixture's static descriptor —
+// undefined behavior, not a reliable mutation signal (confirmed empirically:
+// mutating the loader's gate from >= 4 to >= 3 did NOT flip the test above on
+// this build, because the trailing memory happened to read back zero anyway).
+// This test isolates the gate's pure decision logic instead: a fully
+// in-bounds, fully-populated ABI4-shaped descriptor whose abi_version field
+// alone claims "3", carrying a deliberately nonzero, fully-owned
+// action_descriptor_count sentinel. No out-of-bounds read is possible either
+// way, so the ONLY thing this can be testing is the abi_version comparison —
+// a broken gate reads back the controlled sentinel (42) instead of 0,
+// unconditionally, regardless of struct-layout happenstance.
+TEST_CASE("plugin B2: gated_action_descriptor_count ignores a populated count when abi_version < 4",
+         "[capability][abi3][loader]") {
+    const YuzuActionDescriptor sentinel_descriptors[1] = {};
+    YuzuPluginDescriptor d{};
+    d.abi_version = 3; // claims ABI3 even though this struct is fully ABI4-sized
+    d.action_descriptors = sentinel_descriptors;
+    d.action_descriptor_count = 42; // nonzero, fully in-bounds — never UB to read
+
+    CHECK(yuzu::agent::gated_action_descriptor_count(&d) == 0);
 }

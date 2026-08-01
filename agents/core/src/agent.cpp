@@ -348,7 +348,11 @@ pb::CommandResponse::PluginResultStatus to_proto_result_status(YuzuResultStatus 
 // uses for local_dispatcher.cpp) so
 // tests/unit/test_capability_descriptor.cpp can pin the declared-vs-observable
 // honesty contract directly, without needing a live gRPC stream.
-YuzuResultStatus derive_effective_result_status(YuzuResultStatus reported, int rc) {
+// YUZU_EXPORT (default visibility): agents/core builds -fvisibility=hidden, and
+// unlike dispatch_with_capture (called only within this dylib) this helper is
+// linked from the separate yuzu_agent_tests binary, so it must be exported. The
+// mangled C++ name is not part of the extern "C" plugin ABI.
+YUZU_EXPORT YuzuResultStatus derive_effective_result_status(YuzuResultStatus reported, int rc) {
     if (reported != YUZU_RESULT_STATUS_UNDECLARED)
         return reported;
     return (rc == 0) ? YUZU_RESULT_STATUS_OK : YUZU_RESULT_STATUS_UNAVAILABLE;
@@ -385,6 +389,23 @@ int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* ac
     return rc;
 }
 
+// cpp-expert A4 test seam (no public header — same convention as
+// derive_effective_result_status/dispatch_with_capture above): drives a
+// status value through the REAL yuzu_ctx_set_result_status() entry point
+// against a throwaway CommandContextImpl, then returns whatever ended up
+// stored in impl->result_status. tests/unit/test_capability_descriptor.cpp
+// forward-declares this to observe the RAW stored value the clamp above
+// writes — to_proto_result_status's switch already falls through any
+// unmatched value to PLUGIN_RESULT_UNDECLARED, so a proto-level assertion
+// cannot tell a clamped UNDECLARED(0) apart from an unclamped out-of-range
+// raw status; this seam can.
+YUZU_EXPORT YuzuResultStatus set_result_status_and_read_back(YuzuResultStatus status) {
+    CommandContextImpl ctx_impl{};
+    auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
+    yuzu_ctx_set_result_status(raw_ctx, status, YUZU_RESULT_COMPLETENESS_UNKNOWN, nullptr);
+    return ctx_impl.result_status;
+}
+
 // C ABI context function implementations
 
 extern "C" {
@@ -407,6 +428,23 @@ YUZU_EXPORT void yuzu_ctx_set_result_status(YuzuCommandContext* ctx, YuzuResultS
     if (!ctx)
         return;
     auto* impl = reinterpret_cast<CommandContextImpl*>(ctx);
+    // cpp-expert A4: `status` crosses the C ABI from a third-party plugin as
+    // a bare int — nothing upstream guarantees it is one of the five
+    // declared YuzuResultStatus enumerators. to_proto_result_status()
+    // (above) already maps any unmatched value to PLUGIN_RESULT_UNDECLARED
+    // on the WIRE, but that alone leaves the RAW out-of-range value sitting
+    // in result_status forever (logged, compared, read by any future
+    // consumer of the stored field). Clamp at the source instead. Compare
+    // in `int` explicitly: YuzuResultStatus is an unscoped C enum whose
+    // underlying type is implementation-defined and may be unsigned (every
+    // declared enumerator is non-negative), which would make a direct
+    // `status < YUZU_RESULT_STATUS_UNDECLARED` silently unreachable on some
+    // compilers/ABIs.
+    const int raw_status = static_cast<int>(status);
+    if (raw_status < static_cast<int>(YUZU_RESULT_STATUS_UNDECLARED) ||
+        raw_status > static_cast<int>(YUZU_RESULT_STATUS_CONSTRAINED)) {
+        status = YUZU_RESULT_STATUS_UNDECLARED;
+    }
     impl->result_status = status;
     impl->result_completeness = completeness;
     impl->result_provenance = provenance ? provenance : "";
@@ -2990,14 +3028,11 @@ private:
             stream->Write(timing_resp, grpc::WriteOptions());
         }
 
-        // CC-07: the plugin's typed status if it called yuzu_ctx_set_result_status(),
-        // else derive a coarse one from the int return code alone — the same
-        // fallback an ABI<4 plugin (no such call exists) gets by construction.
-        // This declared-vs-observable distinction is deliberate: a plugin that
-        // never reports a typed status gets an HONEST derivation, not a
-        // fabricated "declared" one. See derive_effective_result_status() above
-        // — pulled out to its own function so the fallback logic is unit-tested
-        // directly (tests/unit/test_capability_descriptor.cpp).
+        // CC-07 log presentation: a coarse "effective" status derived from the
+        // plugin's report (or the int rc when it never reported) is convenient
+        // for the operator log line below. It is a READ-TIME/PRESENTATION
+        // derivation ONLY — see derive_effective_result_status(), unit-tested in
+        // tests/unit/test_capability_descriptor.cpp.
         YuzuResultStatus effective_result_status =
             derive_effective_result_status(ctx_impl.result_status, rc);
 
@@ -3005,8 +3040,8 @@ private:
         // terminal status has been sent — otherwise the dispatch firewall's
         // catch would send a second terminal status (FAILURE after SUCCESS) for
         // the same command_id (#2037 hardening).
-        spdlog::info("Command {} finished (rc={}, exec={}ms, result_status={}, completeness={}, "
-                     "provenance={})",
+        spdlog::info("Command {} finished (rc={}, exec={}ms, effective_result_status={}, "
+                     "completeness={}, provenance={})",
                      cmd.command_id(), rc, exec_ms, static_cast<int>(effective_result_status),
                      static_cast<int>(ctx_impl.result_completeness), ctx_impl.result_provenance);
 
@@ -3017,7 +3052,14 @@ private:
             final_resp.set_status(rc == 0 ? pb::CommandResponse::SUCCESS
                                           : pb::CommandResponse::FAILURE);
             final_resp.set_exit_code(rc);
-            final_resp.set_plugin_result_status(to_proto_result_status(effective_result_status));
+            // BR-006: serialize the RAW reported status, never the rc-derived
+            // one. agent.proto pins 0/UNDECLARED as "the plugin never called
+            // yuzu_ctx_set_result_status() (including every ABI<4 plugin)", so
+            // deriving OK/UNAVAILABLE here would violate the wire contract and
+            // erase the declared-vs-inferred distinction — and the pass/fail
+            // outcome is already carried by status + exit_code. Consumers that
+            // want a coarse status derive it at read time.
+            final_resp.set_plugin_result_status(to_proto_result_status(ctx_impl.result_status));
 
             auto now_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(
                                  std::chrono::system_clock::now().time_since_epoch())

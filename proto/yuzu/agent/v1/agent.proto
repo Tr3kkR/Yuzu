@@ -216,7 +216,7 @@ message CommandResponse {
   bytes  payload = 9;
 
   // CC-07 plugin→host typed result-status seam (ABI4, sdk/include/yuzu/plugin.h).
-  // Populated from the agent-side YuzuExecuteResult the plugin reports via
+  // Populated from the agent-side YuzuResultStatus the plugin reports via
   // yuzu_ctx_set_result_status() during execute(); PLUGIN_RESULT_UNDECLARED
   // (the zero value) means the plugin never called it — either an ABI<4
   // plugin (int-only execute()) or an ABI4 plugin that didn't report a typed

@@ -32,6 +32,13 @@
 # baseline lives here (not a separate tracked file) so there is exactly one
 # place to update when the discovered plugin set changes or a plugin adopts
 # the descriptor.
+#
+# build-ci B1: -Dbuild_examples=false is a supported, default-true option
+# that skips every agents/plugins/*/ subdir (and, matching that, the
+# tools/capmatrix-gen subdir — see meson.build). With no plugins and no
+# generator built, this gate has nothing to check; it queries the build
+# directory's own build_examples value below and skips rather than hard-
+# failing on an artifact that was never supposed to exist.
 set -euo pipefail
 
 # Every discovered plugin is undeclared today (none has adopted the ABI4
@@ -61,7 +68,40 @@ case "$(uname -s)" in
 esac
 
 capmatrix_gen="$BUILDDIR/tools/capmatrix-gen/capmatrix-gen"
+
+# build-ci B1: -Dbuild_examples=false means no plugin subdirs and no
+# capmatrix-gen were configured (meson.build gates both on it) — that is a
+# supported build, not drift. Only introspect the build directory's
+# build_examples option when the expected generator binary is absent —
+# fixture repos (tests/shell/test_capability_matrix_gate.sh) and other
+# callers that already provide capmatrix_gen supply no Meson build metadata
+# at all, so unconditionally introspecting would hard-fail them for no
+# reason.
 if [ ! -x "$capmatrix_gen" ]; then
+  if ! command -v meson >/dev/null 2>&1; then
+    echo "::error::meson is required (already a hard build dependency) but was not found on PATH." >&2
+    exit 2
+  fi
+
+  build_examples="$(meson introspect --buildoptions "$BUILDDIR" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    opts = json.load(sys.stdin)
+except Exception:
+    print("unknown")
+    sys.exit(0)
+for opt in opts:
+    if opt.get("name") == "build_examples":
+        print("true" if opt.get("value") else "false")
+        sys.exit(0)
+print("unknown")
+')"
+
+  if [ "$build_examples" = "false" ]; then
+    echo "check-capability-matrix: SKIP — build_examples=false (no plugins configured, nothing to check)"
+    exit 0
+  fi
+
   echo "::error::capmatrix-gen binary not found/executable at $capmatrix_gen — did the Build step run first?" >&2
   exit 1
 fi
@@ -137,8 +177,15 @@ if (( current_count > RATCHET_BASELINE_UNDECLARED )); then
 fi
 
 if (( current_count < RATCHET_BASELINE_UNDECLARED )); then
-  echo "Undeclared-plugin count improved ($RATCHET_BASELINE_UNDECLARED -> $current_count) —" \
-       "lower RATCHET_BASELINE_UNDECLARED in this script to $current_count to tighten the ratchet."
+  # CDX-P2-006/K-25: the ratchet must be MONOTONIC. An improvement that does not
+  # also lower the baseline leaves room for a later regression back UP to the
+  # old baseline to pass. Require the adoption PR that reduces the count to lower
+  # RATCHET_BASELINE_UNDECLARED in the SAME change, so the gain is sticky.
+  echo "::error::undeclared-plugin count improved ($RATCHET_BASELINE_UNDECLARED -> $current_count)" >&2
+  echo "::error::but RATCHET_BASELINE_UNDECLARED was not lowered to match — the ratchet would not be" >&2
+  echo "::error::sticky (a later regression back to $RATCHET_BASELINE_UNDECLARED would pass). Lower" >&2
+  echo "::error::RATCHET_BASELINE_UNDECLARED to $current_count in THIS PR." >&2
+  exit 1
 fi
 
 echo "check-capability-matrix: OK (generated block matches; undeclared=$current_count," \

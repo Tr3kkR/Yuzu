@@ -1,4 +1,6 @@
 #include "execution_tracker.hpp"
+
+#include "sqlite_raii.hpp" // SqliteStmt — RAII statement owner
 #include "execution_event_bus.hpp"
 #include "migration_runner.hpp"
 
@@ -131,31 +133,62 @@ void ExecutionTracker::create_tables() {
     // pre-added the column on an iterated build hits SQLITE_ERROR: duplicate
     // column name on the next ALTER, which MigrationRunner treats as failure.
     {
-        sqlite3_stmt* probe = nullptr;
+        yuzu::server::SqliteStmt probe; // RAII: finalizes on every exit
         bool col_exists = false;
         if (sqlite3_prepare_v2(db_,
                                "SELECT 1 FROM pragma_table_info('agent_exec_status') "
                                "WHERE name='plugin_result_status' LIMIT 1",
-                               -1, &probe, nullptr) == SQLITE_OK) {
-            col_exists = (sqlite3_step(probe) == SQLITE_ROW);
-            sqlite3_finalize(probe);
+                               -1, probe.addr(), nullptr) == SQLITE_OK)
+            col_exists = (sqlite3_step(probe.get()) == SQLITE_ROW);
+        // BR-012-style predecessor guard (mirrors response_store.cpp's v4
+        // probe): v1 is a single migration that creates the tables AND all
+        // four of its indexes together, so every one of them existing is the
+        // structural marker that v1 genuinely completed. CDX-P1-04: checking
+        // only idx_agent_exec_agent proved only that ONE DDL statement in the
+        // multi-statement v1 migration ran — a schema_meta=0 dev DB that
+        // somehow has the v2 column and that one index but lost, say,
+        // idx_executions_status to hand-rolled schema surgery would still
+        // stamp straight to v2 and permanently skip re-creating the missing
+        // index. Requiring ALL FOUR keeps the stamped version monotonic with
+        // the schema actually applied; if the state really is inconsistent,
+        // MigrationRunner::run() below fails loudly instead (schema_ok() =
+        // false) rather than skipping silently.
+        bool idx_exists = true;
+        for (const char* idx_name : {"idx_executions_status", "idx_agent_exec_agent",
+                                     "idx_executions_dispatched", "idx_executions_definition"}) {
+            yuzu::server::SqliteStmt idx_probe; // RAII: finalizes on every exit
+            bool one_exists = false;
+            if (sqlite3_prepare_v2(db_,
+                                   "SELECT 1 FROM sqlite_master WHERE type='index' "
+                                   "AND name=? LIMIT 1",
+                                   -1, idx_probe.addr(), nullptr) == SQLITE_OK) {
+                sqlite3_bind_text(idx_probe.get(), 1, idx_name, -1, SQLITE_STATIC);
+                one_exists = (sqlite3_step(idx_probe.get()) == SQLITE_ROW);
+            }
+            idx_exists = idx_exists && one_exists;
         }
         int current_v = MigrationRunner::current_version(db_, "execution_tracker");
-        if (col_exists && current_v < 2) {
-            sqlite3_stmt* stamp = nullptr;
+        if (col_exists && idx_exists && current_v < 2) {
+            yuzu::server::SqliteStmt stamp; // RAII: finalizes on every exit
             if (sqlite3_prepare_v2(db_,
                                    "INSERT OR REPLACE INTO schema_meta "
                                    "(store, version, upgraded_at) VALUES (?, 2, ?)",
-                                   -1, &stamp, nullptr) == SQLITE_OK) {
-                sqlite3_bind_text(stamp, 1, "execution_tracker", -1, SQLITE_STATIC);
-                sqlite3_bind_int64(stamp, 2, now_epoch());
-                sqlite3_step(stamp);
-                sqlite3_finalize(stamp);
+                                   -1, stamp.addr(), nullptr) == SQLITE_OK) {
+                sqlite3_bind_text(stamp.get(), 1, "execution_tracker", -1, SQLITE_STATIC);
+                sqlite3_bind_int64(stamp.get(), 2, now_epoch());
+                sqlite3_step(stamp.get());
             }
         }
     }
     if (!MigrationRunner::run(db_, "execution_tracker", kMigrations)) {
-        spdlog::error("ExecutionTracker: schema migration failed");
+        // Record it: this store shares the instructions pool and cannot close
+        // the connection (ResponseStore owns its own, so it can). Without the
+        // flag /readyz sees an open pool and reports ready while every
+        // update_agent_status INSERT references a missing column, wedging every
+        // execution at `dispatched`. See ExecutionTracker::schema_ok().
+        migration_ok_ = false;
+        spdlog::error("ExecutionTracker: schema migration failed — store marked NOT ready; "
+                      "execution status updates will not persist");
     }
 }
 

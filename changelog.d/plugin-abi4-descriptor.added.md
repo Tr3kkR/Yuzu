@@ -6,8 +6,10 @@
   against a real frozen-layout fixture, not just a recompiled stand-in). Plugins can now also
   report a typed runtime result (ok/unavailable/permission-denied/constrained, plus
   completeness and provenance) via a new `yuzu_ctx_set_result_status()` callback instead of
-  the bare int return code; the status flows through to `CommandResponse` and is persisted
-  alongside each response and execution record. A new `tools/capmatrix-gen` host tool plus a
+  the bare int return code; the typed **status** flows through to `CommandResponse` and is
+  persisted alongside each response and execution record (completeness and provenance are
+  captured in the agent-side execution log for now — carrying them on the wire is a later
+  change). A new `tools/capmatrix-gen` host tool plus a
   CI drift gate (ratchet mode) keep `docs/os-capability-matrix.md`'s generated section honest
   against what actually built. The TAR plugin's `OsSupportStatus` is now pinned 1:1 to the new
   descriptor enum as the single source of truth for its `compatibility` action.

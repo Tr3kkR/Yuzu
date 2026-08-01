@@ -141,18 +141,17 @@ void ResponseStore::create_tables() {
         }
         int current_v = MigrationRunner::current_version(db_, "response_store");
         if (col_exists && current_v < 2) {
-            sqlite3_stmt* stamp = nullptr;
+            yuzu::server::SqliteStmt stamp; // RAII: finalizes on every exit
             if (sqlite3_prepare_v2(db_,
                                    "INSERT OR REPLACE INTO schema_meta "
                                    "(store, version, upgraded_at) VALUES (?, 2, ?)",
-                                   -1, &stamp, nullptr) == SQLITE_OK) {
+                                   -1, stamp.addr(), nullptr) == SQLITE_OK) {
                 auto now = std::chrono::duration_cast<std::chrono::seconds>(
                                std::chrono::system_clock::now().time_since_epoch())
                                .count();
-                sqlite3_bind_text(stamp, 1, "response_store", -1, SQLITE_STATIC);
-                sqlite3_bind_int64(stamp, 2, now);
-                sqlite3_step(stamp);
-                sqlite3_finalize(stamp);
+                sqlite3_bind_text(stamp.get(), 1, "response_store", -1, SQLITE_STATIC);
+                sqlite3_bind_int64(stamp.get(), 2, now);
+                sqlite3_step(stamp.get());
             }
         }
     }
@@ -174,18 +173,17 @@ void ResponseStore::create_tables() {
         }
         int current_v = MigrationRunner::current_version(db_, "response_store");
         if (col_exists && current_v < 3) {
-            sqlite3_stmt* stamp = nullptr;
+            yuzu::server::SqliteStmt stamp; // RAII: finalizes on every exit
             if (sqlite3_prepare_v2(db_,
                                    "INSERT OR REPLACE INTO schema_meta "
                                    "(store, version, upgraded_at) VALUES (?, 3, ?)",
-                                   -1, &stamp, nullptr) == SQLITE_OK) {
+                                   -1, stamp.addr(), nullptr) == SQLITE_OK) {
                 auto now = std::chrono::duration_cast<std::chrono::seconds>(
                                std::chrono::system_clock::now().time_since_epoch())
                                .count();
-                sqlite3_bind_text(stamp, 1, "response_store", -1, SQLITE_STATIC);
-                sqlite3_bind_int64(stamp, 2, now);
-                sqlite3_step(stamp);
-                sqlite3_finalize(stamp);
+                sqlite3_bind_text(stamp.get(), 1, "response_store", -1, SQLITE_STATIC);
+                sqlite3_bind_int64(stamp.get(), 2, now);
+                sqlite3_step(stamp.get());
             }
         }
     }
@@ -193,29 +191,34 @@ void ResponseStore::create_tables() {
     // pre-added plugin_result_status on an iterated build hits
     // SQLITE_ERROR: duplicate column name on the next ALTER.
     {
-        sqlite3_stmt* probe = nullptr;
-        bool col_exists = false;
-        if (sqlite3_prepare_v2(db_,
-                               "SELECT 1 FROM pragma_table_info('responses') "
-                               "WHERE name='plugin_result_status' LIMIT 1",
-                               -1, &probe, nullptr) == SQLITE_OK) {
-            col_exists = (sqlite3_step(probe) == SQLITE_ROW);
-            sqlite3_finalize(probe);
-        }
+        auto has_column = [&](const char* col) {
+            yuzu::server::SqliteStmt probe; // RAII: finalizes on every exit
+            bool exists = false;
+            std::string sql = "SELECT 1 FROM pragma_table_info('responses') WHERE name='" +
+                              std::string(col) + "' LIMIT 1";
+            if (sqlite3_prepare_v2(db_, sql.c_str(), -1, probe.addr(), nullptr) == SQLITE_OK)
+                exists = (sqlite3_step(probe.get()) == SQLITE_ROW);
+            return exists;
+        };
+        // BR-012: only stamp v4 when the v3 column (received_at_ms) is ALSO
+        // present. A dev schema with ONLY the v4 column pre-added would
+        // otherwise stamp v4 and permanently skip the v3 migration, leaving
+        // every statement that references received_at_ms broken. Requiring both
+        // keeps the stamped version monotonic with the columns actually applied.
+        bool col_exists = has_column("plugin_result_status") && has_column("received_at_ms");
         int current_v = MigrationRunner::current_version(db_, "response_store");
         if (col_exists && current_v < 4) {
-            sqlite3_stmt* stamp = nullptr;
+            yuzu::server::SqliteStmt stamp; // RAII: finalizes on every exit
             if (sqlite3_prepare_v2(db_,
                                    "INSERT OR REPLACE INTO schema_meta "
                                    "(store, version, upgraded_at) VALUES (?, 4, ?)",
-                                   -1, &stamp, nullptr) == SQLITE_OK) {
+                                   -1, stamp.addr(), nullptr) == SQLITE_OK) {
                 auto now = std::chrono::duration_cast<std::chrono::seconds>(
                                std::chrono::system_clock::now().time_since_epoch())
                                .count();
-                sqlite3_bind_text(stamp, 1, "response_store", -1, SQLITE_STATIC);
-                sqlite3_bind_int64(stamp, 2, now);
-                sqlite3_step(stamp);
-                sqlite3_finalize(stamp);
+                sqlite3_bind_text(stamp.get(), 1, "response_store", -1, SQLITE_STATIC);
+                sqlite3_bind_int64(stamp.get(), 2, now);
+                sqlite3_step(stamp.get());
             }
         }
     }

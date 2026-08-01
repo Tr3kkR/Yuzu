@@ -154,8 +154,11 @@ dlopens each built plugin's `YuzuPluginDescriptor` (ABI4,
 `sdk/include/yuzu/plugin.h`) and emits the block below from its
 `action_descriptors` array. `scripts/ci/check-capability-matrix.sh` regenerates
 and byte-diffs this block on every Linux CI leg, in **RATCHET mode**: the
-"Undeclared plugins" list may shrink as plugins adopt the descriptor but must
-never grow.
+"Undeclared plugins" count must never grow, and it is not enough for a PR to
+merely shrink it — the script exits 1 on a *lower* count too until
+`RATCHET_BASELINE_UNDECLARED` is lowered to match in the same change, so the
+adoption gain is sticky rather than leaving room for a later regression back
+up to the old baseline.
 
 This PR ships the *machinery* only — no plugin populates `action_descriptors`
 yet (that is per-plugin follow-up work; TAR unified its `OsSupportStatus`

@@ -23,15 +23,17 @@
  * that plugin's absence.
  */
 
-#include <yuzu/plugin.h>
-
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -46,9 +48,28 @@
 #include <dlfcn.h>
 #endif
 
+// Project headers last (docs/cpp-conventions.md "Include order: STL →
+// third-party → project", F13).
+#include <yuzu/plugin.h>
+
+// F13: this tool's helpers live in the project namespace like every other
+// yuzu translation unit (docs/cpp-conventions.md "Namespaces: yuzu::"); the
+// inner anonymous namespace keeps them internally linked, which is what the
+// bare `namespace {` was buying before. main() stays at global scope because
+// the C++ entry point cannot be namespaced.
+namespace yuzu::tools {
+namespace {
+
 namespace fs = std::filesystem;
 
-namespace {
+/// F13: the ABI version at which YuzuPluginDescriptor grew
+/// action_descriptors/action_descriptor_count (#2204). Below this an
+/// otherwise-valid plugin simply has no capability data to render — it is
+/// "undeclared", never "unsupported" — so the bare literal that used to sit
+/// in the render loop is named here (docs/cpp-conventions.md "k-prefix for
+/// constants"). It is deliberately NOT YUZU_PLUGIN_ABI_VERSION: a future
+/// ABI5 append must not silently reclassify every ABI4 plugin as undeclared.
+constexpr std::uint32_t kMinDeclaredAbiVersion = 4;
 
 std::string_view support_name(YuzuSupportLevel level) {
     switch (level) {
@@ -110,48 +131,51 @@ private:
 /// Mirrors tests/unit/test_new_plugins.cpp's load_plugin() dlopen + symbol
 /// lookup exactly (same failure modes), applied to an explicit path instead
 /// of a search-dir scan — the CI step passes exact BUILDDIR/plugin paths.
-bool load(const fs::path& so_path, LoadedPlugin& out) {
+///
+/// F13: returns std::expected rather than a bool + `LoadedPlugin&` out-param
+/// (docs/cpp-conventions.md "Forbidden in new code: Raw error codes or output
+/// parameters"). The diagnostic text moves into the error value and is
+/// printed verbatim by the caller, so stderr is unchanged. The partially
+/// constructed LoadedPlugin stays local: on any post-dlopen failure its
+/// destructor still closes the handle, exactly as the out-param's did.
+std::expected<LoadedPlugin, std::string> load(const fs::path& so_path) {
     std::error_code ec;
-    if (!fs::exists(so_path, ec) || ec) {
-        std::cerr << "capmatrix-gen: plugin artifact missing: " << so_path.string() << "\n";
-        return false;
-    }
+    if (!fs::exists(so_path, ec) || ec)
+        return std::unexpected("capmatrix-gen: plugin artifact missing: " + so_path.string());
+
+    LoadedPlugin lp;
 
 #ifdef _WIN32
     auto abs_path = fs::absolute(so_path);
     HMODULE hmod = LoadLibraryW(abs_path.wstring().c_str());
-    if (!hmod) {
-        std::cerr << "capmatrix-gen: LoadLibrary failed for " << so_path.string()
-                  << " (error " << GetLastError() << ")\n";
-        return false;
-    }
-    out.handle = static_cast<void*>(hmod);
+    if (!hmod)
+        return std::unexpected("capmatrix-gen: LoadLibrary failed for " + so_path.string() +
+                               " (error " + std::to_string(GetLastError()) + ")");
+    lp.handle = static_cast<void*>(hmod);
     auto fn = reinterpret_cast<yuzu_plugin_descriptor_fn>(
         GetProcAddress(hmod, "yuzu_plugin_descriptor"));
 #else
     void* h = dlopen(so_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!h) {
-        std::cerr << "capmatrix-gen: dlopen failed for " << so_path.string() << ": " << dlerror()
-                  << "\n";
-        return false;
+        // dlerror() may legitimately return null; streaming that was UB in
+        // the pre-F13 shape, and std::string cannot be built from it at all.
+        const char* dl_err = dlerror();
+        return std::unexpected("capmatrix-gen: dlopen failed for " + so_path.string() + ": " +
+                               (dl_err != nullptr ? dl_err : "unknown error"));
     }
-    out.handle = h;
+    lp.handle = h;
     auto fn = reinterpret_cast<yuzu_plugin_descriptor_fn>(dlsym(h, "yuzu_plugin_descriptor"));
 #endif
 
-    if (!fn) {
-        std::cerr << "capmatrix-gen: missing export 'yuzu_plugin_descriptor' in "
-                  << so_path.string() << "\n";
-        return false;
-    }
-    out.desc = fn();
-    if (!out.desc) {
-        std::cerr << "capmatrix-gen: yuzu_plugin_descriptor() returned null for "
-                  << so_path.string() << "\n";
-        return false;
-    }
-    out.path = so_path.string();
-    return true;
+    if (!fn)
+        return std::unexpected("capmatrix-gen: missing export 'yuzu_plugin_descriptor' in " +
+                               so_path.string());
+    lp.desc = fn();
+    if (!lp.desc)
+        return std::unexpected("capmatrix-gen: yuzu_plugin_descriptor() returned null for " +
+                               so_path.string());
+    lp.path = so_path.string();
+    return lp;
 }
 
 std::string escape_cell(std::string_view s) {
@@ -182,8 +206,11 @@ std::string escape_cell(std::string_view s) {
 }
 
 } // namespace
+} // namespace yuzu::tools
 
 int main(int argc, char** argv) {
+    using namespace yuzu::tools;
+
     std::string out_path;
     std::vector<std::string> plugin_paths;
 
@@ -212,12 +239,13 @@ int main(int argc, char** argv) {
     plugins.reserve(plugin_paths.size());
     bool any_failed = false;
     for (const auto& p : plugin_paths) {
-        LoadedPlugin lp;
-        if (!load(p, lp)) {
+        auto lp = load(p);
+        if (!lp) {
+            std::cerr << lp.error() << "\n";
             any_failed = true;
             continue;
         }
-        plugins.push_back(std::move(lp));
+        plugins.push_back(std::move(*lp));
     }
     if (any_failed) {
         // Never emit a partial/misleading matrix — a plugin that failed to
@@ -240,11 +268,13 @@ int main(int argc, char** argv) {
     out << "|---|---|---|---|---|---|---|\n";
 
     std::vector<std::string> undeclared;
+    std::size_t declared_rows = 0;
     for (const auto& lp : plugins) {
         const auto* d = lp.desc;
         const std::string name = d->name ? d->name : "(unnamed)";
 
-        if (d->abi_version < 4 || d->action_descriptor_count == 0 || d->action_descriptors == nullptr) {
+        if (d->abi_version < kMinDeclaredAbiVersion || d->action_descriptor_count == 0 ||
+            d->action_descriptors == nullptr) {
             undeclared.push_back(name);
             continue;
         }
@@ -269,8 +299,20 @@ int main(int argc, char** argv) {
                     << (leg.rung > 0 ? std::to_string(static_cast<int>(leg.rung)) : "-") << " | "
                     << (leg.mechanism && *leg.mechanism ? escape_cell(leg.mechanism) : "-") << " | "
                     << (leg.fallback && *leg.fallback ? escape_cell(leg.fallback) : "-") << " |\n";
+                ++declared_rows;
             }
         }
+    }
+
+    // C-5: a header-only table (every built plugin still undeclared, the
+    // common case today since no plugin has adopted the descriptor yet)
+    // renders as an empty bordered box in several Markdown viewers — nothing
+    // distinguishes "generated correctly, zero rows" from "generator broke
+    // before emitting rows". One placeholder row, matching the table's real
+    // 7-column shape, removes the ambiguity without affecting the RATCHET
+    // count below (it counts `undeclared`, not table rows).
+    if (declared_rows == 0) {
+        out << "| _(none yet)_ | - | - | - | - | - | - |\n";
     }
 
     out << "\n**Undeclared plugins** (ABI<4, or ABI4 with no capability declarations yet — "

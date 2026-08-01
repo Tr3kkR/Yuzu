@@ -20,24 +20,24 @@ on:
   push:
     branches: [main, dev]
     tags-ignore: ['v*']
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-      - 'LICENSE'
-      - '.gitignore'
-      - '.github/runner-inventory.json'
-      - '.github/workflows/runner-inventory-sentinel.yml'
-      # Carved OUT of docs/** (#2204 PR1.1): docs/os-capability-matrix.md
-      # carries a machine-generated block (tools/capmatrix-gen +
-      # scripts/ci/check-capability-matrix.sh) — a push that only touches
-      # this file must still run the build/gate matrix. Kept in lockstep
-      # with the docs-only case in scripts/ci/detect-code-change.sh. MUST
-      # stay the LAST pattern in this list: GitHub Actions path filters
-      # resolve each changed file by the LAST pattern in the list that
-      # matches it (positive or negated) — placing this negation anywhere
-      # earlier would let a later positive pattern that also happens to
-      # match this path re-exclude it.
-      - '!docs/os-capability-matrix.md'
+    # BR-010: expressed as a `paths` ALLOW-list (not `paths-ignore`) precisely
+    # so docs/os-capability-matrix.md can be re-included after the docs
+    # exclusion. GitHub honours a trailing `!`-negation only in `paths`
+    # (last-match-wins); the same trick in `paths-ignore` is a silent no-op,
+    # which is why the earlier carve-out did nothing. `**` matches everything,
+    # the negations then re-exclude the ignore set, and the final positive
+    # pattern re-includes ONLY the generated matrix (whose drift gate must run
+    # on a push that touches just that file). Its generator/plugins/scripts are
+    # not in the ignore set, so they already trigger.
+    paths:
+      - '**'
+      - '!docs/**'
+      - '!*.md'
+      - '!LICENSE'
+      - '!.gitignore'
+      - '!.github/runner-inventory.json'
+      - '!.github/workflows/runner-inventory-sentinel.yml'
+      - 'docs/os-capability-matrix.md'
   pull_request:
     branches: [main, dev]
     # No paths-ignore here (issue #1978). Filtering this whole workflow out
@@ -650,9 +650,30 @@ jobs:
       # docs/os-capability-matrix.md generated block fails the same way.
       # RATCHET mode only (do not flip to hard-fail on any undeclared plugin
       # — that is a later PR): the undeclared-plugin count must not grow.
+      #
+      # A-2/compliance: this gate's pass/fail signal lives only in the
+      # workflow run log, which sits under Actions' default 90-day retention
+      # — short of a 12-month SOC 2 evidence window. Accepted for now: the
+      # gate is an enforcement mechanism (the PR merge record is the durable
+      # evidence that it ran and passed), not an evidence-retention system;
+      # revisit with an artifact upload (retention-days) if a SOC 2 control
+      # is later scoped to require the raw gate output itself.
       - name: Capability matrix drift gate (#2204)
         run: |
           bash scripts/ci/check-capability-matrix.sh \
+            "build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}"
+
+      # PR1.1 finding F10: the gate step above can only ever observe the
+      # all-undeclared state (every shipped plugin is undeclared and the
+      # baseline equals the count), so on its own it proves neither that
+      # capmatrix-gen renders a DECLARED descriptor nor that either ratchet
+      # rejection branch rejects. This exercises both against the real binary
+      # and the real gate script, using the tests/fixtures/abi4/ declaring
+      # fixture plugin inside throwaway git repos. Runs here rather than on
+      # the preflight shell-gate step because it needs the built artifacts.
+      - name: Capability matrix gate tests (#2204 F10)
+        run: |
+          bash tests/shell/test_capability_matrix_gate.sh \
             "build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}"
 
       # Link-provenance assertion (#1331 review HIGH-2): prove the canary linked

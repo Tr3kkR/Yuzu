@@ -120,7 +120,7 @@
         sent_at                 => 'yuzu.common.v1.Timestamp'(), % = 6, optional
         plugin                  => unicode:chardata(), % = 7, optional
         action                  => unicode:chardata(), % = 8, optional
-        payload                 => iodata(),         % = 9, optional
+        payload                 => iodata(),        % = 9, optional
         plugin_result_status    => 'PLUGIN_RESULT_UNDECLARED' | 'PLUGIN_RESULT_OK' | 'PLUGIN_RESULT_UNAVAILABLE' | 'PLUGIN_RESULT_PERMISSION_DENIED' | 'PLUGIN_RESULT_CONSTRAINED' | integer() % = 10, optional, enum yuzu.agent.v1.CommandResponse.PluginResultStatus
        }.
 
@@ -3870,10 +3870,10 @@ merge_msgs(Prev, New, MsgName, Opts) ->
              _ -> S8
          end,
     S10 = case {PMsg, NMsg} of
-             {_, #{payload := NFpayload}} -> S9#{payload => NFpayload};
-             {#{payload := PFpayload}, _} -> S9#{payload => PFpayload};
-             _ -> S9
-         end,
+              {_, #{payload := NFpayload}} -> S9#{payload => NFpayload};
+              {#{payload := PFpayload}, _} -> S9#{payload => PFpayload};
+              _ -> S9
+          end,
     case {PMsg, NMsg} of
         {_, #{plugin_result_status := NFplugin_result_status}} -> S10#{plugin_result_status => NFplugin_result_status};
         {#{plugin_result_status := PFplugin_result_status}, _} -> S10#{plugin_result_status => PFplugin_result_status};
@@ -5427,7 +5427,6 @@ enum_value_by_symbol('yuzu.common.v1.ScopeCombinator.Op', Sym) -> 'enum_value_by
 'enum_value_by_symbol_yuzu.agent.v1.CommandResponse.Status'('TIMEOUT') -> 3;
 'enum_value_by_symbol_yuzu.agent.v1.CommandResponse.Status'('REJECTED') -> 4.
 
-
 'enum_symbol_by_value_yuzu.agent.v1.CommandResponse.PluginResultStatus'(0) -> 'PLUGIN_RESULT_UNDECLARED';
 'enum_symbol_by_value_yuzu.agent.v1.CommandResponse.PluginResultStatus'(1) -> 'PLUGIN_RESULT_OK';
 'enum_symbol_by_value_yuzu.agent.v1.CommandResponse.PluginResultStatus'(2) -> 'PLUGIN_RESULT_UNAVAILABLE';
@@ -5654,7 +5653,7 @@ get_rpc_containment("common") -> [];
 get_rpc_containment(P) -> error({gpb_error, {badproto, P}}).
 
 
-get_enum_containment("agent") -> ['yuzu.agent.v1.CommandResponse.Status', 'yuzu.agent.v1.CommandResponse.PluginResultStatus'];
+get_enum_containment("agent") -> ['yuzu.agent.v1.CommandResponse.PluginResultStatus', 'yuzu.agent.v1.CommandResponse.Status'];
 get_enum_containment("common") -> ['yuzu.common.v1.ScopeCombinator.Op'];
 get_enum_containment(P) -> error({gpb_error, {badproto, P}}).
 
