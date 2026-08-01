@@ -1073,3 +1073,69 @@ TEST_CASE("RbacStore: migrate_from_sqlite fails closed on an unreadable legacy f
     // can still complete (proves the failure did not stamp the completion marker).
     CHECK(store.migrate_from_sqlite("/nonexistent/rbac.db"));
 }
+
+// The load-bearing ADR-0041 invariant (Gate 3 QE BLOCKING): every authz read
+// on a degraded/unopened store must DENY, never fail open. This is the whole
+// reason the migration preserves deny-on-error on the bool paths.
+TEST_CASE("RbacStore: every authz read fails closed (DENY) on a broken store",
+          "[rbac_store][pg]") {
+    PgPool bad{{.conninfo = "host=192.0.2.1 port=1 dbname=x user=x connect_timeout=1", .size = 1}};
+    RbacStore broken{bad};
+    REQUIRE_FALSE(broken.is_open());
+    CHECK_FALSE(broken.check_permission("alice", "Execution", "Execute"));
+    CHECK_FALSE(broken.check_scoped_permission("alice", "Execution", "Execute", "agent-1", nullptr));
+    CHECK_FALSE(broken.holds_permission_via_any_group("alice", "Execution", "Execute", nullptr));
+    CHECK_FALSE(broken.check_role_has_permission("Administrator", "Execution", "Execute"));
+    // Tri-state read degrades distinguishably (unexpected), never an engaged allow.
+    CHECK_FALSE(broken.get_principal_roles_checked("user", "alice").has_value());
+    // The list-read chokepoint denies-all on a degraded store (never AdmitAll).
+    CHECK(broken.authorize_list_read("alice", "Agent", "Read", nullptr).decision ==
+          ListReadDecision::DenyAll);
+}
+
+// The generation-token cache must not serve a stale ALLOW after a revoke on the
+// same instance (Gate 3 QE BLOCKING): a mutation bumps the durable generation
+// in-txn and clears the local cache, so the next check re-reads and denies.
+TEST_CASE("RbacStore: a revoke invalidates a cached allow (generation token)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    store.assign_role({"user", "cacheuser", "Administrator"}); // Administrator = allow-all
+    // Warm perm_cache_ with an ALLOW verdict.
+    CHECK(store.check_permission("cacheuser", "Execution", "Execute"));
+    // Revoke — bumps write_generation in the same txn + clears the local cache.
+    REQUIRE(store.unassign_role("user", "cacheuser", "Administrator").has_value());
+    // The previously-cached allow must NOT be served; the check re-reads → DENY.
+    CHECK_FALSE(store.check_permission("cacheuser", "Execution", "Execute"));
+}
+
+// R2 (Gate 4 unhappy, CONFIRMED fail-open): the backfill must preserve an
+// operator's edit to a SEEDED system-role permission (e.g. flipping a default
+// 'allow' to 'deny'), which collides on the (role,type,op) key with the seed.
+// DO NOTHING would drop the operator's deny (resurrecting a revoked permission);
+// DO UPDATE preserves it.
+TEST_CASE("RbacStore: backfill preserves an operator's deny-override on a seeded role",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    // Seeded Viewer has AuditLog/Read = allow.
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_r2-"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_rbac_db(legacy.path, /*enabled=*/false);
+    // The operator had revoked Viewer's AuditLog/Read in the legacy DB (deny).
+    {
+        sqlite3* db = nullptr;
+        REQUIRE(sqlite3_open(legacy.path.string().c_str(), &db) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(db,
+                             "INSERT INTO role_permissions VALUES "
+                             "('Viewer','AuditLog','Read','deny');",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(db);
+    }
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+    // The legacy 'deny' must win over the seeded 'allow' (DO UPDATE, not DO NOTHING).
+    const auto perms = store.get_role_permissions("Viewer");
+    std::string effect;
+    for (const auto& p : perms)
+        if (p.securable_type == "AuditLog" && p.operation == "Read")
+            effect = p.effect;
+    CHECK(effect == "deny");
+}

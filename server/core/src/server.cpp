@@ -786,6 +786,30 @@ public:
                           "transaction hold time per ingest, by source and phase "
                           "(full = full-payload replace; hash_only = hash-skip compare)",
                           "histogram");
+        // RbacStore observability (ADR-0041). Described + zero-seeded up front so
+        // the HELP/TYPE lines and closed dims exist on an idle server — critical
+        // here because a degrade means fleet-wide authz DENY (a PG blip denies
+        // every authorized request), so absent-series alerting must work before
+        // the first degrade ever fires (Gate 6 sre BLOCKING / Gate 4 consistency).
+        metrics_.describe("yuzu_server_rbac_read_degrade_total",
+                          "Authorization reads/refreshes that hit a degraded store, by reason "
+                          "(pool_acquire_timeout/query_error = a check denied fail-closed rather "
+                          "than returning data; generation_refresh_failed = the cross-replica "
+                          "generation/enabled-flag refresh failed and the perm cache was dropped). "
+                          "A sustained non-zero rate is a fleet-wide authz availability event, not "
+                          "mass access-denial — alert on it.",
+                          "counter");
+        for (const auto reason : {"pool_acquire_timeout", "query_error",
+                                  "generation_refresh_failed"})
+            metrics_.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}});
+        metrics_.describe("yuzu_server_rbac_backfill_total",
+                          "One-time legacy rbac.db → rbac_store PostgreSQL backfill outcome on "
+                          "first PG boot, by result (fresh = no legacy DB, marked complete; "
+                          "completed = migrated + reconciled; failed = fail-closed, boot refused, "
+                          "next start retries).",
+                          "counter");
+        for (const auto result : {"fresh", "completed", "failed"})
+            metrics_.counter("yuzu_server_rbac_backfill_total", {{"result", result}});
         metrics_.describe("yuzu_inventory_read_degrade_total",
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "

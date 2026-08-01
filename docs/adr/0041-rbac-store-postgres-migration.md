@@ -1,6 +1,8 @@
 # ADR-0041: RbacStore → PostgreSQL (Wave 2.1)
 
-- **Status:** Proposed
+- **Status:** Accepted (governance-resolved 2026-08-01 — the deferred cache-coherence
+  decision below was adjudicated by the security/architect/performance/compliance gates in favour
+  of the generation-token interval; see "Permission cache")
 - **Date:** 2026-08-01
 - **Deciders:** pg workstream; security-guardian + architect + performance + docs-writer (governance)
 - **Parents:** ADR-0006/0007/0008(+Correction), ADR-0009, ADR-0012, ADR-0017 (management-group
@@ -75,13 +77,19 @@ DURABLE generation:
   writing replica is always coherent with itself).
 
 This bounds cross-replica staleness to the refresh interval: a revoke on replica A is visible to
-replica B within ≤`kRbacGenerationRefreshMs`. **Open question flagged for the security/perf/
-architect gates:** is a sub-second stale-allow window acceptable on the authz store, or should
-the cache be (a) dropped entirely (every check hits PG — correctness-first, measure the hot-path
-cost) or (b) invalidated via PG `LISTEN/NOTIFY` (near-instant, more moving parts)? The
-generation-token default is the correctness/perf compromise; the gates decide whether the window
-must shrink to zero. Whatever wins, deny-on-error on the generation read itself is mandatory (a
-failed generation refresh must NOT extend trust — treat as "assume changed" → clear cache).
+replica B within ≤`kRbacGenerationRefreshMs`. Deny-on-error on the generation read itself is
+mandatory (a failed generation refresh must NOT extend trust — treat as "assume changed" → clear
+cache, and count a `generation_refresh_failed` degrade).
+
+**Gate decision (2026-08-01) — ACCEPTED: the generation-token interval, ~1s bounded stale-allow.**
+The security, architect, performance, and compliance gates converged: dropping the cache (option
+a) turns every authorized request into 2 PG round-trips on the shared pool, whose fail-closed
+result under saturation is *spurious denials* (an availability regression); the ~1s cross-replica
+window is well inside the fleet's existing revocation-latency envelope (heartbeat + session/token
+TTLs measured in minutes); and `LISTEN/NOTIFY` (option b) is the right *eventual* answer (window →
+0 without the per-check pool tax) but adds a listener connection + reconnect/missed-notify
+handling that belongs in its own hardening round. The bounded window is an **accepted, recorded
+residual risk**, not an open question. LISTEN/NOTIFY remains the named follow-up.
 
 ### Backfill (ADR-0009) — MANDATORY, with a critical flag-preservation clause
 

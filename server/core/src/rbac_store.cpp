@@ -49,6 +49,7 @@ constexpr std::int64_t kRbacGenerationRefreshMs = 1000;
 // degrades are counted here.
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
+constexpr const char* kReasonRefreshFailed = "generation_refresh_failed";
 constexpr std::uint64_t kReadDegradeLogSample = 100;
 constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
 
@@ -268,7 +269,15 @@ RbacStore::RbacStore(pg::PgPool& pool) : pool_(pool) {
     lease.reset(); // seed_defaults/load_enabled_flag re-acquire their own leases
     open_ = true;
     seed_defaults();
-    load_enabled_flag();
+    // load_enabled_flag() is now fail-closed: if the durable rbac_enabled /
+    // write_generation rows can't be read (lease/query error or absent — a
+    // failed seed also lands here), it returns false and we refuse to serve
+    // rather than boot RBAC-off on a fleet that enabled it (Gate 2 CRITICAL /
+    // Gate 4 R1). is_open()==false → server sets startup_failed_ and refuses boot.
+    if (!load_enabled_flag()) {
+        open_ = false;
+        return;
+    }
     spdlog::info("RbacStore initialized (schema {})", kStoreName);
 }
 
@@ -430,28 +439,53 @@ void RbacStore::seed_defaults() {
     grant("Reviewer", "AccessReview", "Attest");
 }
 
-void RbacStore::load_enabled_flag() {
+bool RbacStore::load_enabled_flag() {
     if (!open_)
-        return;
+        return false;
     auto lease = pool_.acquire();
-    if (!lease)
-        return;
+    if (!lease) {
+        // CRITICAL fail-closed (Gate 2 security / Gate 4 R1): we could NOT read
+        // the durable rbac_enabled flag. Leaving `rbac_enabled_` at its ctor
+        // default (false) while `open_` stays true would serve a fleet that had
+        // ENABLED RBAC with RBAC OFF — authorize_list_read → AdmitAll, a
+        // fleet-wide confined-operator bypass. Refuse boot instead; the next
+        // start retries. NEVER default-to-enabled either (that would break the
+        // legitimate RBAC-off fresh install) — refuse-boot is the only safe
+        // posture when the authoritative flag is unreadable.
+        spdlog::error("RbacStore: could not acquire a connection to read the durable rbac_enabled "
+                      "flag ({}) — refusing to start rather than risk serving RBAC-off on a fleet "
+                      "that enabled it (fail-closed)",
+                      pool_.last_error());
+        return false;
+    }
     pg::PgResult r = pg::exec_params(
         lease.get(), "SELECT value FROM rbac_store.rbac_meta WHERE key='rbac_enabled'",
         std::vector<std::string>{});
-    if (r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) == 1)
-        rbac_enabled_.store(text_col(r.get(), 0, 0) == "true", std::memory_order_relaxed);
+    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1) {
+        // The row is seeded by the migration/seed_defaults (and read-back-verified
+        // by the backfill), so a query error OR a missing row means the durable
+        // flag is unreadable/absent — fail closed, same reasoning as above.
+        spdlog::error("RbacStore: durable rbac_enabled flag is unreadable/absent (status={}) — "
+                      "refusing to start (fail-closed)",
+                      static_cast<int>(r.status()));
+        return false;
+    }
+    rbac_enabled_.store(text_col(r.get(), 0, 0) == "true", std::memory_order_relaxed);
     // Anchor the generation cache from the durable counter so the first read
-    // does not immediately re-query.
+    // does not immediately re-query. This row is likewise init-guaranteed.
     pg::PgResult g = pg::exec_params(
         lease.get(), "SELECT value FROM rbac_store.rbac_meta WHERE key='write_generation'",
         std::vector<std::string>{});
-    std::lock_guard lock(cache_mtx_);
-    if (g.status() == PGRES_TUPLES_OK && PQntuples(g.get()) == 1) {
-        cached_generation_ = to_u64(PQgetvalue(g.get(), 0, 0));
-        generation_valid_ = true;
+    if (g.status() != PGRES_TUPLES_OK || PQntuples(g.get()) != 1) {
+        spdlog::error("RbacStore: durable write_generation is unreadable/absent — refusing to "
+                      "start (fail-closed)");
+        return false;
     }
+    std::lock_guard lock(cache_mtx_);
+    cached_generation_ = to_u64(PQgetvalue(g.get(), 0, 0));
+    generation_valid_ = true;
     last_generation_refresh_ms_ = now_ms();
+    return true;
 }
 
 // ── Durable generation token (ADR-0041 cross-replica coherence) ──────────────
@@ -463,6 +497,13 @@ void RbacStore::maybe_refresh_generation() const {
         std::lock_guard lock(cache_mtx_);
         if ((now_ms() - last_generation_refresh_ms_) < kRbacGenerationRefreshMs)
             return;
+        // Claim the refresh for THIS thread by advancing the timestamp inside the
+        // gate before releasing the lock (Gate 3 perf). Otherwise every concurrent
+        // authz thread that crosses the interval boundary at once fires the SELECT
+        // + grabs a pool lease — an N-way refresh stampede once per interval under
+        // load, competing with real permission queries. Now exactly one thread
+        // refreshes per interval; the rest see the fresh stamp and return.
+        last_generation_refresh_ms_ = now_ms();
     }
     // Read the durable generation + enabled flag WITHOUT holding cache_mtx_.
     std::optional<std::uint64_t> durable_gen;
@@ -488,13 +529,26 @@ void RbacStore::maybe_refresh_generation() const {
     if (!durable_gen) {
         // Fail toward "assume changed": drop the cache and stop trusting it. Do
         // NOT touch rbac_enabled_ — flipping it to disabled would be fail-open.
+        // Count the degrade so on-call can see that the cross-replica generation
+        // + enabled-flag refresh is failing (Gate 3 architect / Gate 6 sre): a
+        // persistent refresh failure means this replica's rbac_enabled view can
+        // go stale, the more-sensitive fail-open dimension.
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonRefreshFailed, sampler))
+            spdlog::warn("RbacStore: durable generation/enabled-flag refresh failed — cache "
+                         "dropped (assume-changed); rbac_enabled view may be stale on this replica");
         perm_cache_.clear();
         generation_valid_ = false;
         return;
     }
     if (durable_enabled)
         rbac_enabled_.store(*durable_enabled, std::memory_order_relaxed);
-    if (!generation_valid_ || *durable_gen != cached_generation_) {
+    // Adopt the durable generation only when it moves FORWARD (Gate 3 cpp-safety):
+    // the SELECT above ran lock-free, so a concurrent local apply_local_generation
+    // may have advanced cached_generation_ past what we read — never regress it
+    // (that would wrongly clear a just-populated cache and re-anchor to a stale
+    // value). Generations are monotonic, so `>` is the correct adopt test.
+    if (!generation_valid_ || *durable_gen > cached_generation_) {
         perm_cache_.clear();
         cached_generation_ = *durable_gen;
         generation_valid_ = true;
@@ -1376,12 +1430,21 @@ std::expected<ReconcileResult, std::string> RbacStore::reconcile_idp_memberships
         }
         result.removed = static_cast<size_t>(PQntuples(del.get()));
 
-        new_gen = bump_generation_in_txn(c);
-        return new_gen.has_value();
+        // Bump the durable generation ONLY when membership actually changed
+        // (Gate 4 consistency SHOULD-1). A no-op reconcile runs on EVERY IdP
+        // login re-asserting unchanged groups; an unconditional bump would clear
+        // the perm cache fleet-wide on every login, defeating the very cache the
+        // generation-token compromise was chosen to preserve.
+        if (result.added || result.removed) {
+            new_gen = bump_generation_in_txn(c);
+            return new_gen.has_value();
+        }
+        return true; // no-op reconcile: commit, no generation churn
     });
     if (!ok)
         return std::unexpected(err.empty() ? "reconcile transaction failed" : err);
-    apply_local_generation(*new_gen);
+    if (new_gen)
+        apply_local_generation(*new_gen);
     return result;
 }
 
@@ -2094,9 +2157,18 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                       bool_lit(r.is_system), std::to_string(r.created_at)}))
                 return false;
         for (const auto& p : perms)
+            // DO UPDATE, not DO NOTHING (Gate 4 R2, CONFIRMED fail-open): the
+            // legacy rbac.db is the AUTHORITATIVE pre-cutover state. If an
+            // operator edited a SEEDED system-role permission (e.g. flipped an
+            // 'allow' default to 'deny'), that row collides on the (role,type,op)
+            // key with the seed we just inserted; DO NOTHING would silently drop
+            // the operator's deny and the row-count reconcile can't see it —
+            // resurrecting a revoked permission (fail-open). DO UPDATE makes the
+            // legacy effect win, preserving the operator's authorization intent.
             if (!run("INSERT INTO rbac_store.role_permissions (role_name, securable_type, "
                      "operation, effect) VALUES ($1, $2, $3, $4) "
-                     "ON CONFLICT (role_name, securable_type, operation) DO NOTHING",
+                     "ON CONFLICT (role_name, securable_type, operation) DO UPDATE SET "
+                     "effect = EXCLUDED.effect",
                      {sanitize_pg_text(p.role_name), sanitize_pg_text(p.securable_type),
                       sanitize_pg_text(p.operation), sanitize_pg_text(p.effect)}))
                 return false;

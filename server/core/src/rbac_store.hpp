@@ -329,7 +329,10 @@ private:
     mutable std::atomic<bool> rbac_enabled_{false};
 
     void seed_defaults();     // idempotent (ON CONFLICT DO NOTHING)
-    void load_enabled_flag(); // seed rbac_enabled_ from the durable row
+    // Loads rbac_enabled_ + the generation anchor from the durable rbac_meta
+    // rows. Returns false (→ ctor refuses boot, fail-closed) if the flag cannot
+    // be read — never leaves rbac_enabled_ at a default while open_ stays true.
+    [[nodiscard]] bool load_enabled_flag();
 
     /// Collect all role names for a principal (direct user grant + via group
     /// membership + direct engine-principal grant, §4.1) using `conn`. Returns
