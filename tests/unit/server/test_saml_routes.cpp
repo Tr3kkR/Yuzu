@@ -21,6 +21,7 @@
 #include "api_token_store.hpp"
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
+#include "pg/pg_pool.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
 #include <yuzu/metrics.hpp>
@@ -37,7 +38,9 @@
 #include <atomic>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 
 // ── Signing fixture headers (success-path test only, non-Windows) ─────────────
@@ -69,6 +72,15 @@ using namespace yuzu::server::saml;
 
 namespace {
 
+// AuditStore migrated to Postgres (ADR-0006) — the fixture below clones this
+// pre-migrated template instead of opening a SQLite path.
+yuzu::test::PgTestTemplate saml_audit_tpl{"samlaudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("samlaudit template: store failed to migrate");
+}};
+
 /// Fixture — stores + AuthRoutes wired against an in-process TestRouteSink.
 /// Accepts an optional (non-owning) SamlProvider pointer so tests can supply
 /// a pre-configured provider without transferring ownership.
@@ -82,6 +94,13 @@ struct SamlRoutesFixture {
     // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
     // store method, and AuthRoutes null-guards the pointer, so it gets nullptr
     // below — embedding the PG fixture only made every case skip without a DSN.
+    // AuditStore ported to Postgres (ADR-0006): a template-cloned ephemeral
+    // database + pool. This fixture has no other PG-backed member, so it
+    // self-skips explicitly (mirrors yuzu::test::AuthDbPg's own posture) —
+    // SKIPs the enclosing TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset,
+    // FAILs when set but broken.
+    std::optional<yuzu::test::PostgresTestDb> audit_db;
+    std::optional<yuzu::server::pg::PgPool>   audit_pool;
     std::unique_ptr<AuditStore>             audit_store;
     std::unique_ptr<AnalyticsEventStore>    analytics;
     std::shared_mutex                       oidc_mu;
@@ -95,7 +114,15 @@ struct SamlRoutesFixture {
         // fixture's comma-operator trick, but explicit is clearer here).
         fs::create_directories(tmp.path);
         auth_mgr.set_metrics_registry(&metrics);
-        audit_store = std::make_unique<AuditStore>(tmp.path / "audit.db");
+
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
+        audit_db.emplace(saml_audit_tpl);
+        INFO("[SamlRoutesFixture] audit db status (blank == ok): " << audit_db->error());
+        REQUIRE(audit_db->available());
+        audit_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = audit_db->dsn(), .size = 4});
+        audit_store = std::make_unique<AuditStore>(*audit_pool);
         analytics   = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
         REQUIRE(audit_store->is_open());
         REQUIRE(analytics->is_open());
@@ -117,7 +144,9 @@ struct SamlRoutesFixture {
     std::vector<AuditEvent> audit_events(std::size_t limit = 10) const {
         AuditQuery q;
         q.limit = static_cast<int>(limit);
-        return audit_store->query(q);
+        auto rows = audit_store->query(q);
+        REQUIRE(rows.has_value());
+        return *rows;
     }
 
     /// Read a metric counter value. The label set must match the production
@@ -683,7 +712,7 @@ TEST_CASE("extract_form_value — key absent returns empty", "[saml][auth_routes
 // GET /auth/saml/start — provider not configured (null pointer)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML start — returns 404 when provider is null", "[saml][auth_routes]") {
+TEST_CASE("SAML start — returns 404 when provider is null", "[pg][saml][auth_routes]") {
     SamlRoutesFixture fix; // saml_provider defaults to nullptr
     auto res = fix.sink.Get("/auth/saml/start");
     REQUIRE(res != nullptr);
@@ -710,7 +739,7 @@ TEST_CASE("SAML start — returns 404 when provider is null", "[saml][auth_route
 // POST /saml/acs — provider not configured
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML ACS — returns 404 when provider is null", "[saml][auth_routes]") {
+TEST_CASE("SAML ACS — returns 404 when provider is null", "[pg][saml][auth_routes]") {
     SamlRoutesFixture fix;
     auto res = fix.sink.Post("/saml/acs",
                              "SAMLResponse=garbage&RelayState=%2Fdashboard",
@@ -742,7 +771,7 @@ TEST_CASE("SAML ACS — returns 404 when provider is null", "[saml][auth_routes]
 // Platform-independent: the empty-field check runs before validate_response.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML ACS — missing SAMLResponse redirects to login error", "[saml][auth_routes]") {
+TEST_CASE("SAML ACS — missing SAMLResponse redirects to login error", "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     // On Windows the provider stub makes is_enabled()=false, so the route 404s
     // before the field-check. Skip the redirect assertion on Windows.
@@ -783,7 +812,7 @@ TEST_CASE("SAML ACS — missing SAMLResponse redirects to login error", "[saml][
 // POST /saml/acs — malformed SAMLResponse (validate_response returns error)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML ACS — malformed SAMLResponse redirects to login error", "[saml][auth_routes]") {
+TEST_CASE("SAML ACS — malformed SAMLResponse redirects to login error", "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -820,7 +849,7 @@ TEST_CASE("SAML ACS — malformed SAMLResponse redirects to login error", "[saml
 // GET /auth/saml/start — provider enabled → redirects to IdP
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML start — redirects when provider is enabled", "[saml][auth_routes]") {
+TEST_CASE("SAML start — redirects when provider is enabled", "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -851,7 +880,7 @@ TEST_CASE("SAML start — redirects when provider is enabled", "[saml][auth_rout
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SAML ACS — RelayState open-redirect: absolute URL falls back to /",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -909,7 +938,7 @@ TEST_CASE("SAML ACS — RelayState open-redirect: absolute URL falls back to /",
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SAML ACS — valid signed SAMLResponse creates session with auth_source=saml",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1059,7 +1088,7 @@ TEST_CASE("SAML ACS — valid signed SAMLResponse creates session with auth_sour
 }
 
 TEST_CASE("SAML ACS — assertion groups containing --saml-admin-group mint an admin session",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1153,7 +1182,7 @@ TEST_CASE("SAML ACS — assertion groups containing --saml-admin-group mint an a
 }
 
 TEST_CASE("SAML ACS — assertion groups not containing --saml-admin-group mint a user session",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1241,7 +1270,7 @@ TEST_CASE("SAML ACS — assertion groups not containing --saml-admin-group mint 
 }
 
 TEST_CASE("SAML ACS — a near-miss group value does not mint admin (qa-S1)",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1266,7 +1295,7 @@ TEST_CASE("SAML ACS — a near-miss group value does not mint admin (qa-S1)",
 }
 
 TEST_CASE("SAML ACS — a case-differing group value does not mint admin (qa-S1)",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1291,7 +1320,7 @@ TEST_CASE("SAML ACS — a case-differing group value does not mint admin (qa-S1)
 }
 
 TEST_CASE("SAML ACS — an admin-group match beyond the 64-value cap does not mint admin (qa-S2)",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1328,7 +1357,7 @@ TEST_CASE("SAML ACS — an admin-group match beyond the 64-value cap does not mi
 
 TEST_CASE("SAML ACS — exactly kMaxGroupValues values does not trip the cap-truncation counter "
           "(#1828.3 boundary)",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1356,7 +1385,7 @@ TEST_CASE("SAML ACS — exactly kMaxGroupValues values does not trip the cap-tru
 }
 
 TEST_CASE("SAML ACS — a trailing space in --saml-admin-group still matches after trim (UP-4)",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1397,7 +1426,7 @@ TEST_CASE("trim_ascii_whitespace — trims leading/trailing space/tab/CR/LF, "
 
 TEST_CASE("SAML ACS — assertion with no AttributeStatement mints a user session even when "
           "--saml-admin-group is configured",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1490,7 +1519,7 @@ TEST_CASE("SAML ACS — assertion with no AttributeStatement mints a user sessio
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SAML ACS — unsafe RelayState values fall back to /",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1565,7 +1594,7 @@ TEST_CASE("SAML ACS — unsafe RelayState values fall back to /",
 // Browser-binding CSRF tests
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML ACS — missing binding cookie is rejected", "[saml][auth_routes]") {
+TEST_CASE("SAML ACS — missing binding cookie is rejected", "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1619,7 +1648,7 @@ TEST_CASE("SAML ACS — missing binding cookie is rejected", "[saml][auth_routes
 #endif
 }
 
-TEST_CASE("SAML ACS — wrong binding cookie value is rejected", "[saml][auth_routes]") {
+TEST_CASE("SAML ACS — wrong binding cookie value is rejected", "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1686,7 +1715,7 @@ TEST_CASE("SAML ACS — wrong binding cookie value is rejected", "[saml][auth_ro
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SAML ACS — shadow-prefix cookie does not shadow real binding cookie (H-B)",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1753,7 +1782,7 @@ TEST_CASE("SAML ACS — shadow-prefix cookie does not shadow real binding cookie
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SAML ACS — RelayState with path traversal (..) falls back to / (H-D)",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1813,7 +1842,7 @@ TEST_CASE("SAML ACS — RelayState with path traversal (..) falls back to / (H-D
 }
 
 TEST_CASE("SAML ACS — valid RelayState /dashboard is accepted (H-D)",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else

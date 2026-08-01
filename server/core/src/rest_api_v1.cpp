@@ -4334,10 +4334,19 @@ void RestApiV1::register_routes(
                  q.principal = req.get_param_value("principal");
                  q.action = req.get_param_value("action");
 
+                 // ADR-0040: degrade-distinguishable read — nullopt on a
+                 // store/pool failure. Surface 503, never a false-empty 200 (an
+                 // audit blip must not read as "no activity" — evidence integrity).
                  auto events = audit_store->query(q);
+                 if (!events) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "audit store degraded"),
+                                     "application/json");
+                     return;
+                 }
                  JArr arr;
-                 for (size_t i = 0; i < events.size(); ++i) {
-                     const auto& e = events[i];
+                 for (size_t i = 0; i < events->size(); ++i) {
+                     const auto& e = (*events)[i];
                      arr.add(JObj()
                                  .add("timestamp", e.timestamp)
                                  .add("principal", e.principal)
@@ -4347,7 +4356,7 @@ void RestApiV1::register_routes(
                                  .add("target_id", e.target_id)
                                  .add("detail", e.detail));
                  }
-                 res.set_content(list_json(arr.str(), static_cast<int64_t>(events.size())),
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(events->size())),
                                  "application/json");
              });
 
@@ -4461,7 +4470,20 @@ void RestApiV1::register_routes(
                 q.limit = 1;
 
             std::size_t pool_size = 0;
-            auto events = audit_store->query(q, &pool_size);
+            // ADR-0040: degrade-distinguishable read — nullopt on a store/pool
+            // failure. 503, never a false-empty sample (evidence integrity; the
+            // is_open() guard above only catches a closed store, not a runtime blip).
+            auto events_opt = audit_store->query(q, &pool_size);
+            if (!events_opt) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "audit store degraded", cid,
+                                                      /*retry_after_ms=*/5000,
+                                                      "the audit store is temporarily unavailable; "
+                                                      "retry shortly"),
+                                "application/json");
+                return;
+            }
+            const auto& events = *events_opt;
             // recency_capped: the window held at least the scan cap, so the sample
             // was drawn only from the most-recent kAuditSampleScanCap events and is
             // NOT a uniform sample of the full window. Surfaced in the response so an

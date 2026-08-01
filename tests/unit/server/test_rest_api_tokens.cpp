@@ -424,17 +424,15 @@ TEST_CASE("HTMX POST /api/settings/api-tokens: CSPRNG failure persists failure "
     // expected fields. Any divergence between this row and the one the
     // handler emits would be caught by the source-level edit pattern in
     // the same commit.
-    // TempDbFile guard declared before the inner scope: the store closes on
-    // scope exit (even via a failing REQUIRE unwinding), then the guard
-    // removes the file — the old trailing fs::remove pair leaked the DB on
-    // any assertion failure (#486). ApiTokenStore ported to Postgres (PR
-    // 4.1) — SKIPs when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but
-    // broken.
-    yuzu::test::TempDbFile audit_db{"yuzu_test_rest_api_audit-"};
+    // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs when
+    // YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken. AuditStore
+    // (ADR-0006) now shares that same ephemeral database via a second pool
+    // (its own `audit_store` schema, no conflict with api_tokens).
     yuzu::test::ApiTokenStorePg token_store;
 
     {
-        AuditStore audit_store(audit_db.path, /*retention_days=*/365,
+        yuzu::server::pg::PgPool audit_pool{{.conninfo = token_store.dsn(), .size = 2}};
+        AuditStore audit_store(audit_pool, /*retention_days=*/365,
                                /*cleanup_interval_min=*/0);
         REQUIRE(audit_store.is_open());
 
@@ -459,13 +457,14 @@ TEST_CASE("HTMX POST /api/settings/api-tokens: CSPRNG failure persists failure "
                                  .result = "failure"}));
 
         auto rows = audit_store.query({});
-        REQUIRE(rows.size() == 1);
-        CHECK(rows[0].action == "api_token.create");
-        CHECK(rows[0].result == "failure");
-        CHECK(rows[0].target_type == "ApiToken");
-        CHECK(rows[0].target_id == "dashboard-token");
-        CHECK(rows[0].principal == "alice");
-        CHECK(rows[0].detail.find("csprng_unavailable") != std::string::npos);
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        CHECK((*rows)[0].action == "api_token.create");
+        CHECK((*rows)[0].result == "failure");
+        CHECK((*rows)[0].target_type == "ApiToken");
+        CHECK((*rows)[0].target_id == "dashboard-token");
+        CHECK((*rows)[0].principal == "alice");
+        CHECK((*rows)[0].detail.find("csprng_unavailable") != std::string::npos);
 
         // Counter parity — events_failure_ must have incremented so /metrics
         // surfaces the security-relevant failure for SRE paging.

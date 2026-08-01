@@ -19,6 +19,7 @@
 #include "api_token_store.hpp"
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "test_route_sink.hpp"
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
@@ -32,13 +33,29 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
 namespace fs = std::filesystem;
 using namespace yuzu::server;
 using yuzu::server::auth::Role;
+
+namespace {
+// AuditStore migrated to Postgres (ADR-0006) — the harness below clones this
+// pre-migrated template instead of opening a SQLite path. Self-contained
+// (mirrors yuzu::test::AuthDbPg, already embedded in the harness): SKIPs the
+// enclosing TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset (via auth_db's own
+// ctor, constructed first), FAILs when set but broken.
+yuzu::test::PgTestTemplate jit_elevation_audit_tpl{"jitaudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("jitaudit template: store failed to migrate");
+}};
+} // namespace
 
 // ── Pure helpers ─────────────────────────────────────────────────────────────
 
@@ -300,6 +317,14 @@ struct JitHarness {
     // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
     // store method, and AuthRoutes null-guards the pointer, so it gets nullptr
     // below — embedding the PG fixture only made every case skip without a DSN.
+    // AuditStore ported to Postgres (ADR-0006): a template-cloned ephemeral
+    // database + pool in the normal case, mirroring auth_db's own
+    // self-contained skip/fail posture above (auth_db constructs first, so an
+    // unset DSN never reaches this member at all). When `audit_store_broken`,
+    // `audit_pool` instead points at an unroutable host — see the ctor doc
+    // below.
+    std::optional<yuzu::test::PostgresTestDb> audit_db;
+    std::optional<yuzu::server::pg::PgPool> audit_pool;
     std::unique_ptr<AuditStore> audit_store;
     std::unique_ptr<AnalyticsEventStore> analytics_store;
     std::shared_mutex oidc_mu;
@@ -308,16 +333,12 @@ struct JitHarness {
     yuzu::server::test::TestRouteSink sink;
 
     // `audit_store_broken` (governance hardening round, UP-3 guard) points
-    // the AuditStore at an unopenable path — SQLITE_CANTOPEN leaves it
-    // wired-but-closed (db_==nullptr), so AuditStore::log() fail-returns
+    // the AuditStore at an unroutable pool — the connection can never
+    // succeed, so AuditStore::is_open() reads false and log() fail-returns
     // false without throwing, matching the idiom at
-    // test_rest_audit_sample.cpp:51. Made HERMETIC (L5, adversarial
-    // review): rather than a hardcoded path outside the sandbox (a
-    // writable-root CI could create `/nonexistent-yuzu-test-dir/` and void
-    // the negative assertion), the unopenable directory is a subdirectory of
-    // the harness's own TempDir with its write bit stripped (mirrors the
-    // owner_read/owner_write idiom in test_cert_reloader.cpp) — SQLite can
-    // list it but can't create a file inside it.
+    // test_rest_audit_sample.cpp:51. This path does NOT depend on
+    // YUZU_TEST_POSTGRES_DSN being set — it needs no live Postgres at all
+    // (mirrors test_audit_store.cpp's "bad-path constructor" fixture).
     explicit JitHarness(bool audit_store_broken = false) {
         fs::create_directories(tmp.path);
         cfg.auth_config_path = tmp.path / "auth.cfg";
@@ -337,15 +358,17 @@ struct JitHarness {
         REQUIRE(auth_db->set_elevation_eligible("bob", true).has_value());
         REQUIRE(auth_db->set_elevation_eligible("carol", true).has_value());
 
-        std::filesystem::path audit_path = tmp.path / "audit.db";
         if (audit_store_broken) {
-            std::filesystem::path unopenable_dir = tmp.path / "no-write";
-            fs::create_directories(unopenable_dir);
-            fs::permissions(unopenable_dir, fs::perms::owner_read | fs::perms::owner_exec,
-                            fs::perm_options::replace);
-            audit_path = unopenable_dir / "audit-broken.db";
+            audit_pool.emplace(yuzu::server::pg::PgPool::Options{
+                .conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1});
+        } else {
+            audit_db.emplace(jit_elevation_audit_tpl);
+            INFO("[JitHarness] audit db status (blank == ok): " << audit_db->error());
+            REQUIRE(audit_db->available());
+            audit_pool.emplace(
+                yuzu::server::pg::PgPool::Options{.conninfo = audit_db->dsn(), .size = 4});
         }
-        audit_store = std::make_unique<AuditStore>(audit_path);
+        audit_store = std::make_unique<AuditStore>(*audit_pool);
         analytics_store = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
         auth_routes = std::make_unique<AuthRoutes>(cfg, auth_mgr, /*rbac_store=*/nullptr,
                                                    /*api_token_store=*/nullptr, audit_store.get(), nullptr,
@@ -400,13 +423,17 @@ struct JitHarness {
                                             "https://idp.example", {}, "", mfa_at);
     }
 
-    // detail string of the most-recent matching audit row ("" if none).
+    // detail string of the most-recent matching audit row ("" if none, or if
+    // the store degrades — the broken-store harness relies on this staying
+    // empty rather than throwing).
     std::string audit_detail(const std::string& action, const std::string& principal) {
         AuditQuery q;
         q.action = action;
         q.principal = principal;
         auto rows = audit_store->query(q);
-        return rows.empty() ? std::string{} : rows.front().detail;
+        if (!rows.has_value() || rows->empty())
+            return {};
+        return rows->front().detail;
     }
 
     // A cookie-authenticated POST.
@@ -420,7 +447,8 @@ struct JitHarness {
         q.action = action;
         if (!principal.empty())
             q.principal = principal;
-        return static_cast<int>(audit_store->query(q).size());
+        auto rows = audit_store->query(q);
+        return rows.has_value() ? static_cast<int>(rows->size()) : 0;
     }
 
     // principal_role recorded on the most-recent matching audit row ("" if none).
@@ -429,7 +457,9 @@ struct JitHarness {
         q.action = action;
         q.principal = principal;
         auto rows = audit_store->query(q);
-        return rows.empty() ? std::string{} : rows.front().principal_role;
+        if (!rows.has_value() || rows->empty())
+            return {};
+        return rows->front().principal_role;
     }
 };
 } // namespace
@@ -465,8 +495,9 @@ TEST_CASE("POST /api/v1/elevate: eligible operator is elevated to admin", "[pg][
         q.action = "role.elevation.granted";
         q.principal = "alice";
         auto rows = h.audit_store->query(q);
-        REQUIRE_FALSE(rows.empty());
-        CHECK(rows.front().detail.find("expires_at=") != std::string::npos);
+        REQUIRE(rows.has_value());
+        REQUIRE_FALSE(rows->empty());
+        CHECK(rows->front().detail.find("expires_at=") != std::string::npos);
     }
 
     // The session is now effectively admin.
@@ -501,8 +532,9 @@ TEST_CASE("POST /api/v1/elevate: duration_secs:1 is a live window, not "
     q.action = "role.elevation.granted";
     q.principal = "alice";
     auto rows = h.audit_store->query(q);
-    REQUIRE_FALSE(rows.empty());
-    const std::string& detail = rows.front().detail;
+    REQUIRE(rows.has_value());
+    REQUIRE_FALSE(rows->empty());
+    const std::string& detail = rows->front().detail;
     auto pos = detail.find("duration_secs=");
     REQUIRE(pos != std::string::npos);
     pos += std::string("duration_secs=").size();
@@ -548,8 +580,9 @@ TEST_CASE("POST /api/v1/elevate: a session-lifetime clamp keeps the audit "
     q.action = "role.elevation.granted";
     q.principal = "alice";
     auto rows = h.audit_store->query(q);
-    REQUIRE_FALSE(rows.empty());
-    const std::string& detail = rows.front().detail;
+    REQUIRE(rows.has_value());
+    REQUIRE_FALSE(rows->empty());
+    const std::string& detail = rows->front().detail;
     auto pos = detail.find("duration_secs=");
     REQUIRE(pos != std::string::npos);
     pos += std::string("duration_secs=").size();

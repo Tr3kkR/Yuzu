@@ -28,6 +28,7 @@
 #include "auth_routes.hpp"           // real-AuthRoutes integration test (C1)
 #include <yuzu/server/server.hpp>     // Config (real-AuthRoutes integration test)
 #include "audit_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "ca_store.hpp"
 #include "discover_routes.hpp"     // A2 discovery builders (Issue 17.1)
 #include "event_bus.hpp"
@@ -59,6 +60,7 @@
 #include <memory>
 #include <set>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -67,6 +69,18 @@
 
 using namespace yuzu::server::mcp;
 using namespace yuzu::server;
+
+namespace {
+// AuditStore migrated to Postgres (ADR-0006) — "MCP AuditStore: query with
+// mcp_tool field" below clones this pre-migrated template instead of opening
+// a SQLite path.
+yuzu::test::PgTestTemplate mcp_audit_tpl{"mcpaudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("mcpaudit template: store failed to migrate");
+}};
+} // namespace
 
 // ── JSON-RPC 2.0 parsing ─────────────────────────────────────────────────
 
@@ -528,8 +542,10 @@ TEST_CASE("MCP InstructionStore: query definitions", "[mcp][instruction]") {
 
 // ── Audit store integration (used by query_audit_log) ─────────────────────
 
-TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
-    AuditStore store(":memory:");
+TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
     REQUIRE(store.is_open());
 
     AuditEvent evt;
@@ -544,8 +560,9 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
     AuditQuery aq;
     aq.principal = "mcp-admin";
     auto events = store.query(aq);
-    REQUIRE(events.size() >= 1);
-    CHECK(events[0].action == "mcp.list_agents");
+    REQUIRE(events.has_value());
+    REQUIRE(events->size() >= 1);
+    CHECK((*events)[0].action == "mcp.list_agents");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

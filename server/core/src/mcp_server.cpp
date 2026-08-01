@@ -2621,9 +2621,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 AuditQuery aq;
                 aq.limit = 50;
+                // ADR-0040: degrade-distinguishable read — nullopt on a
+                // store/pool failure. Surface an error, never a false-empty
+                // resource (an audit blip must not read as "no activity").
                 auto events = audit_store->query(aq);
+                if (!events) {
+                    res.set_content(error_response(id, kInternalError, "Audit store degraded"),
+                                    "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& e : events) {
+                for (const auto& e : *events) {
                     arr.add(JObj()
                                 .add("timestamp", e.timestamp)
                                 .add("principal", e.principal)
@@ -3369,9 +3377,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 aq.since = param_int(args, "since");
                 aq.until = param_int(args, "until");
                 aq.limit = std::min(param_int32(args, "limit", 50), 500);
+                // ADR-0040: degrade-distinguishable read — nullopt on a
+                // store/pool failure. Surface an error, never a false-empty
+                // result (an audit blip must not read as "no activity").
                 auto events = audit_store->query(aq);
+                if (!events) {
+                    res.set_content(error_response(id, kInternalError, "Audit store degraded"),
+                                    "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& e : events) {
+                for (const auto& e : *events) {
                     arr.add(JObj()
                                 .add("id", e.id)
                                 .add("timestamp", e.timestamp)

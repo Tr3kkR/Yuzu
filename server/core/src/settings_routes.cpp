@@ -934,9 +934,12 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                     q.target_id = p.principal_id;
                     q.action_prefixes = {"engine_principal.revoke"};
                     q.limit = 1;
+                    // Best-effort HTML cell (not an evidence endpoint): on a
+                    // degrade (nullopt, ADR-0040) keep the "(not recorded)"
+                    // fallback rather than 503-ing the whole settings page.
                     auto events = audit_store_->query(q);
-                    if (!events.empty() && !events.front().detail.empty())
-                        audit_detail = events.front().detail;
+                    if (events && !events->empty() && !events->front().detail.empty())
+                        audit_detail = events->front().detail;
                 }
                 revocation_cell = linkage +
                                   "<br><span style=\"font-size:0.7rem;color:"

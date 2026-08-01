@@ -1,293 +1,661 @@
 #include "audit_store.hpp"
-#include "migration_runner.hpp"
-#include "sqlite_raii.hpp"
 
+#include "audit_retention_rules.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_migration_runner.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+#include "sqlite_raii.hpp"
+#include "utf8_sanitize.hpp"
+
+#include <yuzu/metrics.hpp>
+
+#include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
-#include <exception>
-#include <random>
-#include <shared_mutex>
-#include <expected>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <limits>
-#include <span>
+#include <optional>
+#include <random>
+#include <string>
 #include <string_view>
 #include <vector>
-#include <utility>
 
 namespace yuzu::server {
 
-AuditStore::AuditStore(const std::filesystem::path& db_path, int retention_days,
-                       int cleanup_interval_min)
-    : retention_days_(retention_days), cleanup_interval_min_(cleanup_interval_min) {
-    int rc = sqlite3_open_v2(db_path.string().c_str(), db_.addr(),
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                             nullptr);
-    if (rc != SQLITE_OK) {
-        // `db_.get()` owns whatever the failed open allocated; its destructor closes it
-        // whether we return here or a later log call throws.
-        spdlog::error("AuditStore: failed to open {}: {}", db_path.string(),
-                      sqlite3_errmsg(db_.get()));
-        db_.close();
-        return;
+namespace {
+
+constexpr const char* kStoreName = "audit_store";
+
+// Bounded acquires (ADR-0012 §2(a)). Writes fail-HARD but must still give up
+// eventually so a saturated pool cannot wedge a serving thread indefinitely;
+// reads back interactive REST/dashboard/MCP callers.
+constexpr std::chrono::milliseconds kReadTimeout{2000};
+constexpr std::chrono::milliseconds kWriteTimeout{4000};
+// Retention runs on the background thread; a generous deadline is fine.
+constexpr std::chrono::milliseconds kReapTimeout{8000};
+// Backfill runs at construction, single-threaded, before serving — a wide
+// deadline so a large batch on slow storage does not spuriously abort boot.
+constexpr std::chrono::milliseconds kBackfillTxnTimeout{60000};
+
+// Read-degrade reason labels (ADR-0037 convention).
+constexpr const char* kReasonStoreNotOpen = "store_not_open";
+constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
+constexpr const char* kReasonQueryError = "query_error";
+// Sample the per-site degrade WARN so a sustained PG outage cannot flood the log
+// — the counter is the continuous signal, the log a sampled breadcrumb.
+constexpr std::uint64_t kReadDegradeLogSample = 100;
+constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
+
+// Backfill batch size. 14 columns/row × this must stay well under libpq's 65535
+// bind-parameter ceiling (14 × 2000 = 28 000). Streaming the legacy table in
+// id-ordered batches this size bounds peak memory independently of total
+// legacy volume (the table can reach tens of millions of rows / ~16 GB; a
+// whole-table read would OOM — #2661).
+constexpr std::size_t kBackfillBatchRows = 2000;
+
+int64_t now_epoch() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+std::int64_t to_i64(const char* s) {
+    if (s == nullptr || s[0] == '\0')
+        return 0;
+    return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
+}
+bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
+
+// sanitize_utf8_strict scrubs invalid UTF-8 to U+FFFD but keeps embedded NUL
+// (a valid ASCII byte). PostgreSQL TEXT cannot store a NUL and libpq's
+// text-format bind C-string-truncates at the first one, silently dropping the
+// rest. On the FAIL-HARD audit path a hostile or mis-encoded value would
+// otherwise fail the INSERT (SQLSTATE 22021 / truncation) and take a real audit
+// event down — the exact evidence-integrity hole this closes (ADR-0040 /
+// #1593). So after the UTF-8 scrub, replace every NUL with U+FFFD too. We do
+// NOT touch utf8_sanitize.hpp itself — NUL handling is a PG-bind concern local
+// to the PG stores.
+std::string sanitize_pg_text(std::string_view s) {
+    std::string out = sanitize_utf8_strict(s);
+    std::size_t pos = 0;
+    while ((pos = out.find('\0', pos)) != std::string::npos) {
+        out.replace(pos, 1, "\xEF\xBF\xBD");
+        pos += 3;
     }
-
-    sqlite3_exec(db_.get(), "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db_.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
-    create_tables();
-    if (db_)
-        spdlog::info("AuditStore: opened {} (retention={}d)", db_path.string(), retention_days_);
+    return out;
 }
 
-AuditStore::~AuditStore() {
-    // Join FIRST: the cleanup thread touches `db_.get()` every pass, so the connection
-    // must outlive it. `db_`'s own destructor then closes the handle.
-    stop_cleanup();
+std::string text_col(PGresult* res, int row, int col) {
+    if (PQgetisnull(res, row, col))
+        return {};
+    return std::string(PQgetvalue(res, row, col));
 }
 
-bool AuditStore::is_open() const {
-    return static_cast<bool>(db_);
+// ── Read-degrade observability (mirrors ResponseStore/InventoryStore) ────────
+struct DegradeSampler {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::int64_t> last_ts{0};
+};
+
+bool note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason, DegradeSampler& s) {
+    if (metrics)
+        metrics->counter("yuzu_server_audit_read_degrade_total", {{"reason", reason}}).increment();
+    const std::int64_t now = now_epoch();
+    const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
+    const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool new_episode = prev == 0 || (now - prev) > kDegradeEpisodeGapSecs;
+    return new_episode || (n % kReadDegradeLogSample) == 0;
 }
 
-void AuditStore::create_tables() {
-    static const std::vector<Migration> kMigrations = {
+// Serialize the four guard facts to a stable string — the durable dedup key
+// (mirrors ResponseStore's `facts_ser`). Compares the whole FACT SET, not the
+// classified enum, so a Wipe arriving underneath a standing BadState (the
+// dead-CMOS-then-NTP sequence that silently wiped the whole trail) is NOT
+// suppressed: the fact set differs, so the pass declines again.
+std::string serialize_facts(const audit_retention::Facts& f) {
+    return std::string(f.has_expired ? "e" : "-") + (f.would_wipe ? "w" : "-") +
+           (f.big_step ? "s" : "-") + (f.prev_unusable ? "u" : "-");
+}
+
+// ── Postgres schema (ADR-0040): the FINAL column set of the SQLite store's
+// three migrations, collapsed into one v1. Unqualified DDL — the migration
+// runner sets search_path to `audit_store` for the migration transaction.
+// Runtime statements below schema-qualify explicitly. Unlike SQLite, the
+// partial retention index is created IN the migration: a PG index build runs
+// inside the migration txn and a failure correctly fails the migration, which
+// for an evidence store is the right fail-closed posture (ADR-0040).
+const std::vector<pg::PgMigration>& migrations() {
+    static const std::vector<pg::PgMigration> kMigrations = {
         {1, R"(
-            CREATE TABLE IF NOT EXISTS audit_events (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp       INTEGER NOT NULL,
+            CREATE TABLE audit_events (
+                id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                timestamp       BIGINT  NOT NULL,
                 principal       TEXT    NOT NULL,
                 principal_role  TEXT    NOT NULL,
                 action          TEXT    NOT NULL,
-                target_type     TEXT,
-                target_id       TEXT,
-                detail          TEXT,
-                source_ip       TEXT,
-                user_agent      TEXT,
-                session_id      TEXT,
+                target_type     TEXT    NOT NULL DEFAULT '',
+                target_id       TEXT    NOT NULL DEFAULT '',
+                detail          TEXT    NOT NULL DEFAULT '',
+                source_ip       TEXT    NOT NULL DEFAULT '',
+                user_agent      TEXT    NOT NULL DEFAULT '',
+                session_id      TEXT    NOT NULL DEFAULT '',
                 result          TEXT    NOT NULL,
-                ttl_expires_at  INTEGER DEFAULT 0
+                ttl_expires_at  BIGINT  NOT NULL DEFAULT 0,
+                principal_class TEXT    NOT NULL DEFAULT ''
             );
-            CREATE INDEX IF NOT EXISTS idx_audit_ts
-                ON audit_events(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_audit_principal_ts
-                ON audit_events(principal, timestamp);
-            CREATE INDEX IF NOT EXISTS idx_audit_action_ts
-                ON audit_events(action, timestamp);
-            CREATE INDEX IF NOT EXISTS idx_audit_target_ts
-                ON audit_events(target_type, target_id, timestamp);
-        )"},
-        // ADR-1005 Decision 9 / execution-plan Phase 3a: additive actor-class
-        // column, no delegation semantics, no Postgres migration required (the
-        // exec plan explicitly scopes this ahead of AuditStore's own eventual PG
-        // Wave-1 cutover). Existing rows backfill to '' (honest-empty — this
-        // program cannot retroactively attribute historical rows).
-        {2, R"(
-            ALTER TABLE audit_events ADD COLUMN principal_class TEXT NOT NULL DEFAULT '';
-        )"},
-        // Durable state for the retention clock guard (#2360). One row, so this
-        // migration is instant on any table size -- unlike the retention index,
-        // which is deliberately NOT here (see ensure_retention_index).
-        {3, R"(
-            CREATE TABLE IF NOT EXISTS audit_retention_meta (
+            CREATE INDEX idx_audit_ts ON audit_events(timestamp);
+            CREATE INDEX idx_audit_principal_ts ON audit_events(principal, timestamp);
+            CREATE INDEX idx_audit_action_ts ON audit_events(action, timestamp);
+            CREATE INDEX idx_audit_target_ts ON audit_events(target_type, target_id, timestamp);
+            CREATE INDEX idx_audit_ttl_id
+                ON audit_events(ttl_expires_at, id) WHERE ttl_expires_at > 0;
+
+            -- Durable state for the reap clock-guard (#2360, ADR-0040). SHARED
+            -- k/v rows (not process-local) — N server replicas each run the
+            -- sweep, so the persisted reading + anomaly-dedup fact set must be
+            -- one shared truth under the sweep's advisory lock. `value` is TEXT
+            -- (holds the integer `last_pass_now`, the `last_anomaly_facts`
+            -- string, and the one-time `backfill_complete` marker).
+            CREATE TABLE audit_retention_meta (
                 key   TEXT PRIMARY KEY,
-                value INTEGER NOT NULL
+                value TEXT NOT NULL
             );
         )"},
     };
-    if (!MigrationRunner::run(db_.get(), "audit_store", kMigrations)) {
-        // Deliberate early close: from here every operation fails, which is the
-        // fail-closed posture for an evidence store whose schema is wrong.
-        spdlog::error("AuditStore: schema migration failed, closing database");
-        db_.close();
+    return kMigrations;
+}
+
+// ── Legacy (SQLite) schema introspection for the backfill ────────────────────
+bool legacy_has_column(sqlite3* db, const char* table, const char* col) {
+    // Table names here are code literals, so inlining is injection-free; PRAGMA
+    // does not accept a bound table name.
+    const std::string q = std::string("PRAGMA table_info(") + table + ")";
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db, q.c_str(), -1, s.addr(), nullptr) != SQLITE_OK)
+        return false;
+    while (sqlite3_step(s.get()) == SQLITE_ROW) {
+        const auto* name = sqlite3_column_text(s.get(), 1); // column 1 = name
+        if (name && std::strcmp(reinterpret_cast<const char*>(name), col) == 0)
+            return true;
+    }
+    return false;
+}
+
+bool legacy_has_table(sqlite3* db, const char* table) {
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", -1,
+                           s.addr(), nullptr) != SQLITE_OK)
+        return false;
+    sqlite3_bind_text(s.get(), 1, table, -1, SQLITE_STATIC);
+    return sqlite3_step(s.get()) == SQLITE_ROW;
+}
+
+} // namespace
+
+// ── Construction ─────────────────────────────────────────────────────────────
+
+AuditStore::AuditStore(pg::PgPool& pool, int retention_days, int cleanup_interval_min)
+    : pool_(pool), retention_days_(retention_days), cleanup_interval_min_(cleanup_interval_min) {
+    auto lease = pool_.acquire();
+    if (!lease) {
+        spdlog::error("AuditStore: no database connection at construction ({}) — audit "
+                      "persistence disabled",
+                      pool_.last_error());
         return;
     }
-    ensure_retention_index();
-    if (auto r = load_meta(kLastPassNowKey)) {
-        last_pass_now_ = *r;
-    } else {
-        last_pass_now_.reset();
-        // BOTH non-benign shapes are carried as an anomaly. Absent alone is the
-        // ordinary fresh-install case and says nothing. Malformed and Unreadable
-        // both mean "there is durable state and we could not use it", which the
-        // first pass must report rather than treat as a clean slate.
-        loaded_meta_unusable_ = (r.error() != MetaReadError::Absent);
-        if (r.error() == MetaReadError::Malformed)
-            spdlog::error("AuditStore: the stored retention clock reading is not an integer; "
-                          "treating it as a clock anomaly and re-anchoring on the next pass");
-        else if (r.error() == MetaReadError::Unreadable)
-            spdlog::error("AuditStore: could not read the stored retention clock reading; the "
-                          "restart-surviving half of the clock guard starts this process with no "
-                          "comparison point");
-    }
-}
-
-void AuditStore::ensure_retention_index() {
-    // The guarded cleanup pass issues two EXISTS probes and one ordered LIMIT
-    // delete per pass, all keyed on ttl_expires_at, under the same exclusive
-    // lock every audit INSERT takes. Without a covering index each is a full
-    // scan of a table that reaches millions of rows, so the guard would trade a
-    // wipe risk for a write stall. Partial on `ttl_expires_at > 0` because rows
-    // with retention disabled (ttl 0) are never candidates -- and because
-    // matching the probes' own predicate is what lets SQLite pick it, so the
-    // term is load-bearing in the queries too, not just here.
-    //
-    // Built OUTSIDE MigrationRunner, best-effort, deliberately. A failed
-    // migration closes the database, and from then on every log() returns false
-    // -- so routing an O(N log N) index build through that fail-closed path
-    // would let a transient temp-space shortfall at the first post-upgrade boot
-    // take the SOC 2 audit trail offline. The index is a PERFORMANCE artifact;
-    // the guard is correct without it. Measured cost at 5M rows on NVMe: ~81 MB
-    // and ~1.8-3.3 s, paid once. At 50M rows the build reads a ~16 GB table --
-    // tens of seconds on local NVMe, potentially minutes on overlayfs or network
-    // storage, which is why `upgrading.md` tells operators to widen the
-    // orchestrator's startup budget. The elapsed time is logged when it is long
-    // enough for an operator to have noticed.
-    if (!db_)
-        return; // symmetry with load_meta/store_meta; also true after a failed migration
-    const auto t0 = std::chrono::steady_clock::now();
-    SqliteErrMsg err;
-    const int rc = sqlite3_exec(db_.get(),
-                                "CREATE INDEX IF NOT EXISTS idx_audit_ttl_id "
-                                "ON audit_events(ttl_expires_at, id) WHERE ttl_expires_at > 0;",
-                                nullptr, nullptr, err.addr());
-    const auto ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
-            .count();
-    if (rc != SQLITE_OK) {
-        // Degraded, not broken: retention still runs, just with full scans under
-        // the store lock, which makes the hold grow with the table. LOG ONLY --
-        // there is deliberately no metric for this state (#2526): three separate
-        // implementations of a health gauge here each shipped a defect, for a
-        // signal about a PERFORMANCE artifact the guard is correct without.
-        spdlog::error("AuditStore: could not create idx_audit_ttl_id ({}); retention will run "
-                      "WITHOUT its index and each pass will scan audit_events",
-                      err.c_str());
+    if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
+        spdlog::error("AuditStore: schema migration failed — audit persistence disabled");
         return;
     }
-    if (ms >= 1000)
-        spdlog::info("AuditStore: built idx_audit_ttl_id in {} ms (one-time, first boot after "
-                     "upgrade on an existing audit_events)",
-                     ms);
+    open_ = true;
+    spdlog::info("AuditStore initialized (schema {}, retention={}d)", kStoreName, retention_days_);
 }
 
-std::expected<std::int64_t, AuditStore::MetaReadError>
-AuditStore::load_meta(const char* key) const {
-    if (!db_)
-        return std::unexpected(MetaReadError::Unreadable);
-    SqliteStmt stmt;
-    if (sqlite3_prepare_v2(db_.get(), "SELECT value FROM audit_retention_meta WHERE key = ?", -1,
-                           stmt.addr(), nullptr) != SQLITE_OK)
-        return std::unexpected(MetaReadError::Unreadable);
-    sqlite3_bind_text(stmt.get(), 1, key, -1, SQLITE_STATIC);
-    const int rc = sqlite3_step(stmt.get());
-    if (rc == SQLITE_ROW) {
-        // Check the STORED TYPE, do not just coerce. The table is not `STRICT`,
-        // so `value INTEGER NOT NULL` is an affinity preference, not a
-        // constraint: SQLite accepts a TEXT value into it, and
-        // `sqlite3_column_int64` then silently coerces `'not-a-number'` to 0.
-        // Zero is a legitimate reading (a dead CMOS at the Unix epoch is the
-        // motivating case), so without this check a corrupted or hand-edited row
-        // is indistinguishable from a real one, and the "unparseable durable
-        // state is an anomaly" property this guard claims would not exist.
-        // Verified against the shipped SQLite before this check was written.
-        if (sqlite3_column_type(stmt.get(), 0) != SQLITE_INTEGER)
-            return std::unexpected(MetaReadError::Malformed); // present, but not a number
-        return sqlite3_column_int64(stmt.get(), 0);
+AuditStore::~AuditStore() {
+    // Join FIRST: the cleanup thread leases `pool_` every pass, so it must be
+    // stopped before this object (and, upstream, the pool) is torn down.
+    stop_cleanup();
+}
+
+// ── Backfill (ADR-0009 MANDATORY class / ADR-0040) ───────────────────────────
+
+bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path) {
+    if (!open_)
+        return false;
+
+    const auto backfill_metric = [this](const char* result) {
+        if (metrics_)
+            metrics_->counter("yuzu_server_audit_backfill_total", {{"result", result}}).increment();
+    };
+
+    // Stamp the one-time completion marker + advance the identity sequence past
+    // the migrated ids, atomically. Called once at the end (and on the
+    // no-legacy fresh-install path with an empty table). Advancing the sequence
+    // is LOAD-BEARING: the id column is GENERATED ALWAYS AS IDENTITY and the
+    // backfill supplies explicit ids via OVERRIDING SYSTEM VALUE, so without
+    // this the sequence still starts at 1 and the first live log() would collide
+    // with a backfilled id and fail the fail-HARD write forever.
+    const auto stamp_complete = [this]() -> bool {
+        return pool_.with_txn_for(kBackfillTxnTimeout, [](PGconn* c) -> bool {
+            pg::PgResult sv = pg::exec_params(
+                c,
+                "SELECT setval(pg_get_serial_sequence('audit_store.audit_events','id'), "
+                "GREATEST((SELECT COALESCE(MAX(id),0) FROM audit_store.audit_events), 1), "
+                "(SELECT COUNT(*) FROM audit_store.audit_events) > 0)",
+                std::vector<std::string>{});
+            if (sv.status() != PGRES_TUPLES_OK) {
+                spdlog::error("AuditStore: migrate_from_sqlite: sequence advance failed: {}",
+                              PQerrorMessage(c));
+                return false;
+            }
+            pg::PgResult mk = pg::exec_params(
+                c,
+                "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES "
+                "('backfill_complete', $1) ON CONFLICT (key) DO NOTHING",
+                std::vector<std::string>{std::to_string(now_epoch())});
+            if (mk.status() != PGRES_COMMAND_OK) {
+                spdlog::error("AuditStore: migrate_from_sqlite: marker stamp failed: {}",
+                              PQerrorMessage(c));
+                return false;
+            }
+            return true;
+        });
+    };
+
+    // 1. Idempotency marker + resume point, on a short-lived lease released
+    // before any legacy I/O (holding two size-1-pool leases at once deadlocks).
+    // Resume point ASSUMES the intended cutover shape (PG starts empty, legacy
+    // present): during backfill the only rows in PG are backfilled ones (log()
+    // is inert until this returns and boot completes), so `MAX(id)` is a safe
+    // id-ordered resume cursor after a mid-backfill crash.
+    std::int64_t resume_from = 0;
+    {
+        auto lease = pool_.acquire();
+        if (!lease) {
+            spdlog::error("AuditStore: migrate_from_sqlite: no database connection ({})",
+                          pool_.last_error());
+            backfill_metric("failed");
+            return false;
+        }
+        pg::PgResult mk = pg::exec_params(
+            lease.get(), "SELECT 1 FROM audit_store.audit_retention_meta WHERE key='backfill_complete'",
+            std::vector<std::string>{});
+        if (mk.status() != PGRES_TUPLES_OK) {
+            spdlog::error("AuditStore: migrate_from_sqlite: marker lookup failed: {}",
+                          PQerrorMessage(lease.get()));
+            backfill_metric("failed");
+            return false;
+        }
+        if (PQntuples(mk.get()) > 0) {
+            spdlog::debug("AuditStore: migrate_from_sqlite already completed, skipping");
+            return true;
+        }
+        pg::PgResult mx = pg::exec_params(lease.get(),
+                                          "SELECT COALESCE(MAX(id),0) FROM audit_store.audit_events",
+                                          std::vector<std::string>{});
+        if (mx.status() != PGRES_TUPLES_OK) {
+            spdlog::error("AuditStore: migrate_from_sqlite: resume-point read failed: {}",
+                          PQerrorMessage(lease.get()));
+            backfill_metric("failed");
+            return false;
+        }
+        resume_from = to_i64(PQgetvalue(mx.get(), 0, 0));
     }
-    // A non-DONE step is a READ FAILURE (SQLITE_CORRUPT, SQLITE_BUSY,
-    // SQLITE_IOERR), not an empty table. Collapsing it into Absent would make a
-    // transient error at boot look exactly like a fresh install and silently
-    // disable the persisted step check for the whole process lifetime -- the
-    // silence-means-healthy hole this guard exists to close.
-    if (rc != SQLITE_DONE)
-        return std::unexpected(MetaReadError::Unreadable);
-    // Absent is NOT the same as malformed or unreadable -- see MetaReadError.
-    // Returning a typed error rather than 0 matters because 0 is a LEGITIMATE
-    // reading: a dead CMOS reporting the Unix epoch is the motivating case for
-    // this whole guard, and collapsing it into a sentinel would suppress the
-    // check on the very pass after NTP corrects.
-    return std::unexpected(MetaReadError::Absent);
+
+    // 2. Legacy present?
+    std::error_code ec;
+    const bool legacy_exists = std::filesystem::exists(legacy_db_path, ec);
+    if (ec) {
+        spdlog::error("AuditStore: migrate_from_sqlite: cannot stat legacy path {}: {}",
+                      legacy_db_path.string(), ec.message());
+        backfill_metric("failed");
+        return false;
+    }
+    if (!legacy_exists) {
+        // Fresh install — nothing to migrate. Stamp complete so every later boot
+        // is a cheap no-op.
+        if (!stamp_complete()) {
+            backfill_metric("failed");
+            return false;
+        }
+        spdlog::info("AuditStore: migrate_from_sqlite: no legacy audit.db at {}; marking backfill "
+                     "complete (fresh install)",
+                     legacy_db_path.string());
+        backfill_metric("fresh");
+        return true;
+    }
+
+    // 3. Open the legacy DB read-only.
+    SqliteDb legacy;
+    if (sqlite3_open_v2(legacy_db_path.string().c_str(), legacy.addr(), SQLITE_OPEN_READONLY,
+                        nullptr) != SQLITE_OK) {
+        spdlog::error("AuditStore: migrate_from_sqlite: failed to open legacy db {}: {}",
+                      legacy_db_path.string(),
+                      legacy ? sqlite3_errmsg(legacy.get()) : "open failed");
+        backfill_metric("failed");
+        return false;
+    }
+    sqlite3_exec(legacy.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
+    if (!legacy_has_table(legacy.get(), "audit_events")) {
+        // A legacy file with no audit_events table is not a migration source —
+        // treat like a fresh install rather than looping forever.
+        if (!stamp_complete()) {
+            backfill_metric("failed");
+            return false;
+        }
+        spdlog::warn("AuditStore: migrate_from_sqlite: legacy db {} has no audit_events table; "
+                     "marking backfill complete",
+                     legacy_db_path.string());
+        backfill_metric("fresh");
+        return true;
+    }
+    const bool has_principal_class =
+        legacy_has_column(legacy.get(), "audit_events", "principal_class");
+
+    // Legacy row count for reconciliation.
+    std::int64_t legacy_count = 0;
+    {
+        SqliteStmt cnt;
+        if (sqlite3_prepare_v2(legacy.get(), "SELECT COUNT(*) FROM audit_events", -1, cnt.addr(),
+                               nullptr) != SQLITE_OK ||
+            sqlite3_step(cnt.get()) != SQLITE_ROW) {
+            spdlog::error("AuditStore: migrate_from_sqlite: legacy count failed: {}",
+                          sqlite3_errmsg(legacy.get()));
+            backfill_metric("failed");
+            return false;
+        }
+        legacy_count = sqlite3_column_int64(cnt.get(), 0);
+    }
+
+    // 4. Stream in bounded, id-ordered batches; each batch is one PG txn with a
+    // multi-row INSERT ... OVERRIDING SYSTEM VALUE ... ON CONFLICT (id) DO
+    // NOTHING (idempotent + resumable). ALL columns copied incl. principal_class
+    // + ttl_expires_at so the retention horizon is preserved exactly.
+    const std::string select_sql =
+        std::string("SELECT id, timestamp, principal, principal_role, action, "
+                    "IFNULL(target_type,''), IFNULL(target_id,''), IFNULL(detail,''), "
+                    "IFNULL(source_ip,''), IFNULL(user_agent,''), IFNULL(session_id,''), "
+                    "result, IFNULL(ttl_expires_at,0), ") +
+        (has_principal_class ? "IFNULL(principal_class,'')" : "''") +
+        " FROM audit_events WHERE id > ? ORDER BY id ASC LIMIT ?";
+    SqliteStmt sel;
+    if (sqlite3_prepare_v2(legacy.get(), select_sql.c_str(), -1, sel.addr(), nullptr) != SQLITE_OK) {
+        spdlog::error("AuditStore: migrate_from_sqlite: legacy prepare failed: {}",
+                      sqlite3_errmsg(legacy.get()));
+        backfill_metric("failed");
+        return false;
+    }
+
+    struct Row {
+        std::int64_t id{0};
+        std::int64_t timestamp{0};
+        std::string principal, principal_role, action, target_type, target_id, detail, source_ip,
+            user_agent, session_id, result;
+        std::int64_t ttl{0};
+        std::string principal_class;
+    };
+    std::int64_t inserted = 0;
+    for (;;) {
+        std::vector<Row> batch;
+        batch.reserve(kBackfillBatchRows);
+        sqlite3_reset(sel.get());
+        sqlite3_bind_int64(sel.get(), 1, resume_from);
+        sqlite3_bind_int64(sel.get(), 2, static_cast<std::int64_t>(kBackfillBatchRows));
+        int rc = SQLITE_DONE;
+        const auto col = [&](int i) {
+            const auto* v = sqlite3_column_text(sel.get(), i);
+            return v ? std::string(reinterpret_cast<const char*>(v)) : std::string{};
+        };
+        while ((rc = sqlite3_step(sel.get())) == SQLITE_ROW) {
+            Row r;
+            r.id = sqlite3_column_int64(sel.get(), 0);
+            r.timestamp = sqlite3_column_int64(sel.get(), 1);
+            r.principal = col(2);
+            r.principal_role = col(3);
+            r.action = col(4);
+            r.target_type = col(5);
+            r.target_id = col(6);
+            r.detail = col(7);
+            r.source_ip = col(8);
+            r.user_agent = col(9);
+            r.session_id = col(10);
+            r.result = col(11);
+            r.ttl = sqlite3_column_int64(sel.get(), 12);
+            r.principal_class = col(13);
+            batch.push_back(std::move(r));
+        }
+        if (rc != SQLITE_DONE) {
+            spdlog::error("AuditStore: migrate_from_sqlite: legacy read failed (rc={})", rc);
+            backfill_metric("failed");
+            return false;
+        }
+        if (batch.empty())
+            break;
+
+        const bool ok = pool_.with_txn_for(kBackfillTxnTimeout, [&](PGconn* c) -> bool {
+            std::string sql =
+                "INSERT INTO audit_store.audit_events (id, timestamp, principal, principal_role, "
+                "action, target_type, target_id, detail, source_ip, user_agent, session_id, "
+                "result, ttl_expires_at, principal_class) OVERRIDING SYSTEM VALUE VALUES ";
+            std::vector<std::string> params;
+            params.reserve(batch.size() * 14);
+            for (std::size_t i = 0; i < batch.size(); ++i) {
+                const auto& r = batch[i];
+                const std::size_t p = params.size(); // 0-based; first placeholder is $(p+1)
+                if (i != 0)
+                    sql += ",";
+                sql += "($" + std::to_string(p + 1) + "::bigint,$" + std::to_string(p + 2) +
+                       "::bigint,$" + std::to_string(p + 3) + ",$" + std::to_string(p + 4) + ",$" +
+                       std::to_string(p + 5) + ",$" + std::to_string(p + 6) + ",$" +
+                       std::to_string(p + 7) + ",$" + std::to_string(p + 8) + ",$" +
+                       std::to_string(p + 9) + ",$" + std::to_string(p + 10) + ",$" +
+                       std::to_string(p + 11) + ",$" + std::to_string(p + 12) + ",$" +
+                       std::to_string(p + 13) + "::bigint,$" + std::to_string(p + 14) + ")";
+                params.push_back(std::to_string(r.id));
+                params.push_back(std::to_string(r.timestamp));
+                // Sanitize the untrusted free-text columns the SAME way log()
+                // does, so a mis-encoded legacy byte cannot fail the fail-HARD
+                // batch INSERT (SQLSTATE 22021 / NUL truncation) and abort the
+                // whole backfill. result/principal_class are enum-controlled.
+                params.push_back(sanitize_pg_text(r.principal));
+                params.push_back(sanitize_pg_text(r.principal_role));
+                params.push_back(sanitize_pg_text(r.action));
+                params.push_back(sanitize_pg_text(r.target_type));
+                params.push_back(sanitize_pg_text(r.target_id));
+                params.push_back(sanitize_pg_text(r.detail));
+                params.push_back(sanitize_pg_text(r.source_ip));
+                params.push_back(sanitize_pg_text(r.user_agent));
+                params.push_back(sanitize_pg_text(r.session_id));
+                params.push_back(r.result);
+                params.push_back(std::to_string(r.ttl));
+                params.push_back(r.principal_class);
+            }
+            sql += " ON CONFLICT (id) DO NOTHING";
+            pg::PgResult ins = pg::exec_params(c, sql.c_str(), params);
+            if (ins.status() != PGRES_COMMAND_OK) {
+                spdlog::error("AuditStore: migrate_from_sqlite: batch insert failed: {}",
+                              PQerrorMessage(c));
+                return false;
+            }
+            return true;
+        });
+        if (!ok) {
+            spdlog::error("AuditStore: migrate_from_sqlite: batch commit failed (aborting "
+                          "backfill unstamped; the next boot retries from MAX(id))");
+            backfill_metric("failed");
+            return false;
+        }
+        inserted += static_cast<std::int64_t>(batch.size());
+        resume_from = batch.back().id;
+        if (batch.size() < kBackfillBatchRows)
+            break;
+    }
+
+    // 5. Copy audit_retention_meta (durable clock-guard reading). Legacy `value`
+    // is INTEGER; PG `value` is TEXT — copy as text. DO NOTHING never clobbers a
+    // reading a running replica has already advanced past.
+    if (legacy_has_table(legacy.get(), "audit_retention_meta")) {
+        SqliteStmt ms;
+        if (sqlite3_prepare_v2(legacy.get(), "SELECT key, value FROM audit_retention_meta", -1,
+                               ms.addr(), nullptr) != SQLITE_OK) {
+            spdlog::error("AuditStore: migrate_from_sqlite: legacy meta prepare failed: {}",
+                          sqlite3_errmsg(legacy.get()));
+            backfill_metric("failed");
+            return false;
+        }
+        std::vector<std::pair<std::string, std::string>> meta_rows;
+        int rc = SQLITE_DONE;
+        while ((rc = sqlite3_step(ms.get())) == SQLITE_ROW) {
+            const auto* k = sqlite3_column_text(ms.get(), 0);
+            if (!k)
+                continue;
+            std::string key(reinterpret_cast<const char*>(k));
+            // Never carry a stale marker across; it is stamped fresh below.
+            if (key == "backfill_complete")
+                continue;
+            meta_rows.emplace_back(std::move(key),
+                                   std::to_string(sqlite3_column_int64(ms.get(), 1)));
+        }
+        if (rc != SQLITE_DONE) {
+            spdlog::error("AuditStore: migrate_from_sqlite: legacy meta read failed (rc={})", rc);
+            backfill_metric("failed");
+            return false;
+        }
+        if (!meta_rows.empty()) {
+            const bool ok = pool_.with_txn_for(kBackfillTxnTimeout, [&](PGconn* c) -> bool {
+                for (const auto& [k, v] : meta_rows) {
+                    pg::PgResult r = pg::exec_params(
+                        c,
+                        "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES ($1, $2) "
+                        "ON CONFLICT (key) DO NOTHING",
+                        std::vector<std::string>{k, v});
+                    if (r.status() != PGRES_COMMAND_OK) {
+                        spdlog::error("AuditStore: migrate_from_sqlite: meta copy failed: {}",
+                                      PQerrorMessage(c));
+                        return false;
+                    }
+                }
+                return true;
+            });
+            if (!ok) {
+                backfill_metric("failed");
+                return false;
+            }
+        }
+    }
+
+    // 6. Row-count reconciliation (ADR-0040: logged AND asserted).
+    {
+        auto lease = pool_.acquire();
+        if (!lease) {
+            spdlog::error("AuditStore: migrate_from_sqlite: reconciliation lease failed ({})",
+                          pool_.last_error());
+            backfill_metric("failed");
+            return false;
+        }
+        pg::PgResult pc = pg::exec_params(
+            lease.get(), "SELECT COUNT(*) FROM audit_store.audit_events", std::vector<std::string>{});
+        if (pc.status() != PGRES_TUPLES_OK) {
+            spdlog::error("AuditStore: migrate_from_sqlite: reconciliation count failed: {}",
+                          PQerrorMessage(lease.get()));
+            backfill_metric("failed");
+            return false;
+        }
+        const std::int64_t pg_count = to_i64(PQgetvalue(pc.get(), 0, 0));
+        if (pg_count < legacy_count) {
+            spdlog::error("AuditStore: migrate_from_sqlite: reconciliation FAILED — legacy has {} "
+                          "row(s) but PostgreSQL has {}; refusing to mark complete (fail-closed, "
+                          "the next boot retries)",
+                          legacy_count, pg_count);
+            backfill_metric("failed");
+            return false;
+        }
+        spdlog::info("AuditStore: migrate_from_sqlite: reconciled — legacy {} row(s), PostgreSQL "
+                     "{} row(s) ({} inserted this run)",
+                     legacy_count, pg_count, inserted);
+    }
+
+    // 7. Advance the identity sequence + stamp the one-time marker atomically.
+    if (!stamp_complete()) {
+        backfill_metric("failed");
+        return false;
+    }
+
+    // 8. Move the verified legacy file aside (not delete) — the pre-cutover
+    // evidence stays recoverable (operator-managed-backup convention). Failure
+    // here is NON-fatal: the backfill is already committed + marked, so a
+    // rename failure must not refuse boot.
+    std::error_code mv_ec;
+    auto aside = legacy_db_path;
+    aside += ".migrated-" + std::to_string(now_epoch());
+    std::filesystem::rename(legacy_db_path, aside, mv_ec);
+    if (mv_ec)
+        spdlog::warn("AuditStore: migrate_from_sqlite: backfill complete but could not move legacy "
+                     "{} aside ({}); it is safe to archive/remove manually",
+                     legacy_db_path.string(), mv_ec.message());
+    else
+        spdlog::info("AuditStore: migrate_from_sqlite: moved legacy audit db to {}", aside.string());
+
+    backfill_metric("completed");
+    return true;
 }
 
-bool AuditStore::store_meta(const char* key, std::int64_t value) {
-    if (!db_)
-        return false;
-    SqliteStmt stmt;
-    if (sqlite3_prepare_v2(db_.get(),
-                           "INSERT INTO audit_retention_meta (key, value) VALUES (?, ?) "
-                           "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                           -1, stmt.addr(), nullptr) != SQLITE_OK)
-        return false;
-    sqlite3_bind_text(stmt.get(), 1, key, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(stmt.get(), 2, value);
-    return sqlite3_step(stmt.get()) == SQLITE_DONE;
-}
+// ── Write (FAIL-HARD) ────────────────────────────────────────────────────────
 
 bool AuditStore::log(const AuditEvent& event) {
-    std::unique_lock lock(mtx_);
-    if (!db_) {
-        // Audit DB not open — surface as a failure so callers can flag the
-        // gap on the response (HIGH-2 from PR #883). Operators running
-        // audit-off (no AuditStore wired at all) never reach this code
-        // path because AuthRoutes::audit_log short-circuits on a null
-        // store and returns true.
+    if (!open_) {
+        // Audit DB not open — surface as a failure so callers can flag the gap
+        // on the response (HIGH-2, PR #883). Operators running audit-off never
+        // reach here (AuthRoutes short-circuits on a null store).
         emit_failed_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-
-    const char* sql = R"(
-        INSERT INTO audit_events (timestamp, principal, principal_role, action,
-            target_type, target_id, detail, source_ip, user_agent, session_id, result, ttl_expires_at,
-            principal_class)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    )";
-    SqliteStmt stmt;
-    if (sqlite3_prepare_v2(db_.get(), sql, -1, stmt.addr(), nullptr) != SQLITE_OK) {
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
         emit_failed_.fetch_add(1, std::memory_order_relaxed);
-        spdlog::error("AuditStore: sqlite3_prepare_v2 failed: {}", sqlite3_errmsg(db_.get()));
+        spdlog::error("AuditStore::log: no connection for action={} ({}); event lost",
+                      event.action, pool_.last_error());
+        return false;
+    }
+    PGconn* conn = lease.get();
+
+    const int64_t now = now_epoch();
+    const int64_t ts = event.timestamp > 0 ? event.timestamp : now;
+    const int64_t ttl = retention_days_ > 0 ? now + static_cast<int64_t>(retention_days_) * 86400 : 0;
+
+    // Sanitize the untrusted free-text columns; result/principal_class are
+    // enum-controlled (ADR-0040) and bound verbatim.
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "INSERT INTO audit_store.audit_events (timestamp, principal, principal_role, action, "
+        "target_type, target_id, detail, source_ip, user_agent, session_id, result, "
+        "ttl_expires_at, principal_class) "
+        "VALUES ($1::bigint,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::bigint,$13) RETURNING id",
+        std::vector<std::string>{std::to_string(ts), sanitize_pg_text(event.principal),
+                                 sanitize_pg_text(event.principal_role),
+                                 sanitize_pg_text(event.action),
+                                 sanitize_pg_text(event.target_type),
+                                 sanitize_pg_text(event.target_id), sanitize_pg_text(event.detail),
+                                 sanitize_pg_text(event.source_ip),
+                                 sanitize_pg_text(event.user_agent),
+                                 sanitize_pg_text(event.session_id), event.result,
+                                 std::to_string(ttl), event.principal_class});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
+        emit_failed_.fetch_add(1, std::memory_order_relaxed);
+        spdlog::error("AuditStore::log: insert failed for action={}: {}; event lost", event.action,
+                      PQerrorMessage(conn));
         return false;
     }
 
-    auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                   std::chrono::system_clock::now().time_since_epoch())
-                   .count();
-    auto ts = event.timestamp > 0 ? event.timestamp : now;
-    auto ttl = retention_days_ > 0 ? now + retention_days_ * 86400LL : 0;
-
-    sqlite3_bind_int64(stmt.get(), 1, ts);
-    sqlite3_bind_text(stmt.get(), 2, event.principal.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 3, event.principal_role.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 4, event.action.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 5, event.target_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 6, event.target_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 7, event.detail.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 8, event.source_ip.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 9, event.user_agent.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 10, event.session_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 11, event.result.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt.get(), 12, ttl);
-    sqlite3_bind_text(stmt.get(), 13, event.principal_class.c_str(), -1, SQLITE_TRANSIENT);
-
-    int step_rc = sqlite3_step(stmt.get());
-
-    // SOC 2 CC7.2: a privileged-mutation handler that emits an audit event
-    // and silently fails to persist it produces a forensically-empty row.
-    // Surface the failure count so operators can alert on a non-zero rate.
-    // We still bucket the per-result counter below so the success/failure
-    // ratio remains observable separately from the emit-failed signal.
-    if (step_rc != SQLITE_DONE) {
-        emit_failed_.fetch_add(1, std::memory_order_relaxed);
-        spdlog::error("AuditStore: sqlite3_step rc={} ({}); event lost", step_rc,
-                      sqlite3_errmsg(db_.get()));
-        return false;
-    }
-
-    // Bucket the write into a Prometheus-friendly counter so the audit subsystem
-    // is observable from the /metrics scrape. Result vocabulary is open-ended at
-    // call sites — collapse anything we don't recognise into "other" rather than
-    // letting cardinality grow unbounded.
+    // Bucket the write into a Prometheus-friendly counter. Result vocabulary is
+    // open-ended at call sites — collapse anything unrecognised into "other".
     if (event.result == "success")
         events_success_.fetch_add(1, std::memory_order_relaxed);
     else if (event.result == "failure")
@@ -311,222 +679,163 @@ uint64_t AuditStore::events_written(const std::string& result) const noexcept {
     return 0;
 }
 
-std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_pool_size) const {
-    std::shared_lock lock(mtx_);
-    std::vector<AuditEvent> results;
-    if (!db_)
-        return results;
+// ── Reads (degrade-distinguishable, DENY on degrade) ─────────────────────────
+
+std::optional<std::vector<AuditEvent>> AuditStore::query(const AuditQuery& q,
+                                                         std::size_t* out_pool_size) const {
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, sampler))
+            spdlog::warn("AuditStore::query: store not open");
+        return std::nullopt;
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn("AuditStore::query: pool acquire timed out");
+        return std::nullopt;
+    }
+    PGconn* conn = lease.get();
 
     std::string sql =
         "SELECT id, timestamp, principal, principal_role, action, target_type, target_id, detail, "
-        "source_ip, user_agent, session_id, result, principal_class FROM audit_events WHERE 1=1";
-    std::vector<std::pair<int, std::string>> text_binds;
-    // int64_binds: (param_index, value) pairs for integer parameters
-    std::vector<std::pair<int, int64_t>> int_binds;
-    int bind_idx = 1;
-
+        "source_ip, user_agent, session_id, result, principal_class FROM audit_store.audit_events "
+        "WHERE 1=1";
+    std::vector<std::string> binds;
+    int idx = 1;
     if (!q.principal.empty()) {
-        sql += " AND principal = ?";
-        text_binds.emplace_back(bind_idx++, q.principal);
+        sql += " AND principal = $" + std::to_string(idx++);
+        binds.push_back(q.principal);
     }
     if (!q.action.empty()) {
-        sql += " AND action = ?";
-        text_binds.emplace_back(bind_idx++, q.action);
+        sql += " AND action = $" + std::to_string(idx++);
+        binds.push_back(q.action);
     }
     if (!q.target_type.empty()) {
-        sql += " AND target_type = ?";
-        text_binds.emplace_back(bind_idx++, q.target_type);
+        sql += " AND target_type = $" + std::to_string(idx++);
+        binds.push_back(q.target_type);
     }
     if (!q.target_id.empty()) {
-        sql += " AND target_id = ?";
-        text_binds.emplace_back(bind_idx++, q.target_id);
+        sql += " AND target_id = $" + std::to_string(idx++);
+        binds.push_back(q.target_id);
     }
     if (q.since > 0) {
-        sql += " AND timestamp >= ?";
-        int_binds.emplace_back(bind_idx++, q.since);
+        sql += " AND timestamp >= $" + std::to_string(idx++) + "::bigint";
+        binds.push_back(std::to_string(q.since));
     }
     if (q.until > 0) {
-        sql += " AND timestamp <= ?";
-        int_binds.emplace_back(bind_idx++, q.until);
+        sql += " AND timestamp <= $" + std::to_string(idx++) + "::bigint";
+        binds.push_back(std::to_string(q.until));
     }
-    // Prefix OR-group (e.g. auth./mfa./session. for the auth-log sample, #4).
-    // Prefixes are code-controlled constants, not user input, so they carry no
-    // LIKE metacharacters to escape; each binds as `<prefix>%`.
+    // Prefix OR-group (auth./mfa./session. for the auth-log sample, #4).
+    // Prefixes are code-controlled constants; each binds as `<prefix>%`. Any
+    // prefix carrying a LIKE metacharacter is dropped (fails closed for that
+    // prefix); an all-empty group emits an always-false guard so it never
+    // silently widens to "all actions" (Hermes M-2).
     if (!q.action_prefixes.empty()) {
         sql += " AND (";
         bool first = true;
         for (const auto& p : q.action_prefixes) {
-            // Runtime enforcement of the header contract (Hermes M-2): a prefix is
-            // bound into an unescaped `LIKE <p>%`, so a `%`/`_`/`\` in it would be a
-            // wildcard. Prefixes are meant to be literals — drop any that carry LIKE
-            // metacharacters (fails closed for that prefix) rather than trusting the
-            // caller, so a future call site that wires untrusted input cannot smuggle
-            // wildcards.
             if (p.empty() || p.find_first_of("%_\\") != std::string::npos)
                 continue;
-            sql += first ? "action LIKE ?" : " OR action LIKE ?";
-            text_binds.emplace_back(bind_idx++, p + "%");
+            sql += first ? "action LIKE $" + std::to_string(idx)
+                         : " OR action LIKE $" + std::to_string(idx);
+            binds.push_back(p + "%");
+            ++idx;
             first = false;
         }
-        // All prefixes empty → an always-false guard so an explicitly-empty
-        // filter never silently widens to "all actions".
-        sql += first ? "0)" : ")";
-    }
-    // Always order by the indexed timestamp (early-terminating index scan) — never
-    // `ORDER BY RANDOM()`, which would force a full scan of every matching row in
-    // the window while holding the reader lock (Hermes M-1: DoS / cleanup-thread
-    // starvation on a large table). For random_sample we instead bind a bounded
-    // candidate cap here and shuffle+truncate in C++ below. OFFSET is meaningless
-    // under random order, so it is skipped there.
-    const int64_t kRandomSampleScanCap = static_cast<int64_t>(kAuditSampleScanCap);
-    sql += " ORDER BY timestamp DESC";
-    sql += " LIMIT ?";
-    int limit_idx = bind_idx++;
-    int offset_idx = 0;
-    if (q.offset > 0 && !q.random_sample) {
-        sql += " OFFSET ?";
-        offset_idx = bind_idx++;
+        sql += first ? "1=0)" : ")";
     }
 
-    SqliteStmt stmt;
-    if (sqlite3_prepare_v2(db_.get(), sql.c_str(), -1, stmt.addr(), nullptr) != SQLITE_OK) {
-        // UP-5: a prepare failure (corruption, locked-past-timeout, schema drift)
-        // otherwise returns an empty vector indistinguishable from "no rows" — a
-        // false "no audit activity" for an evidence query. Make it observable; a
-        // fully-broken store is already pulled from /readyz, and the error-signaling
-        // query() contract (so the REST layer can 503 instead of 200-empty) is the
-        // tracked follow-up.
-        spdlog::error("AuditStore::query prepare failed: {}", sqlite3_errmsg(db_.get()));
-        return results;
-    }
-
-    for (const auto& [idx, val] : text_binds) {
-        sqlite3_bind_text(stmt.get(), idx, val.c_str(), -1, SQLITE_TRANSIENT);
-    }
-    for (const auto& [idx, val] : int_binds) {
-        sqlite3_bind_int64(stmt.get(), idx, val);
-    }
-    // Under random_sample, over-fetch a bounded candidate pool (capped, indexed)
-    // and sample from it in C++ — bounding both CPU and lock-hold. When the window
-    // holds more than the cap, the pool is the most-recent kRandomSampleScanCap
-    // events (a documented recency bias above the cap; true uniform sampling of an
-    // unbounded window would reintroduce the M-1 full-scan).
+    // Always order by the indexed timestamp — never ORDER BY RANDOM() (a full
+    // scan of the window). For random_sample, over-fetch a bounded candidate
+    // pool and shuffle+truncate in C++ (Hermes M-1). OFFSET is meaningless under
+    // random order, so it is skipped there.
     const int64_t fetch_limit =
-        q.random_sample ? std::max(static_cast<int64_t>(q.limit), kRandomSampleScanCap) : q.limit;
-    sqlite3_bind_int64(stmt.get(), limit_idx, fetch_limit);
-    if (offset_idx > 0) {
-        sqlite3_bind_int64(stmt.get(), offset_idx, q.offset);
+        q.random_sample ? std::max(static_cast<int64_t>(q.limit),
+                                   static_cast<int64_t>(kAuditSampleScanCap))
+                        : static_cast<int64_t>(q.limit);
+    sql += " ORDER BY timestamp DESC LIMIT $" + std::to_string(idx++) + "::bigint";
+    binds.push_back(std::to_string(fetch_limit));
+    if (q.offset > 0 && !q.random_sample) {
+        sql += " OFFSET $" + std::to_string(idx++) + "::bigint";
+        binds.push_back(std::to_string(q.offset));
     }
 
-    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+    pg::PgResult res = pg::exec_params(conn, sql.c_str(), binds);
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("AuditStore::query: query failed: {}", PQerrorMessage(conn));
+        return std::nullopt;
+    }
+    std::vector<AuditEvent> results;
+    const int n = PQntuples(res.get());
+    results.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
         AuditEvent e;
-        e.id = sqlite3_column_int64(stmt.get(), 0);
-        e.timestamp = sqlite3_column_int64(stmt.get(), 1);
-        auto col_text = [&](int c) -> std::string {
-            auto t = sqlite3_column_text(stmt.get(), c);
-            return t ? reinterpret_cast<const char*>(t) : std::string{};
-        };
-        e.principal = col_text(2);
-        e.principal_role = col_text(3);
-        e.action = col_text(4);
-        e.target_type = col_text(5);
-        e.target_id = col_text(6);
-        e.detail = col_text(7);
-        e.source_ip = col_text(8);
-        e.user_agent = col_text(9);
-        e.session_id = col_text(10);
-        e.result = col_text(11);
-        e.principal_class = col_text(12);
+        e.id = to_i64(PQgetvalue(res.get(), i, 0));
+        e.timestamp = to_i64(PQgetvalue(res.get(), i, 1));
+        e.principal = text_col(res.get(), i, 2);
+        e.principal_role = text_col(res.get(), i, 3);
+        e.action = text_col(res.get(), i, 4);
+        e.target_type = text_col(res.get(), i, 5);
+        e.target_id = text_col(res.get(), i, 6);
+        e.detail = text_col(res.get(), i, 7);
+        e.source_ip = text_col(res.get(), i, 8);
+        e.user_agent = text_col(res.get(), i, 9);
+        e.session_id = text_col(res.get(), i, 10);
+        e.result = text_col(res.get(), i, 11);
+        e.principal_class = text_col(res.get(), i, 12);
         results.push_back(std::move(e));
     }
 
-    // random_sample: shuffle the bounded candidate pool and truncate to limit, so
-    // the returned rows are a random draw rather than the newest-N (Hermes M-1 —
-    // the randomness is now O(pool) in C++, not an unbounded SQL sort under lock).
     if (q.random_sample) {
-        // Report the pre-truncation pool size so the caller can detect the
-        // recency cap (pool == kAuditSampleScanCap ⇒ the window held >= cap and
-        // the sample is recency-biased) — evidence honesty, #4.
         if (out_pool_size)
             *out_pool_size = results.size();
-        if (results.size() > static_cast<std::size_t>(std::max(q.limit, 0))) {
+        const auto keep = static_cast<std::size_t>(std::max(q.limit, 0));
+        if (results.size() > keep) {
             static thread_local std::mt19937_64 rng{std::random_device{}()};
             std::shuffle(results.begin(), results.end(), rng);
-            results.resize(static_cast<std::size_t>(std::max(q.limit, 0)));
+            results.resize(keep);
         }
     }
     return results;
 }
 
-std::size_t AuditStore::total_count() const {
-    std::shared_lock lock(mtx_);
-    if (!db_)
-        return 0;
-    SqliteStmt stmt;
-    if (sqlite3_prepare_v2(db_.get(), "SELECT COUNT(*) FROM audit_events", -1, stmt.addr(), nullptr) !=
-        SQLITE_OK)
-        return 0;
-    std::size_t count = 0;
-    if (sqlite3_step(stmt.get()) == SQLITE_ROW)
-        count = static_cast<std::size_t>(sqlite3_column_int64(stmt.get(), 0));
-    return count;
+std::optional<std::size_t> AuditStore::total_count() const {
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, sampler))
+            spdlog::warn("AuditStore::total_count: store not open");
+        return std::nullopt;
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn("AuditStore::total_count: pool acquire timed out");
+        return std::nullopt;
+    }
+    pg::PgResult res = pg::exec_params(lease.get(), "SELECT COUNT(*) FROM audit_store.audit_events",
+                                       std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("AuditStore::total_count: query failed: {}", PQerrorMessage(lease.get()));
+        return std::nullopt;
+    }
+    return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
 }
 
-namespace {
-
-// Run a one-row EXISTS probe. Returns the REASON on any prepare/bind/step error so
-// the caller can fail closed rather than read a default.
-//
-// `binds` is a span, not a pointer+count: the arity is then deduced from the
-// array at the call site and checked against the statement's own parameter
-// count below. A hand-maintained count could silently disagree with the SQL --
-// and an unbound parameter reads as NULL, which makes `ttl_expires_at < NULL`
-// yield NULL, which makes EXISTS return 0, which reads as "nothing is expired".
-// Retention would then stop forever while every counter reported healthy.
-std::expected<bool, std::string> exists_probe(sqlite3* db, const char* sql,
-                                             std::span<const std::int64_t> binds) {
-    // Returns the REASON, not a bare optional. The caller cannot reconstruct it
-    // with `sqlite3_errmsg` after the fact: the arity branch below fails without
-    // any SQLite call having failed, so errmsg would report "not an error" (or a
-    // stale message from an unrelated call) in a SOC 2-relevant warn line, and
-    // the statement is finalized by the time the caller looks.
-    SqliteStmt stmt;
-    if (sqlite3_prepare_v2(db, sql, -1, stmt.addr(), nullptr) != SQLITE_OK)
-        return std::unexpected(sqlite3_errmsg(db));
-    if (static_cast<std::size_t>(sqlite3_bind_parameter_count(stmt.get())) != binds.size())
-        return std::unexpected("bind arity mismatch: the SQL and the call site disagree");
-    for (std::size_t i = 0; i < binds.size(); ++i)
-        if (sqlite3_bind_int64(stmt.get(), static_cast<int>(i) + 1, binds[i]) != SQLITE_OK)
-            return std::unexpected(sqlite3_errmsg(db));
-    // EXISTS(...) always yields exactly one row holding 0 or 1.
-    if (sqlite3_step(stmt.get()) != SQLITE_ROW)
-        return std::unexpected(sqlite3_errmsg(db));
-    return sqlite3_column_int(stmt.get(), 0) != 0;
-}
-
-} // namespace
+// ── Retention (clock-guarded, single-sweeper advisory lease — #2360/ADR-0040) ─
 
 std::size_t AuditStore::cleanup_once(std::int64_t now) {
-    // Liveness, stamped for EVERY pass -- including the implausible-`now`
-    // refusal below, declines, and failures. The documented contract is "passes
-    // ATTEMPTED"; a reaper that runs and refuses is healthy, a reaper that never
-    // runs is the failure these two exist to expose, and no other counter moves
-    // in that state. Stamped BEFORE any return so no branch can make the
-    // liveness signal lie.
+    // Liveness, stamped for EVERY pass (attempted) — including declines,
+    // failures, and lock-skips. A reaper that runs and declines is healthy; one
+    // that never runs is the failure these expose. Stamped BEFORE any return.
     retention_passes_.fetch_add(1, std::memory_order_relaxed);
 
-    // Sanitise the CALLER's clock, not only the stored reading. In production
-    // `run_cleanup` passes `system_clock` seconds, but this method is public and
-    // `now + window + kAuditTtlFutureSlackSec` below is signed-overflow UB for a
-    // `now` near INT64_MAX. A reading that far out is not one this guard can
-    // reason about, so refuse the pass instead of computing on it. Counted, not
-    // silent: returning a bare 0 is indistinguishable from a healthy no-op.
-    // UPPER bound only. A NEGATIVE `now` is both safe and legitimate here: it is
-    // the dead-CMOS-reporting-1969 case this guard exists for. It cannot
-    // underflow either subtraction, because the stored-reading sanitiser admits
-    // only `0 <= prev <= now`, which no prev satisfies when `now < 0`, so the
-    // elapsed-time arithmetic is skipped entirely. Rejecting it would refuse the
-    // pass on exactly the machine the guard is for.
+    // Sanitise the CALLER's clock: `now + window + slack` below is signed-
+    // overflow UB near INT64_MAX. UPPER bound only — a NEGATIVE `now` is the
+    // legitimate dead-CMOS case this guard exists for.
     constexpr std::int64_t kMaxPlausibleNow = std::numeric_limits<std::int64_t>::max() / 4;
     if (now > kMaxPlausibleNow) {
         cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
@@ -535,490 +844,229 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                      now);
         return 0;
     }
-
-    // Stamped only for a reading the guard is willing to reason about. Stamping
-    // the refused value would poison the gauge permanently on a machine whose
-    // clock jumped far forward -- and the "last pass is stale" diagnostic the
-    // absence alert points operators at would then never fire again. The
-    // ATTEMPT is already counted above; this is the reading, and a reading we
-    // just declared unusable is not one.
+    // Stamped only for a reading the guard will reason about. The ATTEMPT is
+    // counted above; stamping a value just declared unusable would poison the
+    // staleness gauge permanently.
     last_pass_unixtime_.store(now, std::memory_order_relaxed);
 
-    // What this pass wants logged, filled in under the lock and emitted after it
-    // is released: spdlog formatting is neither cheap nor bounded, and every
-    // audit log() blocks on this same exclusive lock.
-    enum class Emit {
-        None,
-        ProbeFailed,
-        DeclineFirstPass,
-        DeclineWipe,
-        DeclineStep,
-        DeclineImplausible,
-        CorruptStateReported,
-        Deleted,
-        DeleteFailed
-    };
-    Emit emit = Emit::None;
-    bool emit_persist_failed = false;
-    std::string emit_err;
+    if (!open_) {
+        // A store that never opened has stopped retaining permanently; count a
+        // failed pass rather than silence (else an ever-growing table reads as a
+        // healthy guard).
+        cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+
+    const std::int64_t window =
+        retention_days_ > 0 ? static_cast<std::int64_t>(retention_days_) * 86400 : 0;
+
+    // Outcomes captured under the txn, acted on after it commits so counters
+    // only move for committed passes and no spdlog formatting runs under lock.
     std::size_t deleted = 0;
-    std::int64_t emit_delta = 0, emit_window = 0;
-    bool emit_full_wipe = false, emit_capped = false;
-    std::string emit_backlog_probe_err;
+    bool skipped_lock = false;
+    bool declined = false;
+    bool cap_backlog = false;
+    bool persist_failed = false;
+    std::string decline_msg;
 
-    {
-        std::unique_lock lock(mtx_);
-        if (!db_) {
-            // Defensive only, and deliberately NOT the production signal for a
-            // closed store: start_cleanup() early-returns when db_.get() is null, so
-            // no thread reaches this in a running server. A store closed by a
-            // failed migration surfaces through log()'s emit_failed_ counter.
-            // Counted anyway so a direct caller (a test, or a future scheduler
-            // that does not check is_open()) is not silently told it succeeded.
-            cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
-            return 0;
+    const bool ok = pool_.with_txn_for(kReapTimeout, [&](PGconn* conn) -> bool {
+        // Exactly one replica sweeps per tick fleet-wide.
+        pg::PgResult lk = pg::exec_params(
+            conn, "SELECT pg_try_advisory_xact_lock(hashtextextended('audit_store:reap', 0))",
+            std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK) {
+            spdlog::error("AuditStore: reap lock probe failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        if (!to_bool(PQgetvalue(lk.get(), 0, 0))) {
+            skipped_lock = true;
+            return true; // another replica is sweeping; not a failure
         }
 
-        // A non-positive retention setting means "never expire": log() stamps
-        // ttl 0 on every row, so no row is ever a candidate.
-        const std::int64_t window =
-            retention_days_ > 0 ? static_cast<std::int64_t>(retention_days_) * 86400 : 0;
-
-        // Record this pass's reading for the NEXT pass, before any early return
-        // below. The reading is an honest observation of the clock whatever the
-        // pass goes on to do, and not recording it on a failing pass would make
-        // a later recovery report a step that was really an outage. Re-anchoring
-        // here is also what lets a poisoned or stale value self-heal.
-        //
-        // Persisted, because the step check is the ONLY half of this guard that
-        // works when the clock was already wrong before the process started.
-        // Held in memory alone it has no comparison point on the first pass and
-        // never fires -- exactly the dead-CMOS-at-boot case. A failed write is
-        // not fatal: it costs the NEXT restart its comparison point.
-        const std::optional<std::int64_t> raw_prev = last_pass_now_;
-        last_pass_now_ = now;
-        if (!store_meta(kLastPassNowKey, now)) {
-            emit_persist_failed = true;
-            persist_failed_.fetch_add(1, std::memory_order_relaxed);
+        // Durable dedup state (shared across replicas + restarts).
+        pg::PgResult meta = pg::exec_params(
+            conn,
+            "SELECT key, value FROM audit_store.audit_retention_meta WHERE key IN ('last_pass_now',"
+            "'last_anomaly_facts')",
+            std::vector<std::string>{});
+        if (meta.status() != PGRES_TUPLES_OK) {
+            spdlog::error("AuditStore: reap meta read failed: {}", PQerrorMessage(conn));
+            return false;
         }
-
-        // SANITISE the reading before doing arithmetic on it. It is durable
-        // state in the same database as the evidence, so it can come back
-        // corrupt, hand-edited, or -- far more mundanely -- stamped by an
-        // earlier pass that ran while the clock was skewed FORWARD. `prev > now`
-        // makes `now - prev` negative for as long as real time takes to catch up
-        // (potentially years), silently killing the only detector that survives
-        // a restart. `now - INT64_MIN` also overflows, and is reachable with an
-        // ordinary expired backlog, so this prevents UB as well as the silent
-        // disable.
-        //
-        // BOTH out-of-range directions are anomalies, not quiet resets. They are
-        // NOT proof of tampering and must not be described as such: this very
-        // code persists a NEGATIVE reading when it runs on a dead-CMOS machine
-        // (the upper-bound-only guard admits `now < 0` deliberately), and an
-        // ordinary backward NTP correction leaves a perfectly legitimate earlier
-        // reading ahead of `now`. What they prove is that the reading cannot be
-        // reasoned about: the clock moved backward, or the state was corrupted.
-        // Quietly accepting one is how the step check gets disabled while every
-        // counter reports healthy, which is why it declines either way.
-        // Was the clock MOVED, materially, since the previous pass? Computed
-        // before the sanitiser resets the reading below. NOT symmetric with
-        // `big_step`, in three ways that are each load-bearing: this test has no
-        // `window > 0` gate, it compares magnitude in either direction rather
-        // than forward elapsed time, and it is inclusive of the floor where
-        // `big_step` is strict. A movement of EXACTLY the floor is a
-        // `clock_event` and is not a `big_step`. Collapsing the two re-opens the
-        // class this guard exists to catch.
-        //
-        // The floor is the whole point. An earlier version treated ANY backward
-        // reading as an event, with no magnitude test at all, while its forward
-        // twin required seven days. Because an event forces the REPORT branch,
-        // and the report branch is the branch that does NOT delete, a clock
-        // regressing one second per pass -- two disagreeing time sources, a
-        // hypervisor sync racing NTP -- reported forever and never drained once.
-        // Sub-floor jitter is a CONDITION: say it once, then get on with the
-        // drain. True for MONOTONE drift, which is the common shape.
-        //
-        // NOT fixed, and tracked: any clock that yields an EVENT on every pass
-        // holds the report branch and so starves the drain for as long as it
-        // lasts. Three shapes reach that, and they do NOT share preconditions.
-        // BACKWARD movement of at least the floor qualifies on its own, via
-        // `BadState` ahead of every other test. FORWARD movement of more than
-        // the floor qualifies only through `Step`, so it inherits `window > 0`
-        // and `has_expired` -- with retention disabled a forward ratchet over
-        // legacy non-zero TTLs cannot reach `Step` at all, so it does not
-        // starve. (It is not silent either: once the ratchet steps past the
-        // last legacy TTL the survivor probe finds nothing, which is `Wipe` --
-        // a CONDITION, so it declines once and the next pass drains. Pinned by
-        // `retention disabled: a forward ratchet declines ONCE as a Wipe`.)
-        // Sub-floor ALTERNATION needs a standing would-wipe:
-        // `prev_unusable` flips every pass, so the fact set changes every pass
-        // and dedup never engages, which in turn needs a store with no audit
-        // write inside a whole retention window. All three raise
-        // `clock_anomaly_skips_` on every halted pass, so they are loud rather
-        // than silent, and all three predate this floor.
-        //
-        // `clock_event`'s own directional symmetry -- not symmetry with
-        // `big_step`, which the paragraph above rules out -- also covers the
-        // case a backward-only test missed entirely:
-        // recovery OUT of negative time (dead CMOS, then NTP) is a forward
-        // movement of enormous magnitude carried by `BadState`, not by
-        // `big_step`, because the sanitiser has already discarded the negative
-        // reading by the time `big_step` is computed.
-        const bool clock_event =
-            raw_prev && audit_retention::moved_at_least(*raw_prev, now, kAuditMinBigStepSec);
-        std::optional<std::int64_t> prev_pass_now = raw_prev;
-        // A row that existed but was not an integer is corrupted durable state,
-        // which is an anomaly in its own right -- distinct from no row at all.
-        // NOT cleared here. This pass may still return before the decline is
-        // decided -- an unreadable probe, or simply nothing expired -- and
-        // clearing on those paths swallows the corruption signal with no
-        // decline, no counter and no warn. It is cleared only where it is
-        // actually CONSUMED, below. (The durable row is already re-anchored, so
-        // the flag is the only remaining carrier of "the state was corrupt".)
-        bool prev_unusable = loaded_meta_unusable_;
-        if (prev_pass_now && (*prev_pass_now < 0 || *prev_pass_now > now)) {
-            prev_unusable = true;
-            prev_pass_now.reset();
-        }
-
-        // Detect by OUTCOME, not by a clock delta alone: the outcome test needs
-        // no history, so it survives a restart with empty process state. Two
-        // EXISTS probes answer the whole question and stay index-driven; a
-        // COUNT(*) pair would scan.
-        //
-        // `would_wipe` reduces to "no datable row survives the cutoff". A row
-        // older than `cutoff` is necessarily at or below `now + window + slack`,
-        // so every expired row is also datable -- which makes a separate
-        // "datable > 0" term dead, and leaves a single EXISTS over the half-open
-        // band that short-circuits on the first survivor.
-        //
-        // NOTE this test is defeated by ANY write landing after the jump: a
-        // fresh row is a datable survivor. On a server that is up and serving,
-        // that is the common case, which is why the persisted step check below
-        // is not optional. Together they are still best-effort DETECTION -- the
-        // per-pass cap is the half that bounds the damage unconditionally.
-        const std::int64_t datable_horizon = now + window + kAuditTtlFutureSlackSec;
-        const std::int64_t expired_binds[] = {now};
-        const std::int64_t survivor_binds[] = {now, datable_horizon};
-        const auto has_expired =
-            exists_probe(db_.get(),
-                         "SELECT EXISTS(SELECT 1 FROM audit_events "
-                         "WHERE ttl_expires_at > 0 AND ttl_expires_at < ?)",
-                         expired_binds);
-        // `BETWEEN` IS LOAD-BEARING. Do not rewrite it as `>= ? AND <= ?`.
-        //
-        // The partial index carries the literal `ttl_expires_at > 0`. With two
-        // SEPARATE comparisons SQLite can take that literal as its lower seek
-        // bound and demote `>= now` to a per-row filter, so the probe walks the
-        // ENTIRE expired prefix instead of seeking past it. `BETWEEN` is treated
-        // as one range constraint and is not vulnerable to that.
-        //
-        // Measured here, 3M expired rows + 1 survivor, SQLite 3.52, this index:
-        //   `> 0 AND ttl BETWEEN ? AND ?`    0.0069 ms   <-- as written
-        //   `ttl BETWEEN ? AND ? AND > 0`    0.0068 ms
-        //   `> 0 AND ttl >= ? AND ttl <= ?`  83.6 ms     <-- the trap
-        //   `ttl >= ? AND ttl <= ? AND > 0`  0.0066 ms
-        //
-        // So BETWEEN is safe in EITHER position; only the separate-comparison
-        // form is order-sensitive. A rewrite to `>= AND <=` that leaves `> 0`
-        // first therefore reintroduces an ~84 ms hold under the lock every audit
-        // write takes -- with identical results AND a byte-identical EXPLAIN
-        // QUERY PLAN, so no test and no plan check would notice. This comment is
-        // the guard.
-        const auto has_datable_survivor =
-            exists_probe(db_.get(),
-                         "SELECT EXISTS(SELECT 1 FROM audit_events "
-                         "WHERE ttl_expires_at > 0 AND ttl_expires_at BETWEEN ? AND ?)",
-                         survivor_binds);
-
-        if (!has_expired || !has_datable_survivor) {
-            // Fail closed: a probe we could not read is not evidence that
-            // deleting is safe. No verdict is possible, so the anomaly state is
-            // RE-ARMED (a failed pass says nothing about the clock, and carrying
-            // a report across it would let the next genuinely-wiping pass delete
-            // silently) but the load-time flag is deliberately NOT consumed --
-            // this pass did not act on it.
-            cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
-            last_reported_.reset();
-            emit = Emit::ProbeFailed;
-            emit_err = !has_expired ? has_expired.error() : has_datable_survivor.error();
-        } else {
-            const bool would_wipe = !*has_datable_survivor;
-            // Supplement, not a replacement. `would_wipe` only fires when a
-            // forward jump exceeds the WHOLE retention window; a half-window
-            // jump expires half the store, which the cap bounds but nothing
-            // would otherwise report. Persisted across restarts, so unlike the
-            // outcome test it still fires when a write has already landed after
-            // the jump.
-            const bool big_step =
-                prev_pass_now && window > 0 && now - *prev_pass_now > kAuditMinBigStepSec;
-            emit_delta = prev_pass_now ? now - *prev_pass_now : 0;
-            emit_window = kAuditMinBigStepSec;
-            emit_full_wipe = would_wipe;
-
-            // `cleanup_once` is the ONLY caller of `classify`; the rule lives in its
-            // own header so it can be pinned exhaustively (all 16 inputs) without a
-            // database, not because anything else consumes it.
-            const audit_retention::Facts facts{.has_expired = *has_expired,
-                                               .would_wipe = would_wipe,
-                                               .big_step = big_step,
-                                               .prev_unusable = prev_unusable};
-            const audit_retention::Anomaly a = audit_retention::classify(facts);
-            // Consumed HERE, unconditionally, at exactly one site: this pass has
-            // folded it into the verdict. The durable row was re-anchored above,
-            // so from now on the VALUE carries the truth. Three conditional
-            // clear sites is what produced both the cleared-too-early and the
-            // cleared-too-late defects.
-            loaded_meta_unusable_ = false;
-
-            // ONE rule for the whole guard: report an anomaly when it is not the
-            // one already being reported, and stand down when it is gone. This
-            // subsumes what used to be a shared bool latch plus a separate
-            // one-shot flag plus per-branch clearing -- and it fixes what that
-            // could not express, namely a DIFFERENT anomaly arriving while
-            // latched, which the single bool silently swallowed.
-            // EVENTS are not deduplicated; CONDITIONS are.
-            //
-            // A CONDITION persists on its own -- an all-expired table, a corrupt
-            // stored reading -- so a repeat is the same anomaly still being
-            // worked off. Suppressing it is what stops a legitimately
-            // all-expired store from declining forever.
-            //
-            // An EVENT is a material clock MOVEMENT. It is observable only
-            // because this pass re-anchored the reading, so a second one is a
-            // second incident, never a continuation of the first, and must
-            // report every time. It cannot spam: after any pass the stored
-            // reading is `now`, so the next pass sees an interval-sized delta
-            // unless the clock actually moved again.
-            //
-            // Deduplication compares the whole FACT SET, not the classified
-            // enum. `classify` collapses four facts onto one value, so an enum
-            // comparison cannot see a new condition arriving underneath a
-            // reported one: a `Wipe` appearing under a standing `BadState`
-            // classifies as `BadState` both times, matches, and is silently
-            // deleted for. That is the dead-CMOS-then-NTP sequence, and for any
-            // store below the cap it took the entire SOC 2 trail in one pass
-            // with no warning and no counter.
-            const bool is_event = (a == audit_retention::Anomaly::Step) ||
-                                  (a == audit_retention::Anomaly::BadState && clock_event);
-            if (a != audit_retention::Anomaly::None &&
-                (is_event || !last_reported_ || *last_reported_ != facts)) {
-                clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
-                // NOT unobservable for `Step`, which an earlier comment here
-                // claimed. Being event-exempt means this write cannot cause
-                // SUPPRESSION -- that is all that proof established. It does
-                // re-arm the comparison, so a condition recurring after a step
-                // is reported rather than swallowed. Dropping it for `Step`
-                // survived the whole suite until a test was written for it.
-                last_reported_ = facts;
-                switch (a) {
-                case audit_retention::Anomaly::BadState:
-                    // Same condition, two audiences: with a backlog pending the
-                    // operator needs to know deletion was held back; without
-                    // one, that nothing was at risk.
-                    emit = *has_expired ? Emit::DeclineImplausible : Emit::CorruptStateReported;
-                    break;
-                case audit_retention::Anomaly::Step:
-                    emit = Emit::DeclineStep;
-                    break;
-                case audit_retention::Anomaly::Wipe:
-                    emit = prev_pass_now ? Emit::DeclineWipe : Emit::DeclineFirstPass;
-                    break;
-                case audit_retention::Anomaly::None:
-                    break; // unreachable: guarded above
-                }
-            } else {
-                if (a == audit_retention::Anomaly::None)
-                    last_reported_.reset(); // stood down; re-armed
-                // Either nothing is wrong, or we are working off an anomaly we
-                // have already reported. Both delete -- paced by the cap, which
-                // is what actually bounds the damage.
-                if (*has_expired) {
-                    auto outcome = delete_capped_locked(now);
-                    if (!outcome) {
-                        emit = Emit::DeleteFailed;
-                        emit_err = std::move(outcome.error());
-                    } else {
-                        deleted = outcome->deleted;
-                        // "the cap bound AND rows were left behind" -- the same
-                        // post-delete fact the cap counter uses, so the log line
-                        // and the metric cannot disagree.
-                        emit_capped = outcome->backlog_remains;
-                        emit_backlog_probe_err = std::move(outcome->backlog_probe_err);
-                        if (deleted > 0)
-                            emit = Emit::Deleted;
-                        // STAND DOWN once the backlog that anomaly produced is
-                        // gone. This is the other half of the one rule, and it
-                        // must key on the POST-delete fact: without it, a pass
-                        // that drains everything leaves the anomaly still
-                        // "being reported", so a fresh one arriving before any
-                        // intervening quiet pass is silently swallowed. An
-                        // unreadable backlog probe reports `true` conservatively,
-                        // which keeps the report standing -- the safe direction.
-                        if (!outcome->backlog_remains)
-                            last_reported_.reset();
-                    }
-                }
+        std::optional<std::int64_t> prev;
+        bool prev_unusable = false;
+        std::string last_facts;
+        for (int i = 0; i < PQntuples(meta.get()); ++i) {
+            const std::string key = text_col(meta.get(), i, 0);
+            const std::string val = text_col(meta.get(), i, 1);
+            if (key == "last_pass_now") {
+                // A stored reading that is not an integer is corrupted/hand-
+                // edited durable state — an anomaly, not a clean slate.
+                errno = 0;
+                char* end = nullptr;
+                const long long v = std::strtoll(val.c_str(), &end, 10);
+                if (val.empty() || errno != 0 || end == val.c_str() || *end != '\0')
+                    prev_unusable = true;
+                else
+                    prev = static_cast<std::int64_t>(v);
+            } else if (key == "last_anomaly_facts") {
+                last_facts = val;
             }
         }
+        // A reading ahead of the clock (backward NTP correction) or negative
+        // (corruption) cannot be reasoned about — decline either way.
+        if (prev && (*prev < 0 || *prev > now)) {
+            prev_unusable = true;
+            prev.reset();
+        }
 
-    } // lock released before any formatting
+        // Re-anchor the reading for the next pass BEFORE any early return, so a
+        // decline still updates the comparison point and a poisoned value
+        // self-heals. Persisting it is the only half of the guard that works
+        // when the clock was already wrong before the process started.
+        pg::PgResult stamp = pg::exec_params(
+            conn,
+            "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES ('last_pass_now', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            std::vector<std::string>{std::to_string(now)});
+        if (stamp.status() != PGRES_COMMAND_OK) {
+            spdlog::error("AuditStore: reap meta stamp failed: {}", PQerrorMessage(conn));
+            persist_failed = true;
+            return false; // fail closed — roll back the whole pass
+        }
 
-    if (!emit_backlog_probe_err.empty())
-        spdlog::warn("AuditStore: the post-delete backlog probe failed ({}); this pass assumed a "
-                     "backlog remains, so the cap counter and the reported-anomaly state are both "
-                     "acting on an assumption rather than a reading",
-                     emit_backlog_probe_err);
-    if (emit_persist_failed)
-        spdlog::warn("AuditStore: could not persist the retention clock reading; a restart before "
-                     "the next pass will lose its clock-step comparison point");
-    switch (emit) {
-    case Emit::None:
-        break;
-    case Emit::DeclineImplausible:
-        spdlog::warn("AuditStore: the stored retention clock reading is not usable (negative, "
-                     "ahead of the current clock, present but not an integer, or unreadable), "
-                     "so this "
-                     "server's clock moved backward or that durable state was corrupted; "
-                     "declining once and re-anchoring on the current reading");
-        break;
-    case Emit::CorruptStateReported:
-        spdlog::warn("AuditStore: the stored retention clock reading was unusable (negative, "
-                     "ahead of the current clock, not an integer, or unreadable) and has been "
-                     "re-anchored. This pass declined "
-                     "to trust it and deleted nothing -- there was nothing expired to delete "
-                     "either way -- so the restart-surviving half of the clock guard had no "
-                     "comparison point until now");
-        break;
-    case Emit::ProbeFailed:
-        spdlog::warn("AuditStore: retention probe failed ({}); skipping this pass", emit_err);
-        break;
-    case Emit::DeleteFailed:
-        spdlog::warn("AuditStore: cleanup error: {}", emit_err);
-        break;
-    case Emit::DeclineFirstPass:
-        spdlog::warn("AuditStore: the first retention pass against this database would expire "
-                     "EVERY datable audit row; declining once so a clock anomaly cannot delete "
-                     "the audit trail wholesale. (There is no previous reading to compare "
-                     "against, so nothing can be said about the clock yet.)");
-        break;
-    case Emit::DeclineWipe:
-        spdlog::warn("AuditStore: this retention pass would expire EVERY datable audit row; "
-                     "declining once so a clock anomaly cannot delete the audit trail wholesale. "
-                     "(No unusual gap since the last pass -- either the clock moved while this "
-                     "server was running, or the store is genuinely all-expired.)");
-        break;
-    case Emit::DeclineStep:
-        spdlog::warn("AuditStore: {}s elapsed since the last retention pass, over the {}s "
-                     "threshold -- a forward clock jump OR an outage that long. This pass would "
-                     "have expired {}; declining once so a clock anomaly cannot delete the audit "
-                     "trail wholesale",
-                     emit_delta, emit_window,
-                     emit_full_wipe ? "EVERY datable audit row" : "an unexpectedly large slice");
-        break;
-    case Emit::Deleted:
-        if (emit_capped)
+        // Detect by OUTCOME: two counts answer the whole question and stay
+        // index-driven. A forward-skewed row past `now + window + slack` can
+        // never expire, so it is EXCLUDED from the survivor question — else one
+        // bad row vetoes the guard for the store's life.
+        const std::int64_t datable_horizon = now + window + kAuditTtlFutureSlackSec;
+        pg::PgResult probe = pg::exec_params(
+            conn,
+            "SELECT count(*) FILTER (WHERE ttl_expires_at > 0 AND ttl_expires_at < $1::bigint) AS "
+            "expiring, count(*) FILTER (WHERE ttl_expires_at > 0 AND ttl_expires_at >= $1::bigint "
+            "AND ttl_expires_at <= $2::bigint) AS survivor FROM audit_store.audit_events",
+            std::vector<std::string>{std::to_string(now), std::to_string(datable_horizon)});
+        if (probe.status() != PGRES_TUPLES_OK) {
+            spdlog::error("AuditStore: reap probe failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        const std::int64_t expiring = to_i64(PQgetvalue(probe.get(), 0, 0));
+        const std::int64_t survivor = to_i64(PQgetvalue(probe.get(), 0, 1));
+
+        const bool has_expired = expiring > 0;
+        const bool would_wipe = has_expired && survivor == 0;
+        // Supplement to would_wipe: a half-window jump expires a large slice
+        // while leaving survivors, which the cap bounds but nothing else reports.
+        // Gated on window > 0 and strictly greater than the absolute floor.
+        const bool big_step = prev.has_value() && window > 0 && has_expired &&
+                              (now - *prev) > kAuditMinBigStepSec;
+
+        const audit_retention::Facts facts{.has_expired = has_expired,
+                                           .would_wipe = would_wipe,
+                                           .big_step = big_step,
+                                           .prev_unusable = prev_unusable};
+        const audit_retention::Anomaly anomaly = audit_retention::classify(facts);
+        const std::string facts_ser = serialize_facts(facts);
+
+        if (anomaly != audit_retention::Anomaly::None) {
+            // Decline-once per DISTINCT fact set: a new anomaly declines and
+            // records; an identical repeat is suppressed and drains (paced by
+            // the cap), so a legitimately all-expired store still ages out.
+            if (facts_ser != last_facts) {
+                pg::PgResult rec = pg::exec_params(
+                    conn,
+                    "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES "
+                    "('last_anomaly_facts', $1) ON CONFLICT (key) DO UPDATE SET value = "
+                    "EXCLUDED.value",
+                    std::vector<std::string>{facts_ser});
+                if (rec.status() != PGRES_COMMAND_OK) {
+                    spdlog::error("AuditStore: reap anomaly record failed: {}",
+                                  PQerrorMessage(conn));
+                    return false;
+                }
+                declined = true;
+                decline_msg = "AuditStore: retention clock anomaly (facts=" + facts_ser +
+                              ") — declining this pass; an identical next pass will drain, capped";
+                return true; // commit the stamp + anomaly record
+            }
+            // Suppressed repeat of the same fact set — fall through to drain.
+        } else if (!last_facts.empty()) {
+            pg::PgResult clr = pg::exec_params(
+                conn, "DELETE FROM audit_store.audit_retention_meta WHERE key = 'last_anomaly_facts'",
+                std::vector<std::string>{});
+            if (clr.status() != PGRES_COMMAND_OK) {
+                spdlog::error("AuditStore: reap anomaly clear failed: {}", PQerrorMessage(conn));
+                return false;
+            }
+        }
+        if (expiring == 0)
+            return true; // nothing to do
+
+        // Bounded, oldest-first delete so even an allowed wipe ages out at a
+        // paced rate. RETURNING carries the count (no sqlite3_changes()/#1033).
+        pg::PgResult del = pg::exec_params(
+            conn,
+            "DELETE FROM audit_store.audit_events WHERE id IN (SELECT id FROM "
+            "audit_store.audit_events WHERE ttl_expires_at > 0 AND ttl_expires_at < $1::bigint "
+            "ORDER BY ttl_expires_at ASC, id ASC LIMIT $2::bigint) RETURNING id",
+            std::vector<std::string>{std::to_string(now),
+                                     std::to_string(static_cast<std::int64_t>(
+                                         kMaxAuditDeletesPerPass))});
+        if (del.status() != PGRES_TUPLES_OK) {
+            spdlog::error("AuditStore: reap delete failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        deleted = static_cast<std::size_t>(PQntuples(del.get()));
+
+        // Hitting the cap does NOT prove a backlog remains (an exact-boundary
+        // pass drained the last row). Probe for a real remainder, and ONLY when
+        // the cap bound, so the healthy path pays nothing.
+        if (deleted >= kMaxAuditDeletesPerPass) {
+            pg::PgResult more = pg::exec_params(
+                conn,
+                "SELECT EXISTS(SELECT 1 FROM audit_store.audit_events WHERE ttl_expires_at > 0 AND "
+                "ttl_expires_at < $1::bigint)",
+                std::vector<std::string>{std::to_string(now)});
+            if (more.status() != PGRES_TUPLES_OK) {
+                spdlog::error("AuditStore: reap backlog probe failed: {}", PQerrorMessage(conn));
+                return false;
+            }
+            cap_backlog = to_bool(PQgetvalue(more.get(), 0, 0));
+        }
+        return true;
+    });
+
+    if (!ok) {
+        if (persist_failed)
+            persist_failed_.fetch_add(1, std::memory_order_relaxed);
+        cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
+        spdlog::warn("AuditStore: retention pass aborted (statement failed or txn rolled back — "
+                     "see the preceding error line)");
+        return 0;
+    }
+    if (skipped_lock)
+        return 0; // another replica swept this tick
+    if (declined) {
+        clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
+        spdlog::warn("{}", decline_msg);
+        return 0;
+    }
+    if (deleted > 0) {
+        rows_deleted_.fetch_add(deleted, std::memory_order_relaxed);
+        if (cap_backlog) {
+            cap_reached_.fetch_add(1, std::memory_order_relaxed);
             spdlog::info("AuditStore: expired {} rows (per-pass cap reached; the remainder ages "
                          "out on subsequent passes)",
                          deleted);
-        else
+        } else {
             spdlog::info("AuditStore: expired {} rows", deleted);
-        break;
+        }
     }
     return deleted;
 }
 
-std::expected<AuditStore::DeleteOutcome, std::string>
-AuditStore::delete_capped_locked(std::int64_t now) {
-    // Bound the pass so that even a wipe this guard chose to allow ages out at a
-    // paced rate instead of in one statement. Oldest-first so the pacing never
-    // strands the oldest evidence behind newer expiries.
-    //
-    // RETURNING carries the deleted count on the statement itself: reading
-    // sqlite3_changes() after step() on this FULLMUTEX connection is the #1033
-    // data race (FULLMUTEX serialises the calls, not the step->changes pair).
-    static constexpr char kDeleteSql[] = R"(
-        DELETE FROM audit_events WHERE id IN (
-            SELECT id FROM audit_events
-             WHERE ttl_expires_at > 0 AND ttl_expires_at < ?
-             ORDER BY ttl_expires_at ASC, id ASC
-             LIMIT ?)
-        RETURNING id
-    )";
-    SqliteStmt del;
-    if (sqlite3_prepare_v2(db_.get(), kDeleteSql, -1, del.addr(), nullptr) != SQLITE_OK) {
-        cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
-        last_reported_.reset(); // re-arm, as on the probe path
-        return std::unexpected(sqlite3_errmsg(db_.get()));
-    }
-    sqlite3_bind_int64(del.get(), 1, now);
-    sqlite3_bind_int64(del.get(), 2, static_cast<std::int64_t>(kMaxAuditDeletesPerPass));
-    std::size_t deleted = 0;
-    int rc = SQLITE_OK;
-    // A RETURNING statement is not finished until it steps to SQLITE_DONE, so
-    // drain it rather than stopping at the first row. (SQLite performs the whole
-    // delete on the FIRST step and buffers the output rows, so the loop is
-    // bookkeeping over that buffer -- the per-pass cap doubles as its bound.)
-    while ((rc = sqlite3_step(del.get())) == SQLITE_ROW)
-        ++deleted;
-    if (rc != SQLITE_DONE) {
-        cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
-        // Read BEFORE the SqliteStmt destructor finalizes the statement.
-        std::string err = sqlite3_errmsg(db_.get());
-        last_reported_.reset();
-        // The rows RETURNING already yielded are NOT deleted: SQLite unwinds a
-        // failed statement from its statement journal, so they are back.
-        return std::unexpected(std::move(err));
-    }
-    del.reset();
-    rows_deleted_.fetch_add(deleted, std::memory_order_relaxed);
-
-    // Did this pass actually leave a backlog? One bounded EXISTS, and ONLY when
-    // the cap bound the pass, so the healthy path pays nothing.
-    //
-    // Guessing this from `deleted >= cap` is wrong: a drain that removed exactly
-    // a cap's worth and emptied the backlog would still count as capped, while
-    // every doc says that counter proves a backlog remains. The caller ALSO
-    // needs the real answer -- it is what stands the reported anomaly down once
-    // the backlog it produced is gone -- so it must be an observation, not an
-    // inference from the row count.
-    bool backlog_remains = false;
-    std::string probe_err;
-    if (deleted >= kMaxAuditDeletesPerPass) {
-        const std::int64_t binds[] = {now};
-        const auto more = exists_probe(db_.get(),
-                                       "SELECT EXISTS(SELECT 1 FROM audit_events "
-                                       "WHERE ttl_expires_at > 0 AND ttl_expires_at < ?)",
-                                       binds);
-        // Unreadable: assume a backlog remains. That keeps the anomaly reported and
-        // the counter moving, the conservative direction for both -- but SAY SO.
-        // Without this the failure is the only one in the pass that moves no
-        // counter and writes no line, and `cap_reached_` would then be
-        // incremented on an assumption while its own description claims it
-        // proves a backlog. Near-unreachable (the exclusive lock means only an
-        // out-of-process writer could make the delete succeed and an
-        // identical-predicate probe fail), which is exactly why it must not be
-        // the one silent path.
-        if (!more) {
-            probe_err = more.error();
-            cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
-        }
-        backlog_remains = !more || *more;
-        if (backlog_remains)
-            cap_reached_.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    // NO anomaly bookkeeping here. This function deletes; deciding what is being
-    // reported belongs to the one rule in cleanup_once, which re-evaluates the
-    // condition each pass from the probes. Deriving the reported state from a
-    // post-delete fact here is what produced the pre-delete/post-delete
-    // ordering defects.
-    return DeleteOutcome{deleted, backlog_remains, std::move(probe_err)};
-}
-
 void AuditStore::start_cleanup() {
-    if (!db_ || cleanup_interval_min_ <= 0)
+    if (!open_ || cleanup_interval_min_ <= 0)
         return;
 #ifdef __cpp_lib_jthread
     cleanup_thread_ = std::jthread([this](std::stop_token stop) { run_cleanup(stop); });
@@ -1045,39 +1093,25 @@ void AuditStore::stop_cleanup() {
 #ifdef __cpp_lib_jthread
 void AuditStore::run_cleanup(std::stop_token stop) {
     while (!stop.stop_requested()) {
-        for (int i = 0; i < cleanup_interval_min_ * 60 && !stop.stop_requested(); ++i) {
+        for (int i = 0; i < cleanup_interval_min_ * 60 && !stop.stop_requested(); ++i)
             std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
         if (stop.stop_requested())
             break;
 #else
 void AuditStore::run_cleanup() {
     while (!stop_requested_.load()) {
-        for (int i = 0; i < cleanup_interval_min_ * 60 && !stop_requested_.load(); ++i) {
+        for (int i = 0; i < cleanup_interval_min_ * 60 && !stop_requested_.load(); ++i)
             std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
         if (stop_requested_.load())
             break;
 #endif
-
-        auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                       std::chrono::system_clock::now().time_since_epoch())
-                       .count();
-
+        const auto now = now_epoch();
         // NOTHING may escape a thread function: an exception here is
-        // std::terminate, i.e. the whole server dies because a retention pass
-        // could not allocate. `cleanup_once` allocates (the error string) and
-        // formats log lines, so the surface is real (#2037 class).
+        // std::terminate. cleanup_once allocates and formats, so the surface is
+        // real (#2037 class).
         try {
             cleanup_once(now);
         } catch (...) {
-            // The counter first, and unconditionally: it is the part that must
-            // survive. REPORTING the failure allocates (spdlog formats), so a
-            // bad_alloc in the handler would escape this thread function and
-            // terminate the server -- the exact condition the handler exists to
-            // prevent. The report is therefore nested and everything is
-            // swallowed: a pass that failed AND could not say so still leaves
-            // `cleanup_failed_` moving, which is what the alert keys on.
             cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
             try {
                 try {

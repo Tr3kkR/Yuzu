@@ -2544,12 +2544,34 @@ public:
                 gateway_service_->set_fleet_topology_store(fleet_topology_store_.get());
         }
 
-        // Initialize audit store
+        // Initialize audit store — PostgreSQL (ADR-0040, schema audit_store),
+        // born-on-PG like the other migrated stores: fail-closed on open, then
+        // a MANDATORY backfill of the legacy audit.db (SOC 2 evidence chain —
+        // refuse boot rather than serve a knowingly-incomplete trail).
         {
-            auto audit_db = cfg_.db_dir() / "audit.db";
-            audit_store_ = std::make_unique<AuditStore>(audit_db, cfg_.audit_retention_days);
-            if (audit_store_->is_open()) {
-                audit_store_->start_cleanup();
+            if (pg_pool_ && !startup_failed_) {
+                audit_store_ =
+                    std::make_unique<AuditStore>(*pg_pool_, cfg_.audit_retention_days);
+                if (!audit_store_->is_open()) {
+                    spdlog::error("[PG] Refusing to start: audit store migration/open failed "
+                                  "(database reachable but the audit_store schema could not be "
+                                  "created/opened)");
+                    startup_failed_ = true;
+                } else {
+                    auto audit_db = cfg_.db_dir() / "audit.db";
+                    if (!audit_store_->migrate_from_sqlite(audit_db)) {
+                        spdlog::error("[PG] Refusing to start: audit store backfill from legacy {} "
+                                      "failed (ADR-0009 mandatory-backfill fail-closed; see prior "
+                                      "log lines). The SOC 2 evidence chain must be complete before "
+                                      "serving; the next boot retries. Operator remediation: repair "
+                                      "the file, or quarantine it aside if it is unrecoverable.",
+                                      audit_db.string());
+                        startup_failed_ = true;
+                    } else {
+                        audit_store_->set_metrics(&metrics_);
+                        audit_store_->start_cleanup();
+                    }
+                }
             }
             // Internal-CA store (ca.db) — cert inventory + CRL versions. The CA
             // root key itself is a 0600 file via default_certs, never in this DB.
@@ -5259,6 +5281,10 @@ public:
             auth_secret_codec_->set_audit_hook({});
         auth_secret_codec_.reset();
         auth_key_provider_.reset();
+        // AuditStore (ADR-0040) borrows pg_pool_ via its retention thread — that
+        // thread is joined at stop_cleanup() above; drop the store before the
+        // pool so no late lease touches a destroyed pool.
+        audit_store_.reset();
         pg_pool_.reset();
     }
 
@@ -9386,10 +9412,20 @@ private:
                 return;
             }
 
+            // ADR-0040: reads are degrade-distinguishable. A store/pool failure
+            // returns nullopt — surface 503, NEVER a false-empty 200 (an audit
+            // blip must not read as "no activity" — evidence integrity).
             auto results = audit_store_->query(q);
+            if (!results) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"audit store degraded"},"data":null})",
+                    "application/json");
+                return;
+            }
 
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& e : results) {
+            for (const auto& e : *results) {
                 arr.push_back({{"id", e.id},
                                {"timestamp", e.timestamp},
                                {"principal", e.principal},
@@ -9401,9 +9437,13 @@ private:
                                {"source_ip", e.source_ip},
                                {"result", e.result}});
             }
+            // Total is a best-effort adornment now that the page rows are in
+            // hand; on a degrade fall back to the returned count rather than a
+            // second 503.
+            auto total = audit_store_->total_count();
             res.set_content(nlohmann::json({{"events", arr},
                                             {"count", arr.size()},
-                                            {"total", audit_store_->total_count()}})
+                                            {"total", total ? *total : arr.size()}})
                                 .dump(),
                             "application/json");
         });
