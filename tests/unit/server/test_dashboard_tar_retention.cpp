@@ -27,6 +27,7 @@
 
 #include "dashboard_routes.hpp"
 #include "management_group_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 
 #include "../test_helpers.hpp"
@@ -34,9 +35,23 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <initializer_list>
+#include <stdexcept>
 #include <string>
 
 namespace yuzu::server {
+
+using yuzu::server::pg::PgPool;
+
+namespace {
+// ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
+// "responsestore" template key with test_response_store.cpp (identical setup).
+yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("responsestore template: store failed to migrate");
+}};
+} // namespace
 
 // Test-only accessor for the private renderer + its store/scan inputs (#562).
 struct DashboardTarRetentionTestAccess {
@@ -96,10 +111,11 @@ bool contains(const std::string& hay, std::string_view needle) {
 } // namespace
 
 TEST_CASE("render_tar_retention_paused: hostile _enabled value is escaped + flagged (#560)",
-          "[server][tar][retention-render]") {
-    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-rs-"}};
+          "[pg][server][tar][retention-render]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-mg-"}};
-    ResponseStore rs{rs_db.path};
+    ResponseStore rs{pool};
     ManagementGroupStore mg{mg_db.path};
     grant_visibility(mg, {"agent-evil", "agent-ok"});
 
@@ -133,15 +149,16 @@ TEST_CASE("render_tar_retention_paused: hostile _enabled value is escaped + flag
 }
 
 TEST_CASE("render_tar_retention_paused: a value in the _enabled attribute cannot break out (#560)",
-          "[server][tar][retention-render]") {
+          "[pg][server][tar][retention-render]") {
     // The value-error path emits the untrusted value into a title= ATTRIBUTE.
     // A `<`/`>`-free payload that closes the attribute with a bare `\"` would
     // inject an event handler if the `\"`-escape regressed — html_escape must
     // turn `\"` into `&quot;`. Asserting only absence-of-`<script>` would miss
     // this, so pin the attribute-quote escape directly.
-    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-attr-rs-"}};
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-attr-mg-"}};
-    ResponseStore rs{rs_db.path};
+    ResponseStore rs{pool};
     ManagementGroupStore mg{mg_db.path};
     grant_visibility(mg, {"agent-x"});
 
@@ -159,10 +176,11 @@ TEST_CASE("render_tar_retention_paused: a value in the _enabled attribute cannot
 }
 
 TEST_CASE("render_tar_retention_paused: dedup keys on received_at_ms, latest wins (#561)",
-          "[server][tar][retention-render]") {
-    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-dedup-rs-"}};
+          "[pg][server][tar][retention-render]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-dedup-mg-"}};
-    ResponseStore rs{rs_db.path};
+    ResponseStore rs{pool};
     ManagementGroupStore mg{mg_db.path};
     grant_visibility(mg, {"agent-A"});
 
@@ -191,10 +209,11 @@ TEST_CASE("render_tar_retention_paused: dedup keys on received_at_ms, latest win
 }
 
 TEST_CASE("render_tar_retention_paused: each visible agent appears; out-of-scope dropped",
-          "[server][tar][retention-render]") {
-    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-multi-rs-"}};
+          "[pg][server][tar][retention-render]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-multi-mg-"}};
-    ResponseStore rs{rs_db.path};
+    ResponseStore rs{pool};
     ManagementGroupStore mg{mg_db.path};
     grant_visibility(mg, {"agent-A", "agent-B"}); // agent-C deliberately out of scope
 
@@ -223,10 +242,11 @@ TEST_CASE("render_tar_retention_paused: each visible agent appears; out-of-scope
 }
 
 TEST_CASE("render_tar_retention_paused: paused_at==0 sorts oldest with schema badge (#558)",
-          "[server][tar][retention-render]") {
-    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-558-rs-"}};
+          "[pg][server][tar][retention-render]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-558-mg-"}};
-    ResponseStore rs{rs_db.path};
+    ResponseStore rs{pool};
     ManagementGroupStore mg{mg_db.path};
     grant_visibility(mg, {"agent-legacy", "agent-modern"});
 
@@ -252,10 +272,11 @@ TEST_CASE("render_tar_retention_paused: paused_at==0 sorts oldest with schema ba
 }
 
 TEST_CASE("render_tar_retention_paused: all-collecting fleet renders the clean empty state",
-          "[server][tar][retention-render]") {
-    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-empty-rs-"}};
+          "[pg][server][tar][retention-render]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-empty-mg-"}};
-    ResponseStore rs{rs_db.path};
+    ResponseStore rs{pool};
     ManagementGroupStore mg{mg_db.path};
     grant_visibility(mg, {"agent-A"});
 
@@ -271,10 +292,11 @@ TEST_CASE("render_tar_retention_paused: all-collecting fleet renders the clean e
 }
 
 TEST_CASE("render_tar_retention_paused: renders the typed-confirm Purge button (15.A)",
-          "[server][tar][retention-render]") {
-    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-purge-rs-"}};
+          "[pg][server][tar][retention-render]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-purge-mg-"}};
-    ResponseStore rs{rs_db.path};
+    ResponseStore rs{pool};
     ManagementGroupStore mg{mg_db.path};
     grant_visibility(mg, {"agent-A"});
 
@@ -299,10 +321,11 @@ TEST_CASE("render_tar_retention_paused: renders the typed-confirm Purge button (
 }
 
 TEST_CASE("render_tar_retention_paused: row actions gate on effective permission (15.A LOW)",
-          "[server][tar][retention-render]") {
-    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-perm-rs-"}};
+          "[pg][server][tar][retention-render]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-perm-mg-"}};
-    ResponseStore rs{rs_db.path};
+    ResponseStore rs{pool};
     ManagementGroupStore mg{mg_db.path};
     grant_visibility(mg, {"agent-A"});
     rs.store(mk_resp("agent-A", 10, "config|process_enabled|false\n"));

@@ -1,16 +1,59 @@
 #pragma once
 
-#include <sqlite3.h>
+/// @file response_store.hpp
+/// Agentic command/instruction response store — born on SQLite, migrated to
+/// PostgreSQL (ADR-0006/0008/0009/0039, schema `response_store`). Two tables:
+/// `responses` (per-agent result rows) + `response_facets` (denormalised
+/// column values powering the dashboard's facet filters). High-write (every
+/// command result from every agent), TTL'd (default 90-day retention via
+/// `reap_expired()`, called from the server's maintenance tick), a `/tar`-
+/// and executions-drawer read source.
+///
+/// Substrate contract (ADR-0008/0012): holds a `pg::PgPool&`, migrates at
+/// construction on a pinned lease, schema-qualifies every runtime statement
+/// (`response_store.responses`). No `sqlite3_changes()` (#1033) — mutators
+/// check the `PgResult` status / use `RETURNING` directly.
+///
+/// Failure posture (ADR-0012 §1 / ADR-0039), split by operation class:
+///  - **Ingest (`store`)**: FAIL-SOFT (ADR-0037 shape). A dropped result row
+///    is re-derivable operational telemetry (the executions ladder tracks the
+///    command; the agent's result is best-effort persisted for the
+///    drawer/TAR). Never blocks the gRPC thread. Drops counted
+///    (`yuzu_server_response_ingest_dropped_total{reason}`).
+///  - **Reads** (`query`/`query_by_execution`/`get_by_instruction`/
+///    `query_by_ids`/`aggregate`/`distinct_agent_ids`/`facet_values`/
+///    `facet_agent_ids`/`facet_response_ids`): degrade-distinguishable at the
+///    seam (`std::optional<std::vector<...>>`, nullopt = degrade) +
+///    `yuzu_server_response_read_degrade_total{reason,source}` + a sampled
+///    log. NOT the catastrophic-read class — these feed the executions
+///    drawer / TAR dashboard, not an enforce/target/authz decision, so
+///    consumers may render degraded (503 on the REST twin, empty +
+///    degrade-banner on the dashboard) — but the seam MUST distinguish empty
+///    from degraded. The #1634 group-scoped-read seam (`ResponseQuery{
+///    .agent_id}`) is preserved exactly.
+///  - **`finalize_terminal_status` / a future `delete_by_instruction`**:
+///    fail-hard — the existing tri-state `FinalizeResult` already
+///    distinguishes "updated" / "no matching row" / "SQL error"; ported via
+///    `RETURNING` (no `sqlite3_changes()`).
+///  - **Backfill**: SKIPPABLE (ADR-0009's skippable class) — responses are
+///    TTL'd operational data, not authoritative config or compliance
+///    evidence. No `migrate_from_sqlite`; the legacy `response.db` is never
+///    read. See ADR-0039.
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <optional>
-#include <shared_mutex>
 #include <string>
-#include <thread>
 #include <vector>
+
+namespace yuzu {
+class MetricsRegistry;
+}
+
+namespace yuzu::server::pg {
+class PgPool;
+}
 
 namespace yuzu::server {
 
@@ -91,39 +134,58 @@ struct AggregationResult {
     double aggregate_value{0.0};
 };
 
+/// Default retention (days) — matches the pre-migration SQLite default.
+inline constexpr int kDefaultResponseRetentionDays = 90;
+
 class ResponseStore {
 public:
-    explicit ResponseStore(const std::filesystem::path& db_path, int retention_days = 90,
-                           int cleanup_interval_min = 60);
-    ~ResponseStore();
+    /// Borrows the shared pool and runs the `response_store` schema
+    /// migration on a pinned lease. `is_open()` is false if the lease was
+    /// empty or the migration failed.
+    explicit ResponseStore(pg::PgPool& pool, int retention_days = kDefaultResponseRetentionDays);
 
     ResponseStore(const ResponseStore&) = delete;
     ResponseStore& operator=(const ResponseStore&) = delete;
 
-    bool is_open() const;
+    [[nodiscard]] bool is_open() const noexcept { return open_; }
 
+    /// Wire a metrics registry for `yuzu_server_response_read_degrade_total{reason,source}`
+    /// (degrade-distinguishable reads), `yuzu_server_response_ingest_dropped_total{reason}`
+    /// (fail-soft ingest) and `yuzu_server_response_reap_passes_total{result}` (the
+    /// retention sweep). Set ONCE during single-threaded startup, before serving
+    /// — the pointer is read without synchronisation on serving threads. A null
+    /// registry (default, e.g. unit tests) disables emission; every emit site is
+    /// null-guarded.
+    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
+    /// Fail-soft ingest: a response row + its derived facet rows (from the
+    /// plugin output schema). A lease/transaction/insert failure is logged +
+    /// counted (`yuzu_server_response_ingest_dropped_total{reason}`), never
+    /// throws, never blocks the gRPC thread. The response INSERT and every
+    /// per-facet INSERT run in ONE transaction; each facet INSERT is wrapped
+    /// in its OWN SAVEPOINT so a single malformed facet value cannot abort
+    /// the whole transaction and lose the response row too (Postgres aborts
+    /// the WHOLE transaction on any failed statement, unlike SQLite — the
+    /// ADR-0038 lesson). A facet failure is logged and the pass continues;
+    /// only the response INSERT failing aborts the whole call.
     void store(const StoredResponse& resp);
 
     /// Tri-state outcome of `finalize_terminal_status` so callers can
     /// distinguish "we updated rows in place" from "no matching RUNNING
     /// row exists" from "the SQL itself errored". Conflating the latter
-    /// two (bool return) caused UP-3 / chaos CH-1 — under SQLITE_BUSY the
-    /// caller fell through to insert and re-created the empty-output
-    /// sentinel that the original UAT-#11 fix removed.
+    /// two (bool return) caused UP-3 / chaos CH-1 — under a transient
+    /// failure the caller fell through to insert and re-created the
+    /// empty-output sentinel that the original UAT-#11 fix removed.
     enum class FinalizeResult {
         Updated, ///< 1+ rows had their status changed; do NOT also insert.
         NoRow,   ///< 0 rows matched; caller should insert the terminal frame.
-        Error,   ///< SQL prepare/step failed; caller should log, NOT insert.
+        Error,   ///< SQL/lease failed; caller should log, NOT insert.
     };
 
     /// Update existing RUNNING `responses` rows' status when a terminal
     /// CommandResponse frame (SUCCESS / FAILURE / TIMEOUT / REJECTED)
     /// arrives carrying no output — the data already lives in the prior
-    /// RUNNING row(s). Without this, the agent_service Subscribe stream
-    /// inserts an empty-output row whose non-zero `status` enum value
-    /// (1=SUCCESS, 2=FAILURE, …) reads to operators as a failure exit
-    /// code that "happened before" the real result row (UAT 2026-05-06).
-    ///
+    /// RUNNING row(s). Fail-hard (RETURNING, no `sqlite3_changes()`).
     /// Scope is (instruction_id, agent_id, execution_id, status=0). The
     /// execution_id match preserves the PR-2 invariant that re-mapped
     /// command_ids (retry under a new execution row) don't fold a
@@ -133,21 +195,23 @@ public:
                                             const std::string& agent_id, int terminal_status,
                                             const std::string& error_detail,
                                             const std::string& execution_id);
-    std::vector<StoredResponse> query(const std::string& instruction_id,
-                                      const ResponseQuery& q = {}) const;
-    /// Exact-correlation lookup keyed on the new `execution_id` column
-    /// (PR 2). Returns rows whose `execution_id` matches; honours the same
-    /// agent_id / status / since / until / limit filters as `query()`.
-    /// Empty `execution_id` is rejected (returns no rows) — that sentinel
-    /// is the legacy path; callers must fall back to `query()` if they
-    /// support pre-PR-2 data. Backed by `idx_resp_execution_ts`.
-    std::vector<StoredResponse> query_by_execution(const std::string& execution_id,
-                                                   const ResponseQuery& q = {}) const;
-    std::vector<StoredResponse> get_by_instruction(const std::string& instruction_id) const;
-    std::vector<AggregationResult> aggregate(const std::string& instruction_id,
-                                             const AggregationQuery& aq,
-                                             const ResponseQuery& filter = {},
-                                             const AggregateScope& scope = std::nullopt) const;
+
+    /// Degrade-distinguishable read: `std::nullopt` on a store/pool/query
+    /// failure (see the file header's posture note); an engaged EMPTY vector
+    /// is a genuine "no rows" result.
+    [[nodiscard]] std::optional<std::vector<StoredResponse>>
+    query(const std::string& instruction_id, const ResponseQuery& q = {}) const;
+    /// Exact-correlation lookup keyed on `execution_id` (PR 2). Empty
+    /// `execution_id` is rejected (returns an engaged empty vector, NOT
+    /// nullopt) — that sentinel is the legacy path; callers must fall back
+    /// to `query()` if they support pre-PR-2 data.
+    [[nodiscard]] std::optional<std::vector<StoredResponse>>
+    query_by_execution(const std::string& execution_id, const ResponseQuery& q = {}) const;
+    [[nodiscard]] std::optional<std::vector<StoredResponse>>
+    get_by_instruction(const std::string& instruction_id) const;
+    [[nodiscard]] std::optional<std::vector<AggregationResult>>
+    aggregate(const std::string& instruction_id, const AggregationQuery& aq,
+             const ResponseQuery& filter = {}, const AggregateScope& scope = std::nullopt) const;
     /// Distinct agent_ids that have a response row for this instruction,
     /// ordered by agent_id (deterministic). Used to resolve a management-group
     /// scoped aggregate (#1634): enumerate the candidates, keep only those the
@@ -155,67 +219,75 @@ public:
     /// `aggregate()` `scope` argument so the WHERE clause excludes out-of-scope
     /// rows from the totals. Bounded by one instruction's fan-out.
     ///
-    /// Returns `nullopt` on a store-read error (failed prepare/step) — DISTINCT
-    /// from an empty vector (the instruction genuinely has no rows). The caller
-    /// MUST fail closed on `nullopt` (scope to the empty set → zero rows), never
-    /// treat an errored read as "no agents to drop" → unrestricted (governance
-    /// #1634 unhappy-path UP-2: an errored read that looked empty re-opened the
-    /// aggregate to all agents).
-    std::optional<std::vector<std::string>>
+    /// Returns `nullopt` on a store-read error — DISTINCT from an empty
+    /// vector (the instruction genuinely has no rows). The caller MUST fail
+    /// closed on `nullopt` (scope to the empty set → zero rows), never treat
+    /// an errored read as "no agents to drop" → unrestricted (governance
+    /// #1634 unhappy-path UP-2).
+    [[nodiscard]] std::optional<std::vector<std::string>>
     distinct_agent_ids(const std::string& instruction_id) const;
-    std::size_t total_count() const;
-    std::uintmax_t db_size_bytes() const;
+    /// Total response count. Degrades to 0 (matches the pre-migration
+    /// contract; not in the ADR-0039 optional-wrapped set — this is an
+    /// operator-facing gauge, not a fan-out/authz decision input).
+    [[nodiscard]] std::size_t total_count() const;
 
     // -- Faceted queries (for dashboard filtering at scale) --------------------
 
     /// Distinct facet values for a column within an instruction's results.
-    std::vector<FacetValue> facet_values(const std::string& instruction_id, int col_idx) const;
+    [[nodiscard]] std::optional<std::vector<FacetValue>>
+    facet_values(const std::string& instruction_id, int col_idx) const;
 
     /// Distinct agent IDs that have a matching facet value.
-    std::vector<std::string> facet_agent_ids(const std::string& instruction_id,
-                                             const std::vector<FacetFilter>& filters) const;
+    [[nodiscard]] std::optional<std::vector<std::string>>
+    facet_agent_ids(const std::string& instruction_id,
+                    const std::vector<FacetFilter>& filters) const;
 
-    /// Count of distinct agents matching facet filters.
-    int64_t facet_agent_count(const std::string& instruction_id,
-                              const std::vector<FacetFilter>& filters) const;
+    /// Count of distinct agents matching facet filters. Degrades to 0 (scalar
+    /// convenience read, not in the ADR-0039 optional-wrapped vector set).
+    [[nodiscard]] int64_t facet_agent_count(const std::string& instruction_id,
+                                            const std::vector<FacetFilter>& filters) const;
 
-    /// Total result line count matching facet filters.
-    int64_t facet_line_count(const std::string& instruction_id,
-                             const std::vector<FacetFilter>& filters) const;
+    /// Total result line count matching facet filters. Degrades to 0 (same
+    /// convenience-scalar posture as facet_agent_count).
+    [[nodiscard]] int64_t facet_line_count(const std::string& instruction_id,
+                                           const std::vector<FacetFilter>& filters) const;
 
     /// Load specific responses by their IDs (for two-phase filtered display).
-    std::vector<StoredResponse> query_by_ids(const std::vector<int64_t>& response_ids) const;
+    [[nodiscard]] std::optional<std::vector<StoredResponse>>
+    query_by_ids(const std::vector<int64_t>& response_ids) const;
 
     /// Response IDs that match all given facet filters.
-    std::vector<int64_t> facet_response_ids(const std::string& instruction_id,
-                                            const std::vector<FacetFilter>& filters,
-                                            int limit = 200, int offset = 0) const;
+    [[nodiscard]] std::optional<std::vector<int64_t>>
+    facet_response_ids(const std::string& instruction_id, const std::vector<FacetFilter>& filters,
+                       int limit = 200, int offset = 0) const;
 
-    void start_cleanup();
-    void stop_cleanup();
+    /// Clock-guarded retention sweep (#2496 `gc_sweep` shape — ADR-0038's
+    /// port to this store, ADR-0039). Called from the server's maintenance
+    /// tick (~60-minute cadence, matching the old background thread's
+    /// default `cleanup_interval_min`). One sweeping replica at a time via
+    /// `pg_try_advisory_xact_lock`; a durable `gc_meta` reading + anomaly-
+    /// fact-set guards against a skewed wall clock mass-expiring live rows.
+    /// `response_facets` rows are removed via `ON DELETE CASCADE` from
+    /// `responses` — a single DELETE on `responses` reaps both tables.
+    /// Emits `yuzu_server_response_reap_passes_total{result=swept|noop|
+    /// declined|failed|skipped_lock}`.
+    void reap_expired();
+
+    /// Cumulative responses reaped (lock-free counter for Prometheus scraping
+    /// / test observability) — the disposal-evidence twin of the reap-pass
+    /// metric, mirrors GuaranteedStateStore's `events_reaped_total()`.
+    [[nodiscard]] uint64_t responses_reaped_total() const noexcept {
+        return responses_reaped_.load();
+    }
 
 private:
-    sqlite3* db_{nullptr};
-    std::filesystem::path db_path_;
+    pg::PgPool& pool_;
+    bool open_{false};
     int retention_days_;
-    int cleanup_interval_min_;
-    mutable std::shared_mutex mtx_;
-    sqlite3_stmt* insert_stmt_{nullptr};       // Cached prepared INSERT for responses
-    sqlite3_stmt* facet_insert_stmt_{nullptr}; // Cached prepared INSERT for facets
-#ifdef __cpp_lib_jthread
-    std::jthread cleanup_thread_;
-#else
-    std::thread cleanup_thread_;
-    std::atomic<bool> stop_requested_{false};
-#endif
+    yuzu::MetricsRegistry* metrics_{nullptr};
+    std::atomic<uint64_t> responses_reaped_{0};
 
-    void create_tables();
-    void prepare_insert_stmt();
-#ifdef __cpp_lib_jthread
-    void run_cleanup(std::stop_token stop);
-#else
-    void run_cleanup();
-#endif
+    int64_t compute_ttl_epoch() const;
 };
 
 } // namespace yuzu::server

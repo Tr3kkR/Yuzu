@@ -548,9 +548,15 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // server upgrade). Once an admin runs the backfill CLI
                 // (PR 2.1 follow-up) and audits show 100% coverage, the
                 // fallback can be removed.
-                auto responses = response_store->query_by_execution(exec.id, rq);
+                // Degrade → empty (dashboard render, ADR-0039 deny-or-benign):
+                // a transient read failure renders the same as "no responses
+                // yet", falling through to the legacy-window attempt below
+                // exactly as an engaged-empty result would.
+                auto responses =
+                    response_store->query_by_execution(exec.id, rq).value_or(std::vector<StoredResponse>{});
                 if (responses.empty()) {
-                    auto legacy = response_store->query(exec.definition_id, rq);
+                    auto legacy =
+                        response_store->query(exec.definition_id, rq).value_or(std::vector<StoredResponse>{});
                     // Filter to agents that appear in this execution's
                     // status set, mirroring the pre-PR-2 best-effort join.
                     std::unordered_map<std::string, bool> in_set;

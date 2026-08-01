@@ -7,7 +7,10 @@
 
 #include "bundle_orchestrator.hpp"
 #include "bundle_service.hpp"
+#include "pg/pg_pool.hpp"
 #include "response_store.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -17,8 +20,18 @@
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgPool;
 
 namespace {
+
+// ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
+// "responsestore" template key with test_response_store.cpp (identical setup).
+yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("responsestore template: store failed to migrate");
+}};
 
 // Fake per-command dispatcher: records calls, returns a deterministic
 // command_id per (plugin,action) and a configurable agents_reached.
@@ -73,9 +86,11 @@ std::vector<BundleStepSpec> two_steps() {
 } // namespace
 
 TEST_CASE("orchestrator dispatch fans each step under one bundle- correlation id",
-          "[bundle][orchestrator]") {
+          "[pg][bundle][orchestrator]") {
     FakeDispatch fd;
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     BundleOrchestrator orch(fd.fn(), &store, fixed_id("abc"));
 
@@ -98,9 +113,11 @@ TEST_CASE("orchestrator dispatch fans each step under one bundle- correlation id
     CHECK(audited == 2);
 }
 
-TEST_CASE("orchestrator collate groups responses in request order", "[bundle][orchestrator]") {
+TEST_CASE("orchestrator collate groups responses in request order", "[pg][bundle][orchestrator]") {
     FakeDispatch fd;
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     BundleOrchestrator orch(fd.fn(), &store, fixed_id("abc"));
 
@@ -127,10 +144,12 @@ TEST_CASE("orchestrator collate groups responses in request order", "[bundle][or
 }
 
 TEST_CASE("orchestrator: a step that reached no agent is dispatch-failed (terminal)",
-          "[bundle][orchestrator]") {
+          "[pg][bundle][orchestrator]") {
     FakeDispatch fd;
     fd.sent = 0; // every step reaches 0 agents
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     BundleOrchestrator orch(fd.fn(), &store, fixed_id("abc"));
 
@@ -143,9 +162,11 @@ TEST_CASE("orchestrator: a step that reached no agent is dispatch-failed (termin
         CHECK(s.state == BundleStepState::DispatchFailed);
 }
 
-TEST_CASE("orchestrator collate enforces ownership (IDOR guard)", "[bundle][orchestrator]") {
+TEST_CASE("orchestrator collate enforces ownership (IDOR guard)", "[pg][bundle][orchestrator]") {
     FakeDispatch fd;
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     BundleOrchestrator orch(fd.fn(), &store, fixed_id("abc"));
 
@@ -159,9 +180,11 @@ TEST_CASE("orchestrator collate enforces ownership (IDOR guard)", "[bundle][orch
     CHECK(orch.collate(res.correlation_id, "alice", false).has_value());
 }
 
-TEST_CASE("orchestrator collate of an unknown correlation id is nullopt", "[bundle][orchestrator]") {
+TEST_CASE("orchestrator collate of an unknown correlation id is nullopt", "[pg][bundle][orchestrator]") {
     FakeDispatch fd;
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     BundleOrchestrator orch(fd.fn(), &store, fixed_id("abc"));
     CHECK_FALSE(orch.collate("bundle-nope", "alice", false).has_value());
@@ -170,11 +193,13 @@ TEST_CASE("orchestrator collate of an unknown correlation id is nullopt", "[bund
 // ── Gate-7 governance hardening regressions ─────────────────────────────────
 
 TEST_CASE("orchestrator: a throwing dispatch step is isolated, manifest still stored (UP-1)",
-          "[bundle][orchestrator]") {
+          "[pg][bundle][orchestrator]") {
     // A throw from dispatch_ on step 2 must NOT propagate and must NOT orphan the
     // already-sent commands: the manifest is stored regardless, so collate finds
     // it; the throwing step reads dispatch-failed.
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     int n = 0;
     BundleOrchestrator::DispatchFn throwing =
@@ -202,10 +227,12 @@ TEST_CASE("orchestrator: a throwing dispatch step is isolated, manifest still st
 }
 
 TEST_CASE("orchestrator: a single boundary poll does not self-evict; polling slides the TTL",
-          "[bundle][orchestrator]") {
+          "[pg][bundle][orchestrator]") {
     // governance UP-3/UP-4 / CH-3/CH-4.
     FakeDispatch fd;
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     std::int64_t clock = 1000;
     BundleOrchestrator::ClockFn now = [&clock]() { return clock; };
@@ -226,9 +253,11 @@ TEST_CASE("orchestrator: a single boundary poll does not self-evict; polling sli
 }
 
 TEST_CASE("orchestrator: an abandoned (un-polled) bundle is eventually swept",
-          "[bundle][orchestrator]") {
+          "[pg][bundle][orchestrator]") {
     FakeDispatch fd;
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     std::int64_t clock = 0;
     int idctr = 0;
@@ -247,9 +276,11 @@ TEST_CASE("orchestrator: an abandoned (un-polled) bundle is eventually swept",
 }
 
 TEST_CASE("orchestrator: an empty principal can never collate (sec-M2/CH-7)",
-          "[bundle][orchestrator]") {
+          "[pg][bundle][orchestrator]") {
     FakeDispatch fd;
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     BundleOrchestrator orch(fd.fn(), &store, fixed_id("abc"));
     auto res = orch.dispatch("agent-1", two_steps(), /*principal=*/"", null_audit());
@@ -260,9 +291,11 @@ TEST_CASE("orchestrator: an empty principal can never collate (sec-M2/CH-7)",
 }
 
 TEST_CASE("orchestrator: cap eviction drops the oldest manifest (QE-S3)",
-          "[bundle][orchestrator]") {
+          "[pg][bundle][orchestrator]") {
     FakeDispatch fd;
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     std::int64_t clock = 0;
     int idctr = 0;

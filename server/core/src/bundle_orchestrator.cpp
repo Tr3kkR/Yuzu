@@ -208,7 +208,15 @@ BundleOrchestrator::collate(const std::string& correlation_id, const std::string
     ResponseQuery rq;
     rq.limit = 1000; // bundle <= kMaxBundleSteps; well under the cap
     rq.status = -1;  // any status (step results may ride RUNNING or terminal rows)
-    auto rows = response_store_->query_by_execution(correlation_id, rq);
+    auto rows_opt = response_store_->query_by_execution(correlation_id, rq);
+    if (!rows_opt) {
+        // Degraded read: distinct from "not found" for the meter, but the
+        // caller-facing contract stays the same nullopt (deny-or-benign,
+        // ADR-0039) — a poll retries.
+        meter("degraded");
+        return std::nullopt;
+    }
+    const auto& rows = *rows_opt;
 
     std::vector<BundleResponseRow> brows;
     brows.reserve(rows.size());

@@ -67,7 +67,12 @@ collect_check_responses(ResponseStore& store, const std::string& run_id,
         PreflightCheckResponses cr;
         cr.key = key;
         cr.label = label;
-        auto rows = store.query_by_execution(check_execution_id(run_id, key), q);
+        // Degrade → empty (ADR-0039 deny-or-benign carve-out): a transient
+        // read failure reads as "no responses yet for this check", the same
+        // observable state as a genuinely slow cohort — never a fabricated
+        // go/no-go verdict either way (this feeds evidence, not a gate).
+        auto rows = store.query_by_execution(check_execution_id(run_id, key), q)
+                        .value_or(std::vector<StoredResponse>{});
         if (static_cast<int>(rows.size()) >= kResponseFetchCap)
             spdlog::warn("preflight: check '{}' response fetch hit the {}-row cap for run {} — "
                          "some agents' latest may be evicted (keyset-paging follow-up)",

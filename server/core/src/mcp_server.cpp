@@ -3542,14 +3542,23 @@ McpServer::HandlerFn McpServer::build_handler(
                 // freshly minted by execute_instruction on this server cannot
                 // have pre-PR-2 untagged rows, so a fallback would only risk
                 // folding in another execution's responses.
-                auto responses = !exec_id.empty() ? response_store->query_by_execution(exec_id, rq)
-                                                   : response_store->query(instr_id, rq);
+                auto responses_opt = !exec_id.empty()
+                                         ? response_store->query_by_execution(exec_id, rq)
+                                         : response_store->query(instr_id, rq);
                 // Audit target is the primary correlation key actually used:
                 // execution_id when present (the exact-correlation path), else
                 // instruction_id. When both are supplied execution_id wins, so
                 // a dual-id call is recorded under the execution_id it served —
                 // deliberate (execution_id is the agentic-dispatch unit).
                 const std::string& key = !exec_id.empty() ? exec_id : instr_id;
+                if (!responses_opt) {
+                    mcp_audit("failure", "store degraded; " + key);
+                    res.set_content(
+                        error_response(id, kInternalError, "Response store degraded — query failed"),
+                        "application/json");
+                    return;
+                }
+                auto responses = std::move(*responses_opt);
 
                 // Did the raw query hit the row cap BEFORE scope filtering? If so the
                 // result is incomplete (more rows exist past the LIMIT). Capture this
@@ -3853,7 +3862,16 @@ McpServer::HandlerFn McpServer::build_handler(
                         agg_scope = std::move(in_scope);
                 }
 
-                auto results = response_store->aggregate(instr_id, aq, {}, agg_scope);
+                auto results_opt = response_store->aggregate(instr_id, aq, {}, agg_scope);
+                if (!results_opt) {
+                    mcp_audit("failure", "store degraded; " + instr_id);
+                    res.set_content(
+                        error_response(id, kInternalError,
+                                       "Response store degraded — aggregate failed"),
+                        "application/json");
+                    return;
+                }
+                const auto& results = *results_opt;
                 JArr arr;
                 for (const auto& r : results) {
                     arr.add(JObj()

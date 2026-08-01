@@ -77,6 +77,33 @@ in-process cleanup thread goes away.
 AND `/healthz`. Reap piggybacks the existing maintenance thread (respecting each store's own
 is_open gate — the ADR-0038 JC-6 decoupling pattern).
 
+### Untrusted byte columns (UTF-8)
+
+`output` and `error_detail` are agent-supplied plugin bytes, not server-authored text — a
+plugin can legitimately emit non-UTF-8 content (binary data, a mis-decoded code page, a raw
+`0xff`). SQLite's permissive `TEXT` affinity stored those bytes as-is; Postgres `TEXT` requires
+valid server-encoding (UTF8) and rejects an invalid sequence outright at `INSERT` time
+(SQLSTATE 22021). Left unhandled, that turns governance #1593's guarantee — "malformed plugin
+output must still render, defanged, never 500" — into a silent **drop**: the fail-soft ingest
+path would count it as an ordinary transient failure and the row would simply never land,
+which is a regression, not a preserved behaviour.
+
+Fix: `store()` sanitizes `output` and `error_detail` to U+FFFD (the replacement character) via
+the shared `sanitize_utf8_strict` helper (`utf8_sanitize.hpp` — the same implementation the
+inventory and app_perf ingest seams already use for their own untrusted text) **before**
+binding the `INSERT`. The row still lands; byte-for-byte fidelity is not required for
+expendable, TTL'd operational telemetry (consistent with the store's overall fail-soft/
+skippable-backfill posture). This also removes a class of render-time risk at the source —
+invalid bytes never reach `aggregate_to_json`/any downstream JSON serializer in the first
+place, rather than relying on every consumer to defend against them independently. `status`,
+`plugin`, and every id column are server/enum-controlled and are NOT sanitized — this applies
+only to the two free-text columns an agent fully controls.
+
+**Generalises**: any future store migrating an untrusted-byte `TEXT` column from SQLite to
+Postgres needs this same treatment — `AuditStore` is the next store on the ladder with agent-
+supplied free text and should sanitize the same way rather than rediscovering #1593 the hard
+way.
+
 ## Considered and rejected
 
 - **Mandatory backfill**: rejected — responses are expendable TTL'd telemetry (ADR-0009

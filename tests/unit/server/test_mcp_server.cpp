@@ -59,11 +59,13 @@
 #include <memory>
 #include <set>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
 
 #include "../test_helpers.hpp"
+#include "pg/pg_pool.hpp"
 
 using namespace yuzu::server::mcp;
 using namespace yuzu::server;
@@ -469,8 +471,21 @@ TEST_CASE("MCP TagStore: get_all_tags and agents_with_tag", "[mcp][tag]") {
 
 // ── Response store integration (used by query_responses) ──────────────────
 
-TEST_CASE("MCP ResponseStore: query with filters", "[mcp][response]") {
-    ResponseStore store(":memory:");
+namespace {
+// ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
+// "responsestore" template key with test_response_store.cpp (identical setup).
+yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
+    pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("responsestore template: store failed to migrate");
+}};
+} // namespace
+
+TEST_CASE("MCP ResponseStore: query with filters", "[pg][mcp][response]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
 
     StoredResponse r1;
@@ -490,13 +505,15 @@ TEST_CASE("MCP ResponseStore: query with filters", "[mcp][response]") {
     // Query all for instruction
     ResponseQuery rq;
     auto results = store.query("instr-1", rq);
-    CHECK(results.size() == 2);
+    REQUIRE(results.has_value());
+    CHECK(results->size() == 2);
 
     // Query filtered by agent
     rq.agent_id = "agent-1";
     results = store.query("instr-1", rq);
-    CHECK(results.size() == 1);
-    CHECK(results[0].agent_id == "agent-1");
+    REQUIRE(results.has_value());
+    CHECK(results->size() == 1);
+    CHECK((*results)[0].agent_id == "agent-1");
 }
 
 // ── Instruction store integration (used by list_definitions) ──────────────
@@ -4376,7 +4393,9 @@ yuzu::server::StoredResponse mk_resp(const std::string& exec_id, const std::stri
 
 TEST_CASE("MCP query_responses: execution_id collects only that dispatch's rows",
           "[mcp][integration][response][fanout]") {
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     // Two executions of the SAME instruction. Pre-execution_id, a
     // timestamp-window join would conflate them; exact-correlation must not.
@@ -4422,7 +4441,9 @@ TEST_CASE("MCP query_responses: execution_id collects only that dispatch's rows"
 
 TEST_CASE("MCP query_responses: instruction_id path unchanged (no execution_id)",
           "[mcp][integration][response][fanout]") {
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-A", "instr-1", "agent-1", 0, "A1", 100));
     store.store(mk_resp("exec-B", "instr-1", "agent-3", 0, "B1", 102));
@@ -4444,7 +4465,9 @@ TEST_CASE("MCP query_responses: instruction_id path unchanged (no execution_id)"
 
 TEST_CASE("MCP query_responses: rejects when neither id provided",
           "[mcp][integration][response][fanout]") {
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     McpTestServer ts;
     ts.response_store_for_test = &store;
@@ -4471,7 +4494,9 @@ TEST_CASE("MCP query_responses: limit is clamped to [1,1000] (no false-empty, no
     // as "done, no responses"); a negative limit must NOT bind as SQLite
     // `LIMIT -1` (= unbounded), which would defeat the 1000-row cap. Both clamp
     // to 1. (offset is intentionally NOT exposed — see UP-1.)
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-C", "instr-1", "agent-1", 0, "C1", 200));
     store.store(mk_resp("exec-C", "instr-1", "agent-2", 0, "C2", 201));
@@ -4523,7 +4548,9 @@ TEST_CASE("MCP query_responses: full execute_instruction -> collect-by-execution
 
     yuzu::server::ExecutionTracker tracker(db);
     tracker.create_tables();
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(pgdb, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = pgdb.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
 
     McpTestServer ts;
@@ -4573,7 +4600,9 @@ TEST_CASE("MCP query_responses: management-group scope filters another operator'
     // to two agents; the injected scope predicate (production: check_scoped_permission)
     // admits only agent-1 (the caller's). agent-2's row is dropped and the drop is
     // audited distinctly.
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-S", "instr-1", "agent-1", 0, "mine", 400));
     store.store(mk_resp("exec-S", "instr-1", "agent-2", 0, "not-mine", 401));
@@ -4614,7 +4643,9 @@ TEST_CASE("MCP query_responses: no filter when scope predicate is unwired (legac
           "[mcp][integration][response][fanout][scope]") {
     // RBAC-off / unwired predicate → every authenticated caller sees all rows
     // (matches require_scoped_permission's legacy posture). No denied audit.
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-T", "instr-1", "agent-1", 0, "a", 410));
     store.store(mk_resp("exec-T", "instr-1", "agent-2", 0, "b", 411));
@@ -4640,7 +4671,9 @@ TEST_CASE("MCP query_responses: no filter when scope predicate is unwired (legac
 
 TEST_CASE("MCP query_responses: dropped success-audit surfaces audit_persisted:false (#1550)",
           "[mcp][integration][response][fanout][audit]") {
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-U", "instr-1", "agent-1", 0, "x", 420));
 
@@ -4665,7 +4698,9 @@ TEST_CASE("MCP query_responses: limit > INT_MAX clamps to the cap, not to 1 (#15
     // The int32 cast wrapped a > INT_MAX limit negative, which then clamped to 1
     // (under-serving). The 64-bit clamp pins it to the 1000 cap instead, so a huge
     // limit returns all matching rows up to the cap (here, all 3).
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-V", "instr-1", "agent-1", 0, "V1", 430));
     store.store(mk_resp("exec-V", "instr-1", "agent-2", 0, "V2", 431));
@@ -4690,7 +4725,9 @@ TEST_CASE("MCP query_responses: every agent out of scope → empty result + deni
     // The purest isolation proof: the caller can read NONE of this execution's agents.
     // Response is an empty array; both a denied (the drop) and a success (the served
     // empty set) audit fire; no row leaks.
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-W", "instr-1", "agent-1", 0, "alice-1", 440));
     store.store(mk_resp("exec-W", "instr-1", "agent-2", 0, "alice-2", 441));
@@ -4727,7 +4764,9 @@ TEST_CASE("MCP query_responses: scope filter applies on the instruction_id path 
     // The instruction_id path is the wider, definition-scoped collect — it must be
     // scoped identically to the execution_id path (the filter runs post-query on
     // whichever branch populated the rows).
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-X1", "instr-9", "agent-1", 0, "mine", 450));
     store.store(mk_resp("exec-X2", "instr-9", "agent-2", 0, "not-mine", 451));
@@ -4754,7 +4793,9 @@ TEST_CASE("MCP query_responses: scope check is memoised per distinct agent_id (#
     // Two rows for the SAME agent under one execution must trigger only ONE scope
     // check (the memo cache-hit path), and both rows are served when that agent is
     // in scope.
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-Y", "instr-1", "agent-1", 0, "row-a", 460));
     store.store(mk_resp("exec-Y", "instr-1", "agent-1", 1, "row-b", 461));
@@ -4783,7 +4824,9 @@ TEST_CASE("MCP query_responses: result_truncated_by_cap signals a capped raw que
     // When the raw query hits the limit BEFORE scope filtering, the result flags
     // result_truncated_by_cap so an agentic collector does not treat count<limit as
     // "done" (UP-4/UP-5). Use limit=2 with 3 stored rows to hit the cap deterministically.
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-Z", "instr-1", "agent-1", 0, "Z1", 470));
     store.store(mk_resp("exec-Z", "instr-1", "agent-2", 0, "Z2", 471));
@@ -5514,7 +5557,9 @@ yuzu::server::mcp::McpServer::DispatchFn fake_bundle_dispatch() {
 } // namespace
 
 TEST_CASE("MCP execute_bundle fans each step out + returns bundle_id", "[mcp][bundle]") {
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
 
     struct Call {
@@ -5553,7 +5598,9 @@ TEST_CASE("MCP execute_bundle fans each step out + returns bundle_id", "[mcp][bu
 }
 
 TEST_CASE("MCP get_bundle_result collates the responses in request order", "[mcp][bundle]") {
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
 
     McpTestServer ts;
@@ -5590,7 +5637,9 @@ TEST_CASE("MCP get_bundle_result collates the responses in request order", "[mcp
 }
 
 TEST_CASE("MCP get_bundle_result enforces ownership (IDOR)", "[mcp][bundle]") {
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
 
     McpTestServer ts;
@@ -5621,7 +5670,9 @@ TEST_CASE("MCP get_bundle_result enforces ownership (IDOR)", "[mcp][bundle]") {
 }
 
 TEST_CASE("MCP execute_bundle validation errors", "[mcp][bundle][unhappy]") {
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     McpTestServer ts;
     ts.response_store_for_test = &store;
@@ -5660,7 +5711,9 @@ TEST_CASE("MCP bundle tools error when the orchestrator is unwired", "[mcp][bund
 
 TEST_CASE("MCP get_bundle_result surfaces dispatch_failed + succeeded=0", "[mcp][bundle]") {
     // governance QE-S2 (MCP surface).
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     McpTestServer ts;
     ts.response_store_for_test = &store;
@@ -5688,7 +5741,9 @@ TEST_CASE("MCP get_bundle_result tolerates non-UTF-8 plugin output (no envelope 
           "[mcp][bundle]") {
     // governance review #1593 blocker 1: on MCP the strict-dump throw ESCAPED the
     // JSON-RPC envelope; with the replace handler collate must return a result.
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     McpTestServer ts;
     ts.response_store_for_test = &store;
@@ -6246,7 +6301,9 @@ TEST_CASE("MCP query_software_licenses: throwing audit_fn is caught → audit_pe
 
 TEST_CASE("MCP aggregate_responses: out-of-scope agents excluded from totals + denied audit (#1634)",
           "[mcp][integration][response][aggregate][scope]") {
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     // instr-1: two SUCCESS (status 0), one FAILURE (status 1). Only agent-1 is
     // in the caller's management group.
@@ -6292,7 +6349,9 @@ TEST_CASE("MCP aggregate_responses: out-of-scope agents excluded from totals + d
 
 TEST_CASE("MCP aggregate_responses: no filter when scope predicate is unwired (legacy-open) (#1634)",
           "[mcp][integration][response][aggregate][scope]") {
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-2", "instr-2", "agent-1", 0, "ok", 510));
     store.store(mk_resp("exec-2", "instr-2", "agent-2", 0, "ok", 511));
@@ -6318,7 +6377,9 @@ TEST_CASE("MCP aggregate_responses: no filter when scope predicate is unwired (l
 
 TEST_CASE("MCP aggregate_responses: every agent out of scope → empty totals + denied (#1634)",
           "[mcp][integration][response][aggregate][scope]") {
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-3", "instr-3", "agent-1", 0, "ok", 520));
     store.store(mk_resp("exec-3", "instr-3", "agent-2", 1, "err", 521));

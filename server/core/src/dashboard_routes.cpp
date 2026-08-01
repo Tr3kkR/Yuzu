@@ -492,8 +492,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      return;
                  }
 
-                 // Get matching agent IDs from faceted index
-                 auto agent_ids = response_store_->facet_agent_ids(command_id, filters);
+                 // Get matching agent IDs from faceted index. Degrade → empty
+                 // (dashboard render, ADR-0039 deny-or-benign) — the empty
+                 // check below already renders the "no agents match" state.
+                 auto agent_ids =
+                     response_store_->facet_agent_ids(command_id, filters).value_or(
+                         std::vector<std::string>{});
                  if (agent_ids.empty()) {
                      res.status = 422;
                      res.set_header("HX-Retarget", "#group-form-slot");
@@ -1527,16 +1531,21 @@ std::string DashboardRoutes::render_results(
     std::vector<StoredResponse> responses;
     int64_t total_agent_count = 0;
 
+    // Degrade → empty throughout this block (dashboard render, ADR-0039
+    // deny-or-benign) — a transient read failure renders as "no results",
+    // same shape as a genuinely empty answer; the seam itself (this store's
+    // std::optional return) is what stays degrade-distinguishable.
     if (filters.empty()) {
         // No filters — load all responses for this instruction
         ResponseQuery q;
         q.limit = 10000; // upper bound
-        responses = response_store_->query(command_id, q);
+        responses = response_store_->query(command_id, q).value_or(std::vector<StoredResponse>{});
         total_agent_count = static_cast<int64_t>(responses.size());
     } else {
         // Use faceted index to get matching response IDs, then load them
-        auto resp_ids = response_store_->facet_response_ids(command_id, filters, 10000, 0);
-        responses = response_store_->query_by_ids(resp_ids);
+        auto resp_ids = response_store_->facet_response_ids(command_id, filters, 10000, 0)
+                            .value_or(std::vector<int64_t>{});
+        responses = response_store_->query_by_ids(resp_ids).value_or(std::vector<StoredResponse>{});
         total_agent_count = response_store_->facet_agent_count(command_id, filters);
     }
 
@@ -1884,7 +1893,8 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
         int col_idx = static_cast<int>(i - 1);
         std::vector<FacetValue> facet_vals;
         if (response_store_)
-            facet_vals = response_store_->facet_values(command_id, col_idx);
+            facet_vals = response_store_->facet_values(command_id, col_idx)
+                            .value_or(std::vector<FacetValue>{});
 
         html += "<label>" + html_escape(cols[i]) + "</label>";
 
@@ -2108,10 +2118,11 @@ std::string DashboardRoutes::render_tar_retention_paused(
         for (auto& v : visible_ids) visible_set.insert(std::move(v));
     }
 
-    // Pull every response stored for the scan command_id.
+    // Pull every response stored for the scan command_id. Degrade → empty
+    // (dashboard render, ADR-0039 deny-or-benign).
     ResponseQuery q;
     q.limit = 10000;
-    auto responses = response_store_->query(scan_id, q);
+    auto responses = response_store_->query(scan_id, q).value_or(std::vector<StoredResponse>{});
 
     // Each response is from one agent. Parse each line for
     //   config|<source>_enabled|<value>

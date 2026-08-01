@@ -12,6 +12,7 @@
 
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "policy_evaluator.hpp"
 #include "policy_store.hpp"
 #include "response_store.hpp"
@@ -21,14 +22,25 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgPool;
 
 namespace {
+
+// ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
+// "responsestore" template key with test_response_store.cpp (identical setup).
+yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("responsestore template: store failed to migrate");
+}};
 
 // A result envelope parse_result understands: columns + rows arrays.
 std::string out_json(const std::string& col, const std::string& val) {
@@ -46,10 +58,10 @@ std::string out_json2(const std::string& c1, const std::string& v1, const std::s
 
 struct Harness {
     yuzu::test::TempDbFile poldb{std::string_view("pol-")}, insdb{std::string_view("ins-")},
-        resdb{std::string_view("res-")}, mgdb{std::string_view("mg-")};
+        mgdb{std::string_view("mg-")};
     PolicyStore ps{poldb.path};
     InstructionStore is{insdb.path};
-    ResponseStore rs{resdb.path};
+    ResponseStore rs;
     ManagementGroupStore mg{mgdb.path};
 
     int64_t fake_now{1000};
@@ -60,7 +72,7 @@ struct Harness {
 
     std::string group_id;
 
-    Harness() {
+    explicit Harness(pg::PgPool& pool) : rs(pool) {
         auto def = [&](const std::string& id, const std::string& plugin) {
             InstructionDefinition d;
             d.id = id;
@@ -154,8 +166,10 @@ struct Harness {
 } // namespace
 
 TEST_CASE("policy evaluator: compliant + non_compliant verdicts (multi-agent fan-out)",
-          "[policy][evaluator]") {
-    Harness h;
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
     h.canned["agentA|checkp"] = {1, out_json("hostname", "yuzu-a")};
     h.canned["agentB|checkp"] = {1, out_json("hostname", "")};
     auto pid = h.author("result.hostname != ''");
@@ -170,8 +184,10 @@ TEST_CASE("policy evaluator: compliant + non_compliant verdicts (multi-agent fan
 }
 
 TEST_CASE("policy evaluator: non-responder -> unknown, plugin failure -> error",
-          "[policy][evaluator]") {
-    Harness h;
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
     h.canned["agentA|checkp"] = {2, ""}; // FAILURE status -> error
     // agentB intentionally absent -> non-responder -> unknown
     auto pid = h.author("result.hostname != ''");
@@ -186,8 +202,10 @@ TEST_CASE("policy evaluator: non-responder -> unknown, plugin failure -> error",
 }
 
 TEST_CASE("policy evaluator: missing CEL field resolves empty -> non_compliant",
-          "[policy][evaluator]") {
-    Harness h;
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
     // Success status, but the result has no 'hostname' column the CEL references.
     // CEL resolves a missing result field to "" (not an error), so
     // `result.hostname != ''` is `'' != ''` -> false -> non_compliant. Missing
@@ -203,8 +221,10 @@ TEST_CASE("policy evaluator: missing CEL field resolves empty -> non_compliant",
     CHECK(h.status_of(pid, "agentA") == "non_compliant");
 }
 
-TEST_CASE("policy evaluator: CEL evaluation error -> error", "[policy][evaluator]") {
-    Harness h;
+TEST_CASE("policy evaluator: CEL evaluation error -> error", "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
     // Division by zero yields a top-level CEL evaluation error (monostate ->
     // eval_error), which the evaluator must surface as status "error", distinct
     // from a non-compliant verdict. (A comparison like `... > 1` would coerce
@@ -221,8 +241,10 @@ TEST_CASE("policy evaluator: CEL evaluation error -> error", "[policy][evaluator
     CHECK(h.status_of(pid, "agentA") == "error");
 }
 
-TEST_CASE("policy evaluator: interval throttles re-dispatch", "[policy][evaluator]") {
-    Harness h;
+TEST_CASE("policy evaluator: interval throttles re-dispatch", "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
     h.canned["agentA|checkp"] = {1, out_json("hostname", "a")};
     h.canned["agentB|checkp"] = {1, out_json("hostname", "b")};
     auto pid = h.author("result.hostname != ''");
@@ -241,8 +263,10 @@ TEST_CASE("policy evaluator: interval throttles re-dispatch", "[policy][evaluato
 }
 
 TEST_CASE("policy evaluator: empty compliance CEL -> error (no false compliant)",
-          "[policy][evaluator]") {
-    Harness h;
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
     // A successful check whose fragment defines an EMPTY check_compliance. The CEL
     // layer treats empty as always-compliant; the evaluator must NOT report this
     // as compliant (it would be false assurance) — it surfaces as error instead.
@@ -258,8 +282,10 @@ TEST_CASE("policy evaluator: empty compliance CEL -> error (no false compliant)"
 }
 
 TEST_CASE("policy evaluator: remediation attempt cap -> error after 3 fixing transitions",
-          "[policy][evaluator]") {
-    Harness h;
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
     h.canned["agentA|checkp"] = {1, out_json("hostname", "")}; // non_compliant
     auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
     h.canned["agentA|fixp"] = {1, "ok"};
@@ -282,8 +308,10 @@ TEST_CASE("policy evaluator: remediation attempt cap -> error after 3 fixing tra
     CHECK(h.status_of(pid, "agentA") == "error");
 }
 
-TEST_CASE("policy evaluator: verify dispatch failure -> error", "[policy][evaluator]") {
-    Harness h;
+TEST_CASE("policy evaluator: verify dispatch failure -> error", "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
     h.canned["agentA|checkp"] = {1, out_json("hostname", "")}; // non_compliant
     h.canned["agentA|fixp"] = {1, "ok"};
     auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
@@ -308,8 +336,10 @@ TEST_CASE("policy evaluator: verify dispatch failure -> error", "[policy][evalua
 }
 
 TEST_CASE("policy evaluator: manual remediation fix -> verify -> compliant",
-          "[policy][evaluator]") {
-    Harness h;
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
     h.canned["agentA|checkp"] = {1, out_json("hostname", "")}; // non_compliant first
     auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
 
@@ -336,8 +366,10 @@ TEST_CASE("policy evaluator: manual remediation fix -> verify -> compliant",
 }
 
 TEST_CASE("policy evaluator: remediation rejected when no fix_instruction",
-          "[policy][evaluator]") {
-    Harness h;
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
     h.canned["agentA|checkp"] = {1, out_json("hostname", "")};
     auto pid = h.author("result.hostname != ''", /*with_fix=*/false);
 

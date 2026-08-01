@@ -274,11 +274,31 @@ curl -s -b cookies.txt \
     done
 ```
 
+## Storage substrate (PostgreSQL, ADR-0039)
+
+Since the Postgres migration (ADR-0006/0039), responses live in the server's
+PostgreSQL database (schema `response_store`), not a local `response.db`. Two
+operator-visible notes:
+
+- **History reset on cutover.** The legacy SQLite `response.db` is **not**
+  migrated — response history is operational, TTL'd telemetry (skippable
+  backfill, ADR-0009), so on the upgrade to the Postgres substrate the
+  response history starts empty and refills as new commands run. The server
+  logs a one-time `response history reset on Postgres cutover` warning at
+  first boot. Executions-drawer and TAR views for commands issued before the
+  cutover will be empty; commands issued after are unaffected.
+- **Non-UTF-8 plugin output is sanitised.** A plugin can emit non-UTF-8 bytes
+  in its output/error; PostgreSQL `TEXT` requires valid UTF-8, so such bytes
+  are replaced with the Unicode replacement character (U+FFFD) at ingest. The
+  response row is still stored and still renders (defanged) — it is not
+  dropped or turned into a 500.
+
 ## Retention and cleanup
 
-Responses are retained for 90 days by default. A background thread runs every
-hour and deletes responses whose `timestamp` falls outside the retention
-window. Deletion is permanent.
+Responses are retained for 90 days by default. The server reaps responses
+whose TTL has expired on a periodic guarded sweep (clock-guarded and capped,
+so a skewed clock or a large backlog cannot mass-delete or stall — the same
+retention-guard shape the audit log uses). Deletion is permanent.
 
 To preserve data beyond the retention window, set up periodic exports using
 cron or a scheduled task:

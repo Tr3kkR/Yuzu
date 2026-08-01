@@ -22,6 +22,7 @@
 #include "baseline_store.hpp"
 #include "dex_app_perf_model.hpp" // AppPerfProviders (slice-2 app-perf read seams)
 #include "guaranteed_state_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
@@ -41,8 +42,18 @@
 
 namespace fs = std::filesystem;
 using namespace yuzu::server;
+using yuzu::server::pg::PgPool;
 
 namespace {
+
+// ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
+// "responsestore" template key with test_response_store.cpp (identical setup).
+yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("responsestore template: store failed to migrate");
+}};
 
 struct AuditRecord {
     std::string action;
@@ -63,10 +74,11 @@ struct RestGsHarness {
     yuzu::test::TempDbFile db_file{"yuzu_test_rest_gs-"};
     std::unique_ptr<GuaranteedStateStore> store;
 
-    // Live-info dispatch/poll deps. resp_store is a real ResponseStore the live
-    // endpoint polls; the dispatch stub returns a deterministic command_id so a test
-    // can pre-insert the matching response row. live_sent toggles the offline path.
-    yuzu::test::TempDbFile resp_db_file{"yuzu_test_rest_gs_resp-"};
+    // Live-info dispatch/poll deps. resp_store is a real ResponseStore (ADR-0039:
+    // Postgres-backed) the live endpoint polls, constructed only when the caller
+    // supplies a pool (see the constructor's `resp_pool` param); the dispatch stub
+    // returns a deterministic command_id so a test can pre-insert the matching
+    // response row. live_sent toggles the offline path.
     std::unique_ptr<ResponseStore> resp_store;
     int live_sent{1};
     std::string last_live_plugin, last_live_action;
@@ -137,8 +149,17 @@ struct RestGsHarness {
     // unwired so a test can prove /live → 503. wire_scoped_perm=false registers the
     // device-compliance route with an EMPTY ScopedPermFn, exercising its fail-closed-503
     // path. Both default true so every existing test is unchanged.
+    //
+    // ADR-0039: ResponseStore is now a migrated Postgres store, so it needs a
+    // live `pg::PgPool&` — but only the handful of `/live`-exercising
+    // TEST_CASEs in this file actually touch it. `resp_pool` is nullable
+    // (default nullptr) so the ~100 other RestGsHarness call sites in this
+    // file (Guard rule CRUD / DEX aggregations / …) stay PG-independent and
+    // untagged; only callers that pass a real pool get a real (open)
+    // resp_store — everyone else gets the same "substrate absent" shape the
+    // explicit `live_deps=false` case already exercised.
     explicit RestGsHarness(bool live_deps = true, bool wire_scoped_perm = true,
-                           bool wire_app_perf = true)
+                           bool wire_app_perf = true, pg::PgPool* resp_pool = nullptr)
         : wire_live_deps(live_deps) {
         // retention=0 keeps the reaper out of the way for ingest tests.
         store = std::make_unique<GuaranteedStateStore>(db_file.path, /*retention_days=*/0,
@@ -147,7 +168,10 @@ struct RestGsHarness {
         baseline_store = std::make_unique<BaselineStore>(bl_db_file.path);
         REQUIRE(baseline_store->is_open());
 
-        resp_store = std::make_unique<ResponseStore>(resp_db_file.path, /*retention_days=*/0);
+        if (wire_live_deps && resp_pool) {
+            resp_store = std::make_unique<ResponseStore>(*resp_pool, /*retention_days=*/0);
+            REQUIRE(resp_store->is_open());
+        }
 
         // Deterministic dispatch stub: command_id = "<plugin>-live" so a test can
         // pre-insert the matching response row; live_sent toggles offline (0).
@@ -254,7 +278,7 @@ struct RestGsHarness {
                             /*mgmt_store=*/nullptr,
                             /*token_store=*/nullptr,
                             /*quarantine_store=*/nullptr,
-                            wire_live_deps ? resp_store.get() : nullptr,
+                            resp_store.get(), // null unless wire_live_deps && a pool was supplied
                             /*instruction_store=*/nullptr,
                             /*execution_tracker=*/nullptr,
                             /*schedule_engine=*/nullptr,
@@ -962,8 +986,10 @@ TEST_CASE("REST dex/devices/{id}: out-of-scope device → 403, no data leak, no 
 }
 
 TEST_CASE("REST dex/devices/{id}/live uptime: dispatches + returns parsed JSON, audited",
-          "[rest][dex][device][live]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     // Pre-insert the agent's response for the deterministic command_id the stub mints.
     StoredResponse r;
     r.instruction_id = "os_info-live";
@@ -993,8 +1019,10 @@ TEST_CASE("REST dex/devices/{id}/live uptime: dispatches + returns parsed JSON, 
 }
 
 TEST_CASE("REST dex/devices/{id}/live processes: parses proc|pid|name|sha256|path rows",
-          "[rest][dex][device][live]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     StoredResponse r;
     r.instruction_id = "processes-live";
     r.agent_id = "WS-1";
@@ -1024,8 +1052,10 @@ TEST_CASE("REST dex/devices/{id}/live processes: parses proc|pid|name|sha256|pat
 }
 
 TEST_CASE("REST dex/devices/{id}/live: offline device (sent=0) → 503, audited requested",
-          "[rest][dex][device][live]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     h.live_sent = 0; // dispatch reaches no connected agent
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
     REQUIRE(res);
@@ -1042,8 +1072,10 @@ TEST_CASE("REST dex/devices/{id}/live: offline device (sent=0) → 503, audited 
 }
 
 TEST_CASE("REST dex/devices/{id}/live: unknown kind → 400, no dispatch",
-          "[rest][dex][device][live]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=bogus", "");
     REQUIRE(res);
     CHECK(res->status == 400);
@@ -1051,8 +1083,10 @@ TEST_CASE("REST dex/devices/{id}/live: unknown kind → 400, no dispatch",
 }
 
 TEST_CASE("REST dex/devices/{id}/live: out-of-scope device → 403, no dispatch",
-          "[rest][dex][device][live][scope]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     h.deny_scoped_agent = "WS-9";
     auto res = h.sink.Post("/api/v1/dex/devices/WS-9/live?kind=uptime", "");
     REQUIRE(res);
@@ -1095,8 +1129,10 @@ TEST_CASE("REST dex/devices/{id}: off-enum window → 400, no audit, no data",
 }
 
 TEST_CASE("REST dex/devices/{id}/live: terminal failure WINS over a partial-output row → 502",
-          "[rest][dex][device][live]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     // A single frame that carries BOTH partial output AND a failure status — the
     // pre-fix poll returned 200 with the partial data (UP-4). Failure must 502.
     StoredResponse r;
@@ -1115,8 +1151,10 @@ TEST_CASE("REST dex/devices/{id}/live: terminal failure WINS over a partial-outp
 }
 
 TEST_CASE("REST dex/devices/{id}/live: device error| output → 502",
-          "[rest][dex][device][live]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     StoredResponse r;
     r.instruction_id = "os_info-live";
     r.agent_id = "WS-1";
@@ -1133,8 +1171,10 @@ TEST_CASE("REST dex/devices/{id}/live: device error| output → 502",
 }
 
 TEST_CASE("REST dex/devices/{id}/live: terminal failure, no output → 502",
-          "[rest][dex][device][live]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     StoredResponse r;
     r.instruction_id = "os_info-live";
     r.agent_id = "WS-1";
@@ -1149,8 +1189,10 @@ TEST_CASE("REST dex/devices/{id}/live: terminal failure, no output → 502",
 }
 
 TEST_CASE("REST dex/devices/{id}/live: success terminal, no output → 200 empty (not a 504)",
-          "[rest][dex][device][live]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     StoredResponse r;
     r.instruction_id = "processes-live";
     r.agent_id = "WS-1";
@@ -1166,8 +1208,10 @@ TEST_CASE("REST dex/devices/{id}/live: success terminal, no output → 200 empty
 }
 
 TEST_CASE("REST dex/devices/{id}/live: over the concurrency cap → 429, no dispatch",
-          "[rest][dex][device][live]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     AtomicSave cap_save{yuzu::server::detail::live_max_inflight()};
     yuzu::server::detail::live_max_inflight().store(0); // any call is over budget
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
@@ -1177,8 +1221,10 @@ TEST_CASE("REST dex/devices/{id}/live: over the concurrency cap → 429, no disp
 }
 
 TEST_CASE("REST dex/devices/{id}/live: agent never responds → 504",
-          "[rest][dex][device][live]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     AtomicSave mp_save{yuzu::server::detail::live_poll_max_polls()};
     AtomicSave iv_save{yuzu::server::detail::live_poll_interval_ms()};
     yuzu::server::detail::live_poll_max_polls().store(2);
@@ -1189,8 +1235,10 @@ TEST_CASE("REST dex/devices/{id}/live: agent never responds → 504",
 }
 
 TEST_CASE("REST dex/devices/{id}/live: GET is not routed (POST-only side effect)",
-          "[rest][dex][device][live]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     // The endpoint is POST-only (it dispatches a command). A GET must NOT reach the
     // handler — the TestRouteSink returns nullptr when no route matches the method,
     // mirroring httplib's 404. Locks the GET->POST migration (architect B1).
@@ -1200,8 +1248,10 @@ TEST_CASE("REST dex/devices/{id}/live: GET is not routed (POST-only side effect)
 }
 
 TEST_CASE("REST dex/devices/{id}/live: emits outcome counter + in-flight gauge",
-          "[rest][dex][device][live][metrics]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live][metrics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     StoredResponse r;
     r.instruction_id = "os_info-live";
     r.agent_id = "WS-1";
@@ -1535,8 +1585,10 @@ TEST_CASE("REST dex/devices/{id}/app-perf: provider absent → 503 BEFORE audit"
 
 TEST_CASE("REST dex/devices/{id}/live: audit persistence failure → 503, NO dispatch, "
           "Sec-Audit-Failed",
-          "[rest][dex][device][live][audit]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     h.audit_succeeds = false; // evidence row cannot persist
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
     REQUIRE(res);
@@ -1548,8 +1600,10 @@ TEST_CASE("REST dex/devices/{id}/live: audit persistence failure → 503, NO dis
 }
 
 TEST_CASE("REST dex/devices/{id}/live: success echoes X-Correlation-Id header",
-          "[rest][dex][device][live][a3]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live][a3]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     StoredResponse r;
     r.instruction_id = "os_info-live";
     r.agent_id = "WS-1";
@@ -1563,8 +1617,10 @@ TEST_CASE("REST dex/devices/{id}/live: success echoes X-Correlation-Id header",
 }
 
 TEST_CASE("REST dex/devices/{id}/live: Execute denied but Read allowed → 403, no dispatch",
-          "[rest][dex][device][live][scope]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     h.deny_scoped_op = "Execute"; // Read floor passes; Execute floor denies
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
     REQUIRE(res);
@@ -1583,8 +1639,10 @@ TEST_CASE("REST dex/devices/{id}/live: live substrate unavailable → 503",
 }
 
 TEST_CASE("REST dex/devices/{id}/live: device output over the cap → 502",
-          "[rest][dex][device][live]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     StoredResponse r;
     r.instruction_id = "processes-live";
     r.agent_id = "WS-1";
@@ -1599,8 +1657,10 @@ TEST_CASE("REST dex/devices/{id}/live: device output over the cap → 502",
 }
 
 TEST_CASE("REST dex/devices/{id}/live: a different agent's response row is never rendered → 504",
-          "[rest][dex][device][live][scope]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     AtomicSave mp_save{yuzu::server::detail::live_poll_max_polls()};
     AtomicSave iv_save{yuzu::server::detail::live_poll_interval_ms()};
     yuzu::server::detail::live_poll_max_polls().store(2);
@@ -1620,8 +1680,10 @@ TEST_CASE("REST dex/devices/{id}/live: a different agent's response row is never
 }
 
 TEST_CASE("REST dex/devices/{id}/live uptime: success terminal, no output → 200 empty",
-          "[rest][dex][device][live]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, &pool);
     StoredResponse r;
     r.instruction_id = "os_info-live";
     r.agent_id = "WS-1";
