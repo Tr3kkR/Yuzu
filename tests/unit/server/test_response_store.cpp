@@ -1057,6 +1057,38 @@ TEST_CASE("ResponseStore: reap records result=capped when the per-pass cap is hi
     CHECK(reaped("capped") == 1.0); // unchanged
 }
 
+// Exact boundary: a pass that deletes EXACTLY the cap but leaves NO backlog is
+// "swept", not "capped" — hitting the cap doesn't prove a backlog, and a false
+// "capped" would page on-call for a drain that actually completed (chaos Gate 5,
+// the post-delete backlog probe).
+TEST_CASE("ResponseStore: reap that hits the cap with an empty backlog records swept",
+          "[pg][response_store][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool, /*retention_days=*/30);
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    // EXACTLY kReapCapPerPass expired rows, nothing else expired.
+    exec_sql(db.dsn(),
+            "INSERT INTO response_store.responses (instruction_id, agent_id, timestamp, "
+            "status, output, ttl_expires_at) SELECT 'exact-' || g, 'agent-a', 1700000000, 1, "
+            "'', g FROM generate_series(1, 10000) AS g");
+    store.store(mk_agg_resp("exact-live", "agent-a", 1)); // avoids would_wipe
+
+    const auto reaped = [&](const char* result) {
+        return metrics.counter("yuzu_server_response_reap_passes_total", {{"result", result}})
+            .value();
+    };
+
+    store.reap_expired(); // deletes exactly 10000, 0 expired remain → swept
+    CHECK(store.responses_reaped_total() == 10000);
+    CHECK(reaped("swept") == 1.0);
+    CHECK(reaped("capped") == 0.0); // NOT a false backlog page
+    CHECK(store.total_count() == 1); // only the live row
+}
+
 // R3: an embedded NUL is valid ASCII to sanitize_utf8_strict, but PG TEXT can't
 // store it and libpq's text-bind C-string-truncates at the first NUL — silently
 // dropping everything after it. sanitize_pg_text must U+FFFD-defang the NUL so

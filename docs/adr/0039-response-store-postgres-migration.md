@@ -169,3 +169,11 @@ should reach for one batch-under-one-savepoint, not a savepoint per row (subxid 
 - #2634-parity reap counters land here from day one.
 - The #1634 management-group-scoped response read (already threaded via `ResponseQuery`)
   stays defense-in-depth; no change.
+- **Accepted limitation (chaos Gate 5 R4):** the convenience scalar reads
+  (`total_count` / `facet_agent_count` / `facet_line_count`) return a plain `0` on a
+  pool-timeout / query error, indistinguishable from a genuine `0` and NOT counted on
+  `yuzu_server_response_read_degrade_total`. Benign today — no caller treats these as a
+  trigger for a destructive/skip action (the reap uses its own probe, not these), and they
+  feed display/metrics only. If a future authz-adjacent consumer reads one, promote it to the
+  `std::optional`-nullopt seam like the row/aggregate readers. Recorded so it is a deliberate
+  carve-out, not an omission.

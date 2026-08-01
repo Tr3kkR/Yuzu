@@ -1060,14 +1060,30 @@ void ResponseStore::reap_expired() {
             return false;
         }
         responses_deleted = PQntuples(del.get());
-        // A pass that hit the per-pass cap almost certainly left a backlog:
-        // report it distinctly (result="capped") so on-call can tell a healthy
-        // fully-draining reaper from one whose 10k/pass ceiling is being
-        // outrun by ingest — this is the higher-write store, and the ADR text
-        // implies the AuditStore cap-reached shape was ported (sre Gate 6 / R2).
-        // "capped" still counts as a successful drain of `responses_deleted`
-        // rows; the NEXT pass drains the next 10k.
-        outcome = (responses_deleted >= kReapCapPerPass) ? "capped" : "swept";
+        // Report a capped pass distinctly (result="capped") so on-call can tell
+        // a healthy fully-draining reaper from one whose 10k/pass ceiling is
+        // being outrun by ingest (this is the higher-write store; the AuditStore
+        // cap-reached shape, ported — sre Gate 6 / R2). Hitting the cap does NOT
+        // prove a backlog remains: an exact-boundary pass that drained the last
+        // row deleted exactly the cap with nothing left. Probe for a real
+        // remaining backlog (only when the cap was hit, so the cost is rare) so
+        // an exact-boundary drain labels "swept", not a false "capped" page —
+        // the AuditStore post-delete backlog probe (chaos Gate 5).
+        outcome = "swept";
+        if (responses_deleted >= kReapCapPerPass) {
+            pg::PgResult more = pg::exec_params(
+                conn,
+                "SELECT EXISTS(SELECT 1 FROM response_store.responses WHERE ttl_expires_at > 0 "
+                "AND ttl_expires_at < $1::bigint)",
+                std::vector<std::string>{std::to_string(now)});
+            if (more.status() != PGRES_TUPLES_OK) {
+                spdlog::error("ResponseStore::reap_expired: backlog probe failed: {}",
+                              PQerrorMessage(conn));
+                return false;
+            }
+            if (to_bool(PQgetvalue(more.get(), 0, 0)))
+                outcome = "capped";
+        }
         return true;
     });
 
