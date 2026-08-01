@@ -1,5 +1,7 @@
 name: Fork dynamic review
 
+run-name: "Fork review PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha }}"
+
 on:
   workflow_dispatch:
     inputs:
