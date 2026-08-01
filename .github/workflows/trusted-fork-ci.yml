@@ -1,0 +1,98 @@
+name: Trusted fork CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Open fork PR number"
+        required: true
+        type: string
+      head_sha:
+        description: "Exact 40-character PR head SHA reviewed by a maintainer"
+        required: true
+        type: string
+      review_run_id:
+        description: "Successful Fork dynamic review run ID for this PR and SHA"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+
+jobs:
+  validate-approval:
+    name: Validate explicit fork approval
+    runs-on: ubuntu-24.04
+    outputs:
+      pr_number: ${{ steps.validate.outputs.pr_number }}
+      head_sha: ${{ steps.validate.outputs.head_sha }}
+    steps:
+      - id: validate
+        env:
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          APPROVED_SHA: ${{ inputs.head_sha }}
+          REVIEW_RUN_ID: ${{ inputs.review_run_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          [[ "$APPROVED_SHA" =~ ^[0-9a-fA-F]{40}$ ]]
+          [[ "$REVIEW_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+
+          pr_json=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER")
+          state=$(jq -r '.state' <<<"$pr_json")
+          current_sha=$(jq -r '.head.sha' <<<"$pr_json")
+          head_repo=$(jq -r '.head.repo.full_name // empty' <<<"$pr_json")
+          [[ "$state" == "open" ]] || {
+            echo "::error::PR #$PR_NUMBER is not open."
+            exit 1
+          }
+          [[ "$current_sha" == "$APPROVED_SHA" ]] || {
+            echo "::error::PR #$PR_NUMBER moved; approved=$APPROVED_SHA current=$current_sha"
+            exit 1
+          }
+          [[ -n "$head_repo" && "$head_repo" != "$REPOSITORY" ]] || {
+            echo "::error::PR #$PR_NUMBER is not a fork PR."
+            exit 1
+          }
+
+          review_json=$(gh run view "$REVIEW_RUN_ID" --repo "$REPOSITORY" \
+            --json workflowName,displayTitle,status,conclusion)
+          workflow_name=$(jq -r '.workflowName' <<<"$review_json")
+          display_title=$(jq -r '.displayTitle' <<<"$review_json")
+          status=$(jq -r '.status' <<<"$review_json")
+          conclusion=$(jq -r '.conclusion' <<<"$review_json")
+          expected_title="Fork review PR #$PR_NUMBER @ $APPROVED_SHA"
+          [[ "$workflow_name" == "Fork dynamic review" ]] || {
+            echo "::error::Review run is not Fork dynamic review."
+            exit 1
+          }
+          [[ "$display_title" == "$expected_title" ]] || {
+            echo "::error::Review run title does not bind it to PR #$PR_NUMBER @ $APPROVED_SHA"
+            exit 1
+          }
+          [[ "$status" == "completed" && "$conclusion" == "success" ]] || {
+            echo "::error::Static fork review run did not succeed."
+            exit 1
+          }
+
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$APPROVED_SHA" >> "$GITHUB_OUTPUT"
+
+  trusted-gate:
+    name: Run trusted full CI gate
+    needs: [validate-approval]
+    uses: ./.github/workflows/ci.yml
+    with:
+      pr_number: ${{ needs.validate-approval.outputs.pr_number }}
+      head_sha: ${{ needs.validate-approval.outputs.head_sha }}
+    # Keep the called workflow's secret surface explicit. GITHUB_TOKEN is
+    # supplied automatically by Actions; the PAT is consumed only by the
+    # hosted, base-revision runner-control step before fork code is checked out.
+    secrets:
+      TRUSTED_FORK_CI_GATE: ${{ secrets.TRUSTED_FORK_CI_GATE }}
+      RUNNER_INVENTORY_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN }}

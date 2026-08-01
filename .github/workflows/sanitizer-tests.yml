@@ -59,20 +59,22 @@ jobs:
   # than queueing 75 min into a stalled runner). Secrets are available on
   # workflow_dispatch (the /test --full dispatch path), so the PAT resolves.
   preflight:
-    name: "Preflight (runner health)"
+    name: "Sanitizer preflight (runner health)"
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       bigtam_pool_healthy: ${{ steps.health.outputs.bigtam_pool_healthy }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Probe runner health
         id: health
         env:
           GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
-        run: python3 scripts/ci/runner-health-check.py --mode preflight
+        run: >-
+          python3 scripts/ci/runner-health-check.py --mode preflight
+          --require-pool bigtam
 
   asan-ubsan:
     name: "Sanitizers (ASan+UBSan)"
@@ -100,7 +102,7 @@ jobs:
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
@@ -267,7 +269,7 @@ jobs:
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false

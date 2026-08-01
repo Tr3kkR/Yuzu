@@ -340,6 +340,17 @@ if(-not $SkipEndToEnd){
   $work = Join-Path ([IO.Path]::GetTempPath()) "yuzu_test_provgate_$([guid]::NewGuid().ToString('N'))"
   New-Item -ItemType Directory -Force $work | Out-Null
   try {
+    # The real prologue resolves the reviewed contract beside $PSScriptRoot.
+    # Its disposable copy must preserve that runtime layout or the child
+    # processes stop at contract loading before reaching the drain gate.
+    $sourceRoot = Split-Path $ScriptPath
+    $contractPath = Join-Path $sourceRoot 'toolchain-contract.json'
+    $modulePath = Join-Path $sourceRoot 'Toolchain-Contract.psm1'
+    if(-not (Test-Path -LiteralPath $contractPath)){ throw "toolchain contract not found: $contractPath" }
+    if(-not (Test-Path -LiteralPath $modulePath)){ throw "toolchain contract module not found: $modulePath" }
+    Copy-Item -LiteralPath $contractPath -Destination (Join-Path $work 'toolchain-contract.json')
+    Copy-Item -LiteralPath $modulePath -Destination (Join-Path $work 'Toolchain-Contract.psm1')
+
     $text = Get-Content -LiteralPath $ScriptPath -Raw
     $cut  = $text.IndexOf("Step 'winget sanity'")
     if($cut -lt 0){ throw "could not locate the first Step in the script under test" }

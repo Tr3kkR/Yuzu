@@ -1171,18 +1171,25 @@ struct StreamLikeSink {
     std::mutex mu;
     bool stream_up{false};       ///< nullptr guardian_sink_stream_ equivalent
     bool write_fails{false};     ///< Write() returning false equivalent
+    std::size_t retained{0};
     std::vector<std::string> sent_ids;
 
     SendResult operator()(const OutboxEntry& e) {
         std::lock_guard<std::mutex> lk{mu};
-        if (!stream_up || write_fails)
+        if (!stream_up || write_fails) {
+            ++retained;
             return SendResult::Retain; // keep the head and stop this pass
+        }
         sent_ids.push_back(e.event_id);
         return SendResult::Sent;
     }
     std::size_t count() {
         std::lock_guard<std::mutex> lk{mu};
         return sent_ids.size();
+    }
+    std::size_t retain_count() {
+        std::lock_guard<std::mutex> lk{mu};
+        return retained;
     }
     void set_stream(bool up) {
         std::lock_guard<std::mutex> lk{mu};
@@ -1608,7 +1615,14 @@ TEST_CASE("R4: a refill re-arm does not wait out the periodic bound",
     // Deterministic precondition: some room, but not enough for the batch.
     REQUIRE(rig.rt->lifecycle_headroom() == kMaxJournalEntriesPerBatch - 4);
     worker.start();
-    CHECK(spin_until([&] { return rig.journal->pages() >= 1; }));
+    REQUIRE(spin_until([&] { return rig.journal->pages() >= 1; }));
+    // Pin the link-down half of the scenario before reconnecting. Merely observing
+    // the page counter is too early: the worker increments it before the following
+    // drain. If this thread raises the link during that gap, the boot drain can send
+    // the four live entries and its refill re-arm coalesces with notify() into one
+    // forced page. That is correct runtime behaviour, but the old assertion then
+    // waited for a third page that the scenario no longer required.
+    REQUIRE(spin_until([&] { return sink.retain_count() >= 1; }));
     const auto pages_before = rig.journal->pages();
 
     // Link returns. The NEXT cycle pages (blocked: the REQUIRE above pins headroom at

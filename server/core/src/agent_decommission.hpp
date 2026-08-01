@@ -39,9 +39,7 @@
 /// "never holding a lease across another store call" rule.
 ///
 /// NULL-TOLERANT, like the sibling ingest seams. A store that is not configured
-/// on this deployment (a null pointer) is recorded as `Skipped`, never a crash —
-/// so the same cascade works on a Postgres-less deployment (only the SQLite
-/// `InventoryStore` present) and on a full SLE deployment.
+/// on this deployment (a null pointer) is recorded as `Skipped`, never a crash.
 
 #include <cstddef>
 #include <functional>
@@ -112,7 +110,7 @@ struct DecommissionResult {
 /// Extend this struct (and the constructor's registration list) when a new
 /// per-agent store with a `delete_agent` joins the ladder.
 struct AgentDecommissionStores {
-    InventoryStore* inventory{nullptr};                  ///< SQLite generic inventory
+    InventoryStore* inventory{nullptr};                  ///< PG generic per-source inventory
     SoftwareInventoryStore* software_inventory{nullptr}; ///< PG installed_software
     AppPerfDailyStore* app_perf_daily{nullptr};          ///< PG per-device app-perf
     DeviceInventoryStore* device_inventory{nullptr};     ///< PG device_ci

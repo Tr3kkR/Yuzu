@@ -1,5 +1,7 @@
 name: Fork dynamic review
 
+run-name: "Fork review PR #${{ inputs.pr_number }} @ ${{ inputs.head_sha }}"
+
 on:
   workflow_dispatch:
     inputs:
@@ -35,7 +37,7 @@ jobs:
           [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
 
       - name: Check out exact PR revision
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/pull/${{ inputs.pr_number }}/head
           persist-credentials: false

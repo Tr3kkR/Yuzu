@@ -33,8 +33,10 @@ data).
 - **Backfill is mandatory** for config/reference stores and for `audit` (SOC 2 retention).
 - **Backfill may be skipped** (behind a flag) for purely TTL'd ephemeral stores (`response`) —
   history ages out, so a clean cut with a bounded gap is acceptable.
-- **The legacy SQLite file is retained read-only for one release** as a rollback net, then
-  removed in the following release.
+- **The legacy SQLite file is retained for one release** as a rollback net, then removed in
+  the following release. Backfill never mutates it; a store with a wired erasure path must,
+  however, delete the same subject/device from the rollback copy so rollback cannot resurrect
+  data whose erasure was reported successful.
 - Each per-store migration's upgrade-test must assert that config/reference/audit data survives
   the previous-release-SQLite → new-release-Postgres transition.
 
@@ -51,7 +53,8 @@ data).
 
 - Each per-store migration carries a `migrate_from_sqlite()` implementation and an upgrade-test
   assertion; the recipe is uniform, so per-store ADRs focus on schema, not mechanism.
-- The rollback window is exactly one release (the read-only legacy file). A defect discovered
+- The rollback window is exactly one release (the retained legacy file: backfill reads it only;
+  wired subject/device erasure may delete rows). A defect discovered
   after the legacy file is removed has no in-place rollback — so the one-release retention and
   the upgrade-test gate are load-bearing, not optional.
 - **Secrets stores (`api_token`, `ca`) are explicitly out of scope for this mechanism.** They

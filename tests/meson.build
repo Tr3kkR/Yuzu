@@ -486,6 +486,7 @@ if build_server
       'unit/server/test_device_ui.cpp',
       'unit/server/test_device_routes.cpp',
       'unit/server/test_inventory_routes.cpp',
+      'unit/server/test_inventory_store.cpp',
       'unit/server/test_sle_routes.cpp',
       'unit/server/test_inventory_ci_join.cpp',
       'unit/server/test_software_catalog_rollup.cpp',
@@ -761,6 +762,20 @@ test('close automation logic',
   suite: 'docs',
   timeout: 30,
 )
+
+# The native Windows runner contract is pure PowerShell with injected fixture
+# probes, so it is safe on every host that has pwsh. Keeping it in the docs
+# suite makes deleted schema/probe coverage fail in CI instead of depending on
+# an operator remembering the standalone command before provisioning.
+_pwsh_test = find_program('pwsh', required: false)
+if _pwsh_test.found()
+  test('Windows toolchain contract',
+    _pwsh_test,
+    args: ['-NoProfile', '-File', files('../deploy/windows/Test-ToolchainContract.ps1')],
+    suite: 'docs',
+    timeout: 30,
+  )
+endif
 
 # flake-retry's pure-logic selftest (tag-spec surgery, suite matching, junit
 # parsing, budget rows). Wired here (#2092) so the shard-retry contract the

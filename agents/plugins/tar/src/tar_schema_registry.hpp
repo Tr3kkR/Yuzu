@@ -165,7 +165,8 @@ std::optional<std::string> translate_dollar_name(std::string_view dollar_name);
 /**
  * Return true if `real_table_name` is a table that untrusted operator SQL
  * (the tar.sql action) is permitted to read: the typed warehouse tables from
- * the registry plus the base tar_state / tar_config / tar_events tables. Used
+ * the registry plus the base tar_state / tar_config tables (tar_events is NOT
+ * included — schema v3 retired it and v5 drops it from the installed base). Used
  * by the read-only SQL sandbox's SQLite authorizer (#760). The set is computed
  * once from the registry, so it stays in sync as new capture sources land.
  */
