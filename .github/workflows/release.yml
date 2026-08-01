@@ -514,6 +514,10 @@ jobs:
             Write-Host "ccache already present: $((Get-Command ccache).Source)"
           }
 
+      - name: Assert toolchain manifest (self-hosted)
+        shell: pwsh
+        run: ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath 'C:\actions-runner\toolchain-manifest.json'
+
       # ccache (~\AppData\Local\ccache) and vcpkg_installed/ both
       # persist on the self-hosted Windows runner between jobs. The
       # original cache/restore@v5 calls were already restore-only —
@@ -527,6 +531,10 @@ jobs:
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Assert effective vcpkg checkout
+        shell: pwsh
+        run: ./deploy/windows/Assert-VcpkgCheckout.ps1 -VcpkgRoot (Join-Path $env:GITHUB_WORKSPACE 'vcpkg')
 
       - name: vcpkg sentinel (x64-windows)
         # Universal cache-key contract — see scripts/ci/vcpkg-triplet-sentinel.sh.
