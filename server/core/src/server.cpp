@@ -825,6 +825,37 @@ public:
                           "was held at its prior value — a non-zero rate means that gauge may be "
                           "frozen, not genuinely low",
                           "counter");
+        // ResponseStore observability (ADR-0039). Described + seeded up front so
+        // the HELP/TYPE lines and closed reason/result dimensions export zeros on
+        // an idle server (absent-series alerting stays distinguishable from a
+        // scrape failure).
+        metrics_.describe("yuzu_server_response_ingest_dropped_total",
+                          "Response result rows that did not persist (fail-soft ingest, ADR-0039), "
+                          "by reason (store_not_open/pool_acquire_timeout/query_error) — the "
+                          "executions ladder still tracks the command; a sustained non-zero rate "
+                          "means drawer/TAR result history is silently lossy",
+                          "counter");
+        metrics_.describe("yuzu_server_response_read_degrade_total",
+                          "Response reads that returned a degrade (nullopt, not empty) rather than "
+                          "a result, by reason (store_not_open/pool_acquire_timeout/query_error) "
+                          "and source (response_store) — the seam distinguishes empty from "
+                          "degraded so a consumer can render a degrade banner, never misread a "
+                          "blip as 'no responses'",
+                          "counter");
+        metrics_.describe("yuzu_server_response_reap_passes_total",
+                          "TTL reap passes (clock-guarded gc_sweep, ADR-0039), by result "
+                          "(swept = rows deleted; noop = nothing expired; declined = retention "
+                          "classifier vetoed a would-wipe/clock-ahead pass; skipped_lock = another "
+                          "replica held the advisory lock; failed = pass errored)",
+                          "counter");
+        for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"}) {
+            metrics_.counter("yuzu_server_response_ingest_dropped_total", {{"reason", reason}});
+            metrics_.counter("yuzu_server_response_read_degrade_total",
+                             {{"reason", reason}, {"source", "response_store"}});
+        }
+        for (const auto result :
+             {"swept", "noop", "declined", "skipped_lock", "failed"})
+            metrics_.counter("yuzu_server_response_reap_passes_total", {{"result", result}});
         // DEX app-perf-over-time (B1/B2) — ingest, rollup, and read-degrade signals.
         // Described up front so the HELP/TYPE lines exist on an idle server (a
         // low-traffic deployment otherwise ships these series invisible until the
@@ -11949,9 +11980,16 @@ private:
         // gauges. Borrows result_set_store_, execution_tracker_, response_store_
         // and metrics_, so it MUST be joined before any of them are torn down
         // (join sits next to the policy-eval join in stop()).
-        if (result_set_store_ && result_set_store_->is_open()) {
+        // Started if EITHER store is open (cpp-safety JC-6): the response reap
+        // piggybacks this thread, so gating its existence on result_set_store
+        // health would silently stop response-TTL enforcement if that unrelated
+        // store were ever closed/optional. Both fail-closed together at boot
+        // today, so this is defensive against a future refactor; each unit of
+        // work below is independently is_open()-gated.
+        if ((result_set_store_ && result_set_store_->is_open()) ||
+            (response_store_ && response_store_->is_open())) {
             result_set_maint_thread_ = std::thread([this]() {
-                spdlog::info("Result-set maintenance thread started (cadence=2s, GC=5m)");
+                spdlog::info("Result-set/response maintenance thread started (cadence=2s, GC=5m)");
                 constexpr int kGcEveryNTicks = 150;            // ~5 minutes at 2s/tick
                 constexpr int64_t kPendingTimeoutSeconds = 300; // give up waiting after 5m
                 // ADR-0039: response_store_'s reap_expired() piggybacks this same

@@ -467,6 +467,34 @@ What to expect / do:
   — losing the CA key forces a full fleet re-enrollment.
 - Relocate the cert directory with `--ca-dir` (e.g. a dedicated container volume).
 
+## ⚠️ Behaviour change: response history resets on Postgres cutover (ADR-0039)
+
+`ResponseStore` (agentic command/instruction results — the executions drawer
+and TAR read source) moves from the SQLite `response.db` file to the server's
+PostgreSQL substrate in this release (ADR-0006 Wave 1, schema `response_store`).
+Like the `ApiTokenStore` and AuthDB cutovers, this is a **fresh-start cutover
+with no data migration** — response results are expendable, TTL'd telemetry
+(ADR-0009 skippable backfill), so the legacy `response.db` is **never read** on
+upgrade.
+
+**What happens on first PG boot:**
+- The server logs a one-time `response history reset on Postgres cutover`
+  warning.
+- Executions-drawer and TAR views for commands issued **before** the cutover
+  are empty; results for commands issued after are unaffected and refill
+  immediately as agents report.
+- No operator action required. To preserve pre-cutover response history,
+  export it from the old `response.db` before upgrading (see
+  `docs/user-manual/response-store.md` → periodic exports).
+
+**Also in this release:** non-UTF-8 bytes in a plugin's output/error (which
+the old SQLite `TEXT` column tolerated but PostgreSQL `TEXT` rejects) are now
+replaced with the Unicode replacement character (U+FFFD) at ingest — the
+response row is still stored and still renders, defanged, rather than being
+dropped (governance #1593). Retention moved from an hourly background thread
+to a clock-guarded, capped reap on the maintenance tick (no operator-visible
+behaviour change beyond the same 90-day default).
+
 ## ⚠️ Breaking: local accounts + MFA enrolments reset (AuthDB/ScimStore → Postgres, ADR-0006)
 
 `AuthDB` (local user accounts, MFA enrolments, enrollment tokens) and

@@ -149,6 +149,24 @@ both leave rows undeleted, so an audit table that never shrinks looks identical
 either way. Only the pair distinguishes "the guard is protecting the table" from
 "cleanup is broken".
 
+## Response-store metrics
+
+The response store (PostgreSQL schema `response_store`, ADR-0039) persists agentic
+command/instruction results for the executions drawer and the `/tar` dashboard. Its
+ingest is **fail-soft** (a dropped result is re-derivable operational telemetry — the
+executions ladder still tracks the command), its reads are **degrade-distinguishable**
+(nullopt on a store/pool failure, never a false-empty), and its TTL retention runs the
+same clock-guarded sweep the audit store uses.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_server_response_ingest_dropped_total{reason}` | counter | Response result rows that did not persist, by `reason` (`store_not_open` / `pool_acquire_timeout` / `query_error`). Fail-soft by design — the command is still tracked on the executions ladder — but a sustained non-zero rate means drawer/TAR result history is silently lossy. |
+| `yuzu_server_response_read_degrade_total{reason,source}` | counter | Response reads that returned a **degrade** (nullopt, not empty), by `reason` (same three) and `source` (`response_store`). The store seam distinguishes empty from degraded so a consumer renders a degrade banner rather than misreading a blip as "no responses". |
+| `yuzu_server_response_reap_passes_total{result}` | counter | TTL reap passes, by `result`: `swept` (rows deleted), `noop` (nothing expired), `declined` (the retention classifier vetoed a would-wipe or implausible-clock pass), `skipped_lock` (another replica held the advisory lock), `failed` (the pass errored). As with the audit reaper, alert on the total NOT increasing — a reaper that never runs leaves every result flat at 0, identical to a quiet healthy store while the table grows. |
+
+All reason/result dimensions are seeded to zero at boot, so absent-series alerting stays
+distinguishable from a scrape failure.
+
 ## MCP progress-bridge metrics
 
 The MCP Streamable-HTTP progress bridge projects live `notifications/progress` onto a

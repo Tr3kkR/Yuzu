@@ -358,10 +358,23 @@ void ResponseStore::store(const StoredResponse& resp) {
                                 "col_idx={}: {}",
                                 response_id, col_idx, PQerrorMessage(conn));
                     const std::string back_sql = "ROLLBACK TO SAVEPOINT " + sp_name;
-                    pg::exec_params(conn, back_sql.c_str(), std::vector<std::string>{});
+                    pg::PgResult back =
+                        pg::exec_params(conn, back_sql.c_str(), std::vector<std::string>{});
+                    // A failed rollback-to-savepoint leaves the connection in an
+                    // aborted-txn state the outer PgTxn will roll back whole —
+                    // log it so a silent savepoint-management fault isn't invisible.
+                    if (back.status() != PGRES_COMMAND_OK)
+                        spdlog::warn("ResponseStore: facet ROLLBACK TO SAVEPOINT failed for "
+                                     "response_id={}: {}",
+                                     response_id, PQerrorMessage(conn));
                 } else {
                     const std::string rel_sql = "RELEASE SAVEPOINT " + sp_name;
-                    pg::exec_params(conn, rel_sql.c_str(), std::vector<std::string>{});
+                    pg::PgResult rel =
+                        pg::exec_params(conn, rel_sql.c_str(), std::vector<std::string>{});
+                    if (rel.status() != PGRES_COMMAND_OK)
+                        spdlog::warn("ResponseStore: facet RELEASE SAVEPOINT failed for "
+                                     "response_id={}: {}",
+                                     response_id, PQerrorMessage(conn));
                 }
             }
         }
@@ -385,11 +398,19 @@ ResponseStore::FinalizeResult ResponseStore::finalize_terminal_status(
                       pool_.last_error());
         return FinalizeResult::Error;
     }
+    // Sanitize the untrusted error message the SAME way store() sanitizes
+    // output/error_detail (Gate 2 security MEDIUM): error_detail here is
+    // resp.error().message() from the agent, so a non-UTF-8 byte would fail
+    // the UPDATE (PG TEXT / SQLSTATE 22021), leaving the RUNNING row never
+    // finalized and no fallback frame — the #1593 "real result must surface"
+    // gap, reopened on the finalize path. U+FFFD-defang keeps the finalize
+    // landing.
+    const std::string sanitized_error = sanitize_utf8_strict(error_detail);
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "UPDATE response_store.responses SET status = $1::integer, error_detail = $2 "
         "WHERE instruction_id = $3 AND agent_id = $4 AND status = 0 AND execution_id = $5",
-        std::vector<std::string>{std::to_string(terminal_status), error_detail, instruction_id,
+        std::vector<std::string>{std::to_string(terminal_status), sanitized_error, instruction_id,
                                  agent_id, execution_id});
     if (res.status() != PGRES_COMMAND_OK) {
         spdlog::error("ResponseStore::finalize_terminal_status: update failed: {}",

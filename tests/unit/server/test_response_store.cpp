@@ -292,6 +292,70 @@ TEST_CASE("ResponseStore: invalid-UTF-8 output is sanitized to U+FFFD, not dropp
     CHECK((*results)[0].error_detail == "\xEF\xBF\xBD" "err");
 }
 
+// Facets are derived from `sanitized_output` (response_store.cpp:324), NOT the
+// raw bytes — so an invalid-UTF-8 facet value must land as its U+FFFD-defanged
+// form, never a raw byte the facet INSERT would reject (SQLSTATE 22021) and
+// silently ROLLBACK-TO-SAVEPOINT away. The plain-output UTF-8 test above leaves
+// `plugin` empty and so skips the whole facet block; this one exercises the
+// post-sanitize-derivation invariant with a real schema.
+TEST_CASE("ResponseStore: facets are derived post-sanitize (invalid-UTF-8 value defanged)",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+
+    // vuln_scan schema: severity|category|title|detail. Put an invalid byte in
+    // the category field (col_idx 1) — the facet value must come back defanged.
+    StoredResponse resp;
+    resp.instruction_id = "cmd-facet-badutf8";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.plugin = "vuln_scan";
+    resp.output = std::string("high|") + '\xff' + "category|title|detail";
+    store.store(resp);
+
+    auto facets = store.facet_values("cmd-facet-badutf8", /*col_idx=*/1);
+    REQUIRE(facets.has_value());
+    REQUIRE(facets->size() == 1); // derived, not dropped
+    CHECK((*facets)[0].value == "\xEF\xBF\xBD" "category");
+    // No raw invalid byte survived into the persisted facet value.
+    CHECK((*facets)[0].value.find('\xff') == std::string::npos);
+}
+
+// finalize_terminal_status binds the agent-supplied error message; like store()
+// it must U+FFFD-defang it (Gate 2 security MEDIUM). An unsanitized non-UTF-8
+// byte would fail the UPDATE (SQLSTATE 22021), leaving the RUNNING row never
+// finalized and no fallback frame — the #1593 "real result must surface" gap
+// reopened on the finalize path.
+TEST_CASE("ResponseStore: finalize_terminal_status sanitizes error_detail (invalid UTF-8)",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+
+    // A RUNNING row (status 0) awaiting its terminal frame.
+    StoredResponse running;
+    running.instruction_id = "cmd-finalize-badutf8";
+    running.agent_id = "agent-1";
+    running.execution_id = "exec-1";
+    running.status = 0;
+    running.output = "partial output";
+    store.store(running);
+
+    // Terminal frame carries a non-UTF-8 error message.
+    const std::string bad_err = std::string(1, '\xff') + "boom";
+    auto fr = store.finalize_terminal_status("cmd-finalize-badutf8", "agent-1", /*status=*/2,
+                                             bad_err, "exec-1");
+    CHECK(fr == ResponseStore::FinalizeResult::Updated); // row finalized, not lost to 22021
+
+    auto results = store.get_by_instruction("cmd-finalize-badutf8");
+    REQUIRE(results.has_value());
+    REQUIRE(results->size() == 1);
+    CHECK((*results)[0].status == 2);
+    CHECK((*results)[0].error_detail == "\xEF\xBF\xBD" "boom");
+    CHECK((*results)[0].error_detail.find('\xff') == std::string::npos);
+}
+
 TEST_CASE("ResponseStore: timestamp ordering", "[pg][response_store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

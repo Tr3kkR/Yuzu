@@ -91,13 +91,20 @@ which is a regression, not a preserved behaviour.
 Fix: `store()` sanitizes `output` and `error_detail` to U+FFFD (the replacement character) via
 the shared `sanitize_utf8_strict` helper (`utf8_sanitize.hpp` — the same implementation the
 inventory and app_perf ingest seams already use for their own untrusted text) **before**
-binding the `INSERT`. The row still lands; byte-for-byte fidelity is not required for
+binding the `INSERT`. `finalize_terminal_status` applies the identical sanitize to the
+agent-supplied `error_detail` it binds — otherwise a non-UTF-8 byte would fail the terminal-frame
+`UPDATE` (SQLSTATE 22021), leaving the RUNNING row never finalized and no fallback frame, which
+is the #1593 gap reopened on the finalize path rather than the ingest path. The row still lands; byte-for-byte fidelity is not required for
 expendable, TTL'd operational telemetry (consistent with the store's overall fail-soft/
 skippable-backfill posture). This also removes a class of render-time risk at the source —
 invalid bytes never reach `aggregate_to_json`/any downstream JSON serializer in the first
-place, rather than relying on every consumer to defend against them independently. `status`,
-`plugin`, and every id column are server/enum-controlled and are NOT sanitized — this applies
-only to the two free-text columns an agent fully controls.
+place, rather than relying on every consumer to defend against them independently. `status` is server/enum-controlled and is NOT sanitized. `plugin` (agent-supplied
+plugin name) and `instruction_id` (the agent-echoed command id) DO arrive on the wire, so a
+hostile agent could emit non-UTF-8 there — but a malformed value simply fail-soft-drops the
+whole row at INSERT (a garbage/hostile response defangs to a counted drop, by design), which
+is NOT the #1593 legitimate-output-must-surface case. Sanitization is applied only to the two
+free-text RESULT columns (`output`, `error_detail`) where dropping a real result would be the
+regression #1593 guards against.
 
 **Generalises**: any future store migrating an untrusted-byte `TEXT` column from SQLite to
 Postgres needs this same treatment — `AuditStore` is the next store on the ladder with agent-
