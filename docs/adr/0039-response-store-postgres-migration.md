@@ -65,11 +65,23 @@ Rationale recorded here so it is a deliberate decision, not an omission.
 The cleanup thread's bare wall-clock TTL delete ports to the #2496 `gc_sweep` shape
 (the routed-concern requires it; #2508): shared `gc_meta` reading + advisory
 `pg_try_advisory_xact_lock('response_store:reap', 0)` (single sweeper) +
-`audit_retention_rules::classify` decline-once + unconditional per-pass cap (substrate-tuned
-to response write volume; the implausibly-ahead bound sized to the 90-day retention horizon,
-NOT copied from a shorter-TTL store — the ADR-0038 lesson) + `yuzu_server_response_reap_
-passes_total{result}`. Reaped from the maintenance tick (like GS/ResultSetStore); the
-in-process cleanup thread goes away.
+`audit_retention_rules::classify` decline-once + unconditional per-pass cap (10 000,
+substrate-tuned to response write volume) + `yuzu_server_response_reap_passes_total{result}`.
+Reaped from the maintenance tick (like GS/ResultSetStore); the in-process cleanup thread goes
+away.
+
+The implausibly-ahead bound is **DERIVED from the store's own `retention_days` at 2×
+(floored ~120 d)**, not a fixed constant — `response_retention_days` is operator-configurable
+and unclamped, so a fixed bound would silently reintroduce the ADR-0038 false-decline class
+the moment retention passed it (every live row's honest `ttl_expires_at` would land past the
+bound → excluded from `datable` → `would_wipe` trips → perpetual decline → the table never
+reaps). "Size to THIS store's retention, NOT copied" (the ADR-0038 lesson) is taken literally:
+the bound tracks the horizon rather than a magic number.
+
+The per-pass cap is observable: a pass that deletes the full cap records
+`result="capped"` (distinct from `swept`), so on-call can tell a healthy fully-draining reaper
+from one whose 10 000/pass ceiling is being outrun by ingest on this high-write store — the
+`AuditStore` cap-reached signal, ported.
 
 ### Lifecycle
 
@@ -106,10 +118,34 @@ is NOT the #1593 legitimate-output-must-surface case. Sanitization is applied on
 free-text RESULT columns (`output`, `error_detail`) where dropping a real result would be the
 regression #1593 guards against.
 
+One more byte the plain scrub does NOT catch: **NUL (U+0000)**. `sanitize_utf8_strict` treats
+it as a valid ASCII byte and keeps it, but PostgreSQL `TEXT` cannot store an embedded NUL and
+libpq's text-format bind C-string-**truncates** the value at the first NUL — silently dropping
+everything after it (the same "real output vanishes" regression, on any binary/mis-decoded
+result carrying a `0x00`, which is exactly the ADR's motivating case). So a thin store-local
+wrapper `sanitize_pg_text` runs `sanitize_utf8_strict` and then replaces any remaining NUL with
+U+FFFD too. `utf8_sanitize.hpp` itself is NOT edited — it is byte-identical with the agent's
+installed_software copy (the canonical-hash invariant); NUL handling is a PG-bind concern local
+to this store. Facets derive from the same `sanitize_pg_text` output, so a stored `output` and
+its facet values never diverge across a NUL.
+
+### Facet ingest — one savepoint, not one-per-facet
+
+Facets are written as a **single batched multi-row `INSERT` under ONE `SAVEPOINT`**, not the
+per-facet-savepoint loop the first cut used. The savepoint still delivers the ADR-0038
+guarantee (a facet-batch failure rolls back to the savepoint and the response row still
+commits — Postgres aborts the whole txn on any failed statement, unlike SQLite's silent skip),
+but one savepoint mints **one** subtransaction XID regardless of facet cardinality. The
+per-facet loop minted a subxid per distinct value, so a wide tabular output (>64 distinct facet
+values — a routine process/vuln list) **suboverflowed** the ingest txn's snapshot and forced
+cluster-wide `pg_subtrans` SLRU lookups on the SHARED server pool (a blast radius beyond this
+store). The batch is chunked so `3 + 3·chunk` params stay under libpq's 65 535-param ceiling.
+
 **Generalises**: any future store migrating an untrusted-byte `TEXT` column from SQLite to
-Postgres needs this same treatment — `AuditStore` is the next store on the ladder with agent-
-supplied free text and should sanitize the same way rather than rediscovering #1593 the hard
-way.
+Postgres needs the same UTF-8 **and NUL** treatment — `AuditStore` is the next store on the
+ladder with agent-supplied free text and should sanitize the same way rather than rediscovering
+#1593 the hard way. Any store porting SQLite's "tolerate one bad sub-insert" behaviour to PG
+should reach for one batch-under-one-savepoint, not a savepoint per row (subxid suboverflow).
 
 ## Considered and rejected
 

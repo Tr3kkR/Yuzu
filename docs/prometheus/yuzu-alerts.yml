@@ -364,35 +364,68 @@ groups:
             Check that the new PEM files are valid, the cert and key match,
             and file permissions are correct (chmod 600 on Unix).
 
-  # DISABLED: response-store write-health alerting requires
-  # `yuzu_server_response_store_writes_total` and
-  # `yuzu_server_response_store_write_failures_total` counters that the server
-  # does not currently export. Re-enable this group once those metrics are
-  # emitted by the response store.
-  #
-  # - name: yuzu-storage
-  #   rules:
-  #     - alert: YuzuResponseStoreWriteFailures
-  #       expr: |
-  #         rate(yuzu_server_response_store_write_failures_total[5m]) > 0
-  #       for: 2m
-  #       labels:
-  #         severity: critical
-  #       annotations:
-  #         summary: "Response store write failures detected"
-  #
-  #     - alert: YuzuResponseStoreWriteFailureRate
-  #       expr: |
-  #         (
-  #           rate(yuzu_server_response_store_write_failures_total[5m])
-  #           /
-  #           rate(yuzu_server_response_store_writes_total[5m])
-  #         ) > 0.01
-  #       for: 5m
-  #       labels:
-  #         severity: warning
-  #       annotations:
-  #         summary: "Response store write failure rate exceeds 1%"
+  # ── yuzu-response-store — LIVE as of the response store's Postgres migration
+  # (ADR-0039) ──────────────────────────────────────────────────────────────
+  # These replace the old (never-emitted) `yuzu_server_response_store_writes_total`
+  # / `_write_failures_total` stub. The shipped metrics are the fail-soft ingest
+  # drop counter, the degrade-distinguishable read counter, and the clock-guarded
+  # reap-pass counter (all zero-seeded at boot, so absence-vs-zero is meaningful).
+  - name: yuzu-response-store
+    rules:
+      - alert: YuzuResponseIngestDrops
+        expr: |
+          rate(yuzu_server_response_ingest_dropped_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Response results are being dropped at ingest"
+          description: >-
+            The response store fail-soft-dropped command results for 10m
+            (reason label = store_not_open / pool_acquire_timeout / query_error).
+            The executions ladder still tracks the commands, but drawer/TAR
+            result history is lossy — check PostgreSQL pool saturation / health.
+
+      - alert: YuzuResponseReadDegrade
+        expr: |
+          rate(yuzu_server_response_read_degrade_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Response reads are degrading (nullopt, not empty)"
+          description: >-
+            Response reads returned a degrade rather than a result for 10m —
+            consumers render a degrade banner / 503 rather than a false-empty.
+            Usually PostgreSQL pool saturation; correlate with pool metrics.
+
+      - alert: YuzuResponseReapBacklog
+        expr: |
+          rate(yuzu_server_response_reap_passes_total{result="capped"}[1h]) > 0
+        for: 3h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Response TTL reap is hitting its per-pass cap (backlog growing)"
+          description: >-
+            The TTL reap has hit its 10,000-rows-per-pass cap on every pass for
+            3h, so expiry is outrunning the drain and the responses table is
+            growing. Consider a shorter response_retention_days or investigate
+            ingest volume.
+
+      - alert: YuzuResponseReapNotRunning
+        expr: |
+          rate(yuzu_server_response_reap_passes_total[2h]) == 0
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Response TTL reap has not run in 2h"
+          description: >-
+            No response reap pass of any result has been recorded for 2h. A
+            reaper that never runs looks identical to a quiet healthy store
+            while the table grows unbounded (the audit-store retention lesson).
+            Check the server's maintenance thread and PostgreSQL health.
 
   # ── yuzu-secrets — LIVE as of the auth store's Postgres migration ──────
   # The SecretCodec (ADR-0010, #1320 PR 4) counts decrypt failures per store

@@ -6,15 +6,16 @@ analyze fleet-wide data without an external database.
 
 ## Storage
 
-Responses are stored in a dedicated SQLite database using WAL (Write-Ahead
-Logging) mode. Each response is recorded as a `StoredResponse` containing the
-agent identity, instruction metadata, execution status, result payload, and
-timing information.
+Responses are stored in the server's PostgreSQL substrate (schema
+`response_store`, ADR-0039 — see the "Storage substrate (PostgreSQL)" section
+below for the migration and retention details). Each response is recorded as a
+`StoredResponse` containing the agent identity, instruction metadata, execution
+status, result payload, and timing information.
 
 | Setting | Default | Description |
 |---|---|---|
-| Retention period | 90 days | Responses older than this are deleted by background cleanup |
-| Cleanup interval | 1 hour | How often the background thread prunes expired responses |
+| Retention period | 90 days | Responses older than this are deleted by the clock-guarded retention reap (`response_retention_days`) |
+| Reap cadence | ~1 hour | How often the shared maintenance thread runs the expired-response reap |
 
 ## Response structure
 

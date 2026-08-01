@@ -18,6 +18,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <string_view>
+#include <tuple>
 #include <unordered_map>
 
 namespace yuzu::server {
@@ -52,16 +54,21 @@ constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
 // ResultSetStore's much smaller operator-scratch cap.
 constexpr int64_t kReapCapPerPass = 10'000;
 constexpr int64_t kReapBigStepSecs = 86'400; // part 7: absolute, ~1 day
-// kReapImplausiblyAheadSecs (part 1) MUST exceed the legitimate TTL horizon
+// The implausibly-ahead bound (part 1) MUST exceed the legitimate TTL horizon
 // or a live row's own honest ttl_expires_at gets misclassified as
 // "implausibly ahead" and wrongly excluded from `datable` — flipping a
 // normal partial-expiry pass into a false would_wipe decline (the ADR-0038
 // lesson: this bound must be sized to THIS store's retention, never copied
-// from a shorter-TTL sibling). Default retention here is 90 days
-// (kDefaultResponseRetentionDays); ~120 days (~10.4M secs) gives headroom
-// over any realistic operator-configured retention_days while still
-// catching genuinely corrupt/attacker-skewed far-future timestamps.
-constexpr int64_t kReapImplausiblyAheadSecs = 10'368'000; // ~120 days
+// from a shorter-TTL sibling). `response_retention_days` is operator-
+// configurable and UNCLAMPED (a compliance deployment may set it well above
+// the 90-day default), so a FIXED constant would silently reintroduce the
+// false-decline class the moment retention passes the constant — the whole
+// live set would land past the bound and every pass would decline, so the
+// table would never reap. The bound is therefore DERIVED from the store's own
+// horizon at 2× (the ADR-0038 "size to THIS store's retention" rule taken
+// literally), with a floor so a tiny/zero retention still catches genuinely
+// corrupt/attacker-skewed far-future timestamps.
+constexpr int64_t kReapImplausiblyAheadFloorSecs = 10'368'000; // ~120 days
 
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -75,6 +82,29 @@ std::int64_t to_i64(const char* s) {
     return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
 }
 bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
+
+// sanitize_utf8_strict (utf8_sanitize.hpp) scrubs invalid UTF-8 to U+FFFD but
+// treats NUL (U+0000) as a valid ASCII byte and keeps it. PostgreSQL TEXT cannot
+// store an embedded NUL, and libpq's text-format bind (paramLengths=nullptr)
+// C-string-truncates the value at the first NUL — silently dropping everything
+// after it (Gate 4 R3). On binary / mis-decoded plugin output that carries a
+// 0x00 (the ADR's own motivating case) that would partially defeat #1593 (a
+// real result must surface, defanged, never vanish) AND diverge the stored
+// `output` from the facets derived off the same string. So after the UTF-8
+// scrub, replace every NUL with U+FFFD too: the whole value survives to PG and
+// facets stay byte-consistent with `output`. We do NOT touch utf8_sanitize.hpp
+// itself — it is byte-identical with the agent's installed_software copy (the
+// canonical-hash invariant); NUL handling is a PG-bind concern local to this
+// store.
+std::string sanitize_pg_text(std::string_view s) {
+    std::string out = sanitize_utf8_strict(s);
+    std::size_t pos = 0;
+    while ((pos = out.find('\0', pos)) != std::string::npos) {
+        out.replace(pos, 1, "\xEF\xBF\xBD");
+        pos += 3;
+    }
+    return out;
+}
 double to_double(const char* s) {
     if (s == nullptr || s[0] == '\0')
         return 0.0;
@@ -285,8 +315,8 @@ void ResponseStore::store(const StoredResponse& resp) {
     // ingest seam on untrusted text (inventory, app_perf, …) sanitizes the
     // same way before its own PG bind; `sanitize_utf8_strict` is the shared
     // implementation (utf8_sanitize.hpp).
-    const std::string sanitized_output = sanitize_utf8_strict(resp.output);
-    const std::string sanitized_error = sanitize_utf8_strict(resp.error_detail);
+    const std::string sanitized_output = sanitize_pg_text(resp.output);
+    const std::string sanitized_error = sanitize_pg_text(resp.error_detail);
 
     pg::PgResult begin = pg::exec_params(conn, "BEGIN", std::vector<std::string>{});
     if (begin.status() != PGRES_COMMAND_OK) {
@@ -314,12 +344,18 @@ void ResponseStore::store(const StoredResponse& resp) {
     }
     const int64_t response_id = to_i64(PQgetvalue(ins.get(), 0, 0));
 
-    // Extract facets from the output using the plugin schema. Each facet
-    // INSERT runs under its OWN SAVEPOINT (ADR-0038 lesson): Postgres aborts
-    // the WHOLE transaction on any failed statement, unlike SQLite (which
-    // silently ignored a facet-insert failure and kept going) — matching that
-    // original behaviour requires a savepoint per facet so one malformed
-    // value can't take the just-inserted response row down with it.
+    // Extract facets from the output using the plugin schema, then insert them
+    // as a SINGLE batched multi-row INSERT under ONE savepoint. The savepoint
+    // preserves the ADR-0038 guarantee (Postgres aborts the WHOLE transaction
+    // on any failed statement, unlike SQLite's silent skip — so a facet failure
+    // must not take the just-inserted response row down): on batch failure we
+    // ROLLBACK TO this savepoint and still COMMIT the response row. But it is
+    // ONE savepoint, not one-per-facet: the old per-facet loop minted a
+    // subtransaction XID per distinct value, so a wide tabular output (>64
+    // distinct facet values — a routine process/vuln list) suboverflowed the
+    // ingest txn's snapshot and forced cluster-wide pg_subtrans SLRU lookups on
+    // the SHARED server pool (Gate 4 R1). One savepoint bounds it to a single
+    // subxid regardless of facet cardinality.
     if (!resp.plugin.empty() && !sanitized_output.empty()) {
         auto lines = split_output_lines(sanitized_output);
         // Accumulate (col_idx, value) → line_count. col_idx is 0-based offset
@@ -333,49 +369,59 @@ void ResponseStore::store(const StoredResponse& resp) {
                     facets[i][fields[i]]++;
             }
         }
-        int facet_seq = 0;
-        for (const auto& [col_idx, value_counts] : facets) {
-            for (const auto& [value, count] : value_counts) {
-                const std::string sp_name = "facet_ins_" + std::to_string(facet_seq++);
-                const std::string sp_sql = "SAVEPOINT " + sp_name;
-                pg::PgResult sp = pg::exec_params(conn, sp_sql.c_str(), std::vector<std::string>{});
-                if (sp.status() != PGRES_COMMAND_OK) {
-                    spdlog::warn("ResponseStore: facet SAVEPOINT failed for response_id={}: {}",
-                                response_id, PQerrorMessage(conn));
-                    continue;
-                }
-                pg::PgResult fi = pg::exec_params(
-                    conn,
-                    "INSERT INTO response_store.response_facets (response_id, instruction_id, "
-                    "agent_id, col_idx, value, line_count) VALUES ($1::bigint,$2,$3,$4::integer,"
-                    "$5,$6::integer) ON CONFLICT (response_id, col_idx, value) DO UPDATE SET "
-                    "line_count = EXCLUDED.line_count",
-                    std::vector<std::string>{std::to_string(response_id), resp.instruction_id,
-                                             resp.agent_id, std::to_string(col_idx), value,
-                                             std::to_string(count)});
-                if (fi.status() != PGRES_COMMAND_OK) {
-                    spdlog::warn("ResponseStore: facet insert failed for response_id={} "
-                                "col_idx={}: {}",
-                                response_id, col_idx, PQerrorMessage(conn));
-                    const std::string back_sql = "ROLLBACK TO SAVEPOINT " + sp_name;
-                    pg::PgResult back =
-                        pg::exec_params(conn, back_sql.c_str(), std::vector<std::string>{});
-                    // A failed rollback-to-savepoint leaves the connection in an
-                    // aborted-txn state the outer PgTxn will roll back whole —
-                    // log it so a silent savepoint-management fault isn't invisible.
-                    if (back.status() != PGRES_COMMAND_OK)
-                        spdlog::warn("ResponseStore: facet ROLLBACK TO SAVEPOINT failed for "
-                                     "response_id={}: {}",
+        std::vector<std::tuple<int, std::string, int>> flat;
+        for (const auto& [col_idx, value_counts] : facets)
+            for (const auto& [value, count] : value_counts)
+                flat.emplace_back(col_idx, value, count);
+
+        if (!flat.empty()) {
+            pg::PgResult sp =
+                pg::exec_params(conn, "SAVEPOINT facet_batch", std::vector<std::string>{});
+            if (sp.status() != PGRES_COMMAND_OK) {
+                spdlog::warn("ResponseStore: facet SAVEPOINT failed for response_id={}: {}",
+                             response_id, PQerrorMessage(conn));
+            } else {
+                bool facets_ok = true;
+                // Chunk so `3 + 3*chunk` stays well under libpq's 65535-param
+                // ceiling; response_id/instruction_id/agent_id are $1/$2/$3
+                // reused across every tuple, only (col_idx,value,count) vary.
+                constexpr std::size_t kFacetChunk = 2000;
+                for (std::size_t base = 0; facets_ok && base < flat.size();
+                     base += kFacetChunk) {
+                    const std::size_t stop = std::min(base + kFacetChunk, flat.size());
+                    std::string sql =
+                        "INSERT INTO response_store.response_facets (response_id, instruction_id, "
+                        "agent_id, col_idx, value, line_count) VALUES ";
+                    std::vector<std::string> params{std::to_string(response_id),
+                                                    resp.instruction_id, resp.agent_id};
+                    for (std::size_t i = base; i < stop; ++i) {
+                        const auto& [col_idx, value, count] = flat[i];
+                        const std::size_t p = params.size(); // 0-based; next is $(p+1)
+                        if (i != base)
+                            sql += ",";
+                        sql += "($1::bigint,$2,$3,$" + std::to_string(p + 1) + "::integer,$" +
+                               std::to_string(p + 2) + ",$" + std::to_string(p + 3) + "::integer)";
+                        params.push_back(std::to_string(col_idx));
+                        params.push_back(value);
+                        params.push_back(std::to_string(count));
+                    }
+                    sql += " ON CONFLICT (response_id, col_idx, value) DO UPDATE SET "
+                           "line_count = EXCLUDED.line_count";
+                    pg::PgResult fi = pg::exec_params(conn, sql.c_str(), params);
+                    if (fi.status() != PGRES_COMMAND_OK) {
+                        spdlog::warn("ResponseStore: facet batch insert failed for response_id={}: "
+                                     "{}",
                                      response_id, PQerrorMessage(conn));
-                } else {
-                    const std::string rel_sql = "RELEASE SAVEPOINT " + sp_name;
-                    pg::PgResult rel =
-                        pg::exec_params(conn, rel_sql.c_str(), std::vector<std::string>{});
-                    if (rel.status() != PGRES_COMMAND_OK)
-                        spdlog::warn("ResponseStore: facet RELEASE SAVEPOINT failed for "
-                                     "response_id={}: {}",
-                                     response_id, PQerrorMessage(conn));
+                        facets_ok = false;
+                    }
                 }
+                const char* fin_sql = facets_ok ? "RELEASE SAVEPOINT facet_batch"
+                                                : "ROLLBACK TO SAVEPOINT facet_batch";
+                pg::PgResult fin = pg::exec_params(conn, fin_sql, std::vector<std::string>{});
+                if (fin.status() != PGRES_COMMAND_OK)
+                    spdlog::warn("ResponseStore: facet savepoint finalize ({}) failed for "
+                                 "response_id={}: {}",
+                                 fin_sql, response_id, PQerrorMessage(conn));
             }
         }
     }
@@ -403,9 +449,9 @@ ResponseStore::FinalizeResult ResponseStore::finalize_terminal_status(
     // resp.error().message() from the agent, so a non-UTF-8 byte would fail
     // the UPDATE (PG TEXT / SQLSTATE 22021), leaving the RUNNING row never
     // finalized and no fallback frame — the #1593 "real result must surface"
-    // gap, reopened on the finalize path. U+FFFD-defang keeps the finalize
-    // landing.
-    const std::string sanitized_error = sanitize_utf8_strict(error_detail);
+    // gap, reopened on the finalize path. U+FFFD-defang (incl. NUL, see
+    // sanitize_pg_text) keeps the finalize landing.
+    const std::string sanitized_error = sanitize_pg_text(error_detail);
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "UPDATE response_store.responses SET status = $1::integer, error_detail = $2 "
@@ -559,14 +605,16 @@ ResponseStore::aggregate(const std::string& instruction_id, const AggregationQue
             if (std::find(allowed_group.begin(), allowed_group.end(), aq.group_by) ==
                 allowed_group.end()) {
                 spdlog::warn("ResponseStore::aggregate: invalid group_by '{}'", aq.group_by);
-                return std::vector<AggregationResult>{};
+                return std::nullopt; // allow-list miss is a caller/code bug, not a real
+                                     // empty result — degrade-distinguish it (Gate 4 R5)
+                                     // so the seam's empty-vs-degrade discipline holds.
             }
             static const std::vector<std::string> allowed_op_col = {"timestamp", "status", "id"};
             auto effective_op_col = aq.op_column.empty() ? "id" : aq.op_column;
             if (std::find(allowed_op_col.begin(), allowed_op_col.end(), effective_op_col) ==
                 allowed_op_col.end()) {
                 spdlog::warn("ResponseStore::aggregate: invalid op_column '{}'", effective_op_col);
-                return std::vector<AggregationResult>{};
+                return std::nullopt; // as above (Gate 4 R5)
             }
 
             std::string agg_func;
@@ -882,6 +930,14 @@ void ResponseStore::reap_expired() {
         }
 
         const int64_t now = now_epoch();
+        // Derive the implausibly-ahead bound from THIS store's configured
+        // retention (2× horizon, floored) so raising `response_retention_days`
+        // above a fixed constant can't push the whole live set past the bound
+        // and wedge the reaper in permanent decline (consistency-auditor
+        // Gate 4; the ADR-0038 false-decline lesson taken literally).
+        const int64_t implausibly_ahead =
+            std::max<int64_t>(kReapImplausiblyAheadFloorSecs,
+                              static_cast<int64_t>(retention_days_) * 86'400 * 2);
 
         pg::PgResult meta = pg::exec_params(
             conn,
@@ -933,7 +989,7 @@ void ResponseStore::reap_expired() {
             "AS expiring, count(*) FILTER (WHERE ttl_expires_at > 0 AND ttl_expires_at <= "
             "$2::bigint) AS datable FROM response_store.responses",
             std::vector<std::string>{std::to_string(now),
-                                     std::to_string(now + kReapImplausiblyAheadSecs)});
+                                     std::to_string(now + implausibly_ahead)});
         if (probe.status() != PGRES_TUPLES_OK) {
             spdlog::error("ResponseStore::reap_expired: probe failed: {}", PQerrorMessage(conn));
             return false;
@@ -1004,7 +1060,14 @@ void ResponseStore::reap_expired() {
             return false;
         }
         responses_deleted = PQntuples(del.get());
-        outcome = "swept";
+        // A pass that hit the per-pass cap almost certainly left a backlog:
+        // report it distinctly (result="capped") so on-call can tell a healthy
+        // fully-draining reaper from one whose 10k/pass ceiling is being
+        // outrun by ingest — this is the higher-write store, and the ADR text
+        // implies the AuditStore cap-reached shape was ported (sre Gate 6 / R2).
+        // "capped" still counts as a successful drain of `responses_deleted`
+        // rows; the NEXT pass drains the next 10k.
+        outcome = (responses_deleted >= kReapCapPerPass) ? "capped" : "swept";
         return true;
     });
 

@@ -844,9 +844,11 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_response_reap_passes_total",
                           "TTL reap passes (clock-guarded gc_sweep, ADR-0039), by result "
-                          "(swept = rows deleted; noop = nothing expired; declined = retention "
-                          "classifier vetoed a would-wipe/clock-ahead pass; skipped_lock = another "
-                          "replica held the advisory lock; failed = pass errored)",
+                          "(swept = deleted the full expired set; capped = deleted the per-pass "
+                          "cap of 10000 and a backlog likely remains — sustained non-zero means "
+                          "expiry is outrunning the drain; noop = nothing expired; declined = "
+                          "retention classifier vetoed a would-wipe/clock-ahead pass; skipped_lock "
+                          "= another replica held the advisory lock; failed = pass errored)",
                           "counter");
         for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"}) {
             metrics_.counter("yuzu_server_response_ingest_dropped_total", {{"reason", reason}});
@@ -854,7 +856,7 @@ public:
                              {{"reason", reason}, {"source", "response_store"}});
         }
         for (const auto result :
-             {"swept", "noop", "declined", "skipped_lock", "failed"})
+             {"swept", "capped", "noop", "declined", "skipped_lock", "failed"})
             metrics_.counter("yuzu_server_response_reap_passes_total", {{"result", result}});
         // DEX app-perf-over-time (B1/B2) — ingest, rollup, and read-degrade signals.
         // Described up front so the HELP/TYPE lines exist on an idle server (a
@@ -12009,7 +12011,17 @@ private:
                                                 std::chrono::system_clock::now().time_since_epoch())
                                                 .count();
 
+                        // Each unit of work below is INDEPENDENTLY is_open-gated
+                        // (JC-6): the thread starts if either store is open, so a
+                        // closed result-set store must not crash the response reap
+                        // (or vice-versa). `tick` increments unconditionally so a
+                        // closed result-set store never starves the response reap's
+                        // cadence.
+                        const bool rs_ok = result_set_store_ && result_set_store_->is_open();
+                        ++tick;
+
                         // 1) Materialise terminal pending sets.
+                        if (rs_ok)
                         for (const auto& p : result_set_store_->list_pending()) {
                             if (p.source_execution_id.empty())
                                 continue;
@@ -12065,7 +12077,7 @@ private:
                         }
 
                         // 2) GC sweep on the slow cadence.
-                        if (++tick % kGcEveryNTicks == 0) {
+                        if (rs_ok && tick % kGcEveryNTicks == 0) {
                             int swept = result_set_store_->gc_sweep();
                             if (swept > 0) {
                                 metrics_.counter("yuzu_result_set_gc_total")
@@ -12082,11 +12094,13 @@ private:
                         }
 
                         // 3) Refresh alive gauges.
-                        auto c = result_set_store_->counts();
-                        metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "true"}})
-                            .set(static_cast<double>(c.pinned));
-                        metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "false"}})
-                            .set(static_cast<double>(c.total - c.pinned));
+                        if (rs_ok) {
+                            auto c = result_set_store_->counts();
+                            metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "true"}})
+                                .set(static_cast<double>(c.pinned));
+                            metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "false"}})
+                                .set(static_cast<double>(c.total - c.pinned));
+                        }
                     } catch (const std::exception& e) {
                         spdlog::error("result_set_maint: tick threw ({}) — thread continuing",
                                       e.what());

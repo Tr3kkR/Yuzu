@@ -16,6 +16,8 @@
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
@@ -992,4 +994,126 @@ TEST_CASE("ResponseStore: reap_expired declines once on a clock reading ahead of
     CHECK(store.total_count() == 1);
     CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM response_store.gc_meta WHERE key = "
                                  "'last_anomaly_facts'") == "0"); // consumed/cleared
+}
+
+// The implausibly-ahead bound must be DERIVED from retention_days (2× horizon,
+// floored), NOT a fixed constant (consistency-auditor Gate 4). With a fixed
+// ~120d bound, an operator who raised response_retention_days above ~120 would
+// push every LIVE row's honest ttl_expires_at past the bound → excluded from
+// `datable` → would_wipe trips → perpetual decline → the table never reaps. At
+// retention=200d a fresh row (ttl ≈ now+200d) must stay datable and a genuinely
+// expired row must still drain on the first pass.
+TEST_CASE("ResponseStore: reap bound scales with a >120d retention (no false would_wipe)",
+          "[pg][response_store][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool, /*retention_days=*/200); // > the old fixed ~120d bound
+    REQUIRE(store.is_open());
+
+    store.store(mk_agg_resp("ret200-live", "agent-a", 1)); // ttl ≈ now + 200d
+    store.store(mk_agg_resp("ret200-old", "agent-a", 1));
+    exec_sql(db.dsn(), "UPDATE response_store.responses SET ttl_expires_at = 1 WHERE "
+                       "instruction_id = 'ret200-old'");
+
+    store.reap_expired();
+    // The live row is datable (bound is 2×200d), so would_wipe does NOT trip and
+    // the expired row drains — with a fixed 120d bound the live row would fall
+    // out of `datable`, trip would_wipe, and this pass would decline (0 reaped).
+    CHECK(store.responses_reaped_total() == 1);
+    CHECK(store.total_count() == 1); // only the live row survives
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM response_store.gc_meta WHERE key = "
+                                 "'last_anomaly_facts'") == "0"); // no anomaly recorded
+}
+
+// A capped pass (per-pass cap hit, backlog remains) must record
+// result="capped", not "swept", so on-call can distinguish a healthy drain from
+// one being outrun (Gate 4 R2 / sre). A fully-draining pass records "swept".
+TEST_CASE("ResponseStore: reap records result=capped when the per-pass cap is hit",
+          "[pg][response_store][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool, /*retention_days=*/30);
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    exec_sql(db.dsn(),
+            "INSERT INTO response_store.responses (instruction_id, agent_id, timestamp, "
+            "status, output, ttl_expires_at) SELECT 'capm-' || g, 'agent-a', 1700000000, 1, "
+            "'', g FROM generate_series(1, 10001) AS g");
+    store.store(mk_agg_resp("capm-live", "agent-a", 1)); // avoids would_wipe
+
+    const auto reaped = [&](const char* result) {
+        return metrics.counter("yuzu_server_response_reap_passes_total", {{"result", result}})
+            .value();
+    };
+
+    store.reap_expired(); // deletes 10000, backlog of 1 remains → capped
+    CHECK(reaped("capped") == 1.0);
+    CHECK(reaped("swept") == 0.0);
+
+    store.reap_expired(); // drains the last row → swept
+    CHECK(reaped("swept") == 1.0);
+    CHECK(reaped("capped") == 1.0); // unchanged
+}
+
+// R3: an embedded NUL is valid ASCII to sanitize_utf8_strict, but PG TEXT can't
+// store it and libpq's text-bind C-string-truncates at the first NUL — silently
+// dropping everything after it. sanitize_pg_text must U+FFFD-defang the NUL so
+// the WHOLE value survives (the #1593 must-surface guarantee) and facets stay
+// byte-consistent with the stored output.
+TEST_CASE("ResponseStore: embedded NUL is defanged, output past it is not truncated",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+
+    StoredResponse resp;
+    resp.instruction_id = "cmd-nul";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.output = std::string("before") + '\0' + "after";      // embedded NUL
+    resp.error_detail = std::string("e") + '\0' + "x";
+    store.store(resp);
+
+    auto results = store.get_by_instruction("cmd-nul");
+    REQUIRE(results.has_value());
+    REQUIRE(results->size() == 1);
+    // "after" survived — NOT truncated at the NUL — with the NUL as U+FFFD.
+    CHECK((*results)[0].output == "before\xEF\xBF\xBD" "after");
+    CHECK((*results)[0].error_detail == "e\xEF\xBF\xBD" "x");
+    CHECK((*results)[0].output.find('\0') == std::string::npos);
+}
+
+// R1: a wide tabular output (>64 distinct facet values) must still persist ALL
+// its facets. The batched single-savepoint INSERT replaced the per-facet
+// savepoint loop (which suboverflowed the ingest txn's subxids on the shared
+// pool); this pins that the batch itself is correct — every distinct value lands
+// and the response row is present.
+TEST_CASE("ResponseStore: wide facet set (>64 distinct values) all persist via batch insert",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+
+    // vuln_scan schema: severity|category|title|detail. 200 distinct category
+    // values in col_idx 1 — well past the 64-subxid suboverflow threshold.
+    std::string out;
+    for (int i = 0; i < 200; ++i)
+        out += "high|category-" + std::to_string(i) + "|title|detail\n";
+    StoredResponse resp;
+    resp.instruction_id = "cmd-wide";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.plugin = "vuln_scan";
+    resp.output = out;
+    store.store(resp);
+
+    auto facets = store.facet_values("cmd-wide", /*col_idx=*/1);
+    REQUIRE(facets.has_value());
+    CHECK(facets->size() == 200); // every distinct category landed
+    // The response row itself is present.
+    auto results = store.get_by_instruction("cmd-wide");
+    REQUIRE(results.has_value());
+    CHECK(results->size() == 1);
 }
