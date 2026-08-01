@@ -1265,13 +1265,19 @@ int main(int argc, char* argv[]) {
         // it isn't, refuse to proceed rather than silently clear a second factor
         // with no record (H-1). This also gives the operator an actionable error
         // instead of a buried warning during a stressful recovery.
-        yuzu::server::AuditStore audit(cfg.data_dir / "audit.db");
+        // ADR-0040: AuditStore is Postgres-backed now. Reuse the already-open,
+        // validated break-glass PgPool (auth_pg_pool is non-null here — this
+        // block is guarded by `if (!auth_db)` above, and auth_db only exists
+        // when auth_pg_pool is valid). Constructing runs the (idempotent) schema
+        // migration; the one-shot only needs a writable store for one evidence
+        // row, so it does NOT run migrate_from_sqlite (that is a boot-time
+        // concern in server.cpp).
+        yuzu::server::AuditStore audit(*auth_pg_pool);
         if (!audit.is_open()) {
-            spdlog::error("--mfa-reset: audit store (audit.db in '{}') is not writable; refusing "
-                          "to clear MFA without an audit record. Fix audit.db permissions/disk and "
-                          "retry, or perform the reset via your documented break-glass SQL path "
-                          "(which you must then record in change management).",
-                          cfg.data_dir.string());
+            spdlog::error("--mfa-reset: Postgres audit store (schema audit_store) is not writable; "
+                          "refusing to clear MFA without an audit record. Check --postgres-dsn "
+                          "reachability and retry, or perform the reset via your documented "
+                          "break-glass SQL path (which you must then record in change management).");
             std::cerr << "error: audit store unavailable; refusing to clear MFA without an audit "
                          "record\n";
             return EXIT_FAILURE;
@@ -1348,11 +1354,13 @@ int main(int argc, char* argv[]) {
         }
         // Audit is MANDATORY (CC6.6): verify the audit store is WRITABLE before
         // arming, so the exemption is never granted without a record.
-        yuzu::server::AuditStore audit(cfg.data_dir / "audit.db");
+        // ADR-0040: Postgres-backed AuditStore; reuse the validated PgPool
+        // (auth_pg_pool non-null — guarded by `if (!auth_db)` above).
+        yuzu::server::AuditStore audit(*auth_pg_pool);
         if (!audit.is_open()) {
-            spdlog::error("--break-glass-arm: audit store (audit.db in '{}') is not writable; "
-                          "refusing to arm break-glass without an audit record.",
-                          cfg.data_dir.string());
+            spdlog::error("--break-glass-arm: Postgres audit store (schema audit_store) is not "
+                          "writable; refusing to arm break-glass without an audit record. Check "
+                          "--postgres-dsn reachability and retry.");
             std::cerr << "error: audit store unavailable; refusing to arm without an audit record\n";
             return EXIT_FAILURE;
         }

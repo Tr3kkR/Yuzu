@@ -2558,6 +2558,10 @@ public:
                                   "created/opened)");
                     startup_failed_ = true;
                 } else {
+                    // Wire metrics BEFORE the backfill so yuzu_server_audit_backfill_total
+                    // actually emits — the backfill's own outcome metric was dead when
+                    // set_metrics ran after it (Gate 2 security MEDIUM).
+                    audit_store_->set_metrics(&metrics_);
                     auto audit_db = cfg_.db_dir() / "audit.db";
                     if (!audit_store_->migrate_from_sqlite(audit_db)) {
                         spdlog::error("[PG] Refusing to start: audit store backfill from legacy {} "
@@ -2568,7 +2572,6 @@ public:
                                       audit_db.string());
                         startup_failed_ = true;
                     } else {
-                        audit_store_->set_metrics(&metrics_);
                         audit_store_->start_cleanup();
                     }
                 }
@@ -5283,7 +5286,15 @@ public:
         auth_key_provider_.reset();
         // AuditStore (ADR-0040) borrows pg_pool_ via its retention thread — that
         // thread is joined at stop_cleanup() above; drop the store before the
-        // pool so no late lease touches a destroyed pool.
+        // pool so no late lease touches a destroyed pool. Unwire the borrowed
+        // pointer from every writer FIRST (belt-and-braces, matching the sibling
+        // stores above + ADR-0040 §Lifecycle) rather than relying on RPC/HTTP
+        // drain ordering — a late log() must not touch a reset store.
+        agent_service_.set_audit_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_audit_store(nullptr);
+        if (fleet_topology_store_)
+            fleet_topology_store_->set_audit_store(nullptr);
         audit_store_.reset();
         pg_pool_.reset();
     }

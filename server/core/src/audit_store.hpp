@@ -141,7 +141,7 @@ inline constexpr std::size_t kAuditSampleScanCap = 10000;
 // the full rationale (ported verbatim from the SQLite guard): a forward-skewed
 // row that can never itself expire must not be counted as a survivor, or ONE bad
 // row vetoes the guard for the life of the store.
-inline constexpr std::int64_t kAuditTtlFutureSlackSec = 2 * 86400;
+inline constexpr std::int64_t kAuditTtlFutureSlackSec = 2 * 86'400LL;
 
 // Upper bound on rows deleted by ONE retention pass. The load-bearing half of
 // the guard: it applies unconditionally, turning an accepted wipe into a paced
@@ -155,7 +155,7 @@ inline constexpr std::size_t kMaxAuditDeletesPerPass = 25000;
 // window is the fatal mistake (at 365d it becomes a YEAR and never fires). Set
 // past the point where an outage is itself remarkable; a server genuinely down
 // for eight days declines one pass, the right trade for catching a month jump.
-inline constexpr std::int64_t kAuditMinBigStepSec = 7 * 86400;
+inline constexpr std::int64_t kAuditMinBigStepSec = 7 * 86'400LL;
 
 class AuditStore {
 public:
@@ -169,6 +169,11 @@ public:
 
     AuditStore(const AuditStore&) = delete;
     AuditStore& operator=(const AuditStore&) = delete;
+    // Non-movable: borrows PgPool& and owns a retention thread + atomics. Already
+    // immovable (deleted copy suppresses implicit moves); explicit to document
+    // intent and satisfy cppcoreguidelines-special-member-functions.
+    AuditStore(AuditStore&&) = delete;
+    AuditStore& operator=(AuditStore&&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 

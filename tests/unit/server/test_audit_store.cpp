@@ -511,6 +511,126 @@ TEST_CASE("AuditStore: backfill handles a legacy DB without the principal_class 
           "5");
 }
 
+// The reconcile shortfall guard is the sole safety net that stops boot from
+// proceeding with an INCOMPLETE evidence chain (Gate 3 QE BLOCKING — it was
+// untested). Force pg_count < legacy_count deterministically: pre-insert a row
+// whose id is HIGHER than every legacy id, with NO marker. migrate then resumes
+// from MAX(id) (past all legacy rows), migrates nothing, and reconcile sees
+// pg_count(1) < legacy_count(50) → must return false and NOT stamp the marker.
+TEST_CASE("AuditStore: backfill reconcile shortfall fails closed and does not mark complete",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bf5_"}};
+    auto legacy = dir.path / "audit.db";
+    build_legacy_audit_db(legacy, /*count=*/50);
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    // Resume cursor jumps past every legacy id (1..50) → nothing gets migrated.
+    exec_sql(db.dsn(), "INSERT INTO audit_store.audit_events (id, timestamp, principal, "
+                       "principal_role, action, result, ttl_expires_at) OVERRIDING SYSTEM VALUE "
+                       "VALUES (100000, 1000, 'admin','admin','auth.login','success',0)");
+
+    CHECK_FALSE(store.migrate_from_sqlite(legacy)); // reconcile shortfall → fail-closed
+    // Marker NOT stamped — the next boot retries rather than serving an
+    // incomplete SOC-2 evidence chain.
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE key = "
+                                 "'backfill_complete'") == "0");
+    // The legacy file is left in place for the retry (not moved aside).
+    CHECK(std::filesystem::exists(legacy));
+}
+
+// A legacy audit.db is UNTRUSTED-at-rest: years of free-text fields may hold
+// invalid UTF-8 or an embedded NUL — in ANY column, including result/
+// principal_class. Without sanitizing those two on the backfill path, one bad
+// byte fails the fail-hard batch INSERT (SQLSTATE 22021), fails the MANDATORY
+// backfill, and bricks boot forever (Gate 4 cpp-safety/unhappy #2). This proves
+// the row lands, defanged, and the backfill succeeds.
+TEST_CASE("AuditStore: backfill sanitizes invalid-UTF-8 legacy bytes in every text column",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bf6_"}};
+    auto legacy = dir.path / "audit.db";
+    std::filesystem::create_directories(legacy.parent_path());
+    {
+        SqliteDb ldb;
+        REQUIRE(sqlite3_open(legacy.string().c_str(), ldb.addr()) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(ldb.get(),
+                             "CREATE TABLE audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                             "timestamp INTEGER NOT NULL, principal TEXT NOT NULL, principal_role "
+                             "TEXT NOT NULL, action TEXT NOT NULL, target_type TEXT, target_id "
+                             "TEXT, detail TEXT, source_ip TEXT, user_agent TEXT, session_id TEXT, "
+                             "result TEXT NOT NULL, ttl_expires_at INTEGER DEFAULT 0, "
+                             "principal_class TEXT NOT NULL DEFAULT '');",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+        SqliteStmt s;
+        REQUIRE(sqlite3_prepare_v2(ldb.get(),
+                                   "INSERT INTO audit_events (timestamp, principal, principal_role, "
+                                   "action, detail, result, ttl_expires_at, principal_class) VALUES "
+                                   "(?,?,?,?,?,?,?,?)",
+                                   -1, s.addr(), nullptr) == SQLITE_OK);
+        // Invalid UTF-8 (0xff) + embedded NUL in detail, result, principal_class.
+        const std::string bad_detail = std::string("d") + '\xff' + '\0' + "x";
+        const std::string bad_result = std::string("succ") + '\xff' + "ess"; // non-enum, non-UTF8
+        const std::string bad_class = std::string("hum") + '\xff' + "an";
+        sqlite3_bind_int64(s.get(), 1, 1000);
+        sqlite3_bind_text(s.get(), 2, "admin", -1, SQLITE_STATIC);
+        sqlite3_bind_text(s.get(), 3, "admin", -1, SQLITE_STATIC);
+        sqlite3_bind_text(s.get(), 4, "auth.login", -1, SQLITE_STATIC);
+        sqlite3_bind_text(s.get(), 5, bad_detail.data(), static_cast<int>(bad_detail.size()),
+                          SQLITE_TRANSIENT);
+        sqlite3_bind_text(s.get(), 6, bad_result.data(), static_cast<int>(bad_result.size()),
+                          SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s.get(), 7, 0);
+        sqlite3_bind_text(s.get(), 8, bad_class.data(), static_cast<int>(bad_class.size()),
+                          SQLITE_TRANSIENT);
+        REQUIRE(sqlite3_step(s.get()) == SQLITE_DONE);
+    }
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.migrate_from_sqlite(legacy)); // must NOT brick on the bad bytes
+    CHECK(row_count(db.dsn()) == 1);
+    // The row landed with valid UTF-8 (U+FFFD defanged). That the INSERT
+    // committed at all proves result/principal_class no longer fail the batch;
+    // chr(65533) is U+FFFD, so its presence proves the bytes were scrubbed, not
+    // dropped. (PG TEXT structurally cannot hold a NUL, so there is nothing to
+    // assert about NUL beyond "the row exists".)
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_events WHERE detail LIKE "
+                                 "'%' || chr(65533) || '%'") == "1");
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_events WHERE "
+                                 "principal_class LIKE '%' || chr(65533) || '%'") == "1");
+}
+
+// Dead-CMOS-then-NTP, driven through the real reap flow (Gate 3 QE SHOULD — the
+// catastrophic-protection claim for the dropped is_event exemption was only
+// proven at the pure classify() level). A corrupt durable last_pass_now
+// (prev_unusable) stacked under a would_wipe condition (every row expired) must
+// DECLINE, never drain the evidence chain on the corrupt pass.
+TEST_CASE("AuditStore #2360: a corrupt clock reading under a would-wipe declines, never drains",
+          "[pg][audit_store][retention][clock-guard]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+    REQUIRE(store.is_open());
+    seed_rows_with_ttl(db.dsn(), kNow - 100, 10); // every row expired → would_wipe
+    // Poison the durable clock reading with a non-numeric value → prev_unusable.
+    exec_sql(db.dsn(), "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES "
+                       "('last_pass_now', 'not-a-number') ON CONFLICT (key) DO UPDATE SET value = "
+                       "EXCLUDED.value");
+
+    CHECK(store.cleanup_once(kNow) == 0);          // declines (BadState/prev_unusable)
+    CHECK(row_count(db.dsn()) == 10);              // nothing deleted on the corrupt pass
+    CHECK(store.clock_anomaly_skips_count() == 1); // reported
+    CHECK(store.rows_deleted_count() == 0);
+    // The pass re-anchored an honest reading, so a durable anomaly fact set was
+    // recorded rather than the evidence being wiped.
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE key = "
+                                 "'last_anomaly_facts'") == "1");
+}
+
 // ── #2360: retention clock guard (single-sweeper advisory lease) ─────────────
 
 TEST_CASE("AuditStore #2360: a first pass that would wipe every datable row declines once, "

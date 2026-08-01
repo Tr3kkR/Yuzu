@@ -275,6 +275,26 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     // present): during backfill the only rows in PG are backfilled ones (log()
     // is inert until this returns and boot completes), so `MAX(id)` is a safe
     // id-ordered resume cursor after a mid-backfill crash.
+    //
+    // Why "PG non-empty AND no backfill_complete marker" is ALWAYS a crash-resume
+    // (Gate 4 architect): native rows can only appear AFTER the marker is stamped
+    // — a fresh install stamps `backfill_complete` before serving, and log() is
+    // inert until boot completes, so the first native write happens strictly
+    // after the marker exists. Therefore no-marker + non-empty is only reachable
+    // via a partial prior backfill, for which resume-from-MAX(id) + ON CONFLICT
+    // DO NOTHING is exactly correct. A "refuse boot if non-empty + no marker"
+    // guard would instead BREAK that legitimate crash-resume, so it is not added.
+    //
+    // Multi-replica first boot (Gate 6 sre): the supported cutover is single-
+    // writer SQLite → shared PG with ONE legacy audit.db (the SQLite substrate
+    // never permitted N concurrent servers). N new-binary replicas racing the
+    // SAME audit.db is idempotent (identical ids+content, ON CONFLICT DO NOTHING;
+    // one wins the marker stamp, the rest no-op). The only unsafe shape —
+    // DIVERGENT per-replica audit.db copies with colliding ids — cannot arise
+    // from a single-writer history; operators scaling out MUST let the first
+    // replica finish the backfill (marker stamped) before starting the rest
+    // (documented in upgrading.md). A cross-txn advisory lock is deliberately NOT
+    // taken here: it would reintroduce the two-lease deadlock this block avoids.
     std::int64_t resume_from = 0;
     {
         auto lease = pool_.acquire();
@@ -473,9 +493,17 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
                 params.push_back(sanitize_pg_text(r.source_ip));
                 params.push_back(sanitize_pg_text(r.user_agent));
                 params.push_back(sanitize_pg_text(r.session_id));
-                params.push_back(r.result);
+                // result/principal_class are enum-controlled on the LIVE write
+                // path, but the backfill reads them from an UNTRUSTED-at-rest
+                // legacy audit.db — a single embedded NUL / invalid-UTF-8 byte
+                // in either would fail this fail-hard batch INSERT (SQLSTATE
+                // 22021), fail the MANDATORY backfill, and fail-close boot
+                // FOREVER (every retry re-hits the same row → un-upgradeable
+                // server). Sanitize them too on the backfill path (Gate 4
+                // cpp-safety/unhappy #2).
+                params.push_back(sanitize_pg_text(r.result));
                 params.push_back(std::to_string(r.ttl));
-                params.push_back(r.principal_class);
+                params.push_back(sanitize_pg_text(r.principal_class));
             }
             sql += " ON CONFLICT (id) DO NOTHING";
             pg::PgResult ins = pg::exec_params(c, sql.c_str(), params);
