@@ -2204,6 +2204,8 @@ Remove a template. Returns 400 when `template_id` is `__default__`.
 
 Query the server audit trail. All state-changing operations are recorded with the acting principal, action, target, and result.
 
+> **Reads deny on store degrade (ADR-0040).** The audit trail is the SOC 2 evidence chain, so the audit query endpoints (`GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, and the legacy `GET /api/audit`) **return `503` when the underlying store or connection pool is unavailable — never an empty `200`.** A reviewer, SIEM, or CMDB integration can therefore never mistake an infrastructure blip for "no audit activity"; treat a `503` here as a transient, retryable evidence-availability gap, not as an empty result set. This is the read-side counterpart to the fail-hard write posture (`503` + `Sec-Audit-Failed` on the behavioural-PII routes).
+
 #### `GET /api/v1/audit`
 
 Query audit events.

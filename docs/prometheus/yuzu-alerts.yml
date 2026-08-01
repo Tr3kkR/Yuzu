@@ -808,6 +808,63 @@ groups:
             Usually a disk or permissions problem on the audit database.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
+      # ADR-0040 PostgreSQL cutover. The audit trail migrated from SQLite
+      # audit.db to the PostgreSQL schema audit_store via a MANDATORY one-time
+      # streamed backfill that PRESERVES history. A failed/partial backfill
+      # fails the boot CLOSED (the server refuses to serve a knowingly-incomplete
+      # evidence chain) and retries on the next start -- so a replica stuck
+      # failing backfill sits in a restart loop with no audit evidence chain
+      # available. yuzu_server_audit_backfill_total{result="failed"} is the only
+      # signal that this is happening.
+      - alert: YuzuAuditBackfillFailing
+        expr: |
+          increase(yuzu_server_audit_backfill_total{result="failed"}[15m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Audit-store backfill is failing — server refusing to boot (no evidence chain)"
+          description: >-
+            A server attempted the one-time legacy audit.db -> PostgreSQL audit_store
+            backfill (ADR-0040) and it FAILED. The server fails CLOSED: it refuses to
+            serve with a knowingly-incomplete SOC 2 evidence chain and retries the
+            backfill on the next start, so a replica reporting this is in a
+            restart loop and its audit trail is unavailable. Check the server BOOT
+            log for the loud backfill diagnostic (row-count reconciliation / stream
+            error), confirm the legacy audit.db is readable and the PostgreSQL
+            substrate is reachable and writable, then let the resumable backfill
+            re-run. In a multi-replica deployment bring up ONE replica and let it
+            finish the backfill (the backfill_complete marker is stamped in
+            audit_store) BEFORE starting the rest.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md"
+
+      # Read-path evidence-availability. On the PostgreSQL substrate an audit
+      # QUERY that cannot be served degrades to DENY (503), never a false-empty
+      # 200 -- so a reviewer or SIEM can never mistake an infrastructure blip for
+      # "no audit activity". A sustained non-zero increase means audit reads are
+      # 503ing (store not open / pool acquire timeout / query error), i.e. the
+      # evidence trail is unreadable to a wired integration.
+      - alert: YuzuAuditReadDegraded
+        expr: |
+          increase(yuzu_server_audit_read_degrade_total[15m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit-store reads are degrading to 503 — evidence trail unreadable"
+          description: >-
+            yuzu_server_audit_read_degrade_total is rising: audit-log queries are
+            returning 503 rather than serving results (deny-on-degrade, never a
+            false-empty 200). Break down by the {reason} label -- store_not_open
+            (the store failed construction / is closed), pool_acquire_timeout (the
+            shared PgPool is saturated or Postgres is slow), or query_error (the
+            SELECT itself failed). A CMDB / SIEM / auditor pulling the trail gets
+            503s while this persists. Check PostgreSQL health and pool saturation
+            (see the substrate metrics) and free disk on the database host.
+            Escalate toward critical if it does not clear, since evidence reads are
+            a SOC 2 CC7.2 availability obligation.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#storage"
+
   - name: yuzu-bundles
     # Live-query bundle surface (ADR-0011). The manifest map is in-memory + bounded
     # (TTL + cap), so cap-eviction silently discards another operator's in-flight

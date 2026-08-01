@@ -532,6 +532,66 @@ for lockout/break-glass recovery — that runbook has been rewritten for this
 cutover and is Postgres-native throughout (`psql "$YUZU_POSTGRES_DSN"` against
 the `auth` schema).
 
+## Audit trail migrates to PostgreSQL — history preserved (AuditStore, ADR-0040)
+
+The audit log (`AuditStore`, the SOC 2 evidence chain) moves from the SQLite
+`audit.db` file to the server's PostgreSQL substrate in this release (ADR-0006
+Wave 1.3), schema `audit_store`. **Unlike the AuthDB/ScimStore and ApiTokenStore
+cutovers above, this is NOT a fresh start — audit history is preserved.** Because
+the audit trail is SOC 2 evidence retained 365 days, pre-cutover rows are
+migrated, not reset.
+
+No new flag or environment variable is introduced: the store reuses the shared
+`--postgres-dsn` / `YUZU_POSTGRES_DSN` connection the rest of the server already
+requires, and (like every server store) it **fails closed** at boot if Postgres
+is unreachable — there is no SQLite fallback.
+
+**What happens on first PG boot:**
+
+- If a legacy `audit.db` is present, the server runs a **one-time, mandatory,
+  streamed backfill** of every audit row (in bounded batches, so a multi-GB table
+  does not exhaust memory) into `audit_store` before serving. The retention
+  horizon (`ttl_expires_at`) and clock-guard state come across too, so retention
+  behaviour is preserved exactly. Row counts are reconciled and logged.
+- The backfill is **idempotent and resumable** (a `backfill_complete` marker
+  gates re-runs; a crash mid-backfill resumes from where it stopped, with no
+  duplication and no loss).
+- **A failed or partial backfill fails the boot** — the server refuses to serve
+  with a knowingly-incomplete evidence chain, logs a loud diagnostic, and
+  **retries on the next start**. It does not silently start with a partial trail.
+  The `yuzu_server_audit_backfill_total{result}` metric (`fresh` / `completed` /
+  `failed`) reports the outcome.
+- After a verified backfill the legacy `audit.db` is **moved aside, not deleted**
+  — it becomes an operator-managed backup of the pre-cutover trail. Relocating or
+  archiving that file afterward is expected and safe.
+
+**What to expect / do:**
+
+- **Budget for a longer first boot on a large `audit.db`.** A trail with tens of
+  millions of rows (~16 GB) can take meaningfully longer to stream than a normal
+  startup. **Widen your startup budget accordingly:** raise the Kubernetes
+  `startupProbe` (and any liveness) failure/period budget, or the Docker Compose
+  healthcheck `start_period`, so the orchestrator does not kill the server
+  mid-backfill and restart it into the same long boot repeatedly. The backfill is
+  resumable, so a killed boot is not corrupting — but it wastes the window.
+- **Scale-out: bring up ONE replica first.** In a multi-replica deployment, start
+  a single server and let it finish the backfill (the `backfill_complete` marker
+  is stamped in `audit_store`) **before** starting the remaining replicas. Once
+  the marker is present the other replicas see a completed backfill and start
+  normally; retention afterward is single-swept fleet-wide via an advisory lease
+  (see [Audit Log](audit-log.md#the-retention-clock-guard)).
+- **Reads deny-on-degrade.** After cutover, an audit-store or connection-pool
+  failure makes `GET /api/v1/audit*` return `503` rather than an empty `200`, so
+  an infrastructure blip can never be mistaken for "no audit activity."
+
+**Not affected:** the audit event vocabulary and REST/MCP query surface are
+unchanged; SIEM export recipes keep working. One deliberate behaviour change: on
+a multi-replica deployment an identical-magnitude repeat clock step no longer
+re-emits `yuzu_server_audit_clock_anomaly_skips_total` on every pass (only a
+distinct anomaly does) — if you alerted on that counter's *cadence*, alert on a
+sustained increase instead. See
+[Audit Log](audit-log.md#the-retention-clock-guard).
+
 ## Upgrade Order
 
 Always upgrade in this order:
