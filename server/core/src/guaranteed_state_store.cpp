@@ -103,11 +103,22 @@ bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
 double to_double(const char* s) {
     if (s == nullptr || s[0] == '\0')
         return 0.0;
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
     double v = 0.0;
     const auto len = std::strlen(s);
     auto [ptr, ec] = std::from_chars(s, s + len, v);
     (void)ptr;
     return ec == std::errc() ? v : 0.0;
+#else
+    // Apple Clang / libc++ ships no floating-point std::from_chars, so the
+    // call above resolves to the deleted `bool` overload and fails to
+    // compile. Same feature-test guard as cel_eval.cpp's try_parse_double;
+    // strtod (not stod) to match to_i64's strtoll above and stay
+    // exception-free. Both branches yield 0.0 on a parse miss.
+    char* end = nullptr;
+    const double v = std::strtod(s, &end);
+    return end == s ? 0.0 : v;
+#endif
 }
 
 std::string text_col(PGresult* res, int row, int col) {
