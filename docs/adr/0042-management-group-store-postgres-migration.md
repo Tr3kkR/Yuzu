@@ -1,6 +1,6 @@
 # ADR-0042: ManagementGroupStore → PostgreSQL (Wave 2.2)
 
-- **Status:** Proposed
+- **Status:** Accepted (governance-resolved 2026-08-02)
 - **Date:** 2026-08-01
 - **Deciders:** pg workstream; security-guardian + architect + docs-writer (governance)
 - **Parents:** ADR-0006/0007/0008(+Correction), ADR-0009, ADR-0012, **ADR-0017**
@@ -44,9 +44,11 @@ Migrate to PostgreSQL schema **`management_group_store`** (ADR-0008), constructi
 ### Schema
 
 `management_groups` (id, name, parent_id, scope_expression, …), `management_group_members`
-(group_id, agent_id, …), `management_group_role_assignments` (group_id, principal_type,
-principal_id, role_name) port column-for-column; the parent/child tree stays a `parent_id`
-self-reference. All indexes carry over.
+(group_id, agent_id, …), `management_group_roles` (group_id, principal_type, principal_id,
+role_name — the legacy table name is kept as-is, byte-identical to the SQLite schema, to keep the
+backfill mapping 1:1) port column-for-column; the parent/child tree stays a `parent_id`
+self-reference (FK `DEFERRABLE INITIALLY DEFERRED` so the backfill can bulk-insert in any order).
+All indexes carry over.
 
 ### Reads — degrade-distinguishable on the confinement path (the load-bearing decision)
 
@@ -69,9 +71,19 @@ silent under-deny.
 
 ### Hierarchy traversal
 
-`get_ancestor_ids` / `get_descendant_ids` become **recursive CTEs** (`WITH RECURSIVE`) with a
-depth bound / cycle guard (a corrupt parent cycle must terminate, not spin) rather than the
-SQLite app-side BFS. The bound is asserted in a test.
+`get_ancestor_ids` / `get_descendant_ids` / `get_member_agents_in_subtrees` become **recursive
+CTEs** (`WITH RECURSIVE`) with a `depth < kMaxHierarchyDepth` bound + `DISTINCT`/`id <> seed`
+cycle guard (a corrupt parent cycle terminates and drops phantom IDs) rather than the SQLite
+app-side BFS. Both cycle termination and the depth bound are asserted in tests.
+
+**Over-deep trees are guarded at BACKFILL, not at read (governance-resolved).** A tree deeper
+than `kMaxHierarchyDepth` would be silently truncated by the read CTEs → a mis-confining partial
+set (the deny-ward direction is a fail-OPEN). The write path caps depth at 5, so this is only
+reachable by backfilling a corrupt / pre-cap legacy DB. A read-side cap-hit detector was rejected
+because it cannot distinguish a genuine deep chain from a cycle (which the `DISTINCT` guard
+already handles correctly) — it false-positives on cycles. Instead `migrate_from_sqlite`
+validates the legacy parent-chain over distinct nodes (explicit cycle detection) and **refuses
+the backfill fail-closed** if any tree exceeds the bound, so an over-deep tree never lands.
 
 ### Backfill (ADR-0009) — MANDATORY
 

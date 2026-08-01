@@ -26,6 +26,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace yuzu::server {
@@ -1114,6 +1115,45 @@ bool ManagementGroupStore::migrate_from_sqlite(const std::filesystem::path& lega
     const std::int64_t legacy_groups = static_cast<std::int64_t>(groups.size());
     const std::int64_t legacy_members = static_cast<std::int64_t>(members.size());
     const std::int64_t legacy_roles = static_cast<std::int64_t>(roles.size());
+
+    // Depth/cycle validation of the legacy tree (Gate 4 architect / unhappy R1).
+    // The confinement reads bound hierarchy traversal at kMaxHierarchyDepth; a
+    // legacy tree deeper than that (or cyclic) would be silently truncated at
+    // read time → mis-confinement (the deny-ward direction is a fail-OPEN). This
+    // is the ONLY reachable path to an over-deep tree (create_group caps depth
+    // at 5), so validate over the distinct-node parent chain — explicit cycle
+    // detection, no cycle-inflation false positive — and refuse the backfill
+    // (fail-closed boot) rather than migrate into a mis-confining state.
+    {
+        std::unordered_map<std::string, std::optional<std::string>> parent_of;
+        parent_of.reserve(groups.size());
+        for (const auto& g : groups)
+            parent_of[g.id] = g.parent_id;
+        for (const auto& g : groups) {
+            std::unordered_set<std::string> seen;
+            std::optional<std::string> cur = g.parent_id;
+            int depth = 0;
+            while (cur && !cur->empty()) {
+                if (!seen.insert(*cur).second) {
+                    spdlog::error("ManagementGroupStore: backfill: parent cycle reachable from "
+                                  "group {} — refusing (fail-closed)",
+                                  g.id);
+                    backfill_metric("failed");
+                    return false;
+                }
+                if (++depth > kMaxHierarchyDepth) {
+                    spdlog::error("ManagementGroupStore: backfill: group {} exceeds the max "
+                                  "hierarchy depth {} — refusing (fail-closed); the confinement "
+                                  "reads would truncate a deeper tree and mis-confine",
+                                  g.id, kMaxHierarchyDepth);
+                    backfill_metric("failed");
+                    return false;
+                }
+                auto it = parent_of.find(*cur);
+                cur = (it != parent_of.end()) ? it->second : std::nullopt;
+            }
+        }
+    }
 
     // 5. Insert in one transaction. The self-referential parent_id FK is
     // DEFERRABLE INITIALLY DEFERRED, so groups may be inserted in arbitrary

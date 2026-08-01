@@ -82,6 +82,10 @@ public:
 
     ManagementGroupStore(const ManagementGroupStore&) = delete;
     ManagementGroupStore& operator=(const ManagementGroupStore&) = delete;
+    // Non-movable: borrows PgPool& and owns atomics/probe. Already immovable
+    // (deleted copy suppresses implicit moves); explicit to document intent.
+    ManagementGroupStore(ManagementGroupStore&&) = delete;
+    ManagementGroupStore& operator=(ManagementGroupStore&&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
@@ -119,7 +123,7 @@ public:
     /// `nullopt` on store-not-open / pool-acquire timeout / query error so the
     /// caller fails closed (a silent empty would drop the agent's reachable
     /// groups and mis-decide the scoped check).
-    std::optional<std::vector<std::string>> get_agent_groups(const std::string& agent_id) const;
+    [[nodiscard]] std::optional<std::vector<std::string>> get_agent_groups(const std::string& agent_id) const;
 
     /// Replace dynamic membership for a group (used after scope expression evaluation).
     void refresh_dynamic_membership(const std::string& group_id,
@@ -130,10 +134,10 @@ public:
     /// a depth cap so a corrupt parent cycle TERMINATES (does not spin) and the
     /// outer `DISTINCT` drops phantom cycle IDs. `nullopt` on degrade →
     /// fail-closed at the caller.
-    std::optional<std::vector<std::string>> get_ancestor_ids(const std::string& group_id) const;
+    [[nodiscard]] std::optional<std::vector<std::string>> get_ancestor_ids(const std::string& group_id) const;
     /// Descendant-ward walk, same bounded/cycle-safe recursive CTE. `nullopt`
     /// on degrade.
-    std::optional<std::vector<std::string>> get_descendant_ids(const std::string& group_id) const;
+    [[nodiscard]] std::optional<std::vector<std::string>> get_descendant_ids(const std::string& group_id) const;
 
     // ── Group-scoped role assignments ────────────────────────────────────
     std::expected<void, std::string> assign_role(const GroupRoleAssignment& assignment);
@@ -152,7 +156,7 @@ public:
     /// than silently narrowing to nothing — which, for a principal carrying a
     /// DENY assignment, would fail OPEN (an unseen deny → an un-suppressed
     /// agent). A value (possibly empty) is a genuine, fully-read result.
-    std::expected<std::vector<GroupRoleAssignment>, std::string>
+    [[nodiscard]] std::expected<std::vector<GroupRoleAssignment>, std::string>
     get_assignments_for_principal(const std::string& user,
                                   const std::vector<std::string>& rbac_groups) const;
 
@@ -164,7 +168,7 @@ public:
     /// (INV-1/INV-5): `unexpected(msg)` on any failure, so a partial walk can
     /// never under-compute a DENY set (which would over-disclose). Empty
     /// `seed_groups` yields an empty result without a query.
-    std::expected<std::vector<std::string>, std::string>
+    [[nodiscard]] std::expected<std::vector<std::string>, std::string>
     get_member_agents_in_subtrees(const std::vector<std::string>& seed_groups) const;
 
     /// Which agents can a user see based on group-scoped role assignments?
@@ -177,7 +181,7 @@ public:
     /// superuser posture). When the probe is UNSET or reports RBAC ENABLED, the
     /// exact role-scoped semantics are preserved (the fallback can never widen
     /// visibility while RBAC is on).
-    std::optional<std::vector<std::string>> get_visible_agents(const std::string& username) const;
+    [[nodiscard]] std::optional<std::vector<std::string>> get_visible_agents(const std::string& username) const;
 
     /// Inject a predicate reporting whether RBAC enforcement is globally
     /// enabled, wired once at startup. If never set, `get_visible_agents` fails

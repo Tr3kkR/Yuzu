@@ -815,6 +815,8 @@ public:
                           "(completed = rows migrated + reconciled; fresh = no legacy DB / empty; "
                           "failed = fail-closed refusal). One-time at boot (ADR-0042)",
                           "counter");
+        for (const auto result : {"completed", "fresh", "failed"})
+            metrics_.counter("yuzu_server_mgmt_group_backfill_total", {{"result", result}});
         // Generic InventoryStore observability (ADR-0037 hardening round).
         metrics_.describe(
             "yuzu_inventory_ingest_dropped_total",

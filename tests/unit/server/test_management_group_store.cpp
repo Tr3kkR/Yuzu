@@ -21,8 +21,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
+#include <sqlite3.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -827,4 +829,109 @@ TEST_CASE("ManagementGroupStore: confinement reads degrade-distinguishable when 
     auto empty = store.get_member_agents_in_subtrees({});
     REQUIRE(empty.has_value());
     CHECK(empty->empty());
+}
+
+// ── Mandatory backfill (ADR-0042) — Gate 3 QE: zero coverage existed ─────────
+namespace {
+// Build a legacy (pre-migration SQLite) management-groups.db: a parent chain of
+// `chain_len` groups (grp0 root → grp1 → … → grp{chain_len-1}) plus one member
+// and one role on the leaf. `chain_len` lets a test build a tree deeper than the
+// confinement bound (the API caps depth at 5; the legacy file bypasses that).
+void make_legacy_mgmt_db(const std::filesystem::path& path, int chain_len) {
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open_v2(path.string().c_str(), &db,
+                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+    const char* ddl =
+        "CREATE TABLE management_groups (id TEXT PRIMARY KEY, name TEXT, description TEXT, "
+        "parent_id TEXT, membership_type TEXT, scope_expression TEXT, created_by TEXT, "
+        "created_at INTEGER, updated_at INTEGER);"
+        "CREATE TABLE management_group_members (group_id TEXT, agent_id TEXT, source TEXT, "
+        "added_at INTEGER);"
+        "CREATE TABLE management_group_roles (group_id TEXT, principal_type TEXT, "
+        "principal_id TEXT, role_name TEXT);";
+    REQUIRE(sqlite3_exec(db, ddl, nullptr, nullptr, nullptr) == SQLITE_OK);
+    for (int i = 0; i < chain_len; ++i) {
+        std::string sql = "INSERT INTO management_groups VALUES ('grp" + std::to_string(i) +
+                          "','name" + std::to_string(i) + "','desc'," +
+                          (i == 0 ? std::string("NULL") : ("'grp" + std::to_string(i - 1) + "'")) +
+                          ",'static',NULL,'admin',1,1);";
+        REQUIRE(sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+    const std::string leaf = "grp" + std::to_string(chain_len - 1);
+    REQUIRE(sqlite3_exec(db,
+                         ("INSERT INTO management_group_members VALUES ('" + leaf +
+                          "','agent-1','static',1);")
+                             .c_str(),
+                         nullptr, nullptr, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(db,
+                         ("INSERT INTO management_group_roles VALUES ('" + leaf +
+                          "','user','alice','Operator');")
+                             .c_str(),
+                         nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(db);
+}
+
+std::string scalar(const std::string& dsn, const std::string& sql) {
+    PgConn c{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+    PgResult r{PQexec(c.get(), sql.c_str())};
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    return PQntuples(r.get()) ? std::string(PQgetvalue(r.get(), 0, 0)) : std::string{};
+}
+} // namespace
+
+TEST_CASE("ManagementGroupStore: backfill migrates legacy config + is idempotent",
+          "[pg][management_group][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::test::TempDbFile legacy{"yuzu_test_mgmt_legacy_"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_mgmt_db(legacy.path, /*chain_len=*/3); // depth 2, within the bound
+
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+    CHECK(scalar(db.dsn(), "SELECT count(*) FROM management_group_store.management_groups") == "3");
+    CHECK(scalar(db.dsn(), "SELECT count(*) FROM management_group_store.management_group_members") ==
+          "1");
+    CHECK(scalar(db.dsn(), "SELECT count(*) FROM management_group_store.management_group_roles") ==
+          "1");
+    CHECK(scalar(db.dsn(), "SELECT value FROM management_group_store.mgmt_group_meta WHERE key = "
+                           "'backfill_complete'") != "");
+    CHECK_FALSE(std::filesystem::exists(legacy.path)); // moved aside after verified backfill
+    // Second call short-circuits on the marker (legacy already gone).
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+    CHECK(scalar(db.dsn(), "SELECT count(*) FROM management_group_store.management_groups") == "3");
+}
+
+TEST_CASE("ManagementGroupStore: backfill of a no-legacy path marks fresh",
+          "[pg][management_group][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    REQUIRE(store.migrate_from_sqlite("/nonexistent-yuzu-test/management-groups.db"));
+    CHECK(scalar(db.dsn(), "SELECT value FROM management_group_store.mgmt_group_meta WHERE key = "
+                           "'backfill_complete'") != "");
+}
+
+// The reachable over-deep-tree vector (Gate 4 architect/unhappy R1): a legacy DB
+// with a chain deeper than the confinement bound would be silently truncated by
+// the recursive-CTE reads → mis-confinement (deny-ward fail-OPEN). The backfill
+// must REFUSE it (fail-closed boot), not migrate into a mis-confining state.
+TEST_CASE("ManagementGroupStore: backfill refuses an over-deep legacy tree (fail-closed)",
+          "[pg][management_group][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::test::TempDbFile legacy{"yuzu_test_mgmt_deep_"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_mgmt_db(legacy.path, /*chain_len=*/13); // depth 12 > kMaxHierarchyDepth(10)
+
+    CHECK_FALSE(store.migrate_from_sqlite(legacy.path)); // depth guard → fail-closed
+    // Nothing migrated, no marker, legacy left in place for the operator to fix.
+    CHECK(scalar(db.dsn(), "SELECT count(*) FROM management_group_store.management_groups") == "0");
+    CHECK(scalar(db.dsn(), "SELECT count(*) FROM management_group_store.mgmt_group_meta WHERE key = "
+                           "'backfill_complete'") == "0");
+    CHECK(std::filesystem::exists(legacy.path));
 }
