@@ -1228,11 +1228,22 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
 
 Quarantine isolates a device from receiving commands or participating in normal operations. Quarantined devices remain connected but are blocked from instruction execution.
 
+> **Scoped per-target authorization (#1788).** All three routes below authorize
+> per-device, matching the MCP `quarantine_device` tool: a management-group-confined
+> operator holding `Security:Execute`/`Security:Read` only through a group can
+> act on and see devices inside their own group(s), and is refused (`403`) for
+> devices outside them. A global grant (or an unfiltered/legacy-RBAC-disabled
+> deployment) still reaches every device, unchanged. If the per-target scope
+> gate is ever left unconfigured, every request on these routes fails **closed**
+> with a `500` rather than silently widening to a fleet-wide check.
+
 #### `GET /api/v1/quarantine`
 
-List all currently quarantined devices.
+List currently quarantined devices visible to the caller — admit-then-filter:
+a device outside the caller's management-group scope is omitted from the
+list entirely, not merely hidden from write access.
 
-**Permission:** `Security:Read`
+**Permission:** `Security:Read`, scoped per-device
 
 **Response:**
 
@@ -1259,7 +1270,7 @@ List all currently quarantined devices.
 
 Quarantine a device.
 
-**Permission:** `Security:Execute`
+**Permission:** `Security:Execute`, scoped per-device (see the note above)
 
 > **Supervised MCP tokens are approval-gated here too.** A bearer token minted
 > with `mcp_tier: "supervised"` gets `403` on this route (and on the `DELETE`
@@ -1298,7 +1309,7 @@ Quarantine a device.
 
 Release a device from quarantine.
 
-**Permission:** `Security:Execute`
+**Permission:** `Security:Execute`, scoped per-device (see the note above)
 
 **Response:**
 
@@ -4095,7 +4106,7 @@ The server expands the bundle into N ordinary plugin commands, each dispatched u
 
 Dispatch a bundle. Returns the correlation id immediately; poll `GET /api/v1/bundles/{id}` for the collated result.
 
-**Permission:** `Execution:Execute`
+**Permission:** `Execution:Execute`, scoped per-device (management-group-confined operators are admitted for devices in their own group(s)). The caller's derived visibility is also enforced a second time at dispatch (#1788, defense-in-depth) — a target outside it is treated as unreached (`result=no_agents`, `state=dispatch_failed` on collate) rather than reaching the device.
 
 **Request body:**
 

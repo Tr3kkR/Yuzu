@@ -2146,7 +2146,7 @@ McpServer::HandlerFn McpServer::build_handler(
     McpSessionRegistry* sessions, const bool* mcp_streaming_disabled,
     std::vector<std::string> allowed_origins, SoftwareLicensingStore* software_licensing_store,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
-    AuthDB* auth_db, DirectorySync* directory_sync) {
+    AuthDB* auth_db, DirectorySync* directory_sync, ExecVisibleFn exec_visible_fn) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -5854,11 +5854,24 @@ McpServer::HandlerFn McpServer::build_handler(
                 // forever AND the JSON-RPC client sees a connection
                 // drop instead of a structured error envelope. Mirrors
                 // the REST sibling at workflow_routes.cpp:1427-1444.
+                // #1788: confine the dispatch to the caller's Execution:Execute
+                // visible device set, mirroring /api/command. Fail closed when
+                // the derivation is unwired (CDX-R6-02, see below).
+                auto exec_visible =
+                    exec_visible_fn ? exec_visible_fn(*session)
+                                    // CDX-R6-02: unwired == FAIL CLOSED. A present EMPTY set
+                                    // (not nullopt) means "no target visible" -> nothing
+                                    // dispatched. ADR-0033 §1 forbids inferring unfiltered
+                                    // authority from an omitted applicable filter (same
+                                    // posture as the tag ScopedPermFn, K-06). Production
+                                    // always wires it (server.cpp); a test wanting unfiltered
+                                    // wires a callback that returns nullopt.
+                                    : yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{}};
                 std::string command_id;
                 int agents_reached = 0;
                 try {
-                    std::tie(command_id, agents_reached) =
-                        dispatch_fn(plugin, action, agent_ids, scope, params, execution_id);
+                    std::tie(command_id, agents_reached) = dispatch_fn(
+                        plugin, action, agent_ids, scope, params, execution_id, exec_visible);
                 } catch (const std::exception& e) {
                     spdlog::error("MCP execute_instruction: dispatch failed: {}", e.what());
                     // 2f PR 3a: unwind the bridge record FIRST (unsubscribe waits
@@ -6035,14 +6048,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // H1 (PR #1796): per-device scope gate — a management-group-
                 // confined operator may tag only devices inside their groups.
-                // Runs AFTER agent_id parse (the scope needs the target); falls
-                // back to the global perm_fn when unwired (test harness).
-                if (scoped_perm_fn) {
-                    if (!scoped_perm_fn(req, res, "Tag", "Write", agent_id))
-                        return;
-                } else if (!perm_fn(req, res, "Tag", "Write")) {
+                // Runs AFTER agent_id parse (the scope needs the target).
+                // K-06/CDX-R4-09: fail CLOSED when unwired (never widen to the
+                // global perm_fn), matching the SoftwareLicensing tool above and
+                // the REST tag twins (ADR-0033 §1).
+                if (!scoped_perm_fn) {
+                    res.set_content(error_response(id, kInternalError, "scope gate not configured"),
+                                    "application/json");
                     return;
                 }
+                if (!scoped_perm_fn(req, res, "Tag", "Write", agent_id))
+                    return;
                 auto set_res = tag_store->set_tag_checked(agent_id, key, value, "mcp");
                 if (!set_res) {
                     mcp_audit("failure", agent_id + ":" + key);
@@ -6088,12 +6104,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 // H1 (PR #1796): per-device scope gate (see set_tag above).
-                if (scoped_perm_fn) {
-                    if (!scoped_perm_fn(req, res, "Tag", "Delete", agent_id))
-                        return;
-                } else if (!perm_fn(req, res, "Tag", "Delete")) {
+                // K-06/CDX-R4-09: fail CLOSED when unwired, never widen to perm_fn.
+                if (!scoped_perm_fn) {
+                    res.set_content(error_response(id, kInternalError, "scope gate not configured"),
+                                    "application/json");
                     return;
                 }
+                if (!scoped_perm_fn(req, res, "Tag", "Delete", agent_id))
+                    return;
                 bool deleted = tag_store->delete_tag(agent_id, key);
                 if (!deleted) {
                     // 404-equivalent (mirror the REST 404 on a missing tag).
@@ -6174,13 +6192,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // H1 (PR #1796): per-device scope gate — a management-group-
                 // confined operator may isolate only devices inside their groups.
-                // Falls back to the global perm_fn when unwired (test harness).
-                if (scoped_perm_fn) {
-                    if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
-                        return;
-                } else if (!perm_fn(req, res, "Security", "Execute")) {
+                // governance UP-9: FAILS CLOSED when unwired (K-06/CDX-R4-09),
+                // matching set_tag/delete_tag above — this was the last write tool
+                // still widening to the global perm_fn on an unwired scope gate.
+                if (!scoped_perm_fn) {
+                    mcp_audit("failure", "scope gate not configured");
+                    res.set_content(error_response(id, kInternalError, "scope gate not configured"),
+                                    "application/json");
                     return;
                 }
+                if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
+                    return;
                 // Server-side input validation BEFORE any store write or dispatch
                 // (governance cppsafety-SHOULD-1 / UP-7). The whitelist ultimately
                 // reaches the agent's netsh/iptables/pf sink; the agent already
@@ -6266,9 +6288,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!whitelist.empty())
                         qparams["whitelist_ips"] = whitelist;
                     try {
+                        // governance UP-9: thread a set CONFINED to the single
+                        // scope-gate-checked target, not an unfiltered VisibleSet{} —
+                        // defense in depth matching the bundle/execute_instruction
+                        // dispatch arms (this was the last arm still passing
+                        // unfiltered on a single already-authorized target).
                         std::tie(command_id, agents_reached) = dispatch_fn(
                             "quarantine", "quarantine", {agent_id}, /*scope=*/"", qparams,
-                            /*execution_id=*/"");
+                            /*execution_id=*/"",
+                            yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{agent_id}});
                     } catch (const std::exception& e) {
                         spdlog::error("MCP quarantine_device: isolation dispatch failed: {}",
                                       e.what());
@@ -6301,10 +6329,21 @@ McpServer::HandlerFn McpServer::build_handler(
             // device. Thin wrapper over the shared BundleOrchestrator — the SAME
             // transport-agnostic core as POST /api/v1/bundles. Tier + approval are
             // already enforced by the C8 generic block (execute_bundle ∈
-            // kToolSecurity); this mirrors execute_instruction (perm_fn only here).
+            // kToolSecurity).
+            //
+            // governance C4/sec-4: a bundle targets ONE device, so authorization is
+            // the per-target confinement below (exec_visible_fn + in_scope) — NOT
+            // ALSO a targetless global Execution:Execute perm_fn gate. Keeping both
+            // (as this handler previously did) is STRICTER than REST's
+            // /api/v1/bundles twin (scoped_perm_fn only, no global gate), so a
+            // management-group-scoped operator with no GLOBAL Execution:Execute
+            // grant was admitted by REST and 403'd here — the twins must agree.
+            // Dropping the global gate matches REST's per-target-only posture; a
+            // caller with neither a global grant NOR a scoped one for this agent
+            // still gets denied below by `in_scope` (compose_exec_visible resolves
+            // to a present-empty set when the caller holds no Execution:Execute
+            // grant at all, scoped or global — see authz_model.hpp).
             if (tool_name == "execute_bundle") {
-                if (!perm_fn(req, res, "Execution", "Execute"))
-                    return;
                 if (!bundle_orch) {
                     res.set_content(
                         error_response(id, kInternalError, "Command dispatch unavailable"),
@@ -6339,9 +6378,34 @@ McpServer::HandlerFn McpServer::build_handler(
                                         const std::string& detail) {
                     audit_fn(req, verb, result_status, type, tid, detail);
                 };
+                // #1788: a bundle targets ONE device, so confine it HERE (not in the
+                // orchestrator) — the single target must be in the caller's
+                // Execution:Execute visible set. Fail closed when unwired (CDX-R6-02).
+                auto exec_visible =
+                    exec_visible_fn ? exec_visible_fn(*session)
+                                    // CDX-R6-02: unwired == FAIL CLOSED. A present EMPTY set
+                                    // (not nullopt) means "no target visible" -> nothing
+                                    // dispatched. ADR-0033 §1 forbids inferring unfiltered
+                                    // authority from an omitted applicable filter (same
+                                    // posture as the tag ScopedPermFn, K-06). Production
+                                    // always wires it (server.cpp); a test wanting unfiltered
+                                    // wires a callback that returns nullopt.
+                                    : yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{}};
+                if (!yuzu::server::authz::in_scope(exec_visible, agent_id)) {
+                    mcp_audit("failure", "agent_id=" + agent_id + " out_of_scope");
+                    res.set_content(
+                        error_response(id, kInvalidParams, "target agent not in your visible scope"),
+                        "application/json");
+                    return;
+                }
                 BundleOrchestrator::DispatchResult r;
                 try {
-                    r = bundle_orch->dispatch(agent_id, *specs, session->username, bundle_audit);
+                    // governance UP-8: thread the exec_visible ALREADY derived +
+                    // checked above through to the orchestrator, rather than let it
+                    // default to unfiltered — defense in depth if a future dispatch_fn
+                    // starts consulting it itself.
+                    r = bundle_orch->dispatch(agent_id, *specs, session->username, bundle_audit,
+                                              exec_visible);
                 } catch (const std::exception& e) {
                     spdlog::error("MCP execute_bundle: dispatch failed: {}", e.what());
                     mcp_audit("failure", std::string("dispatch_exception: ") + e.what());
@@ -8842,7 +8906,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 yuzu::server::detail::StreamBudget* stream_budget,
                                 StreamRevalidateFn revalidate_fn,
                                 std::size_t mcp_max_streams_per_principal,
-                                StreamPrincipalAuditFn principal_audit_fn) {
+                                StreamPrincipalAuditFn principal_audit_fn,
+                                ExecVisibleFn exec_visible_fn) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
@@ -8867,7 +8932,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
                            sessions, mcp_streaming_disabled, std::move(allowed_origins),
                            software_licensing_store, engine_principal_store, access_review_store,
-                           auth_db, directory_sync));
+                           auth_db, directory_sync, std::move(exec_visible_fn)));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).

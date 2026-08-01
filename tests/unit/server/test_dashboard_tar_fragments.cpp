@@ -67,6 +67,8 @@ struct DispatchCall {
     std::string plugin, action, scope_expr;
     std::vector<std::string> agent_ids;
     std::unordered_map<std::string, std::string> params;
+    // CDX-R7-02: the exec_visible set the handler threaded into dispatch.
+    yuzu::server::authz::VisibleSet exec_visible;
 };
 struct AuditRow {
     std::string action, result, target_type, target_id, detail;
@@ -119,9 +121,25 @@ struct FragmentHarness {
     bool auth_ok{true};    ///< auth_fn verdict (false → handler returns early)
     int dispatch_sent{1};  ///< agents reached per dispatch (0 → offline 404)
 
+    /// CDX-R7-02: the per-request exec-visible derivation the handlers consult
+    /// for /api/dashboard/execute + tar-execute. Default returns nullopt
+    /// (UNFILTERED) so pre-existing fragment tests keep the full-fleet path; a
+    /// confinement test overrides it with a specific set; a fail-closed test
+    /// sets it to `{}` (genuinely unwired → the production handler denies all).
+    DashboardRoutes::ExecVisibleFn exec_visible_fn{
+        [](const httplib::Request&) { return yuzu::server::authz::VisibleSet{}; }};
+
+    /// CDX-R7-02: what the harness resolve_fn returns for /api/dashboard/execute
+    /// (empty → "unknown command", so the dispatch path is unreachable). A
+    /// confinement test sets a valid (plugin, action) so dispatch is reached.
+    std::pair<std::string, std::string> resolve_to{};
+
     /// @param with_dispatch false → register with an empty DispatchFn so the
     ///        "dispatch unavailable" 503 branch is reachable.
-    explicit FragmentHarness(bool with_dispatch = true) {
+    /// @param wire_exec_visible false → register with an EMPTY ExecVisibleFn so
+    ///        the production handler's own fail-closed branch (unwired → present-
+    ///        empty deny-all) is exercised (CDX-R7-02).
+    explicit FragmentHarness(bool with_dispatch = true, bool wire_exec_visible = true) {
         // A failed open would make get_visible_agents return empty and quietly
         // turn every scope assertion into a pass-for-the-wrong-reason.
         REQUIRE(mg.is_open());
@@ -153,9 +171,10 @@ struct FragmentHarness {
         DashboardRoutes::DispatchFn dispatch =
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& ids, const std::string& scope,
-                   const std::unordered_map<std::string, std::string>& params)
+                   const std::unordered_map<std::string, std::string>& params,
+                   const yuzu::server::authz::VisibleSet& exec_visible)
             -> std::pair<std::string, int> {
-            calls.push_back({plugin, action, scope, ids, params});
+            calls.push_back({plugin, action, scope, ids, params, exec_visible});
             return {"cmd-" + std::to_string(calls.size()), dispatch_sent};
         };
 
@@ -164,10 +183,20 @@ struct FragmentHarness {
                                /*tag_store=*/nullptr, /*event_bus=*/nullptr,
                                /*agents_json_fn=*/[] { return std::string{"[]"}; },
                                with_dispatch ? dispatch : DashboardRoutes::DispatchFn{},
+                               /*exec_visible_fn=*/
+                               wire_exec_visible
+                                   ? DashboardRoutes::ExecVisibleFn{
+                                         [this](const httplib::Request& req) {
+                                             // Delegate to the reassignable member so
+                                             // a test can override it after
+                                             // construction (live read).
+                                             return exec_visible_fn
+                                                        ? exec_visible_fn(req)
+                                                        : yuzu::server::authz::VisibleSet{};
+                                         }}
+                                   : DashboardRoutes::ExecVisibleFn{},
                                /*resolve_fn=*/
-                               [](const std::string&) {
-                                   return std::pair<std::string, std::string>{};
-                               },
+                               [this](const std::string&) { return resolve_to; },
                                &metrics, /*instruction_store=*/nullptr);
         // Exactly one registration pass. Two overloads of register_routes now
         // exist; calling both (or either twice) would register every route
@@ -544,4 +573,185 @@ TEST_CASE("fragment purge: form fields are read the way httplib would parse them
     CHECK(res->status == 200);
     REQUIRE(h.calls.size() == 1);
     CHECK(h.calls[0].params.at("source") == "tcp");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CDX-R7-02 — dashboard execute dispatch confinement handoff
+//
+// The dashboard execute surface now routes through the shared
+// `dispatch_confined` seam (server.cpp), narrowing every arm to the operator's
+// Execution:Execute visible set. As with the MCP handoff test
+// (test_mcp_server.cpp CDX-R5-02), the route-level harness wires a MOCK
+// DispatchFn, so it asserts the HANDOFF — the handler derived the caller's
+// visible set and threaded it into dispatch — while the per-arm narrowing
+// itself (filter_to_scope / in_scope) is pinned by the authz_model unit tests
+// and the single shared dispatch_confined seam.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("dashboard execute threads the caller's exec_visible into dispatch (CDX-R7-02)",
+          "[server][dashboard][execute][scope]") {
+    FragmentHarness h;
+    h.resolve_to = {"os_info", "version"};
+    h.dispatch_sent = 0; // stop before the result-render path (registry_ is null here)
+    // Service-scoped confinement: the caller can see only dev-A.
+    h.exec_visible_fn = [](const httplib::Request&) {
+        return yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"dev-A"}};
+    };
+    // Target dev-B (an id-list arm), which is OUTSIDE the caller's visible set.
+    auto res = h.post("/api/dashboard/execute", "instruction=run&scope=dev-B");
+    REQUIRE(res->status == 200);
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0].agent_ids == std::vector<std::string>{"dev-B"});
+    // The handoff: a PRESENT (confined) set, dev-A in / dev-B out. The
+    // production dispatch_confined then drops dev-B via filter_to_scope.
+    REQUIRE(h.calls[0].exec_visible.has_value());
+    CHECK(h.calls[0].exec_visible->count("dev-A") == 1);
+    CHECK(h.calls[0].exec_visible->count("dev-B") == 0);
+}
+
+TEST_CASE("dashboard execute broadcast still carries the caller's exec_visible (CDX-R7-02)",
+          "[server][dashboard][execute][scope]") {
+    FragmentHarness h;
+    h.resolve_to = {"os_info", "version"};
+    h.dispatch_sent = 0;
+    h.exec_visible_fn = [](const httplib::Request&) {
+        return yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"dev-A"}};
+    };
+    // CDX-R8-01: `__all__` is now passed THROUGH by name (the Broadcast arm),
+    // not stripped to empty+empty (the None arm). Broadcast is named, never
+    // inferred from emptiness — dispatch_target_shape.hpp:14-16. This assertion
+    // deliberately inverts the previous one, which pinned the empty-fallthrough
+    // shape the contract forbids.
+    auto res = h.post("/api/dashboard/execute", "instruction=run&scope=__all__");
+    REQUIRE(res->status == 200);
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0].agent_ids.empty());
+    CHECK(h.calls[0].scope_expr == "__all__"); // kBroadcastScope, by name
+    // Even the deliberate fleet broadcast composes with the visible set.
+    REQUIRE(h.calls[0].exec_visible.has_value());
+    CHECK(h.calls[0].exec_visible->count("dev-A") == 1);
+}
+
+TEST_CASE("dashboard execute REFUSES a supplied-but-empty scope (CDX-R8-01)",
+          "[server][dashboard][execute][scope][security]") {
+    // The defect: `extract_form_value` returns "" for an absent `scope` AND for
+    // a supplied `scope=`, so a crafted or malformed submission that names
+    // NOBODY previously fell through to the broadest action the caller was
+    // allowed to take. An omitted target still means the fleet; a supplied one
+    // resolving to nothing is an error.
+    FragmentHarness h;
+    h.resolve_to = {"os_info", "version"};
+    auto res = h.post("/api/dashboard/execute", "instruction=run&scope=");
+    REQUIRE(res->status == 200); // HTMX fragment, not a status-code surface
+    CHECK(h.calls.empty());      // the security property: nothing was dispatched
+    CHECK(res->body.find("No target selected") != std::string::npos);
+}
+
+TEST_CASE("dashboard execute still broadcasts when scope is OMITTED entirely (CDX-R8-01)",
+          "[server][dashboard][execute][scope]") {
+    // The other half of the contract, and the reason this cannot simply reject
+    // every empty value: an OMITTED targeting argument means the whole fleet.
+    FragmentHarness h;
+    h.resolve_to = {"os_info", "version"};
+    h.dispatch_sent = 0;
+    auto res = h.post("/api/dashboard/execute", "instruction=run");
+    REQUIRE(res->status == 200);
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0].agent_ids.empty());
+    CHECK(h.calls[0].scope_expr.empty()); // None arm + broadcast_on_none
+}
+
+TEST_CASE("dashboard execute FAILS CLOSED when the exec-visible derivation is unwired (CDX-R7-02)",
+          "[server][dashboard][execute][scope]") {
+    // Genuinely UNWIRED ExecVisibleFn: the production handler must hand dispatch
+    // a PRESENT EMPTY visible set (deny all), never nullopt (unfiltered).
+    FragmentHarness h(/*with_dispatch=*/true, /*wire_exec_visible=*/false);
+    h.resolve_to = {"os_info", "version"};
+    h.dispatch_sent = 0;
+    auto res = h.post("/api/dashboard/execute", "instruction=run&scope=dev-A");
+    REQUIRE(res->status == 200);
+    REQUIRE(h.calls.size() == 1);
+    REQUIRE(h.calls[0].exec_visible.has_value()); // PRESENT (deny), not nullopt
+    CHECK(h.calls[0].exec_visible->empty());       // EMPTY → production sink reaches no one
+}
+
+TEST_CASE("dashboard execute REFUSES a PERCENT-ENCODED supplied-but-empty scope "
+          "(CDX-P1-01)",
+          "[server][dashboard][execute][scope][security]") {
+    // The defect: the prior refusal checked ONLY the raw-body helper
+    // (form_value_supplied), a literal byte-scan for the needle `scope=` that
+    // cannot recognize a percent-encoded KEY spelling. httplib DECODES both
+    // keys and values when it parses an application/x-www-form-urlencoded
+    // body into req.params, so `sc%6fpe=` (percent-encoded `o`) decodes to the
+    // key `scope` there even though the raw-body scan never matches it —
+    // reopening the exact supplied-vs-omitted collapse CDX-R8-01 closed, just
+    // spelled differently. The fix checks req.has_param() FIRST.
+    FragmentHarness h;
+    h.resolve_to = {"os_info", "version"};
+    auto res = h.post("/api/dashboard/execute", "instruction=run&sc%6fpe=");
+    REQUIRE(res->status == 200); // HTMX fragment, not a status-code surface
+    CHECK(h.calls.empty());      // the security property: nothing was dispatched
+    CHECK(res->body.find("No target selected") != std::string::npos);
+}
+
+TEST_CASE("dashboard execute REFUSES a BARE supplied-but-empty scope (no '=') "
+          "(CDX-P1-01)",
+          "[server][dashboard][execute][scope][security]") {
+    // A second spelling form_value_supplied's `key + "="` needle also misses:
+    // a bare `scope` field with no `=` at all. httplib's form parser still
+    // recognizes it as a present key with an empty value.
+    FragmentHarness h;
+    h.resolve_to = {"os_info", "version"};
+    auto res = h.post("/api/dashboard/execute", "instruction=run&scope");
+    REQUIRE(res->status == 200);
+    CHECK(h.calls.empty());
+    CHECK(res->body.find("No target selected") != std::string::npos);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// QE-4 / UP-10 — /api/dashboard/tar-execute (the TAR-SQL sibling of
+// /api/dashboard/execute above) had NO test at all for the CDX-R8-01
+// supplied-but-empty-scope refusal. The last case below is the UP-10 bind:
+// the TAR route used req.has_param()/get_param_value() ALONE, which only see
+// the query string or a body httplib parsed into req.params — form-encoded
+// Content-Type only — so a non-form POST left a body-supplied `scope=`
+// invisible to the refusal and it was silently skippable.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("tar-execute REFUSES a supplied-but-empty scope (CDX-R8-01)",
+          "[server][dashboard][tar-execute][scope][security]") {
+    FragmentHarness h;
+    auto res = h.post("/api/dashboard/tar-execute", "sql=SELECT+1&scope=");
+    REQUIRE(res->status == 200); // HTMX fragment, not a status-code surface
+    CHECK(h.calls.empty());      // the security property: nothing was dispatched
+    CHECK(res->body.find("No target selected") != std::string::npos);
+}
+
+TEST_CASE("tar-execute still broadcasts when scope is OMITTED entirely (CDX-R8-01)",
+          "[server][dashboard][tar-execute][scope]") {
+    FragmentHarness h;
+    auto res = h.post("/api/dashboard/tar-execute", "sql=SELECT+1");
+    REQUIRE(res->status == 200);
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0].agent_ids.empty());
+    CHECK(h.calls[0].scope_expr.empty());
+}
+
+TEST_CASE("tar-execute REFUSES a supplied-but-empty scope even under a non-form "
+          "Content-Type (UP-10)",
+          "[server][dashboard][tar-execute][scope][security]") {
+    // `sql` rides the QUERY string — parsed into req.params regardless of
+    // Content-Type — purely so the handler's earlier "Missing SQL query" 400
+    // doesn't short-circuit before the scope logic under test is reached.
+    // `scope=` rides the BODY under a non-form Content-Type: req.has_param()
+    // and get_param_value() cannot see it (httplib parses a body into
+    // req.params only for application/x-www-form-urlencoded), so this proves
+    // the refusal via the raw-body fallback, not the params branch.
+    FragmentHarness h;
+    auto res = h.sink.dispatch("POST", "/api/dashboard/tar-execute?sql=SELECT+1", "scope=",
+                               "text/plain", FragmentHarness::same_site_headers());
+    REQUIRE(res != nullptr);
+    REQUIRE(res->status == 200);
+    CHECK(h.calls.empty());
+    CHECK(res->body.find("No target selected") != std::string::npos);
 }

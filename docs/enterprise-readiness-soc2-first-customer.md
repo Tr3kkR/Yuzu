@@ -139,6 +139,43 @@ as a CC6.2 revocation control with the bounds above; the operator-facing
 reference is `docs/mcp-server.md` "Revocation." and the upgrade note in
 `docs/user-manual/server-admin.md`.
 
+**Addendum — per-device dispatch confinement, one seam for every operator
+surface (CC6.1/CC6.3, #1788/ADR-0033).** Every operator-facing dispatch path —
+`POST /api/command`, MCP `execute_instruction`/`execute_bundle`, REST
+`POST /api/v1/bundles`, the dashboard execute route, TAR `purge_source`, and
+`POST /api/instructions|workflows/{id}/execute` — now intersects its resolved
+target set against ONE derived visibility decision (`derive_exec_visible` →
+`dispatch_confined_arms`) before sending, instead of four independently
+hand-rolled arm-classification copies. A service-scoped token is confined to
+devices tagged with its own service on every one of those surfaces; a global
+administrator, a JIT-elevated session, or a legacy-RBAC-disabled admin remains
+full-fleet (their actual authority, not a bypass); the derivation fails
+**closed** (a present-empty visible set, never "unfiltered") if the underlying
+store is unavailable. Credit as a CC6.1 least-privilege control and a CC6.3
+access-enforcement control with consistent enforcement across every listed
+surface; operator-facing reference is `docs/authz-model.md`. **Residual, not
+yet closed, for THIS seam specifically:** a purely management-group-confined
+operator (no global grant) reaching one of the surfaces above is *narrowed but
+not yet reachable* — that principal is still denied earlier by the base
+`require_permission` gate (the ADR-0017 "correct-but-unreachable" World-A gap)
+until the admit-then-filter list gate lands (#1714/#1715); do not cite
+management-group-scoped dispatch on THESE surfaces as an affirmative
+CAIQ/CC6.1 answer until that lands. The BACKGROUND dispatch paths (scheduler,
+Guardian push, the policy evaluator) dispatch as system, not on behalf of an
+operator, and are explicitly out of scope for this control — tracked with the
+core-owned dispatch chokepoint (#1714/#1715).
+
+**REST `/api/v1/quarantine` (POST/DELETE/GET) is a SEPARATE control, already
+fully reachable — do not fold it into the residual above.** It gates on the
+per-target `scoped_perm_fn` chokepoint (`check_scoped_permission`), not
+`require_permission` → `dispatch_confined_arms`, and is EXEMPT from the
+ADR-0017 World-A gap: a management-group-confined operator with
+`Security:Execute`/`Security:Read` only through a group succeeds on all three
+routes TODAY for devices in their group(s), not merely "narrowed" for a future
+gate. Credit affirmatively as a CC6.1/CC6.3 control now, citing
+`docs/authz-model.md`'s `quarantine_device` paragraph and the MCP
+`quarantine_device` twin as the reference implementation.
+
 ---
 
 ## 3.3 Workstream C — Application and Infrastructure Security

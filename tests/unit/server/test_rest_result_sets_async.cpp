@@ -93,10 +93,16 @@ struct AsyncHarness {
     int dispatch_sent{2}; // agents "reached" by each dispatch
     bool dispatch_throws{false};
     bool wire_dispatch{true}; // false → leave the callback empty (503 path)
+    /// CWE-862: these producers DISPATCH, so they must gate on
+    /// Execution:Execute. Set false to model an authenticated caller who
+    /// holds no such grant — the case that previously reached the fleet.
+    static inline bool permit_exec{true};
 
     explicit AsyncHarness(pg::PgPool& pool, bool with_dispatch = true,
                           InventoryStore* inv = nullptr)
         : inventory(inv), wire_dispatch(with_dispatch) {
+        permit_exec = true; // each harness starts permissive
+
         store = std::make_unique<ResultSetStore>(pool);
         REQUIRE(store->is_open());
 
@@ -114,8 +120,12 @@ struct AsyncHarness {
             s.role = auth::Role::admin;
             return s;
         };
-        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+        auto perm_fn = [](const httplib::Request&, httplib::Response& r, const std::string&,
                           const std::string&) -> bool {
+            if (!permit_exec) {
+                r.status = 403;
+                return false;
+            }
             return true;
         };
         auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
@@ -561,4 +571,77 @@ TEST_CASE("re-eval: not-owned / missing set is 404", "[pg][result_set][async][re
     int status = 0;
     h.post("/api/v1/result-sets/rs_00000000000deadbeef/re-eval", "", status);
     REQUIRE(status == 404);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CWE-862 — the three async producers DISPATCH, so they must gate on
+// Execution:Execute.
+//
+// They authenticated the caller and then performed no authorization check at
+// all: `perm_fn` was not even in the lambda capture list, so ANY authenticated
+// session — including one holding no Execution grant — reached
+// `command_dispatch_fn` with scope `__all__` and ran operator SQL across the
+// whole fleet. Ungated since e7b47ca3 (2026-05-31) and shipped in v0.13.0.
+//
+// These assert the SECURITY OUTCOME — that nothing was dispatched — not merely
+// that a status code changed. A test asserting only `status == 403` would still
+// pass if the gate ran after the dispatch.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("from-tar-query: an authenticated caller WITHOUT Execution:Execute dispatches nothing",
+          "[pg][result_set][async][tar][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    AsyncHarness::permit_exec = false; // authenticated, but no Execution grant
+
+    int status = 0;
+    h.post("/api/v1/result-sets/from-tar-query",
+           R"({"sql":"SELECT pid FROM process_live","name":"probe"})", status);
+
+    CHECK(status == 403);
+    CHECK(h.calls.empty()); // THE assertion: the fleet was never reached
+}
+
+TEST_CASE("from-instruction-result: an authenticated caller WITHOUT Execution:Execute dispatches "
+          "nothing",
+          "[pg][result_set][async][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto def_id = make_instruction(*h.instr);
+    AsyncHarness::permit_exec = false;
+
+    int status = 0;
+    h.post("/api/v1/result-sets/from-instruction-result",
+           R"({"instruction_id":")" + def_id + R"(","name":"probe"})", status);
+
+    CHECK(status == 403);
+    CHECK(h.calls.empty());
+}
+
+TEST_CASE("re-eval: an authenticated caller WITHOUT Execution:Execute dispatches nothing",
+          "[pg][result_set][async][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+
+    // Create a set legitimately first (gate permitted), then re-eval it without
+    // the grant — proving the gate is on the re-eval route itself, not merely
+    // inherited from whoever created the original.
+    int status = 0;
+    auto created = h.post("/api/v1/result-sets/from-tar-query",
+                          R"({"sql":"SELECT pid FROM process_live","name":"orig"})", status);
+    REQUIRE(status == 202);
+    const auto rs_id = created["data"]["id"].get<std::string>();
+    const auto calls_before = h.calls.size();
+
+    AsyncHarness::permit_exec = false;
+    h.post("/api/v1/result-sets/" + rs_id + "/re-eval", "{}", status);
+
+    CHECK(status == 403);
+    CHECK(h.calls.size() == calls_before); // no NEW dispatch
 }

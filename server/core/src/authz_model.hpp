@@ -19,7 +19,7 @@
 /// write `rbac.db`, and it enforces nothing on the wire — it is a header-only
 /// vocabulary + a handful of pure classification rules, seeded with the SAME
 /// securable/operation catalogue `RbacStore::seed_defaults()` hardcodes today
-/// (`rbac_store.cpp:217-244`+ops, read-only reference) so PR1.9 has real data
+/// (`rbac_store.cpp:291-327`+ops, 22 seeded types, read-only reference) so PR1.9 has real data
 /// to migrate rather than a speculative schema. `mcp_policy.hpp` is the other
 /// read-only reference for the existing (securable, operation) vocabulary in
 /// live use.
@@ -204,19 +204,50 @@ struct CapabilityDeclaration {
     /// registering a tool that skipped them.
     bool agentic_context_annotated{false};
 
+    /// CDX-P2-004/K-23 presence sentinels — ADR-0033 §2: "a missing or
+    /// unparseable mcp_tier_class, securable or operation means the capability
+    /// does not exist. Never defaults to read." Because `operation`/
+    /// `mcp_tier_class` are plain enums whose zero value IS `Read`, a future
+    /// decoder (PR1.9) that fails to parse them would silently leave `Read`.
+    /// `classification_explicit` is set true ONLY after a decoder positively
+    /// parses securable + operation + mcp_tier_class; `a4_envelope_declared`
+    /// records the mandatory A4 error-envelope obligation (ADR-1005/ADR-0032 §8)
+    /// as an explicit field. Both default false, so a default-constructed or
+    /// partially-decoded declaration fails `is_valid` (fail closed).
+    bool a4_envelope_declared{false};
+    bool classification_explicit{false};
+
     /// Fail-closed validation: a missing/inconsistent field means the
     /// capability DOES NOT REGISTER on any surface (ADR-0033 §2 — "never
     /// defaults to read"), not that it silently narrows or widens. Checks:
+    ///   - classification (securable+operation+mcp_tier_class) POSITIVELY
+    ///     supplied, the A4 envelope declared, the agentic context annotated
+    ///   - `operation`/`mcp_tier_class` in range (reject a bad-decode cast)
     ///   - `securable`/`discovery_entry`/`data_class`/`audit_verb` non-empty
     ///   - `risk_tier` at or above `min_risk_tier_for(operation)`
-    ///   - at least one twin present, or an exception is recorded
+    ///   - BOTH REST and MCP twins present, unless an exception is recorded
     [[nodiscard]] bool is_valid() const {
+        // ADR-0033 §2 never-defaults-to-read: the classification, the A4
+        // envelope, and the agentic annotation must be POSITIVELY supplied.
+        if (!classification_explicit || !a4_envelope_declared || !agentic_context_annotated)
+            return false;
+        // Reject an out-of-range enum (e.g. a bad decode casting arbitrary bits).
+        // risk_tier needs a CEILING as well as the floor check below: a decoder
+        // casting an unparseable value (CDX-R2-005) must not slip through just
+        // because a high bit pattern sits above every operation's floor.
+        if (static_cast<uint8_t>(operation) > static_cast<uint8_t>(Operation::Attest) ||
+            static_cast<uint8_t>(mcp_tier_class) > static_cast<uint8_t>(McpTierClass::Execute) ||
+            static_cast<uint8_t>(risk_tier) > static_cast<uint8_t>(RiskTier::Critical))
+            return false;
         if (securable.empty() || discovery_entry.empty() || data_class.empty() ||
             audit_verb.empty())
             return false;
         if (static_cast<uint8_t>(risk_tier) < static_cast<uint8_t>(min_risk_tier_for(operation)))
             return false;
-        if (!has_rest_twin && !has_mcp_twin && twin_exception_ref.empty())
+        // ADR-1005 twin contract: a capability must be discoverable on BOTH the
+        // REST and MCP surfaces. EITHER twin missing without a recorded
+        // exception is invalid -- not just both missing. (BR-005)
+        if ((!has_rest_twin || !has_mcp_twin) && twin_exception_ref.empty())
             return false;
         return true;
     }
@@ -252,6 +283,10 @@ struct CapabilitySeed {
     decl.data_class = std::string(seed.data_class);
     decl.audit_verb = std::string(seed.audit_verb);
     decl.agentic_context_annotated = true;
+    // Seed rows are hand-authored, complete capabilities: their classification
+    // is explicit and they ship the A4 envelope (CDX-P2-004 presence sentinels).
+    decl.a4_envelope_declared = true;
+    decl.classification_explicit = true;
     return decl;
 }
 
@@ -317,6 +352,54 @@ template <class Ids>
         if (visible->contains(id))
             out.push_back(id);
     return out;
+}
+
+/// The already-resolved facts `compose_exec_visible` decides from. Each is
+/// looked up by the caller (which owns the RbacStore/TagStore handles this
+/// registry-independent header deliberately does not depend on) so the DECISION
+/// itself stays pure and directly testable.
+struct ExecVisibleFacts {
+    /// The caller presented a service-scoped token (`token_scope_service`
+    /// non-empty).
+    bool service_scoped = false;
+    /// Agents tagged with that service. `nullopt` == the tag store was
+    /// unavailable, which must fail CLOSED, not open.
+    std::optional<std::unordered_set<std::string>> service_tagged;
+    /// RBAC is loaded-but-disabled (legacy-open). A null or load-failed store
+    /// is NOT legacy-open — that stays fail-closed (BR-002).
+    bool legacy_open = false;
+    /// The session reached the route via JIT admin elevation.
+    bool elevated = false;
+    /// The username holds a GLOBAL `Execution:Execute` grant.
+    bool global_grant = false;
+    /// The ADR-0017 per-agent visible set. `nullopt` == store error, fail closed.
+    std::optional<std::unordered_set<std::string>> scoped_visible;
+};
+
+/// Decide a caller's `Execution:Execute` visible set (#1788).
+///
+/// ORDER IS THE CONTRACT, and it is the whole of CDX-001: a service-scoped
+/// token is resolved FIRST and is NEVER unfiltered, so its confinement takes
+/// PRECEDENCE over any global grant the minting username holds. BR-001 confined
+/// service tokens only INSIDE the `!unfiltered` branch, so an administrator
+/// minting a service-A token still matched the global grant, came out
+/// unfiltered, and reached the whole fleet. Checking the global grant first —
+/// or composing the two branches independently — reintroduces exactly that.
+///
+/// This is a free function rather than a method for one reason: the previous
+/// arrangement, where the decision lived only inside `ServerImpl`, could not be
+/// tested without an `RbacStore`, so its tests re-implemented it. Two
+/// independent copies then diverged and the PRECEDENCE was composed by neither,
+/// leaving CDX-001 reopenable under green tests. Keep the decision here.
+[[nodiscard]] inline VisibleSet compose_exec_visible(const ExecVisibleFacts& f) {
+    if (f.service_scoped) {
+        // Never unfiltered. Absent tag store -> empty == deny-all.
+        return f.service_tagged.value_or(std::unordered_set<std::string>{});
+    }
+    if (f.legacy_open || f.elevated || f.global_grant)
+        return std::nullopt; // genuinely unfiltered authority
+    // Store error -> empty == deny-all, never nullopt.
+    return f.scoped_visible.value_or(std::unordered_set<std::string>{});
 }
 
 } // namespace yuzu::server::authz

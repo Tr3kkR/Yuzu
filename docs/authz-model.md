@@ -1,4 +1,4 @@
-# The authz MODEL (ADR-0033 §2) and the `/api/command` per-device visibility fix (#1788)
+# The authz MODEL (ADR-0033 §2) and per-device dispatch visibility (#1788)
 
 This document covers two related but separable pieces of PR1.4:
 
@@ -24,8 +24,8 @@ if the ADR is amended before PR1.9 lands, this schema may need a rework pass.
 
 ### Vocabulary
 
-- **`securable`** — reuses an existing `RbacStore::list_securable_types()` entry (21 seeded types,
-  `rbac_store.cpp:217-244`, read-only reference for this PR) wherever one accurately describes the
+- **`securable`** — reuses an existing `RbacStore::list_securable_types()` entry (22 seeded types,
+  `rbac_store.cpp:291-327`, read-only reference for this PR) wherever one accurately describes the
   protected resource. A Module minting a genuinely new securable is an ADR-0033 §2 escape hatch that
   is **not built yet** — its own stated precondition is the runtime capability-declaration registry,
   which is PR1.9's job, not this one's.
@@ -42,9 +42,10 @@ if the ADR is amended before PR1.9 lands, this schema may need a rework pass.
   inherently sensitive operation class (Delete/Approve/Push floor at High; Write/Execute/Attest at
   Medium; Read at Low). Declaring above the floor is always fine.
 - **`mcp_tier_class`** — `yuzu::server::authz::McpTierClass` (read/write/execute). ADR-0033 §2: the
-  routing input the shipped **tier-before-RBAC** ordering (`docs/mcp-server.md`,
-  `mcp_policy.hpp::tier_allows`) evaluates every built-in and declared tool through — one
-  chokepoint, extended, never a parallel one. This is deliberately **not** derived purely from
+  routing input PR1.9 **will** feed into the shipped **tier-before-RBAC** ordering
+  (`docs/mcp-server.md`, `mcp_policy.hpp::tier_allows`) so every built-in and declared tool routes
+  through one chokepoint, extended, never a parallel one. **Not wired today** — `tier_allows` still
+  takes a `std::string_view` and has no knowledge of this type. This is deliberately **not** derived purely from
   `operation` in general: ADR-0033 §1 is explicit that read-vs-effect ("the one typing that must not
   be self-certified") is core's *ratified* mutability class, decided when a Module's capability
   manifest is approved. `default_mcp_tier_class(operation)` is only a convenience for classifying
@@ -61,11 +62,17 @@ the A4 error envelope, agentic-context annotations (track 2g), and `data_class` 
 registration — it does not redefine the platform mechanisms themselves, which stay governed by
 ADR-1005/ADR-0032 and `rest_a4_envelope.hpp`.
 
-`CapabilityDeclaration::is_valid()` enforces ADR-0033 §2's "undeclared means the capability does
-not exist — never defaults to read": a missing `securable`/`discovery_entry`/`data_class`/
-`audit_verb`, a `risk_tier` below its operation's floor, or both twins absent with no recorded
-exception all fail validation, and a Module registration that fails it must not register on **any**
-surface.
+`CapabilityDeclaration::is_valid()` **expresses** ADR-0033 §2's "undeclared means the capability
+does not exist — never defaults to read": a missing `securable`/`discovery_entry`/`data_class`/
+`audit_verb`, a `risk_tier` below its operation's floor, or **either** REST/MCP twin absent with no
+recorded exception all fail validation. Once PR1.9 adds the registration path, a Module registration
+that fails it must not register on **any** surface.
+
+**It enforces nothing today.** `is_valid()` has zero production callers — the whole §2 half of
+`authz_model.hpp` is reachable only from `test_authz_model.cpp`. That is the deliberate
+shipped-incomplete state this section's own opening states ("the model does not enforce anything");
+the future tense above is load-bearing, because a reader who takes this as a live control would
+believe a capability registration is validated when nothing calls the validator.
 
 There is deliberately **no `execute_roles` field** (or any role-shaped field) — which principals
 hold `operation` on `securable` stays entirely in `RbacStore`'s `role_permissions` table. This model
@@ -91,7 +98,7 @@ group). It classifies securables/operations/risk-tiers and composes strictly on 
 `check_scoped_permission`, `authorize_list_read`) — never the private `resolve_perm_groups`/
 `PermGroups`.
 
-## 2. Closing #1788: per-device visibility on every `/api/command` dispatch arm
+## 2. Closing #1788: per-device visibility on every operator dispatch arm
 
 ### The gap
 
@@ -103,10 +110,25 @@ possibly-**global** `Execution:Execute` permission and then dispatches through o
 3. **Group** — `group:<id>`, resolved via `ManagementGroupStore::get_members`.
 4. **Scope** — a scope DSL expression, resolved via `AgentRegistry::evaluate_scope`.
 
-None of the four narrowed the actual send set to the operator's own visibility — a caller whose
-`Execution:Execute` grant is scoped to a management group (or who reaches the route via JIT
-elevation, an MCP tier auto-grant, or a service-scoped token) could reach a device outside that
-scope through **any** arm, most directly by simply naming it in `agent_ids`.
+None of the four narrowed the actual send set to the operator's own visibility. This has **one
+live consequence and one forward-wired one**, which the fix below deliberately closes together:
+
+- **Live (the exploit #1788 actually closes):** a **service-scoped token** reaches this route because
+  `require_permission` admits it via the `ITServiceOwner` role's `Execution:Execute` grant —
+  independent of the minting principal's own grants (`auth_routes.cpp`
+  `check_role_has_permission("ITServiceOwner", …)`). So before this fix the token dispatched to the
+  whole fleet through any arm, most directly by naming a foreign-service device in `agent_ids`,
+  ignoring the very confinement `require_scoped_permission` enforces per-target on the non-generic
+  paths. (Separately, because the minter *may* also hold a global `Execution:Execute` grant, the
+  visibility composition below checks the service scope **first** — CDX-001 — so that grant cannot
+  make the token unfiltered.)
+- **Forward-wired (correct-but-currently-unreachable):** a purely **management-group-confined**
+  operator holds *no* global `Execution:Execute` grant, so the base `require_permission` gate above
+  **already denies them** before any arm runs (ADR-0017 records this as the World-A "correct-but-
+  unreachable" gap). The per-agent narrowing below therefore changes nothing for that principal
+  *today*; it composes correctly for when the ADR-0017 list-admit gate (#1714/#1715) makes such a
+  caller reachable. The changelog should not be read as evidence a live management-group exploit was
+  closed — it was not; the service-token arm is the live fix.
 
 ### The fix
 
@@ -114,12 +136,18 @@ scope through **any** arm, most directly by simply naming it in `agent_ids`.
 `std::nullopt` meaning "unfiltered" — right after the existing destructive-action block and before
 any dispatch arm runs:
 
-- If the operator holds `Execution:Execute` **globally** (`RbacStore::check_permission`), or reaches
-  the route via JIT admin elevation (`auth::is_elevated`) or a service-scoped token's ITServiceOwner
-  grant (`Session::token_scope_service`) — both of which `require_permission` above already treats
-  as full access without a matching `principal_roles` row — the set is unfiltered. This mirrors
-  `RbacStore::check_scoped_permission`'s own internal order (global first) so a global ALLOW keeps
-  overriding a group deny (#1715(b)), rather than this fix inventing a second, divergent order.
+- A **service-scoped token** (`Session::token_scope_service` non-empty) is resolved **first** and is
+  **never unfiltered**: it attenuates to exactly its own service's agents
+  (`TagStore::agents_with_tag("service", …)`), and that confinement takes precedence over any global
+  `Execution:Execute` grant the minting username holds (an administrator minting a service-A token
+  must still be confined to service A, not reach the whole fleet — CDX-001). The tag store being
+  unavailable fails closed to the empty set.
+- Otherwise, if the operator holds `Execution:Execute` **globally** (`RbacStore::check_permission`),
+  or reaches the route via JIT admin elevation (`auth::is_elevated`) — both of which
+  `require_permission` above already treats as full access without a matching `principal_roles` row —
+  the set is unfiltered. This mirrors `RbacStore::check_scoped_permission`'s own internal order
+  (global first) so a global ALLOW keeps overriding a group deny (#1715(b)), rather than this fix
+  inventing a second, divergent order.
 - Otherwise, the set is `RbacStore::visible_agents_for_permission(user, "Execution", "Execute",
   mgmt_store)` — the ADR-0017 per-agent visible set. Any store error narrows to "nothing visible",
   never "everything" (fail-closed).
@@ -140,6 +168,48 @@ A hidden id is **silently dropped**, the same posture the Scope/Group arms alrea
 that resolves to nothing (a 503 "failed to send command to any agent" only if the visibility filter
 empties the *entire* resolved set) — this fix narrows the send set, it does not add a new error
 shape.
+
+### Where the decision lives, and which surfaces route through it
+
+Two functions, each with exactly one implementation:
+
+| | Function | Decides |
+|---|---|---|
+| Which arm | `classify_dispatch_arm` (`dispatch_target_shape.hpp`) | Group / Scope / Ids / Broadcast / None |
+| Who is reached | `dispatch_confined_arms` (`dispatch_confined_arms.hpp`) | the per-arm `VisibleSet` intersection |
+
+Every OPERATOR dispatch surface reaches the second through one of two callers —
+`ServerImpl::dispatch_confined` (the shared closure behind MCP `execute_instruction` /
+`execute_bundle`, the dashboard execute and TAR `purge_source` routes, and
+`POST /api/instructions|workflows/{id}/execute`) or the `/api/command` inline handler. Those two
+callers legitimately differ in how they RESOLVE targets (management-group store, scope engine,
+principal from a live session versus an execution row) and in how they report failure
+(`/api/command` answers 400/503; the shared closure has no response object — background runners call
+it). They do not differ in who gets reached, and that is the part now held in one place.
+
+Each surface supplies the caller's set via an `ExecVisibleFn`, derived per request by
+`derive_exec_visible`. **An unwired `ExecVisibleFn` substitutes a PRESENT-EMPTY set, never
+`nullopt`** — deny-all rather than unfiltered. That asymmetry is the whole fail-closed contract: the
+two states are not interchangeable, and treating a missing derivation as "no filter" is precisely
+the failure mode being guarded.
+
+`broadcast_on_none` is the one thing a caller parameterises: it says what an UNNAMED target means.
+The shared closure passes `false` — no target named reaches NOBODY (#2500). Callers whose UI or tool
+has already normalised a deliberate whole-fleet selection into empty+empty pass `true`. A new
+dispatch caller passes `false` and names `__all__` explicitly.
+
+One deliberate exclusion: the BACKGROUND engines (scheduler, Guardian push, policy evaluator)
+dispatch as system with `nullopt`, deferred to the #1714/#1715 core chokepoint.
+
+`quarantine_device` is NOT an unfiltered exclusion — both the MCP tool and the REST twin
+(`POST`/`DELETE /api/v1/quarantine`) gate on the SOLE per-target `scoped_perm_fn("Security","Execute",
+agent_id)` (CDX-P1-02 brought REST to parity with MCP, which already threads a `{agent_id}` confined
+`VisibleSet`), and both fail CLOSED — a 500/`kInternalError` — when the scope gate is unwired, never
+widening to a global grant. `GET /api/v1/quarantine` is scoped the same way (gov-fix, admit-then-filter
+per record via the same `scoped_perm_fn`): a device outside the caller's visible set is dropped from
+the list entirely, not merely blocked from write access — closing the asymmetry where a confined
+operator could act on a device via POST/DELETE but not see it via GET, and a global `Security:Read`
+holder could enumerate devices outside every caller's actionable scope.
 
 ### What this fix deliberately preserves
 
@@ -169,7 +239,17 @@ shape.
   known-agent-id list for broadcast) against a scoped visible set, and against `std::nullopt`
   (unfiltered).
 
-The four dispatch arms themselves live inside `Server::start()`'s raw `httplib::Server`
-registration and are not independently reachable by a test harness (the same limitation
-`dispatch_target_shape.hpp` documents for `classify_dispatch_arm`, #2557) — the tests above cover
-the shared primitive every arm calls, not the route closures directly.
+The arms themselves are covered separately, and both layers are needed. The tests above cover the
+shared `in_scope`/`filter_to_scope` PRIMITIVE; `tests/unit/server/test_dispatch_confined_arms.cpp`
+covers the per-arm SEAM (`server/core/src/dispatch_confined_arms.hpp`) by running it against a
+recording sink and asserting the exact set of agents reached, for every arm against each of the
+three `VisibleSet` states.
+
+Proving the primitive correct says nothing about whether every arm actually calls it — that gap is
+what previously let route mocks pass while the intersection was deleted from production. The seam
+tests are mutation-checked against exactly that: removing any single `in_scope`/`filter_to_scope`
+call fails them.
+
+Route-level tests additionally prove the HANDOFF — that each handler derives the caller's visible
+set and threads it in — for the MCP, REST-bundle, dashboard, instruction-execute and
+workflow-execute surfaces. Handoff plus intersection together is the full path; either alone is not.

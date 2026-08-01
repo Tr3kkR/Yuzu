@@ -8,6 +8,7 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "authz_model.hpp"
 #include "device_token_store.hpp"
 #include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
@@ -154,6 +155,17 @@ public:
     /// admit-then-filter gate for fan-out reads lands (the remaining #1634 work).
     using ResponseScopeFn =
         std::function<bool(const std::string& username, const std::string& agent_id)>;
+    /// #1788: derives the caller's dispatch-confinement VisibleSet (nullopt =
+    /// unfiltered, present-empty = deny-all — ADR-0033 §1), the SAME primitive
+    /// `ServerImpl::derive_exec_visible` feeds into `/api/command` and every MCP
+    /// dispatch surface. POST /api/v1/bundles threads it into
+    /// `BundleOrchestrator::dispatch` as a SECOND, independent confinement check
+    /// alongside the per-target `scoped_perm_fn` gate already enforced at the
+    /// handler — defense-in-depth, not the primary gate (a bundle already has
+    /// its single target authorized by scoped_perm_fn before this runs). Empty
+    /// default `{}` preserves the pre-existing unfiltered-VisibleSet behaviour
+    /// for any caller (test harness) that hasn't wired it.
+    using ExecVisibleFn = std::function<yuzu::server::authz::VisibleSet(const auth::Session&)>;
     /// Audit-event callback. Returns true iff the event was persisted
     /// (or the deployment runs audit-off — both look the same to a
     /// caller, see `AuthRoutes::audit_log` doc). Returns false on a
@@ -314,7 +326,11 @@ public:
         // ADR-0034: THE shared admission budget for held-open responses. GET /api/v1/events
         // pins an httplib worker for the life of the subscription, so it leases from the same
         // counter as every other streaming surface. nullptr = no admission control (tests).
-        yuzu::server::detail::StreamBudget* stream_budget = nullptr);
+        yuzu::server::detail::StreamBudget* stream_budget = nullptr,
+        // #1788 defense-in-depth: see ExecVisibleFn's doc comment above. Trailing
+        // optional dep; `{}` preserves the pre-existing unfiltered-VisibleSet
+        // behaviour on POST /api/v1/bundles.
+        ExecVisibleFn exec_visible_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -372,7 +388,11 @@ public:
         AccessReviewStore* access_review_store = nullptr, AuthDB* auth_db = nullptr,
         DirectorySync* directory_sync = nullptr,
         // ADR-0034: the shared held-open-response budget (see the overload above).
-        yuzu::server::detail::StreamBudget* stream_budget = nullptr);
+        yuzu::server::detail::StreamBudget* stream_budget = nullptr,
+        // #1788 defense-in-depth: see ExecVisibleFn's doc comment above (production
+        // overload). `{}` preserves the pre-existing unfiltered-VisibleSet behaviour
+        // for test harnesses that haven't wired it.
+        ExecVisibleFn exec_visible_fn = {});
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the

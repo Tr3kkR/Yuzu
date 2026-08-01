@@ -321,6 +321,8 @@ device filter that matched nothing produces. Each of these is now `400`.
 | `POST /api/instructions/{id}/execute` | body is not a JSON object | treated as "no target" → broadcast | `400` |
 | `POST /api/command` | `scope` is `"__all__"` | `400 invalid scope` | dispatches to **all connected agents** |
 | `POST /api/v1/result-sets/from-*` | body is not a JSON object | `500` (uncaught type error) | `400` |
+| `POST /api/dashboard/execute` | form field `scope=` supplied but EMPTY | broadcast to all | refused, nothing dispatched |
+| `POST /api/dashboard/tar-execute` | query param `scope=` supplied but EMPTY | broadcast to all | refused, nothing dispatched |
 
 The two remediation rows matter for the same reason as the rest: on that route an **absent**
 `agent_ids` means "every non-compliant agent in this policy", so a supplied selector that named
@@ -355,8 +357,16 @@ change is that the dashboard's "All agents" button now sends `__all__` explicitl
 that way look different from before. A saved query selecting historical broadcasts by
 `scope_expression = ''` still matches everything except dashboard-initiated ones.
 
-**Dashboard users need do nothing** — the Instructions execute dialog's "All agents" option now
-sends `__all__` instead of an empty string.
+**Dashboard users driving the UI in a browser need do nothing** — the Instructions execute
+dialog's "All agents" option sends `__all__` instead of an empty string.
+
+**But automation that POSTs the dashboard forms directly does need attention.** As of the
+Wave-1 foundations change, `/api/dashboard/execute` and `/api/dashboard/tar-execute`
+distinguish an OMITTED `scope` from one SUPPLIED as empty (`scope=`): omitted still means the
+whole fleet, but supplied-but-empty is now refused and dispatches to nobody, where it
+previously broadcast. If a script builds the form body unconditionally and leaves `scope`
+blank when no device is selected, it will stop dispatching — which is the intended outcome,
+but a silent one. Send `scope=__all__` to keep the fleet-wide behaviour deliberately.
 
 **Detecting affected clients — and the limit of what is possible.** There is no reliable way to
 find them *before* upgrading. The audit trail records the OUTCOME of a dispatch, not the request

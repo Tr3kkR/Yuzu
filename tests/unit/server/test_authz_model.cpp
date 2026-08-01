@@ -12,17 +12,22 @@
  *      semantics for `Execution:Execute` specifically, PLUS negative tests
  *      for each of the four `/api/command` dispatch-arm shapes.
  *
- * The four dispatch arms themselves live inside `Server::start()`'s raw
- * `httplib::Server` registration and are not independently reachable by a
- * test harness — the same limitation `dispatch_target_shape.hpp` documents
- * for `classify_dispatch_arm` (#2557). These tests cover the shared
- * `in_scope`/`filter_to_scope` primitive every arm calls before `send_to`,
- * against each arm's characteristic already-resolved target-set shape.
+ * These tests cover the shared `in_scope`/`filter_to_scope` PRIMITIVE against
+ * each arm's characteristic already-resolved target-set shape — the helper
+ * semantics, not the dispatch path.
+ *
+ * The arms THEMSELVES are covered by `test_dispatch_confined_arms.cpp`, which
+ * binds the production `dispatch_confined_arms` seam with exact-send-set
+ * assertions. Both files are needed and neither substitutes for the other:
+ * proving the primitive is correct says nothing about whether every arm calls
+ * it, which is exactly the gap that let a false-green closure test pass while
+ * the intersection was deleted (CDX-R8-02).
  */
 
 #include "authz_model.hpp"
 #include "management_group_store.hpp"
 #include "rbac_store.hpp"
+#include "tag_store.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -142,6 +147,85 @@ TEST_CASE("authz_model: CapabilityDeclaration::is_valid rejects both twins absen
     CHECK(decl.is_valid()); // a recorded exception makes an absent twin valid
 }
 
+TEST_CASE("authz_model: is_valid rejects EITHER single twin missing without an exception (BR-005)",
+          "[authz_model][validate]") {
+    // The contract is BOTH twins present unless excepted -- not merely "at
+    // least one". Each single-missing shape must be invalid on its own, and an
+    // exception must rescue each.
+    {
+        CapabilityDeclaration decl = from_seed(kSeedCatalogue[0]);
+        decl.has_rest_twin = true;
+        decl.has_mcp_twin = false;
+        CHECK(!decl.is_valid()); // MCP twin missing
+        decl.twin_exception_ref = "ADR-1005-ledger#7";
+        CHECK(decl.is_valid());
+    }
+    {
+        CapabilityDeclaration decl = from_seed(kSeedCatalogue[0]);
+        decl.has_rest_twin = false;
+        decl.has_mcp_twin = true;
+        CHECK(!decl.is_valid()); // REST twin missing
+        decl.twin_exception_ref = "ADR-1005-ledger#8";
+        CHECK(decl.is_valid());
+    }
+    {
+        CapabilityDeclaration decl = from_seed(kSeedCatalogue[0]);
+        decl.has_rest_twin = true;
+        decl.has_mcp_twin = true;
+        CHECK(decl.is_valid()); // both present, no exception needed
+    }
+}
+
+TEST_CASE("authz_model: is_valid fails closed on an un-supplied classification/A4/agentic field "
+          "(CDX-P2-004)",
+          "[authz_model][validate]") {
+    // ADR-0033 §2 "never defaults to read": because operation/mcp_tier_class are
+    // plain enums whose zero value IS Read, a decoder that fails to populate them
+    // must NOT leave a silently-Read capability registered. The presence
+    // sentinels make a default-constructed or partially-decoded declaration
+    // invalid.
+    SECTION("a default-constructed declaration is invalid") {
+        CapabilityDeclaration blank; // every sentinel false by default
+        CHECK(!blank.is_valid());
+    }
+    SECTION("each sentinel is independently load-bearing") {
+        {
+            CapabilityDeclaration d = from_seed(kSeedCatalogue[0]);
+            REQUIRE(d.is_valid());
+            d.classification_explicit = false;
+            CHECK(!d.is_valid());
+        }
+        {
+            CapabilityDeclaration d = from_seed(kSeedCatalogue[0]);
+            d.a4_envelope_declared = false;
+            CHECK(!d.is_valid());
+        }
+        {
+            CapabilityDeclaration d = from_seed(kSeedCatalogue[0]);
+            d.agentic_context_annotated = false;
+            CHECK(!d.is_valid());
+        }
+    }
+    SECTION("an out-of-range enum (bad decode cast) is rejected") {
+        {
+            CapabilityDeclaration d = from_seed(kSeedCatalogue[0]);
+            d.operation = static_cast<Operation>(0xFF);
+            CHECK(!d.is_valid());
+        }
+        {
+            CapabilityDeclaration d = from_seed(kSeedCatalogue[0]);
+            d.mcp_tier_class = static_cast<McpTierClass>(0xFF);
+            CHECK(!d.is_valid());
+        }
+        {
+            // CDX-R2-005: risk_tier needs a ceiling, not just the floor check.
+            CapabilityDeclaration d = from_seed(kSeedCatalogue[0]);
+            d.risk_tier = static_cast<RiskTier>(0xFF);
+            CHECK(!d.is_valid());
+        }
+    }
+}
+
 TEST_CASE("authz_model: min_risk_tier_for never floors below Low, never above High",
           "[authz_model][validate]") {
     CHECK(min_risk_tier_for(Operation::Read) == RiskTier::Low);
@@ -206,24 +290,91 @@ struct Rig {
     }
 };
 
-/// Compose a `VisibleSet` the SAME way the #1788 `/api/command` fix does:
-/// global `check_permission` first (unfiltered on a hit, #1715(b)), else the
-/// ADR-0017 `visible_agents_for_permission` scoped set, fail-closed to
-/// "nothing visible" on any store error. This is the exact composition
-/// `server.cpp` performs — duplicated here (rather than exported from
-/// `authz_model.hpp`) because it needs an `RbacStore&`, which the
-/// registry-independent header deliberately does not depend on.
+/// Resolve the facts from REAL stores, then hand them to the PRODUCTION
+/// composer `authz::compose_exec_visible`.
+///
+/// This mirrors only the LOOKUPS `ServerImpl::derive_exec_visible` performs.
+/// The DECISION — crucially the CDX-001 precedence, that a service-scoped token
+/// is resolved first and is never unfiltered — belongs to the production
+/// function, so deleting that branch there FAILS these tests.
+///
+/// An earlier revision of this file re-implemented the decision instead, split
+/// across two helpers, one of which took no `RbacStore` at all. The precedence
+/// was therefore composed by neither, and reinstating CDX-001 in production left
+/// every case here green — a false-green offered as closure evidence for a
+/// blocking finding. Do not reintroduce a local copy of the ordering.
+VisibleSet resolve_and_compose(const yuzu::server::RbacStore& rbac, const std::string& user,
+                               yuzu::server::ManagementGroupStore* mgmt,
+                               yuzu::server::TagStore* tags = nullptr,
+                               const std::string& token_scope_service = {}) {
+    yuzu::server::authz::ExecVisibleFacts f;
+    f.service_scoped = !token_scope_service.empty();
+    if (f.service_scoped) {
+        if (tags) {
+            auto svc = tags->agents_with_tag("service", token_scope_service);
+            f.service_tagged = std::unordered_set<std::string>(svc.begin(), svc.end());
+        }
+        // tags == nullptr -> service_tagged stays nullopt -> fail closed.
+        return yuzu::server::authz::compose_exec_visible(f);
+    }
+    f.global_grant = rbac.check_permission(user, "Execution", "Execute");
+    if (auto v = rbac.visible_agents_for_permission(user, "Execution", "Execute", mgmt))
+        f.scoped_visible = std::unordered_set<std::string>(v->begin(), v->end());
+    return yuzu::server::authz::compose_exec_visible(f);
+}
+
+/// Non-service-token spelling, kept so the group-arm cases below read plainly.
 VisibleSet compose_exec_visible(const yuzu::server::RbacStore& rbac, const std::string& user,
                                 yuzu::server::ManagementGroupStore* mgmt) {
-    if (rbac.check_permission(user, "Execution", "Execute"))
-        return std::nullopt;
-    std::unordered_set<std::string> visible;
-    if (auto v = rbac.visible_agents_for_permission(user, "Execution", "Execute", mgmt))
-        visible.insert(v->begin(), v->end());
-    return visible;
+    return resolve_and_compose(rbac, user, mgmt);
 }
 
 } // namespace
+
+TEST_CASE("authz_model #1788: a service-scoped token narrows to its service, over a global grant "
+          "(CDX-001, live arm)",
+          "[authz_model][1788][service]") {
+    yuzu::test::TempDbFile tag_db{"yuzu_test_authzmodel_tags-"};
+    yuzu::server::TagStore tags{tag_db.path};
+    tags.set_tag("a_svcA1", "service", "serviceA");
+    tags.set_tag("a_svcA2", "service", "serviceA");
+    tags.set_tag("a_svcB1", "service", "serviceB");
+
+    // THE CDX-001 VECTOR, and the reason this needs a REAL RbacStore rather
+    // than a tag store alone: the minting principal holds a GLOBAL
+    // Execution:Execute grant. BR-001 confined service tokens only inside the
+    // `!unfiltered` branch, so this exact combination came out unfiltered and
+    // reached the whole fleet. The token must win over the grant.
+    Rig r;
+    REQUIRE(r.rbac.assign_role({"user", "svc_admin", "ExecReader"}).has_value()); // GLOBAL allow
+    REQUIRE(r.rbac.check_permission("svc_admin", "Execution", "Execute")); // grant is real
+
+    auto visible = resolve_and_compose(r.rbac, "svc_admin", &r.mgmt, &tags, "serviceA");
+    REQUIRE(visible.has_value()); // never unfiltered, DESPITE the global grant
+    CHECK(visible->contains("a_svcA1"));
+    CHECK(visible->contains("a_svcA2"));
+    CHECK(!visible->contains("a_svcB1"));
+
+    SECTION("the same principal WITHOUT the token scope is unfiltered — proving the "
+            "token, not the user, is what narrows") {
+        auto unscoped = resolve_and_compose(r.rbac, "svc_admin", &r.mgmt);
+        CHECK_FALSE(unscoped.has_value()); // nullopt == unfiltered
+    }
+
+    // Each of the four arms then intersects its resolved targets against it via
+    // the same in_scope/filter_to_scope primitive the route uses — so naming a
+    // serviceB device in agent_ids (the most direct arm) drops it.
+    const std::vector<std::string> requested{"a_svcA1", "a_svcB1"};
+    auto sent = filter_to_scope(requested, visible);
+    CHECK(contains(sent, "a_svcA1"));
+    CHECK(!contains(sent, "a_svcB1"));
+
+    SECTION("a null/unavailable tag store fails closed to the empty set, never unfiltered") {
+        auto broken = resolve_and_compose(r.rbac, "svc_admin", &r.mgmt, nullptr, "serviceA");
+        REQUIRE(broken.has_value());
+        CHECK(broken->empty());
+    }
+}
 
 TEST_CASE("authz_model composition: global allow ⇒ unfiltered (#1715(b))",
           "[authz_model][compose][1715]") {
