@@ -11,11 +11,15 @@
  *                       from nullopt so a route cannot render empty as unfiltered)
  * plus the is_list_read audit flag on the denial row.
  *
- * PG-free by construction: a default AuthManager (config-file-only, no AuthDB)
- * mints the cookie in-memory, and api_token_store is nullptr (the cookie branch
- * of resolve_session never dereferences it). The ENGINE-principal branch of the
- * wrapper (503/403, RBAC-only, never legacy-open) needs the PG token +
- * engine-principal harness and is covered by a [pg] sibling test.
+ * The cookie principal itself is PG-free: a default AuthManager (config-file-only,
+ * no AuthDB) mints the session in-memory via create_local_session, and
+ * api_token_store is nullptr (the cookie branch of resolve_session never
+ * dereferences it). The ManagementGroupStore it filters through, however, is
+ * born-on-Postgres since the ADR-0042 migration, so the fixture is PG-gated:
+ * skips when YUZU_TEST_POSTGRES_DSN is unset, fails when set-but-broken
+ * (test_helpers.hpp skip-vs-fail contract). The ENGINE-principal branch (503/403,
+ * RBAC-only, never legacy-open) needs the PG token harness and lives in the
+ * sibling test_require_list_read_engine.cpp.
  */
 
 #include "analytics_event_store.hpp"
@@ -24,6 +28,8 @@
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
 #include "rbac_store.hpp"
+
+#include "pg/pg_pool.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -34,21 +40,38 @@
 #include <httplib.h>
 
 #include <memory>
+#include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 
 using namespace yuzu::server;
 
 namespace {
 
-/// PG-free AuthRoutes rig: real RBAC/mgmt/audit, no ApiTokenStore (cookie auth
-/// only). RBAC enforcement ON so the standard branch runs the real gate.
+// PG-backed ManagementGroupStore over its own migrated template clone (ADR-0042
+// made this store Postgres-only). A distinct template name keeps the
+// PgTestTemplate registry entry separate from sibling suites.
+void setup_list_read_mgmt_template(const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    ManagementGroupStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("require_list_read mgmt template: store failed to migrate");
+}
+
+yuzu::test::PgTestTemplate list_read_mgmt_template{"listread_mgmt",
+                                                   &setup_list_read_mgmt_template};
+
+/// AuthRoutes rig: cookie auth (no ApiTokenStore), a SQLite RbacStore, and a
+/// PG-backed ManagementGroupStore. RBAC enforcement ON so the standard branch
+/// runs the real admit-then-filter gate.
 struct ListReadRig {
     Config cfg{};
     auth::AuthManager auth_mgr{};
     RbacStore rbac{":memory:"};
-    yuzu::test::TempDbFile mgmt_db{"yuzu_test_rlr_mgmt-"};
-    ManagementGroupStore mgmt{mgmt_db.path};
+    std::optional<yuzu::test::PostgresTestDb> mgmt_db;
+    std::optional<yuzu::server::pg::PgPool> mgmt_pool;
+    std::unique_ptr<ManagementGroupStore> mgmt;
     AuditStore audit{":memory:"};
     yuzu::test::TempDbFile an_db{"yuzu_test_rlr_an-"};
     std::unique_ptr<AnalyticsEventStore> analytics;
@@ -57,6 +80,16 @@ struct ListReadRig {
     std::unique_ptr<AuthRoutes> ar;
 
     ListReadRig() {
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
+        mgmt_db.emplace(list_read_mgmt_template);
+        REQUIRE(mgmt_db->available());
+        mgmt_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = mgmt_db->dsn(), .size = 4});
+        REQUIRE(mgmt_pool->valid());
+        mgmt = std::make_unique<ManagementGroupStore>(*mgmt_pool);
+        REQUIRE(mgmt->is_open());
+
         analytics = std::make_unique<AnalyticsEventStore>(an_db.path);
         REQUIRE(rbac.is_open());
         REQUIRE(audit.is_open());
@@ -67,8 +100,8 @@ struct ListReadRig {
         // AuthDB. We only need an in-memory SESSION, which create_local_session
         // mints directly (in-memory session store, no AuthDB) — see as_op().
         ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac, /*api_token_store=*/nullptr, &audit,
-                                          &mgmt, /*tag_store=*/nullptr, analytics.get(), oidc_mu,
-                                          oidc_provider);
+                                          mgmt.get(), /*tag_store=*/nullptr, analytics.get(),
+                                          oidc_mu, oidc_provider);
     }
 
     // A cookie-authenticated request as human user "op" — session minted in
@@ -87,7 +120,7 @@ struct ListReadRig {
         g.name = name;
         g.membership_type = "static";
         g.parent_id = parent;
-        auto id = mgmt.create_group(g);
+        auto id = mgmt->create_group(g);
         REQUIRE(id.has_value());
         return *id;
     }
@@ -96,7 +129,7 @@ struct ListReadRig {
 } // namespace
 
 TEST_CASE("require_list_read: global grant -> AdmitAll (admitted, unfiltered)",
-          "[auth_routes][list_read]") {
+          "[pg][auth_routes][list_read]") {
     ListReadRig r;
     REQUIRE(r.rbac.assign_role({"user", "op", "RespReader"}).has_value()); // GLOBAL grant
     auto req = r.as_op();
@@ -107,12 +140,12 @@ TEST_CASE("require_list_read: global grant -> AdmitAll (admitted, unfiltered)",
 }
 
 TEST_CASE("require_list_read: confined operator -> AdmitScoped to group members",
-          "[auth_routes][list_read]") {
+          "[pg][auth_routes][list_read]") {
     ListReadRig r;
     auto g = r.make_group("G1");
-    REQUIRE(r.mgmt.add_member(g, "agent-1").has_value());
-    REQUIRE(r.mgmt.add_member(g, "agent-2").has_value());
-    REQUIRE(r.mgmt.assign_role({g, "user", "op", "RespReader"}).has_value()); // group-scoped only
+    REQUIRE(r.mgmt->add_member(g, "agent-1").has_value());
+    REQUIRE(r.mgmt->add_member(g, "agent-2").has_value());
+    REQUIRE(r.mgmt->assign_role({g, "user", "op", "RespReader"}).has_value()); // group-scoped only
     auto req = r.as_op();
     httplib::Response res;
     auto gate = r.ar->require_list_read(req, res, "Response", "Read");
@@ -122,10 +155,10 @@ TEST_CASE("require_list_read: confined operator -> AdmitScoped to group members"
 }
 
 TEST_CASE("require_list_read: confined on an EMPTY group -> AdmitScoped with empty scope (UP-14)",
-          "[auth_routes][list_read]") {
+          "[pg][auth_routes][list_read]") {
     ListReadRig r;
     auto g = r.make_group("Empty"); // holds the grant but has zero members
-    REQUIRE(r.mgmt.assign_role({g, "user", "op", "RespReader"}).has_value());
+    REQUIRE(r.mgmt->assign_role({g, "user", "op", "RespReader"}).has_value());
     auto req = r.as_op();
     httplib::Response res;
     auto gate = r.ar->require_list_read(req, res, "Response", "Read");
@@ -135,7 +168,7 @@ TEST_CASE("require_list_read: confined on an EMPTY group -> AdmitScoped with emp
 }
 
 TEST_CASE("require_list_read: no grant -> DenyAll 403 + is_list_read audit row",
-          "[auth_routes][list_read]") {
+          "[pg][auth_routes][list_read]") {
     ListReadRig r;
     auto req = r.as_op();
     httplib::Response res;
@@ -154,7 +187,7 @@ TEST_CASE("require_list_read: no grant -> DenyAll 403 + is_list_read audit row",
 }
 
 TEST_CASE("require_list_read: RBAC loaded-and-disabled -> legacy-open AdmitAll",
-          "[auth_routes][list_read]") {
+          "[pg][auth_routes][list_read]") {
     ListReadRig r;
     r.rbac.set_rbac_enabled(false); // loaded & disabled -> legacy-open (not a corrupt store)
     auto req = r.as_op();
