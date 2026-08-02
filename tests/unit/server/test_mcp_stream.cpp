@@ -1761,6 +1761,106 @@ TEST_CASE("McpStreamState: a final past the pin bound displaces the OLDEST pin",
     CHECK(reg.counter("yuzu_mcp_stream_final_unpinned_total").value() == 0.0);
 }
 
+TEST_CASE("McpStreamState: unpin of a displaced id no-ops - it cannot release the usurper",
+          "[mcp][stream][pins]") {
+    // The bridge holds the DISPLACED request's id until its POST wire settles, and its
+    // normal teardown still calls unpin(displaced_id). unpin matches by ID VALUE across
+    // the slots - never by index - so the stale release must find nothing: the slot that
+    // held the displaced id now protects the newer terminal, and releasing THAT pin on a
+    // stale handle would strip the exemption from exactly the frame the LRU chose to keep.
+    mcp::McpStreamState state;
+    std::vector<std::uint64_t> ids;
+    for (std::size_t i = 0; i < mcp::kMaxStreamedPostsPerSession; ++i) {
+        ids.push_back(state.publish_final("message", "final"));
+    }
+    const auto overflow_id = state.publish_final("message", "one-too-many");
+    REQUIRE_FALSE(state.is_pinned(ids[0])); // displaced by the overflow
+
+    state.unpin(ids[0]); // the stale release the bridge will eventually issue
+    CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession); // nothing released
+    CHECK(state.is_pinned(overflow_id));                             // the usurper kept its slot
+    CHECK(state.is_pinned(ids[1]));
+
+    state.unpin(overflow_id); // a REAL release still works after the stale one no-op'd
+    CHECK_FALSE(state.is_pinned(overflow_id));
+    CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession - 1);
+}
+
+TEST_CASE("McpStreamState/CH-5: a post-commit fault during displacement loses only the count",
+          "[mcp][stream][pins]") {
+    // Compound of the displacement path with the #2366 post-commit containment: the
+    // observability block throws AFTER the frame committed and the older pin was already
+    // destroyed. The containment must hold displacement-shaped state coherent - committed
+    // id returned, usurper pinned, bound intact - with ONLY the drift count lost, and the
+    // loss must not latch: the next displacement, with the registry healthy again, counts.
+    yuzu::MetricsRegistry reg;
+    mcp::McpStreamState state{mcp::kMcpRingCapDefault, &reg};
+    std::vector<std::uint64_t> ids;
+    for (std::size_t i = 0; i < mcp::kMaxStreamedPostsPerSession; ++i) {
+        ids.push_back(state.publish_final("message", "final"));
+    }
+
+    state.inject_publish_fault_for_test(
+        mcp::McpStreamState::PublishFault::kPostCommitObservability);
+    const auto first_overflow = state.publish_final("message", "displaces-under-fault");
+    REQUIRE(first_overflow != 0);          // committed - the fault must not un-commit it
+    CHECK(state.is_pinned(first_overflow)); // displacement itself completed under mu_
+    CHECK_FALSE(state.is_pinned(ids[0]));
+    CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession);
+    // The drift count is the documented casualty (sec-L1: observability must not
+    // un-commit, so the increment dies with the throw).
+    CHECK(reg.counter("yuzu_mcp_stream_pin_displaced_total").value() == 0.0);
+
+    // The loss does not latch: a healthy registry counts the next displacement.
+    const auto second_overflow = state.publish_final("message", "displaces-counted");
+    REQUIRE(second_overflow != 0);
+    CHECK_FALSE(state.is_pinned(ids[1])); // next-oldest yielded this time
+    CHECK(reg.counter("yuzu_mcp_stream_pin_displaced_total").value() == 1.0);
+}
+
+TEST_CASE("McpStreamPump/CH-1: the first pass after a long write stall runs the revalidation",
+          "[mcp][stream][ch4][tickgate]") {
+    // A saturated socket parks the pump inside write_all for up to the 30s write timeout -
+    // passes simply do not happen while it blocks. The tick gate must not turn that stall
+    // into a revalidation hole: the FIRST pass once writes resume finds next_check_ long
+    // overdue and runs the check BEFORE the drain delivers anything, so a credential
+    // revoked during the stall closes the stream ahead of any further frames.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    auto now = std::chrono::steady_clock::now();
+    auto verdict = mcp::StreamRevalidate::kValid;
+    mcp::McpStreamPump::Config cfg{};
+    cfg.tick = std::chrono::seconds(3);
+    mcp::McpStreamPump pump{attached.sink,
+                            state,
+                            attached.generation,
+                            [&] { return verdict; },
+                            [] { return true; },
+                            cfg,
+                            [&] { return now; }};
+    FakeWire wire;
+
+    // A healthy delivering pass first, so the stall starts from the busy-stream shape.
+    state->publish("message", "before-the-stall");
+    REQUIRE(pump.pump_once(wire.writer()));
+    REQUIRE(wire.contains("before-the-stall"));
+
+    // The stall: no passes while the clock crosses several tick boundaries, and the
+    // credential is revoked mid-stall. Frames queue up behind the blocked write.
+    now += cfg.tick * 10; // well past next_check_ - a 30s write timeout is 10 ticks
+    verdict = mcp::StreamRevalidate::kRevoked;
+    state->publish("message", "queued-during-stall");
+
+    // The resumed pass must close revoked WITHOUT delivering what queued during the stall:
+    // the gate runs before the drain, and an overdue check fires on the first opportunity.
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kCredentialRevoked);
+    CHECK(wire.contains(R"("reason":"credential_revoked")"));
+    CHECK_FALSE(wire.contains("queued-during-stall"));
+}
+
 TEST_CASE("McpStreamPump: a parked pump is woken by the producer's drop, not the tick (#2382)",
           "[mcp][stream]") {
     // The deferred #2366 follow-up: prove the DETERMINISTIC condvar handoff, not just the
