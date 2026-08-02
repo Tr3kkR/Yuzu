@@ -7,14 +7,16 @@
     "meson": "1.11.1",
     "erlang": "28.4.2",
     "rebar3": "3.24.0",
-    "postgres": "18.4"
+    "postgres": "18.4",
+    "windows_sdk": "10.0.26100.0"
   },
   "accepted_host_pins": {
     "python": ["3.14.6"],
     "meson": ["1.11.1"],
     "erlang": ["28.4.2"],
     "rebar3": ["3.24.0"],
-    "postgres": ["18.4"]
+    "postgres": ["18.4"],
+    "windows_sdk": ["10.0.26100.0"]
   },
   "job_pins": {
     "vcpkg_baseline": "4b77da7fed37817f124936239197833469f1b9a8"
@@ -37,7 +39,27 @@
     "rebar3",
     "msvc",
     "msys2_bash",
-    "postgres"
+    "postgres",
+    "windows_sdk_header",
+    "windows_sdk_lib",
+    "windows_sdk_rc"
+  ],
+  "artifact_probes": [
+    {
+      "tool": "windows_sdk_header",
+      "pin": "windows_sdk",
+      "path": "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\{pin}\\um\\Windows.h"
+    },
+    {
+      "tool": "windows_sdk_lib",
+      "pin": "windows_sdk",
+      "path": "C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\{pin}\\um\\x64\\kernel32.lib"
+    },
+    {
+      "tool": "windows_sdk_rc",
+      "pin": "windows_sdk",
+      "path": "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\{pin}\\x64\\rc.exe"
+    }
   ],
   "effective_commands": [
     { "command": "python", "tool": "python" },

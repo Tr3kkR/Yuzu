@@ -39,6 +39,7 @@ param(
   [string]$ErlangVersion   = '28.4.2',
   [string]$Rebar3Version   = '3.24.0',
   [string]$PostgresVersion = '18.4',
+  [ValidateSet('10.0.26100.0')][string]$WindowsSdkVersion = '10.0.26100.0',
   [string]$VcpkgBaseline   = '4b77da7fed37817f124936239197833469f1b9a8',  # == vcpkg.json builtin-baseline
 
   # --- machine layout (conventions; keep in sync with Start-PinnedRunner.ps1) ---
@@ -85,6 +86,7 @@ $requestedPins = [ordered]@{
   erlang=$ErlangVersion
   rebar3=$Rebar3Version
   postgres=$PostgresVersion
+  windows_sdk=$WindowsSdkVersion
   vcpkg_baseline=$VcpkgBaseline
 }
 foreach($pin in $requestedPins.GetEnumerator()){
@@ -125,13 +127,23 @@ function Step([string]$name,[scriptblock]$body){
     $script:failedSteps += $name
   }
 }
-function WG([string]$id,[string]$ver='',[string]$override='',[string]$scope='machine'){
+function WG([string]$id,[string]$ver='',[string]$override='',[string]$scope='machine',[switch]$EnforceExitPolicy){
   $a=@('install','--id',$id,'-e','--source','winget','--accept-source-agreements','--accept-package-agreements','--disable-interactivity')
   if($ver)     { $a+=@('--version',$ver) }
   if($scope)   { $a+=@('--scope',$scope) }
   if($override){ $a+=@('--override',$override) }
   Write-Host ("winget " + ($a -join ' '))
   winget @a
+  if($EnforceExitPolicy){
+    $wingetExitCode = $LASTEXITCODE
+    Invoke-YuzuInstallerExitPolicy -ExitCode $wingetExitCode -Context "winget install $id" `
+      -RebootHandler { param($context,$exitCode) Stop-YuzuProvisioningForReboot "$context returned $exitCode" }
+  }
+}
+function Stop-YuzuProvisioningForReboot([string]$context){
+  Write-Host "REBOOT REQUIRED ($context): keep every runner drained, reboot this host, then rerun provisioning and Assert-Toolchain.ps1 before registration." -ForegroundColor Yellow
+  try { Stop-Transcript | Out-Null } catch {}
+  exit 3
 }
 function Add-MachinePath([string]$dir){
   if(-not (Test-Path $dir)){ return }
@@ -341,12 +353,40 @@ Step "rebar3 $Rebar3Version (de-Shulgi-ified: env vars, NOT a C:\Erlang junction
   "escript: $escript ; rebar3: $Rebar3Dir\rebar3"
 }
 
-Step 'VS 2022 Build Tools (C++ workload)' {
+Step "VS 2022 Build Tools (C++ workload + Windows SDK $WindowsSdkVersion)" {
   $vsw="${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-  $have = (Test-Path $vsw) -and (& $vsw -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
-  if($have){ "already: $have" }
-  else { WG -id 'Microsoft.VisualStudio.2022.BuildTools' -scope '' `
-            -override '--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended' }
+  $have = if(Test-Path $vsw){ (& $vsw -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1) } else { $null }
+  $sdkComponent = 'Microsoft.VisualStudio.Component.Windows11SDK.26100'
+  $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+  $sdkHeader = Join-Path $sdkRoot "Include\$WindowsSdkVersion\um\Windows.h"
+  $sdkLib = Join-Path $sdkRoot "Lib\$WindowsSdkVersion\um\x64\kernel32.lib"
+  $sdkRc = Join-Path $sdkRoot "bin\$WindowsSdkVersion\x64\rc.exe"
+  if(-not $have){
+    WG -id 'Microsoft.VisualStudio.2022.BuildTools' -scope '' `
+       -override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --add $sdkComponent" `
+       -EnforceExitPolicy
+    $have = if(Test-Path $vsw){ (& $vsw -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1) } else { $null }
+  }
+  if(-not $have){ throw 'VS 2022 C++ Build Tools not found after install' }
+
+  # An existing Build Tools instance may predate this contract. `winget
+  # install` reports it as already installed and does not add a component, so
+  # modify the selected instance explicitly when the pinned SDK is absent.
+  if(-not (Test-Path -LiteralPath $sdkHeader) -or
+     -not (Test-Path -LiteralPath $sdkLib) -or
+     -not (Test-Path -LiteralPath $sdkRc)){
+    $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+    if(-not (Test-Path -LiteralPath $installer)){ throw "Visual Studio Installer not found at $installer" }
+    $proc = Start-Process -FilePath $installer -ArgumentList @(
+      'modify','--installPath',('"' + $have + '"'),'--add',$sdkComponent,'--quiet','--norestart'
+    ) -Wait -PassThru
+    Invoke-YuzuInstallerExitPolicy -ExitCode $proc.ExitCode -Context 'Visual Studio Installer modify' `
+      -RebootHandler { param($context,$exitCode) Stop-YuzuProvisioningForReboot "$context returned $exitCode" }
+  }
+  if(-not (Test-Path -LiteralPath $sdkHeader)){ throw "pinned Windows SDK header missing: $sdkHeader" }
+  if(-not (Test-Path -LiteralPath $sdkLib)){ throw "pinned Windows SDK library missing: $sdkLib" }
+  if(-not (Test-Path -LiteralPath $sdkRc)){ throw "pinned Windows SDK resource compiler missing: $sdkRc" }
+  "VS: $have ; Windows SDK: $WindowsSdkVersion"
 }
 
 Step "PostgreSQL $PostgresVersion (service :$PostgresPort, role yuzu, db yuzu_test)" {
@@ -896,6 +936,9 @@ Step "emit toolchain manifest -> $ManifestPath" {
   function Ver([scriptblock]$b){ try { (& $b 2>&1 | Select-Object -First 1) -replace '\s+$','' } catch { $null } }
   $vsw="${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
   $msvc = if(Test-Path $vsw){ (& $vsw -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1) } else { $null }
+  $windowsSdkHeader = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\$WindowsSdkVersion\um\Windows.h"
+  $windowsSdkLib = "${env:ProgramFiles(x86)}\Windows Kits\10\Lib\$WindowsSdkVersion\um\x64\kernel32.lib"
+  $windowsSdkRc = "${env:ProgramFiles(x86)}\Windows Kits\10\bin\$WindowsSdkVersion\x64\rc.exe"
   $major = $PostgresVersion.Split('.')[0]
   # Same resolution as the PostgreSQL/per-agent-cluster/Defender-exclusion
   # steps above - each Step scriptblock gets its own scope, so $pgbin from
@@ -915,6 +958,9 @@ Step "emit toolchain manifest -> $ManifestPath" {
     @{ name='escript';    path=[Environment]::GetEnvironmentVariable('YUZU_ESCRIPT','Machine'); version=(Ver { erl -version }); required=$true }
     @{ name='rebar3';     path=[Environment]::GetEnvironmentVariable('YUZU_REBAR3','Machine');  version=$Rebar3Version; required=$true }
     @{ name='msvc';       path=$msvc; version=$null; required=$true }
+    @{ name='windows_sdk_header'; path=$windowsSdkHeader; version=$WindowsSdkVersion; required=$true }
+    @{ name='windows_sdk_lib'; path=$windowsSdkLib; version=$WindowsSdkVersion; required=$true }
+    @{ name='windows_sdk_rc'; path=$windowsSdkRc; version=$WindowsSdkVersion; required=$true }
     @{ name='msys2_bash'; path="$Msys2Root\usr\bin\bash.exe"; version=(Ver { & "$Msys2Root\usr\bin\bash.exe" --version }); required=$true }
     @{ name='postgres';   path=(Join-Path $pgbin 'psql.exe'); version=$PostgresVersion; required=$true }
   )
@@ -937,7 +983,7 @@ Step "emit toolchain manifest -> $ManifestPath" {
     generated = (Get-Date).ToUniversalTime().ToString('o')
     host      = $env:COMPUTERNAME
     runner_count = $RunnerCount
-    pins      = [ordered]@{ python=$PythonVersion; meson=$MesonVersion; erlang=$ErlangVersion; rebar3=$Rebar3Version; postgres=$PostgresVersion; build_jobs=$BuildJobs; vcpkg_baseline=$VcpkgBaseline }
+    pins      = [ordered]@{ python=$PythonVersion; meson=$MesonVersion; erlang=$ErlangVersion; rebar3=$Rebar3Version; postgres=$PostgresVersion; windows_sdk=$WindowsSdkVersion; build_jobs=$BuildJobs; vcpkg_baseline=$VcpkgBaseline }
     env       = [ordered]@{
       VCPKG_ROOT=$VcpkgRoot; CCACHE_DIR="$CacheRoot\ccache"; RUNNER_TOOL_CACHE="$CacheRoot\tool_cache"
       YUZU_BUILD_JOBS="$BuildJobs"

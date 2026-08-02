@@ -230,6 +230,8 @@ jobs:
       - name: Setup MSVC (windows)
         if: matrix.os == 'windows'
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          sdk: 10.0.26100.0
 
       # Big Tam (the Linux leg's runner) does not carry meson on the default
       # PATH: ci.yml pip-installs it under ~/.local/bin and adds that to PATH

@@ -11,6 +11,7 @@ tells you where it belongs.
 | Ecosystem         | Source of truth                               | Update path                                                                                  |
 |-------------------|-----------------------------------------------|----------------------------------------------------------------------------------------------|
 | GitHub Actions    | `uses: ...@vX` in every `.github/workflows/*` | Dependabot (weekly) — `.github/dependabot.yml` `github-actions` entry                         |
+| Windows SDK       | `10.0.26100.0` in the Windows build/provisioning contract | Deliberate reviewed PR; `tests/test_windows_sdk_contract.py` prevents drift (Dependabot tracks the MSVC action, not its `with.sdk` input) |
 | Docker base images| `FROM` in `deploy/docker/*`                   | Dependabot (weekly) — `.github/dependabot.yml` `docker` entry                                 |
 | Python tooling    | `requirements-ci.txt` (repo root)             | Dependabot (weekly) — `.github/dependabot.yml` `pip` entry                                    |
 | npm tooling       | `package-lock.json` in `site/`, `tests/puppeteer/`, `deploy/docker/cedar-vale/app/` | Dependabot (weekly, grouped per directory) — `.github/dependabot.yml` `npm` entry; see "npm tooling" below |

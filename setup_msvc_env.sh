@@ -9,7 +9,7 @@
 
 # ── Version pins (update when toolchain upgrades) ────────────────────────────
 _MSVC_VER="14.44.35207"
-_SDK_VER="10.0.22621.0"
+_SDK_VER="10.0.26100.0"
 
 # ── Base directories (Unix-style paths for MSYS2) ────────────────────────────
 _VS_ROOT="/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools"

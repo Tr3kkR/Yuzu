@@ -1,10 +1,11 @@
 #Requires -Version 7
 
 $script:SupportedSchema = 'yuzu/windows-toolchain/v1'
-$script:V1Pins = @('python','meson','erlang','rebar3','postgres')
+$script:V1Pins = @('python','meson','erlang','rebar3','postgres','windows_sdk')
 $script:V1JobPins = @('vcpkg_baseline')
 $script:V1Environment = @('CCACHE_DIR','RUNNER_TOOL_CACHE','YUZU_ESCRIPT','YUZU_REBAR3','YUZU_TEST_POSTGRES_DSN')
-$script:V1Tools = @('python','meson','ninja','cmake','git','ccache','escript','rebar3','msvc','msys2_bash','postgres')
+$script:V1Tools = @('python','meson','ninja','cmake','git','ccache','escript','rebar3','msvc','msys2_bash','postgres','windows_sdk_header','windows_sdk_lib','windows_sdk_rc')
+$script:V1ArtifactProbes = @('windows_sdk_header','windows_sdk_lib','windows_sdk_rc')
 $script:V1EffectiveCommands = @('python','meson','git')
 $script:V1ToolProbes = @('python','meson','rebar3','postgres')
 $script:V1FileProbes = @('Erlang OTP')
@@ -153,6 +154,78 @@ function Resolve-YuzuPinnedPython {
   }
 }
 
+function Get-YuzuInstallerDisposition {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)]
+    [int]$ExitCode
+  )
+
+  switch($ExitCode){
+    0 { 'Complete'; break }
+    1641 { 'RebootRequired'; break }
+    3010 { 'RebootRequired'; break }
+    -1978334967 { 'RebootRequired'; break } # WinGet: reboot required to finish
+    -1978334966 { 'RebootRequired'; break } # WinGet: reboot required before install
+    -1978334965 { 'RebootRequired'; break } # WinGet: reboot initiated
+    default { 'Failed' }
+  }
+}
+
+function Invoke-YuzuInstallerExitPolicy {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)]
+    [int]$ExitCode,
+    [Parameter(Mandatory)]
+    [string]$Context,
+    [Parameter(Mandatory)]
+    [scriptblock]$RebootHandler
+  )
+
+  $disposition = Get-YuzuInstallerDisposition -ExitCode $ExitCode
+  if($disposition -eq 'Complete'){ return }
+  if($disposition -eq 'RebootRequired'){
+    & $RebootHandler $Context $ExitCode
+    throw "$Context requires a reboot, but its reboot handler returned"
+  }
+  throw "$Context failed (exit $ExitCode)"
+}
+
+function Test-YuzuRequiredToolPaths {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)]
+    [AllowEmptyCollection()]
+    [object[]]$Tools,
+    [scriptblock]$PathTester
+  )
+
+  if(-not $PathTester){
+    $PathTester = { param([string]$path) Test-Path -LiteralPath $path }
+  }
+  $observations = foreach($tool in $Tools){
+    $exists = $false
+    $pathError = ''
+    if(-not [string]::IsNullOrWhiteSpace([string]$tool.path)){
+      try { $exists = [bool](& $PathTester ([string]$tool.path)) }
+      catch { $exists = $false; $pathError = $_.Exception.Message }
+    }
+    [pscustomobject]@{
+      Name = [string]$tool.name
+      Path = [string]$tool.path
+      Version = [string]$tool.version
+      Required = ($tool.required -eq $true)
+      Exists = $exists
+      Error = $pathError
+    }
+  }
+  [pscustomobject]@{
+    Healthy = @($observations | Where-Object { $_.Required -and -not $_.Exists }).Count -eq 0
+    Observations = [object[]]$observations
+  }
+}
+
 function Test-YuzuToolchainManifest {
   [CmdletBinding()]
   param(
@@ -228,6 +301,7 @@ function Test-YuzuToolchainManifest {
   $contractJobPins = @($Contract.job_pins.PSObject.Properties | ForEach-Object Name)
   $contractEnv = @($Contract.required_env | ForEach-Object { [string]$_ })
   $contractTools = @($Contract.required_tools | ForEach-Object { [string]$_ })
+  $artifactProbeNames = @($Contract.artifact_probes | ForEach-Object { [string]$_.tool })
   $effectiveCommands = @($Contract.effective_commands | ForEach-Object { [string]$_.command })
   $toolProbeNames = @($Contract.tool_probes | ForEach-Object { [string]$_.tool })
   $fileProbeNames = @($Contract.file_probes | ForEach-Object { [string]$_.name })
@@ -236,6 +310,7 @@ function Test-YuzuToolchainManifest {
   & $requireUnique 'job pin' $contractJobPins $script:V1JobPins
   & $requireUnique 'required env' $contractEnv $script:V1Environment
   & $requireUnique 'required tool' $contractTools $script:V1Tools
+  & $requireUnique 'artifact probe' $artifactProbeNames $script:V1ArtifactProbes
   & $requireUnique 'effective command' $effectiveCommands $script:V1EffectiveCommands
   & $requireUnique 'tool probe' $toolProbeNames $script:V1ToolProbes
   & $requireUnique 'file probe' $fileProbeNames $script:V1FileProbes
@@ -257,6 +332,15 @@ function Test-YuzuToolchainManifest {
   foreach($mapping in @($Contract.effective_commands)){
     if($contractTools -notcontains [string]$mapping.tool){
       $errors.Add("effective command '$($mapping.command)' references unknown tool '$($mapping.tool)'")
+    }
+  }
+  foreach($probe in @($Contract.artifact_probes)){
+    if($contractTools -notcontains [string]$probe.tool -or $contractPins -notcontains [string]$probe.pin){
+      $errors.Add("artifact probe '$($probe.tool)' references an unknown tool or pin")
+    }
+    if([string]::IsNullOrWhiteSpace([string]$probe.path) -or
+       -not ([string]$probe.path).Contains('{pin}')){
+      $errors.Add("artifact probe '$($probe.tool)' must have a path containing {pin}")
     }
   }
   foreach($probe in @($Contract.tool_probes)){
@@ -347,6 +431,24 @@ function Test-YuzuToolchainManifest {
     }
     if([string]::IsNullOrWhiteSpace([string]$matches[0].path)){
       $errors.Add("manifest tool '$name' has no path")
+    }
+  }
+
+  foreach($probe in @($Contract.artifact_probes)){
+    $matches = @($manifestTools | Where-Object { [string]$_.name -eq [string]$probe.tool })
+    if($matches.Count -ne 1){ continue }
+    $tool = $matches[0]
+    $expectedVersion = [string]$Manifest.pins.([string]$probe.pin)
+    if(-not [string]::Equals([string]$tool.version, $expectedVersion, [StringComparison]::OrdinalIgnoreCase)){
+      $errors.Add("manifest tool '$($probe.tool)' version is '$($tool.version ?? '<unset>')'; expected '$expectedVersion'")
+    }
+    $expectedPath = ([string]$probe.path).Replace('{pin}', $expectedVersion)
+    $actualPath = ConvertTo-YuzuCanonicalWindowsPath ([string]$tool.path)
+    $canonicalExpected = ConvertTo-YuzuCanonicalWindowsPath $expectedPath
+    $matched = [string]::Equals($actualPath, $canonicalExpected, [StringComparison]::OrdinalIgnoreCase)
+    $observations.Add([pscustomobject]@{ Name=[string]$probe.tool; Actual=[string]$tool.path; Expected=$expectedPath; Matched=$matched })
+    if(-not $matched){
+      $errors.Add("manifest tool '$($probe.tool)' path '$($tool.path)' does not equal '$expectedPath'")
     }
   }
 
@@ -586,4 +688,4 @@ function Test-YuzuVcpkgCheckout {
   }
 }
 
-Export-ModuleMember -Function Invoke-YuzuContractProbe,Read-YuzuToolchainContract,Resolve-YuzuEffectiveCommand,Resolve-YuzuPinnedPython,Test-YuzuToolchainManifest,Test-YuzuVcpkgCheckout
+Export-ModuleMember -Function Get-YuzuInstallerDisposition,Invoke-YuzuContractProbe,Invoke-YuzuInstallerExitPolicy,Read-YuzuToolchainContract,Resolve-YuzuEffectiveCommand,Resolve-YuzuPinnedPython,Test-YuzuRequiredToolPaths,Test-YuzuToolchainManifest,Test-YuzuVcpkgCheckout
