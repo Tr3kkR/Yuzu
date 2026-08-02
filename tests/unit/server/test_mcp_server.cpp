@@ -6585,9 +6585,13 @@ TEST_CASE("MCP: a schema-inexpressible violation never mints or consumes a ticke
     }
     SECTION("empty plugin/action is refused BEFORE a ticket is minted") {
         // Sol's find, and the FIFTH instance of the burn class: the schema
-        // marks plugin/action `required` (which C8 enforces) but the closed
-        // subset has no minLength, so "" passes every published check and the
-        // handler refused it only after the ticket had been consumed.
+        // marks plugin/action `required` (which C8 enforces) but the SERVED
+        // schema puts no floor on their length, so "" passes every published
+        // check and the handler refused it only after the ticket had been
+        // consumed. The compiler gained `minLength` in #2444, so the served
+        // schema can express the floor directly once kTools[] in the frozen
+        // mcp_server.cpp reopens; check_exec_instruction_shape holds the line
+        // until then, and afterwards for the tiers that never reach C8.
         auto res = call_with(R"({"plugin":"","action":""})");
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);

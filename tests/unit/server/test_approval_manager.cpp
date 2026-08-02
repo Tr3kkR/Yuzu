@@ -438,6 +438,15 @@ TEST_CASE("ApprovalManager: an undeclared mint records no origin and keeps the m
     // The MCP gate still mints without declaring (mcp_server.cpp is frozen for
     // a parallel rebase). It must keep working, and must NOT be recorded as a
     // surface it did not come from.
+    //
+    // This case is also the TETHER on the exemption, which is the weakest part
+    // of the design and is meant to be temporary: an undeclared mint is the
+    // one remaining way to reach the reserved namespace, so a future caller
+    // that forgot to declare an origin would reach it too. Nothing relies on
+    // that today — the MCP gate is the only undeclared caller in the tree.
+    // When the MCP mint declares kMcp, the exemption should go and THIS TEST
+    // should fail; that failure is the prompt to delete it deliberately, not a
+    // regression to paper over.
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{\"agent_id\":\"a1\"}");
     REQUIRE(id.has_value());
     auto row = mgr.get(*id);
