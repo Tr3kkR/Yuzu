@@ -404,4 +404,42 @@ reject_forbidden_authority_fields(const nlohmann::json& root) {
     return {};
 }
 
+std::expected<void, ContractError>
+reject_forbidden_authority_fields_recursive(const nlohmann::json& value,
+                                             std::string_view parent_path) {
+    struct Pending {
+        const nlohmann::json* value;
+        std::string path;
+    };
+
+    std::vector<Pending> pending{{&value, std::string{parent_path}}};
+    while (!pending.empty()) {
+        auto current = std::move(pending.back());
+        pending.pop_back();
+
+        if (current.value->is_object()) {
+            for (auto it = current.value->begin(); it != current.value->end(); ++it) {
+                const auto path = current.path + "/" + escape_json_pointer(it.key());
+                const auto normalised = normalise_name(it.key());
+                for (const auto forbidden : kForbiddenAuthorityNames) {
+                    if (normalised == forbidden) {
+                        return std::unexpected(ContractError{
+                            ContractErrorCode::ForbiddenAuthorityField,
+                            path,
+                            "caller-authored identity or authentication context is forbidden",
+                        });
+                    }
+                }
+                pending.push_back(Pending{&*it, path});
+            }
+        } else if (current.value->is_array()) {
+            for (std::size_t index = 0; index < current.value->size(); ++index) {
+                pending.push_back(Pending{&(*current.value)[index],
+                                          current.path + "/" + std::to_string(index)});
+            }
+        }
+    }
+    return {};
+}
+
 } // namespace yuzu::contracts::adr31::detail
