@@ -35,7 +35,17 @@ The reference user journey is the **Chrome IR walkthrough** in §10.
 
 ## 3. Data model
 
-### 3.1 Server schema (`result_set_store.cpp`, new SQLite database `result_sets.db`)
+### 3.1 Server schema (`result_set_store.cpp`, PostgreSQL schema `result_set_store`)
+
+**2026-07-25 update (ADR-0036):** this store originally shipped as SQLite
+(`result_sets.db`, as the SQL below still illustrates) and has since migrated
+to PostgreSQL — schema `result_set_store`, tables `result_sets` +
+`result_set_members`, unchanged in shape (`INTEGER`→`BIGINT`, the `pinned`
+0/1 flag→`BOOLEAN`; see ADR-0036 for the exact type mapping). The legacy
+SQLite file is retained read-only for one release as a rollback breadcrumb
+(ADR-0009) and backfilled into Postgres on first boot. The SQL below is
+retained as the original design illustration; treat ADR-0036 as authoritative
+for the live schema.
 
 ```sql
 CREATE TABLE result_sets (
@@ -108,7 +118,7 @@ All shapes carry enough information to **re-evaluate the query against the curre
 | Pin | `pinned = 1`, `ttl_at = INT64_MAX`. Audit row written. Pin is reversible — unpinning restores `ttl_at = max(now + 3600, original_ttl_at)` |
 | Use as input scope | Touching a set as the scope of a new query or action extends `ttl_at` to `max(ttl_at, now + 3600)` so an operator working a chain does not lose the head of the chain mid-investigation |
 | Pin storm guard | Per-operator cap of 50 pinned result sets; further pins return `409 PIN_LIMIT`. Operator must unpin or delete before pinning more |
-| GC | Background sweep every 5 minutes deletes rows where `ttl_at < now AND pinned = 0`. Cascades via `ON DELETE CASCADE` to `result_set_members`. Audit row written summarising count of GC'd sets |
+| GC | Background sweep every 5 minutes deletes rows where `ttl_at < now AND pinned = 0`. Cascades via `ON DELETE CASCADE` to `result_set_members`. Audit row written summarising count of GC'd sets. Post-ADR-0036: one replica sweeps per pass (Postgres advisory lock); a retention-clock anomaly (unusable prior reading, big step, would-wipe) declines the pass once per distinct anomaly fact-set (routed-concern "Clock-guarded retention"); every accepted pass is capped (5,000 deletes) |
 
 Hard maximum cap: **10,000 result sets per operator** (enforced at create time, returns `429 RESULT_SET_QUOTA`). Prevents a runaway script from filling the table.
 
@@ -167,7 +177,7 @@ Base path: `/api/v1/result-sets`. All routes require an authenticated session an
 | Method | Path | Body | Returns | Notes |
 |---|---|---|---|---|
 | `POST` | `/api/v1/result-sets` | `{name?, source_kind, source_payload, device_ids[]}` | `{id, ttl_at, device_count}` | Direct create — operator passes pre-computed members. Used by dashboard for "I have a CSV" import. |
-| `POST` | `/api/v1/result-sets/from-inventory-query` | `{name?, query, parent_id?}` | `{id, ttl_at, device_count}` | Server runs the inventory query inside `parent_id`'s scope (or `__all__`) and persists the result. |
+| `POST` | `/api/v1/result-sets/from-inventory-query` | `{name?, query, parent_id?}` | `{id, ttl_at, device_count}` | Server runs the inventory query inside `parent_id`'s scope (or `__all__`) and persists the result. Reads the Postgres-backed generic `InventoryStore` (ADR-0037); returns **503** on a store degrade rather than persisting a result set built from a silent-empty read. |
 | `POST` | `/api/v1/result-sets/from-tar-query` | `{name?, sql, parent_id?}` | `{id, ttl_at, device_count}` | Dispatches the SQL to TAR agents in `parent_id`'s scope; the device-ID set is the union of agents that returned ≥1 row (default) or all agents that responded (`include_empty=true`). |
 | `POST` | `/api/v1/result-sets/from-instruction-result` | `{name?, instruction_id, params, matcher, parent_id?}` | `{id, ttl_at, device_count}` | Runs the instruction in `parent_id`'s scope; the device set is filtered by `matcher`. Mirrors the Chrome hash-check step. |
 | `GET` | `/api/v1/result-sets` | — | `{result_sets: [...]}` | Pagination by `?cursor=`. Default sort: `created_at DESC`. |
@@ -190,7 +200,7 @@ point, and only one of them wants everything. Refusals are counted as
 `yuzu_server_dispatch_target_rejected_total{route="result_set_parent"}` and audited as
 `result_set.create|denied`.
 
-Errors use the `error_codes` taxonomy (`docs/data-architecture.md`): `RESULT_SET_NOT_FOUND`, `RESULT_SET_NOT_OWNER`, `RESULT_SET_QUOTA`, `PIN_LIMIT`, `RESULT_SET_EXPIRED`.
+Errors use the `error_codes` taxonomy (`docs/data-architecture.md`): `RESULT_SET_NOT_FOUND`, `RESULT_SET_NOT_OWNER`, `RESULT_SET_QUOTA`, `PIN_LIMIT`, `RESULT_SET_EXPIRED`, and (ADR-0036, 2026-07-25) `RESULT_SET_STORE_UNAVAILABLE` (**503**) — returned when the store itself (not the requested row) could not answer, e.g. a Postgres error mid-read on `get`/`resolve_alias`. This is deliberately **type-distinguishable from 404**: a `RESULT_SET_NOT_FOUND`/404 tells the caller "there is definitely no such row, or it is not yours" (safe to treat as a clean not-found for retry/UI purposes), while a 503 tells the caller "we could not determine the answer at all" — collapsing the two would let a transient database blip on an authorization-relevant read (ownership check, alias resolution, `from_result_set:` membership) masquerade as a confident "not found," which for a `NOT`-combined scope expression is a fail-open (see `docs/postgres-store-playbook.md` "Authoritative reads must be type-distinguishable").
 
 ## 7. YAML DSL surface
 
@@ -223,7 +233,7 @@ Validation rules (enforced at YAML load by `definition_store_*`):
 
 The DSL spec (`docs/yaml-dsl-spec.md` §9.3) carries the normative subsection covering these rules, with the Chrome IR walkthrough as the anchoring example.
 
-**Status (PR-E).** Shipped: the `selector:` / `fromResultSet:` mapping parses and lowers (`scope_yaml.{hpp,cpp}` — `selector.platform` → `ostype`, `selector.tags` → `EXISTS tag:`); rules 1–2 are enforced at create on both the policy and instruction paths; rule 3 is enforced at dispatch via the `instruction.scope_resolution_failed` audit row. `from_result_set:` aliases are resolved at the dispatch layer (`resolve_scope_aliases`) against the operator's owned sets, including the `/api/scope/estimate` preview. A behaviour fix rode along: a `scope.selector:` mapping previously read as an empty scalar and stored no scope — it now lowers. **Deferred:** policy `fromResultSet:` — a result set's TTL clashes with continuous policy evaluation, so `create_policy` rejects it pending a `Policy.owner_principal` field, `PolicyEvaluator` result-set wiring, and a pinned-set requirement (PR-E2); and a definition-embedded scope that auto-applies at dispatch (the operator supplies the dispatch scope for now).
+**Status (PR-E).** Shipped: the `selector:` / `fromResultSet:` mapping parses and lowers (`scope_yaml.{hpp,cpp}` — `selector.platform` → `ostype`, `selector.tags` → `EXISTS tag:`); rules 1–2 are enforced at create on both the policy and instruction paths; rule 3 is enforced at dispatch — a referenced set that is absent/expired/unowned writes the `instruction.scope_resolution_failed` forensic row per failing ref AND aborts the dispatch (`scope_evaluation_aborted`, reason `owner_check_failed`; governance M1 2026-07-29 — the prior audit-then-dispatch-anyway behaviour let `NOT from_result_set:<absent-or-unowned-id>` invert a no-match atom into a fleet-wide dispatch). `from_result_set:` aliases are resolved at the dispatch layer (`resolve_scope_aliases`) against the operator's owned sets, including the `/api/scope/estimate` preview. A behaviour fix rode along: a `scope.selector:` mapping previously read as an empty scalar and stored no scope — it now lowers. **Deferred:** policy `fromResultSet:` — a result set's TTL clashes with continuous policy evaluation, so `create_policy` rejects it pending a `Policy.owner_principal` field, `PolicyEvaluator` result-set wiring, and a pinned-set requirement (PR-E2); and a definition-embedded scope that auto-applies at dispatch (the operator supplies the dispatch scope for now).
 
 ## 8. Dashboard surface
 

@@ -94,7 +94,6 @@ public:
     void set_notification_store(NotificationStore* store) { notification_store_ = store; }
     void set_webhook_store(WebhookStore* store) { webhook_store_ = store; }
     void set_offload_target_store(OffloadTargetStore* store) { offload_target_store_ = store; }
-    void set_inventory_store(InventoryStore* store) { inventory_store_ = store; }
     /// Typed software-inventory projection (ADR-0016) — receives the
     /// installed_software daily-sync source via ReportInventory.
     void set_software_inventory_store(SoftwareInventoryStore* store) {
@@ -351,7 +350,6 @@ private:
     NotificationStore* notification_store_{nullptr};
     WebhookStore* webhook_store_{nullptr};
     OffloadTargetStore* offload_target_store_{nullptr};
-    InventoryStore* inventory_store_{nullptr};
     SoftwareInventoryStore* software_inventory_store_{nullptr};
     AppPerfDailyStore* app_perf_daily_store_{nullptr};
     DeviceInventoryStore* device_inventory_store_{nullptr};

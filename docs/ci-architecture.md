@@ -21,7 +21,7 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   `workflow_dispatch`): ASan+UBSan, TSan, coverage on the Big Tam pool
   (`yuzu-bigtam-linux`, gated on `bigtam_pool_healthy`), plus a Windows ASan
   leg (`windows-asan`, agent-only, Wee Tam pool, gated on
-  `windows_pool_healthy`) covering the Windows-only spark mechanisms that the
+  `weetam_pool_healthy`) covering the Windows-only spark mechanisms that the
   Linux sanitizers can't reach (#1934a). On any leg failure, the `alert` job auto-opens or comments on a
   `nightly-broken` issue. **Discipline norm: no merge to main while a
   `nightly-broken` issue is open.**
@@ -63,6 +63,44 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
 `workflow_dispatch` only works once a workflow file exists on the **default
 branch (`main`)**. Cron schedules likewise. New workflows added on `dev` are
 dormant until merged.
+
+### Trusted fork pull-request CI
+
+Automatic `pull_request` runs from forks are deliberately fail-closed. They
+must never emit healthy self-hosted runner outputs, because fork code is not
+trusted to execute on Big Tam or Wee Tam. The ordinary preflight fails red
+when it detects a fork; it does not bypass runner control.
+
+After static review, a maintainer may approve one immutable fork revision.
+First run the hosted review workflow and wait for it to pass:
+
+```bash
+gh workflow run fork-dynamic-review.yml --ref main \
+  -f pr_number=123 -f head_sha=<40-character-head-sha>
+gh run list --workflow=fork-dynamic-review.yml --limit 5
+```
+
+Then dispatch the trusted gate using that exact SHA and successful review run:
+
+```bash
+gh workflow run trusted-fork-ci.yml --ref main \
+  -f pr_number=123 \
+  -f head_sha=<40-character-head-sha> \
+  -f review_run_id=<successful-review-run-id>
+```
+
+The wrapper requires the PR to remain open, verifies that its current head is
+the supplied SHA, requires the hosted review run to match the same PR and SHA,
+and invokes the reusable `ci.yml` matrix. The reusable workflow also requires
+the repository-only `TRUSTED_FORK_CI_GATE` secret, so a fork cannot call it
+directly. The wrapper passes only that sentinel and `RUNNER_INVENTORY_TOKEN`;
+the PAT is consumed by a hosted, base-workflow-revision runner-control step
+before the approved fork revision is checked out. Trusted self-hosted jobs
+start from a clean workspace, use run-private ccache/test state, disable vcpkg
+binary sources, and purge the workspace afterwards. They never read or write
+the normal `runner.tool_cache` caches. This deliberate approval therefore
+executes the full PR gate without turning a reviewed fork into a cache-publisher
+or exposing the administration-scoped PAT to fork-controlled code.
 
 ## Gates outside the tier ladder
 
@@ -267,11 +305,23 @@ and opens a `runner-inventory-drift` issue on mismatch. Both the sentinel
 and the new ci.yml `preflight` job share `scripts/ci/runner-health-check.py`
 (`--mode sentinel` vs `--mode preflight`). Preflight gates downstream
 self-hosted jobs with explicit
-`if: needs.preflight.outputs.<runner>_healthy == 'true'` — fail-closed: a
-degraded runner skips its jobs in <30 s rather than queueing 30 min into a
-stalled runner. Requires the `RUNNER_INVENTORY_TOKEN` PAT secret
-(fine-grained, Administration:read on Tr3kkR/Yuzu); without it preflight
-returns false and self-hosted jobs are skipped with a clear reason.
+`if: needs.preflight.outputs.<runner>_healthy == 'true'`. Each workflow also
+declares its required pools with `--require-pool`. A wholly unavailable
+required pool fails preflight red instead of silently turning its required
+jobs into successful skips. The control interface distinguishes observed
+runner drift from authentication, API/transport, and malformed-response
+failures; missing evidence is a failure, never an inferred healthy state.
+The query requires the `RUNNER_INVENTORY_TOKEN` PAT secret (fine-grained,
+Administration:read on Tr3kkR/Yuzu). Expected failures publish a typed
+`failure_kind` and `failure_report`; an unexpected crash before those outputs
+still takes the sentinel's fallback issue path.
+
+Automatic fork PRs are rejected before the runner query and cannot emit
+healthy self-hosted outputs. Runner-control failures and required-pool outages
+are red operational failures. In particular, an offline Big Tam or Wee Tam
+pool causes nightly preflight to fail and the nightly alert opens
+`nightly-broken`; the repository discipline remains **no merge to main while
+that issue is open**. Follow `docs/ci-troubleshooting.md` before closing it.
 
 As of #1978, preflight also emits a `code_changed` output (from
 `scripts/ci/detect-code-change.sh`); the build jobs additionally gate on
@@ -468,9 +518,12 @@ per-command error checks.
 
 ## Persistence and recovery
 
-Self-hosted checkouts use `clean: false`. Pre-checkout wipes `build-<os>/`
-ONLY on branch change; vcpkg state is invalidated by the sentinel above.
-`meson setup --reconfigure` when `meson-info/` exists. Manual recovery:
+Normal self-hosted checkouts use `clean: false`. Pre-checkout wipes
+`build-<os>/` ONLY on branch change; vcpkg state is invalidated by the
+sentinel above. A trusted fork execution is the intentional exception: it uses
+`clean: true`, private temporary ccache/test paths, `VCPKG_BINARY_SOURCES=clear`,
+and a final checkout-only purge. `meson setup --reconfigure` when
+`meson-info/` exists. Manual recovery:
 `bash scripts/ci/runner-reset.sh`
 (`git clean -fdx -e vcpkg/ -e vcpkg_installed/ -e build-*/`) — **the only
 sanctioned in-repo nuke path**; never `rm -rf` runner caches (memory
@@ -542,10 +595,13 @@ one file is one PG-instance event, not a test bug.
 
 ## Workflow-PR canary
 
-`ci.yml`'s `detect-ci-changes` + `canary` jobs run only when a PR touches
-`.github/workflows/`, `.github/actions/`, or `scripts/ci/`. Canary mirrors
-the linux build on a fresh-disk GHA-hosted `ubuntu-24.04` with
-`actions/cache` for vcpkg — catches workflow regressions before main.
+`ci.yml`'s `detect-ci-changes` + `canary` jobs run when a PR or main push
+touches `.github/workflows/`, `.github/actions/`, or `scripts/ci/`. The named
+`ci-infrastructure` class in `scripts/ci/detect-code-change.sh` owns both the
+path rules and `git diff` error handling. If the diff cannot be established,
+it returns changed=true so the canary runs fail-closed. Canary mirrors the
+linux build on a fresh-disk GHA-hosted `ubuntu-24.04` with `actions/cache` for
+vcpkg — catches workflow regressions before main.
 
 ## Cache pruning + weekly maintenance
 

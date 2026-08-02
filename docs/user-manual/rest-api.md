@@ -2336,7 +2336,8 @@ carries a `Sec-Audit-Failed: true` header (the export still returns).
 | `execution.live_subscribe` | Server-Sent Events subscribe to `/sse/executions/{id}`. `result=success`. Emitted on every successful subscribe (no per-session-per-execution dedup currently — see #700). The forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`. |
 | `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result=success`. Detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). Post-auth denial branches (404 unknown execution / 410 terminal / 503 unavailable) do not audit but write a `spdlog::warn` row carrying the cid and the authenticated principal so an operator can reconstruct what happened without the client surfacing the cid. |
 | `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). |
-| `instruction.scope_resolution_failed` | Emitted at dispatch when a `from_result_set:` reference in the scope cannot be resolved (set absent, TTL-expired, or not owned by the dispatching principal). `result=failure`. Detail format: `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<id-or-alias> reason=...`. Fires on all scoped dispatch paths (generic REST, tracked, MCP) and increments the `yuzu_scope_resolution_failed_total` metric; the dispatch targets zero devices from that set and continues. |
+| `instruction.scope_resolution_failed` | Emitted at dispatch when a `from_result_set:` reference in the scope cannot be resolved (set absent, TTL-expired, or not owned by the dispatching principal). `result=failure`. Detail format: `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<id-or-alias> reason=...`. Fires on all scoped dispatch paths (generic REST, tracked, MCP) and increments the `yuzu_scope_resolution_failed_total` metric; as of governance M1 (2026-07-29) the **entire dispatch is aborted** — no devices are targeted, including from other scope atoms — recorded by a paired `scope.evaluation_aborted` row with `reason=owner_check_failed`. |
+| `scope.evaluation_aborted` | Emitted when a scoped dispatch is aborted fail-closed before any device is targeted. `result=failure`. Reasons: `db_degraded` (result-set store could not answer an alias/owner/membership read — ADR-0036), `owner_check_failed` (a referenced set is absent, expired, or not owned — paired with per-ref `instruction.scope_resolution_failed` rows), `principal_unresolved` (a tracked/MCP dispatch could not recover the dispatching operator). Fires on all three scoped dispatch paths, plus the no-principal tracked-closure guard (principal_unresolved only). |
 | `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`. `result=success` (`target_id=<bundle-… correlation id>`, detail `agent=<id> steps=<n>`) or `result=failure` (dispatch threw — `target_id` empty, detail `agent=<id> error=<…>`). |
 | `bundle.<plugin>.<action>` | One step of a live-query bundle, emitted per step at dispatch — the device-access lens. `target_type=Agent`, `target_id=<agent_id>`. `result=dispatched` (reached the agent) or `result=no_agents` (reached zero agents → `dispatch_failed` on collate). A bundle of N steps emits N of these, so it is exactly as auditable as N separate executions (works-council parity). Emitted on **both** the REST and MCP surfaces (the per-step verb is transport-agnostic; the MCP tool-call envelope additionally audits as `mcp.execute_bundle`). |
 | `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`) or `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded). |
@@ -3631,7 +3632,7 @@ An action carries an inline `parameter_schema` **only** when it has a published 
 
 ### Inventory
 
-Inventory data is structured per-plugin telemetry collected from agents and stored server-side.
+Inventory data is structured per-plugin telemetry collected from agents and stored server-side. The generic store (`InventoryStore`, ADR-0037) is Postgres-backed with an AUTHORITATIVE read posture — a store/pool/query degrade returns **503**, never a silent empty result.
 
 #### `GET /api/v1/inventory/tables`
 
@@ -3655,6 +3656,23 @@ List all inventory tables (one per plugin that reports inventory data).
 }
 ```
 
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 503 | Inventory store unavailable or degraded |
+
+#### `POST /api/v1/result-sets/from-inventory-query`
+
+Creates an owner-scoped result set from an inventory query (scope-walking
+producer; see `docs/scope-walking-design.md` for the full result-set surface).
+One behavior worth calling out here: when the underlying inventory read hits
+the server row cap or 8 MiB aggregate payload cap, the route returns **503**
+("inventory query truncated ... refusing to materialise a partial result set") rather than
+persisting a silently-incomplete set — a fleet-targeting set is never silently
+narrowed.
+
 #### `GET /api/v1/inventory/{plugin}/{agent_id}`
 
 Get inventory data for a specific plugin and agent.
@@ -3677,6 +3695,13 @@ Get inventory data for a specific plugin and agent.
 
 The `data` field contains the plugin-specific structured inventory blob as parsed JSON (or a string if the blob is not valid JSON).
 
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 404 | No inventory data found for this agent+plugin |
+| 503 | Inventory store unavailable or degraded |
+
 #### `POST /api/v1/inventory/query`
 
 Query inventory data across agents with filters.
@@ -3693,7 +3718,16 @@ Query inventory data across agents with filters.
 | `until` | integer | No | Unix timestamp — only records collected before this time |
 | `limit` | integer | No | Max results (default 100, max 1000) |
 
-**Response:** List of inventory records matching the query.
+**Response:** List of inventory records matching the query, plus top-level
+`result_truncated_by_cap`. When that flag is `true`, the server's row or 8 MiB aggregate
+payload budget was reached and the returned fleet result is incomplete; callers must not
+interpret omitted rows as absence.
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 503 | Inventory store unavailable or degraded |
 
 #### `POST /api/v1/inventory/evaluate`
 
@@ -3735,9 +3769,22 @@ Each condition object:
 }
 ```
 
+`result_truncated_by_cap` (bool, optional) — emitted at the **top level of the
+envelope** (alongside `data`), present and `true` when the underlying inventory
+read hit its row cap (5,000 for this route) or 8 MiB aggregate payload cap:
+absent devices may simply not have
+been read rather than not matching. (The typed software route carries the same
+flag inside `data` — placement alignment is tracked with #2633.)
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 503 | Inventory store unavailable or degraded |
+
 #### `GET /api/v1/inventory/software`
 
-Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareInventoryStore`). **Distinct** from the generic `/inventory/*` routes above, which read the legacy blob store. This is the REST sibling of the `query_installed_software` MCP tool — same data, same scope contract.
+Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareInventoryStore`). **Distinct** from the generic `/inventory/*` routes above, which read the generic per-source blob store (`InventoryStore`, also Postgres-backed as of ADR-0037, but a separate schema/table). This is the REST sibling of the `query_installed_software` MCP tool — same data, same scope contract.
 
 **Permission:** `Inventory:Read`
 
@@ -6578,6 +6625,8 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `validate_scope` | Validate a scope expression |
 | `preview_scope_targets` | Preview which agents match a scope |
 | `list_pending_approvals` | List pending approval requests |
+
+`query_inventory`, `list_inventory_tables`, and `get_agent_inventory` read the Postgres-backed generic `InventoryStore` (ADR-0037) and now return a JSON-RPC internal-error response (code `-32603`) when the store is unavailable or degraded (previously a silent empty result).
 
 **Additional read-only tools (post-Phase-1).** Beyond the Phase 1 set the server also exposes the DEX signal/perf, network, and inventory read tools. The **application-performance-over-time** tools (this release) are:
 

@@ -249,8 +249,15 @@ std::vector<std::string> PolicyEvaluator::resolve_targets(const Policy& p) const
     } else if (!p.scope_expression.empty() && d_.registry) {
         auto parsed = yuzu::scope::parse(p.scope_expression);
         if (parsed) {
-            auto matched =
-                d_.registry->evaluate_scope(*parsed, d_.tag_store, d_.custom_properties_store);
+            // No rs_store/principal passed. A from_result_set: atom in a
+            // policy scope now ABORTS to nullopt (H1, 2026-07-29) and
+            // value_or({}) collapses that to zero targets — evaluate nothing,
+            // the safe direction. Unreachable today (create_policy rejects
+            // fromResultSet:, PR-E2 pending) but the comment must not claim
+            // "cannot degrade" on an authz-adjacent branch.
+            auto matched = d_.registry
+                              ->evaluate_scope(*parsed, d_.tag_store, d_.custom_properties_store)
+                              .value_or(std::vector<std::string>{});
             for (const auto& a : matched)
                 if (seen.insert(a).second)
                     out.push_back(a);

@@ -13,6 +13,8 @@
 
 #include "agent_registry.hpp"
 #include "event_bus.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "result_set_store.hpp"
 #include "scope_engine.hpp"
 #include "scope_yaml.hpp"
@@ -25,13 +27,19 @@
 
 #include "agent.pb.h"
 
+#include <libpq-fe.h>
+
 #include <algorithm>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 using namespace yuzu::server;
 using yuzu::server::detail::AgentRegistry;
 using yuzu::server::detail::EventBus;
+using yuzu::server::pg::PgConn;
+using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
 namespace agent_pb = ::yuzu::agent::v1;
 
 namespace {
@@ -47,12 +55,23 @@ bool has(const std::vector<std::string>& v, const std::string& id) {
     return std::find(v.begin(), v.end(), id) != v.end();
 }
 
+// ResultSetStore is now a migrated Postgres store (ADR-0036) — shares the
+// "resultset" template key with test_result_set_store.cpp (identical setup).
+yuzu::test::PgTestTemplate result_set_tpl{"resultset", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResultSetStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("resultset template: store failed to migrate");
+}};
+
 } // namespace
 
 TEST_CASE("evaluate_scope: from_result_set is owner-scoped (no cross-operator targeting)",
-          "[scope][result_set][authz]") {
-    yuzu::test::TempDbFile rs_db{std::string_view{"scope-authz-rs-"}};
-    ResultSetStore store(rs_db.path);
+          "[pg][scope][result_set][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
     REQUIRE(store.is_open());
 
     EventBus bus;
@@ -76,35 +95,46 @@ TEST_CASE("evaluate_scope: from_result_set is owner-scoped (no cross-operator ta
     SECTION("owner resolves exactly the set's members") {
         auto matched = registry.evaluate_scope(*expr, /*tag_store=*/nullptr,
                                                /*props_store=*/nullptr, &store, "alice");
-        REQUIRE(matched.size() == 1);
-        CHECK(has(matched, "agent-win"));
-        CHECK_FALSE(has(matched, "agent-lin")); // not a broadcast
+        REQUIRE(matched.has_value()); // no preload degrade (ADR-0036)
+        REQUIRE(matched->size() == 1);
+        CHECK(has(*matched, "agent-win"));
+        CHECK_FALSE(has(*matched, "agent-lin")); // not a broadcast
     }
 
     SECTION("a non-owner targets nothing — IDOR blocked (review B1)") {
         auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "bob");
-        CHECK(matched.empty());
+        REQUIRE(matched.has_value());
+        CHECK(matched->empty());
     }
 
-    SECTION("empty principal (untracked raw-dispatch path) resolves nothing") {
+    SECTION("empty principal (untracked raw-dispatch path) ABORTS, never silently "
+            "no-matches (B2, 2026-07-26 hardening round)") {
+        // Pre-B2 this resolved to an empty (but present) match — which under a
+        // NOT combinator elsewhere would invert to "matches every agent" purely
+        // from a missing principal, no DB error required. A real rs_store is
+        // wired here but there is no principal to owner-resolve against, so
+        // evaluate_scope must abort (nullopt), not degrade to "0 matched".
         auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "");
-        CHECK(matched.empty());
+        REQUIRE_FALSE(matched.has_value());
     }
 
     SECTION("an unknown result-set id resolves to nothing — fail-closed, not match-all (UP-14)") {
         auto e2 = yuzu::scope::parse("from_result_set:rs_does_not_exist");
         REQUIRE(e2.has_value());
         auto matched = registry.evaluate_scope(*e2, nullptr, nullptr, &store, "alice");
-        CHECK(matched.empty());
+        REQUIRE(matched.has_value());
+        CHECK(matched->empty());
     }
 }
 
 // ── Dispatch-time alias resolution (PR-E) ────────────────────────────────────
 
 TEST_CASE("resolve_scope_aliases: rewrites owner aliases, leaves ids/non-owners",
-          "[scope][result_set][authz]") {
-    yuzu::test::TempDbFile rs_db{std::string_view{"scope-alias-rs-"}};
-    ResultSetStore store(rs_db.path);
+          "[pg][scope][result_set][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
     REQUIRE(store.is_open());
 
     CreateRequest cr;
@@ -146,9 +176,11 @@ TEST_CASE("resolve_scope_aliases: rewrites owner aliases, leaves ids/non-owners"
 }
 
 TEST_CASE("scope_refs_failing_owner_check: flags absent/unowned, not empty-but-owned",
-          "[scope][result_set][authz]") {
-    yuzu::test::TempDbFile rs_db{std::string_view{"scope-fail-rs-"}};
-    ResultSetStore store(rs_db.path);
+          "[pg][scope][result_set][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
     REQUIRE(store.is_open());
 
     CreateRequest cr;
@@ -161,30 +193,305 @@ TEST_CASE("scope_refs_failing_owner_check: flags absent/unowned, not empty-but-o
     REQUIRE(empty_owned.has_value());
 
     SECTION("an owned, non-empty set is not flagged") {
-        CHECK(scope_refs_failing_owner_check("from_result_set:" + owned->id, "alice", &store)
-                  .empty());
+        auto f = scope_refs_failing_owner_check("from_result_set:" + owned->id, "alice", &store);
+        REQUIRE(f.has_value());
+        CHECK(f->empty());
     }
     SECTION("an owned but legitimately empty set is not flagged") {
-        CHECK(scope_refs_failing_owner_check("from_result_set:" + empty_owned->id, "alice", &store)
-                  .empty());
+        auto f =
+            scope_refs_failing_owner_check("from_result_set:" + empty_owned->id, "alice", &store);
+        REQUIRE(f.has_value());
+        CHECK(f->empty());
     }
     SECTION("an absent id is flagged") {
         auto f = scope_refs_failing_owner_check("from_result_set:rs_does_not_exist", "alice", &store);
-        REQUIRE(f.size() == 1);
-        CHECK(f[0] == "rs_does_not_exist");
+        REQUIRE(f.has_value());
+        REQUIRE(f->size() == 1);
+        CHECK((*f)[0] == "rs_does_not_exist");
     }
     SECTION("another operator's id is flagged (not owned)") {
         auto f = scope_refs_failing_owner_check("from_result_set:" + owned->id, "bob", &store);
-        REQUIRE(f.size() == 1);
-        CHECK(f[0] == owned->id);
+        REQUIRE(f.has_value());
+        REQUIRE(f->size() == 1);
+        CHECK((*f)[0] == owned->id);
     }
     SECTION("mixed owned + absent: only the absent ref is flagged") {
         auto f = scope_refs_failing_owner_check(
             "from_result_set:" + owned->id + " AND from_result_set:rs_ghost", "alice", &store);
-        REQUIRE(f.size() == 1);
-        CHECK(f[0] == "rs_ghost");
+        REQUIRE(f.has_value());
+        REQUIRE(f->size() == 1);
+        CHECK((*f)[0] == "rs_ghost");
     }
     SECTION("empty owner yields no findings (no owner context)") {
-        CHECK(scope_refs_failing_owner_check("from_result_set:" + owned->id, "", &store).empty());
+        auto f = scope_refs_failing_owner_check("from_result_set:" + owned->id, "", &store);
+        REQUIRE(f.has_value());
+        CHECK(f->empty());
+    }
+}
+
+// ── ADR-0036 fail-closed regression: a degraded store must ABORT, never ─────
+// ── silently expand a NOT-inverted scope to the whole fleet.             ────
+//
+// The concrete vulnerability this guards: a `NOT from_result_set:<id>` scope
+// resolves the atom to "" (no match) for every agent NOT in the (possibly
+// empty/degraded) preloaded membership set, and NOT inverts "no match" to
+// "match" — so a membership preload that silently came back empty because of
+// a transient Postgres error (not because the set is genuinely empty) used to
+// make every connected agent match. `evaluate_scope` must instead return
+// `std::nullopt` the instant the preload can't be trusted, so the dispatch
+// layer aborts (503) rather than sending to "everyone".
+TEST_CASE("evaluate_scope: a degraded result-set store ABORTS — never expands a "
+          "NOT-inverted scope to the whole fleet",
+          "[pg][scope][result_set][authz][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.register_agent(info("agent-win"));
+    registry.register_agent(info("agent-lin"));
+
+    CreateRequest cr;
+    cr.owner_principal = "alice";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto set = store.create_materialized(cr, {"agent-win"});
+    REQUIRE(set.has_value());
+
+    // Simulate a Postgres-side degrade: drop the table `member_set_owned`
+    // queries out from under the live store — a reproducible stand-in for a
+    // transient connection loss / botched migration, without needing to kill
+    // the whole pool (which would also fail is_open()-style checks upstream
+    // and hide the specific regression this test targets: a QUERY failure
+    // once the store believes it is open).
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult r{PQexec(conn.get(), "DROP TABLE result_set_store.result_set_members CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    SECTION("NOT from_result_set:<id> aborts rather than matching every agent") {
+        auto expr = yuzu::scope::parse("NOT from_result_set:" + set->id);
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "alice");
+        // The regression this test exists to catch: pre-fix, a degraded
+        // preload silently produced an EMPTY (but present) membership map,
+        // so `matched` would come back holding EVERY registered agent under
+        // the NOT combinator. Post-fix, degrade is type-distinguishable —
+        // std::nullopt — so a caller can never mistake this for "0 matches"
+        // or, worse, silently dispatch to `*matched` at all.
+        REQUIRE_FALSE(matched.has_value());
+    }
+
+    SECTION("the plain (non-NOT) form also aborts, never a false empty match") {
+        auto expr = yuzu::scope::parse("from_result_set:" + set->id);
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "alice");
+        REQUIRE_FALSE(matched.has_value());
+    }
+}
+
+// ── B2 fail-closed regression (2026-07-26 hardening round): an EMPTY ────────
+// ── principal must ABORT, never silently expand a NOT-inverted scope to ────
+// ── the whole fleet — no DB error required, purely structural.           ────
+//
+// The concrete vulnerability: `evaluate_scope`'s preload guard used to be
+// `if (rs_store && !principal.empty())` — with a real rs_store wired but an
+// empty principal (e.g. the tracked/MCP dispatch paths recovering `principal`
+// from an execution row's `dispatched_by`, which can miss/be empty), the
+// preload loop never ran at all. A `from_result_set:<id>` atom then resolved
+// "" (no match) for every agent, and `NOT` inverted that to "matches every
+// agent" — a fleet-wide command dispatch reachable with a perfectly healthy
+// database, purely from a missing principal.
+TEST_CASE("evaluate_scope: an empty principal ABORTS — never expands a NOT-inverted "
+          "scope to the whole fleet (B2, no DB degrade needed)",
+          "[pg][scope][result_set][authz][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.register_agent(info("agent-win"));
+    registry.register_agent(info("agent-lin"));
+
+    CreateRequest cr;
+    cr.owner_principal = "alice";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto set = store.create_materialized(cr, {"agent-win"});
+    REQUIRE(set.has_value());
+
+    SECTION("NOT from_result_set:<id> with empty principal aborts rather than matching "
+            "every agent") {
+        auto expr = yuzu::scope::parse("NOT from_result_set:" + set->id);
+        REQUIRE(expr.has_value());
+        // rs_store IS wired (real store, healthy DB) — only `principal` is
+        // empty. Pre-B2 this would have silently matched BOTH agents.
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "");
+        REQUIRE_FALSE(matched.has_value());
+    }
+
+    SECTION("the plain (non-NOT) form also aborts, never a false empty match") {
+        auto expr = yuzu::scope::parse("from_result_set:" + set->id);
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "");
+        REQUIRE_FALSE(matched.has_value());
+    }
+
+    SECTION("a scope WITHOUT a from_result_set: atom is completely unaffected by an "
+            "empty principal (narrowness check)") {
+        auto expr = yuzu::scope::parse(R"(ostype == "windows")");
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "");
+        REQUIRE(matched.has_value()); // no from_result_set: atom -> never aborts
+    }
+}
+
+// ── H1 fail-closed regression (2026-07-29 governance round): a NULL store ──
+// ── must ABORT a from_result_set: scope, never silently evaluate it false. ──
+//
+// The concrete vulnerability: the B2 guard above was written INSIDE
+// `if (rs_store)`, so the callers that pass NO store at all (the Guardian
+// push paths — server.cpp threads neither store nor principal there) skipped
+// every guard. A `from_result_set:<id>` atom then resolved "no match" for
+// every agent, and `NOT` inverted that to "matches every agent" — for a
+// Guardian rule arming an enforcing guard, a fleet-wide arm, reachable with
+// no DB and no error anywhere. The header contract even asserted the
+// null/null combination "can never degrade". Post-H1 the guard runs for the
+// null-store case too: an atom nobody can resolve aborts.
+//
+// Deliberately NOT [pg]-tagged: no store is constructed — this is the
+// null-store arm, and it must hold with no database in the picture at all.
+TEST_CASE("evaluate_scope: a NULL result-set store ABORTS a from_result_set scope — "
+          "never a silent false-match (H1, no store at all)",
+          "[scope][result_set][authz][failclosed]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.register_agent(info("agent-win"));
+    registry.register_agent(info("agent-lin"));
+
+    SECTION("NOT from_result_set:<id> with a null store aborts rather than matching "
+            "every agent") {
+        auto expr = yuzu::scope::parse("NOT from_result_set:rs_anything");
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, nullptr, "");
+        REQUIRE_FALSE(matched.has_value());
+    }
+
+    SECTION("the plain (non-NOT) form also aborts") {
+        auto expr = yuzu::scope::parse("from_result_set:rs_anything");
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, nullptr, "");
+        REQUIRE_FALSE(matched.has_value());
+    }
+
+    SECTION("an atom buried under a combinator still aborts (the collector walks "
+            "the whole AST, not just the root)") {
+        auto expr = yuzu::scope::parse("hostname == \"agent-win.local\" AND NOT from_result_set:rs_x");
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, nullptr, "");
+        REQUIRE_FALSE(matched.has_value());
+    }
+
+    SECTION("null store with a NON-empty principal still aborts (branch-message combo)") {
+        auto expr = yuzu::scope::parse("from_result_set:rs_anything");
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, nullptr, "alice");
+        REQUIRE_FALSE(matched.has_value());
+    }
+
+    SECTION("a scope with NO from_result_set atom is unaffected — null store stays "
+            "legal for plain scopes") {
+        auto expr = yuzu::scope::parse("hostname == \"agent-win.local\"");
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, nullptr, "");
+        REQUIRE(matched.has_value());
+        CHECK(matched->size() == 1); // agent-win only
+    }
+}
+
+// ── M1 regression net (governance round 2, 2026-07-29): the dispatch GATE ──
+// ── itself. The pre-M1 bug was each dispatch site auditing the failing    ──
+// ── refs and then dispatching anyway; the rule now lives in ONE function  ──
+// ── (gate_scope_dispatch) consumed by all three sites, so pinning it here ──
+// ── pins the behavior a future edit could silently revert per-site.       ──
+TEST_CASE("gate_scope_dispatch: absent/foreign refs ABORT, owned refs proceed",
+          "[pg][scope][result_set][authz][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    CreateRequest cr;
+    cr.owner_principal = "alice";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto owned = store.create_materialized(cr, {"agent-win"});
+    REQUIRE(owned.has_value());
+
+    std::vector<std::string> failing;
+
+    SECTION("owned ref proceeds") {
+        CHECK(gate_scope_dispatch("from_result_set:" + owned->id, "alice", &store, failing) ==
+              ScopeDispatchGate::Proceed);
+        CHECK(failing.empty());
+    }
+    SECTION("absent ref aborts with the ref reported") {
+        CHECK(gate_scope_dispatch("from_result_set:rs_does_not_exist", "alice", &store, failing) ==
+              ScopeDispatchGate::AbortOwnerCheck);
+        REQUIRE(failing.size() == 1);
+        CHECK(failing[0] == "rs_does_not_exist");
+    }
+    SECTION("foreign (unowned) ref aborts — indistinguishable from absent by design") {
+        CHECK(gate_scope_dispatch("from_result_set:" + owned->id, "bob", &store, failing) ==
+              ScopeDispatchGate::AbortOwnerCheck);
+        REQUIRE(failing.size() == 1);
+    }
+    SECTION("NOT over an absent ref still aborts — the inversion the pre-M1 "
+            "audit-then-proceed behavior turned into a fleet-wide match") {
+        CHECK(gate_scope_dispatch("NOT from_result_set:rs_ghost", "alice", &store, failing) ==
+              ScopeDispatchGate::AbortOwnerCheck);
+    }
+    SECTION("NOT over a foreign ref aborts") {
+        CHECK(gate_scope_dispatch("NOT from_result_set:" + owned->id, "bob", &store, failing) ==
+              ScopeDispatchGate::AbortOwnerCheck);
+    }
+    SECTION("a mixed expression with one bad ref aborts the WHOLE gate — no "
+            "partial-dispatch semantics") {
+        CHECK(gate_scope_dispatch("from_result_set:" + owned->id +
+                                      " AND NOT from_result_set:rs_ghost",
+                                  "alice", &store, failing) ==
+              ScopeDispatchGate::AbortOwnerCheck);
+    }
+    SECTION("owned-but-EMPTY set proceeds — empty membership is a valid, owned answer") {
+        auto empty_owned = store.create_materialized(cr, {});
+        REQUIRE(empty_owned.has_value());
+        CHECK(gate_scope_dispatch("from_result_set:" + empty_owned->id, "alice", &store,
+                                  failing) == ScopeDispatchGate::Proceed);
+    }
+    SECTION("degraded store aborts as AbortDbDegraded, never OwnerCheck or Proceed") {
+        // The owner check probes the result_sets table itself (ownership
+        // rows), so THAT is the table to break — dropping only the members
+        // table degrades the membership preload (covered by the
+        // evaluate_scope degrade test above), not this gate.
+        {
+            PgConn conn{PQconnectdb(db.dsn().c_str())};
+            REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+            PgResult r{PQexec(conn.get(), "DROP TABLE result_set_store.result_sets CASCADE")};
+            REQUIRE(r.ok());
+        }
+        CHECK(gate_scope_dispatch("from_result_set:" + owned->id, "alice", &store, failing) ==
+              ScopeDispatchGate::AbortDbDegraded);
     }
 }

@@ -11,9 +11,9 @@
 //     through the `add_store` seam with recording/throwing/failing fakes (no
 //     database needed);
 //   * a real-store fan-out ([pg][decommission][software_licensing]) — populate
-//     all five stores (four born-on-PG + the SQLite InventoryStore), decommission
-//     one agent, and assert its rows are gone from EVERY store while a bystander
-//     survives, with the new software_licensing store included.
+//     all five stores (all born-on-PG), decommission one agent, and assert its
+//     rows are gone from EVERY store while a bystander survives, with the new
+//     software_licensing store included.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -259,31 +259,54 @@ TEST_CASE("DecommissionOutcome renders stable audit tags", "[decommission]") {
     CHECK(std::string_view(to_string(DecommissionOutcome::Failed)) == "failed");
 }
 
+namespace {
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp) covering every
+// store this file's [pg] tests construct — a store-behaviour test clones an
+// already-migrated database instead of re-running the migrations.
+yuzu::test::PgTestTemplate decommission_tpl{"decommission", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::InventoryStore inventory{pool};
+    yuzu::server::SoftwareInventoryStore software_inventory{pool};
+    yuzu::server::AppPerfDailyStore app_perf_daily{pool};
+    yuzu::server::DeviceInventoryStore device_inventory{pool};
+    yuzu::server::SoftwareLicensingStore software_licensing{pool};
+    if (!inventory.is_open() || !software_inventory.is_open() || !app_perf_daily.is_open() ||
+        !device_inventory.is_open() || !software_licensing.is_open())
+        throw std::runtime_error("decommission template: a store failed to migrate");
+}};
+} // namespace
+
 // Directly exercise InventoryStore::delete_agent's new empty-id guard and bool
-// commit-status return (SQLite, no Postgres). The cascade short-circuits an empty
-// id to all-Skipped before any deleter runs, so this guard is the store-level
-// belt-and-braces that is otherwise reached by no test.
+// commit-status return. The cascade short-circuits an empty id to all-Skipped
+// before any deleter runs, so this guard is the store-level belt-and-braces
+// that is otherwise reached by no test.
 TEST_CASE("InventoryStore::delete_agent guards an empty id and reports commit status",
-          "[decommission][inventory]") {
-    yuzu::test::TempDbFile inv_db;
-    yuzu::server::InventoryStore inv{inv_db.path};
+          "[pg][decommission][inventory]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, decommission_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::InventoryStore inv{pool};
     REQUIRE(inv.is_open());
     inv.upsert("agent-x", "installed_software", R"({"seed":"1"})", 1000);
 
     // Empty id: guarded — never a `WHERE agent_id = ''` — reports false (no
     // commit), and the real row is untouched.
     CHECK_FALSE(inv.delete_agent(""));
-    CHECK_FALSE(inv.get_agent_inventory("agent-x").empty());
+    auto got = inv.get_agent_inventory("agent-x");
+    REQUIRE(got.has_value()); // store open + query OK, not a degrade
+    CHECK_FALSE(got->empty());
 
     // A real delete commits → true, and the row is gone.
     CHECK(inv.delete_agent("agent-x"));
-    CHECK(inv.get_agent_inventory("agent-x").empty());
+    got = inv.get_agent_inventory("agent-x");
+    REQUIRE(got.has_value());
+    CHECK(got->empty());
 
     // Idempotent: a 0-row delete of an already-erased agent still commits → true.
     CHECK(inv.delete_agent("agent-x"));
 }
 
-// ── Real-store fan-out (Postgres + SQLite) ───────────────────────────────────
+// ── Real-store fan-out (all born-on-Postgres) ────────────────────────────────
 
 namespace {
 
@@ -351,12 +374,11 @@ void seed_agent(const std::string& agent_id, yuzu::server::InventoryStore& inv,
 
 TEST_CASE("AgentDecommission erases an agent from every real store; a bystander survives",
           "[pg][decommission][software_licensing]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, decommission_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 8}};
     REQUIRE(pool.valid());
 
-    yuzu::test::TempDbFile inv_db; // default prefix; a string literal here is ambiguous
-    yuzu::server::InventoryStore inventory{inv_db.path};
+    yuzu::server::InventoryStore inventory{pool};
     REQUIRE(inventory.is_open());
 
     yuzu::server::SoftwareInventoryStore software_inventory{pool};
@@ -393,7 +415,9 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     CHECK(sl->outcome == DecommissionOutcome::Deleted); // the new SLE store IS included
 
     // agent-del is gone from EVERY store.
-    CHECK(inventory.get_agent_inventory("agent-del").empty());
+    auto inv_del = inventory.get_agent_inventory("agent-del");
+    REQUIRE(inv_del.has_value()); // store open + query OK → empty value, not a degrade
+    CHECK(inv_del->empty());
 
     auto soft_del = software_inventory.get_agent_software("agent-del");
     REQUIRE(soft_del.has_value()); // store open + query OK → empty value, not a degrade
@@ -415,7 +439,9 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     CHECK_FALSE(lic_hash->has_value()); // state row gone
 
     // The bystander is untouched in EVERY store (agent-scoped deletes).
-    CHECK_FALSE(inventory.get_agent_inventory("agent-bystander").empty());
+    auto inv_by = inventory.get_agent_inventory("agent-bystander");
+    REQUIRE(inv_by.has_value());
+    CHECK_FALSE(inv_by->empty());
 
     auto soft_by = software_inventory.get_agent_software("agent-bystander");
     REQUIRE(soft_by.has_value());
