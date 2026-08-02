@@ -551,6 +551,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         None,
         ProbeFailed,
         DeclineFirstPass,
+        DeclineNoAnchor,
         DeclineWipe,
         DeclineStep,
         DeclineImplausible,
@@ -758,12 +759,16 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             emit_full_wipe = would_wipe;
 
             // `cleanup_once` is the ONLY caller of `classify`; the rule lives in its
-            // own header so it can be pinned exhaustively (all 16 inputs) without a
+            // own header so it can be pinned exhaustively (all 32 inputs) without a
             // database, not because anything else consumes it.
             const audit_retention::Facts facts{.has_expired = *has_expired,
                                                .would_wipe = would_wipe,
                                                .big_step = big_step,
-                                               .prev_unusable = prev_unusable};
+                                               .prev_unusable = prev_unusable,
+                                               // The same optional `big_step` tests, so the two are
+                                               // mutually exclusive by construction: a pass either
+                                               // has a comparison point or it has none (#2579).
+                                               .no_anchor = !prev_pass_now};
             const audit_retention::Anomaly a = audit_retention::classify(facts);
             // Consumed HERE, unconditionally, at exactly one site: this pass has
             // folded it into the verdict. The durable row was re-anchored above,
@@ -793,7 +798,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             // unless the clock actually moved again.
             //
             // Deduplication compares the whole FACT SET, not the classified
-            // enum. `classify` collapses four facts onto one value, so an enum
+            // enum. `classify` collapses five facts onto one value, so an enum
             // comparison cannot see a new condition arriving underneath a
             // reported one: a `Wipe` appearing under a standing `BadState`
             // classifies as `BadState` both times, matches, and is silently
@@ -804,7 +809,16 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                                   (a == audit_retention::Anomaly::BadState && clock_event);
             if (a != audit_retention::Anomaly::None &&
                 (is_event || !last_reported_ || *last_reported_ != facts)) {
-                clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
+                // Two counters, because they make two different claims. Only the
+                // bootstrap decline can say "nothing can be ruled out yet"; every
+                // other trigger here is asserting something positive about the
+                // clock or the stored state (#2579). The dedup and decline
+                // behaviour below is identical either way -- this chooses the
+                // signal, not the verdict.
+                if (a == audit_retention::Anomaly::NoAnchor)
+                    bootstrap_declines_.fetch_add(1, std::memory_order_relaxed);
+                else
+                    clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
                 // NOT unobservable for `Step`, which an earlier comment here
                 // claimed. Being event-exempt means this write cannot cause
                 // SUPPRESSION -- that is all that proof established. It does
@@ -824,6 +838,9 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                     break;
                 case audit_retention::Anomaly::Wipe:
                     emit = prev_pass_now ? Emit::DeclineWipe : Emit::DeclineFirstPass;
+                    break;
+                case audit_retention::Anomaly::NoAnchor:
+                    emit = Emit::DeclineNoAnchor;
                     break;
                 case audit_retention::Anomaly::None:
                     break; // unreachable: guarded above
@@ -902,6 +919,14 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                      "EVERY datable audit row; declining once so a clock anomaly cannot delete "
                      "the audit trail wholesale. (There is no previous reading to compare "
                      "against, so nothing can be said about the clock yet.)");
+        break;
+    case Emit::DeclineNoAnchor:
+        spdlog::warn("AuditStore: there is no stored clock reading to compare against and rows "
+                     "are already expired; declining this pass once, so a clock that was ALREADY "
+                     "wrong before the first guarded pass cannot delete them unremarked. Nothing "
+                     "here says the clock IS wrong -- only that nothing can yet rule it out. The "
+                     "reading is anchored now, so the next pass proceeds normally: if this "
+                     "server's time may be wrong, correct it before then (#2579)");
         break;
     case Emit::DeclineWipe:
         spdlog::warn("AuditStore: this retention pass would expire EVERY datable audit row; "

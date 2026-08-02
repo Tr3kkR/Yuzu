@@ -15,7 +15,7 @@
 /// Why it is worth isolating: the retention guard's precedence went unpinned
 /// long enough for two separate mutations to survive, because reaching it meant
 /// standing up a seeded multi-pass integration test. As a free function it is
-/// four bools in, one enum out.
+/// five bools in, one enum out.
 
 #include <cstdint>
 
@@ -24,12 +24,13 @@ namespace yuzu::server::audit_retention {
 /// What the guard can conclude about one retention pass, in precedence order.
 enum class Anomaly {
     None,     ///< Nothing to report; the pass may delete (paced by the cap).
+    NoAnchor, ///< No usable previous reading, and there is data to lose (#2579).
     Wipe,     ///< This pass would expire every datable row.
     Step,     ///< The gap since the previous pass exceeds the absolute threshold.
     BadState, ///< The persisted clock reading cannot be used at all.
 };
 
-/// The four independent facts one pass observes. An AGGREGATE rather than four
+/// The five independent facts one pass observes. An AGGREGATE rather than five
 /// positional bools: the parameter order deliberately does not match the
 /// precedence order, so a call-site transposition of `would_wipe` and `big_step`
 /// used to compile silently while the exhaustive table below stayed green -- the
@@ -37,7 +38,7 @@ enum class Anomaly {
 /// transposition a compile error.
 ///
 /// Equality is the guard's deduplication key. It compares the whole fact SET,
-/// not the classified enum, because `classify` collapses four facts onto one
+/// not the classified enum, because `classify` collapses five facts onto one
 /// value: a `Wipe` arriving underneath an already-reported `BadState` classifies
 /// as `BadState` both times and is invisible to an enum comparison. That is not
 /// hypothetical -- it is the dead-CMOS-then-NTP sequence, which silently deleted
@@ -47,6 +48,13 @@ struct Facts {
     bool would_wipe = false;
     bool big_step = false;
     bool prev_unusable = false;
+    /// No usable previous reading to compare against (#2579). TRUE for an
+    /// ABSENT row and equally for one discarded as unusable, because both leave
+    /// the pass with no comparison point -- the fact is "cannot vouch for the
+    /// clock", not "the row was missing". `prev_unusable` still outranks it, so
+    /// corrupt durable state keeps reporting as corruption rather than as a
+    /// bootstrap.
+    bool no_anchor = false;
 
     friend constexpr bool operator==(const Facts&, const Facts&) noexcept = default;
 };
@@ -70,9 +78,10 @@ struct Facts {
 /// Classify one pass. PURE: no state, no side effects, so each condition can be
 /// reasoned about and tested alone.
 ///
-/// Precedence is BadState > Step > Wipe. A reading that cannot be trusted makes
-/// the other two unreliable, and an elapsed-time step explains a wipe better
-/// than the wipe explains itself.
+/// Precedence is BadState > Step > Wipe > NoAnchor. A reading that cannot be
+/// trusted makes the others unreliable, an elapsed-time step explains a wipe
+/// better than the wipe explains itself, and having no reading at all is the
+/// weakest statement of the four -- it says only that nothing can be ruled out.
 ///
 /// The BadState/Step edge is REACHABLE, so the ordering is load-bearing rather
 /// than decorative. `prev_unusable` has three carriers and only two of them
@@ -85,6 +94,22 @@ struct Facts {
 /// `!has_expired` short-circuits to None: with nothing to delete there is
 /// nothing to hold back, and the only thing still worth reporting is an unusable
 /// reading, which is why `prev_unusable` is tested first.
+///
+/// `no_anchor` is tested LAST, and that placement is the whole of #2579's fix.
+/// Before it existed, a pass with no comparison point rested entirely on the
+/// outcome test, so a host already skewed FORWARD -- whose post-skew rows are
+/// still inside the window, defeating `would_wipe` -- deleted with every
+/// detector false. Sitting last, it cannot mask a more specific verdict: a wipe
+/// or a step still reports as itself, and it only speaks when nothing else did.
+/// Sitting AFTER `!has_expired` is what keeps it quiet on the case that made
+/// this a judgement call at all -- a fresh install has no anchor and nothing to
+/// delete, so it never declines, and the trigger costs an operator nothing until
+/// there is actually data at risk.
+///
+/// It needs no anti-latch special case, unlike the parallel implementation that
+/// carried this trigger on another line: deduplication compares the whole fact
+/// SET, so the next pass -- which has re-anchored, and therefore differs in this
+/// very field -- is a different set and reports on its own merits.
 [[nodiscard]] constexpr Anomaly classify(const Facts& f) noexcept {
     if (f.prev_unusable)
         return Anomaly::BadState;
@@ -92,7 +117,9 @@ struct Facts {
         return Anomaly::None;
     if (f.big_step)
         return Anomaly::Step;
-    return f.would_wipe ? Anomaly::Wipe : Anomaly::None;
+    if (f.would_wipe)
+        return Anomaly::Wipe;
+    return f.no_anchor ? Anomaly::NoAnchor : Anomaly::None;
 }
 
 } // namespace yuzu::server::audit_retention

@@ -203,6 +203,27 @@ public:
         return clock_anomaly_skips_.load(std::memory_order_relaxed);
     }
 
+    /// Cumulative count of passes declined for the ONE reason that is not a
+    /// statement about the clock: there was no usable previous reading to
+    /// compare against and rows were already expired (#2579).
+    ///
+    /// Deliberately NOT folded into `clock_anomaly_skips_count()`, and the
+    /// separation is semantic before it is operational. That counter's alert
+    /// says the clock "moved in a way that WOULD have wiped audit evidence";
+    /// this decline asserts nothing of the sort -- only that nothing can yet
+    /// rule it out, which is a weaker claim and a different incident. Sharing
+    /// the counter would have made the sibling alert's own description untrue
+    /// for this case, and fired it on every server carrying a backlog through
+    /// an upgrade.
+    ///
+    /// Expected to be 0 or 1 per database in the ordinary course: the pass that
+    /// declines also anchors the reading, so the next one has a comparison
+    /// point. A value that keeps climbing means the anchor is not surviving --
+    /// look for `..._retention_persist_failed_total` alongside it.
+    uint64_t bootstrap_declines_count() const noexcept {
+        return bootstrap_declines_.load(std::memory_order_relaxed);
+    }
+
     /// Cumulative count of retention passes that did NOT do their job. Seven
     /// sites: an unreadable pre-delete probe; a failed delete prepare; a failed
     /// delete step; an unreadable POST-delete backlog probe; a pass refused
@@ -303,6 +324,7 @@ private:
     // entirely (the thread-boundary catch), and the two liveness values are
     // stamped before the lock is taken.
     std::atomic<uint64_t> clock_anomaly_skips_{0};
+    std::atomic<uint64_t> bootstrap_declines_{0};
     std::atomic<uint64_t> cleanup_failed_{0};
     std::atomic<uint64_t> rows_deleted_{0};
     std::atomic<uint64_t> cap_reached_{0};
