@@ -53,9 +53,11 @@ constexpr const char* kMetricStreamCloses = "yuzu_mcp_stream_closes_total";
 constexpr const char* kMetricFramesDropped = "yuzu_mcp_stream_frames_dropped_total";
 constexpr const char* kMetricFramesTruncated = "yuzu_mcp_stream_frames_too_large_total";
 constexpr const char* kMetricPublishFailures = "yuzu_mcp_stream_publish_failures_total";
-// A committed final response found no free pin slot - never expected (the bridge caps
-// streamed records per session at the pin count); the frame is kept unpinned rather than
-// lost. A non-zero value means the pin bound and the admission cap have drifted.
+// A committed final response was published with NO pin at all. Structurally unreachable
+// while the pin array is non-empty - a full slot set displaces its oldest pin instead
+// (kMetricPinDisplaced below, which now carries the admission-drift reading). Kept as
+// defence in depth: non-zero means the array was resized to zero or the displacement
+// path was bypassed.
 constexpr const char* kMetricFinalUnpinned = "yuzu_mcp_stream_final_unpinned_total";
 /// An older pinned terminal yielded its eviction-exemption slot to a newer one. NOT expected:
 /// the bridge admits streamed records against `pinned_count() + unpinned`, and the pin array is

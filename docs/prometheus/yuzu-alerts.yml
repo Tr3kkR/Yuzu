@@ -178,6 +178,37 @@ groups:
             failure poisons that session's stream). Results remain durably
             fetchable by execution_id, but the streaming surface is degraded;
             this is an allocation-pressure or stream-state signal worth paging.
+      - alert: YuzuMcpStreamPinDisplaced
+        expr: |
+          rate(yuzu_mcp_stream_pin_displaced_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP replay-ring pin slots exhausted (admission accounting drift)"
+          description: >-
+            yuzu_mcp_stream_pin_displaced_total is moving - a session filled every
+            replay-ring pin slot, which the bridge's admission cap should make
+            unreachable, so admission accounting has drifted. The server degraded
+            gracefully (the oldest pinned terminal yielded its eviction exemption
+            to the newest; the displaced final stays committed and remains
+            fetchable by execution_id). No restart needed - this is a diagnostic
+            signal, not an outage: file a bug with the session's stream metrics.
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement"
+      - alert: YuzuMcpStreamFinalUnpinned
+        expr: |
+          rate(yuzu_mcp_stream_final_unpinned_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP terminal committed with no pin at all (defence-in-depth tripped)"
+          description: >-
+            yuzu_mcp_stream_final_unpinned_total is moving. This is structurally
+            unreachable while the pin array is non-empty (a full slot set displaces
+            its oldest pin instead), so a non-zero value means the pin array was
+            resized to zero or the displacement path was bypassed. The affected
+            terminal is evictable from the replay ring but remains fetchable by
+            execution_id. File a bug; no restart needed.
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement"
       - alert: YuzuMcpBridgeTeardownIncomplete
         expr: |
           sum by (reason) (yuzu_mcp_bridge_teardown_incomplete_total) > 0
