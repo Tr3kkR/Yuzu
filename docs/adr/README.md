@@ -24,7 +24,7 @@ This is why ADR-0022 was renumbered to **ADR-1005** — it is Dave Rae's, and 00
 ls docs/adr/ | grep -oE '^[0-9]{4}' | sort -n | tail -20   # what's taken
 ```
 
-Take the next free number in your block. Filename is `<number>-<kebab-slug>.md`. Record the author in the frontmatter (`owner:`) or a `**Authors:**` line — several older ADRs are inconsistent here, and `0020` has no author line at all.
+Take the next free number in your block. Filename is `<number>-<kebab-slug>.md`. **Record the author** in the frontmatter (`owner:`) or a `**Authors:**` line — without it nobody can tell which block an ADR belongs to. Older ADRs are inconsistent about which of the two forms they use; either is fine, but one of them is required.
 
 ## The convention binds prospectively
 
