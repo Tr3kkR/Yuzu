@@ -58,6 +58,50 @@ TEST_CASE("AuditStore: log and retrieve", "[audit_store]") {
     CHECK(results[0].source_ip == "192.168.1.1");
 }
 
+TEST_CASE("AuditStore: is_list_read flag round-trips and is selectable (ADR-0017 #2473)",
+          "[audit_store]") {
+    AuditStore store(":memory:");
+    REQUIRE(store.is_open());
+
+    // Two rows with the SAME verb — only the flag distinguishes the list-read
+    // gate decision from an ordinary permission denial (the #2473 design: a bit,
+    // not a dedicated audit verb).
+    AuditEvent list_ev;
+    list_ev.principal = "opA";
+    list_ev.principal_role = "operator";
+    list_ev.action = "auth.permission_required";
+    list_ev.result = "denied";
+    list_ev.is_list_read = true;
+    CHECK(store.log(list_ev));
+
+    AuditEvent other_ev;
+    other_ev.principal = "opA";
+    other_ev.principal_role = "operator";
+    other_ev.action = "auth.permission_required";
+    other_ev.result = "denied";
+    other_ev.is_list_read = false;
+    CHECK(store.log(other_ev));
+
+    // The flag survives log -> query (read back into AuditEvent).
+    auto all = store.query();
+    REQUIRE(all.size() == 2);
+
+    // SELECT against the flag: only the list-read row comes back.
+    AuditQuery q_list;
+    q_list.is_list_read = true;
+    auto list_only = store.query(q_list);
+    REQUIRE(list_only.size() == 1);
+    CHECK(list_only[0].is_list_read);
+    CHECK(list_only[0].principal == "opA");
+
+    // The inverse filter excludes it; nullopt (default) does not filter.
+    AuditQuery q_other;
+    q_other.is_list_read = false;
+    auto non_list = store.query(q_other);
+    REQUIRE(non_list.size() == 1);
+    CHECK_FALSE(non_list[0].is_list_read);
+}
+
 TEST_CASE("AuditStore: filter by principal", "[audit_store]") {
     AuditStore store(":memory:");
 

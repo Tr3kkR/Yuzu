@@ -128,6 +128,42 @@ public:
                                    const std::string& securable_type, const std::string& operation,
                                    const std::string& agent_id);
 
+    /// Result of `require_list_read` — the ADR-0017 admit-then-filter list gate
+    /// for per-agent list/fan-out reads (#2473). The caller inspects it as:
+    ///   - `!admitted`         → a 4xx/5xx (+ audit) was already written; RETURN now.
+    ///   - `admitted, scope == std::nullopt`  → UNFILTERED read (a global/legacy/
+    ///                            elevated/engine-fleet grant): serve every row.
+    ///   - `admitted, scope has value`        → SCOPED read: serve ONLY rows whose
+    ///                            `agent_id` is in `*scope`. An **empty** value means
+    ///                            ZERO rows — never "no filter" (INV-2 / UP-14).
+    ///
+    /// `scope` is the `AggregateScope` shape (`std::optional<std::vector<...>>`)
+    /// deliberately: an empty visible set is a *value*, structurally distinct from
+    /// `nullopt`, so a route CANNOT accidentally render an empty-scoped admit as an
+    /// unfiltered fleet read (the UP-14 fail-open). Push it into SQL as
+    /// `WHERE agent_id IN (...)` (empty ⇒ `AND 1=0`), never a post-fetch
+    /// `if (scope.empty()) serve_all`.
+    struct ListReadGate {
+        bool admitted{false};
+        std::optional<std::vector<std::string>> scope; // nullopt = unfiltered
+        std::optional<auth::Session> session;          // the resolved principal
+    };
+
+    /// ADR-0017 admit-then-filter list gate (REST transport, #2473). Sibling to
+    /// `require_scoped_permission`; the list-read analogue of `require_permission`
+    /// for reads that return MANY per-agent rows and thus have no single `agent_id`
+    /// to gate on. Mirrors `require_permission`'s principal-kind ladder — elevation,
+    /// then engine principals (RBAC-only, default-deny: `!is_open`→503,
+    /// `!rbac_enabled`||no-grant→403; NEVER the legacy-open path, and — since engine
+    /// grants are fleet-wide only, #2485 — never `AdmitScoped`), then MCP-tier
+    /// (enforce tier, fall through), then service-scoped — but the STANDARD branch
+    /// delegates to `RbacStore::authorize_list_read` (broadened admit + management-
+    /// group filter) instead of the inert global `check_permission`. Fail-closed:
+    /// a corrupt `rbac.db` yields `DenyAll`, never an unfiltered read.
+    ListReadGate require_list_read(const httplib::Request& req, httplib::Response& res,
+                                   const std::string& securable_type,
+                                   const std::string& operation);
+
     /// Build a synthetic session from a validated API token. Two-branch on the
     /// token's persisted `principal_kind` (design doc §6):
     ///  - "human" (or any legacy/unset value): exactly the pre-#2021 behavior
@@ -167,7 +203,8 @@ public:
     /// fire-and-forget.
     bool audit_log(const httplib::Request& req, const std::string& action,
                    const std::string& result, const std::string& target_type = {},
-                   const std::string& target_id = {}, const std::string& detail = {});
+                   const std::string& target_id = {}, const std::string& detail = {},
+                   bool is_list_read = false);
 
     /// Variant that stamps `principal` + `principal_role` explicitly
     /// rather than resolving from `resolve_session(req)`. Used at the

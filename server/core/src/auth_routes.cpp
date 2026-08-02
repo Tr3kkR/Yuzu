@@ -919,6 +919,148 @@ std::string AuthRoutes::session_cookie_attrs() const {
     return attrs;
 }
 
+AuthRoutes::ListReadGate AuthRoutes::require_list_read(const httplib::Request& req,
+                                                      httplib::Response& res,
+                                                      const std::string& securable_type,
+                                                      const std::string& operation) {
+    // ADR-0017 admit-then-filter list gate (#2473). Mirrors require_permission's
+    // principal-kind ladder; only the STANDARD branch differs (authorize_list_read
+    // instead of the inert global check_permission). Every denial writes a 4xx/5xx
+    // + audit and leaves gate.admitted == false so the caller returns immediately.
+    ListReadGate gate;
+    const std::string perm = securable_type + ":" + operation;
+
+    // Every denial from this gate is a list-read authorization row. Per #2473 we
+    // do NOT mint a dedicated verb: we reuse the shared "auth.permission_required"
+    // verb and stamp AuditEvent::is_list_read, so `WHERE is_list_read` pulls every
+    // list/fan-out authorization decision out of the log with an index.
+    auto deny_audit = [&](const std::string& detail) {
+        audit_log(req, "auth.permission_required", "denied", "", "", detail,
+                  /*is_list_read=*/true);
+    };
+
+    auto session = require_auth(req, res);
+    if (!session)
+        return gate; // require_auth wrote 401
+    gate.session = session;
+
+    // JIT admin elevation: full admin for the window → unfiltered (scope=nullopt).
+    if (auth::is_elevated(*session)) {
+        gate.admitted = true;
+        return gate;
+    }
+
+    // Engine principals: RBAC-only, default-deny. NEVER the legacy-open path below
+    // (an engine must not get fleet-wide read the moment RBAC is off). Engine grants
+    // are fleet-wide only (#2485 / auth-architecture PR 4.2), so an engine is
+    // AdmitAll (a real global grant) or DenyAll — never AdmitScoped. Same 503/403
+    // shape as require_permission's engine branch.
+    if (session->principal_kind == "engine") {
+        if (!rbac_store_ || !rbac_store_->is_open()) {
+            deny_audit(
+                      "engine principal denied: RBAC store unavailable");
+            res.status = 503;
+            res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return gate;
+        }
+        if (!rbac_store_->is_rbac_enabled() ||
+            !rbac_store_->check_permission(session->username, securable_type, operation)) {
+            deny_audit(
+                      "engine principal denied " + perm);
+            res.status = 403;
+            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return gate;
+        }
+        gate.admitted = true; // fleet-wide grant → unfiltered
+        return gate;
+    }
+
+    // MCP-tier tokens: enforce the tier policy, then FALL THROUGH to the standard
+    // list gate — which applies the creator's RBAC + management-group confinement
+    // via authorize_list_read (strictly tighter than require_permission's global
+    // check for a list read). Reads are never approval-gated, so no ticket check.
+    if (!session->mcp_tier.empty()) {
+        if (!mcp::tier_allows(session->mcp_tier, securable_type, operation)) {
+            deny_audit(
+                      "MCP token tier '" + session->mcp_tier + "' does not allow " + perm);
+            res.status = 403;
+            res.set_content(detail::a4_denial(res, 403, "MCP token tier does not allow " + perm,
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return gate;
+        }
+    }
+
+    // Service-scoped tokens: ITServiceOwner must grant the permission; scoped tokens
+    // cannot be used with RBAC off. Parity with require_permission — this admits an
+    // ITServiceOwner token to the whole fleet, matching the DOCUMENTED current state
+    // ("fleet-wide only", auth-architecture.md "Authorization model"). Narrowing such
+    // reads to the caller's management groups is deliberately DEFERRED, not dropped:
+    // the systemic intent is tracked in #1634 (per-agent reads → management-group
+    // scoped) and the scoped-principal chokepoint is a Phase-5 deliverable
+    // (auth-architecture.md: "scoped (management-group) engine assignment is rejected
+    // pending that Phase-5 chokepoint"). When that lands, this branch routes through
+    // authorize_list_read on the token creator, exactly like the standard branch
+    // below. This introduces no NEW bypass — the wrapper is >= as tight as
+    // require_permission for every principal kind, and tighter for confined humans.
+    if (!session->token_scope_service.empty()) {
+        if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
+            deny_audit(
+                      "service-scoped token blocked: RBAC not enabled");
+            res.status = 403;
+            res.set_content(detail::a4_denial(res, 403,
+                                              "service-scoped tokens require RBAC to be enabled",
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return gate;
+        }
+        if (!rbac_store_->check_role_has_permission("ITServiceOwner", securable_type, operation)) {
+            deny_audit(
+                      "service-scoped token blocked: lacks ITServiceOwner permission");
+            res.status = 403;
+            res.set_content(detail::a4_denial(res, 403,
+                                              "service-scoped token does not grant " + perm +
+                                                  " (ITServiceOwner permission required)",
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return gate;
+        }
+        gate.admitted = true; // ITServiceOwner is fleet-scoped by role → unfiltered
+        return gate;
+    }
+
+    // Standard principal → the admit-then-filter list gate (ADR-0017). A wholly
+    // unwired RBAC store means no RBAC subsystem: legacy-open for a Read (mirrors
+    // require_permission's null-store fallthrough; list reads are Read-class).
+    if (!rbac_store_) {
+        gate.admitted = true; // legacy-open → unfiltered
+        return gate;
+    }
+    auto decision = rbac_store_->authorize_list_read(session->username, securable_type, operation,
+                                                     mgmt_group_store_);
+    switch (decision.decision) {
+    case ListReadDecision::DenyAll:
+        deny_audit( "RBAC denied " + perm);
+        res.status = 403;
+        res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
+                                          detail::A4ErrorOpts{.permission = perm}),
+                        "application/json");
+        return gate; // admitted == false
+    case ListReadDecision::AdmitAll:
+        gate.admitted = true; // scope stays nullopt → unfiltered
+        return gate;
+    case ListReadDecision::AdmitScoped:
+        gate.admitted = true;
+        gate.scope = std::move(decision.visible_agents); // value (maybe empty) → restrict
+        return gate;
+    }
+    return gate; // unreachable; fail-closed default (admitted == false)
+}
+
 AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::string& action,
                                         const std::string& result) {
     AuditEvent event;
@@ -961,13 +1103,15 @@ void AuthRoutes::reap_mfa_pending_locked() {
 
 bool AuthRoutes::audit_log(const httplib::Request& req, const std::string& action,
                            const std::string& result, const std::string& target_type,
-                           const std::string& target_id, const std::string& detail) {
+                           const std::string& target_id, const std::string& detail,
+                           bool is_list_read) {
     if (!audit_store_)
         return true; // audit-off deployment — not a failure relative to config
     auto event = make_audit_event(req, action, result);
     event.target_type = target_type;
     event.target_id = target_id;
     event.detail = detail;
+    event.is_list_read = is_list_read;
     auto ok = audit_store_->log(event);
     if (!ok) {
         // SOC 2 CC7.2 — surface audit-write failures via spdlog so on-call

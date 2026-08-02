@@ -418,6 +418,7 @@ if build_server
     files(
       'unit/server/test_auth.cpp',
       'unit/server/test_auth_routes.cpp',
+      'unit/server/test_require_list_read.cpp',
       'unit/server/test_auth_routes_mfa.cpp',
       'unit/server/test_auth_jit_elevation.cpp',
       'unit/server/test_auth_sso_identity.cpp',

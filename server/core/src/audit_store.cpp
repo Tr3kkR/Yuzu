@@ -95,6 +95,15 @@ void AuditStore::create_tables() {
                 value INTEGER NOT NULL
             );
         )"},
+        // ADR-0017 #2473: additive flag marking list-read-gate authorization rows
+        // (AuditEvent::is_list_read). Same additive-ahead-of-PG-cutover posture as
+        // principal_class (migration 2) — AuditStore's eventual PG migration must
+        // carry this column + index forward. Existing rows default 0.
+        {4, R"(
+            ALTER TABLE audit_events ADD COLUMN is_list_read INTEGER NOT NULL DEFAULT 0;
+            CREATE INDEX IF NOT EXISTS idx_audit_list_read
+                ON audit_events(is_list_read, timestamp);
+        )"},
     };
     if (!MigrationRunner::run(db_.get(), "audit_store", kMigrations)) {
         // Deliberate early close: from here every operation fails, which is the
@@ -243,8 +252,8 @@ bool AuditStore::log(const AuditEvent& event) {
     const char* sql = R"(
         INSERT INTO audit_events (timestamp, principal, principal_role, action,
             target_type, target_id, detail, source_ip, user_agent, session_id, result, ttl_expires_at,
-            principal_class)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            principal_class, is_list_read)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     )";
     SqliteStmt stmt;
     if (sqlite3_prepare_v2(db_.get(), sql, -1, stmt.addr(), nullptr) != SQLITE_OK) {
@@ -272,6 +281,7 @@ bool AuditStore::log(const AuditEvent& event) {
     sqlite3_bind_text(stmt.get(), 11, event.result.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt.get(), 12, ttl);
     sqlite3_bind_text(stmt.get(), 13, event.principal_class.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 14, event.is_list_read ? 1 : 0);
 
     int step_rc = sqlite3_step(stmt.get());
 
@@ -322,7 +332,8 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_
 
     std::string sql =
         "SELECT id, timestamp, principal, principal_role, action, target_type, target_id, detail, "
-        "source_ip, user_agent, session_id, result, principal_class FROM audit_events WHERE 1=1";
+        "source_ip, user_agent, session_id, result, principal_class, is_list_read FROM "
+        "audit_events WHERE 1=1";
     std::vector<std::pair<int, std::string>> text_binds;
     // int64_binds: (param_index, value) pairs for integer parameters
     std::vector<std::pair<int, int64_t>> int_binds;
@@ -351,6 +362,10 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_
     if (q.until > 0) {
         sql += " AND timestamp <= ?";
         int_binds.emplace_back(bind_idx++, q.until);
+    }
+    if (q.is_list_read.has_value()) {
+        sql += " AND is_list_read = ?";
+        int_binds.emplace_back(bind_idx++, *q.is_list_read ? 1 : 0);
     }
     // Prefix OR-group (e.g. auth./mfa./session. for the auth-log sample, #4).
     // Prefixes are code-controlled constants, not user input, so they carry no
@@ -440,6 +455,7 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_
         e.session_id = col_text(10);
         e.result = col_text(11);
         e.principal_class = col_text(12);
+        e.is_list_read = sqlite3_column_int64(stmt.get(), 13) != 0;
         results.push_back(std::move(e));
     }
 

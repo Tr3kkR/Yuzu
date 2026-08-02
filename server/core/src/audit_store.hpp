@@ -46,6 +46,12 @@ struct AuditEvent {
     // `principal_class_of(req)`; every other AuditEvent construction leaves it
     // at its default "".
     std::string principal_class;
+    // ADR-0017 #2473: set on rows emitted by the admit-then-filter list-read gate
+    // (`AuthRoutes::require_list_read`), so list/fan-out authorization decisions are
+    // one indexed `WHERE is_list_read` SELECT away without a dedicated audit verb.
+    // Additive ahead of AuditStore's PG Wave-1 cutover (same posture as
+    // principal_class, migration 2); the PG migration must carry it forward.
+    bool is_list_read{false};
 };
 
 struct AuditQuery {
@@ -57,6 +63,10 @@ struct AuditQuery {
     int64_t until{0};
     int limit{100};
     int offset{0};
+    // ADR-0017 #2473: filter to (true) or exclude (false) rows emitted by the
+    // list-read gate. nullopt = no filter. This is the "SELECT against the flag"
+    // key — pull every list/fan-out authorization decision with `{.is_list_read=true}`.
+    std::optional<bool> is_list_read;
     // Match any action that starts with one of these prefixes (OR-combined),
     // e.g. {"auth.","mfa.","session."} to scope to the authentication surface
     // (sampled auth-log evidence export, #4 / SOC 2 CC7.2). Empty = no prefix
