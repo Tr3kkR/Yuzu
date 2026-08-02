@@ -135,8 +135,9 @@ documented in `docs/user-manual/audit-log.md`.
 | `yuzu_server_audit_cleanup_failed_total` | counter | Retention passes that did not fully do their job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. **One of the seven sites fires after a SUCCESSFUL delete** (the post-delete backlog probe), so this means "retention is not fully healthy", not "nothing was deleted". |
 | `yuzu_server_audit_retention_cap_reached_total` | counter | Passes that hit the per-pass delete cap, leaving a backlog. Sustained growth means expiry is outrunning the drain. This is the failure the cap itself introduces; neither counter above moves in that state. |
 | `yuzu_server_audit_rows_deleted_total` | counter | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
+| `yuzu_server_audit_retention_bootstrap_declines_total` | counter | Retention passes **declined** because the pass began with no usable stored clock reading while rows were already expired (#2579). Nothing was deleted. Deliberately NOT folded into `..._clock_anomaly_skips_total`: that series' alert means "the clock moved in a way that would have wiped audit evidence", whereas this decline asserts only that nothing can yet rule that out - a weaker claim and a different incident. Expect 0 or 1 per database: the declining pass also anchors the reading, so the next pass proceeds. A value that keeps climbing means the anchor is not surviving - read it alongside `..._retention_persist_failed_total`. A SINGLE decline is deliberately unalerted - that is the ordinary schema-v3 upgrade - but a climbing value fires `YuzuAuditRetentionAnchorNotSurviving` (`increase(...[24h]) > 1`). It is deliberately not folded into `YuzuAuditRetentionClockAnomaly`, whose meaning is that the clock MOVED. See [the retention clock guard](audit-log.md#the-retention-clock-guard). |
 | `yuzu_server_audit_retention_persist_failed_total` | counter | Failures to persist the retention clock reading. Sustained non-zero means clock-anomaly detection will not survive a restart. |
-| `yuzu_server_audit_retention_passes_total` | counter | Retention passes **attempted**, including declined and failed ones. Alert on this NOT increasing: the other five retention counters are silence-means-healthy, so a cleanup thread that never runs leaves them flat at 0 - identical to a quiet, healthy store, while `audit.db` grows without bound. |
+| `yuzu_server_audit_retention_passes_total` | counter | Retention passes **attempted**, including declined and failed ones. Alert on this NOT increasing: the other six retention counters are silence-means-healthy, so a cleanup thread that never runs leaves them flat at 0 - identical to a quiet, healthy store, while `audit.db` grows without bound. |
 | `yuzu_server_audit_retention_last_pass_unixtime` | gauge | Wall-clock reading of the most recent pass; `0` if none has run in this process. Read WITH the counter above: stale here while that RISES means the reaper is alive but refusing an implausible clock -- a different fault from stopped. |
 
 **Alert on absence, not just on rising counters.** Four of the five retention alert
@@ -938,13 +939,15 @@ account for the deliberately-disabled case, not just the stuck case.
 
 ## Management group metrics
 
-The server exposes two gauges for management group telemetry. These are
-refreshed on every `/metrics` scrape.
+The server exposes two gauges plus two counters for management group telemetry.
+The gauges are refreshed on every `/metrics` scrape; the counters are cumulative.
 
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_management_groups_total` | gauge | Total number of management groups (including the root "All Devices" group) |
 | `yuzu_server_group_members_total` | gauge | Total membership records across all management groups |
+| `yuzu_server_mgmt_group_read_degrade_total{reason}` | counter | A **confinement-feeding** hierarchy read (ancestors/descendants/agent-groups) degraded instead of returning a result, so the caller failed closed to **DenyAll**. `reason` ∈ `store_not_open` (store failed to open at boot), `pool_acquire_timeout` (no Postgres connection available in time — correlates with `yuzu_pg_acquire_*` saturation), `query_error` (the recursive-CTE query failed). **A non-zero rate means scoped operators see reduced/empty lists** because the confinement substrate (`management_group_store`, ADR-0042) is degraded — it does **not** mean groups shrank. This is the deny-set fail-**open** hazard now closed (a degraded read denies rather than silently under-restricting). |
+| `yuzu_server_mgmt_group_backfill_total{result}` | counter | Outcome of the one-time SQLite→Postgres confinement backfill at boot (ADR-0042). `result` ∈ `completed` (legacy `management-groups.db` found and backfilled, then moved aside), `fresh` (no legacy DB — a clean install, nothing to migrate), `failed` (backfill could not complete — write error, unreadable/over-deep/cyclic legacy tree; the server **fails closed at boot** and retries on next start). Emitted once per boot; a `failed` sample is the signal that the server refused to come up. |
 
 **Example output:**
 
@@ -969,6 +972,15 @@ yuzu_server_group_members_total / yuzu_server_management_groups_total
 
 # Alert if no management groups exist (store may be down)
 yuzu_server_management_groups_total == 0
+
+# Confinement reads degrading → scoped operators see reduced/empty lists (DenyAll).
+# A degrade denies confinement reads fleet-wide — treat any non-zero rate as a
+# confidentiality/availability signal, not a fleet-size change. (Shipped as the
+# YuzuMgmtGroupReadDegraded alert.)
+sum(rate(yuzu_server_mgmt_group_read_degrade_total[5m])) by (reason) > 0
+
+# One-time confinement backfill failed → server refused to boot (ADR-0042).
+sum(rate(yuzu_server_mgmt_group_backfill_total{result="failed"}[15m])) > 0
 ```
 
 ## Useful PromQL queries

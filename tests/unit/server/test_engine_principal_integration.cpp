@@ -545,9 +545,16 @@ TEST_CASE("Engine namespace: the T8 startup collision-scan preflight finds pre-e
 // ═══════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("ManagementGroupStore::assign_role rejects principal_type=='engine' outright",
-          "[engine_principal][integration][management_group]") {
-    auto db = yuzu::test::TempDbFile{"engine-mgmt-group-role-"};
-    ManagementGroupStore store(db.path);
+          "[pg][engine_principal][integration][management_group]") {
+    static yuzu::test::PgTestTemplate mgmt_role_tpl{"enginemgmtrole", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        ManagementGroupStore s{pool};
+        if (!s.is_open())
+            throw std::runtime_error("enginemgmtrole template: mgmt store failed to migrate");
+    }};
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_role_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
     REQUIRE(store.is_open());
 
     auto group_id = store.create_group({.name = "g1",

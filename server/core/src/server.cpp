@@ -795,6 +795,28 @@ public:
                           "green under pure pool saturation, so "
                           "this is the read-path degrade signal",
                           "counter");
+        // Management-group CONFINEMENT store observability (ADR-0042). The
+        // read-degrade counter is the fail-closed signal: a non-zero rate means
+        // RbacStore's authorize_list_read / check_scoped_permission is denying
+        // because the confinement substrate could not answer (store_not_open /
+        // pool_acquire_timeout / query_error). /readyz stays green under pure
+        // pool saturation, so this is the read-path degrade signal.
+        metrics_.describe("yuzu_server_mgmt_group_read_degrade_total",
+                          "Management-group confinement reads (get_agent_groups / "
+                          "get_ancestor_ids / get_descendant_ids / get_member_agents_in_subtrees "
+                          "/ get_assignments_for_principal / get_visible_agents) that returned a "
+                          "degrade (nullopt/DenyAll) rather than a result, by reason "
+                          "(store_not_open/pool_acquire_timeout/query_error)",
+                          "counter");
+        for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
+            metrics_.counter("yuzu_server_mgmt_group_read_degrade_total", {{"reason", reason}});
+        metrics_.describe("yuzu_server_mgmt_group_backfill_total",
+                          "Management-group legacy-SQLite backfill outcomes by result "
+                          "(completed = rows migrated + reconciled; fresh = no legacy DB / empty; "
+                          "failed = fail-closed refusal). One-time at boot (ADR-0042)",
+                          "counter");
+        for (const auto result : {"completed", "fresh", "failed"})
+            metrics_.counter("yuzu_server_mgmt_group_backfill_total", {{"result", result}});
         // Generic InventoryStore observability (ADR-0037 hardening round).
         metrics_.describe(
             "yuzu_inventory_ingest_dropped_total",
@@ -1234,6 +1256,18 @@ public:
                           "audit_retention_rules.hpp plus the fact construction in "
                           "AuditStore::cleanup_once, pinned by tests - it is "
                           "deliberately not paraphrased here",
+                          "counter");
+        metrics_.describe("yuzu_server_audit_retention_bootstrap_declines_total",
+                          "Audit retention passes declined because there was no usable previous "
+                          "clock reading to compare against AND rows were already expired "
+                          "(#2579). Counted apart from the clock-anomaly series on purpose: this "
+                          "decline does NOT claim the clock moved, only that nothing can yet "
+                          "rule it out, so it must not fire an alert that says otherwise. "
+                          "Expect 0 or 1 per database - the declining pass also anchors the "
+                          "reading, so the next pass proceeds. A value that keeps climbing "
+                          "means the anchor is not surviving; check "
+                          "yuzu_server_audit_retention_persist_failed_total. Triage: "
+                          "docs/user-manual/audit-log.md#the-retention-clock-guard",
                           "counter");
         metrics_.describe("yuzu_server_audit_cleanup_failed_total",
                           "Audit retention passes that did not fully do their job: an unreadable "
@@ -3192,9 +3226,37 @@ public:
                 startup_failed_ = true;
             }
         }
-        {
-            auto mgmt_db = cfg_.db_dir() / "management-groups.db";
-            mgmt_group_store_ = std::make_unique<ManagementGroupStore>(mgmt_db);
+        // Management-group CONFINEMENT hierarchy. Migrated Postgres store
+        // (ADR-0006/ADR-0042, schema `management_group_store`) — construction
+        // fail-CLOSED per ADR-0012 §1: a reachable database whose schema can't
+        // migrate/open is a fatal startup error, never a serve-degraded
+        // confinement substrate. `migrate_from_sqlite` runs the one-time,
+        // idempotent legacy-`management-groups.db` backfill (ADR-0009) —
+        // AUTHORITATIVE confinement scope means a backfill failure is ALSO fatal
+        // (never serve on top of partially-migrated confinement config).
+        if (pg_pool_ && !startup_failed_) {
+            mgmt_group_store_ = std::make_unique<ManagementGroupStore>(*pg_pool_);
+            if (!mgmt_group_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: management-group store migration/open failed "
+                              "(database reachable but the management_group_store schema could not "
+                              "be created/opened)");
+                startup_failed_ = true;
+            } else {
+                mgmt_group_store_->set_metrics(&metrics_);
+                auto mgmt_db = cfg_.db_dir() / "management-groups.db";
+                if (!mgmt_group_store_->migrate_from_sqlite(mgmt_db)) {
+                    spdlog::error("[PG] Refusing to start: management-group legacy-SQLite backfill "
+                                  "failed (see prior log lines) — management_group_store is the "
+                                  "AUTHORITATIVE confinement substrate and must not serve "
+                                  "partially-migrated data. Operator remediation: repair {} or move "
+                                  "it aside to skip the backfill (confinement groups in it will NOT "
+                                  "carry over)",
+                                  mgmt_db.string());
+                    startup_failed_ = true;
+                }
+            }
+        }
+        if (mgmt_group_store_ && mgmt_group_store_->is_open() && !startup_failed_) {
             // #1453 — make device visibility honor the RBAC-disabled posture.
             // When RBAC is globally off there are no per-user
             // management_group_roles rows, so get_visible_agents would return an
@@ -3206,27 +3268,23 @@ public:
             // does not matter.
             //
             // #1498 — the predicate fails CLOSED on a missing or load-failed
-            // store (open/migration failure leaves db_ null), so a corrupt
-            // rbac.db can never widen TAR fleet-scan visibility to the whole
-            // fleet; see rbac_enforcement_in_effect (rbac_store.hpp) for the
-            // full policy and its unit tests.
+            // store, so a corrupt rbac.db can never widen TAR fleet-scan
+            // visibility to the whole fleet.
             mgmt_group_store_->set_rbac_enabled_probe(
                 [this]() { return rbac_enforcement_in_effect(rbac_store_.get()); });
             // Ensure root "All Devices" group exists
-            if (mgmt_group_store_ && mgmt_group_store_->is_open()) {
-                auto root = mgmt_group_store_->get_group(ManagementGroupStore::kRootGroupId);
-                if (!root) {
-                    ManagementGroup g;
-                    g.id = ManagementGroupStore::kRootGroupId;
-                    g.name = "All Devices";
-                    g.description = "Root group containing all enrolled agents";
-                    g.membership_type = "dynamic";
-                    g.scope_expression = "*";
-                    g.created_by = "system";
-                    auto r = mgmt_group_store_->create_group(g);
-                    if (r)
-                        spdlog::info("Auto-created root management group 'All Devices'");
-                }
+            auto root = mgmt_group_store_->get_group(ManagementGroupStore::kRootGroupId);
+            if (!root) {
+                ManagementGroup g;
+                g.id = ManagementGroupStore::kRootGroupId;
+                g.name = "All Devices";
+                g.description = "Root group containing all enrolled agents";
+                g.membership_type = "dynamic";
+                g.scope_expression = "*";
+                g.created_by = "system";
+                auto r = mgmt_group_store_->create_group(g);
+                if (r)
+                    spdlog::info("Auto-created root management group 'All Devices'");
             }
             agent_service_.set_mgmt_group_store(mgmt_group_store_.get());
             if (gateway_service_)
@@ -4488,6 +4546,8 @@ public:
                     // failed passes are scraped separately (see describe above).
                     metrics_.gauge("yuzu_server_audit_clock_anomaly_skips_total")
                         .set(static_cast<double>(audit_store_->clock_anomaly_skips_count()));
+                    metrics_.gauge("yuzu_server_audit_retention_bootstrap_declines_total")
+                        .set(static_cast<double>(audit_store_->bootstrap_declines_count()));
                     metrics_.gauge("yuzu_server_audit_cleanup_failed_total")
                         .set(static_cast<double>(audit_store_->cleanup_failed_count()));
                     metrics_.gauge("yuzu_server_audit_rows_deleted_total")
@@ -5233,6 +5293,16 @@ public:
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
         app_perf_fleet_store_.reset();
+        // ManagementGroupStore borrows pg_pool_ (ADR-0042) — null the borrowed
+        // raw pointers in the gRPC ingest services, then drop the store, BEFORE
+        // the pool. It also holds a `this`-capturing RBAC-enabled probe that
+        // reads rbac_store_; dropping the store here disarms that probe well
+        // before rbac_store_ tears down. Every HTTP/gRPC handler holding the raw
+        // pointer is quiesced by the drains above.
+        agent_service_.set_mgmt_group_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_mgmt_group_store(nullptr);
+        mgmt_group_store_.reset();
         // ResultSetStore borrows pg_pool_ — drop before the pool. The maintenance
         // thread that leased it is already joined above; every HTTP/gRPC handler
         // holding the raw pointer is quiesced by the drains above.
@@ -6185,8 +6255,12 @@ private:
             bool global_read = rbac_store_ && rbac_store_->is_open() &&
                                rbac_store_->check_permission(username, "Infrastructure", "Read");
             if (!global_read) {
+                // ADR-0042: nullopt (store degraded) → empty visible set
+                // (fail-closed: return no agents rather than the full fleet).
                 auto visible = mgmt_group_store_->get_visible_agents(username);
-                std::set<std::string> visible_set(visible.begin(), visible.end());
+                std::set<std::string> visible_set;
+                if (visible)
+                    visible_set.insert(visible->begin(), visible->end());
                 nlohmann::json filtered = nlohmann::json::array();
                 for (const auto& a : agents) {
                     if (a.contains("agent_id") &&
@@ -7313,6 +7387,11 @@ private:
             bool inventory_ok = inventory_store_ && inventory_store_->is_open();
             // Load-bearing for the MCP write surface + REST approvals (sre-BLOCKING-1).
             bool approval_ok = approval_manager_ && approval_manager_->is_open();
+            // Management-group CONFINEMENT substrate (ADR-0042) — was wired into
+            // /readyz but missing here, the same readyz-vs-healthz drift the
+            // rows above document. A degraded confinement store fails RbacStore's
+            // list gate closed, so surface it.
+            bool mgmt_group_ok = mgmt_group_store_ && mgmt_group_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -7320,7 +7399,7 @@ private:
                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
-                approval_ok;
+                approval_ok && mgmt_group_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -7343,7 +7422,8 @@ private:
                   {"app_perf_daily_store", app_perf_daily_ok ? "ok" : "error"},
                   {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"},
                   {"device_inventory_store", device_inventory_ok ? "ok" : "error"},
-                  {"inventory_store", inventory_ok ? "ok" : "error"}}},
+                  {"inventory_store", inventory_ok ? "ok" : "error"},
+                  {"management_group_store", mgmt_group_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -8727,8 +8807,11 @@ private:
                     if (mgmt_group_store_) {
                         auto s = require_auth(req, res);
                         if (!s) return;
+                        // ADR-0042: nullopt (store degraded) → empty visible set → 404.
                         auto vis = mgmt_group_store_->get_visible_agents(s->username);
-                        std::unordered_set<std::string> visible(vis.begin(), vis.end());
+                        std::unordered_set<std::string> visible;
+                        if (vis)
+                            visible.insert(vis->begin(), vis->end());
                         for (const auto& aid : agent_ids)
                             if (visible.count(aid))
                                 filtered.push_back(aid);
@@ -11526,8 +11609,13 @@ private:
             [this](const std::string& username) -> std::optional<std::set<std::string>> {
             if (rbac_store_ && rbac_store_->is_rbac_enabled() && mgmt_group_store_) {
                 if (!rbac_store_->check_permission(username, "Infrastructure", "Read")) {
+                    // ADR-0042: get_visible_agents nullopt means the mgmt-store
+                    // DEGRADED — return an EMPTY confined set (fail-closed: sees
+                    // nothing), NOT nullopt here (which means "sees all fleet").
                     auto v = mgmt_group_store_->get_visible_agents(username);
-                    return std::set<std::string>(v.begin(), v.end());
+                    if (!v)
+                        return std::set<std::string>{};
+                    return std::set<std::string>(v->begin(), v->end());
                 }
             }
             return std::nullopt; // global read or RBAC disabled → sees all

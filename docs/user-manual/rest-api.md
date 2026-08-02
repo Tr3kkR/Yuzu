@@ -450,6 +450,23 @@ All validation runs at the `ManagementGroupStore` layer as well as the REST hand
 }
 ```
 
+**Error (503) -- store unavailable:**
+
+Cycle and depth validation walk the hierarchy via recursive ancestor/descendant
+reads against the `management_group_store` Postgres substrate (ADR-0042). If
+those reads degrade (store not open, connection-pool acquire timeout, or a query
+error) the re-parent cannot be validated safely, so it **fails closed with 503**
+rather than risk applying an unvalidated move — the caller did nothing wrong, the
+store did. This is distinct from the `400` validation errors above (a genuinely
+bad request); retry a `503` once the substrate recovers.
+
+```json
+{
+  "error": "management group store unavailable",
+  "meta": { "api_version": "v1" }
+}
+```
+
 ---
 
 #### `DELETE /api/v1/management-groups/{id}`
