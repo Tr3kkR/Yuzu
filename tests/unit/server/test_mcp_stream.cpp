@@ -638,6 +638,45 @@ TEST_CASE("McpStreamPump: a sub-millisecond remainder waits rather than spinning
     CHECK(elapsed >= std::chrono::milliseconds(50)); // ~100ms honoured; a few ms floored
 }
 
+TEST_CASE("McpStreamPump: pass one owes no store round trip - the ctor seeds the check deadline",
+          "[mcp][stream][tickgate]") {
+    // FAST-RED GUARD for the epoch-seed regression (#2730 review). Leaving next_check_
+    // at its default leaves it at the steady_clock EPOCH, which is in the past for any
+    // real reading: the first wait budget floors to zero, the pass returns instantly
+    // and re-enters, and the suite SPINS. It was found that way - as a >10-minute hang
+    // rather than a failed assertion - and a hang is a far worse diagnostic for whoever
+    // hits it next than a named red.
+    //
+    // So this asserts the SEMANTIC property the seed exists for, not a timing floor:
+    // attach has just authenticated this request end to end, so pass one owes neither
+    // store round trip. One pass, no wall-clock dependence, and it reddens the moment
+    // the seed goes. The frozen clock is what makes it exact - `now` never advances, so
+    // the ONLY thing that can put the gate in the future is the ctor's seed.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    const auto base = std::chrono::steady_clock::now();
+    mcp::McpStreamPump::Config cfg{};
+    cfg.tick = std::chrono::milliseconds(20);  // the honoured wait IS this test's whole cost
+    int checks = 0;
+    int liveness = 0;
+    mcp::McpStreamPump pump{attached.sink,
+                            state,
+                            attached.generation,
+                            [&] { ++checks; return mcp::StreamRevalidate::kValid; },
+                            [&] { ++liveness; return true; },
+                            cfg,
+                            [&] { return base; }};
+    FakeWire wire;
+    REQUIRE(pump.pump_once(wire.writer()));  // the stream stays open either way
+    // Unseeded, `base >= epoch` is true and BOTH tick-gated round trips fire on the
+    // pass that was supposed to owe neither - so both halves of the gate are pinned,
+    // not just the credential one.
+    CHECK(checks == 0);
+    CHECK(liveness == 0);
+}
+
 TEST_CASE("McpStreamPump: the wait is bounded by the next check, so the tick cannot stretch",
           "[mcp][stream][tickgate]") {
     // The trap that this exact fix fell into once already, on the abandoned branch: gating

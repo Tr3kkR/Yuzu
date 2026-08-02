@@ -37,6 +37,19 @@ static_assert(McpSessionRegistry::Config{}.ring_cap == kMcpRingCapDefault,
 // forward-declares McpStreamState), so the two literals are pinned together here.
 static_assert(McpSessionRegistry::Config{}.ring_bytes_cap == kMcpRingBytesCapDefault,
               "registry byte-cap default and stream byte-cap default must not drift");
+// The session TTL slide rides the TICK GATE (#2730). Before that it ran on every
+// wake, so the tick was irrelevant to it; now a live stream refreshes its session
+// once per tick, and a tick approaching the idle TTL would let the registry's idle
+// GC reclaim a session out from under a stream that is demonstrably alive. The
+// margin is deliberately generous rather than a bare `tick < idle_ttl`: a pass can
+// stall for up to the 30 s socket write timeout before it reaches the gate, so the
+// interval between slides is bounded by tick PLUS that stall, not by tick alone.
+// 100x puts the floor at 300 s against today's 1800 s vs 3000 ms. This is the
+// fourth cross-constant pair the file pins, and the one the tick gate created -
+// the other three predate it.
+static_assert(kMcpStreamTickDefault * 100 <= McpSessionRegistry::Config{}.idle_ttl,
+              "session idle_ttl must stay far above the stream tick (#2730) - the TTL slide "
+              "now runs once per tick, so a narrow margin lets idle GC reap a live stream");
 
 namespace {
 
