@@ -57,6 +57,7 @@ contract_test_exe = executable(
   'yuzu_adr31_contract_tests',
   files(
     'unit/contracts/test_contract_version.cpp',
+    'unit/contracts/test_b2_use_case.cpp',
     'unit/contracts/test_b3_platform.cpp',
     'unit/contracts/test_transport_auth_slot.cpp',
   ),
