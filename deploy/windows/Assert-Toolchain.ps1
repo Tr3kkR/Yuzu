@@ -1,3 +1,4 @@
+#Requires -Version 7
 <#
   Assert-Toolchain.ps1 — runner self-test. Verifies that the toolchain manifest
   emitted by Provision-Windows-Runner.ps1 still holds: every required tool is
@@ -9,11 +10,13 @@
   build. This is the catch for the cutover faults (toolchain off PATH, MSYS2
   /usr/bin missing, gateway escript/rebar3 unresolved).
 
-  Exit 0 = healthy; exit 1 = at least one required tool/env missing.
+  Exit 0 = healthy; exit 1 = an incompatible manifest, a version mismatch,
+  or at least one required tool/env item missing.
 #>
 [CmdletBinding()]
 param(
-  [string]$ManifestPath = 'C:\actions-runner\toolchain-manifest.json'
+  [string]$ManifestPath = 'C:\actions-runner\toolchain-manifest.json',
+  [string]$ContractPath = (Join-Path $PSScriptRoot 'toolchain-contract.json')
 )
 $ErrorActionPreference = 'Stop'
 
@@ -21,7 +24,63 @@ if(-not (Test-Path $ManifestPath)){
   Write-Host "FAIL: no manifest at $ManifestPath — run Provision-Windows-Runner.ps1 first." -ForegroundColor Red
   exit 1
 }
-$m = Get-Content $ManifestPath -Raw | ConvertFrom-Json
+try {
+  $m = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json -ErrorAction Stop
+} catch {
+  Write-Host "FAIL: manifest is not valid JSON: $ManifestPath ($($_.Exception.Message))" -ForegroundColor Red
+  exit 1
+}
+
+$contractModule = Join-Path $PSScriptRoot 'Toolchain-Contract.psm1'
+if(-not (Test-Path -LiteralPath $contractModule)){
+  Write-Host "FAIL: toolchain contract module missing at $contractModule" -ForegroundColor Red
+  exit 1
+}
+try {
+  Import-Module $contractModule -Force -ErrorAction Stop
+  $contract = Read-YuzuToolchainContract -Path $ContractPath
+  $manifestSchema = [string]$m.schema
+  if([string]::IsNullOrWhiteSpace($manifestSchema)){
+    $legacyDeadline = [DateTimeOffset]::MinValue
+    $deadlineValue = $contract.legacy_schema_compatibility_until
+    $deadlineValid = if($deadlineValue -is [datetime]){
+      $legacyDeadline = [DateTimeOffset]$deadlineValue
+      $true
+    } else {
+      [DateTimeOffset]::TryParse([string]$deadlineValue, [ref]$legacyDeadline)
+    }
+    if(-not $deadlineValid){
+      throw 'contract legacy_schema_compatibility_until is missing or invalid'
+    }
+    if([DateTimeOffset]::UtcNow -gt $legacyDeadline){
+      throw "schema-less manifest compatibility expired at $($legacyDeadline.ToString('o')); drain and reprovision this runner"
+    }
+    Write-Host ("WARN: schema-less legacy manifest accepted through {0}; drain and reprovision this runner before the deadline." -f $legacyDeadline.ToString('o')) -ForegroundColor Yellow
+    # The immediately preceding provisioner emitted the complete v1 shape
+    # except for its discriminator. Add it only in memory so every v1 pin,
+    # path, and live-version probe still runs during the compatibility window.
+    $m | Add-Member -NotePropertyName schema -NotePropertyValue ([string]$contract.schema)
+  }
+  $contractResult = Test-YuzuToolchainManifest -Manifest $m -Contract $contract -ExpectedHost $env:COMPUTERNAME
+} catch {
+  Write-Host "FAIL: could not validate the toolchain contract ($($_.Exception.Message))" -ForegroundColor Red
+  exit 1
+}
+
+Write-Host "Toolchain contract: $ContractPath" -ForegroundColor Cyan
+foreach($observation in @($contractResult.Observations)){
+  $label = if($observation.Matched){ 'OK' } else { 'SEEN' }
+  $color = if($observation.Matched){ 'Green' } else { 'Yellow' }
+  Write-Host ("  [{0}] {1,-18} {2} (expected {3})" -f $label, $observation.Name, $observation.Actual, $observation.Expected) -ForegroundColor $color
+}
+if(-not $contractResult.Healthy){
+  foreach($problem in @($contractResult.Errors)){
+    Write-Host "  [MISS] $problem" -ForegroundColor Red
+  }
+  Write-Host "`nFAIL: manifest/tool versions do not satisfy the repository contract." -ForegroundColor Red
+  exit 1
+}
+
 $fail = 0
 
 function Get-ServiceExe([string]$image){
@@ -31,7 +90,7 @@ function Get-ServiceExe([string]$image){
 }
 
 Write-Host "Toolchain manifest: $ManifestPath" -ForegroundColor Cyan
-Write-Host ("  host=$($m.host)  generated=$($m.generated)")
+Write-Host ("  schema=$($m.schema)  host=$($m.host)  generated=$($m.generated)")
 
 Write-Host "`n-- tools --"
 foreach($t in $m.tools){
@@ -143,9 +202,18 @@ if(-not $hasClusterContract){
         }
       }
       if($c.psql -and (Test-Path -LiteralPath $c.psql)){
-        $probe = (& $c.psql -w -U yuzu -d yuzu_test -h 127.0.0.1 -p $c.port -tAc 'SELECT 1' 2>$null | Out-String).Trim()
-        if($LASTEXITCODE -ne 0 -or $probe -ne '1'){
-          Write-Host ("  [MISS] agent {0}: authenticated SELECT 1 failed on :{1}" -f $c.agent, $c.port) -ForegroundColor Red
+        $probeError = $null
+        try {
+          $probe = (Invoke-YuzuContractProbe -Executable $c.psql `
+            -Arguments @('-w','-U','yuzu','-d','yuzu_test','-h','127.0.0.1','-p',[string]$c.port,'-tAc','SELECT 1') `
+            -TimeoutSeconds ([int]$contract.probe_timeout_seconds)).Trim()
+        } catch {
+          $probe = ''
+          $probeError = $_.Exception.Message
+        }
+        if($probe -ne '1'){
+          $detail = if($probeError){ ": $probeError" } else { '' }
+          Write-Host ("  [MISS] agent {0}: authenticated SELECT 1 failed on :{1}{2}" -f $c.agent, $c.port, $detail) -ForegroundColor Red
           $clusterOk = $false
           $fail++
         }
@@ -164,7 +232,18 @@ if(-not $hasClusterContract){
 # (full path); this is the `head: command not found` regression guard.
 $bash = ($m.tools | Where-Object name -eq 'msys2_bash').path
 if($bash -and (Test-Path $bash)){
-  $head = & $bash --noprofile --norc -c 'command -v head' 2>$null
+  # Provisioning deliberately keeps MSYS2 out of machine PATH so its
+  # find/sort/etc. do not shadow Windows tools. Start-PinnedRunner prepends the
+  # recorded bash directory inside each runner process; model that exact child
+  # environment here without leaking it into the maintenance shell.
+  $oldPath = $env:Path
+  try {
+    $bashDir = Split-Path -Parent $bash
+    $env:Path = "$bashDir;$oldPath"
+    $head = & $bash --noprofile --norc -c 'command -v head' 2>$null
+  } finally {
+    $env:Path = $oldPath
+  }
   if($head){ Write-Host "`n  [OK]   msys2 bash resolves coreutils (head=$head)" -ForegroundColor Green }
   else     { Write-Host "`n  [MISS] msys2 bash cannot resolve 'head'" -ForegroundColor Red; $fail++ }
 }
