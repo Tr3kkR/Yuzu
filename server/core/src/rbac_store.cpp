@@ -2256,6 +2256,12 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
     }
 
     // 8. Move the verified legacy file aside (non-fatal on failure).
+    // Close the legacy read-only handle FIRST: Windows refuses to rename a file
+    // with an open handle (ERROR_SHARING_VIOLATION), so leaving `legacy` open
+    // silently defeated the move-aside on the Wee Tam MSVC leg (POSIX allows
+    // rename-with-open-handle, so it passed on Linux/macOS). All legacy reads
+    // are already materialised in memory above.
+    legacy.close();
     std::error_code mv_ec;
     auto aside = legacy_db_path;
     aside += ".migrated-" + std::to_string(now_secs());
