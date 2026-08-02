@@ -1,6 +1,9 @@
 yuzu_adr31_contracts_lib = static_library(
   'yuzu_adr31_contracts',
-  files('src/b3_platform.cpp'),
+  files(
+    'src/b3_platform.cpp',
+    'src/json_support.cpp',
+  ),
   include_directories: include_directories('include'),
   dependencies: [nlohmann_dep],
   install: false,

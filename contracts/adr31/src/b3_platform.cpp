@@ -2,6 +2,8 @@
 
 #include <yuzu/contracts/adr31/contract_version.hpp>
 
+#include "json_support.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <cstddef>
@@ -174,6 +176,11 @@ decode_b3_platform_request(std::string_view wire_json) {
     if (!root.is_object()) {
         return std::unexpected(
             error(ContractErrorCode::RootNotObject, "", "contract body must be an object"));
+    }
+
+    if (const auto authority_fields = detail::reject_forbidden_authority_fields(root);
+        !authority_fields) {
+        return std::unexpected(authority_fields.error());
     }
 
     const auto version = decode_contract_header(root);
