@@ -35,6 +35,37 @@ std::string col_text(sqlite3_stmt* stmt, int col) {
     return p ? std::string(reinterpret_cast<const char*>(p)) : std::string{};
 }
 
+} // namespace
+
+std::string to_string(ApprovalOrigin origin) {
+    switch (origin) {
+    case ApprovalOrigin::kInstruction:
+        return "instruction";
+    case ApprovalOrigin::kSchedule:
+        return "schedule";
+    case ApprovalOrigin::kMcp:
+        return "mcp";
+    case ApprovalOrigin::kUnspecified:
+        break;
+    }
+    return "";
+}
+
+ApprovalOrigin approval_origin_from_string(const std::string& text) {
+    if (text == "instruction")
+        return ApprovalOrigin::kInstruction;
+    if (text == "schedule")
+        return ApprovalOrigin::kSchedule;
+    if (text == "mcp")
+        return ApprovalOrigin::kMcp;
+    // Empty (pre-v5 row or an undeclared mint) and any unrecognised value both
+    // read as "no declared origin" — an unknown string must never be silently
+    // promoted into a surface that grants something.
+    return ApprovalOrigin::kUnspecified;
+}
+
+namespace {
+
 Approval row_to_approval(sqlite3_stmt* stmt) {
     Approval a;
     a.id = col_text(stmt, 0);
@@ -49,6 +80,7 @@ Approval row_to_approval(sqlite3_stmt* stmt) {
     a.consumed_at = sqlite3_column_int64(stmt, 9);
     a.consumed_by = col_text(stmt, 10);
     a.schedule_id = col_text(stmt, 11);
+    a.origin = approval_origin_from_string(col_text(stmt, 12));
     return a;
 }
 
@@ -56,7 +88,7 @@ Approval row_to_approval(sqlite3_stmt* stmt) {
 // this constant so the column order can never drift between call sites.
 const char* kSelectAllCols = "id, definition_id, status, submitted_by, submitted_at, "
                              "reviewed_by, reviewed_at, review_comment, scope_expression, "
-                             "consumed_at, consumed_by, schedule_id";
+                             "consumed_at, consumed_by, schedule_id, origin";
 
 } // namespace
 
@@ -111,6 +143,14 @@ void ApprovalManager::create_tables() {
             CREATE INDEX IF NOT EXISTS idx_approvals_schedule_id
                 ON approvals(schedule_id);
         )"},
+        // v5 (#2442): WHICH surface minted the ticket. Additive, '' = no
+        // declared origin — the honest reading for both a pre-v5 row and the
+        // MCP mint that cannot yet declare itself. Deliberately NOT back-filled
+        // to 'instruction': every pre-v5 row would then claim a surface it may
+        // not have come from, and these rows are approval evidence.
+        {5, R"(
+            ALTER TABLE approvals ADD COLUMN origin TEXT NOT NULL DEFAULT '';
+        )"},
     };
     if (!MigrationRunner::run(db_, "approval_manager", kMigrations)) {
         // Fail closed (governance sre-BLOCKING-1 / HC-1): a failed v2 migration
@@ -131,13 +171,26 @@ void ApprovalManager::create_tables() {
 
 std::expected<std::string, std::string>
 ApprovalManager::submit(const std::string& definition_id, const std::string& submitted_by,
-                        const std::string& scope_expression, const std::string& schedule_id) {
+                        const std::string& scope_expression, const std::string& schedule_id,
+                        ApprovalOrigin origin) {
     if (!db_)
         return std::unexpected("database not open");
     if (definition_id.empty())
         return std::unexpected("definition_id is required");
     if (submitted_by.empty())
         return std::unexpected("submitted_by is required");
+    // Namespace reservation (#2442): a surface that has declared itself as
+    // something other than MCP may not mint into the MCP ticket namespace. The
+    // MCP recall matches on (definition_id, scope_expression) and does not bind
+    // the submitter, so without this a ticket minted through the REST
+    // instruction gate — where the definition id is caller-influenced and the
+    // scope expression is caller-supplied verbatim — is a ticket the MCP recall
+    // will accept. Undeclared mints are exempt because the MCP gate itself is
+    // still one of them (ApprovalOrigin::kUnspecified).
+    if (origin != ApprovalOrigin::kMcp && origin != ApprovalOrigin::kUnspecified &&
+        definition_id.rfind(kMcpDefinitionPrefix, 0) == 0)
+        return std::unexpected(std::string("definition_id may not use the reserved '") +
+                               kMcpDefinitionPrefix + "' prefix");
 
     std::lock_guard lock(mtx_);
 
@@ -216,8 +269,8 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     const char* sql = R"(
         INSERT INTO approvals (id, definition_id, status, submitted_by, submitted_at,
                                reviewed_by, reviewed_at, review_comment, scope_expression,
-                               schedule_id)
-        VALUES (?, ?, 'pending', ?, ?, '', 0, '', ?, ?)
+                               schedule_id, origin)
+        VALUES (?, ?, 'pending', ?, ?, '', 0, '', ?, ?, ?)
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
@@ -229,6 +282,8 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     sqlite3_bind_int64(stmt, 4, ts);
     sqlite3_bind_text(stmt, 5, scope_expression.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 6, schedule_id.c_str(), -1, SQLITE_TRANSIENT);
+    auto origin_text = to_string(origin);
+    sqlite3_bind_text(stmt, 7, origin_text.c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         auto err = std::string(sqlite3_errmsg(db_));

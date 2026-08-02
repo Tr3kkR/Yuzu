@@ -1,4 +1,5 @@
 #include "instruction_store.hpp"
+#include "approval_manager.hpp" // kMcpDefinitionPrefix — the ONE definition of the reserved prefix
 #include "migration_runner.hpp"
 #include "product_pack_store.hpp" // ProductPackStore::verify_signature (#1073)
 #include "response_templates_engine.hpp"
@@ -448,6 +449,17 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
                 return std::unexpected(
                     "definition id may only contain letters, digits, '.', '_', and '-'");
         }
+        // Reserved namespace (#2442): `mcp.<tool>` ids belong to the MCP
+        // approval-ticket gate, whose recall matches a ticket on
+        // (definition_id, scope_expression) without binding the submitter. An
+        // instruction definition authored under that prefix is the other half
+        // of the cross-surface confusion — it is what would let an approval
+        // minted through the instruction gate line up with an MCP tool's
+        // canonical arguments. No shipped content uses the prefix, so nothing
+        // legitimate is rejected here.
+        if (def.id.rfind(kMcpDefinitionPrefix, 0) == 0)
+            return std::unexpected(std::string("definition id may not use the reserved '") +
+                                   kMcpDefinitionPrefix + "' prefix (reserved for MCP approvals)");
     }
 
     auto id = def.id.empty() ? generate_id() : def.id;

@@ -12,6 +12,43 @@
 
 namespace yuzu::server {
 
+/// WHICH surface minted a ticket (#2442). `ApprovalManager` is one shared store
+/// with three mint paths, and a ticket was previously matched on
+/// (definition_id, scope_expression) alone — so an instruction definition named
+/// `mcp.<tool>` whose approval scope equalled a tool's canonical argument JSON
+/// was consumable through the MCP recall, and vice versa. Recording the minting
+/// surface makes the namespaces separable, and gives audit a clean per-surface
+/// split.
+enum class ApprovalOrigin {
+    /// A mint that predates this enum, or one that has not declared itself:
+    /// today ONLY the MCP gate, which cannot be updated to declare `kMcp` while
+    /// mcp_server.cpp is frozen for a parallel rebase. Kept honest rather than
+    /// mislabelled — a ticket recorded `instruction` when MCP minted it would be
+    /// false evidence. Tighten to `kMcp` when the MCP mint declares itself.
+    kUnspecified,
+    /// The interactive REST/dashboard instruction-approval gate
+    /// (workflow_routes.cpp).
+    kInstruction,
+    /// A scheduled-fire submission (schedule_runner.cpp).
+    kSchedule,
+    /// The MCP approval-ticket gate (mcp_server.cpp). Not yet passed by that
+    /// caller — see kUnspecified.
+    kMcp,
+};
+
+/// Column text for `origin`. `kUnspecified` stores the empty string, which is
+/// also what migration v5 back-fills into pre-existing rows, so "no declared
+/// origin" reads identically whether the row predates the column or the caller
+/// stayed silent.
+std::string to_string(ApprovalOrigin origin);
+ApprovalOrigin approval_origin_from_string(const std::string& text);
+
+/// Definition-id prefix reserved for MCP-minted tickets (#2442). Enforced on
+/// both halves: no non-MCP mint path may submit an id under it, and no
+/// instruction definition may be authored with it
+/// (InstructionStore::create_definition_impl).
+inline constexpr const char* kMcpDefinitionPrefix = "mcp.";
+
 struct Approval {
     std::string id;
     std::string definition_id;
@@ -40,6 +77,9 @@ struct Approval {
     /// sharing the same (submitted_by, definition_id, scope_expression)
     /// tuple. Additive column (migration v4).
     std::string schedule_id;
+    /// Which surface minted this ticket (#2442). Additive column (migration
+    /// v5); pre-existing rows read back as kUnspecified.
+    ApprovalOrigin origin{ApprovalOrigin::kUnspecified};
 };
 
 struct ApprovalQuery {
@@ -82,10 +122,19 @@ public:
     /// `schedule_id` (M-02, #1806): empty for the interactive submit path;
     /// the owning schedule's id for a scheduled-fire submission — see the
     /// `Approval::schedule_id` doc comment for why this matters.
-    std::expected<std::string, std::string> submit(const std::string& definition_id,
-                                                   const std::string& submitted_by,
-                                                   const std::string& scope_expression,
-                                                   const std::string& schedule_id = "");
+    ///
+    /// `origin` (#2442) declares the minting surface. A caller that declares a
+    /// non-MCP origin may NOT mint a `mcp.`-prefixed definition_id: that is the
+    /// forgeable half of the cross-surface confusion, since the REST
+    /// instruction gate mints with a caller-influenced definition id and a
+    /// fully caller-controlled scope expression, which the MCP recall matches
+    /// on. Declaring no origin still permits the prefix, because the MCP mint
+    /// itself is the one caller that cannot yet declare — see
+    /// ApprovalOrigin::kUnspecified.
+    std::expected<std::string, std::string>
+    submit(const std::string& definition_id, const std::string& submitted_by,
+           const std::string& scope_expression, const std::string& schedule_id = "",
+           ApprovalOrigin origin = ApprovalOrigin::kUnspecified);
 
     std::vector<Approval> query(const ApprovalQuery& q = {}) const;
 

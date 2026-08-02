@@ -383,6 +383,124 @@ TEST_CASE("ApprovalManager: consume_ticket replay is rejected and keeps the orig
     CHECK(row->consumed_by == "operator1"); // the losing recall never overwrites
 }
 
+// ── Mint-surface origin + reserved namespace (#2442) ───────────────────────
+// The MCP recall matches a ticket on (definition_id, scope_expression) and
+// does not bind the submitter, so a ticket minted elsewhere under an `mcp.`
+// definition id is a ticket the MCP gate would accept.
+
+TEST_CASE("ApprovalManager: a declared non-MCP origin cannot mint into the mcp. namespace",
+          "[approval_manager][approval][security]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    // The REST instruction gate: definition id caller-influenced, scope
+    // expression caller-supplied verbatim.
+    auto forged = mgr.submit("mcp.quarantine_device", "attacker", "{\"agent_id\":\"a1\"}", "",
+                             ApprovalOrigin::kInstruction);
+    REQUIRE(!forged.has_value());
+    CHECK(forged.error().find("reserved") != std::string::npos);
+
+    auto from_schedule = mgr.submit("mcp.delete_tag", "attacker", "{}", "sched-1",
+                                    ApprovalOrigin::kSchedule);
+    CHECK(!from_schedule.has_value());
+
+    // Nothing was written.
+    CHECK(mgr.query({}).empty());
+}
+
+TEST_CASE("ApprovalManager: a declared origin is recorded on the ticket",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto instr = mgr.submit("inventory.audit", "operator1", "{}", "", ApprovalOrigin::kInstruction);
+    REQUIRE(instr.has_value());
+    auto sched = mgr.submit("inventory.audit", "operator2", "{}", "sched-1",
+                            ApprovalOrigin::kSchedule);
+    REQUIRE(sched.has_value());
+    auto mcp = mgr.submit("mcp.delete_tag", "operator3", "{}", "", ApprovalOrigin::kMcp);
+    REQUIRE(mcp.has_value());
+
+    CHECK(mgr.get(*instr)->origin == ApprovalOrigin::kInstruction);
+    CHECK(mgr.get(*sched)->origin == ApprovalOrigin::kSchedule);
+    CHECK(mgr.get(*mcp)->origin == ApprovalOrigin::kMcp);
+    CHECK(mgr.query({.submitted_by = "operator1"}).at(0).origin == ApprovalOrigin::kInstruction);
+}
+
+TEST_CASE("ApprovalManager: an undeclared mint records no origin and keeps the mcp. prefix",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    // The MCP gate still mints without declaring (mcp_server.cpp is frozen for
+    // a parallel rebase). It must keep working, and must NOT be recorded as a
+    // surface it did not come from.
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{\"agent_id\":\"a1\"}");
+    REQUIRE(id.has_value());
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->origin == ApprovalOrigin::kUnspecified);
+}
+
+TEST_CASE("ApprovalManager: origin round-trips through its column text",
+          "[approval_manager][approval]") {
+    CHECK(to_string(ApprovalOrigin::kInstruction) == "instruction");
+    CHECK(to_string(ApprovalOrigin::kSchedule) == "schedule");
+    CHECK(to_string(ApprovalOrigin::kMcp) == "mcp");
+    CHECK(to_string(ApprovalOrigin::kUnspecified).empty());
+
+    CHECK(approval_origin_from_string("instruction") == ApprovalOrigin::kInstruction);
+    CHECK(approval_origin_from_string("schedule") == ApprovalOrigin::kSchedule);
+    CHECK(approval_origin_from_string("mcp") == ApprovalOrigin::kMcp);
+    // Empty (a pre-v5 row) and anything unrecognised both fall back to "no
+    // declared origin" — an unknown string must never be promoted into a
+    // surface.
+    CHECK(approval_origin_from_string("") == ApprovalOrigin::kUnspecified);
+    CHECK(approval_origin_from_string("MCP") == ApprovalOrigin::kUnspecified);
+    CHECK(approval_origin_from_string("nonsense") == ApprovalOrigin::kUnspecified);
+}
+
+TEST_CASE("ApprovalManager: migration v5 leaves pre-existing rows with no declared origin",
+          "[approval_manager][db]") {
+    TestDb tdb;
+    // A v4-shaped store with a row already in it, schema_meta pinned at 4 so
+    // create_tables() runs migration 5 alone (the shape test_nvd.cpp uses).
+    REQUIRE(sqlite3_exec(tdb.db,
+                         "CREATE TABLE schema_meta (store TEXT PRIMARY KEY,"
+                         " version INTEGER NOT NULL, upgraded_at INTEGER NOT NULL DEFAULT 0);"
+                         "INSERT INTO schema_meta (store, version, upgraded_at)"
+                         " VALUES ('approval_manager', 4, 0);"
+                         "CREATE TABLE approvals ("
+                         "id TEXT PRIMARY KEY, definition_id TEXT NOT NULL,"
+                         "status TEXT NOT NULL DEFAULT 'pending',"
+                         "submitted_by TEXT NOT NULL DEFAULT '',"
+                         "submitted_at INTEGER NOT NULL DEFAULT 0,"
+                         "reviewed_by TEXT NOT NULL DEFAULT '',"
+                         "reviewed_at INTEGER NOT NULL DEFAULT 0,"
+                         "review_comment TEXT NOT NULL DEFAULT '',"
+                         "scope_expression TEXT NOT NULL DEFAULT '',"
+                         "consumed_at INTEGER NOT NULL DEFAULT 0,"
+                         "consumed_by TEXT NOT NULL DEFAULT '',"
+                         "schedule_id TEXT NOT NULL DEFAULT '');"
+                         "INSERT INTO approvals (id, definition_id, status, submitted_by)"
+                         " VALUES ('legacy-1', 'inventory.audit', 'pending', 'operator1');",
+                         nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables(); // migrates v1..v5 over the existing table
+    REQUIRE(mgr.is_open());
+
+    auto row = mgr.get("legacy-1");
+    REQUIRE(row.has_value());
+    CHECK(row->definition_id == "inventory.audit");
+    // NOT back-filled to 'instruction': the row is evidence, and its surface is
+    // genuinely unknown.
+    CHECK(row->origin == ApprovalOrigin::kUnspecified);
+}
+
 // ── Pre-consume recheck (#2443) ────────────────────────────────────────────
 // A ticket can sit approved-but-unconsumed for up to the 7-day TTL, so the
 // state its effect assumes may drift. The recheck runs between the match and
