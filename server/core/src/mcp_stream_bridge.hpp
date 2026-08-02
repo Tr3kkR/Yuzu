@@ -86,6 +86,14 @@
 // window for a terminal to land in; closing that window IS #2409 (C5), so do not
 // re-split this into two steps.
 //
+// A DEFER advances to the next-oldest victim; it does not end the pass (UP-5,
+// #2489). The no-tight-re-visit property FA-4 wanted is carried by a monotonic
+// parked_seq floor instead, so an oldest victim that is perpetually mid-projection
+// costs itself its turn rather than denying relief to every newer victim. The
+// marks that pass leaves behind are cleared in one place only - the exit where
+// the cap is back under water (UP-4, #2489) - because a mark on a merely-deferred
+// victim is still live work.
+//
 // Record state DOMINATES the bus verdict: a record that already holds a real final
 // (accepted AND projected) is torn down with nothing published; one with a latched
 // but unprojected terminal, or a projection in flight, DEFERS - keeping its
@@ -344,6 +352,21 @@ public:
     /// record; kSynthesizeUnavailable = the -32014 error, reachable ONLY for a
     /// record that genuinely never saw a terminal.
     enum class TeardownFinal { kNone, kSynthesizeUnavailable, kFallbackFinal };
+    /// sre-N1 (#2489): the CLOSED disposition label set for
+    /// yuzu_mcp_bridge_forced_expire_total. Only the failure of a publish was
+    /// counted before, so an operator could not tell a degrade-to-fallback from a
+    /// synthesized -32014 from an ordinary settle - the distinction existed only
+    /// in audit, which is not scraped. Ordered to match TeardownFinal and derived
+    /// from it, so a fourth disposition cannot be added without the label set and
+    /// server.cpp's pre-seed loop following it (same contract as
+    /// kTeardownStageNames and kDegradeReasons).
+    static constexpr std::size_t kTeardownFinalCount = 3;
+    static constexpr std::array<const char*, kTeardownFinalCount> kForcedExpireDispositions{
+        "none", "synthesize_unavailable", "fallback_final"};
+    static constexpr const char* forced_expire_disposition(TeardownFinal d) {
+        const auto idx = static_cast<std::size_t>(d);
+        return idx < kTeardownFinalCount ? kForcedExpireDispositions[idx] : "unknown";
+    }
 
     /// The three resources a claimed teardown must settle, in the order it settles
     /// them. ONE source of truth: the metric label set, the pre-seed loop in
@@ -706,9 +729,12 @@ private:
         ///    path, and with a lock-free release store when `mu` cannot be
         ///    acquired. It used to be cleared inside the try whose FIRST act was
         ///    that acquisition, so a lock failure left it set forever and wedged
-        ///    the record out of all four consumers - and because a defer exits
-        ///    the pressure loop, one wedged victim stalled ring-only pressure
-        ///    relief bridge-wide.
+        ///    the record out of all four consumers - and under the defer-exits-
+        ///    the-pressure-loop behaviour of the time, one wedged victim stalled
+        ///    ring-only pressure relief bridge-wide. UP-5 (#2489) has since made a
+        ///    defer advance to the next victim, so a repeat would now cost that
+        ///    one record rather than the whole hatch - the containment here is
+        ///    still what stops the record itself wedging permanently.
         ///  - READ under `mu` at every consumer, with acquire, to pair with that
         ///    lock-free store.
         ///  - CLEARED LAST, always: whatever settle bookkeeping the degraded path
@@ -717,7 +743,15 @@ private:
         /// What the SKIPPED in-try bookkeeping means is stated once, at
         /// ~ClaimGuard in project_record - do not restate it here.
         std::atomic<bool> projection_in_flight{false};
-        bool pressure_requested = false;   ///< E1 - projector claims no new progress batch
+        /// E1 - while set, the projector starts no NEW progress batch for this
+        /// record (an already-latched terminal still settles). SET by a pressure
+        /// sweep on a victim it is about to visit; CLEARED (UP-4, #2489) by the
+        /// sweep pass that finds the cap back under water. It is NOT cleared on a
+        /// mere defer: the quiesce has to survive between sweeps or the next visit
+        /// finds a fresh projection in flight and defers again. Anything that
+        /// leaves it set past the pressure it was raised for freezes this record's
+        /// progress for the rest of its execution.
+        bool pressure_requested = false;
         /// H1 (MCP MUST: notifications/progress `progress` strictly increases):
         /// the highest `progress` value already committed to the wire for this
         /// record, and whether any has been sent. Touched ONLY by the single
@@ -883,6 +917,12 @@ private:
     void count_teardown_incomplete(TeardownStage stage) noexcept;
     /// #2529: a charge release deferred to teardown because its lock failed.
     void count_charge_release_deferred() noexcept;
+    /// sre-N1 (#2489): one pressure-sweep forced expiry, by the disposition it
+    /// decided. Called at the two pressure teardown sites rather than inside
+    /// teardown_claimed, because "forced expire" is a property of the PRESSURE
+    /// pass - the pin-ack / session-death / arming reap shares teardown_claimed
+    /// but is not a forced expiry and must not land in this family.
+    void count_forced_expire(TeardownFinal decision) noexcept;
     /// True iff a fault is armed for `stage` (consumes one). Test seam only.
     bool take_step_fault(TeardownStage stage) noexcept;
     void publish_records_gauge(std::size_t n) noexcept;

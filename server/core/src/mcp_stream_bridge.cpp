@@ -31,6 +31,15 @@ constexpr const char* kMetricStreamingBackstop = "yuzu_mcp_bridge_streaming_back
 // or its bus subscription outlived its teardown and now waits for shutdown() -
 // alert on > 0.
 constexpr const char* kMetricTeardownIncomplete = "yuzu_mcp_bridge_teardown_incomplete_total";
+// sre-N1 (#2489): one ring-only PRESSURE forced expiry, by the disposition the
+// visitor decided. `disposition` is a CLOSED set derived from TeardownFinal
+// (none | synthesize_unavailable | fallback_final), pre-seeded in server.cpp.
+// Without it the only forced-expire series was a FAILURE counter, so a fleet
+// silently degrading clients to the fallback final and one synthesizing -32014
+// looked identical on a dashboard; the split existed only in audit, which is not
+// scraped. Success-shaped by design: any movement at all means the cap is being
+// enforced, and `synthesize_unavailable` is the one to alert on.
+constexpr const char* kMetricForcedExpire = "yuzu_mcp_bridge_forced_expire_total";
 // #2529: a streamed admission charge that could not be released at its natural
 // release point (arm()'s cancel-degrade) and is therefore RETAINED on the record
 // until its teardown reclaims it. Distinct from kMetricTeardownIncomplete, which
@@ -1556,9 +1565,24 @@ void McpStreamBridge::sweep() {
     }
 
     // Pass 3: ring-only pressure (E1 two-stage, multi-victim, oldest-first).
+    //
+    // UP-5 (#2489): a DEFER now ADVANCES to the next-oldest victim instead of
+    // ending the pass. FA-4's concern was re-visiting the SAME oldest victim in a
+    // tight cycle within one sweep - not visiting a different one - so the guard
+    // is a monotonic floor over `parked_seq` rather than an early return. That is
+    // a sound total order: `parked_seq` comes from `next_parked_seq_++` under
+    // bridge_mu_ on the only two transitions into kRingOnly, and both write it in
+    // the SAME record-lock hold as the phase CAS, so every kRingOnly record has a
+    // unique nonzero value by the time a sweep can read it. Each victim is
+    // therefore visited at most once per sweep and the loop still terminates,
+    // while an oldest victim caught perpetually mid-projection no longer denies
+    // relief to every newer victim behind it.
+    std::uint64_t victim_floor = 0;  // consider only victims with parked_seq >= this
+    bool wake_projector = false;     // a defer left a secured terminal to settle
     for (;;) {
         std::shared_ptr<BridgeRecord> oldest;
         std::size_t ring_only = 0;
+        std::size_t marked = 0;
         {
             std::lock_guard<std::mutex> lk(bridge_mu_);
             if (shutdown_started_) {
@@ -1568,14 +1592,52 @@ void McpStreamBridge::sweep() {
                 if (rec->phase.load(std::memory_order_acquire) != Phase::kRingOnly) {
                     continue;
                 }
+                // The CAP is measured over EVERY parked record; the floor narrows
+                // only the SELECTION. Counting just the unvisited ones would make
+                // pressure appear to ease as the pass walks its own victims, and
+                // the escape hatch would stop with the cap still exceeded.
                 ++ring_only;
                 std::lock_guard<std::mutex> rlk(rec->mu);
+                if (rec->pressure_requested) {
+                    ++marked;
+                }
+                if (rec->parked_seq < victim_floor) {
+                    continue;  // already visited this sweep (UP-5)
+                }
                 if (!oldest || rec->parked_seq < oldest->parked_seq) {
                     oldest = rec;
                 }
             }
         }
         if (ring_only <= cfg_.ring_only_pressure_cap || !oldest) {
+            // UP-4 (#2489): `pressure_requested` is a request to QUIESCE a victim
+            // for a reap that is coming, and project_record gates `want_progress`
+            // on it - so a mark that outlives the pressure freezes progress on a
+            // record nothing is reaping any more, for the rest of what may be a
+            // long-running execution (the terminal still settles; `want_terminal`
+            // is ungated). Clear every mark HERE, where the escape hatch actually
+            // disengages, and ONLY here: a mark on a victim this pass merely
+            // deferred past is still live work, and clearing it would let the
+            // projector start the very batch the next visit needs quiesced.
+            // A record cannot leave kRingOnly except by a teardown claim that
+            // erases it, so this walk sees every mark that exists.
+            if (marked > 0 && ring_only <= cfg_.ring_only_pressure_cap) {
+                std::lock_guard<std::mutex> lk(bridge_mu_);
+                if (shutdown_started_) {
+                    return;
+                }
+                for (const auto& [key, rec] : records_) {
+                    if (rec->phase.load(std::memory_order_acquire) != Phase::kRingOnly) {
+                        continue;
+                    }
+                    std::lock_guard<std::mutex> rlk(rec->mu);
+                    rec->pressure_requested = false;
+                }
+                wake_projector = true;  // progress may have been frozen mid-execution
+            }
+            if (wake_projector) {
+                wake(*core_);
+            }
             return;
         }
         // Stage 1: mark the victim so the projector starts no NEW progress batch
@@ -1726,6 +1788,11 @@ void McpStreamBridge::sweep() {
                     continue;  // shutdown/another sweep already removed it
                 }
             }
+            // sre-N1: counted BEFORE the teardown, and unconditionally. The
+            // disposition is already decided and its terminal is published by
+            // teardown step 0, so a later step failing must not lose the reading -
+            // that failure has its own family (teardown_incomplete).
+            count_forced_expire(decision);
             teardown_claimed(oldest, decision, "mcp.bridge.forced_expire");
             continue;  // recount
         }
@@ -1772,15 +1839,20 @@ void McpStreamBridge::sweep() {
                 }
             }
             if (guard_claim) {
+                count_forced_expire(guard_decision);  // sre-N1; kNone-only by construction
                 teardown_claimed(oldest, guard_decision, "mcp.bridge.forced_expire");
                 continue;
             }
         }
-        // Deferred (not claimed, or a bus-less build): wake the projector to settle
-        // any secured terminal, then return. Defer-class exits the loop so we never
-        // re-visit the same oldest victim in a tight cycle within one sweep (FA-4).
-        wake(*core_);
-        return;
+        // Deferred (not claimed, or a bus-less build). ADVANCE past this victim
+        // rather than ending the pass (UP-5, #2489): the monotonic floor is what
+        // carries FA-4's no-tight-re-visit property now, so a defer costs this
+        // victim its turn this sweep instead of costing every newer victim theirs.
+        // The projector is woken ONCE at the exit - a defer means work was left for
+        // it (a secured terminal to settle), and one wake covers every deferral.
+        wake_projector = true;
+        victim_floor = oldest->parked_seq + 1;
+        continue;
     }
 }
 
@@ -2116,6 +2188,17 @@ void McpStreamBridge::count_reject(const char* reason) noexcept {
 void McpStreamBridge::count_charge_release_deferred() noexcept {
     if (metrics_ != nullptr) {
         obs_guard([&] { metrics_->counter(kMetricChargeReleaseDeferred).increment(); });
+    }
+}
+
+void McpStreamBridge::count_forced_expire(TeardownFinal decision) noexcept {
+    if (metrics_ != nullptr) {
+        obs_guard([&] {
+            metrics_
+                ->counter(kMetricForcedExpire,
+                          {{"disposition", forced_expire_disposition(decision)}})
+                .increment();
+        });
     }
 }
 

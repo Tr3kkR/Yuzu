@@ -209,6 +209,22 @@ groups:
             terminal is evictable from the replay ring but remains fetchable by
             execution_id. File a bug; no restart needed.
           runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement"
+      - alert: YuzuMcpBridgeForcedExpireUnavailable
+        expr: |
+          rate(yuzu_mcp_bridge_forced_expire_total{disposition="synthesize_unavailable"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP progress bridge is answering clients -32014 (no result exists)"
+          description: >-
+            The ring-only pressure escape hatch is force-expiring parked records
+            that never reached a terminal, so those clients received -32014. The
+            answer is honest, but a sustained rate means records are parking faster
+            than they settle - check yuzu_mcp_bridge_records_active against the
+            record cap and whether executions are completing at all. The sibling
+            disposition="fallback_final" is a milder, different signal (a terminal
+            DID happen but had aged out of the bus buffer), so treat that one as a
+            buffer-sizing question rather than a correctness one.
       - alert: YuzuMcpBridgeTeardownIncomplete
         expr: |
           sum by (reason) (yuzu_mcp_bridge_teardown_incomplete_total) > 0

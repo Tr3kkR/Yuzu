@@ -685,6 +685,10 @@ TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final
         CHECK(count_error_code(frames, mcp::kMcpTerminalUnavailable) == 0);  // no synthesis
         CHECK(count_results(frames) == 1);
         CHECK(s.stream->is_pinned(final_id));  // truth stays in the ring
+        // sre-N1 (#2489): the "client lost nothing" disposition, counted as such -
+        // the label set is closed, so it must be reachable at its real producer.
+        CHECK(fx.reg.counter("yuzu_mcp_bridge_forced_expire_total", {{"disposition", "none"}})
+                  .value() == 1.0);
     }
     SECTION("terminal racing the pressure sweep: the real result always wins") {
         // The terminal is LATCHED before the sweeper starts (the listener runs
@@ -818,6 +822,12 @@ TEST_CASE("bridge pressure - kTerminalKnownLost publishes the fallback final, ne
         }
         CHECK(ok);
     }
+    // sre-N1 (#2489): and it is now countable, which the audit row is not. This is
+    // the disposition an operator most needs to watch - a rising rate means records
+    // are parking for longer than the bus buffer holds their terminal.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_forced_expire_total",
+                         {{"disposition", "fallback_final"}})
+              .value() == 1.0);
     // Charge released: teardown_claimed already released the streamed charge
     // synchronously when it reaped record 1 (streamed_unpinned_ back to 0); the pinned
     // fallback still holds one slot, which the resume cursor below consumes. With BOTH
@@ -871,6 +881,103 @@ TEST_CASE("bridge pressure - a visitor copy-OOM defers and keeps the listener (#
     auto frames = ring_frames(*s.stream, "alice");
     CHECK(count_error_code(frames, mcp::kMcpTerminalUnavailable) == 0);
     CHECK(count_results(frames) == 1);  // the real final, after the fault healed
+}
+
+namespace {
+
+/// A + B parked into one session, A first so it owns the lower parked_seq and is
+/// therefore the victim pass 3 picks first. A's verdict is kTerminalBuffered (a
+/// terminal-flagged progress the listener does not latch); B never reaches a
+/// terminal at all, so its visit is an unambiguous claim. Paired with a PERSISTENT
+/// visitor copy fault this is a deterministic "oldest defers forever, newer is
+/// reapable" shape - the only one that tells the two #2489 pressure defects apart.
+void park_deferring_a_and_claimable_b(Fx& fx, Fx::Session& s) {
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-a"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(2), "exec-b"));
+    REQUIRE(fx.bridge->arm(s.id, json(2), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(2)));
+    fx.bus.publish("exec-a", "execution-progress",
+                   R"({"status":"succeeded","agents_success":1,"agents_failure":0})",
+                   /*is_terminal=*/true);
+    // PERSISTENT: while it fires, A's terminal copy never latches, so A can never be
+    // claimed however many sweeps run. That is the self-validating half of both
+    // tests below - any reap they observe is necessarily B's.
+    fx.bridge->inject_visit_copy_fault_for_test(/*times=*/100);
+}
+
+}  // namespace
+
+TEST_CASE("bridge pressure - a deferred victim no longer blocks relief for the newer ones "
+          "(#2489 UP-5)",
+          "[mcp][bridge][2f][2489]") {
+    // Pass 3 used to wake-and-RETURN on any defer, and it always picks the OLDEST
+    // victim first - so one record caught perpetually mid-projection held the escape
+    // hatch shut for every newer victim behind it. Per record the defer is bounded;
+    // in aggregate, sustained pressure got no relief at all.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+    auto s = fx.make_session();
+    park_deferring_a_and_claimable_b(fx, s);
+
+    fx.bridge->sweep();
+
+    // B reaped THROUGH the deferring A, in ONE sweep. Before UP-5: 2, forever.
+    CHECK(fx.bridge->record_count() == 1);
+    CHECK(fx.bridge->phase_for(s.id, json(1)).has_value());        // A survives...
+    CHECK_FALSE(fx.bridge->phase_for(s.id, json(2)).has_value());  // ...B does not
+    CHECK(count_error_code(ring_frames(*s.stream, "alice"), mcp::kMcpTerminalUnavailable) == 1);
+    // sre-N1 (#2489): which disposition it was is now readable from metrics, not
+    // only from an audit row nothing scrapes.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_forced_expire_total",
+                         {{"disposition", "synthesize_unavailable"}})
+              .value() == 1.0);
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_forced_expire_total", {{"disposition", "none"}})
+              .value() == 0.0);
+
+    // A is genuinely unreapable while the fault fires, which is what makes the reap
+    // above attributable to the advance rather than to A settling early.
+    for (int i = 0; i < 10; ++i) {
+        fx.bridge->sweep();
+    }
+    CHECK(fx.bridge->record_count() == 1);
+}
+
+TEST_CASE("bridge pressure - a mark does not outlive the pressure that raised it (#2489 UP-4)",
+          "[mcp][bridge][2f][2489]") {
+    // pressure_requested tells the projector to start no NEW progress batch for a
+    // victim. Nothing cleared it, so a victim that was marked and then survived -
+    // because the cap went back under water before its turn came round - had its
+    // progress frozen for the REST of its execution. The terminal still settles
+    // (want_terminal is ungated), which is precisely why the freeze is silent: a
+    // parked GET-resume client watching a long run simply stops seeing movement.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+    auto s = fx.make_session();
+    park_deferring_a_and_claimable_b(fx, s);
+
+    fx.bridge->sweep();  // A marked and deferred; B reaped -> cap back under water
+    REQUIRE(fx.bridge->record_count() == 1);
+    REQUIRE(fx.bridge->phase_for(s.id, json(1)).has_value());
+
+    // A strictly-higher progress value than anything published so far. Monotonic
+    // suppression (H1) means a frame carrying 2 can ONLY have come from this
+    // publish, so the assertion cannot be satisfied by a frame the projector had
+    // already emitted before the sweep - no ordering assumption needed.
+    fx.bus.publish("exec-a", "execution-progress", prog(2, 3));
+    CHECK(poll_until([&] {
+        for (const auto& f : ring_frames(*s.stream, "alice")) {
+            auto j = json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+            if (j.is_object() && j.value("method", "") == "notifications/progress" &&
+                j["params"].value("progress", 0) == 2) {
+                return true;
+            }
+        }
+        return false;
+    }));
 }
 
 TEST_CASE("bridge pressure - two concurrent sweeps reap a victim exactly once (#2409 qa-S5, TSan)",
