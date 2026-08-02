@@ -218,8 +218,11 @@ public:
     ///
     /// Expected to be 0 or 1 per database in the ordinary course: the pass that
     /// declines also anchors the reading, so the next one has a comparison
-    /// point. A value that keeps climbing means the anchor is not surviving --
-    /// look for `..._retention_persist_failed_total` alongside it.
+    /// point. A value that keeps climbing means the anchor is not surviving.
+    /// `..._retention_persist_failed_total` is a PARTIAL signal for that, not an
+    /// equivalent one: when the reading is destroyed out of band -- a restore
+    /// from a pre-v3 backup, a rehydrated replica, a disk rollback -- the write
+    /// succeeds every pass and that counter never moves.
     uint64_t bootstrap_declines_count() const noexcept {
         return bootstrap_declines_.load(std::memory_order_relaxed);
     }
@@ -390,6 +393,17 @@ private:
     // and collapsing the two suppresses the check on the pass right after NTP
     // corrects.
     std::optional<std::int64_t> last_pass_now_;
+    /// "This process has not yet reached a VERDICT with a usable comparison
+    /// point" (#2579). Carried as its own flag rather than derived from
+    /// `last_pass_now_`, for the reason the probe-failure branch already states
+    /// about `loaded_meta_unusable_`: `cleanup_once` re-anchors BEFORE it probes,
+    /// so a pass that fails its probes has spent the anchor without classifying
+    /// anything. Deriving the fact from the anchor would let one transient
+    /// SQLITE_BUSY on the first post-upgrade pass -- the slowest pass, against
+    /// the largest backlog, possibly before the index exists -- disarm the
+    /// bootstrap trigger permanently, which is precisely the defect this closes.
+    /// Consumed at exactly one site: where the verdict is folded in.
+    bool bootstrap_pending_ = false;
     // Set at construction when durable state EXISTED but could not be used --
     // either not an integer, or unreadable (corruption, busy, I/O error).
     // Absent is NOT carried: that is the ordinary fresh-install shape.

@@ -675,6 +675,48 @@ TEST_CASE("AuditStore #2579: no stored reading + rows already expired declines, 
     CHECK(f.store.bootstrap_declines_count() == 1); // and NOT counted twice
 }
 
+TEST_CASE("AuditStore #2579: a probe-failed pass does not spend the bootstrap trigger",
+          "[audit_store][retention][clock-guard]") {
+    // BLOCKING, found by unhappy-path at Gate 4.
+    //
+    // `cleanup_once` re-anchors BEFORE it probes (the durable write and the
+    // in-memory stamp both happen at the top of the locked section), so a pass
+    // whose probes then fail has consumed the anchor without ever reaching a
+    // verdict. Deriving `no_anchor` from the anchor therefore let ONE transient
+    // probe failure disarm the trigger permanently: pass 2 sees a reading, calls
+    // itself anchored, and deletes with every detector false -- the exact defect
+    // #2579 closes, reinstated.
+    //
+    // It is not a remote shape. The first post-upgrade pass is the one with the
+    // largest backlog and possibly no retention index yet (the index build is
+    // deliberately best-effort), so it is the slowest and the likeliest to meet
+    // SQLITE_BUSY. The population at risk and the population that trips this are
+    // the same population.
+    //
+    // The fix mirrors what `loaded_meta_unusable_` already does on this path, for
+    // the reason that branch states in place: the flag is not consumed by a pass
+    // that did not act on it.
+    GuardFixture f;
+    f.seed(kNow - 100, 10);    // expired: written before the skew
+    f.seed(kNow + kWindow, 2); // datable survivors: written after it
+
+    // Pass 1 cannot probe -- and DOES re-anchor on its way past.
+    exec_raw(f.tmp.path, "ALTER TABLE audit_events RENAME TO audit_events_hidden");
+    CHECK(f.store.cleanup_once(kNow) == 0);
+    CHECK(f.store.cleanup_failed_count() == 1);
+    CHECK(f.store.bootstrap_declines_count() == 0); // no verdict was reached
+    exec_raw(f.tmp.path, "ALTER TABLE audit_events_hidden RENAME TO audit_events");
+
+    // Pass 2 must STILL decline. Before the fix it deleted all 10.
+    CHECK(f.store.cleanup_once(kNow + 1) == 0);
+    CHECK(f.store.bootstrap_declines_count() == 1);
+    CHECK(f.store.total_count() == 12);
+
+    // ...and having now reached a verdict, it is spent: pass 3 drains.
+    CHECK(f.store.cleanup_once(kNow + 2) == 10);
+    CHECK(f.store.bootstrap_declines_count() == 1);
+}
+
 TEST_CASE("AuditStore #2579: nothing expired means no bootstrap decline",
           "[audit_store][retention][clock-guard]") {
     // The cost control. A fresh install has no stored reading either, and if the
@@ -1328,16 +1370,27 @@ TEST_CASE("AuditStore #2360 CH-1: hostile guard state cannot wipe, cannot disabl
     CHECK(remaining > 0);
     CHECK(remaining == before);
 
-    // ...and the BOOTSTRAP state specifically does not persist: every pass above
-    // re-anchored the reading, so a pass that follows the row-deleted iteration
-    // has a usable comparison point and cannot decline for want of one again.
-    // Deliberately narrow -- whether this pass then deletes depends on the wipe
-    // outcome for this fixture's seed, which is a different rule's business.
-    // What #2579 owns is that the no-anchor decline happens once, not forever.
+    // ...and the guard is NOT DISABLED by any of it -- the other half of this
+    // case's title, and the half the old `remaining < before` used to carry.
+    //
+    // It takes two passes, and the reason is worth stating: the 1969 pass above
+    // re-anchored the durable reading to a NEGATIVE value, so the next pass
+    // reads it, refuses to trust it (`BadState`) and re-anchors on a sane clock.
+    // Only then is there a usable comparison point. That is the self-heal, and
+    // asserting a real delete at the end of it is what proves the hostile state
+    // could pace the drain but never stop it.
     {
         AuditStore healed(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
         REQUIRE(healed.is_open());
-        CHECK(healed.cleanup_once(kNow + 10) <= kMaxAuditDeletesPerPass);
+
+        CHECK(healed.cleanup_once(kNow + 10) == 0);        // declines the negative reading
+        CHECK(healed.clock_anomaly_skips_count() == 1);
+        CHECK(healed.bootstrap_declines_count() == 0);     // NOT the bootstrap trigger
+
+        // Anchored and sane: the backlog drains, paced by the cap.
+        CHECK(healed.cleanup_once(kNow + 11) == kMaxAuditDeletesPerPass);
+        CHECK(healed.total_count() < before);
+        CHECK(healed.clock_anomaly_skips_count() == 1);    // no new anomaly
         CHECK(healed.bootstrap_declines_count() == 0);
     }
     // The two readings ahead of `now` were each reported as a decline (of one
@@ -2222,7 +2275,7 @@ TEST_CASE("AuditStore #2360: an arriving would-wipe is not swallowed by a standi
           "[audit_store][retention][clock-guard]") {
     // BLOCKING, found by cpp-safety and proven with a 5/5 deterministic probe.
     //
-    // `classify` collapses FOUR independent facts onto ONE enum, so the
+    // `classify` collapses FIVE independent facts onto ONE enum, so the
     // `a != last_reported_` half cannot see a NEW condition arriving underneath
     // an already-reported one. The dead-CMOS-then-NTP sequence -- the guard's own
     // motivating case -- walks straight through it:
@@ -2237,8 +2290,12 @@ TEST_CASE("AuditStore #2360: an arriving would-wipe is not swallowed by a standi
     // For any store under the 25,000-row cap that is the entire SOC 2 trail, in
     // one statement, with no warning and no counter. Exactly what #2360 exists
     // to prevent.
+    // NOT anchored, deliberately: the sequence below IS the fixture. Pass 1 has
+    // no reading and nothing expired, which is the one shape #2579's trigger
+    // stays silent on, so it is quiet for the reason the narrative needs. An
+    // anchoring pass would make pass 1 a huge BACKWARD move instead and report
+    // there, shifting the whole story by one.
     GuardFixture f;
-    f.anchor();
 
     REQUIRE(f.store.cleanup_once(-100) == 0); // 1969, quiet
     REQUIRE(f.store.cleanup_once(-50) == 0);  // prev < 0 -> BadState reported
@@ -2390,8 +2447,12 @@ TEST_CASE("AuditStore #2360: a wipe arriving under a standing bad state is repor
     // identically to pass 2, so an enum comparison matches and DELETES. The fact
     // set does not match -- `has_expired` and `would_wipe` both flipped -- so it
     // is reported and nothing is deleted.
+    // NOT anchored: pass 1 must have no previous reading for the sequence above
+    // to be the one that runs. An anchoring pass leaves a reading AHEAD of a 1969
+    // `now`, so pass 1 would report BadState and the whole narrative shifts by
+    // one -- and it buys nothing here, since pass 1 has nothing expired and the
+    // #2579 trigger is silent on exactly that shape.
     GuardFixture f;
-    f.anchor();
 
     REQUIRE(f.store.cleanup_once(-2) == 0); // quiet: no previous reading yet
     REQUIRE(f.store.cleanup_once(-1) == 0); // prev < 0 -> BadState, reported

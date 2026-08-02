@@ -517,7 +517,11 @@ fix --- not hand-deletion.
   meaning "the clock moved in a way that would have wiped audit evidence", and
   this decline claims nothing of the sort --- only that nothing can yet rule it
   out. Expect 0 or 1 per database. A value that keeps climbing means the anchor is
-  not surviving; read `yuzu_server_audit_retention_persist_failed_total` beside it.
+  not surviving, which `YuzuAuditRetentionAnchorNotSurviving` alerts on. Read
+  `yuzu_server_audit_retention_persist_failed_total` beside it, but do not treat
+  that counter as equivalent coverage: when the reading is destroyed OUT OF BAND
+  (a restore from a pre-v3 backup, a rehydrated replica, a disk rollback) the
+  write succeeds every pass and it stays flat at zero.
 - **Before the fix**, such a pass deleted up to the cap with no decline and no
   clock-anomaly counter, and kept deleting rows stamped before the skew until that
   cohort was exhausted --- only those lose time, since a row written under the skew
@@ -564,8 +568,9 @@ directly. Do not collapse the first two:
 | `yuzu_server_audit_cleanup_failed_total` | A pass did not fully do its job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. **One site fires after a SUCCESSFUL delete** (the post-delete backlog probe), so read this as "retention is not fully healthy", not "nothing was deleted". |
 | `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
+| `yuzu_server_audit_retention_bootstrap_declines_total` | A pass declined because it had NO stored clock reading while rows were already expired (#2579); nothing was deleted. Counted apart from the clock-anomaly series on purpose - it claims only that nothing can yet rule out a wrong clock, not that the clock moved, so it must not fire an alert that says otherwise. Expect 0 or 1 per database; a climbing value means the anchor is not surviving, so read it with `..._retention_persist_failed_total`. |
 | `yuzu_server_audit_retention_persist_failed_total` | The durable clock reading could not be written. Detection will not survive a restart while this is rising. |
-| `yuzu_server_audit_retention_passes_total` | Passes **attempted**, including declined and failed ones. The one signal that catches a reaper which is not running at all - in that state the other five counters here stay flat at 0, which looks exactly like a quiet, healthy store. Alert on it NOT increasing. |
+| `yuzu_server_audit_retention_passes_total` | Passes **attempted**, including declined and failed ones. The one signal that catches a reaper which is not running at all - in that state the other six counters here stay flat at 0, which looks exactly like a quiet, healthy store. Alert on it NOT increasing. |
 | `yuzu_server_audit_retention_last_pass_unixtime` | When the most recent pass with a USABLE clock reading ran; `0` if none has in this process. A pass refused for an implausible `now` counts as a pass but does not stamp this gauge, and a restart resets it to `0` for up to one cleanup interval even though the durable reading survives. |
 
 The first two both leave rows undeleted, so an audit table that never shrinks

@@ -113,6 +113,9 @@ void AuditStore::create_tables() {
         // both mean "there is durable state and we could not use it", which the
         // first pass must report rather than treat as a clean slate.
         loaded_meta_unusable_ = (r.error() != MetaReadError::Absent);
+        // No usable reading of ANY kind, however it went missing: this process
+        // has no comparison point until a pass actually reaches a verdict.
+        bootstrap_pending_ = true;
         if (r.error() == MetaReadError::Malformed)
             spdlog::error("AuditStore: the stored retention clock reading is not an integer; "
                           "treating it as a clock anomaly and re-anchoring on the next pass");
@@ -758,17 +761,20 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             emit_window = kAuditMinBigStepSec;
             emit_full_wipe = would_wipe;
 
-            // `cleanup_once` is the ONLY caller of `classify`; the rule lives in its
-            // own header so it can be pinned exhaustively (all 32 inputs) without a
-            // database, not because anything else consumes it.
+            // The rule lives in its own header so it can be pinned exhaustively (all
+            // 32 inputs) without a database. It has a SECOND consumer --
+            // `ResultSetStore::gc_sweep` (#2496) -- so a change here is a change
+            // there: check that site before touching the fact set or the enum.
+            // (This comment used to claim `cleanup_once` was the only caller, which
+            // is how #2579's enum insertion nearly missed the other one.)
             const audit_retention::Facts facts{.has_expired = *has_expired,
                                                .would_wipe = would_wipe,
                                                .big_step = big_step,
                                                .prev_unusable = prev_unusable,
-                                               // The same optional `big_step` tests, so the two are
-                                               // mutually exclusive by construction: a pass either
-                                               // has a comparison point or it has none (#2579).
-                                               .no_anchor = !prev_pass_now};
+                                               // NOT `!prev_pass_now`: the anchor is rewritten
+                                               // before the probes, so deriving it there lets a
+                                               // verdict-less pass disarm the trigger (#2579).
+                                               .no_anchor = bootstrap_pending_};
             const audit_retention::Anomaly a = audit_retention::classify(facts);
             // Consumed HERE, unconditionally, at exactly one site: this pass has
             // folded it into the verdict. The durable row was re-anchored above,
@@ -776,6 +782,9 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             // clear sites is what produced both the cleared-too-early and the
             // cleared-too-late defects.
             loaded_meta_unusable_ = false;
+            // Same site, same reason: this pass reached a verdict, so the
+            // bootstrap question has now been ANSWERED rather than skipped.
+            bootstrap_pending_ = false;
 
             // ONE rule for the whole guard: report an anomaly when it is not the
             // one already being reported, and stand down when it is gone. This
