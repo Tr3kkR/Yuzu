@@ -101,8 +101,7 @@ What to expect:
 ### 1 · `ci` — CI/test revamp
 
 Handover: `/Users/nathan/Desktop/Yuzu CI revamp handover 2026-07-29.md` (authoritative session
-state). Design input: `docs/proposals/ci-test-architecture-review.md` — **local-only on the Mac
-and untracked**, like the handover; ask the operator if it is missing. Reference:
+state). Design input: `docs/proposals/ci-test-architecture-review.md`. Reference:
 `docs/ci-architecture.md`, `.claude/skills/ci-cache/SKILL.md`.
 
 Units — one worktree each under `<yz-root>/ci/`. State as of 2026-08-02:
