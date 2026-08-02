@@ -1266,6 +1266,14 @@ bool ManagementGroupStore::migrate_from_sqlite(const std::filesystem::path& lega
     }
 
     // 8. Move the verified legacy file aside (non-fatal on failure).
+    // Close the legacy read-only handle FIRST: Windows refuses to rename a file
+    // that still has an open handle (ERROR_SHARING_VIOLATION), so leaving
+    // `legacy` open here silently defeated the move-aside on Windows (POSIX
+    // allows rename-with-open-handle, so it worked on Linux/macOS — a
+    // cross-platform gotcha that only surfaced on the Wee Tam MSVC leg). All
+    // legacy reads are already materialised in memory above, so closing now is
+    // safe.
+    legacy.close();
     std::error_code mv_ec;
     auto aside = legacy_db_path;
     aside += ".migrated-" + std::to_string(now_secs());
