@@ -25,6 +25,9 @@ required_string(const nlohmann::json& object, std::string_view name,
 decode_contract_header(const nlohmann::json& root, const ContractDescriptor& descriptor);
 
 [[nodiscard]] std::expected<void, ContractError>
+validate_opaque_run_id(std::string_view value, std::string_view path);
+
+[[nodiscard]] std::expected<void, ContractError>
 reject_forbidden_authority_fields(const nlohmann::json& root);
 
 } // namespace yuzu::contracts::adr31::detail

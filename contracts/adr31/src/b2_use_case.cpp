@@ -52,6 +52,11 @@ decode_versioned_identity(const nlohmann::json& root, std::string_view name) {
         return std::unexpected(error(ContractErrorCode::InvalidValue, "/use_case_run_id",
                                      "use_case_run_id must not be empty"));
     }
+    if (const auto run_id =
+            detail::validate_opaque_run_id(request.use_case_run_id, "/use_case_run_id");
+        !run_id) {
+        return std::unexpected(run_id.error());
+    }
     if (request.use_case.id.empty() || request.use_case.version.empty()) {
         return std::unexpected(error(ContractErrorCode::InvalidValue, "/use_case",
                                      "use_case id and version must not be empty"));
@@ -109,6 +114,10 @@ decode_b2_use_case_request(std::string_view wire_json) {
     if (!request_id) return std::unexpected(request_id.error());
     auto run_id = detail::required_string(*root, "use_case_run_id");
     if (!run_id) return std::unexpected(run_id.error());
+    if (const auto valid_run_id = detail::validate_opaque_run_id(*run_id, "/use_case_run_id");
+        !valid_run_id) {
+        return std::unexpected(valid_run_id.error());
+    }
     auto use_case = decode_versioned_identity(*root, "use_case");
     if (!use_case) return std::unexpected(use_case.error());
     auto module = decode_versioned_identity(*root, "module");
@@ -135,6 +144,15 @@ decode_b2_use_case_request(std::string_view wire_json) {
         .module = std::move(*module),
         .normalised_inputs = *inputs_it,
     };
+}
+
+std::expected<std::string, ContractError>
+canonical_b2_input_bytes(const B2UseCaseRequest& request) {
+    if (!request.normalised_inputs.is_object()) {
+        return std::unexpected(error(ContractErrorCode::WrongType, "/normalised_inputs",
+                                     "normalised_inputs must be an object"));
+    }
+    return detail::encode_contract_json(request.normalised_inputs);
 }
 
 } // namespace yuzu::contracts::adr31

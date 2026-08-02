@@ -303,6 +303,24 @@ decode_contract_header(const nlohmann::json& root, const ContractDescriptor& des
     return version;
 }
 
+std::expected<void, ContractError> validate_opaque_run_id(std::string_view value,
+                                                          std::string_view path) {
+    if (value.size() < kMinOpaqueRunIdCharacters || value.size() > kMaxOpaqueRunIdCharacters) {
+        return std::unexpected(error(ContractErrorCode::InvalidValue, std::string{path},
+                                     "run identifier length is outside the opaque-id contract"));
+    }
+    for (const unsigned char byte : value) {
+        const bool allowed = (byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
+                             (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' ||
+                             byte == '.' || byte == ':' || byte == '=';
+        if (!allowed) {
+            return std::unexpected(error(ContractErrorCode::InvalidValue, std::string{path},
+                                         "run identifier is not an opaque ASCII token"));
+        }
+    }
+    return {};
+}
+
 std::expected<nlohmann::json, ContractError> parse_contract_json(std::string_view wire_json) {
     if (wire_json.size() > kMaxContractWireBytes) {
         return std::unexpected(error(ContractErrorCode::TooLarge, "",
