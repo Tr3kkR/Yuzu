@@ -58,6 +58,7 @@ contract_test_exe = executable(
   files(
     'unit/contracts/test_contract_version.cpp',
     'unit/contracts/test_b3_platform.cpp',
+    'unit/contracts/test_transport_auth_slot.cpp',
   ),
   dependencies: [yuzu_adr31_contracts_dep, catch2_dep],
 )
