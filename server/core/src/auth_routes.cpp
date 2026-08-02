@@ -927,6 +927,12 @@ AuthRoutes::ListReadGate AuthRoutes::require_list_read(const httplib::Request& r
     // principal-kind ladder; only the STANDARD branch differs (authorize_list_read
     // instead of the inert global check_permission). Every denial writes a 4xx/5xx
     // + audit and leaves gate.admitted == false so the caller returns immediately.
+    //
+    // INVARIANT — Read-class list/fan-out reads only. Like require_permission's
+    // Read path, this deliberately omits the MCP-tier `requires_approval` re-deny
+    // and the legacy non-Read admin check (both apply only to destructive ops).
+    // Callers MUST pass a Read operation; approval-gated or mutating ops go through
+    // require_permission / require_scoped_permission.
     ListReadGate gate;
     const std::string perm = securable_type + ":" + operation;
 
