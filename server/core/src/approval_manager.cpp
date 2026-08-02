@@ -24,6 +24,15 @@ std::expected<std::string, std::string> generate_id() {
     return *hex;
 }
 
+// An approval id is a BEARER CAPABILITY (see generate_id above): presenting it
+// is what authorizes an MCP recall. Logs are read by more people than may
+// redeem a ticket, so log a prefix that is enough to correlate two lines about
+// the same ticket and not enough to redeem it. 8 hex chars of a 128-bit id.
+std::string redact_id(const std::string& id) {
+    constexpr std::size_t kKeep = 8;
+    return id.size() <= kKeep ? id : id.substr(0, kKeep) + "...";
+}
+
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -37,7 +46,7 @@ std::string col_text(sqlite3_stmt* stmt, int col) {
 
 } // namespace
 
-std::string to_string(ApprovalOrigin origin) {
+const char* to_string(ApprovalOrigin origin) {
     switch (origin) {
     case ApprovalOrigin::kInstruction:
         return "instruction";
@@ -51,7 +60,7 @@ std::string to_string(ApprovalOrigin origin) {
     return "";
 }
 
-ApprovalOrigin approval_origin_from_string(const std::string& text) {
+ApprovalOrigin approval_origin_from_string(std::string_view text) {
     if (text == "instruction")
         return ApprovalOrigin::kInstruction;
     if (text == "schedule")
@@ -151,6 +160,22 @@ void ApprovalManager::create_tables() {
         {5, R"(
             ALTER TABLE approvals ADD COLUMN origin TEXT NOT NULL DEFAULT '';
         )"},
+        // v6: make the two status-scoped access patterns index-covered. Neither
+        // is new, but both became load-bearing when mtx_ started covering the
+        // readers: a consumed ticket keeps status='approved' (consume stamps
+        // consumed_at, it does not restatus the row) and nothing prunes, so the
+        // 'approved' bucket only grows, and idx_approvals_status alone left both
+        // the ORDER BY in query() and the expiry sweep walking it. MEASURED on a
+        // synthetic table: at 1M rows query() 112 ms -> 0.34 ms and the
+        // approved-unconsumed sweep 100 ms -> 0.01 ms, temp B-tree gone. That
+        // matters beyond latency because ScheduleRunner issues three query()
+        // calls per tick on the same mutex an MCP approval recall needs.
+        {6, R"(
+            CREATE INDEX IF NOT EXISTS idx_approvals_status_submitted
+                ON approvals(status, submitted_at);
+            CREATE INDEX IF NOT EXISTS idx_approvals_status_consumed_reviewed
+                ON approvals(status, consumed_at, reviewed_at);
+        )"},
     };
     if (!MigrationRunner::run(db_, "approval_manager", kMigrations)) {
         // Fail closed (governance sre-BLOCKING-1 / HC-1): a failed v2 migration
@@ -188,9 +213,8 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     // will accept. Undeclared mints are exempt because the MCP gate itself is
     // still one of them (ApprovalOrigin::kUnspecified).
     if (origin != ApprovalOrigin::kMcp && origin != ApprovalOrigin::kUnspecified &&
-        definition_id.rfind(kMcpDefinitionPrefix, 0) == 0)
-        return std::unexpected(std::string("definition_id may not use the reserved '") +
-                               kMcpDefinitionPrefix + "' prefix");
+        is_reserved_definition_id(definition_id))
+        return std::unexpected(std::string(kReservedDefinitionIdError));
 
     std::lock_guard lock(mtx_);
 
@@ -282,8 +306,7 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     sqlite3_bind_int64(stmt, 4, ts);
     sqlite3_bind_text(stmt, 5, scope_expression.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 6, schedule_id.c_str(), -1, SQLITE_TRANSIENT);
-    auto origin_text = to_string(origin);
-    sqlite3_bind_text(stmt, 7, origin_text.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 7, to_string(origin), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         auto err = std::string(sqlite3_errmsg(db_));
@@ -292,7 +315,7 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     }
     sqlite3_finalize(stmt);
 
-    spdlog::info("ApprovalManager: submitted approval {} for definition {} by {}", id,
+    spdlog::info("ApprovalManager: submitted approval {} for definition {} by {}", redact_id(id),
                  definition_id, submitted_by);
     return id;
 }
@@ -385,23 +408,37 @@ int ApprovalManager::pending_count_for(const std::string& submitted_by) const {
 // ---------------------------------------------------------------------------
 
 std::optional<Approval> ApprovalManager::get(const std::string& id) const {
-    if (!db_ || id.empty())
-        return std::nullopt;
+    auto r = get_checked(id);
+    return r ? *r : std::nullopt;
+}
+
+std::expected<std::optional<Approval>, std::string>
+ApprovalManager::get_checked(const std::string& id) const {
+    if (!db_)
+        return std::unexpected("database not open");
+    if (id.empty())
+        return std::unexpected("approval id is required");
 
     std::lock_guard lock(mtx_);
 
     std::string sql = std::string("SELECT ") + kSelectAllCols + " FROM approvals WHERE id = ?";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
-        return std::nullopt;
+        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
 
     sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
 
     std::optional<Approval> out;
-    if (sqlite3_step(stmt) == SQLITE_ROW)
+    const auto rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW)
         out = row_to_approval(stmt);
-
     sqlite3_finalize(stmt);
+
+    // A read that FAILED is not a read that found nothing. Collapsing the two
+    // is what let a store error be reported to the operator as "this one-time
+    // capability is spent" — see the pre-consume path in consume_ticket.
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE)
+        return std::unexpected(std::string("read failed: ") + sqlite3_errmsg(db_));
     return out;
 }
 
@@ -474,20 +511,46 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     // supplied, so the two-argument path issues the exact same single statement
     // it always has.
     if (precondition) {
-        auto row = get(id); // takes mtx_ itself — must be outside the lock below
+        // get_checked, not get: a FAILED read must not be reported as a row that
+        // is not there. Telling the operator a live human-approved ticket is
+        // spent, because SQLite was busy for a moment, is the burn class #2443
+        // exists to close, re-entered through the taxonomy.
+        auto row = get_checked(id); // takes mtx_ itself — must be outside the lock below
+        if (!row)
+            return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, row.error()});
         // A row that cannot transition is reported WITHOUT running the
         // precondition: the callback may be costly or emit audit, and the CAS
         // below would decline this row anyway. Same message as the CAS decline,
         // so the two paths are indistinguishable to the caller (they mean the
         // same thing).
-        if (!row || row->status != "approved" || row->consumed_at != 0)
+        if (!*row || (*row)->status != "approved" || (*row)->consumed_at != 0)
             return std::unexpected(ConsumeError{
                 ConsumeFailure::kNotConsumable,
                 "approval not consumable (already used, not approved, or absent)"});
-        auto ok = precondition(*row);
+        // The callback is caller code. If it throws, that must not escape a
+        // store method as an unhandled exception on an httplib worker: the
+        // ticket is untouched either way, so report it as a store error and let
+        // the caller answer with its own envelope. Deliberately NOT
+        // kPrecondition — a callback that threw did not decide anything.
+        std::expected<void, std::string> ok;
+        try {
+            ok = precondition(**row);
+        } catch (const std::exception& e) {
+            spdlog::warn("ApprovalManager: pre-consume recheck threw for ticket {}: {}",
+                         redact_id(id), e.what());
+            return std::unexpected(ConsumeError{ConsumeFailure::kStoreError,
+                                                std::string("pre-consume recheck failed: ") +
+                                                    e.what()});
+        } catch (...) {
+            spdlog::warn("ApprovalManager: pre-consume recheck threw a non-std exception for "
+                         "ticket {}",
+                         redact_id(id));
+            return std::unexpected(
+                ConsumeError{ConsumeFailure::kStoreError, "pre-consume recheck failed"});
+        }
         if (!ok) {
-            spdlog::info("ApprovalManager: pre-consume recheck declined ticket {} for {}: {}", id,
-                         consumed_by, ok.error());
+            spdlog::info("ApprovalManager: pre-consume recheck declined ticket {} for {}: {}",
+                         redact_id(id), consumed_by, ok.error());
             return std::unexpected(ConsumeError{ConsumeFailure::kPrecondition, ok.error()});
         }
     }
@@ -518,7 +581,7 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     sqlite3_finalize(stmt);
 
     if (rc == SQLITE_ROW) {
-        spdlog::info("ApprovalManager: consumed approval ticket {} by {}", id, consumed_by);
+        spdlog::info("ApprovalManager: consumed approval ticket {} by {}", redact_id(id), consumed_by);
         return {};
     }
     if (rc == SQLITE_DONE)
@@ -606,7 +669,7 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
     auto rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
         sqlite3_finalize(stmt);
-        spdlog::info("ApprovalManager: {} approval {} by {}", status, id, reviewer);
+        spdlog::info("ApprovalManager: {} approval {} by {}", status, redact_id(id), reviewer);
         return {};
     }
     if (rc == SQLITE_DONE) {

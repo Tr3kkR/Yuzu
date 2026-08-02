@@ -11,8 +11,13 @@
 #include <catch2/catch_test_macros.hpp>
 #include <sqlite3.h>
 
+#include <chrono>
 #include <expected>
+#include <future>
+#include <stdexcept>
+#include <thread>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace yuzu::server;
@@ -456,10 +461,10 @@ TEST_CASE("ApprovalManager: an undeclared mint records no origin and keeps the m
 
 TEST_CASE("ApprovalManager: origin round-trips through its column text",
           "[approval_manager][approval]") {
-    CHECK(to_string(ApprovalOrigin::kInstruction) == "instruction");
-    CHECK(to_string(ApprovalOrigin::kSchedule) == "schedule");
-    CHECK(to_string(ApprovalOrigin::kMcp) == "mcp");
-    CHECK(to_string(ApprovalOrigin::kUnspecified).empty());
+    CHECK(std::string_view(to_string(ApprovalOrigin::kInstruction)) == "instruction");
+    CHECK(std::string_view(to_string(ApprovalOrigin::kSchedule)) == "schedule");
+    CHECK(std::string_view(to_string(ApprovalOrigin::kMcp)) == "mcp");
+    CHECK(std::string_view(to_string(ApprovalOrigin::kUnspecified)).empty());
 
     CHECK(approval_origin_from_string("instruction") == ApprovalOrigin::kInstruction);
     CHECK(approval_origin_from_string("schedule") == ApprovalOrigin::kSchedule);
@@ -617,6 +622,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
     // Same for a pending (never-approved) ticket and for an absent id.
     auto pending = mgr.submit("mcp.delete_tag", "operator1", "{\"n\":1}");
     REQUIRE(pending.has_value());
+    ran = false; // reset per sub-case so a regression names WHICH one regressed
     auto on_pending = mgr.consume_ticket(*pending, "operator1",
                                          [&ran](const Approval&) -> std::expected<void, std::string> {
                                              ran = true;
@@ -625,6 +631,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
     REQUIRE(!on_pending.has_value());
     CHECK(on_pending.error().kind == ConsumeFailure::kNotConsumable);
 
+    ran = false;
     auto absent = mgr.consume_ticket("does-not-exist", "operator1",
                                      [&ran](const Approval&) -> std::expected<void, std::string> {
                                          ran = true;
@@ -675,6 +682,65 @@ TEST_CASE("ApprovalManager: a missing principal fails closed on the recheck over
     CHECK(row->consumed_at == 0);
 }
 
+TEST_CASE("ApprovalManager: the CAS still wins when the row is consumed during the recheck",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+
+    // The window the design deliberately accepts: row read, lock released,
+    // callback runs, lock retaken, CAS runs. Force that exact interleaving by
+    // consuming the ticket from inside the callback. The outer consume must
+    // LOSE — a denial, never a second consume.
+    auto outer =
+        mgr.consume_ticket(*id, "operator1",
+                           [&mgr, &id](const Approval&) -> std::expected<void, std::string> {
+                               (void)mgr.consume_ticket(*id, "operator2");
+                               return {};
+                           });
+    REQUIRE(!outer.has_value());
+    CHECK(outer.error().kind == ConsumeFailure::kNotConsumable);
+
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_by == "operator2"); // consumed exactly once, by the winner
+}
+
+TEST_CASE("ApprovalManager: a throwing recheck denies without consuming and does not escape",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+
+    // The callback is caller code running on an httplib worker. A throw must
+    // not leave a store method as an exception, and must not be reported as a
+    // decision the callback never made.
+    auto threw = mgr.consume_ticket(
+        *id, "operator1", [](const Approval&) -> std::expected<void, std::string> {
+            throw std::runtime_error("rotation lookup failed");
+        });
+    REQUIRE(!threw.has_value());
+    CHECK(threw.error().kind == ConsumeFailure::kStoreError); // NOT kPrecondition
+    CHECK(threw.error().message.find("pre-consume recheck failed") != std::string::npos);
+    CHECK(mgr.get(*id)->consumed_at == 0); // still recallable
+
+    // A non-std throw takes the same path.
+    auto odd = mgr.consume_ticket(
+        *id, "operator1",
+        [](const Approval&) -> std::expected<void, std::string> { throw 42; });
+    REQUIRE(!odd.has_value());
+    CHECK(odd.error().kind == ConsumeFailure::kStoreError);
+    CHECK(mgr.get(*id)->consumed_at == 0);
+}
+
 TEST_CASE("ApprovalManager: the recheck may read the store without deadlocking",
           "[approval_manager][approval]") {
     TestDb tdb;
@@ -689,14 +755,31 @@ TEST_CASE("ApprovalManager: the recheck may read the store without deadlocking",
     // approval store (a plausible shape: "no newer ticket supersedes this one")
     // is safe. Under a lock-held design this self-deadlocks on the
     // non-recursive mutex.
-    auto consumed =
-        mgr.consume_ticket(*id, "operator1", [&mgr](const Approval& a) -> std::expected<void, std::string> {
-            (void)mgr.get(a.id);
-            (void)mgr.pending_count();
-            (void)mgr.query({});
-            return {};
-        });
-    CHECK(consumed.has_value());
+    //
+    // Run it on its own thread with a bounded wait: a regression here is a
+    // DEADLOCK, and a deadlocked assertion inside the test body would hang the
+    // whole binary until the CI job times out. This way the regression is a
+    // clean FAIL with a message, and the detached thread is parked on a mutex
+    // rather than corrupting anything.
+    std::promise<bool> done;
+    auto fut = done.get_future();
+    std::thread worker([&mgr, &id, &done] {
+        auto consumed = mgr.consume_ticket(
+            *id, "operator1", [&mgr](const Approval& a) -> std::expected<void, std::string> {
+                (void)mgr.get(a.id);
+                (void)mgr.pending_count();
+                (void)mgr.query({});
+                return {};
+            });
+        done.set_value(consumed.has_value());
+    });
+
+    const bool finished = fut.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    INFO("a timeout here means the precondition ran with mtx_ held — self-deadlock on the "
+         "non-recursive mutex");
+    REQUIRE(finished);
+    CHECK(fut.get());
+    worker.join();
 }
 
 // ── Expiry sweep (PR #1796 N3 + L2) ────────────────────────────────────────

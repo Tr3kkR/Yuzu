@@ -5609,7 +5609,18 @@ uniqueness against existing definitions.
 **Response (200):** `{"id": "<id>"}` for the newly-created definition.
 
 **Response (400):** Validation error (missing required field, invalid
-`approval_mode`, malformed JSON). Body is `{"error": "<reason>"}`.
+`approval_mode`, malformed JSON, or an `id` under the reserved `mcp.` prefix).
+Body is `{"error": "<reason>"}`.
+
+The `mcp.` definition-id prefix is **reserved** (#2442): it names MCP approval
+tickets, and the MCP recall matches a ticket on its definition id and scope
+expression without binding the submitter, so a definition authored under that
+prefix could line up with an MCP tool's canonical arguments. Every authoring
+route that creates a definition refuses it — this one, `POST
+/api/instructions/yaml`, `POST /api/instructions/import`, product-pack install,
+and boot-time auto-import. It is a **create-time** rule: an id that predates it
+stays editable and executable through `PUT`, because an update cannot originate
+an id.
 
 **Response (409):** Returned when an explicit `id` is supplied that already
 exists in the store. Body is

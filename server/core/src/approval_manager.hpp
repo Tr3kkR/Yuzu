@@ -1,5 +1,7 @@
 #pragma once
 
+#include "reserved_definition_id.hpp" // is_reserved_definition_id (#2442)
+
 #include <sqlite3.h>
 
 #include <cstdint>
@@ -8,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server {
@@ -40,14 +43,8 @@ enum class ApprovalOrigin {
 /// also what migration v5 back-fills into pre-existing rows, so "no declared
 /// origin" reads identically whether the row predates the column or the caller
 /// stayed silent.
-std::string to_string(ApprovalOrigin origin);
-ApprovalOrigin approval_origin_from_string(const std::string& text);
-
-/// Definition-id prefix reserved for MCP-minted tickets (#2442). Enforced on
-/// both halves: no non-MCP mint path may submit an id under it, and no
-/// instruction definition may be authored with it
-/// (InstructionStore::create_definition_impl).
-inline constexpr const char* kMcpDefinitionPrefix = "mcp.";
+const char* to_string(ApprovalOrigin origin);
+ApprovalOrigin approval_origin_from_string(std::string_view text);
 
 struct Approval {
     std::string id;
@@ -92,6 +89,16 @@ struct ApprovalQuery {
 /// "state moved, mint a fresh ticket" with the ticket still recallable, whereas
 /// kNotConsumable means the one-time capability is spent. Distinguishing them by
 /// parsing the message string would be a fragile seam, so the kind is typed.
+///
+/// OBLIGATION ON THE FIRST CALLER of the three-argument overload: today the MCP
+/// recall maps every consume failure onto one message — "approval already used
+/// (one-time ticket)", remediating "submit a new request without approval_id".
+/// That is correct only while the two-argument overload is the sole caller.
+/// Wired as-is to a precondition, it would tell the operator to discard a ticket
+/// this code deliberately left recallable — re-entering the very burn class
+/// #2443 exists to close. Map the kinds, and audit a kPrecondition denial: a
+/// refusal to honour a human-approved capability currently leaves nothing but a
+/// log line.
 enum class ConsumeFailure {
     kPrecondition,  ///< precondition denied — ticket UNTOUCHED, still recallable
     kNotConsumable, ///< absent / not approved / already consumed (the CAS lost)
@@ -107,6 +114,14 @@ struct ConsumeError {
 /// evaluated between the ticket match and the consuming CAS (#2443). Returning
 /// an error denies the recall WITHOUT consuming; the string is operator-facing
 /// (it reaches the MCP error envelope's remediation), so say what drifted.
+///
+/// Two constraints on what you may write there. The message must not echo any
+/// field of the `Approval` it is handed: `definition_id` and `scope_expression`
+/// are caller-supplied, and the MCP envelope and audit detail are documented as
+/// carrying no caller-derived text. And the callback must not decide AUTHORITY —
+/// that stays in the core approval gate, which can audit it. This seam is for
+/// state the effect depends on (a rotation already resolved, a device gone),
+/// not for re-deciding who may act.
 using ConsumePrecondition = std::function<std::expected<void, std::string>(const Approval&)>;
 
 class ApprovalManager {
@@ -152,6 +167,13 @@ public:
     bool is_open() const { return db_ != nullptr; }
 
     std::optional<Approval> get(const std::string& id) const;
+
+    /// get() with the store failure kept apart from the row simply not being
+    /// there. Both read back as nullopt through get(), which is fine for a
+    /// caller that 404s either way, and NOT fine for one deciding whether a
+    /// one-time capability is spent — see consume_ticket's pre-consume recheck,
+    /// which uses this.
+    std::expected<std::optional<Approval>, std::string> get_checked(const std::string& id) const;
 
     /// Newest PENDING approval matching (definition_id, submitted_by,
     /// scope_expression), or nullopt. The MCP approval-ticket mint dedup key

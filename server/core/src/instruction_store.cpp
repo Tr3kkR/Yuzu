@@ -1,5 +1,5 @@
 #include "instruction_store.hpp"
-#include "approval_manager.hpp" // kMcpDefinitionPrefix — the ONE definition of the reserved prefix
+#include "reserved_definition_id.hpp" // the ONE reserved-namespace rule (#2442)
 #include "migration_runner.hpp"
 #include "product_pack_store.hpp" // ProductPackStore::verify_signature (#1073)
 #include "response_templates_engine.hpp"
@@ -457,9 +457,12 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
         // minted through the instruction gate line up with an MCP tool's
         // canonical arguments. No shipped content uses the prefix, so nothing
         // legitimate is rejected here.
-        if (def.id.rfind(kMcpDefinitionPrefix, 0) == 0)
-            return std::unexpected(std::string("definition id may not use the reserved '") +
-                                   kMcpDefinitionPrefix + "' prefix (reserved for MCP approvals)");
+        // Create-path only, deliberately: update_definition cannot originate an
+        // id (UPDATE ... WHERE id=?), so an id that predates the reservation
+        // stays editable and executable rather than becoming uneditable on
+        // upgrade.
+        if (is_reserved_definition_id(def.id))
+            return std::unexpected(std::string(kReservedDefinitionIdError));
     }
 
     auto id = def.id.empty() ? generate_id() : def.id;

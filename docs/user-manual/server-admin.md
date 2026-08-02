@@ -193,6 +193,40 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — the `mcp.` instruction-definition id prefix is reserved (#2442) (breaking)
+
+**Who this affects.** Anyone whose instruction definitions include an id beginning `mcp.`. No
+shipped or bundled content uses that prefix, so a deployment running only Yuzu-supplied content
+is unaffected and needs no action.
+
+**Why.** `mcp.<tool>` names an MCP approval ticket. The MCP recall matches a ticket on its
+definition id and scope expression and does not bind the submitter, so a definition authored
+under that prefix could line up with an MCP tool's canonical arguments — a ticket raised on one
+surface being redeemable on another. Consuming it still required the schema check, the tier
+gate, per-handler RBAC and a human approval, so this closes a namespace confusion rather than an
+open escalation.
+
+**What changes.** Creating a definition whose id starts `mcp.` is refused with a 400 on every
+authoring route — `POST /api/instructions`, `POST /api/instructions/yaml`, `POST
+/api/instructions/import`, and product-pack install — and such a definition is skipped (counted
+in `defs_errored`) at boot auto-import. The dashboard's YAML validator refuses it too, so
+Validate and Save agree.
+
+**What does NOT change.** The rule applies at creation only. A definition that already carries
+such an id keeps executing, stays editable, and can still be saved through `PUT` — an update
+cannot originate an id, so blocking it there would strand content rather than protect anything.
+
+**What to do.** Before upgrading, check for affected content:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8080/api/v1/instructions | jq -r '.data[].id | select(startswith("mcp."))'
+```
+
+Any id listed will keep running after the upgrade, but re-importing an export of it, or
+reinstalling a product pack containing it, will fail. Rename those definitions — create a
+replacement under a different id and delete the original.
+
 ### vNEXT — behind a reverse proxy, declare your external origin or CSRF-gated dashboard actions keep failing (#2537)
 
 **Who this affects.** Anyone running the dashboard behind nginx, Envoy, HAProxy, an ALB or
