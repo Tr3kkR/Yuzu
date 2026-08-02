@@ -6502,7 +6502,12 @@ private:
             return;
         auto entries = runtime_config_store_->get_all();
         for (const auto& e : entries) {
-            spdlog::info("Applying runtime config override: {} = {}", e.key, e.value);
+            // Never log a credential. This line wrote the OIDC client secret verbatim
+            // into yuzu-server.log on every boot once it had been set via Settings.
+            spdlog::info("Applying runtime config override: {} = {}", e.key,
+                         RuntimeConfigStore::is_secret_key(e.key)
+                             ? RuntimeConfigStore::redacted_placeholder()
+                             : e.value.c_str());
             if (e.key == "log_level") {
                 spdlog::set_level(spdlog::level::from_str(e.value));
             } else if (e.key == "heartbeat_timeout") {
@@ -7823,9 +7828,17 @@ private:
             if (runtime_config_store_ && runtime_config_store_->is_open()) {
                 auto entries = runtime_config_store_->get_all();
                 for (const auto& e : entries) {
-                    overrides[e.key] = {{"value", e.value},
-                                        {"updated_by", e.updated_by},
-                                        {"updated_at", e.updated_at}};
+                    // Same rule as the startup log: the value of a secret key is not
+                    // returned. This route is gated only on Infrastructure:Read, and the
+                    // settings UI already masks the same field as "********" -- the API
+                    // was the inconsistent one. updated_by/updated_at are kept so an
+                    // operator can still see THAT it is set and who set it.
+                    overrides[e.key] = {
+                        {"value", RuntimeConfigStore::is_secret_key(e.key)
+                                      ? std::string(RuntimeConfigStore::redacted_placeholder())
+                                      : e.value},
+                        {"updated_by", e.updated_by},
+                        {"updated_at", e.updated_at}};
                 }
             }
 

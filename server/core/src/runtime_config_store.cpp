@@ -34,12 +34,25 @@ static const std::vector<std::string> kAllowedKeys = {
     "dex_cohort_export_key",         // tag key; "" = export disabled (validated on apply)
 };
 
+// Keys whose VALUE is a credential. Adding a secret-valued key above without adding
+// it here is the mistake this list exists to make hard: the value was previously
+// written verbatim to the startup log AND returned by GET /api/config, which is
+// gated only on Infrastructure:Read, while the settings UI has always masked it as
+// "********" -- so the API contradicted the UI's own posture.
+const std::vector<std::string> kSecretKeys = {
+    "oidc_client_secret",
+};
+
 const std::vector<std::string>& RuntimeConfigStore::allowed_keys() {
     return kAllowedKeys;
 }
 
 bool RuntimeConfigStore::is_allowed_key(const std::string& key) {
     return std::find(kAllowedKeys.begin(), kAllowedKeys.end(), key) != kAllowedKeys.end();
+}
+
+bool RuntimeConfigStore::is_secret_key(const std::string& key) {
+    return std::find(kSecretKeys.begin(), kSecretKeys.end(), key) != kSecretKeys.end();
 }
 
 // ── Constructor / destructor ─────────────────────────────────────────────────

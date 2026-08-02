@@ -54,6 +54,17 @@ public:
     /// Check if a key is in the allow-list of safe runtime-configurable keys.
     static bool is_allowed_key(const std::string& key);
 
+    /// True if this key's VALUE is a credential and must never be emitted in
+    /// plaintext — not to a log, not to an API response, not to a config dump.
+    /// The store still returns the real value (callers such as the startup override
+    /// pass need it); redaction is the emitter's job, and this is the one predicate
+    /// every emitter must consult so a newly-added secret key cannot be missed.
+    static bool is_secret_key(const std::string& key);
+
+    /// What to print in place of a secret. Single spelling so log scrapers and API
+    /// consumers see one token.
+    static const char* redacted_placeholder() { return "<redacted>"; }
+
     /// Returns the list of allowed config keys.
     static const std::vector<std::string>& allowed_keys();
 

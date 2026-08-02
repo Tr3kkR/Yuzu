@@ -396,6 +396,7 @@ if build_server
       'unit/server/test_auth_db_pg.cpp',
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_cidr_match.cpp',
+      'unit/server/test_runtime_config_secret_redaction.cpp',
       'unit/server/test_nvd.cpp',
       'unit/server/test_cpe_identity_resolver.cpp',
       'unit/server/test_update_registry.cpp',
