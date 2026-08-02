@@ -55,7 +55,10 @@ endif
 # same framework-neutral fixtures without linking the fused server.
 contract_test_exe = executable(
   'yuzu_adr31_contract_tests',
-  files('unit/contracts/test_contract_version.cpp'),
+  files(
+    'unit/contracts/test_contract_version.cpp',
+    'unit/contracts/test_b3_platform.cpp',
+  ),
   dependencies: [yuzu_adr31_contracts_dep, catch2_dep],
 )
 test('ADR31 contract tests', contract_test_exe, suite: ['server', 'contracts'], timeout: 30)

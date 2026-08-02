@@ -23,21 +23,31 @@ struct ContractDescriptor {
 inline constexpr ContractVersion kVersion1_0{1, 0};
 inline constexpr std::array kInitialSupportedVersions{kVersion1_0};
 
+inline constexpr ContractDescriptor kB2UseCaseRequest{
+    "yuzu.b2.use_case.request", kVersion1_0,
+    std::span<const ContractVersion>{kInitialSupportedVersions}};
+inline constexpr ContractDescriptor kB2UseCaseResult{
+    "yuzu.b2.use_case.result", kVersion1_0,
+    std::span<const ContractVersion>{kInitialSupportedVersions}};
+inline constexpr ContractDescriptor kB3PlatformRequest{
+    "yuzu.b3.platform.request", kVersion1_0,
+    std::span<const ContractVersion>{kInitialSupportedVersions}};
+inline constexpr ContractDescriptor kB3PlatformResult{
+    "yuzu.b3.platform.result", kVersion1_0,
+    std::span<const ContractVersion>{kInitialSupportedVersions}};
+inline constexpr ContractDescriptor kB4Fact{
+    "yuzu.b4.fact", kVersion1_0,
+    std::span<const ContractVersion>{kInitialSupportedVersions}};
+inline constexpr ContractDescriptor kB4Finalisation{
+    "yuzu.b4.finalisation", kVersion1_0,
+    std::span<const ContractVersion>{kInitialSupportedVersions}};
+inline constexpr ContractDescriptor kB4Redemption{
+    "yuzu.b4.redemption", kVersion1_0,
+    std::span<const ContractVersion>{kInitialSupportedVersions}};
+
 inline constexpr std::array kContractDescriptors{
-    ContractDescriptor{"yuzu.b2.use_case.request", kVersion1_0,
-                       std::span<const ContractVersion>{kInitialSupportedVersions}},
-    ContractDescriptor{"yuzu.b2.use_case.result", kVersion1_0,
-                       std::span<const ContractVersion>{kInitialSupportedVersions}},
-    ContractDescriptor{"yuzu.b3.platform.request", kVersion1_0,
-                       std::span<const ContractVersion>{kInitialSupportedVersions}},
-    ContractDescriptor{"yuzu.b3.platform.result", kVersion1_0,
-                       std::span<const ContractVersion>{kInitialSupportedVersions}},
-    ContractDescriptor{"yuzu.b4.fact", kVersion1_0,
-                       std::span<const ContractVersion>{kInitialSupportedVersions}},
-    ContractDescriptor{"yuzu.b4.finalisation", kVersion1_0,
-                       std::span<const ContractVersion>{kInitialSupportedVersions}},
-    ContractDescriptor{"yuzu.b4.redemption", kVersion1_0,
-                       std::span<const ContractVersion>{kInitialSupportedVersions}},
+    kB2UseCaseRequest, kB2UseCaseResult, kB3PlatformRequest, kB3PlatformResult,
+    kB4Fact,           kB4Finalisation, kB4Redemption,
 };
 
 [[nodiscard]] constexpr std::span<const ContractDescriptor> contract_descriptors() noexcept {
