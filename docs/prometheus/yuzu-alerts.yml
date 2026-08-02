@@ -675,8 +675,11 @@ groups:
       # clock moved in a way that WOULD have wiped audit evidence -- an
       # unattended host whose time sync is broken is one guard away from losing
       # its SOC 2 trail.
-      # NO rule ships for yuzu_server_audit_retention_bootstrap_declines_total
-      # (#2579), and that is deliberate rather than an oversight. That counter
+      # yuzu_server_audit_retention_bootstrap_declines_total (#2579) is NOT
+      # folded into the rule below, and that is deliberate rather than an
+      # oversight. It has its own rule further down
+      # (YuzuAuditRetentionAnchorNotSurviving) keyed on the value CLIMBING; what
+      # is deliberately unalerted is a SINGLE decline. That counter
       # marks a pass declined for having NO stored clock reading while rows were
       # already expired - it asserts only that nothing can yet RULE OUT a wrong
       # clock, never that the clock moved, so folding it into the rule below

@@ -717,6 +717,29 @@ TEST_CASE("AuditStore #2579: a probe-failed pass does not spend the bootstrap tr
     CHECK(f.store.bootstrap_declines_count() == 1);
 }
 
+TEST_CASE("AuditStore #2579: consecutive probe failures do not erode the trigger",
+          "[audit_store][retention][clock-guard]") {
+    // quality-engineer's Gate 8 coverage gap: the single-failure case is pinned
+    // above, but nothing showed the flag surviving a RUN of them. It has to,
+    // because the condition that makes a probe fail (a busy or wedged database
+    // on the first post-upgrade pass) is exactly the kind that repeats.
+    GuardFixture f;
+    f.seed(kNow - 100, 10);
+    f.seed(kNow + kWindow, 2);
+
+    exec_raw(f.tmp.path, "ALTER TABLE audit_events RENAME TO audit_events_hidden");
+    for (int i = 0; i < 3; ++i)
+        CHECK(f.store.cleanup_once(kNow + i) == 0);
+    CHECK(f.store.cleanup_failed_count() == 3);
+    CHECK(f.store.bootstrap_declines_count() == 0); // no verdict on any of them
+    exec_raw(f.tmp.path, "ALTER TABLE audit_events_hidden RENAME TO audit_events");
+
+    // Still armed after three failures.
+    CHECK(f.store.cleanup_once(kNow + 10) == 0);
+    CHECK(f.store.bootstrap_declines_count() == 1);
+    CHECK(f.store.total_count() == 12);
+}
+
 TEST_CASE("AuditStore #2579: nothing expired means no bootstrap decline",
           "[audit_store][retention][clock-guard]") {
     // The cost control. A fresh install has no stored reading either, and if the

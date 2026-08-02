@@ -48,12 +48,16 @@ struct Facts {
     bool would_wipe = false;
     bool big_step = false;
     bool prev_unusable = false;
-    /// No usable previous reading to compare against (#2579). TRUE for an
-    /// ABSENT row and equally for one discarded as unusable, because both leave
-    /// the pass with no comparison point -- the fact is "cannot vouch for the
-    /// clock", not "the row was missing". `prev_unusable` still outranks it, so
-    /// corrupt durable state keeps reporting as corruption rather than as a
-    /// bootstrap.
+    /// This process has not yet reached a VERDICT with a usable previous
+    /// reading (#2579). Deliberately NOT "the anchor is missing right now":
+    /// `cleanup_once` re-anchors before it probes, so deriving it from the
+    /// anchor lets a pass that failed its probes spend the trigger without ever
+    /// classifying anything -- see `AuditStore::bootstrap_pending_`, which is
+    /// what the sole producer passes here.
+    ///
+    /// A reading DISCARDED by the in-pass sanitiser therefore leaves this FALSE:
+    /// that path sets `prev_unusable` instead, which outranks, so corrupt
+    /// durable state still reports as corruption rather than as a bootstrap.
     bool no_anchor = false;
 
     friend constexpr bool operator==(const Facts&, const Facts&) noexcept = default;
