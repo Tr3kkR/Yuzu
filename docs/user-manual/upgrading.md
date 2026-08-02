@@ -550,16 +550,14 @@ Before upgrading any component:
   - `yuzu-server.cfg`, `enrollment-tokens.cfg`, `pending-agents.cfg`
   - All `.db` files (response store, audit, policies, **auth.db**, etc.) — use `sqlite3 <path> ".backup ..."` rather than `cp` against live WAL databases
   - The **PostgreSQL database**, once your deployment carries one (ADR-0006 — bundled in the composes; provisioned natively by `install-server-postgres.sh`) — use `pg_dump --format=custom`; see [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate) for the full backup/restore procedure and the ADR-0010 restore-pairing invariant (DB and `KeyProvider` keys-dir backups restore **together**)
-- [ ] **Correct the server's clock before upgrading** (`timedatectl status` or
-  `chronyc tracking`; under Docker it is the host's clock that matters). A
-  forward-skewed clock can delete audit rows on the first retention pass after the
-  upgrade with no decline recorded, and keeps doing so until the rows stamped
-  before the skew are exhausted -
-  see [Retention clock
+- [ ] **Verify the server's clock before upgrading** (`timedatectl status` or
+  `chronyc tracking`; under Docker it is the host's clock that matters). Rows
+  already stamped cannot be protected retroactively by any setting, and a server
+  upgraded to schema v3 while its clock was skewed FORWARD could delete expired
+  audit rows unremarked on its first guarded pass - see [Retention clock
   guards](#retention-clock-guards-2360-server-audit-store-2361-tar-agent-warehouse)
-  below and #2579. If you cannot establish that the clock is right, defer the
-  upgrade: there is no reaper kill switch, and no retention setting protects rows
-  that are already stamped.
+  below and #2579. Fixed forward: that pass now declines instead, so the risk is
+  to servers upgrading FROM an affected version with a wrong clock.
 - [ ] Check the [CHANGELOG](../../CHANGELOG.md) for breaking changes
 - [ ] Verify disk space (at least 500 MB free for migration)
 - [ ] Note current version: `yuzu-server --version` / `yuzu-agent --version`
@@ -910,19 +908,23 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
 - **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
   table holding the durable clock reading - one row, instant) plus the
   best-effort index build described under Schema Migrations above.
-- **Correct the clock BEFORE upgrading a server whose time may be wrong (#2579).**
-  The stored clock reading (the anchor) is new in schema v3, so every database
-  starts its first guarded pass without one. An ABSENT reading is not itself a
-  decline trigger - it is the ordinary fresh-install case - and that leaves one
-  shape unguarded: a host already skewed FORWARD, where rows written after the
-  skew are still inside the retention window, so the would-expire-everything test
-  does not fire either. Such a pass deletes up to the 25,000-row cap without
-  declining, and **the exposure is not limited to that one pass** - it keeps
-  deleting rows stamped before the skew ahead of their window until that cohort is
-  exhausted. If you cannot establish that the clock is right, defer the
-  upgrade: there is no reaper kill switch, no retention setting protects rows
-  already stamped, and there is no reliable way to detect the loss afterwards.
-  The bound, the full signal set, and why no retrospective test is offered:
+- **The first guarded pass now declines when it has no stored reading and rows
+  are already expired (#2579).** The stored clock reading (the anchor) is new in
+  schema v3, so every database starts its first guarded pass without one. An
+  ABSENT reading is not a statement about the clock - it is the ordinary
+  fresh-install case - which previously left one shape unguarded: a host already
+  skewed FORWARD, where rows written after the skew were still inside the window,
+  so the would-expire-everything test did not fire either, and the pass deleted up
+  to the 25,000-row cap unremarked. Such a pass now declines ONCE, warns, and
+  anchors the reading; the next pass proceeds normally, paced by the cap. A fresh
+  install with nothing expired does not decline at all. **Expect at most one such
+  decline per server on this upgrade**, counted by the new
+  `yuzu_server_audit_retention_bootstrap_declines_total` and NOT by
+  `yuzu_server_audit_clock_anomaly_skips_total` - so it does not fire
+  `YuzuAuditRetentionClockAnomaly`, and you should not stand that alert down for
+  it. Servers upgrading FROM an affected version with a wrong clock may already
+  have lost rows; there is no reliable retrospective test, and the loss is not
+  recoverable without a backup predating it. Detail:
   [audit-log.md § The retention clock
   guard](audit-log.md#the-retention-clock-guard).
 - **Expect a first-pass retention decline on the AGENT, and only conditionally on

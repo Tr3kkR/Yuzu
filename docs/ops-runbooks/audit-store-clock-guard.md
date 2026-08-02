@@ -34,20 +34,17 @@ log line (step 3 below); it names its own trigger.
 operational fault drains roughly 600k rows/day. The alert is the control. The
 guard is the seatbelt.
 
-**Known gap (#2579), and this page alerts on it late at best.** A pass that
-begins with NO stored reading has no missing-anchor trigger, so on a host whose
-clock is ALREADY skewed forward it deletes without declining, and keeps doing so
-until the rows stamped before the skew are exhausted (a still-drifting clock is
-the open-ended case). The 600k rows/day figure above is one such case. It
-reaches the alerts on this page only once a backlog binds the cap
-(`YuzuAuditRetentionCapBinding`, and only after six such passes - roughly 150,000
-rows); a sub-cap pass never fires anything here, and looks exactly like routine
-expiry. `yuzu_server_audit_rows_deleted_total` does move throughout, so it is
-evidence, but on its own it does not distinguish this from healthy expiry. There
-is no reliable retrospective test today - read the Limits note before improvising
-one. The full trigger list and the reasoning behind these signals live on the
-canonical page:
-[Limits](../user-manual/audit-log.md#the-retention-clock-guard).
+**The bootstrap decline (#2579), and why it is not one of your alerts.** A pass
+that begins with NO stored clock reading while rows are already expired declines
+once, warns, and anchors the reading - it cannot tell whether the clock was wrong
+before the guard ever ran, so it holds back rather than delete. That decline
+raises `yuzu_server_audit_retention_bootstrap_declines_total` and NOT the
+clock-anomaly series, deliberately: it makes no claim that the clock moved, so it
+must not fire an alert that says one did. Expect 0 or 1 per database, typically on
+the upgrade to schema v3. A value that keeps climbing means the anchor is not
+surviving - read `yuzu_server_audit_retention_persist_failed_total` beside it. The
+full trigger list and the reasoning behind these signals live on the canonical
+page: [Limits](../user-manual/audit-log.md#the-retention-clock-guard).
 
 ## YuzuAuditPersistFailures - audit WRITES are failing
 
@@ -85,6 +82,9 @@ cannot see it.
      check fired; the line prints the measured gap against the threshold.
    - `"the stored retention clock reading is not usable"` - the persisted
      reading was ahead of now, negative, non-integer or unreadable.
+   - `"no stored clock reading to compare against"` - the bootstrap decline
+     (#2579). This one does NOT raise the clock-anomaly counter, so it cannot be
+     what fired THIS alert; you are seeing it beside another trigger.
 4. If the line reads `"the first retention pass against this database"`, **do NOT
    stand it down on sight** - treat it exactly as the wipe case above and confirm
    the clock before letting the next pass drain. That line carries its own

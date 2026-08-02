@@ -5,17 +5,14 @@ provides a tamper-evident trail suitable for compliance reporting, incident
 investigation, and forwarding to external SIEM platforms such as Splunk or
 Elastic.
 
-> **Known issue, UNFIXED (#2579):** a retention pass that begins with NO stored
-> clock reading can delete audit rows without declining. An absent reading is not
-> a trigger (an unusable one is). On a host whose clock is already skewed forward,
-> the first pass after upgrading to schema v3 --- and any later pass that again
-> starts with no stored reading --- deletes up to 25,000 rows with no decline and no
-> `yuzu_server_audit_clock_anomaly_skips_total` increment. **The exposure does not
-> end after that one pass:** it keeps deleting rows stamped before the skew until
-> that cohort is exhausted. There is no
-> reliable way to detect it after the fact today. Bounds and signals are under
-> [Limits](#the-retention-clock-guard) below. **Correct the clock before
-> upgrading**; if you cannot, defer the upgrade.
+> **Fixed (#2579), and it affected upgrades only.** A retention pass that began
+> with NO stored clock reading declined nothing on its own account, so a host
+> whose clock was ALREADY skewed forward when it first ran the guard could delete
+> expired rows unremarked. Such a pass now declines once, warns, and anchors the
+> reading; the next pass proceeds normally. A correct clock was never at risk, and
+> a fresh install with nothing expired does not decline. If you ran an affected
+> version with a wrong clock, rows deleted then are not recoverable without a
+> backup taken before it. Detail under [Limits](#the-retention-clock-guard).
 
 > **Known issue in v0.9.0 (advisory YZA-2026-001):** audit rows for requests
 > authenticated via `Authorization: Bearer` or `X-Yuzu-Token` (every MCP tool
@@ -502,46 +499,37 @@ fix --- not hand-deletion.
 - Detection is best-effort; the cap is the half that always applies. It bounds any
   allowed wipe to 25,000 rows per pass unconditionally, whether or not a detector
   fired --- an instantaneous wipe becomes a paced one plus an operator signal.
-- **A pass that begins with NO stored reading is the weakest one, and the exposure
-  does not end with it (#2579).** An ABSENT reading is the ordinary fresh-install
-  case and is not a trigger on its own; an unusable one IS. So a pass that starts
-  with none rests entirely on the would-expire-everything test, and a host already
-  skewed forward whose post-skew rows are still inside the window satisfies neither
-  test and deletes up to the cap. Persisting the anchor does not close it: while
-  the clock stays skewed the guard has nothing to compare against that would
-  register the skew, so passes keep deleting --- at up to 600k rows/day once a
-  backlog binds the cap, and thereafter at the rate those rows were originally
-  written. What ends it is not correcting the clock but exhausting the affected
-  cohort: only rows stamped BEFORE the skew lose time, because a row written under
-  the skew is stamped from the same wall clock the cutoff is read from and so
-  carries its full window. A forward step of `S` on a window of `W` therefore
-  works through the pre-skew rows and stops about `W - S` later. (A clock that
-  keeps DRIFTING is the open-ended case.) The same state recurs outside upgrades:
-  after a failed anchor persist plus a restart, or after restoring a pre-v3
-  snapshot. The rule itself is stated once, above; this bullet
-  deliberately does not restate it. The shape is pinned by "AuditStore #2360: a
-  datable survivor means no wipe, so the pass deletes immediately" in
-  `tests/unit/server/test_audit_store.cpp` --- expired rows plus one survivor,
-  against a store with no stored reading, delete with
-  `clock_anomaly_skips_count() == 0`.
-- **What you see, and what you do not.** Never a decline, and never a
-  `yuzu_server_audit_clock_anomaly_skips_total` increment. The pass is not
-  signal-free: it raises `yuzu_server_audit_rows_deleted_total` and writes an
-  `AuditStore: expired ...` info line (the cap-bound variant when the cap binds).
-  A backlog large enough to bind the cap also raises
-  `yuzu_server_audit_retention_cap_reached_total`, which
-  `YuzuAuditRetentionCapBinding` alerts on --- but only if you have wired the
-  shipped rules, which no compose file mounts, and only after six cap-binding
-  passes, so roughly 150,000 rows are already gone before it fires. None of these
-  distinguishes this case from healthy expiry on its own.
-- **There is no reliable retrospective test for this today, and you should not
-  improvise one.** The obvious checks do not discriminate: a surviving-row floor
-  near the configured cutoff is what a healthy oldest-first reaper looks like;
-  `MIN(timestamp)` is pinned indefinitely by any row stamped `ttl_expires_at = 0`
-  (rows written while retention was disabled), which deletion never touches; and a
-  cutoff computed on the affected host moves with the skew. Deletions here are also
-  not recoverable without a pre-incident backup. Designing a check that actually
-  separates this from routine expiry is part of #2579. Upgrade guidance:
+- **A pass that begins with NO stored reading declines, once (#2579).** An
+  ABSENT reading is the ordinary fresh-install case and says nothing about the
+  clock; an unusable one is a separate, stronger signal and still reports as
+  corruption. But an absent reading together with rows ALREADY EXPIRED leaves the
+  pass nothing that could rule out a clock which was wrong before the guard ever
+  ran, so it holds back rather than delete. It declines once, warns, and anchors
+  the reading; the next pass has a comparison point and proceeds, paced by the cap
+  as always. With nothing expired there is nothing to hold back and no decline
+  happens, so a fresh install is unaffected. The same one-off decline recurs
+  wherever the reading goes missing again: after a failed anchor persist plus a
+  restart, or after restoring a pre-v3 snapshot. The rule itself is stated once,
+  above; this bullet deliberately does not restate it.
+- **Its signal is separate on purpose.** The decline raises
+  `yuzu_server_audit_retention_bootstrap_declines_total`, NOT
+  `yuzu_server_audit_clock_anomaly_skips_total`. The latter drives an alert
+  meaning "the clock moved in a way that would have wiped audit evidence", and
+  this decline claims nothing of the sort --- only that nothing can yet rule it
+  out. Expect 0 or 1 per database. A value that keeps climbing means the anchor is
+  not surviving; read `yuzu_server_audit_retention_persist_failed_total` beside it.
+- **Before the fix**, such a pass deleted up to the cap with no decline and no
+  clock-anomaly counter, and kept deleting rows stamped before the skew until that
+  cohort was exhausted --- only those lose time, since a row written under the skew
+  is stamped from the same wall clock the cutoff is read from and keeps its full
+  window, so a forward step of `S` on a window of `W` works through the pre-skew
+  rows and stops about `W - S` later. There is no reliable retrospective test for
+  whether a given database was affected, and the obvious checks do not
+  discriminate: a surviving-row floor near the configured cutoff is what a healthy
+  oldest-first reaper looks like; `MIN(timestamp)` is pinned indefinitely by any
+  row stamped `ttl_expires_at = 0`, which deletion never touches; and a cutoff
+  computed on the affected host moves with the skew. Rows deleted then are not
+  recoverable without a backup predating the pass. Upgrade guidance:
   [upgrading.md § Retention clock guards](upgrading.md#retention-clock-guards-2360-server-audit-store-2361-tar-agent-warehouse).
 - Changing `--audit-retention-days` does not re-date existing rows.
   `ttl_expires_at` is stamped once at INSERT and never rewritten, so a reduction
