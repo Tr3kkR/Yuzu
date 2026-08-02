@@ -101,23 +101,27 @@ What to expect:
 ### 1 · `ci` — CI/test revamp
 
 Handover: `/Users/nathan/Desktop/Yuzu CI revamp handover 2026-07-29.md` (authoritative session
-state). Design input: `docs/proposals/ci-test-architecture-review.md`. Reference:
+state). Design input: `docs/proposals/ci-test-architecture-review.md` — **local-only on the Mac
+and untracked**, like the handover; ask the operator if it is missing. Reference:
 `docs/ci-architecture.md`, `.claude/skills/ci-cache/SKILL.md`.
 
-Units in flight — one worktree each under `<yz-root>/ci/`:
+Units — one worktree each under `<yz-root>/ci/`. State as of 2026-08-02:
 
 | Unit | Dir | PR | State |
 |---|---|---|---|
-| U02 canary classifier | `u02-canary-classifier` | #2616 | draft, base `dev` |
-| U03 runner control | `u03-runner-control` | #2612 | draft, base `dev` |
-| U05 runner preparation | `u05-prepare-runner` | — | **uncommitted, base 38 behind `dev`** |
-| U06 toolchain contract | `u06-toolchain-contract` | #2617 | draft, base `dev` |
-| U08 TAR determinism | `u08-tar-determinism` | #2613 | draft, stacked on U09 |
-| U09 annotation adapter | `u09-annotation-adapter` | #2608 | open, base `ci5-u07-flake-expiry` |
-| U10 guardian refill | `u10-guardian-refill` | #2615 | draft, base `dev` |
-| CodeQL dispatch invariant | `codeql-invariant` | #2621 | open, base `dev` |
+| U01 resource envelopes | — | #2601 | merged |
+| U02 canary classifier | `u02-canary-classifier` | #2616 | merged |
+| U03 runner control | `u03-runner-control` | #2612 | merged |
+| U05 runner preparation | `u05-prepare-runner` | — | **uncommitted; branch carries no commits and is 184 behind `dev`** |
+| U06 toolchain contract | `u06-toolchain-contract` | #2617 | merged |
+| U07 flake expiry | — | #2602 | merged |
+| U08 TAR determinism | `u08-tar-determinism` | #2613 | merged |
+| U09 annotation adapter | `u09-annotation-adapter` | #2608 | merged |
+| U10 guardian refill | `u10-guardian-refill` | #2615 | merged |
+| CodeQL dispatch invariant | `codeql-invariant` | #2621 | merged |
 
-Merged: U01 (#2601), U07 (#2602).
+U05 is the only unit still outstanding. Every other worktree in this stream is landed and can be
+torn down; check each for unpushed work first.
 
 Two prototypes are **preserved but must not be published** — runner admission and U04 execution
 trust. Both are blocked on the same prerequisite: every runner service needs its own non-admin OS
@@ -135,10 +139,10 @@ The `authorize_list_read` admit-then-filter chokepoint. Every new list or fan-ou
 per-agent data goes through it — never a bare global `require_permission`, which is inert for
 confined operators and fails open on a corrupt `rbac.db`.
 
-Open work: **#1715** (global↔management-group permission combining — deny precedence) is the
-prerequisite and is still open. Then PR-B: **#2473** wrapper + engine-principal guard, **#2474**
-authz decision metric and deny-reason split, **#2475** resolver cache and loop hoist, **#2477**
-worked cross-boundary docs example. Robustness edges in **#2476**.
+Open work: **#1715** (global↔management-group permission combining — deny precedence) was the
+prerequisite and is now **closed**, so PR-B is unblocked: **#2473** wrapper + engine-principal
+guard, **#2474** authz decision metric and deny-reason split, **#2475** resolver cache and loop
+hoist, **#2477** worked cross-boundary docs example. Robustness edges in **#2476**. All five open.
 
 Interlock, from ADR-1005: no ballot-A5 code ships before engine principals plus the ADR-0017 gate
 (#1714, prerequisite #1715). #1716 is the closed doc-honesty companion — **not** the gate.
@@ -171,13 +175,14 @@ Starter worktree: `<yz-root>/adr31/plan` on `adr31/decomposition-plan`.
 Read: `docs/postgres-migration-ladder.md` (the ordered queue), `docs/postgres-store-playbook.md`
 (the recipe), ADR-0012 (the author contract), ADR-0006/0007/0008/0010.
 
-Two pilot migrations are open and governance-clean: **#2496** `ResultSetStore`, **#2497**
-`InventoryStore`. Land these before opening more — the per-store conventions they establish
-(type-distinguishable authoritative reads, backfill RAII, degrade audit + metric, `stop()` unwire,
-`/readyz` + `/healthz` wiring) are what the rest of the ladder copies.
+Both pilots have merged — **#2496** `ResultSetStore` and **#2497** `InventoryStore`. The per-store
+conventions they established (type-distinguishable authoritative reads, backfill RAII, degrade
+audit + metric, `stop()` unwire, `/readyz` + `/healthz` wiring) are what the rest of the ladder
+copies; read one of them before opening a new store PR.
 
-Next from Wave 1 once the pilots land: `GuaranteedStateStore`, `FleetTopologyStore`,
-`ResponseStore`, `AuditStore`.
+In flight as of 2026-08-02, one worktree each under `<yz-root>/pg/`: **#2663** `GuaranteedStateStore`
+(Wave 1.1), **#2691** `ResponseStore` (1.2), **#2697** `AuditStore` (1.3), **#2703** `RbacStore`
+(2.1), **#2708** `ManagementGroupStore` (2.2) — all open. `FleetTopologyStore` is unstarted.
 
 Every store migrates behind its own per-store ADR and PR. Secrets are never a plain column —
 verify-only hash or a `SecretCodec` envelope, with `security-guardian` review on every
