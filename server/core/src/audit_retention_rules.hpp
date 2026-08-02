@@ -55,9 +55,10 @@ struct Facts {
     /// classifying anything -- see `AuditStore::bootstrap_pending_`, which is
     /// what the sole producer passes here.
     ///
-    /// A reading DISCARDED by the in-pass sanitiser therefore leaves this FALSE:
-    /// that path sets `prev_unusable` instead, which outranks, so corrupt
-    /// durable state still reports as corruption rather than as a bootstrap.
+    /// The in-pass sanitiser sets `prev_unusable`, which outranks, so corrupt
+    /// durable state reports as corruption whether or not this is ALSO set --
+    /// the two are not mutually exclusive, and a verdict-less pass can leave
+    /// both true on a later one.
     bool no_anchor = false;
 
     friend constexpr bool operator==(const Facts&, const Facts&) noexcept = default;
