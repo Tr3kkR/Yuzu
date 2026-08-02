@@ -13,7 +13,7 @@
 # Build context is the repo root (compose sets context: ../..).
 
 FROM yuzu-agent-viz-uat:latest AS agentsrc
-FROM envoyproxy/envoy:v1.38-latest@sha256:5f7c43e1147412fdb3af578c651c67478a3df818eae89d2261e707e06c209cdb AS envoysrc
+FROM envoyproxy/envoy:v1.39-latest@sha256:d59f7f5fa10cff6d5892b6c5e7df5c9297ddfb2c3683e33fbfb82da24de4fa66 AS envoysrc
 
 FROM debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
 
