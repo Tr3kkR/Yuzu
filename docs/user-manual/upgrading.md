@@ -614,6 +614,14 @@ Before upgrading any component:
   - `yuzu-server.cfg`, `enrollment-tokens.cfg`, `pending-agents.cfg`
   - All `.db` files (response store, audit, policies, **auth.db**, etc.) — use `sqlite3 <path> ".backup ..."` rather than `cp` against live WAL databases
   - The **PostgreSQL database**, once your deployment carries one (ADR-0006 — bundled in the composes; provisioned natively by `install-server-postgres.sh`) — use `pg_dump --format=custom`; see [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate) for the full backup/restore procedure and the ADR-0010 restore-pairing invariant (DB and `KeyProvider` keys-dir backups restore **together**)
+- [ ] **Verify the server's clock before upgrading** (`timedatectl status` or
+  `chronyc tracking`; under Docker it is the host's clock that matters). Rows
+  already stamped cannot be protected retroactively by any setting, and a server
+  upgraded to schema v3 while its clock was skewed FORWARD could delete expired
+  audit rows unremarked on its first guarded pass - see [Retention clock
+  guards](#retention-clock-guards-2360-server-audit-store-2361-tar-agent-warehouse)
+  below and #2579. Fixed forward: that pass now declines instead, so the risk is
+  to servers upgrading FROM an affected version with a wrong clock.
 - [ ] Check the [CHANGELOG](../../CHANGELOG.md) for breaking changes
 - [ ] Verify disk space (at least 500 MB free for migration)
 - [ ] Note current version: `yuzu-server --version` / `yuzu-agent --version`
@@ -964,6 +972,25 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
 - **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
   table holding the durable clock reading - one row, instant) plus the
   best-effort index build described under Schema Migrations above.
+- **The first guarded pass now declines when it has no stored reading and rows
+  are already expired (#2579).** The stored clock reading (the anchor) is new in
+  schema v3, so every database starts its first guarded pass without one. An
+  ABSENT reading is not a statement about the clock - it is the ordinary
+  fresh-install case - which previously left one shape unguarded: a host already
+  skewed FORWARD, where rows written after the skew were still inside the window,
+  so the would-expire-everything test did not fire either, and the pass deleted up
+  to the 25,000-row cap unremarked. Such a pass now declines ONCE, warns, and
+  anchors the reading; the next pass proceeds normally, paced by the cap. A fresh
+  install with nothing expired does not decline at all. **Expect at most one such
+  decline per server on this upgrade**, counted by the new
+  `yuzu_server_audit_retention_bootstrap_declines_total` and NOT by
+  `yuzu_server_audit_clock_anomaly_skips_total` - so it does not fire
+  `YuzuAuditRetentionClockAnomaly`, and you should not stand that alert down for
+  it. Servers upgrading FROM an affected version with a wrong clock may already
+  have lost rows; there is no reliable retrospective test, and the loss is not
+  recoverable without a backup predating it. Detail:
+  [audit-log.md § The retention clock
+  guard](audit-log.md#the-retention-clock-guard).
 - **Expect a first-pass retention decline on the AGENT, and only conditionally on
   the server.** The two guards differ here and the difference matters:
   - **TAR declines on a missing anchor, by design.** It checks per warehouse

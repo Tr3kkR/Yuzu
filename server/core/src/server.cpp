@@ -1257,6 +1257,18 @@ public:
                           "AuditStore::cleanup_once, pinned by tests - it is "
                           "deliberately not paraphrased here",
                           "counter");
+        metrics_.describe("yuzu_server_audit_retention_bootstrap_declines_total",
+                          "Audit retention passes declined because there was no usable previous "
+                          "clock reading to compare against AND rows were already expired "
+                          "(#2579). Counted apart from the clock-anomaly series on purpose: this "
+                          "decline does NOT claim the clock moved, only that nothing can yet "
+                          "rule it out, so it must not fire an alert that says otherwise. "
+                          "Expect 0 or 1 per database - the declining pass also anchors the "
+                          "reading, so the next pass proceeds. A value that keeps climbing "
+                          "means the anchor is not surviving; check "
+                          "yuzu_server_audit_retention_persist_failed_total. Triage: "
+                          "docs/user-manual/audit-log.md#the-retention-clock-guard",
+                          "counter");
         metrics_.describe("yuzu_server_audit_cleanup_failed_total",
                           "Audit retention passes that did not fully do their job: an unreadable "
                           "probe, a failed delete, a refused implausible clock, a closed store, or "
@@ -4534,6 +4546,8 @@ public:
                     // failed passes are scraped separately (see describe above).
                     metrics_.gauge("yuzu_server_audit_clock_anomaly_skips_total")
                         .set(static_cast<double>(audit_store_->clock_anomaly_skips_count()));
+                    metrics_.gauge("yuzu_server_audit_retention_bootstrap_declines_total")
+                        .set(static_cast<double>(audit_store_->bootstrap_declines_count()));
                     metrics_.gauge("yuzu_server_audit_cleanup_failed_total")
                         .set(static_cast<double>(audit_store_->cleanup_failed_count()));
                     metrics_.gauge("yuzu_server_audit_rows_deleted_total")

@@ -506,6 +506,16 @@ constexpr std::int64_t kWindow = static_cast<std::int64_t>(kGuardRetentionDays) 
 // An arbitrary fixed "now", far from both the epoch and the real clock.
 constexpr std::int64_t kNow = 1'700'000'000;
 
+/// Anchor a directly-constructed store, as `GuardFixture::anchor` does for the
+/// fixture-based tests. Same mechanism and same reason (#2579): a pass over an
+/// empty table records the reading without classifying anything, so the test
+/// that follows exercises its own trigger rather than the bootstrap.
+void anchor_pass(AuditStore& s, std::int64_t at = kNow - 3600) {
+    REQUIRE(s.cleanup_once(at) == 0);
+    REQUIRE(s.clock_anomaly_skips_count() == 0);
+    REQUIRE(s.bootstrap_declines_count() == 0);
+}
+
 struct GuardFixture {
     yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-"}};
     AuditStore store;
@@ -513,6 +523,28 @@ struct GuardFixture {
         REQUIRE(store.is_open());
     }
     void seed(std::int64_t ttl, int count) { seed_rows_with_ttl(tmp.path, ttl, count); }
+
+    /// Put this store in the state of one that has already completed a pass, so
+    /// the bootstrap trigger (#2579) does not fire.
+    ///
+    /// Needed because #2579 made "no stored reading, and rows already expired" a
+    /// decline in its own right. Almost every guard test here is about something
+    /// else -- the cap, the dedup rule, one specific trigger -- and each would
+    /// otherwise spend its first pass absorbing a bootstrap decline it never
+    /// meant to exercise. This states the precondition those tests always
+    /// assumed implicitly. The ones that ARE about the bootstrap do not call it.
+    ///
+    /// A pass over an EMPTY table is the whole mechanism, and it is exact rather
+    /// than approximate: `cleanup_once` anchors the reading before it probes
+    /// anything, and with nothing expired the rule short-circuits to `None`, so
+    /// no counter moves, nothing is deleted and no anomaly is recorded. Call it
+    /// BEFORE seeding. The default is an hour back, comfortably inside the
+    /// 7-day step threshold, so it cannot itself provoke a `Step`.
+    void anchor(std::int64_t last_pass_now = kNow - 3600) {
+        REQUIRE(store.cleanup_once(last_pass_now) == 0);
+        REQUIRE(store.clock_anomaly_skips_count() == 0);
+        REQUIRE(store.bootstrap_declines_count() == 0);
+    }
 };
 
 
@@ -574,6 +606,7 @@ TEST_CASE("AuditStore #2360: the decline is latched, so the backlog still drains
     // Declining EVERY pass would mean a genuinely all-expired store never ages
     // out anything at all - the guard would become a permanent retention leak.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 10);
 
     REQUIRE(f.store.cleanup_once(kNow) == 0);
@@ -587,6 +620,7 @@ TEST_CASE("AuditStore #2360: the decline is latched, so the backlog still drains
 TEST_CASE("AuditStore #2360: the latch clears once the backlog is gone, re-arming the guard",
           "[audit_store][retention][clock-guard]") {
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 10);
 
     REQUIRE(f.store.cleanup_once(kNow) == 0);      // decline #1
@@ -604,12 +638,120 @@ TEST_CASE("AuditStore #2360: a datable survivor means no wipe, so the pass delet
     // The healthy steady state: some rows have aged out, others have not. The
     // guard must be completely invisible here.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 10);       // expired
     f.seed(kNow + kWindow, 1);    // a normal, unexpired row
 
     CHECK(f.store.cleanup_once(kNow) == 10);
     CHECK(f.store.total_count() == 1);
     CHECK(f.store.clock_anomaly_skips_count() == 0);
+}
+
+TEST_CASE("AuditStore #2579: no stored reading + rows already expired declines, once",
+          "[audit_store][retention][clock-guard]") {
+    // The disclosed shape, end to end. A host whose clock was ALREADY skewed
+    // forward before its first guarded pass: rows written before the skew look
+    // expired, rows written after it are still inside the window, so the
+    // would-expire-everything test does not fire and -- before this trigger --
+    // nothing else did either. The pass deleted, with no decline, no counter and
+    // no warning.
+    //
+    // Deliberately NOT anchored: the absence of a stored reading IS the input.
+    GuardFixture f;
+    f.seed(kNow - 100, 10);    // expired: written before the skew
+    f.seed(kNow + kWindow, 2); // datable survivors: written after it
+
+    REQUIRE(f.store.cleanup_once(kNow) == 0); // was 10 before #2579
+    CHECK(f.store.total_count() == 12);
+    CHECK(f.store.bootstrap_declines_count() == 1);
+    // The signal separation is the contract, not an implementation detail: this
+    // decline must not fire the alert that means "the clock moved".
+    CHECK(f.store.clock_anomaly_skips_count() == 0);
+
+    // Once, not forever. The declining pass anchored the reading, so the next
+    // pass has a comparison point and proceeds -- paced by the cap as always.
+    CHECK(f.store.cleanup_once(kNow + 1) == 10);
+    CHECK(f.store.total_count() == 2);
+    CHECK(f.store.bootstrap_declines_count() == 1); // and NOT counted twice
+}
+
+TEST_CASE("AuditStore #2579: a probe-failed pass does not spend the bootstrap trigger",
+          "[audit_store][retention][clock-guard]") {
+    // BLOCKING, found by unhappy-path at Gate 4.
+    //
+    // `cleanup_once` re-anchors BEFORE it probes (the durable write and the
+    // in-memory stamp both happen at the top of the locked section), so a pass
+    // whose probes then fail has consumed the anchor without ever reaching a
+    // verdict. Deriving `no_anchor` from the anchor therefore let ONE transient
+    // probe failure disarm the trigger permanently: pass 2 sees a reading, calls
+    // itself anchored, and deletes with every detector false -- the exact defect
+    // #2579 closes, reinstated.
+    //
+    // It is not a remote shape. The first post-upgrade pass is the one with the
+    // largest backlog and possibly no retention index yet (the index build is
+    // deliberately best-effort), so it is the slowest and the likeliest to meet
+    // SQLITE_BUSY. The population at risk and the population that trips this are
+    // the same population.
+    //
+    // The fix mirrors what `loaded_meta_unusable_` already does on this path, for
+    // the reason that branch states in place: the flag is not consumed by a pass
+    // that did not act on it.
+    GuardFixture f;
+    f.seed(kNow - 100, 10);    // expired: written before the skew
+    f.seed(kNow + kWindow, 2); // datable survivors: written after it
+
+    // Pass 1 cannot probe -- and DOES re-anchor on its way past.
+    exec_raw(f.tmp.path, "ALTER TABLE audit_events RENAME TO audit_events_hidden");
+    CHECK(f.store.cleanup_once(kNow) == 0);
+    CHECK(f.store.cleanup_failed_count() == 1);
+    CHECK(f.store.bootstrap_declines_count() == 0); // no verdict was reached
+    exec_raw(f.tmp.path, "ALTER TABLE audit_events_hidden RENAME TO audit_events");
+
+    // Pass 2 must STILL decline. Before the fix it deleted all 10.
+    CHECK(f.store.cleanup_once(kNow + 1) == 0);
+    CHECK(f.store.bootstrap_declines_count() == 1);
+    CHECK(f.store.total_count() == 12);
+
+    // ...and having now reached a verdict, it is spent: pass 3 drains.
+    CHECK(f.store.cleanup_once(kNow + 2) == 10);
+    CHECK(f.store.bootstrap_declines_count() == 1);
+}
+
+TEST_CASE("AuditStore #2579: consecutive probe failures do not erode the trigger",
+          "[audit_store][retention][clock-guard]") {
+    // quality-engineer's Gate 8 coverage gap: the single-failure case is pinned
+    // above, but nothing showed the flag surviving a RUN of them. It has to,
+    // because the condition that makes a probe fail (a busy or wedged database
+    // on the first post-upgrade pass) is exactly the kind that repeats.
+    GuardFixture f;
+    f.seed(kNow - 100, 10);
+    f.seed(kNow + kWindow, 2);
+
+    exec_raw(f.tmp.path, "ALTER TABLE audit_events RENAME TO audit_events_hidden");
+    for (int i = 0; i < 3; ++i)
+        CHECK(f.store.cleanup_once(kNow + i) == 0);
+    CHECK(f.store.cleanup_failed_count() == 3);
+    CHECK(f.store.bootstrap_declines_count() == 0); // no verdict on any of them
+    exec_raw(f.tmp.path, "ALTER TABLE audit_events_hidden RENAME TO audit_events");
+
+    // Still armed after three failures.
+    CHECK(f.store.cleanup_once(kNow + 10) == 0);
+    CHECK(f.store.bootstrap_declines_count() == 1);
+    CHECK(f.store.total_count() == 12);
+}
+
+TEST_CASE("AuditStore #2579: nothing expired means no bootstrap decline",
+          "[audit_store][retention][clock-guard]") {
+    // The cost control. A fresh install has no stored reading either, and if the
+    // trigger fired on that it would declare an anomaly on every server's first
+    // boot -- which is why `no_anchor` is tested AFTER `has_expired`.
+    GuardFixture f;
+    f.seed(kNow + kWindow, 3); // nothing expired
+
+    CHECK(f.store.cleanup_once(kNow) == 0);
+    CHECK(f.store.bootstrap_declines_count() == 0);
+    CHECK(f.store.clock_anomaly_skips_count() == 0);
+    CHECK(f.store.total_count() == 3);
 }
 
 TEST_CASE("AuditStore #2360: one forward-skew far-future row cannot disarm the guard",
@@ -621,6 +763,7 @@ TEST_CASE("AuditStore #2360: one forward-skew far-future row cannot disarm the g
     // pass would not wipe everything" for the life of the store - disarming the
     // guard exactly when it is needed. It is excluded from the question instead.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 10);
     f.seed(kNow + kWindow + kAuditTtlFutureSlackSec + 1'000, 1); // implausible future
 
@@ -636,6 +779,7 @@ TEST_CASE("AuditStore #2360: a sub-window forward jump is caught by the step che
     // survivors behind, which the per-pass cap would bound but nothing would
     // report. The step check is what turns that into an operator signal.
     GuardFixture f;
+    f.anchor();
     // Past the FLOOR (kAuditMinBigStepSec), not merely past the 1-day retention
     // window: elapsed time cannot tell a jump from an outage, so the check only
     // fires past a duration where an outage is itself remarkable.
@@ -669,6 +813,7 @@ TEST_CASE("AuditStore #2360: an ordinary over-cap backlog does NOT arm the latch
     // meaningful (and the cap test stays honest) if the cap is ever retuned.
     constexpr std::size_t kSurplus = 7;
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, static_cast<int>(kMaxAuditDeletesPerPass + kSurplus));
     f.seed(kNow + kWindow, 1); // a survivor: this is a backlog, not an anomaly
 
@@ -696,6 +841,7 @@ TEST_CASE("AuditStore #2360: a failing pass fails closed and counts separately f
     // separate counter tells an operator watching an audit table that never
     // shrinks which of the two is happening.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 5);
     f.seed(kNow + kWindow, 1);
     REQUIRE(f.store.cleanup_once(kNow) == 5);
@@ -717,6 +863,7 @@ TEST_CASE("AuditStore #2360: a delete that fails mid-statement deletes nothing a
     // SQLite unwinds the statement, so any RETURNING rows already seen are back
     // -- count as a failure rather than a clock anomaly, and not touch the latch.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 5);
     f.seed(kNow + kWindow, 1);
     exec_raw(f.tmp.path, "CREATE TRIGGER block_delete BEFORE DELETE ON audit_events "
@@ -742,6 +889,7 @@ TEST_CASE("AuditStore #2360: a failed DELETE re-arms the guard instead of spendi
     // first sight of a genuine anomaly -- delete with no decline, no warn line
     // and no counter increment: the guard spent on a failure.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 10); // every datable row expired
 
     REQUIRE(f.store.cleanup_once(kNow) == 0); // decline #1, latch set
@@ -765,6 +913,7 @@ TEST_CASE("AuditStore #2360: a failed probe re-arms the guard instead of spendin
     // Same contract on the other failure path. Renaming the table away and back
     // makes the EXISTS probes fail for exactly one pass.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 10);
 
     REQUIRE(f.store.cleanup_once(kNow) == 0); // decline #1, latch set
@@ -799,6 +948,7 @@ TEST_CASE("AuditStore #2360: retention disabled never declines on an elapsed-tim
     yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-off-"}};
     AuditStore store(tmp.path, /*retention_days=*/0, /*cleanup_interval_min=*/0);
     REQUIRE(store.is_open());
+    anchor_pass(store);
 
     seed_rows_with_ttl(tmp.path, kNow - 100, 5); // expired
     seed_rows_with_ttl(tmp.path, kNow + 3'600, 1); // survivor at this reading
@@ -831,6 +981,7 @@ TEST_CASE("AuditStore #2360: a young store IS protected against a large forward 
     // expires them, however young the store is. The jump SIZE decides this, not
     // the store's age.
     GuardFixture f;
+    f.anchor();
     LogCapture log;
     f.seed(kNow + kWindow, 5); // written "now", nothing expired yet: a young store
     REQUIRE(f.store.cleanup_once(kNow) == 0);
@@ -865,6 +1016,7 @@ TEST_CASE("AuditStore #2360: retention disabled: a forward ratchet declines ONCE
     yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-ratchet-"}};
     AuditStore store(tmp.path, /*retention_days=*/0, /*cleanup_interval_min=*/0);
     REQUIRE(store.is_open());
+    anchor_pass(store);
 
     // Legacy rows, stamped while retention was switched ON, all already expired
     // and with no survivor behind them.
@@ -890,6 +1042,7 @@ TEST_CASE("AuditStore #2360: retention disabled: an 8-day gap is still not a ste
     yuzu::test::TempDbFile tmp{std::string_view{"audit-clockguard-off-gap-"}};
     AuditStore store(tmp.path, /*retention_days=*/0, /*cleanup_interval_min=*/0);
     REQUIRE(store.is_open());
+    anchor_pass(store);
 
     seed_rows_with_ttl(tmp.path, kNow - 100, 5);
     seed_rows_with_ttl(tmp.path, kNow + 3'600, 1); // inside the 2-day future slack
@@ -913,6 +1066,7 @@ TEST_CASE("AuditStore #2360: a forward movement of EXACTLY the floor is not a st
     // report and the pass deletes. One second more does report -- that case is
     // the sub-window-forward-jump test above, which uses `+ 1`.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 5);
     f.seed(kNow + kWindow, 1); // survivor for pass 1
     REQUIRE(f.store.cleanup_once(kNow) == 5);
@@ -943,6 +1097,7 @@ TEST_CASE("AuditStore #2360: cleanup passes race-free against concurrent writers
     // its own coverage -- writers alone cannot exercise the latch, since only a
     // cleanup pass ever touches it.)
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 400);
     f.seed(kNow + kWindow, 1); // a survivor, so passes accept and do real work
 
@@ -1005,6 +1160,7 @@ TEST_CASE("AuditStore #2360: the clock-step check survives a restart",
     {
         AuditStore first(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
         REQUIRE(first.is_open());
+        anchor_pass(first);
         seed_rows_with_ttl(tmp.path, kNow - 100, 5);
         seed_rows_with_ttl(tmp.path, kNow + kWindow, 1); // survivor: no `would_wipe`
         REQUIRE(first.cleanup_once(kNow) == 5);
@@ -1051,6 +1207,7 @@ TEST_CASE("AuditStore #2360: a cap-bound pass is counted, not just logged",
     // counter moves in that state.
     constexpr std::size_t kSurplus = 7;
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, static_cast<int>(kMaxAuditDeletesPerPass + kSurplus));
     f.seed(kNow + kWindow, 1);
 
@@ -1072,6 +1229,7 @@ TEST_CASE("AuditStore #2360: an ordinary outage below the floor is not a clock a
     // destroys the signal. The gap here is far past the 1-day retention window
     // but below the floor, so it must stay silent.
     GuardFixture f;
+    f.anchor();
     // A literal 5 days, deliberately NOT derived from kAuditMinBigStepSec: this
     // pins the floor's VALUE, so shrinking it back toward the retention window
     // reddens here instead of passing silently.
@@ -1138,6 +1296,7 @@ TEST_CASE("AuditStore #2360 CH-1: hostile guard state cannot wipe, cannot disabl
     {
         AuditStore warm(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
         REQUIRE(warm.is_open());
+        anchor_pass(warm);
     }
     seed_rows_with_ttl(tmp.path, kNow - 100, static_cast<int>(kMaxAuditDeletesPerPass + kSurplus));
     seed_rows_with_ttl(tmp.path, kNow + kWindow, 1); // a survivor throughout
@@ -1197,7 +1356,11 @@ TEST_CASE("AuditStore #2360 CH-1: hostile guard state cannot wipe, cannot disabl
         // Every pass re-anchors the durable reading on its own clock, so a
         // poisoned value can never persist beyond the pass that saw it.
         CHECK(stored_reading() == now);
-        skips += store.clock_anomaly_skips_count();
+        // Either decline counter answers the question this case asks -- was the
+        // hostile state REPORTED, or silently accepted. #2579 split the signal in
+        // two (a bootstrap decline makes no claim about the clock), so summing
+        // them keeps the assertion measuring what it always measured.
+        skips += store.clock_anomaly_skips_count() + store.bootstrap_declines_count();
         failures += store.cleanup_failed_count();
         remaining = store.total_count();
         ++pass;
@@ -1224,11 +1387,37 @@ TEST_CASE("AuditStore #2360 CH-1: hostile guard state cannot wipe, cannot disabl
     }
 
     // The survivor is untouched and the store was never emptied: the hostile
-    // state could not cause a wipe, only pace or decline.
+    // state could not cause a wipe, only pace or decline. Since #2579 every one
+    // of these passes declines, so nothing is removed at all -- a strictly
+    // stronger statement than the old "it deleted, but only a capped amount".
     CHECK(remaining > 0);
-    CHECK(remaining < before);
-    // The two readings ahead of `now` were each reported as an anomaly, and none
-    // of this was misreported as a cleanup failure.
+    CHECK(remaining == before);
+
+    // ...and the guard is NOT DISABLED by any of it -- the other half of this
+    // case's title, and the half the old `remaining < before` used to carry.
+    //
+    // It takes two passes, and the reason is worth stating: the 1969 pass above
+    // re-anchored the durable reading to a NEGATIVE value, so the next pass
+    // reads it, refuses to trust it (`BadState`) and re-anchors on a sane clock.
+    // Only then is there a usable comparison point. That is the self-heal, and
+    // asserting a real delete at the end of it is what proves the hostile state
+    // could pace the drain but never stop it.
+    {
+        AuditStore healed(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
+        REQUIRE(healed.is_open());
+
+        CHECK(healed.cleanup_once(kNow + 10) == 0);        // declines the negative reading
+        CHECK(healed.clock_anomaly_skips_count() == 1);
+        CHECK(healed.bootstrap_declines_count() == 0);     // NOT the bootstrap trigger
+
+        // Anchored and sane: the backlog drains, paced by the cap.
+        CHECK(healed.cleanup_once(kNow + 11) == kMaxAuditDeletesPerPass);
+        CHECK(healed.total_count() < before);
+        CHECK(healed.clock_anomaly_skips_count() == 1);    // no new anomaly
+        CHECK(healed.bootstrap_declines_count() == 0);
+    }
+    // The two readings ahead of `now` were each reported as a decline (of one
+    // kind or the other), and none of this was misreported as a cleanup failure.
     CHECK(skips >= 2);
     CHECK(failures == 0);
 }
@@ -1241,6 +1430,7 @@ TEST_CASE("AuditStore #2360: a clean drain clears the latch in the SAME pass",
     // deleted with no decline, no warn and no counter -- the guard spent on an
     // anomaly that was already over. The latch now comes from a post-delete fact.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 10); // all expired, well under the cap
 
     REQUIRE(f.store.cleanup_once(kNow) == 0);      // decline, latch armed
@@ -1262,6 +1452,7 @@ TEST_CASE("AuditStore #2360: an exact-cap drain that empties the backlog is not 
     // from `deleted >= cap` alone made an exact-cap drain that emptied the table
     // report a backlog that was not there.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, static_cast<int>(kMaxAuditDeletesPerPass));
     f.seed(kNow + kWindow, 1); // survivor, so the pass is accepted, not declined
 
@@ -1325,6 +1516,7 @@ TEST_CASE("AuditStore #2360: the latch is HELD through a capped drain, then rele
     // one pass can delete.
     constexpr std::size_t kSurplus = 4;
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, static_cast<int>(kMaxAuditDeletesPerPass + kSurplus));
 
     REQUIRE(f.store.cleanup_once(kNow) == 0); // decline #1
@@ -1386,6 +1578,7 @@ TEST_CASE("AuditStore #2360: a month-long jump fires on a DEFAULT-retention serv
     {
         AuditStore warm(tmp.path, kLongRetentionDays, /*cleanup_interval_min=*/0);
         REQUIRE(warm.is_open());
+        anchor_pass(warm);
     }
     seed_rows_with_ttl(tmp.path, kNow - 100, 5);        // expired at both readings
     seed_rows_with_ttl(tmp.path, kNow + kLongWindow, 1); // survivor at pass 1
@@ -1415,6 +1608,7 @@ TEST_CASE("AuditStore #2360: a pass that cannot persist its clock reading counts
     // pass must still do its job (the reading is a supplement, not a
     // precondition) AND count the failure rather than swallowing it.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 5);
     f.seed(kNow + kWindow, 1); // a survivor, so nothing declines on `would_wipe`
 
@@ -1455,6 +1649,7 @@ TEST_CASE("AuditStore #2360: a store whose retention index cannot be built stays
     LogCapture log;
     AuditStore store(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
     REQUIRE(store.is_open());
+    anchor_pass(store);
     REQUIRE(log.says("could not create idx_audit_ttl_id"));
 
     seed_rows_with_ttl(tmp.path, kNow - 100, 5);
@@ -1476,6 +1671,7 @@ TEST_CASE("AuditStore #2360: a second pass at the same `now` is a clean no-op",
     // Every other test advances `now` between calls, so nothing pinned this --
     // an accidental re-delete or a double-count would have gone unnoticed.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 6);
     f.seed(kNow + kWindow, 1); // survivor, so the first pass accepts
 
@@ -1524,6 +1720,7 @@ TEST_CASE("AuditStore #2360: an implausible caller clock is refused before any a
     // for a `now` near INT64_MAX. Without this case the guard is mutation-inert
     // and UBSan never reaches the overflow. Run under UBSan.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 5);
     f.seed(kNow + kWindow, 1);
 
@@ -1532,13 +1729,14 @@ TEST_CASE("AuditStore #2360: an implausible caller clock is refused before any a
     CHECK(f.store.cleanup_failed_count() == 1); // counted, not silent
     // Refusing is still a pass that RAN, so liveness must move -- the contract is
     // "attempted", and a refusal that looked like a dead reaper would be worse.
-    CHECK(f.store.retention_passes_count() == 1);
+    // Two, not one: `anchor()` above is itself a pass that ran (#2579).
+    CHECK(f.store.retention_passes_count() == 2);
 
     // And a NEGATIVE now is admitted: that is the dead-CMOS-1969 case the whole
     // guard exists for, and it cannot underflow anything.
     CHECK(f.store.cleanup_once(-86'400) == 0);
     CHECK(f.store.cleanup_failed_count() == 1); // unchanged -- not a refusal
-    CHECK(f.store.retention_passes_count() == 2);
+    CHECK(f.store.retention_passes_count() == 3);
 }
 
 TEST_CASE("AuditStore #2360: each decline names the trigger that actually fired",
@@ -1559,6 +1757,7 @@ TEST_CASE("AuditStore #2360: each decline names the trigger that actually fired"
 
     SECTION("would-wipe with a sane recent reading: no elapsed-time claim") {
         GuardFixture f;
+        f.anchor();
         f.seed(kNow - 100, 5);
         f.seed(kNow + kWindow, 1);
         REQUIRE(f.store.cleanup_once(kNow) == 5); // establishes a reading, drains
@@ -1573,6 +1772,7 @@ TEST_CASE("AuditStore #2360: each decline names the trigger that actually fired"
 
     SECTION("a real step: reports the gap and names BOTH possible causes") {
         GuardFixture f;
+        f.anchor();
         f.seed(kNow - 100, 5);
         f.seed(kNow + kWindow, 1);
         REQUIRE(f.store.cleanup_once(kNow) == 5);
@@ -1591,6 +1791,7 @@ TEST_CASE("AuditStore #2360: each decline names the trigger that actually fired"
 
     SECTION("a poisoned stored reading is reported as corrupted state, not as a step") {
         GuardFixture f;
+        f.anchor();
         f.seed(kNow - 100, 5);
         f.seed(kNow + kWindow, 1);
         REQUIRE(f.store.cleanup_once(kNow) == 5);
@@ -1626,6 +1827,7 @@ TEST_CASE("AuditStore #2360: a capped pass only claims a remainder when one exis
     // pass 2 is under the cap either way, so both agree and the test is toothless.
     // Seed exactly one cap's worth.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, static_cast<int>(kMaxAuditDeletesPerPass));
     f.seed(kNow + kWindow, 1); // survivor, so the pass accepts rather than declines
 
@@ -1654,6 +1856,7 @@ TEST_CASE("AuditStore #2360: a non-integer stored reading is rejected, not coerc
     // advertises simply does not exist, and corrupted state is indistinguishable
     // from a real reading.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 5);
     f.seed(kNow + kWindow, 1); // survivor, so nothing declines on would_wipe
     REQUIRE(f.store.cleanup_once(kNow) == 5); // establishes a real reading
@@ -1718,6 +1921,7 @@ TEST_CASE("AuditStore #2360: durable state that cannot be READ is an anomaly, no
     {
         AuditStore seed(tmp.path, kGuardRetentionDays, /*cleanup_interval_min=*/0);
         REQUIRE(seed.is_open());
+        anchor_pass(seed);
         seed_rows_with_ttl(tmp.path, kNow - 100, 5);
         seed_rows_with_ttl(tmp.path, kNow + kWindow, 1);
         REQUIRE(seed.cleanup_once(kNow) == 5); // establishes a real durable reading
@@ -1787,6 +1991,7 @@ TEST_CASE("AuditStore #2360: an out-of-range durable VALUE is reported even with
     // anomaly vanished with no counter and no warn. A backward NTP correction on
     // a store with no expired backlog went unreported.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow + kWindow, 1); // a survivor only -- nothing is expired
     REQUIRE(f.store.cleanup_once(kNow) == 0);
     REQUIRE(f.store.clock_anomaly_skips_count() == 0); // healthy baseline
@@ -1888,6 +2093,7 @@ TEST_CASE("AuditStore #2360: a DIFFERENT anomaly arriving while latched is still
     // the operator sees one warn for the first cause and nothing at all for the
     // second, in a SOC 2 signal whose whole job is to say what happened.
     GuardFixture f;
+    f.anchor();
 
     // 1. All rows expired, no survivor -> would-wipe. Declines and latches.
     f.seed(kNow - 100, 5);
@@ -1919,6 +2125,7 @@ TEST_CASE("AuditStore #2360: a quiet pass re-arms even when nothing was deleted"
     // recurs. Without the re-arm the recurrence equals `last_reported_` and is
     // silently swallowed.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 5); // all expired, no survivor -> would-wipe
 
     REQUIRE(f.store.cleanup_once(kNow) == 0);
@@ -1955,6 +2162,7 @@ TEST_CASE("AuditStore #2360: a SECOND clock step is a second event, not a contin
     // the pass that reads it, or it is excluded as forward-skewed and `Wipe`
     // fires instead of `Step` -- so each pass gets its own.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 5);
     f.seed(kNow + kWindow, 1);
     REQUIRE(f.store.cleanup_once(kNow) == 5); // healthy baseline, establishes a reading
@@ -2030,6 +2238,7 @@ TEST_CASE("AuditStore #2360: a SECOND backward jump is a second event, not a con
     // this is lost signal rather than data loss -- but it is a delete on a pass
     // whose own classifier just said the clock state was unusable.
     GuardFixture f;
+    f.anchor();
     f.seed(kNow - 100, 9);
     f.seed(kNow + kWindow, 1);
     REQUIRE(f.store.cleanup_once(kNow) == 9); // healthy: establishes a reading
@@ -2058,6 +2267,7 @@ TEST_CASE("AuditStore #2360: one CONDITION replacing another is reported",
     // `last_reported_ == None`). This transitions between two CONDITIONS, where
     // only the inequality can carry the report.
     GuardFixture f;
+    f.anchor();
 
     // 1. Everything expired, no survivor -> Wipe. Reported.
     f.seed(kNow - 100, 6);
@@ -2088,7 +2298,7 @@ TEST_CASE("AuditStore #2360: an arriving would-wipe is not swallowed by a standi
           "[audit_store][retention][clock-guard]") {
     // BLOCKING, found by cpp-safety and proven with a 5/5 deterministic probe.
     //
-    // `classify` collapses FOUR independent facts onto ONE enum, so the
+    // `classify` collapses FIVE independent facts onto ONE enum, so the
     // `a != last_reported_` half cannot see a NEW condition arriving underneath
     // an already-reported one. The dead-CMOS-then-NTP sequence -- the guard's own
     // motivating case -- walks straight through it:
@@ -2103,6 +2313,11 @@ TEST_CASE("AuditStore #2360: an arriving would-wipe is not swallowed by a standi
     // For any store under the 25,000-row cap that is the entire SOC 2 trail, in
     // one statement, with no warning and no counter. Exactly what #2360 exists
     // to prevent.
+    // NOT anchored, deliberately: the sequence below IS the fixture. Pass 1 has
+    // no reading and nothing expired, which is the one shape #2579's trigger
+    // stays silent on, so it is quiet for the reason the narrative needs. An
+    // anchoring pass would make pass 1 a huge BACKWARD move instead and report
+    // there, shifting the whole story by one.
     GuardFixture f;
 
     REQUIRE(f.store.cleanup_once(-100) == 0); // 1969, quiet
@@ -2140,6 +2355,7 @@ TEST_CASE("AuditStore #2360: a would-wipe arriving after an implausible-reading 
     // which an operator could correct the clock -- after which expiry
     // re-evaluates against the corrected reading and nothing is deleted at all.
     GuardFixture f;
+    f.anchor();
     REQUIRE(f.store.cleanup_once(kNow) == 0); // anchor the reading at kNow
 
     // Pass 1: the clock reads BEFORE the anchor, so the stored reading is ahead
@@ -2175,6 +2391,7 @@ TEST_CASE("AuditStore #2360: a sub-threshold backward drift must not halt retent
     //
     // Before 0407082b this reported once and drained.
     GuardFixture f;
+    f.anchor();
 
     // Establish a previous reading FIRST. Without this the opening pass has no
     // `prev`, so it cannot see a backward step and simply drains the backlog --
@@ -2209,6 +2426,7 @@ TEST_CASE("AuditStore #2360: a condition recurring after a step is reported agai
     // actually showed; it can and does cause a report that would otherwise not
     // happen.
     GuardFixture f;
+    f.anchor();
 
     f.seed(kNow - 100, 5); // all expired, no survivor -> Wipe
     REQUIRE(f.store.cleanup_once(kNow) == 0);
@@ -2252,6 +2470,11 @@ TEST_CASE("AuditStore #2360: a wipe arriving under a standing bad state is repor
     // identically to pass 2, so an enum comparison matches and DELETES. The fact
     // set does not match -- `has_expired` and `would_wipe` both flipped -- so it
     // is reported and nothing is deleted.
+    // NOT anchored: pass 1 must have no previous reading for the sequence above
+    // to be the one that runs. An anchoring pass leaves a reading AHEAD of a 1969
+    // `now`, so pass 1 would report BadState and the whole narrative shifts by
+    // one -- and it buys nothing here, since pass 1 has nothing expired and the
+    // #2579 trigger is silent on exactly that shape.
     GuardFixture f;
 
     REQUIRE(f.store.cleanup_once(-2) == 0); // quiet: no previous reading yet
