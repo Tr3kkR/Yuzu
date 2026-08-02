@@ -283,7 +283,10 @@ std::string lower_copy(std::string v) {
     return v;
 }
 
-// All 26 Phase 1 read-only tools.
+// EVERY published tool, all phases - not just the read-only ones. The count has
+// moved with every rung and a stale one here reads as a completeness claim, so it
+// is deliberately not restated: kToolCount is computed from this array, and the
+// tier/securable rows in kToolSecurityRows are cross-checked against it at boot.
 //
 // SCHEMA AUTHORING (#2405): every input_schema_json below must compile under
 // the CLOSED keyword catalogue in mcp_input_schema.cpp — an unsupported
@@ -9365,11 +9368,13 @@ McpServer::HandlerFn McpServer::build_handler(
     };
 }
 
-// ── GET / DELETE handlers (Streamable HTTP transport, 2f PR 1) ──────────────
+// ── GET / DELETE handlers (Streamable HTTP transport, 2f) ───────────────────
 // mcp_disabled / streaming_disabled are captured by pointer (live cfg_ reads),
-// mirroring build_handler's kill-switch treatment. GET is a 405 placeholder this
-// rung (the SSE channel lands in 2f PR 2); DELETE terminates a principal-bound
-// session (200) or 404s an unknown/foreign one (no cross-principal oracle).
+// mirroring build_handler's kill-switch treatment. GET is the session's live
+// server->client SSE channel - attach, replay, heartbeat, per-tick credential
+// revalidation (it was a 405 placeholder in PR 1 only; the 405 now survives just
+// under --mcp-no-streaming). DELETE terminates a principal-bound session (200)
+// or 404s an unknown/foreign one (no cross-principal oracle).
 
 McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_fn,
                                                   const bool* mcp_disabled,
