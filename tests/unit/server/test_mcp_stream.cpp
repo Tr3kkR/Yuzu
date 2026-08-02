@@ -610,9 +610,11 @@ TEST_CASE("McpStreamPump: a sub-millisecond remainder waits rather than spinning
     //
     // Asserted as a LOWER bound AMPLIFIED over many passes: a single-call floor would be
     // defeated by a loaded runner inflating the buggy path past the threshold, which is how
-    // a sibling assertion was found to be unfalsifiable. 20 passes are ~20ms when the wait
-    // is honoured and ~1ms when it is floored, so load would have to inflate the buggy path
-    // tenfold to produce a false pass.
+    // a sibling assertion was found to be unfalsifiable. 100 passes are ~100ms when the wait
+    // is honoured and a few ms when it is floored, so load would have to inflate the buggy
+    // path more than tenfold to cross the 50ms floor and produce a false pass (margin
+    // widened from 20 passes / 10ms after two external reviewers judged that thin on a
+    // saturated CI box).
     auto state = std::make_shared<mcp::McpStreamState>();
     auto attached = state->attach_and_replay(0, nullptr, "alice");
     REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
@@ -629,11 +631,11 @@ TEST_CASE("McpStreamPump: a sub-millisecond remainder waits rather than spinning
     // 500us short of the check: ceil rounds the budget up to 1ms, floor would make it 0.
     now = base + cfg.tick - std::chrono::microseconds(500);
     const auto started = std::chrono::steady_clock::now();
-    for (int i = 0; i < 20; ++i) {
+    for (int i = 0; i < 100; ++i) {
         REQUIRE(pump.pump_once(wire.writer()));
     }
     const auto elapsed = std::chrono::steady_clock::now() - started;
-    CHECK(elapsed >= std::chrono::milliseconds(10)); // ~20ms honoured; ~1ms floored
+    CHECK(elapsed >= std::chrono::milliseconds(50)); // ~100ms honoured; a few ms floored
 }
 
 TEST_CASE("McpStreamPump: the wait is bounded by the next check, so the tick cannot stretch",
@@ -1818,7 +1820,7 @@ TEST_CASE("McpStreamState/CH-5: a post-commit fault during displacement loses on
     CHECK(reg.counter("yuzu_mcp_stream_pin_displaced_total").value() == 1.0);
 }
 
-TEST_CASE("McpStreamPump/CH-1: the first pass after a long write stall runs the revalidation",
+TEST_CASE("McpStreamPump/CH-4: the first pass after a long write stall runs the revalidation",
           "[mcp][stream][ch4][tickgate]") {
     // A saturated socket parks the pump inside write_all for up to the 30s write timeout -
     // passes simply do not happen while it blocks. The tick gate must not turn that stall

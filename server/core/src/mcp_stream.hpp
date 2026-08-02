@@ -16,7 +16,8 @@
 ///   * The replay ring is BOUNDED (Decision 15(d)). A cursor whose frames have
 ///     been evicted is never silently gapped: the caller 404s and the client
 ///     re-initializes, refetching durable state by `execution_id`.
-///   * A live stream re-validates its credential every heartbeat tick and dies
+///   * A live stream re-validates its credential once per tick (~3 s), independent
+///     of whether a heartbeat frame is emitted that tick, and dies
 ///     within one tick of a revocation (Decision 15(c)); an INDETERMINATE auth
 ///     backend (a blip, not a revocation) gets a bounded grace window instead of
 ///     a mass kill (Decision 15(i)).
