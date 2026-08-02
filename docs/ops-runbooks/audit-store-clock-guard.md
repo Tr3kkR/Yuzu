@@ -44,7 +44,8 @@ rows); a sub-cap pass never fires anything here, and looks exactly like routine
 expiry. `yuzu_server_audit_rows_deleted_total` does move throughout, so it is
 evidence, but on its own it does not distinguish this from healthy expiry. There
 is no reliable retrospective test today - read the Limits note before improvising
-one. Per this page's own rule the decision rule is not restated here:
+one. The trigger list, the bound and the signal set all live on the canonical
+page, deliberately not here:
 [Limits](../user-manual/audit-log.md#the-retention-clock-guard).
 
 ## YuzuAuditPersistFailures - audit WRITES are failing
@@ -93,7 +94,12 @@ time sync; a recent `audit_retention_days` reduction needs nothing. Note the log
 line names the TRIGGER, not the root cause: a reduction and a clock jump can both
 surface as the wipe line, which is why step 1 comes first. The next pass then
 resumes, paced. If the clock was genuinely wrong, decide before it drains whether
-the already-expired rows should be preserved (snapshot `audit.db` now).
+the already-expired rows should be preserved - page the window out through
+`/api/audit` per
+[Protecting evidence right now](../user-manual/audit-log.md#the-retention-clock-guard),
+which works on any deployment. Do NOT reach for a file-level snapshot here: a
+raw copy of a live WAL database can be torn, and the shipped server image
+carries no `sqlite3` to take a clean one.
 
 **If declines REPEAT, step 1 is not sufficient on its own.** Work the
 "Was this expected?" ladder on the canonical page before concluding the clock is

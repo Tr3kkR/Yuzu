@@ -10,9 +10,13 @@
   declining. Persisting the anchor does not close it: while the clock stays skewed the
   guard has nothing to compare against that would register the skew, so deletion
   continues -- at up to 600k rows/day once a backlog binds the cap, and thereafter at
-  the ingest rate, because effective retention stays shortened by the skew. The state
-  also recurs after a failed anchor persist plus a restart, or after restoring a pre-v3
-  snapshot. **Signals:** no decline and no
+  the rate those rows were originally written. What ends it is exhausting the affected
+  cohort rather than correcting the clock: only rows stamped BEFORE the skew lose time,
+  since a row written under the skew is stamped from the same wall clock the cutoff is
+  read from and keeps its full window, so a forward step of `S` on a window of `W`
+  works through the pre-skew rows and stops about `W - S` later (a still-drifting clock
+  is the open-ended case). The state also recurs after a failed anchor persist plus a
+  restart, or after restoring a pre-v3 snapshot. **Signals:** no decline and no
   `yuzu_server_audit_clock_anomaly_skips_total` increment; `..._rows_deleted_total` does
   rise and an `AuditStore: expired ...` info line is written, and a cap-binding backlog
   also raises `..._retention_cap_reached_total` (which `YuzuAuditRetentionCapBinding`

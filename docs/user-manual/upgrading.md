@@ -916,8 +916,9 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
   shape unguarded: a host already skewed FORWARD, where rows written after the
   skew are still inside the retention window, so the would-expire-everything test
   does not fire either. Such a pass deletes up to the 25,000-row cap without
-  declining, and **the exposure is not limited to that one pass** - it persists
-  while the skew does. If you cannot establish that the clock is right, defer the
+  declining, and **the exposure is not limited to that one pass** - it keeps
+  deleting rows stamped before the skew ahead of their window until that cohort is
+  exhausted. If you cannot establish that the clock is right, defer the
   upgrade: there is no reaper kill switch, no retention setting protects rows
   already stamped, and there is no reliable way to detect the loss afterwards.
   The bound, the full signal set, and why no retrospective test is offered:

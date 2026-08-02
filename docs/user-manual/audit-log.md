@@ -5,8 +5,8 @@ provides a tamper-evident trail suitable for compliance reporting, incident
 investigation, and forwarding to external SIEM platforms such as Splunk or
 Elastic.
 
-> **Known issue, UNFIXED (#2579): a retention pass that begins with NO stored
-> clock reading can delete audit rows without declining.** An absent reading is not
+> **Known issue, UNFIXED (#2579):** a retention pass that begins with NO stored
+> clock reading can delete audit rows without declining. An absent reading is not
 > a trigger (an unusable one is). On a host whose clock is already skewed forward,
 > the first pass after upgrading to schema v3 --- and any later pass that again
 > starts with no stored reading --- deletes up to 25,000 rows with no decline and no
@@ -509,11 +509,20 @@ fix --- not hand-deletion.
   test and deletes up to the cap. Persisting the anchor does not close it: while
   the clock stays skewed the guard has nothing to compare against that would
   register the skew, so passes keep deleting --- at up to 600k rows/day once a
-  backlog binds the cap, and thereafter at the ingest rate, since effective
-  retention stays shortened by the skew for as long as it persists. The same state
-  recurs outside upgrades: after a failed anchor persist plus a restart, or after
-  restoring a pre-v3 snapshot. The rule itself is stated once, above; this bullet
-  deliberately does not restate it.
+  backlog binds the cap, and thereafter at the rate those rows were originally
+  written. What ends it is not correcting the clock but exhausting the affected
+  cohort: only rows stamped BEFORE the skew lose time, because a row written under
+  the skew is stamped from the same wall clock the cutoff is read from and so
+  carries its full window. A forward step of `S` on a window of `W` therefore
+  works through the pre-skew rows and stops about `W - S` later. (A clock that
+  keeps DRIFTING is the open-ended case.) The same state recurs outside upgrades:
+  after a failed anchor persist plus a restart, or after restoring a pre-v3
+  snapshot. The rule itself is stated once, above; this bullet
+  deliberately does not restate it. The shape is pinned by "AuditStore #2360: a
+  datable survivor means no wipe, so the pass deletes immediately" in
+  `tests/unit/server/test_audit_store.cpp` --- expired rows plus one survivor,
+  against a store with no stored reading, delete with
+  `clock_anomaly_skips_count() == 0`.
 - **What you see, and what you do not.** Never a decline, and never a
   `yuzu_server_audit_clock_anomaly_skips_total` increment. The pass is not
   signal-free: it raises `yuzu_server_audit_rows_deleted_total` and writes an
