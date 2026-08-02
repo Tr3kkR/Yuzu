@@ -18,8 +18,8 @@
 //
 // This is a SUPPORTED SUBSET of JSON Schema, not a conforming validator: the
 // keyword catalogue is CLOSED to exactly what the served tool schemas use
-// (type / properties / required / enum / minimum / maximum / maxLength /
-// pattern / items / minItems / maxItems / additionalProperties /
+// (type / properties / required / enum / minimum / maximum / minLength /
+// maxLength / pattern / items / minItems / maxItems / additionalProperties /
 // anyOf-of-required-alternatives, with description and default ignored).
 // The catalogue is enumerated in THREE places that must move together:
 // kSupportedKeywords in mcp_input_schema.cpp, this comment, and the
@@ -41,6 +41,12 @@
 //     (param_int returns int64_t).
 //   * "maxLength" counts BYTES, not codepoints (stricter-or-equal), so a
 //     schema bound and its handler-side twin can be compared literally.
+//     "minLength" counts bytes for the same reason, but note the direction
+//     differs: bytes >= codepoints, so a byte-counted minLength is LOOSER
+//     than a codepoint-counted one for values above 1. It is exact at the
+//     case the catalogue exists to serve — minLength:1, i.e. "not empty",
+//     where any non-empty string has at least one byte and one codepoint.
+//     Do not read a minLength above 1 as a character-count guarantee.
 //     (This line used to claim it "matches the byte-cap kAgenticParamMaxLen
 //     the handlers enforce" — that constant serves two unrelated READ tools
 //     and was never a general handler cap. The real handler-side twins are
