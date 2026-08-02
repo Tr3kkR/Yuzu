@@ -164,7 +164,13 @@ struct EngineListReadFixture {
 TEST_CASE("require_list_read engine: RBAC store unavailable -> 503, not admitted",
           "[pg][auth_routes][list_read][engine_principal][rbac]") {
     EngineListReadFixture fix;
-    fix.make(/*rbac=*/nullptr); // models a store that never opened -> same 503 branch
+    // rbac_store_ == nullptr covers the first clause of the engine gate's
+    // `!rbac_store_ || !rbac_store_->is_open()` 503 test. The second clause (a
+    // constructed-but-unopened store) produces the identical 503 but needs a
+    // corrupt/locked-SQLite fixture this suite has no harness for — reviewed by
+    // code instead, exactly as test_engine_principal_integration.cpp's
+    // require_permission 503 case documents.
+    fix.make(/*rbac=*/nullptr);
 
     auto req = fix.request();
     httplib::Response res;
