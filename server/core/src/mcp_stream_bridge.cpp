@@ -40,6 +40,14 @@ constexpr const char* kMetricTeardownIncomplete = "yuzu_mcp_bridge_teardown_inco
 // scraped. Success-shaped by design: any movement at all means the cap is being
 // enforced, and `synthesize_unavailable` is the one to alert on.
 constexpr const char* kMetricForcedExpire = "yuzu_mcp_bridge_forced_expire_total";
+// #2489 review: the ring-only pressure pass stopped on its per-invocation victim
+// budget with the cap STILL exceeded. The budget exists because a defer now
+// advances instead of ending the pass, so without it a sustained park rate could
+// keep one maintenance tick expiring records indefinitely. Movement here is
+// therefore not an error - it is the hatch saying arrivals are keeping pace with
+// expiries, and the remaining victims roll to the next tick.
+constexpr const char* kMetricPressureBudgetExhausted =
+    "yuzu_mcp_bridge_pressure_budget_exhausted_total";
 // #2529: a streamed admission charge that could not be released at its natural
 // release point (arm()'s cancel-degrade) and is therefore RETAINED on the record
 // until its teardown reclaims it. Distinct from kMetricTeardownIncomplete, which
@@ -1150,8 +1158,9 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
                 // flag that can throw (two mutex acquisitions). Without this, such a
                 // record has terminal_accepted set and terminal_projected clear, and
                 // the pressure visitor's "latched but unprojected -> defer" arm then
-                // defers it FOREVER; because a defer exits the pressure loop, one
-                // wedged victim stalls ring-only pressure relief bridge-wide. Setting
+                // defers it FOREVER - and while the pass now advances past a defer
+                // (UP-5, #2489) rather than ending, a record that defers on every
+                // sweep is never expired at all. Setting
                 // it here is safe precisely because terminal_settled means the frame
                 // is already published - it cannot cause a republish.
                     rec->terminal_projected.store(true, std::memory_order_release);
@@ -1163,9 +1172,10 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
 
             // DEGRADED SETTLE (#2528). `mu` is unavailable, so none of the above
             // ran. The claim must be released anyway - leaving it set wedges the
-            // record out of all four consumers, and because a defer exits the
-            // pressure loop, one wedged victim stalls ring-only pressure relief
-            // bridge-wide. This is the ONE statement of what the skipped
+            // record out of all four consumers - and under the defer-ends-the-pass
+            // behaviour that predated UP-5 (#2489), one such record stalled ring-only
+            // pressure relief bridge-wide; it now costs that record alone, which is a
+            // smaller blast radius and still a wedge. This is the ONE statement of what the skipped
             // bookkeeping means; the field comments point here rather than
             // restate it.
             //
@@ -1579,6 +1589,18 @@ void McpStreamBridge::sweep() {
     // relief to every newer victim behind it.
     std::uint64_t victim_floor = 0;  // consider only victims with parked_seq >= this
     bool wake_projector = false;     // a defer left a secured terminal to settle
+    // VICTIM BUDGET, captured at entry (#2489 review). The floor bounds this pass
+    // against the population it STARTED with, but not against arrivals: a record
+    // that parks mid-pass gets a higher parked_seq, so it lands ABOVE the floor and
+    // is eligible. Under sustained parking at the reap rate, `ring_only` never falls
+    // back under the cap and the pass would keep finding fresh victims - turning one
+    // maintenance tick into unbounded teardown + audit work and delaying the session
+    // GC that shares this thread, against the bounded-work property server.cpp's
+    // tick comment states. So the pass may visit at most the number of parked
+    // records it observed on its FIRST count. Relief that arrives late is the NEXT
+    // tick's job, which is the same answer the cap itself gives.
+    std::size_t visit_budget = 0;
+    bool budget_set = false;
     for (;;) {
         std::shared_ptr<BridgeRecord> oldest;
         std::size_t ring_only = 0;
@@ -1608,8 +1630,12 @@ void McpStreamBridge::sweep() {
                     oldest = rec;
                 }
             }
+            if (!budget_set) {
+                visit_budget = ring_only;
+                budget_set = true;
+            }
         }
-        if (ring_only <= cfg_.ring_only_pressure_cap || !oldest) {
+        if (ring_only <= cfg_.ring_only_pressure_cap || !oldest || visit_budget == 0) {
             // UP-4 (#2489): `pressure_requested` is a request to QUIESCE a victim
             // for a reap that is coming, and project_record gates `want_progress`
             // on it - so a mark that outlives the pressure freezes progress on a
@@ -1619,36 +1645,59 @@ void McpStreamBridge::sweep() {
             // disengages, and ONLY here: a mark on a victim this pass merely
             // deferred past is still live work, and clearing it would let the
             // projector start the very batch the next visit needs quiesced.
-            // A record cannot leave kRingOnly except by a teardown claim that
-            // erases it, so this walk sees every mark that exists.
-            if (marked > 0 && ring_only <= cfg_.ring_only_pressure_cap) {
+            //
+            // The cap is RE-TESTED inside the clearing hold, not carried in from
+            // the count above (#2489 review). Those are two different critical
+            // sections with a gap between them, and a record parking in that gap
+            // puts the bridge back over cap - clearing on the stale reading would
+            // then strip a live quiesce and hand the next visit a fresh projection
+            // to defer on, which is exactly the liveness hole this policy exists to
+            // avoid. Stage 1 marks under bridge_mu_ for the same reason, so a
+            // concurrent sweep cannot slip a mark past this hold either.
+            if (marked > 0) {
                 std::lock_guard<std::mutex> lk(bridge_mu_);
                 if (shutdown_started_) {
                     return;
                 }
+                std::size_t still_parked = 0;
                 for (const auto& [key, rec] : records_) {
-                    if (rec->phase.load(std::memory_order_acquire) != Phase::kRingOnly) {
-                        continue;
+                    if (rec->phase.load(std::memory_order_acquire) == Phase::kRingOnly) {
+                        ++still_parked;
                     }
-                    std::lock_guard<std::mutex> rlk(rec->mu);
-                    rec->pressure_requested = false;
                 }
-                wake_projector = true;  // progress may have been frozen mid-execution
+                if (still_parked <= cfg_.ring_only_pressure_cap) {
+                    // A record cannot leave kRingOnly except by a teardown claim that
+                    // erases it, so this walk sees every mark that exists.
+                    for (const auto& [key, rec] : records_) {
+                        if (rec->phase.load(std::memory_order_acquire) != Phase::kRingOnly) {
+                            continue;
+                        }
+                        std::lock_guard<std::mutex> rlk(rec->mu);
+                        rec->pressure_requested = false;
+                    }
+                    wake_projector = true;  // progress may have been frozen mid-execution
+                }
+            }
+            if (visit_budget == 0 && ring_only > cfg_.ring_only_pressure_cap) {
+                // NOT a silent cap: the hatch stopped with the cap still exceeded, so
+                // say so. Sustained movement here means records are parking at least
+                // as fast as they are being expired.
+                count_pressure_budget_exhausted();
             }
             if (wake_projector) {
                 wake(*core_);
             }
             return;
         }
-        // Stage 1: mark the victim so the projector starts no NEW progress batch
-        // (project_record gates on pressure_requested). ALL disposition logic
-        // lives in the atomic visit below - one source of truth (CORE-2).
-        {
-            std::lock_guard<std::mutex> rlk(oldest->mu);
-            oldest->pressure_requested = true;
-        }
+        --visit_budget;
         // Re-validate map identity before the visit (the victim was selected in a
-        // prior bridge_mu_ section; a concurrent teardown may have moved it).
+        // prior bridge_mu_ section; a concurrent teardown may have moved it), and
+        // mark it in the SAME hold - stage 1. The mark tells the projector to start
+        // no NEW progress batch (project_record gates on pressure_requested); ALL
+        // disposition logic lives in the atomic visit below, one source of truth
+        // (CORE-2). Marking under bridge_mu_ -> mu rather than mu alone is what
+        // makes it mutually exclusive with the clearing walk above, and it also
+        // stops us marking a record that has already been torn down.
         {
             std::lock_guard<std::mutex> lk(bridge_mu_);
             if (shutdown_started_) {
@@ -1658,6 +1707,8 @@ void McpStreamBridge::sweep() {
             if (it == records_.end() || it->second != oldest) {
                 continue;  // torn down concurrently - recount
             }
+            std::lock_guard<std::mutex> rlk(oldest->mu);
+            oldest->pressure_requested = true;
         }
         // Stage 2: the atomic visit that closes #2409 (was the KNOWN GAP here).
         // Under a SINGLE hold of the bus channel mutex, `f` computes the
@@ -2199,6 +2250,12 @@ void McpStreamBridge::count_forced_expire(TeardownFinal decision) noexcept {
                           {{"disposition", forced_expire_disposition(decision)}})
                 .increment();
         });
+    }
+}
+
+void McpStreamBridge::count_pressure_budget_exhausted() noexcept {
+    if (metrics_ != nullptr) {
+        obs_guard([&] { metrics_->counter(kMetricPressureBudgetExhausted).increment(); });
     }
 }
 

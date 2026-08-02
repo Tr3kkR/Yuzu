@@ -660,18 +660,40 @@ public:
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_forced_expire_total",
                           "Parked progress-bridge records force-expired by the ring-only "
-                          "pressure escape hatch, by the disposition the visitor decided "
-                          "(#2489). \"none\": a real final was already pinned, so the client "
-                          "loses nothing. \"fallback_final\": a terminal DID happen but its "
-                          "payload had aged out of the bus buffer, so a success-shaped final "
-                          "pointing at execution_id went out instead. "
-                          "\"synthesize_unavailable\": the bus says the execution never reached "
-                          "a terminal at all, so the client got -32014. Movement means the cap "
-                          "is doing its job; the previous only signal here was a FAILURE "
+                          "pressure escape hatch, by the disposition the visitor DECIDED "
+                          "(#2489). Counted at the decision, before the teardown publishes, so "
+                          "this is an attempted disposition and not proof of delivery - a frame "
+                          "build, the publish ladder or the poison step can still fail "
+                          "afterwards, which is what yuzu_mcp_stream_terminal_publish_failures_"
+                          "total and yuzu_mcp_bridge_teardown_incomplete_total report. A claim "
+                          "that loses a shutdown race is reaped by shutdown() and is NOT "
+                          "counted here (the shutdown-silent convention in "
+                          "docs/observability-conventions.md). \"none\": a real final was "
+                          "already pinned, so the client loses nothing. \"fallback_final\": a "
+                          "terminal DID happen but its payload is gone - either aged out of the "
+                          "bus buffer, or lost to a degraded projection claim (#2528, see "
+                          "yuzu_mcp_bridge_projection_degraded_total) - so a success-shaped "
+                          "final pointing at execution_id is published instead. "
+                          "\"synthesize_unavailable\": the bus verdict was that the execution "
+                          "never reached a terminal, so -32014 is published. Movement means the "
+                          "cap is doing its job; the previous only signal here was a FAILURE "
                           "counter, so a fleet quietly degrading every client to the fallback "
                           "and one synthesizing -32014 looked identical. Alert on a rising "
-                          "synthesize_unavailable rate; a rising fallback_final rate means "
-                          "records park for longer than the replay buffer holds",
+                          "synthesize_unavailable rate; for fallback_final check the "
+                          "projection-degraded counter first, and only then treat it as a "
+                          "bus-buffer sizing question",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_pressure_budget_exhausted_total",
+                          "Ring-only pressure passes that stopped on their per-invocation "
+                          "victim budget with the cap STILL exceeded (#2489 review). The budget "
+                          "is the number of parked records the pass saw when it started, and it "
+                          "exists because a deferred victim now advances the pass instead of "
+                          "ending it - without it, records parking as fast as they are expired "
+                          "would keep one maintenance tick working indefinitely and delay the "
+                          "session GC that shares that thread. Not an error and not a loss: the "
+                          "remaining victims are expired on the next tick. A sustained rate "
+                          "means arrivals are keeping pace with expiries - look at "
+                          "yuzu_mcp_bridge_records_active and the streamed-POST admission rate",
                           "counter");
         metrics_.describe("yuzu_mcp_maintenance_tick_failures_total",
                           "MCP maintenance ticks that threw and were contained, by tick "
@@ -747,6 +769,7 @@ public:
             metrics_.counter("yuzu_mcp_bridge_forced_expire_total",
                              {{"disposition", disposition}});
         }
+        metrics_.counter("yuzu_mcp_bridge_pressure_budget_exhausted_total");
         for (auto tick : {"bridge_sweep", "session_gc"}) {
             metrics_.counter("yuzu_mcp_maintenance_tick_failures_total", {{"tick", tick}});
         }

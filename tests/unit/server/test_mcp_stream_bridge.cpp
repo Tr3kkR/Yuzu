@@ -980,6 +980,94 @@ TEST_CASE("bridge pressure - a mark does not outlive the pressure that raised it
     }));
 }
 
+TEST_CASE("bridge pressure - one sweep is bounded by the population it started with "
+          "(#2489 review, TSan)",
+          "[mcp][bridge][2f][2489]") {
+    // The parked_seq floor bounds a pass against the records it STARTED with, but a
+    // record that parks mid-pass gets a HIGHER parked_seq, so it lands above the
+    // floor and stays eligible. Under sustained parking the cap never falls back
+    // under water and the pass would keep finding fresh victims - one maintenance
+    // tick doing unbounded teardown + audit work, starving the session GC that
+    // shares that thread. The victim budget captured at entry is what bounds it, and
+    // stopping on that budget is COUNTED rather than silent.
+    //
+    // This also puts the mark/clear pair under real contention for TSan: stage 1
+    // marks under bridge_mu_ -> rec->mu, the clearing walk takes the same pair, and
+    // the producer mutates records_ throughout.
+    //
+    // The assertion needs at least one record to arrive DURING a sweep. That is
+    // near-certain with a tight producer against a sweep doing 32 teardowns, but it
+    // is a race, so the scenario gets a few attempts and passes on the first that
+    // lands. It cannot false-RED into a wrong conclusion: without the budget the
+    // sweep drains until the producer stops, and the counter can never move at all.
+    // Streamed admission is capped at 4 per SESSION (pin slots), so a population of
+    // this size needs a session pool. Every session is minted on THIS thread up
+    // front - make_session carries Catch2 assertions, which are not valid off the
+    // main thread - and the producer only ever touches its own slice.
+    constexpr int kPerSession = 4;
+    constexpr int kMainSessions = 8;   // 32 records parked before the sweep
+    constexpr int kProdSessions = 40;  // up to 160 arrivals during it
+    bool observed = false;
+    for (int attempt = 0; attempt < 5 && !observed; ++attempt) {
+        // The per-principal SESSION cap (8, Decision 15(d)) would otherwise bound the
+        // pool to 32 records - exactly the pre-sweep population, leaving the producer
+        // nothing to add. Raised here only to reach a population big enough for the
+        // budget to bite; nothing in this test depends on the production value.
+        Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0},
+              mcp::McpSessionRegistry::Config{.per_principal_cap = 64}};
+        std::vector<Fx::Session> pool;
+        pool.reserve(kMainSessions + kProdSessions);
+        for (int i = 0; i < kMainSessions + kProdSessions; ++i) {
+            pool.push_back(fx.make_session());
+        }
+        auto park = [&](const Fx::Session& s, int slot) {
+            const auto j = json(slot);
+            if (!fx.bridge->reserve(s.id, "alice", j, json("t"), true).ok) {
+                return false;
+            }
+            if (!fx.bridge->subscribe(s.id, j, s.id + "-exec-" + std::to_string(slot))) {
+                return false;
+            }
+            if (fx.bridge->arm(s.id, j, Bridge::ArmMode::kStreaming) !=
+                Bridge::ArmOutcome::kArmed) {
+                return false;
+            }
+            return fx.bridge->on_post_closed(s.id, j);
+        };
+        for (int i = 0; i < kMainSessions; ++i) {
+            for (int slot = 0; slot < kPerSession; ++slot) {
+                REQUIRE(park(pool[static_cast<std::size_t>(i)], slot));
+            }
+        }
+
+        std::atomic<bool> stop{false};
+        std::atomic<int> parked_during{0};
+        auto producer = std::async(std::launch::async, [&] {
+            for (int i = kMainSessions; i < kMainSessions + kProdSessions; ++i) {
+                for (int slot = 0; slot < kPerSession; ++slot) {
+                    if (stop.load(std::memory_order_relaxed)) {
+                        return;
+                    }
+                    if (park(pool[static_cast<std::size_t>(i)], slot)) {
+                        parked_during.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        });
+
+        fx.bridge->sweep();  // MUST return without waiting for the producer to stop
+        stop.store(true, std::memory_order_relaxed);
+        producer.get();
+
+        if (parked_during.load() > 0) {
+            // It stopped on its budget with the cap still exceeded, and said so.
+            CHECK(fx.reg.counter("yuzu_mcp_bridge_pressure_budget_exhausted_total").value() > 0.0);
+            observed = true;
+        }
+    }
+    CHECK(observed);  // producer never won a race in 5 attempts - scenario not exercised
+}
+
 TEST_CASE("bridge pressure - two concurrent sweeps reap a victim exactly once (#2409 qa-S5, TSan)",
           "[mcp][bridge][2f][2409]") {
     Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
@@ -2752,8 +2840,9 @@ TEST_CASE("bridge reserve - the streamed charge and the record commit together (
 //
 // The claim used to be cleared INSIDE the try whose first act was the record-lock
 // acquisition, so a lock failure left it set forever. All four consumers then skip
-// the record, and because a defer exits the pressure loop, one wedged victim
-// stalls ring-only pressure relief bridge-wide.
+// the record; under the defer-ends-the-pass behaviour that predated UP-5 (#2489)
+// one such victim also stalled ring-only pressure relief bridge-wide, and it now
+// wedges only itself.
 //
 // Coverage note (deliberate, not an omission): the degraded path's third arm -
 // storing terminal_projected when the frame was ALREADY published - needs the

@@ -89,10 +89,20 @@
 // A DEFER advances to the next-oldest victim; it does not end the pass (UP-5,
 // #2489). The no-tight-re-visit property FA-4 wanted is carried by a monotonic
 // parked_seq floor instead, so an oldest victim that is perpetually mid-projection
-// costs itself its turn rather than denying relief to every newer victim. The
-// marks that pass leaves behind are cleared in one place only - the exit where
+// costs itself its turn rather than denying relief to every newer victim. Because
+// advancing means the pass no longer stops on the first defer, it also carries a
+// VICTIM BUDGET captured at entry: a record parking mid-pass gets a higher
+// parked_seq and would otherwise be eligible, so a sustained park rate could keep
+// one maintenance tick working without end. Hitting the budget is counted, never
+// silent (yuzu_mcp_bridge_pressure_budget_exhausted_total).
+//
+// The marks that pass leaves behind are cleared in one place only - the exit where
 // the cap is back under water (UP-4, #2489) - because a mark on a merely-deferred
-// victim is still live work.
+// victim is still live work. Both the mark and the clear take bridge_mu_ before
+// the record lock, and the clear RE-TESTS the cap inside that hold: the cap
+// reading from the selection walk is one critical section old by then, and
+// clearing on it would strip a quiesce that a record parking in the gap had just
+// made live again.
 //
 // Record state DOMINATES the bus verdict: a record that already holds a real final
 // (accepted AND projected) is torn down with nothing published; one with a latched
@@ -356,16 +366,27 @@ public:
     /// yuzu_mcp_bridge_forced_expire_total. Only the failure of a publish was
     /// counted before, so an operator could not tell a degrade-to-fallback from a
     /// synthesized -32014 from an ordinary settle - the distinction existed only
-    /// in audit, which is not scraped. Ordered to match TeardownFinal and derived
-    /// from it, so a fourth disposition cannot be added without the label set and
-    /// server.cpp's pre-seed loop following it (same contract as
-    /// kTeardownStageNames and kDegradeReasons).
+    /// in audit, which is not scraped.
+    ///
+    /// The label comes from a SWITCH with no `default:`, which is the actual gate:
+    /// a fourth TeardownFinal value makes this function a -Wswitch warning at the
+    /// point of the change. An index into the array could not do that - it would
+    /// have compiled and quietly emitted an unseeded "unknown" (#2489 review). The
+    /// array is the seed list `server.cpp` walks, and must carry one entry per
+    /// case; the static_assert below only pins its size, not its contents.
     static constexpr std::size_t kTeardownFinalCount = 3;
     static constexpr std::array<const char*, kTeardownFinalCount> kForcedExpireDispositions{
         "none", "synthesize_unavailable", "fallback_final"};
     static constexpr const char* forced_expire_disposition(TeardownFinal d) {
-        const auto idx = static_cast<std::size_t>(d);
-        return idx < kTeardownFinalCount ? kForcedExpireDispositions[idx] : "unknown";
+        switch (d) {
+        case TeardownFinal::kNone:
+            return "none";
+        case TeardownFinal::kSynthesizeUnavailable:
+            return "synthesize_unavailable";
+        case TeardownFinal::kFallbackFinal:
+            return "fallback_final";
+        }
+        return "none";  // unreachable for a valid enumerator; never a new label
     }
 
     /// The three resources a claimed teardown must settle, in the order it settles
@@ -614,8 +635,9 @@ public:
     /// The NEXT `times` ~ClaimGuard record-lock acquisitions throw, modelling the
     /// mutex failure this file's fault model already treats as real. Drives the
     /// #2528 DEGRADED SETTLE: the claim must still be released (else the record is
-    /// wedged out of all four consumers and one victim stalls ring-only pressure
-    /// relief bridge-wide), and the settle bookkeeping that could not run must be
+    /// wedged out of all four consumers, and before UP-5 (#2489) made a deferred
+    /// victim advance the pressure pass rather than end it, one such record stalled
+    /// ring-only pressure relief bridge-wide), and the settle bookkeeping must be
     /// recorded honestly - terminal_projected when the frame was already published,
     /// terminal_payload_lost when it was extracted and never published.
     void inject_claim_lock_fault_for_test(int times = 1);
@@ -923,6 +945,11 @@ private:
     /// pass - the pin-ack / session-death / arming reap shares teardown_claimed
     /// but is not a forced expiry and must not land in this family.
     void count_forced_expire(TeardownFinal decision) noexcept;
+    /// #2489 review: the pressure pass stopped on its per-invocation victim budget
+    /// with the cap still exceeded. Not an error - the remaining victims roll to the
+    /// next tick - but it must not be silent, or a hatch that never keeps up looks
+    /// identical to one with nothing to do.
+    void count_pressure_budget_exhausted() noexcept;
     /// True iff a fault is armed for `stage` (consumes one). Test seam only.
     bool take_step_fault(TeardownStage stage) noexcept;
     void publish_records_gauge(std::size_t n) noexcept;

@@ -115,9 +115,11 @@ two alerts often fire together. A projection could not retake the record lock at
 of its batch and released its projection claim **without** it.
 
 Releasing the claim is deliberate and is the better half of the trade: a claim left set
-excludes that record from every consumer, and because a deferred record exits the
-pressure loop, one such record stalls ring-only pressure relief for every session until
-the process restarts. What is lost instead is that batch's settle bookkeeping:
+excludes that record from every consumer until the process restarts. It used to be
+worse still: before #2489, a deferred record ended the whole pressure pass, so one
+wedged record stalled ring-only pressure relief for every session. The pass now
+advances past a defer, so the damage is confined to the wedged record itself. What is
+lost instead is that batch's settle bookkeeping:
 
 - a progress-only batch loses **nothing** - the claim release is a complete recovery;
 - a batch holding a terminal payload that had not yet been published loses that payload
