@@ -19,4 +19,4 @@ Pair with `cpp-expert`. Load `docs/cpp-conventions.md` and inspect existing owne
 
 ## Output
 
-Return only evidence-backed `BLOCKING` or `SHOULD` findings with `file:line`, consequence, and the smallest project-native fix. End with `Ownership note: complete`, `incomplete`, or `not required`, then `PASS` or `BLOCKED`.
+Return only evidence-backed `BLOCKING` or `SHOULD` findings with `file:line`, consequence, and the smallest project-native fix. End with `Ownership note: complete`, `incomplete`, or `not required`. Return exactly `PASS` when there are no findings. `BLOCKED` is the pipeline's decision, not a reviewer's — never emit it from this role.

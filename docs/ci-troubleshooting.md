@@ -18,6 +18,9 @@ Companion docs:
 - `docs/windows-build.md` — the canonical Windows build path
   (MSYS2 bash + `setup_msvc_env.sh` + `scripts/ensure-erlang.sh`) and the
   current gRPC/protobuf linkage contract.
+- `.claude/agents/build-ci.md` — the #375 timeline: every approach that was
+  tried and failed before option D, and the #376 QUIC escape path. Read it
+  before proposing a change the project has already rejected.
 
 ---
 
@@ -458,11 +461,16 @@ OR the hand-rolled `find_library()` wiring re-introduces the failure.
 The current contract and its two failure mechanisms live in
 `docs/windows-build.md` under **"Windows gRPC/protobuf linkage"**. Read it
 and the live comments in the triplet and root `meson.build` before touching
-the wiring; discarded alternatives belong in git and issue history, not a
-reviewer prompt.
+the wiring.
 
-**Reference fix:** PR #373 merged as `bf95d3b` on 2026-04-15. Don't
-simplify either half without reading the build reference first.
+The **rejected** alternatives — per-build-type triplets, explicit
+`CMAKE_BUILD_TYPE`, dropping the static override, the option H hybrid — and
+the #376 QUIC escape path are recorded in `.claude/agents/build-ci.md` under
+**"Windows MSVC static-link history and #375"**. Read that before proposing
+one of them again.
+
+**Reference fix:** PR #373 merged as `bf95d3b` on 2026-04-15 (#375). Don't
+simplify either half without reading both references first.
 
 ---
 

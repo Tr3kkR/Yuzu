@@ -21,7 +21,9 @@ Evidence: observable code path, contract, or failing/missing test.
 Fix: smallest change that removes the consequence.
 ```
 
-Security uses `CRITICAL`, `HIGH`, or `MEDIUM`; every other role uses `BLOCKING` or `SHOULD`. Return exactly `PASS` when there are no findings.
+Security uses `CRITICAL`, `HIGH`, or `MEDIUM`; every other role uses `BLOCKING` or `SHOULD`. Return exactly `PASS` when there are no findings. `PASS WITH DEFERRED` and `BLOCKED` are the pipeline's decision vocabulary in `SKILL.md`; a reviewer never emits them.
+
+**A role prompt never decides gating.** Report the finding in your own vocabulary; whether it blocks is decided by the canonical derived band (TRIGGER + IMPACT + EXPOSURE + EPISTEMIC STATUS) plus the policy floors, defined once in `.claude/skills/governance/SKILL.md` and loaded via this skill's Blocking section. Do not restate or second-guess that rule here — a second copy is how the two runners drifted into enforcing different gates (#2623).
 
 ## Mandatory Roles
 
@@ -40,7 +42,7 @@ Security uses `CRITICAL`, `HIGH`, or `MEDIUM`; every other role uses `BLOCKING` 
 - **gateway-erlang** — Load `docs/erlang-gateway-build.md`. Review OTP lifecycle, supervision, message ownership, proto mirrors, test isolation, EUnit/CT, and Dialyzer implications; do not restate Erlang tutorials.
 - **dsl-engineer** — Load the owning DSL docs. Review grammar, evaluation semantics, bounds, compatibility, and parser tests against implemented behavior, not roadmap phases.
 - **cross-platform** — Load the relevant OS build/compatibility docs. Review only affected platforms, including paths, APIs, types, service behavior, build guards, and validation gaps.
-- **performance** — Review demonstrated hot paths, query plans, contention, allocation, cardinality, backpressure, and bounded growth. Require a benchmark only when the change makes a performance claim or creates a material regression risk.
+- **performance** — Always triggered by a changed `get_*_ids` query, a SQLite or Postgres BFS/graph traversal, or a per-authorization hot path. Review demonstrated hot paths, query plans, contention, allocation, cardinality, backpressure, and bounded growth. Require a benchmark only when the change makes a performance claim or creates a material regression risk.
 - **release-deploy** — Load the deployment and UAT docs routed by `AGENTS.md`. Review packaging, configuration, upgrade/rollback, images, services, and release artifacts without duplicating topology reference material.
 
 ## Correctness Roles
@@ -48,6 +50,9 @@ Security uses `CRITICAL`, `HIGH`, or `MEDIUM`; every other role uses `BLOCKING` 
 - **happy-path** — Trace each changed public behavior end to end under valid inputs. Report only broken or incomplete flows, wrong outputs, unintended side effects, or violated idempotency claims.
 - **unhappy-path** — Test credible failures at changed boundaries: partial work, retry, duplicate, timeout, restart, corruption, exhaustion, and teardown. Trace only failure modes supported by code evidence.
 - **consistency-auditor** — Compare representations of the same changed contract across code, schema, proto, tests, docs, audit, metrics, and sibling handlers. Naming differences are findings only when a consumer or operator can observe the mismatch.
+
+## Chaos Role (Gate 5)
+
 - **chaos-injector** — Convert the cited unresolved Gate 4 finding into the smallest safe, reproducible fault test with injection point, observable pass condition, and rollback. Produce no unrelated scenarios.
 
 ## Operational Roles

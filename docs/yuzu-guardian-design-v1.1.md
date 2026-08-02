@@ -2526,8 +2526,10 @@ Guardian ladder must check these.
   deliberately adding NO new schema token, so the cross-checks stay
   untouched. Published schema enums (`guardian_schema_registry.cpp`) and the
   agent's per-type support arrays (`registry_support::kHives`,
-  `service_support::kStates`) are bound by schema↔handler cross-check unit
-  tests: add or remove a guard type in BOTH or neither.
+  `service_support::kStates`) are bound by the **H2/G9** schema↔handler
+  cross-check unit tests: add or remove a guard type in BOTH or neither.
+  (H2/G9 is the project-wide name for this pattern — it is cited that way in
+  `CLAUDE.md`, ADR-0017, ADR-0028, and `docs/tar-module-loads.md`.)
 - **Guardian-store SQLite transactions use the RAII owners.** New or modified
   transactions in the Guardian stores (`guaranteed-state.db`,
   `guardian-baselines.db` / `BaselineStore`,
