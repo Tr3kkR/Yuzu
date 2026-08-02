@@ -11,7 +11,7 @@ TEST_CASE("ADR-0031 B3 platform request has a deterministic round trip", "[adr31
     contracts::B3PlatformRequest request{
         .correlation_id = "req-contract-0001",
         .securable = "GuaranteedState",
-        .operation = "Read",
+        .operation = contracts::CoreOperation::Read,
         .scope = nlohmann::json{{"kind", "fleet"}},
     };
 
@@ -31,6 +31,15 @@ TEST_CASE("ADR-0031 B3 platform request has a deterministic round trip", "[adr31
     const auto reencoded = contracts::encode_b3_platform_request(*decoded);
     REQUIRE(reencoded.has_value());
     CHECK(*reencoded == *encoded);
+}
+
+TEST_CASE("ADR-0031 B3 rejects an untyped operation", "[adr31][contract][b3][negative]") {
+    const auto decoded = contracts::decode_b3_platform_request(
+        R"({"contract":{"id":"yuzu.b3.platform.request","version":{"major":1,"minor":0}},"correlation_id":"req-contract-0001","operation":"Observe","scope":{"kind":"fleet"},"securable":"GuaranteedState"})");
+
+    REQUIRE_FALSE(decoded.has_value());
+    CHECK(decoded.error().code == contracts::ContractErrorCode::InvalidValue);
+    CHECK(decoded.error().path == "/operation");
 }
 
 TEST_CASE("ADR-0031 B3 decoder distinguishes absent, null, and mistyped fields",

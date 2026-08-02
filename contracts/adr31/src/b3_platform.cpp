@@ -127,9 +127,9 @@ std::expected<void, ContractError> validate_request(const B3PlatformRequest& req
         return std::unexpected(error(ContractErrorCode::InvalidValue, "/securable",
                                      "securable must not be empty"));
     }
-    if (request.operation.empty()) {
+    if (to_string(request.operation).empty()) {
         return std::unexpected(error(ContractErrorCode::InvalidValue, "/operation",
-                                     "operation must not be empty"));
+                                     "operation is not a supported Core operation"));
     }
     if (!request.scope.is_object()) {
         return std::unexpected(
@@ -152,7 +152,7 @@ encode_b3_platform_request(const B3PlatformRequest& request) {
           {"version", {{"major", kB3PlatformRequest.current.major},
                        {"minor", kB3PlatformRequest.current.minor}}}}},
         {"correlation_id", request.correlation_id},
-        {"operation", request.operation},
+        {"operation", to_string(request.operation)},
         {"scope", request.scope},
         {"securable", request.securable},
     };
@@ -186,6 +186,18 @@ decode_b3_platform_request(std::string_view wire_json) {
     auto operation = required_string(root, "operation");
     if (!operation) return std::unexpected(operation.error());
 
+    const auto typed_operation = [&]() -> std::expected<CoreOperation, ContractError> {
+        if (*operation == "Read") return CoreOperation::Read;
+        if (*operation == "Write") return CoreOperation::Write;
+        if (*operation == "Execute") return CoreOperation::Execute;
+        if (*operation == "Delete") return CoreOperation::Delete;
+        if (*operation == "Approve") return CoreOperation::Approve;
+        if (*operation == "Push") return CoreOperation::Push;
+        return std::unexpected(error(ContractErrorCode::InvalidValue, "/operation",
+                                     "operation is not a supported Core operation"));
+    }();
+    if (!typed_operation) return std::unexpected(typed_operation.error());
+
     const auto scope_it = root.find("scope");
     if (scope_it == root.end()) {
         return std::unexpected(
@@ -203,7 +215,7 @@ decode_b3_platform_request(std::string_view wire_json) {
     return B3PlatformRequest{
         .correlation_id = std::move(*correlation_id),
         .securable = std::move(*securable),
-        .operation = std::move(*operation),
+        .operation = *typed_operation,
         .scope = *scope_it,
     };
 }
