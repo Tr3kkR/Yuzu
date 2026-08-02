@@ -1041,6 +1041,56 @@ groups:
             <CVE>") reads as degraded, NOT "installed nowhere" — do not trust a
             zero-result inventory answer while this fires.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuMgmtGroupReadDegraded
+        # A CONFINEMENT-feeding management-group hierarchy read (ancestors /
+        # descendants / agent-groups, ADR-0042) degraded, so the caller failed
+        # closed to DenyAll. This is the confinement substrate itself faulting,
+        # not the fleet shrinking: a fired alert means SCOPED operators see
+        # reduced/empty lists, NOT that groups were deleted. Same dashboard-
+        # invisibility as YuzuInventoryReadDegraded — /readyz stays green under
+        # pure pool saturation, so only the store-specific counter moves.
+        # reason = store_not_open | pool_acquire_timeout | query_error.
+        expr: |
+          sum(rate(yuzu_server_mgmt_group_read_degrade_total[5m])) by (reason) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Management-group confinement reads degrading ({{ $labels.reason }})"
+          description: >-
+            yuzu_server_mgmt_group_read_degrade_total{reason="{{ $labels.reason }}"}
+            is non-zero: a confinement-feeding hierarchy read degraded and the
+            caller failed closed to DenyAll. This is a confinement-substrate
+            degrade — scoped operators now see REDUCED or EMPTY lists, it does
+            NOT mean management groups shrank or devices left the fleet.
+            pool_acquire_timeout/query_error correlate with yuzu_pg_* saturation
+            or outage; store_not_open means the store failed to open at boot. Do
+            not read a scoped operator's short/empty list as authoritative while
+            this fires.
+          runbook_url: "https://docs.yuzu.io/runbooks/management-groups"
+      - alert: YuzuMgmtGroupBackfillFailing
+        # The one-time SQLite->Postgres confinement backfill (ADR-0042) reported
+        # a failed outcome. The server fails closed at boot on a backfill failure
+        # (write error, or an over-deep/cyclic legacy tree) and retries next
+        # start, so a failed sample means the server refused to come up with a
+        # partial/empty confinement hierarchy — an operator must repair or move
+        # aside the legacy management-groups.db before it will boot.
+        expr: |
+          sum(rate(yuzu_server_mgmt_group_backfill_total{result="failed"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Management-group confinement backfill failed (server refused to boot)"
+          description: >-
+            yuzu_server_mgmt_group_backfill_total{result="failed"} advanced: the
+            one-time confinement backfill could not complete (Postgres write
+            error, or an over-deep/cyclic legacy management-groups.db). The server
+            fails closed at boot rather than come up with partial confinement and
+            retries on the next start — repair the legacy tree (flatten below 10
+            levels / break the cycle) or move management-groups.db aside, then
+            restart.
+          runbook_url: "https://docs.yuzu.io/runbooks/management-groups"
       - alert: YuzuInventoryIngestSlow
         # Leading indicator for ingest transaction-hold saturation: full-payload
         # ingests taking >10s. Distinct from the yuzu_pg_acquire_* family, which

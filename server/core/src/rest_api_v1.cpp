@@ -1718,16 +1718,31 @@ void RestApiV1::register_routes(
         }
 
         if (!updated.parent_id.empty() && updated.parent_id != existing->parent_id) {
+            // CONFINEMENT/hierarchy reads are degrade-distinguishable (ADR-0042):
+            // a nullopt means the mgmt-store degraded — refuse the mutation
+            // (503) rather than validate against a partial/empty walk.
             auto descendants = mgmt_store->get_descendant_ids(id);
-            if (std::find(descendants.begin(), descendants.end(), updated.parent_id) !=
-                descendants.end()) {
+            if (!descendants) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "management group store unavailable"),
+                                "application/json");
+                return;
+            }
+            if (std::find(descendants->begin(), descendants->end(), updated.parent_id) !=
+                descendants->end()) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "re-parenting would create a cycle"),
                                 "application/json");
                 return;
             }
             auto ancestors = mgmt_store->get_ancestor_ids(updated.parent_id);
-            if (ancestors.size() >= 4) {
+            if (!ancestors) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "management group store unavailable"),
+                                "application/json");
+                return;
+            }
+            if (ancestors->size() >= 4) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "maximum hierarchy depth (5) exceeded"),
                                 "application/json");

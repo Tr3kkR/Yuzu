@@ -40,6 +40,7 @@
 
 #include "dashboard_routes.hpp"
 #include "management_group_store.hpp"
+#include "test_mgmt_group_pg_helper.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -107,7 +108,8 @@ struct FragmentHarness {
     // leaves live handlers holding a destroyed owner. `mg`/`metrics` precede
     // `routes` because `routes` borrows both.
     yuzu::test::TempDbFile mg_db{"yuzu_test_tar_frag_mg_"};
-    ManagementGroupStore mg{mg_db.path};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
     yuzu::MetricsRegistry metrics;
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
@@ -217,7 +219,7 @@ bool contains(const std::string& hay, std::string_view needle) {
 // ── Permission tier ─────────────────────────────────────────────────────────
 
 TEST_CASE("fragment purge: gates on Infrastructure:Delete; denial audits + counts, no dispatch",
-          "[server][tar][purge][fragment]") {
+          "[pg][server][tar][purge][fragment]") {
     FragmentHarness h;
     h.perm_allow = false;
     auto res = h.post(kPurgePath, "device_id=dev-A&source=process");
@@ -232,7 +234,7 @@ TEST_CASE("fragment purge: gates on Infrastructure:Delete; denial audits + count
 }
 
 TEST_CASE("fragment reenable: gates on Execution:Execute; denial audits + counts, no dispatch",
-          "[server][tar][reenable][fragment]") {
+          "[pg][server][tar][reenable][fragment]") {
     FragmentHarness h;
     h.perm_allow = false;
     auto res = h.post(kReenablePath, "device_id=dev-A&source=process");
@@ -249,7 +251,7 @@ TEST_CASE("fragment reenable: gates on Execution:Execute; denial audits + counts
 // ── CSRF same-site gate ─────────────────────────────────────────────────────
 
 TEST_CASE("fragment purge: cross-origin and header-less POSTs are refused before dispatch",
-          "[server][tar][purge][fragment][csrf]") {
+          "[pg][server][tar][purge][fragment][csrf]") {
     SECTION("cross-origin Origin") {
         FragmentHarness h;
         auto res = h.post(kPurgePath, "device_id=dev-A&source=process",
@@ -284,7 +286,7 @@ TEST_CASE("fragment purge: cross-origin and header-less POSTs are refused before
 }
 
 TEST_CASE("fragment reenable: cross-origin and header-less POSTs are refused before dispatch",
-          "[server][tar][reenable][fragment][csrf]") {
+          "[pg][server][tar][reenable][fragment][csrf]") {
     SECTION("cross-origin") {
         FragmentHarness h;
         auto res = h.post(kReenablePath, "device_id=dev-A&source=process",
@@ -305,7 +307,7 @@ TEST_CASE("fragment reenable: cross-origin and header-less POSTs are refused bef
 // ── Input validation ────────────────────────────────────────────────────────
 
 TEST_CASE("fragment purge: missing fields and forged sources are rejected 400, no dispatch",
-          "[server][tar][purge][fragment]") {
+          "[pg][server][tar][purge][fragment]") {
     FragmentHarness h;
     CHECK(h.post(kPurgePath, "source=process")->status == 400);          // no device_id
     CHECK(h.post(kPurgePath, "device_id=dev-A")->status == 400);         // no source
@@ -318,7 +320,7 @@ TEST_CASE("fragment purge: missing fields and forged sources are rejected 400, n
 }
 
 TEST_CASE("fragment reenable: missing fields and forged sources are rejected 400, no dispatch",
-          "[server][tar][reenable][fragment]") {
+          "[pg][server][tar][reenable][fragment]") {
     FragmentHarness h;
     CHECK(h.post(kReenablePath, "source=process")->status == 400);
     CHECK(h.post(kReenablePath, "device_id=dev-A")->status == 400);
@@ -330,7 +332,7 @@ TEST_CASE("fragment reenable: missing fields and forged sources are rejected 400
 }
 
 TEST_CASE("fragment reenable: every allowlisted source dispatches",
-          "[server][tar][reenable][fragment]") {
+          "[pg][server][tar][reenable][fragment]") {
     // The negative cases above cannot tell "rejected because forged" from
     // "rejected because the allowlist rejects everything" — this is the
     // positive half that makes removing a source from the allowlist fail.
@@ -345,7 +347,7 @@ TEST_CASE("fragment reenable: every allowlisted source dispatches",
     CHECK(h.metric("yuzu_tar_source_reenable_total", "success") == 4.0);
 }
 
-TEST_CASE("fragment purge: every allowlisted source dispatches", "[server][tar][purge][fragment]") {
+TEST_CASE("fragment purge: every allowlisted source dispatches", "[pg][server][tar][purge][fragment]") {
     FragmentHarness h;
     for (const char* src : {"process", "tcp", "service", "user"})
         CHECK(h.post(kPurgePath, std::string{"device_id=dev-A&source="} + src)->status == 200);
@@ -356,7 +358,7 @@ TEST_CASE("fragment purge: every allowlisted source dispatches", "[server][tar][
 // ── RBAC device scope ───────────────────────────────────────────────────────
 
 TEST_CASE("fragment purge: out-of-scope device 404s (no existence oracle) and audits the reason",
-          "[server][tar][purge][fragment]") {
+          "[pg][server][tar][purge][fragment]") {
     FragmentHarness h;
     auto res = h.post(kPurgePath, "device_id=dev-OTHER&source=process");
     CHECK(res->status == 404);
@@ -369,7 +371,7 @@ TEST_CASE("fragment purge: out-of-scope device 404s (no existence oracle) and au
 }
 
 TEST_CASE("fragment reenable: out-of-scope device 404s and audits the reason",
-          "[server][tar][reenable][fragment]") {
+          "[pg][server][tar][reenable][fragment]") {
     FragmentHarness h;
     auto res = h.post(kReenablePath, "device_id=dev-OTHER&source=tcp");
     CHECK(res->status == 404);
@@ -382,7 +384,7 @@ TEST_CASE("fragment reenable: out-of-scope device 404s and audits the reason",
 // ── Offline / unavailable ───────────────────────────────────────────────────
 
 TEST_CASE("fragment purge: offline agent (0 reached) → 404 + agent_not_connected",
-          "[server][tar][purge][fragment]") {
+          "[pg][server][tar][purge][fragment]") {
     FragmentHarness h;
     h.dispatch_sent = 0;
     auto res = h.post(kPurgePath, "device_id=dev-A&source=process");
@@ -394,7 +396,7 @@ TEST_CASE("fragment purge: offline agent (0 reached) → 404 + agent_not_connect
 }
 
 TEST_CASE("fragment reenable: offline agent (0 reached) → 404 + agent_not_connected",
-          "[server][tar][reenable][fragment]") {
+          "[pg][server][tar][reenable][fragment]") {
     FragmentHarness h;
     h.dispatch_sent = 0;
     auto res = h.post(kReenablePath, "device_id=dev-A&source=user");
@@ -405,7 +407,7 @@ TEST_CASE("fragment reenable: offline agent (0 reached) → 404 + agent_not_conn
 }
 
 TEST_CASE("fragment purge: the out-of-scope and offline 404s are byte-identical",
-          "[server][tar][purge][fragment]") {
+          "[pg][server][tar][purge][fragment]") {
     // The whole point of the collapse is that a caller cannot tell "not yours"
     // from "not connected". A substring check would still pass if a refactor
     // added a distinguishing class or marker to one of them, so compare the
@@ -422,7 +424,7 @@ TEST_CASE("fragment purge: the out-of-scope and offline 404s are byte-identical"
 }
 
 TEST_CASE("fragment purge/reenable: no dispatch wiring → 503",
-          "[server][tar][purge][fragment]") {
+          "[pg][server][tar][purge][fragment]") {
     // No `calls.empty()` assertion here: with an empty DispatchFn nothing can
     // ever be recorded, so it would be a tautology rather than evidence.
     FragmentHarness h{/*with_dispatch=*/false};
@@ -431,7 +433,7 @@ TEST_CASE("fragment purge/reenable: no dispatch wiring → 503",
 }
 
 TEST_CASE("fragment purge/reenable: an unauthenticated session stops before dispatch",
-          "[server][tar][purge][fragment]") {
+          "[pg][server][tar][purge][fragment]") {
     FragmentHarness h;
     h.auth_ok = false;
     CHECK(h.post(kPurgePath, "device_id=dev-A&source=process")->status == 401);
@@ -442,7 +444,7 @@ TEST_CASE("fragment purge/reenable: an unauthenticated session stops before disp
 // ── Success shape ───────────────────────────────────────────────────────────
 
 TEST_CASE("fragment purge: success dispatches tar/purge_source to the one device",
-          "[server][tar][purge][fragment]") {
+          "[pg][server][tar][purge][fragment]") {
     FragmentHarness h;
     auto res = h.post(kPurgePath, "device_id=dev-B&source=tcp");
     CHECK(res->status == 200);
@@ -462,7 +464,7 @@ TEST_CASE("fragment purge: success dispatches tar/purge_source to the one device
 }
 
 TEST_CASE("fragment reenable: success dispatches tar/configure with <source>_enabled=true",
-          "[server][tar][reenable][fragment]") {
+          "[pg][server][tar][reenable][fragment]") {
     FragmentHarness h;
     auto res = h.post(kReenablePath, "device_id=dev-A&source=service");
     CHECK(res->status == 200);
@@ -482,7 +484,7 @@ TEST_CASE("fragment reenable: success dispatches tar/configure with <source>_ena
 }
 
 TEST_CASE("fragment purge: query-string params are honoured like form-body params",
-          "[server][tar][purge][fragment]") {
+          "[pg][server][tar][purge][fragment]") {
     // htmx posts a urlencoded body, but the handler also accepts req.params —
     // both paths must land on the same dispatch.
     FragmentHarness h;
@@ -494,7 +496,7 @@ TEST_CASE("fragment purge: query-string params are honoured like form-body param
 }
 
 TEST_CASE("fragment purge: a query param wins over a body param of the same name",
-          "[server][tar][purge][fragment]") {
+          "[pg][server][tar][purge][fragment]") {
     // httplib parses the query string into req.params BEFORE the body, and
     // get_param_value returns the first match — so a query value shadows a body
     // value. Pinned because it is a request-smuggling shape: a proxy inspecting
@@ -509,7 +511,7 @@ TEST_CASE("fragment purge: a query param wins over a body param of the same name
 }
 
 TEST_CASE("fragment purge: a non-form content-type falls back to raw-body parsing",
-          "[server][tar][purge][fragment]") {
+          "[pg][server][tar][purge][fragment]") {
     // With a non-urlencoded Content-Type the sink leaves req.params empty, as
     // httplib does, so the handler takes its extract_form_value(req.body, ...)
     // fallback. That fallback carries the unanchored-key defect filed as #2527
@@ -526,7 +528,7 @@ TEST_CASE("fragment purge: a non-form content-type falls back to raw-body parsin
 }
 
 TEST_CASE("fragment purge: form fields are read the way httplib would parse them",
-          "[server][tar][purge][fragment]") {
+          "[pg][server][tar][purge][fragment]") {
     // Guards the TestRouteSink fidelity fix (#1786): the sink must parse a
     // urlencoded BODY into req.params like httplib::Server does, so these
     // tests exercise the handler's `req.has_param` branch — the production

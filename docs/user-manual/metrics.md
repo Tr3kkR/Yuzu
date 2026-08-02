@@ -939,13 +939,15 @@ account for the deliberately-disabled case, not just the stuck case.
 
 ## Management group metrics
 
-The server exposes two gauges for management group telemetry. These are
-refreshed on every `/metrics` scrape.
+The server exposes two gauges plus two counters for management group telemetry.
+The gauges are refreshed on every `/metrics` scrape; the counters are cumulative.
 
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_management_groups_total` | gauge | Total number of management groups (including the root "All Devices" group) |
 | `yuzu_server_group_members_total` | gauge | Total membership records across all management groups |
+| `yuzu_server_mgmt_group_read_degrade_total{reason}` | counter | A **confinement-feeding** hierarchy read (ancestors/descendants/agent-groups) degraded instead of returning a result, so the caller failed closed to **DenyAll**. `reason` ∈ `store_not_open` (store failed to open at boot), `pool_acquire_timeout` (no Postgres connection available in time — correlates with `yuzu_pg_acquire_*` saturation), `query_error` (the recursive-CTE query failed). **A non-zero rate means scoped operators see reduced/empty lists** because the confinement substrate (`management_group_store`, ADR-0042) is degraded — it does **not** mean groups shrank. This is the deny-set fail-**open** hazard now closed (a degraded read denies rather than silently under-restricting). |
+| `yuzu_server_mgmt_group_backfill_total{result}` | counter | Outcome of the one-time SQLite→Postgres confinement backfill at boot (ADR-0042). `result` ∈ `completed` (legacy `management-groups.db` found and backfilled, then moved aside), `fresh` (no legacy DB — a clean install, nothing to migrate), `failed` (backfill could not complete — write error, unreadable/over-deep/cyclic legacy tree; the server **fails closed at boot** and retries on next start). Emitted once per boot; a `failed` sample is the signal that the server refused to come up. |
 
 **Example output:**
 
@@ -970,6 +972,15 @@ yuzu_server_group_members_total / yuzu_server_management_groups_total
 
 # Alert if no management groups exist (store may be down)
 yuzu_server_management_groups_total == 0
+
+# Confinement reads degrading → scoped operators see reduced/empty lists (DenyAll).
+# A degrade denies confinement reads fleet-wide — treat any non-zero rate as a
+# confidentiality/availability signal, not a fleet-size change. (Shipped as the
+# YuzuMgmtGroupReadDegraded alert.)
+sum(rate(yuzu_server_mgmt_group_read_degrade_total[5m])) by (reason) > 0
+
+# One-time confinement backfill failed → server refused to boot (ADR-0042).
+sum(rate(yuzu_server_mgmt_group_backfill_total{result="failed"}[15m])) > 0
 ```
 
 ## Useful PromQL queries
