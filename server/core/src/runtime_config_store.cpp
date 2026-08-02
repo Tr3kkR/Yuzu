@@ -108,6 +108,15 @@ void RuntimeConfigStore::create_tables() {
 // ── Queries ──────────────────────────────────────────────────────────────────
 
 std::vector<RuntimeConfigEntry> RuntimeConfigStore::get_all() const {
+    auto entries = get_all_with_secrets();
+    for (auto& e : entries) {
+        if (is_secret_key(e.key))
+            e.value = redacted_placeholder();
+    }
+    return entries;
+}
+
+std::vector<RuntimeConfigEntry> RuntimeConfigStore::get_all_with_secrets() const {
     std::vector<RuntimeConfigEntry> results;
     if (!db_)
         return results;

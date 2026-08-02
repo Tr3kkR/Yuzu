@@ -36,7 +36,18 @@ public:
     bool is_open() const;
 
     /// Get all config entries.
+    /// All entries, with the value of any secret key REPLACED by
+    /// redacted_placeholder(). This is the default deliberately: an emitter that
+    /// forgets to think about secrets gets the safe behaviour. Use
+    /// get_all_with_secrets() only where the real value is genuinely required.
     std::vector<RuntimeConfigEntry> get_all() const;
+
+    /// All entries with real values. ONE legitimate caller today: the startup
+    /// override pass, which must apply the real secret. Anything that EMITS -- a
+    /// log, an API response, an audit detail, a dashboard fragment -- must not use
+    /// this. Redaction being opt-in is how the plaintext secret reached an audit
+    /// row that Operator can read (governance, this branch).
+    std::vector<RuntimeConfigEntry> get_all_with_secrets() const;
 
     /// Get a single config entry.
     std::optional<RuntimeConfigEntry> get(const std::string& key) const;
@@ -55,10 +66,11 @@ public:
     static bool is_allowed_key(const std::string& key);
 
     /// True if this key's VALUE is a credential and must never be emitted in
-    /// plaintext — not to a log, not to an API response, not to a config dump.
-    /// The store still returns the real value (callers such as the startup override
-    /// pass need it); redaction is the emitter's job, and this is the one predicate
-    /// every emitter must consult so a newly-added secret key cannot be missed.
+    /// plaintext — not to a log, not to an API response, not to an audit detail, not
+    /// to a config dump. Prefer get_all(), which applies this for you; consult the
+    /// predicate directly only where the value does not come from the store (the
+    /// PUT handler audits a caller-supplied value, which is the path that leaked
+    /// past the first version of this fix).
     static bool is_secret_key(const std::string& key);
 
     /// What to print in place of a secret. Single spelling so log scrapers and API

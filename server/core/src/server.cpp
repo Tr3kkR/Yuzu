@@ -6500,7 +6500,8 @@ private:
     void apply_runtime_config_overrides() {
         if (!runtime_config_store_ || !runtime_config_store_->is_open())
             return;
-        auto entries = runtime_config_store_->get_all();
+        // The ONE caller entitled to plaintext: it must apply the real secret.
+        auto entries = runtime_config_store_->get_all_with_secrets();
         for (const auto& e : entries) {
             // Never log a credential. This line wrote the OIDC client secret verbatim
             // into yuzu-server.log on every boot once it had been set via Settings.
@@ -7833,12 +7834,20 @@ private:
                     // settings UI already masks the same field as "********" -- the API
                     // was the inconsistent one. updated_by/updated_at are kept so an
                     // operator can still see THAT it is set and who set it.
-                    overrides[e.key] = {
-                        {"value", RuntimeConfigStore::is_secret_key(e.key)
-                                      ? std::string(RuntimeConfigStore::redacted_placeholder())
-                                      : e.value},
-                        {"updated_by", e.updated_by},
-                        {"updated_at", e.updated_at}};
+                    // A secret's value is OMITTED, not placeholdered. A placeholder is
+                    // a legal value, so a config-as-code or backup-restore client that
+                    // reads this and writes it back would silently set the literal
+                    // string as the client secret and break SSO. `is_set` carries the
+                    // only part an operator needs.
+                    if (RuntimeConfigStore::is_secret_key(e.key)) {
+                        overrides[e.key] = {{"is_set", !e.value.empty()},
+                                            {"updated_by", e.updated_by},
+                                            {"updated_at", e.updated_at}};
+                    } else {
+                        overrides[e.key] = {{"value", e.value},
+                                            {"updated_by", e.updated_by},
+                                            {"updated_at", e.updated_at}};
+                    }
                 }
             }
 
@@ -7938,11 +7947,21 @@ private:
             }
             // log_level is applied inside RuntimeConfigStore::set()
 
+            // NOT the raw value. An audit detail is durable, retained by policy, and
+            // readable by every role seeded AuditLog:Read (Operator among them) -- so
+            // writing a credential here is a worse sink than the log and the API this
+            // branch already fixed, and it is not rotatable away afterwards.
             (void)audit_log(req, "config.update", "success", "RuntimeConfig", key,
-                            "value=" + value);
+                            "value=" + (RuntimeConfigStore::is_secret_key(key)
+                                            ? std::string(RuntimeConfigStore::redacted_placeholder())
+                                            : value));
 
             res.set_content(
-                nlohmann::json({{"key", key}, {"value", value}, {"applied", true}}).dump(),
+                nlohmann::json(RuntimeConfigStore::is_secret_key(key)
+                                   ? nlohmann::json{{"key", key}, {"applied", true}}
+                                   : nlohmann::json{{"key", key}, {"value", value},
+                                                    {"applied", true}})
+                    .dump(),
                 "application/json");
         });
 

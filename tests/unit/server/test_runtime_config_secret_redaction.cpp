@@ -19,11 +19,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <filesystem>
 #include <string>
 #include <algorithm>
 #include <vector>
 
 #include "runtime_config_store.hpp"
+#include "../test_helpers.hpp"
 
 using yuzu::server::RuntimeConfigStore;
 
@@ -86,4 +88,43 @@ TEST_CASE("every registered secret key is actually storable", "[runtime_config][
     const auto& allowed = RuntimeConfigStore::allowed_keys();
     CHECK(std::find(allowed.begin(), allowed.end(), std::string("oidc_client_secret")) !=
           allowed.end());
+}
+
+// The store-level contract is the part that makes a FUTURE emitter safe: get_all()
+// redacts by default, and plaintext requires asking for it by name. Redaction being
+// opt-in at the emitter is exactly how the plaintext value reached an audit row that
+// every AuditLog:Read holder (Operator among them) can read -- a durable sink that
+// cannot be rotated away, and one this file's earlier tests passed straight over
+// because they only checked key REGISTRATION, never emitter consultation.
+TEST_CASE("get_all() redacts secrets; get_all_with_secrets() does not",
+          "[runtime_config][secret]") {
+    auto db = yuzu::test::unique_temp_path("yuzu_test_rtcfg");
+    {
+        RuntimeConfigStore store(db);
+        REQUIRE(store.is_open());
+        REQUIRE(store.set("oidc_client_secret", "s3cr3t-value", "tester"));
+        REQUIRE(store.set("oidc_issuer", "https://idp.example.com", "tester"));
+
+        std::string redacted_secret, redacted_issuer, real_secret, real_issuer;
+        for (const auto& e : store.get_all()) {
+            if (e.key == "oidc_client_secret") redacted_secret = e.value;
+            if (e.key == "oidc_issuer")        redacted_issuer = e.value;
+        }
+        for (const auto& e : store.get_all_with_secrets()) {
+            if (e.key == "oidc_client_secret") real_secret = e.value;
+            if (e.key == "oidc_issuer")        real_issuer = e.value;
+        }
+
+        // The default must never hand back the credential.
+        CHECK(redacted_secret == RuntimeConfigStore::redacted_placeholder());
+        CHECK(redacted_secret != "s3cr3t-value");
+        // A non-secret key is untouched by either accessor -- redacting configuration
+        // would cost real diagnostic signal.
+        CHECK(redacted_issuer == "https://idp.example.com");
+        // The named accessor still works, or the startup override pass breaks.
+        CHECK(real_secret == "s3cr3t-value");
+        CHECK(real_issuer == "https://idp.example.com");
+    }
+    std::error_code ec;
+    std::filesystem::remove(db, ec);
 }

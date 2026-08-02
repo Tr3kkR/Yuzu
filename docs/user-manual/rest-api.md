@@ -3048,31 +3048,25 @@ Returns current configuration values and any active runtime overrides.
 
 **Permission:** `Infrastructure:Read`
 
-> **Secret values are redacted.** An override whose key holds a credential (today:
-> `oidc_client_secret`) is returned with its value replaced by `<redacted>`. The
-> `updated_by` and `updated_at` fields are still returned, so you can see that the
-> value is set and who set it, but the value itself is never disclosed by this route
-> — matching the settings UI, which renders the same field as `********`. To change
-> it, `PUT /api/config/oidc_client_secret`; there is no read-back.
+> **Secret values are never returned.** For an override whose key holds a credential
+> (today: `oidc_client_secret`) the `value` field is **omitted entirely** and replaced
+> by `"is_set": true|false`. It is not a placeholder string: a placeholder is a legal
+> value, so a config-as-code or backup-restore client that read this and wrote it back
+> would silently overwrite the real secret. `updated_by` and `updated_at` are still
+> returned. `PUT /api/config/oidc_client_secret` sets it, and its 200 response omits
+> the value too.
 
-> **Note:** the example below predates the handler's current shape — the response
-> also carries an `overrides` object (keyed by config key, each with `value`,
-> `updated_by`, `updated_at`) and an `allowed_keys` array. That drift is
-> pre-existing and is not corrected here; only the redaction behaviour above was
-> verified against the code.
-
-**Response:**
+**Response** (shape corrected — the handler returns `config`, `overrides` and
+`allowed_keys`, not a `data`/`meta` envelope):
 
 ```json
 {
-  "data": {
-    "heartbeat_timeout": 120,
-    "response_retention_days": 90,
-    "audit_retention_days": 365,
-    "auto_approve_enabled": false,
-    "log_level": "info"
+  "config": { "heartbeat_timeout": 120, "log_level": "info" },
+  "overrides": {
+    "log_level":          { "value": "debug", "updated_by": "admin", "updated_at": 1754150400 },
+    "oidc_client_secret": { "is_set": true,   "updated_by": "admin", "updated_at": 1754150400 }
   },
-  "meta": { "api_version": "v1" }
+  "allowed_keys": ["heartbeat_timeout", "log_level", "oidc_client_secret"]
 }
 ```
 
