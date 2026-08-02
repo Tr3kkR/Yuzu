@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -45,6 +46,28 @@ struct ApprovalQuery {
     std::string status;
     std::string submitted_by;
 };
+
+/// Why a precondition-guarded consume did not consume (#2443). The caller needs
+/// these apart: a precondition denial must be reported to the operator as
+/// "state moved, mint a fresh ticket" with the ticket still recallable, whereas
+/// kNotConsumable means the one-time capability is spent. Distinguishing them by
+/// parsing the message string would be a fragile seam, so the kind is typed.
+enum class ConsumeFailure {
+    kPrecondition,  ///< precondition denied — ticket UNTOUCHED, still recallable
+    kNotConsumable, ///< absent / not approved / already consumed (the CAS lost)
+    kStoreError,    ///< store unavailable, missing argument, or a SQLite failure
+};
+
+struct ConsumeError {
+    ConsumeFailure kind{ConsumeFailure::kStoreError};
+    std::string message;
+};
+
+/// A cheap, read-only recheck of the state a ticket's effect depends on,
+/// evaluated between the ticket match and the consuming CAS (#2443). Returning
+/// an error denies the recall WITHOUT consuming; the string is operator-facing
+/// (it reaches the MCP error envelope's remediation), so say what drifted.
+using ConsumePrecondition = std::function<std::expected<void, std::string>(const Approval&)>;
 
 class ApprovalManager {
 public:
@@ -118,6 +141,34 @@ public:
     /// the same CAS UPDATE so the who and the when can never disagree.
     std::expected<void, std::string> consume_ticket(const std::string& id,
                                                     const std::string& consumed_by);
+
+    /// consume_ticket with a pre-consume recheck (#2443). A ticket can sit
+    /// approved-but-unconsumed for up to the 7-day TTL, so the state its effect
+    /// assumes may have moved on (the canonical case: an engine-key rotation the
+    /// ticket confirms has already resolved). Without a recheck the recall
+    /// matches, CONSUMES, and only then does the handler fail — burning a
+    /// human-approved one-time capability on a no-op and forcing a fresh
+    /// approval round.
+    ///
+    /// Order: match the row → reject a non-consumable one → evaluate
+    /// `precondition` → CAS. A precondition denial returns
+    /// ConsumeFailure::kPrecondition and leaves the row untouched, so the same
+    /// ticket is still recallable once the operator resolves the drift.
+    ///
+    /// `precondition` runs WITHOUT `mtx_` held, deliberately: it inspects state
+    /// OUTSIDE this store (RBAC, rotation status, device state), which no lock
+    /// here can freeze, so holding the store mutex across an arbitrary caller
+    /// callback would buy no atomicity while adding a lock-order hazard and
+    /// serialising the store behind caller I/O. The consequence is honest rather
+    /// than hidden: this NARROWS the drift window, it does not close it — state
+    /// can still move between a passing recheck and the CAS, and a handler must
+    /// stay correct when it does. The CAS remains the sole one-time-consumption
+    /// guard, so a concurrent recall still loses exactly as before.
+    ///
+    /// An empty `precondition` behaves exactly like the two-argument overload.
+    std::expected<void, ConsumeError> consume_ticket(const std::string& id,
+                                                     const std::string& consumed_by,
+                                                     const ConsumePrecondition& precondition);
 
 private:
     std::expected<void, std::string> set_review_status(const std::string& id,

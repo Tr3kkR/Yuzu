@@ -11,6 +11,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <sqlite3.h>
 
+#include <expected>
 #include <string>
 #include <vector>
 
@@ -380,6 +381,195 @@ TEST_CASE("ApprovalManager: consume_ticket replay is rejected and keeps the orig
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
     CHECK(row->consumed_by == "operator1"); // the losing recall never overwrites
+}
+
+// ── Pre-consume recheck (#2443) ────────────────────────────────────────────
+// A ticket can sit approved-but-unconsumed for up to the 7-day TTL, so the
+// state its effect assumes may drift. The recheck runs between the match and
+// the CAS: a denial must leave the ticket RECALLABLE, because burning a
+// human-approved capability on a no-op is the defect being fixed.
+
+TEST_CASE("ApprovalManager: a failing pre-consume recheck denies WITHOUT consuming",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.confirm_engine_rotation", "operator1", "{\"token_id\":\"t1\"}");
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
+
+    auto consumed = mgr.consume_ticket(*id, "operator1", [](const Approval&) {
+        return std::expected<void, std::string>(
+            std::unexpected("rotation t1 already resolved; mint a fresh ticket"));
+    });
+    REQUIRE(!consumed.has_value());
+    CHECK(consumed.error().kind == ConsumeFailure::kPrecondition);
+    CHECK(consumed.error().message == "rotation t1 already resolved; mint a fresh ticket");
+
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "approved");
+    CHECK(row->consumed_at == 0); // the CAS never ran
+    CHECK(row->consumed_by.empty());
+}
+
+TEST_CASE("ApprovalManager: a ticket denied by the recheck is still consumable afterwards",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.confirm_engine_rotation", "operator1", "{}");
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+
+    bool drifted = true;
+    ConsumePrecondition recheck = [&drifted](const Approval&) -> std::expected<void, std::string> {
+        if (drifted)
+            return std::unexpected("state drifted");
+        return {};
+    };
+
+    REQUIRE(!mgr.consume_ticket(*id, "operator1", recheck).has_value());
+    drifted = false; // operator resolved the drift — the SAME ticket still works
+    REQUIRE(mgr.consume_ticket(*id, "operator1", recheck).has_value());
+
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at > 0);
+    CHECK(row->consumed_by == "operator1");
+}
+
+TEST_CASE("ApprovalManager: the pre-consume recheck sees the matched ticket's own row",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{\"agent_id\":\"a1\"}");
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
+
+    Approval seen;
+    auto consumed = mgr.consume_ticket(*id, "operator1",
+                                       [&seen](const Approval& a) -> std::expected<void, std::string> {
+                                           seen = a;
+                                           return {};
+                                       });
+    REQUIRE(consumed.has_value());
+    CHECK(seen.id == *id);
+    CHECK(seen.definition_id == "mcp.delete_tag");
+    CHECK(seen.scope_expression == "{\"agent_id\":\"a1\"}");
+    CHECK(seen.submitted_by == "operator1");
+    CHECK(seen.status == "approved"); // pre-CAS snapshot, so not yet consumed
+    CHECK(seen.consumed_at == 0);
+}
+
+TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running the recheck",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1").has_value());
+
+    bool ran = false;
+    auto replay = mgr.consume_ticket(*id, "operator2",
+                                     [&ran](const Approval&) -> std::expected<void, std::string> {
+                                         ran = true;
+                                         return {};
+                                     });
+    REQUIRE(!replay.has_value());
+    CHECK(replay.error().kind == ConsumeFailure::kNotConsumable);
+    CHECK(!ran); // the recheck may be costly or emit audit — spent tickets skip it
+
+    // Same for a pending (never-approved) ticket and for an absent id.
+    auto pending = mgr.submit("mcp.delete_tag", "operator1", "{\"n\":1}");
+    REQUIRE(pending.has_value());
+    auto on_pending = mgr.consume_ticket(*pending, "operator1",
+                                         [&ran](const Approval&) -> std::expected<void, std::string> {
+                                             ran = true;
+                                             return {};
+                                         });
+    REQUIRE(!on_pending.has_value());
+    CHECK(on_pending.error().kind == ConsumeFailure::kNotConsumable);
+
+    auto absent = mgr.consume_ticket("does-not-exist", "operator1",
+                                     [&ran](const Approval&) -> std::expected<void, std::string> {
+                                         ran = true;
+                                         return {};
+                                     });
+    REQUIRE(!absent.has_value());
+    CHECK(absent.error().kind == ConsumeFailure::kNotConsumable);
+    CHECK(!ran);
+}
+
+TEST_CASE("ApprovalManager: an empty precondition consumes exactly like the two-argument overload",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+
+    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_by == "operator1");
+}
+
+TEST_CASE("ApprovalManager: a missing principal fails closed on the recheck overload too",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+
+    bool ran = false;
+    auto consumed = mgr.consume_ticket(*id, "",
+                                       [&ran](const Approval&) -> std::expected<void, std::string> {
+                                           ran = true;
+                                           return {};
+                                       });
+    REQUIRE(!consumed.has_value());
+    CHECK(consumed.error().kind == ConsumeFailure::kStoreError);
+    CHECK(!ran); // argument validation precedes any callback
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0);
+}
+
+TEST_CASE("ApprovalManager: the recheck may read the store without deadlocking",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+
+    // The callback runs with mtx_ RELEASED, so a precondition that consults the
+    // approval store (a plausible shape: "no newer ticket supersedes this one")
+    // is safe. Under a lock-held design this self-deadlocks on the
+    // non-recursive mutex.
+    auto consumed =
+        mgr.consume_ticket(*id, "operator1", [&mgr](const Approval& a) -> std::expected<void, std::string> {
+            (void)mgr.get(a.id);
+            (void)mgr.pending_count();
+            (void)mgr.query({});
+            return {};
+        });
+    CHECK(consumed.has_value());
 }
 
 // ── Expiry sweep (PR #1796 N3 + L2) ────────────────────────────────────────

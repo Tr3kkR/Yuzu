@@ -251,6 +251,8 @@ std::vector<Approval> ApprovalManager::query(const ApprovalQuery& q) const {
     if (!db_)
         return results;
 
+    std::lock_guard lock(mtx_);
+
     std::string sql = std::string("SELECT ") + kSelectAllCols + " FROM approvals WHERE 1=1";
     std::vector<std::string> binds;
 
@@ -286,6 +288,8 @@ int ApprovalManager::pending_count() const {
     if (!db_)
         return 0;
 
+    std::lock_guard lock(mtx_);
+
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM approvals WHERE status = 'pending'", -1,
                            &stmt, nullptr) != SQLITE_OK)
@@ -302,6 +306,8 @@ int ApprovalManager::pending_count() const {
 int ApprovalManager::pending_count_for(const std::string& submitted_by) const {
     if (!db_ || submitted_by.empty())
         return 0;
+
+    std::lock_guard lock(mtx_);
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(
@@ -387,14 +393,49 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
 
 std::expected<void, std::string> ApprovalManager::consume_ticket(const std::string& id,
                                                                  const std::string& consumed_by) {
+    auto r = consume_ticket(id, consumed_by, {});
+    if (r)
+        return {};
+    // The two-argument overload is the pre-#2443 contract: one flat string, and
+    // the same strings as before so its callers keep reporting identically.
+    return std::unexpected(r.error().message);
+}
+
+std::expected<void, ConsumeError>
+ApprovalManager::consume_ticket(const std::string& id, const std::string& consumed_by,
+                                const ConsumePrecondition& precondition) {
     if (!db_)
-        return std::unexpected("database not open");
+        return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, "database not open"});
     if (id.empty())
-        return std::unexpected("approval id is required");
+        return std::unexpected(
+            ConsumeError{ConsumeFailure::kStoreError, "approval id is required"});
     // SOC-2 CC7.2 (PR #1796 H3/N2): a consumption with no attributable principal
     // would be an evidence-chain hole — fail the recall closed instead.
     if (consumed_by.empty())
-        return std::unexpected("consumed_by is required");
+        return std::unexpected(
+            ConsumeError{ConsumeFailure::kStoreError, "consumed_by is required"});
+
+    // Pre-consume recheck (#2443). Skipped entirely when no precondition was
+    // supplied, so the two-argument path issues the exact same single statement
+    // it always has.
+    if (precondition) {
+        auto row = get(id); // takes mtx_ itself — must be outside the lock below
+        // A row that cannot transition is reported WITHOUT running the
+        // precondition: the callback may be costly or emit audit, and the CAS
+        // below would decline this row anyway. Same message as the CAS decline,
+        // so the two paths are indistinguishable to the caller (they mean the
+        // same thing).
+        if (!row || row->status != "approved" || row->consumed_at != 0)
+            return std::unexpected(ConsumeError{
+                ConsumeFailure::kNotConsumable,
+                "approval not consumable (already used, not approved, or absent)"});
+        auto ok = precondition(*row);
+        if (!ok) {
+            spdlog::info("ApprovalManager: pre-consume recheck declined ticket {} for {}: {}", id,
+                         consumed_by, ok.error());
+            return std::unexpected(ConsumeError{ConsumeFailure::kPrecondition, ok.error()});
+        }
+    }
 
     std::lock_guard lock(mtx_);
 
@@ -411,7 +452,8 @@ std::expected<void, std::string> ApprovalManager::consume_ticket(const std::stri
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+        return std::unexpected(ConsumeError{ConsumeFailure::kStoreError,
+                                            std::string("prepare failed: ") + sqlite3_errmsg(db_)});
 
     sqlite3_bind_int64(stmt, 1, now_epoch());
     sqlite3_bind_text(stmt, 2, consumed_by.c_str(), -1, SQLITE_TRANSIENT);
@@ -425,8 +467,11 @@ std::expected<void, std::string> ApprovalManager::consume_ticket(const std::stri
         return {};
     }
     if (rc == SQLITE_DONE)
-        return std::unexpected("approval not consumable (already used, not approved, or absent)");
-    return std::unexpected(std::string("consume failed: ") + sqlite3_errmsg(db_));
+        return std::unexpected(
+            ConsumeError{ConsumeFailure::kNotConsumable,
+                         "approval not consumable (already used, not approved, or absent)"});
+    return std::unexpected(ConsumeError{ConsumeFailure::kStoreError,
+                                        std::string("consume failed: ") + sqlite3_errmsg(db_)});
 }
 
 // ---------------------------------------------------------------------------
