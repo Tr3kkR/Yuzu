@@ -3056,7 +3056,7 @@ Returns current configuration values and any active runtime overrides.
 > returned. `PUT /api/config/oidc_client_secret` sets it, and its 200 response omits
 > the value too.
 
-**Response** (shape corrected — the handler returns `config`, `overrides` and
+**Response** (shape corrected - the handler returns `config`, `overrides` and
 `allowed_keys`, not a `data`/`meta` envelope):
 
 ```json

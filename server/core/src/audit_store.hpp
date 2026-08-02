@@ -178,6 +178,25 @@ public:
                                   std::size_t* out_pool_size = nullptr) const;
     std::size_t total_count() const;
 
+    /// The `detail` a reader should see for a row, given its action and target.
+    ///
+    /// A `config.update` on a secret-valued key recorded `value=<the secret>` in
+    /// `detail` before that write path was fixed. Those rows are ALREADY on disk on
+    /// any install that set the secret before upgrading, and fixing the writer does
+    /// nothing for them: the readers serialise `detail` verbatim, so a seeded
+    /// Operator (`AuditLog:Read`) could still read a live credential out of history.
+    ///
+    /// Redaction is applied on READ rather than by rewriting the rows, deliberately.
+    /// An audit row is compliance evidence; editing history to hide a mistake is a
+    /// worse posture than declining to disclose it, and a DELETE/UPDATE sweep over
+    /// audit_events is exactly the kind of thing that must not become routine.
+    /// The plaintext therefore remains at rest (unchanged by this) and stops being
+    /// DISCLOSED. Operators who set the secret pre-upgrade should still rotate it.
+    ///
+    /// Idempotent: rows written after the writer fix already hold the placeholder.
+    static std::string sanitized_detail(const std::string& action, const std::string& target_id,
+                                        const std::string& detail);
+
     /// Cumulative audit-event write counts grouped by `result` value. Exposed for
     /// Prometheus scraping; reset at process start. Lock-free reads.
     uint64_t events_written(const std::string& result) const noexcept;

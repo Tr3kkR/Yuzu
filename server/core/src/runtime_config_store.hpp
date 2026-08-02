@@ -23,7 +23,7 @@ struct RuntimeConfigEntry {
 /// Persistent runtime configuration overrides.
 /// Stores key/value pairs in SQLite that override startup defaults.
 /// Only a fixed set of allowed keys is accepted. One of them
-/// (oidc_client_secret) IS a secret and is stored plaintext today —
+/// (oidc_client_secret) IS a secret and is stored plaintext today -
 /// its envelope encryption lands with the Postgres migration (ADR-0010).
 class RuntimeConfigStore {
 public:
@@ -66,7 +66,7 @@ public:
     static bool is_allowed_key(const std::string& key);
 
     /// True if this key's VALUE is a credential and must never be emitted in
-    /// plaintext — not to a log, not to an API response, not to an audit detail, not
+    /// plaintext - not to a log, not to an API response, not to an audit detail, not
     /// to a config dump. Prefer get_all(), which applies this for you; consult the
     /// predicate directly only where the value does not come from the store (the
     /// PUT handler audits a caller-supplied value, which is the path that leaked

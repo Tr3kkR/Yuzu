@@ -15,7 +15,10 @@
 //
 // The tripwire below is the durable half. A future secret-valued key added to
 // `allowed_keys()` and NOT to the secret list would silently start leaking through
-// exactly the same two paths, and nothing else would notice.
+// FOUR paths - the startup log, the GET /api/config override list, the PUT audit
+// detail and the PUT response echo - and nothing else would notice. (This sentence
+// said "the same two paths" while the fix was mid-flight; the audit detail and the
+// response echo were found afterwards. A count in a comment is a fact that rots.)
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -65,8 +68,13 @@ TEST_CASE("TRIPWIRE: every credential-shaped allowed key is registered as secret
     // `*_password` / `*_token` key added without redaction) and is honest about what
     // it cannot catch -- a credential-valued key with an innocuous name, which needs a
     // human to notice.
+    // NOT "_key" on its own: `dex_cohort_export_key` is an allowed key whose value is
+    // a grouping mode ("model"), so that suffix is genuinely ambiguous here and would
+    // fire on a non-credential. The compound spellings below are not.
     static const std::vector<std::string> kCredentialShapedSuffixes = {
-        "_secret", "_password", "_token", "_key_material", "_credential",
+        "_secret",     "_password",   "_token",      "_key_material", "_credential",
+        "_api_key",    "_access_key", "_secret_key", "_private_key",  "_passphrase",
+        "_client_key", "_signing_key",
     };
 
     for (const auto& key : RuntimeConfigStore::allowed_keys()) {
@@ -124,6 +132,39 @@ TEST_CASE("get_all() redacts secrets; get_all_with_secrets() does not",
         // The named accessor still works, or the startup override pass breaks.
         CHECK(real_secret == "s3cr3t-value");
         CHECK(real_issuer == "https://idp.example.com");
+    }
+    std::error_code ec;
+    std::filesystem::remove(db, ec);
+}
+
+TEST_CASE("an EMPTY secret survives redaction as empty, so is_set can be false",
+          "[runtime_config][secret]") {
+    // GET /api/config reports `is_set` as !value.empty() on the REDACTED entry.
+    // Replacing every secret value -- including "" -- with the non-empty placeholder
+    // made that unconditionally true: no stored secret could report unset. Caught by
+    // review after the redaction landed, which is why it has its own case.
+    auto db = yuzu::test::unique_temp_path("yuzu_test_rtcfg_empty");
+    {
+        RuntimeConfigStore store(db);
+        REQUIRE(store.is_open());
+        REQUIRE(store.set("oidc_client_secret", "", "tester"));
+
+        std::string v;
+        bool found = false;
+        for (const auto& e : store.get_all()) {
+            if (e.key == "oidc_client_secret") { v = e.value; found = true; }
+        }
+        REQUIRE(found);
+        CHECK(v.empty());
+        CHECK(v != RuntimeConfigStore::redacted_placeholder());
+
+        // And a non-empty one still redacts, or the fix for the emptiness case would
+        // have been "stop redacting".
+        REQUIRE(store.set("oidc_client_secret", "real", "tester"));
+        for (const auto& e : store.get_all()) {
+            if (e.key == "oidc_client_secret")
+                CHECK(e.value == RuntimeConfigStore::redacted_placeholder());
+        }
     }
     std::error_code ec;
     std::filesystem::remove(db, ec);

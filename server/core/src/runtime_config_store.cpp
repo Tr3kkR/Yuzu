@@ -110,7 +110,12 @@ void RuntimeConfigStore::create_tables() {
 std::vector<RuntimeConfigEntry> RuntimeConfigStore::get_all() const {
     auto entries = get_all_with_secrets();
     for (auto& e : entries) {
-        if (is_secret_key(e.key))
+        // An EMPTY secret stays empty. There is nothing to protect, and replacing it
+        // with the non-empty placeholder destroys the only signal a caller has for
+        // set-vs-unset: GET /api/config derives `is_set` from !value.empty(), so
+        // blanket replacement made `is_set` unconditionally true and no stored
+        // secret could ever report false.
+        if (is_secret_key(e.key) && !e.value.empty())
             e.value = redacted_placeholder();
     }
     return entries;

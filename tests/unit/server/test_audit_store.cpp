@@ -39,6 +39,74 @@ TEST_CASE("AuditStore: open in-memory", "[audit_store][db]") {
     REQUIRE(store.is_open());
 }
 
+TEST_CASE("AuditStore: a pre-existing config.update secret detail is redacted on READ",
+          "[audit_store][secret]") {
+    // The writer-side fix is prospective only. A row written BEFORE it holds the
+    // plaintext and is served verbatim by all three readers (REST v1, legacy REST,
+    // MCP), so an install that set the secret pre-upgrade and did not rotate still
+    // discloses a live credential to any AuditLog:Read holder -- seeded Operator
+    // among them. `log()` plants the row exactly as the old writer would have; the
+    // assertion is on what `query()` hands back.
+    AuditStore store(":memory:");
+
+    AuditEvent legacy;
+    legacy.principal = "admin";
+    legacy.action = "config.update";
+    legacy.target_type = "RuntimeConfig";
+    legacy.target_id = "oidc_client_secret";
+    legacy.detail = "value=s3cr3t-from-before-the-fix";
+    legacy.result = "success";
+    CHECK(store.log(legacy));
+
+    // A non-secret key on the SAME action keeps its detail: the redaction must not
+    // cost the evidence value of ordinary config auditing.
+    AuditEvent ordinary;
+    ordinary.principal = "admin";
+    ordinary.action = "config.update";
+    ordinary.target_type = "RuntimeConfig";
+    ordinary.target_id = "log_level";
+    ordinary.detail = "value=debug";
+    ordinary.result = "success";
+    CHECK(store.log(ordinary));
+
+    // A DIFFERENT action naming a secret-shaped target is untouched -- the rule is
+    // deliberately the (action, key) PAIR, not "anything mentioning a secret".
+    AuditEvent other;
+    other.principal = "admin";
+    other.action = "oidc.configure";
+    other.target_type = "OidcConfig";
+    other.target_id = "oidc_client_secret";
+    other.detail = "issuer=https://idp.example.com";
+    other.result = "success";
+    CHECK(store.log(other));
+
+    std::string secret_detail, ordinary_detail, other_detail;
+    for (const auto& e : store.query()) {
+        if (e.action == "config.update" && e.target_id == "oidc_client_secret")
+            secret_detail = e.detail;
+        if (e.target_id == "log_level")
+            ordinary_detail = e.detail;
+        if (e.action == "oidc.configure")
+            other_detail = e.detail;
+    }
+
+    CHECK(secret_detail.find("s3cr3t-from-before-the-fix") == std::string::npos);
+    CHECK(secret_detail == "value=<redacted>");
+    CHECK(ordinary_detail == "value=debug");
+    CHECK(other_detail == "issuer=https://idp.example.com");
+}
+
+TEST_CASE("AuditStore::sanitized_detail is idempotent and leaves an empty detail alone",
+          "[audit_store][secret]") {
+    // Rows written after the writer fix already hold the placeholder; applying the
+    // read-time rule again must not double-wrap or invent content.
+    CHECK(AuditStore::sanitized_detail("config.update", "oidc_client_secret",
+                                       "value=<redacted>") == "value=<redacted>");
+    CHECK(AuditStore::sanitized_detail("config.update", "oidc_client_secret", "").empty());
+    CHECK(AuditStore::sanitized_detail("config.update", "oidc_issuer", "value=https://idp") ==
+          "value=https://idp");
+}
+
 TEST_CASE("AuditStore: log and retrieve", "[audit_store]") {
     AuditStore store(":memory:");
 
