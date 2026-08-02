@@ -9,6 +9,7 @@ enum class ContractErrorCode : std::uint8_t {
     MalformedJson,
     RootNotObject,
     MissingField,
+    NullField,
     WrongType,
     InvalidValue,
     UnsupportedVersion,

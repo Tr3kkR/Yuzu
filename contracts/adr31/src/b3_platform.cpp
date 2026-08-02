@@ -20,12 +20,17 @@ ContractError error(ContractErrorCode code, std::string path, std::string messag
 }
 
 std::expected<std::string, ContractError> required_string(const nlohmann::json& object,
-                                                          std::string_view name) {
+                                                          std::string_view name,
+                                                          std::string_view parent_path = {}) {
     const auto it = object.find(name);
-    const auto path = "/" + std::string{name};
+    const auto path = std::string{parent_path} + "/" + std::string{name};
     if (it == object.end()) {
         return std::unexpected(error(ContractErrorCode::MissingField, path,
                                      std::string{name} + " is required"));
+    }
+    if (it->is_null()) {
+        return std::unexpected(
+            error(ContractErrorCode::NullField, path, std::string{name} + " must not be null"));
     }
     if (!it->is_string()) {
         return std::unexpected(
@@ -47,6 +52,10 @@ std::expected<std::uint16_t, ContractError> version_part(const nlohmann::json& o
         return std::unexpected(error(ContractErrorCode::MissingField, path,
                                      std::string{name} + " is required"));
     }
+    if (it->is_null()) {
+        return std::unexpected(
+            error(ContractErrorCode::NullField, path, std::string{name} + " must not be null"));
+    }
     if (!it->is_number_unsigned()) {
         return std::unexpected(error(ContractErrorCode::WrongType, path,
                                      std::string{name} + " must be an unsigned integer"));
@@ -66,12 +75,16 @@ decode_contract_header(const nlohmann::json& root) {
         return std::unexpected(
             error(ContractErrorCode::MissingField, "/contract", "contract is required"));
     }
+    if (contract_it->is_null()) {
+        return std::unexpected(
+            error(ContractErrorCode::NullField, "/contract", "contract must not be null"));
+    }
     if (!contract_it->is_object()) {
         return std::unexpected(
             error(ContractErrorCode::WrongType, "/contract", "contract must be an object"));
     }
 
-    const auto id = required_string(*contract_it, "id");
+    const auto id = required_string(*contract_it, "id", "/contract");
     if (!id) return std::unexpected(id.error());
     if (*id != kB3PlatformRequest.identifier) {
         return std::unexpected(error(ContractErrorCode::InvalidValue, "/contract/id",
@@ -82,6 +95,10 @@ decode_contract_header(const nlohmann::json& root) {
     if (version_it == contract_it->end()) {
         return std::unexpected(error(ContractErrorCode::MissingField, "/contract/version",
                                      "version is required"));
+    }
+    if (version_it->is_null()) {
+        return std::unexpected(error(ContractErrorCode::NullField, "/contract/version",
+                                     "version must not be null"));
     }
     if (!version_it->is_object()) {
         return std::unexpected(error(ContractErrorCode::WrongType, "/contract/version",
@@ -173,6 +190,10 @@ decode_b3_platform_request(std::string_view wire_json) {
     if (scope_it == root.end()) {
         return std::unexpected(
             error(ContractErrorCode::MissingField, "/scope", "scope is required"));
+    }
+    if (scope_it->is_null()) {
+        return std::unexpected(
+            error(ContractErrorCode::NullField, "/scope", "scope must not be null"));
     }
     if (!scope_it->is_object()) {
         return std::unexpected(
