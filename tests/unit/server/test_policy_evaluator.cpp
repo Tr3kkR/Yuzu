@@ -12,6 +12,7 @@
 
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
+#include "test_mgmt_group_pg_helper.hpp"
 #include "policy_evaluator.hpp"
 #include "policy_store.hpp"
 #include "response_store.hpp"
@@ -50,7 +51,8 @@ struct Harness {
     PolicyStore ps{poldb.path};
     InstructionStore is{insdb.path};
     ResponseStore rs{resdb.path};
-    ManagementGroupStore mg{mgdb.path};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
 
     int64_t fake_now{1000};
     int dispatch_calls{0};
@@ -154,7 +156,7 @@ struct Harness {
 } // namespace
 
 TEST_CASE("policy evaluator: compliant + non_compliant verdicts (multi-agent fan-out)",
-          "[policy][evaluator]") {
+          "[pg][policy][evaluator]") {
     Harness h;
     h.canned["agentA|checkp"] = {1, out_json("hostname", "yuzu-a")};
     h.canned["agentB|checkp"] = {1, out_json("hostname", "")};
@@ -170,7 +172,7 @@ TEST_CASE("policy evaluator: compliant + non_compliant verdicts (multi-agent fan
 }
 
 TEST_CASE("policy evaluator: non-responder -> unknown, plugin failure -> error",
-          "[policy][evaluator]") {
+          "[pg][policy][evaluator]") {
     Harness h;
     h.canned["agentA|checkp"] = {2, ""}; // FAILURE status -> error
     // agentB intentionally absent -> non-responder -> unknown
@@ -186,7 +188,7 @@ TEST_CASE("policy evaluator: non-responder -> unknown, plugin failure -> error",
 }
 
 TEST_CASE("policy evaluator: missing CEL field resolves empty -> non_compliant",
-          "[policy][evaluator]") {
+          "[pg][policy][evaluator]") {
     Harness h;
     // Success status, but the result has no 'hostname' column the CEL references.
     // CEL resolves a missing result field to "" (not an error), so
@@ -203,7 +205,7 @@ TEST_CASE("policy evaluator: missing CEL field resolves empty -> non_compliant",
     CHECK(h.status_of(pid, "agentA") == "non_compliant");
 }
 
-TEST_CASE("policy evaluator: CEL evaluation error -> error", "[policy][evaluator]") {
+TEST_CASE("policy evaluator: CEL evaluation error -> error", "[pg][policy][evaluator]") {
     Harness h;
     // Division by zero yields a top-level CEL evaluation error (monostate ->
     // eval_error), which the evaluator must surface as status "error", distinct
@@ -221,7 +223,7 @@ TEST_CASE("policy evaluator: CEL evaluation error -> error", "[policy][evaluator
     CHECK(h.status_of(pid, "agentA") == "error");
 }
 
-TEST_CASE("policy evaluator: interval throttles re-dispatch", "[policy][evaluator]") {
+TEST_CASE("policy evaluator: interval throttles re-dispatch", "[pg][policy][evaluator]") {
     Harness h;
     h.canned["agentA|checkp"] = {1, out_json("hostname", "a")};
     h.canned["agentB|checkp"] = {1, out_json("hostname", "b")};
@@ -241,7 +243,7 @@ TEST_CASE("policy evaluator: interval throttles re-dispatch", "[policy][evaluato
 }
 
 TEST_CASE("policy evaluator: empty compliance CEL -> error (no false compliant)",
-          "[policy][evaluator]") {
+          "[pg][policy][evaluator]") {
     Harness h;
     // A successful check whose fragment defines an EMPTY check_compliance. The CEL
     // layer treats empty as always-compliant; the evaluator must NOT report this
@@ -258,7 +260,7 @@ TEST_CASE("policy evaluator: empty compliance CEL -> error (no false compliant)"
 }
 
 TEST_CASE("policy evaluator: remediation attempt cap -> error after 3 fixing transitions",
-          "[policy][evaluator]") {
+          "[pg][policy][evaluator]") {
     Harness h;
     h.canned["agentA|checkp"] = {1, out_json("hostname", "")}; // non_compliant
     auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
@@ -282,7 +284,7 @@ TEST_CASE("policy evaluator: remediation attempt cap -> error after 3 fixing tra
     CHECK(h.status_of(pid, "agentA") == "error");
 }
 
-TEST_CASE("policy evaluator: verify dispatch failure -> error", "[policy][evaluator]") {
+TEST_CASE("policy evaluator: verify dispatch failure -> error", "[pg][policy][evaluator]") {
     Harness h;
     h.canned["agentA|checkp"] = {1, out_json("hostname", "")}; // non_compliant
     h.canned["agentA|fixp"] = {1, "ok"};
@@ -308,7 +310,7 @@ TEST_CASE("policy evaluator: verify dispatch failure -> error", "[policy][evalua
 }
 
 TEST_CASE("policy evaluator: manual remediation fix -> verify -> compliant",
-          "[policy][evaluator]") {
+          "[pg][policy][evaluator]") {
     Harness h;
     h.canned["agentA|checkp"] = {1, out_json("hostname", "")}; // non_compliant first
     auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
@@ -336,7 +338,7 @@ TEST_CASE("policy evaluator: manual remediation fix -> verify -> compliant",
 }
 
 TEST_CASE("policy evaluator: remediation rejected when no fix_instruction",
-          "[policy][evaluator]") {
+          "[pg][policy][evaluator]") {
     Harness h;
     h.canned["agentA|checkp"] = {1, out_json("hostname", "")};
     auto pid = h.author("result.hostname != ''", /*with_fix=*/false);
