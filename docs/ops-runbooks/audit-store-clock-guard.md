@@ -34,14 +34,17 @@ log line (step 3 below); it names its own trigger.
 operational fault drains roughly 600k rows/day. The alert is the control. The
 guard is the seatbelt.
 
-**Known gap (#2579), and it is the one this page cannot alert you to.** A pass
-that begins with no readable stored reading has no missing-anchor trigger, so on
-a host whose clock is ALREADY skewed forward it deletes without declining - and
-keeps doing so on every later pass while the skew persists, because there is then
-no step to detect and no wipe to declare. The 600k rows/day figure above IS that
-case. It reaches this page's alerts only when the backlog binds the cap
-(`YuzuAuditRetentionCapBinding`); a sub-cap pass moves no counter here at all and
-looks exactly like routine expiry. Bound, signals and the retrospective check:
+**Known gap (#2579), and this page alerts on it late at best.** A pass that
+begins with NO stored reading has no missing-anchor trigger, so on a host whose
+clock is ALREADY skewed forward it deletes without declining, and keeps doing so
+while the skew persists. The 600k rows/day figure above is one such case. It
+reaches the alerts on this page only once a backlog binds the cap
+(`YuzuAuditRetentionCapBinding`, and only after six such passes - roughly 150,000
+rows); a sub-cap pass never fires anything here, and looks exactly like routine
+expiry. `yuzu_server_audit_rows_deleted_total` does move throughout, so it is
+evidence, but on its own it does not distinguish this from healthy expiry. There
+is no reliable retrospective test today - read the Limits note before improvising
+one. Per this page's own rule the decision rule is not restated here:
 [Limits](../user-manual/audit-log.md#the-retention-clock-guard).
 
 ## YuzuAuditPersistFailures - audit WRITES are failing

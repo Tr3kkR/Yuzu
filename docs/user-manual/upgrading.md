@@ -550,14 +550,15 @@ Before upgrading any component:
   - `yuzu-server.cfg`, `enrollment-tokens.cfg`, `pending-agents.cfg`
   - All `.db` files (response store, audit, policies, **auth.db**, etc.) — use `sqlite3 <path> ".backup ..."` rather than `cp` against live WAL databases
   - The **PostgreSQL database**, once your deployment carries one (ADR-0006 — bundled in the composes; provisioned natively by `install-server-postgres.sh`) — use `pg_dump --format=custom`; see [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate) for the full backup/restore procedure and the ADR-0010 restore-pairing invariant (DB and `KeyProvider` keys-dir backups restore **together**)
-- [ ] **Verify the server's clock is correct before upgrading** (`timedatectl
-  status` or `chronyc tracking`; under Docker it is the host's clock that
-  matters). A server whose clock is already skewed FORWARD can delete audit rows
-  on its first retention pass after the upgrade without recording a decline, and
-  keeps doing so while the skew persists - see [Retention clock
+- [ ] **Correct the server's clock before upgrading** (`timedatectl status` or
+  `chronyc tracking`; under Docker it is the host's clock that matters). A
+  forward-skewed clock can delete audit rows on the first retention pass after the
+  upgrade with no decline recorded, and keeps doing so while the skew persists -
+  see [Retention clock
   guards](#retention-clock-guards-2360-server-audit-store-2361-tar-agent-warehouse)
-  below and #2579. If you cannot verify it, take the `audit.db` backup above
-  first, and correct the clock BEFORE restoring that backup.
+  below and #2579. If you cannot establish that the clock is right, defer the
+  upgrade: there is no reaper kill switch, and no retention setting protects rows
+  that are already stamped.
 - [ ] Check the [CHANGELOG](../../CHANGELOG.md) for breaking changes
 - [ ] Verify disk space (at least 500 MB free for migration)
 - [ ] Note current version: `yuzu-server --version` / `yuzu-agent --version`
@@ -908,34 +909,20 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
 - **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
   table holding the durable clock reading - one row, instant) plus the
   best-effort index build described under Schema Migrations above.
-- **Verify time sync BEFORE upgrading a server whose clock may be wrong.** The
-  stored clock reading (the anchor) is new in schema v3, so every database has
-  none on its first guarded pass. An absent reading is not itself a decline
-  trigger: it is the ordinary fresh-install case. That leaves one shape unguarded
-  - a host whose clock is ALREADY skewed forward, where rows written after the
+- **Correct the clock BEFORE upgrading a server whose time may be wrong (#2579).**
+  The stored clock reading (the anchor) is new in schema v3, so every database
+  starts its first guarded pass without one. An ABSENT reading is not itself a
+  decline trigger - it is the ordinary fresh-install case - and that leaves one
+  shape unguarded: a host already skewed FORWARD, where rows written after the
   skew are still inside the retention window, so the would-expire-everything test
-  does not fire either. Such a pass deletes up to the 25,000-row cap.
-  **The exposure is not limited to that one pass.** While the clock stays skewed,
-  each later pass sees only a tick's worth of elapsed time (nothing to detect as a
-  step) and the same post-skew survivors (nothing to declare a wipe), so it drains
-  another capped batch - roughly 600k rows/day at the default hourly cadence -
-  until the backlog is gone. The same state recurs outside the upgrade: after a
-  failed anchor persist plus a restart, or after restoring a pre-v3 snapshot.
-  **What you do and do not see:** never a decline and never a
-  `yuzu_server_audit_clock_anomaly_skips_total` increment; always a routine
-  `AuditStore: expired N rows` info line and a rising
-  `yuzu_server_audit_rows_deleted_total`. A backlog large enough to bind the cap
-  also raises `yuzu_server_audit_retention_cap_reached_total` and will fire
-  `YuzuAuditRetentionCapBinding` once six passes inside six hours have bound the
-  cap, if you have wired the shipped rules; a sub-cap pass raises neither and
-  nothing detects it.
-  If you cannot verify the clock, back up `audit.db` first using the
-  `sqlite3 ".backup"` method in the [Pre-Upgrade
-  Checklist](#pre-upgrade-checklist) (a live `cp`/`tar` of a WAL-mode database can
-  be torn), and **correct the clock before restoring** such a backup - restoring
-  it under the same skew re-enters the window. Detection after the fact:
+  does not fire either. Such a pass deletes up to the 25,000-row cap without
+  declining, and **the exposure is not limited to that one pass** - it persists
+  while the skew does. If you cannot establish that the clock is right, defer the
+  upgrade: there is no reaper kill switch, no retention setting protects rows
+  already stamped, and there is no reliable way to detect the loss afterwards.
+  The bound, the full signal set, and why no retrospective test is offered:
   [audit-log.md § The retention clock
-  guard](audit-log.md#the-retention-clock-guard). Tracked in #2579.
+  guard](audit-log.md#the-retention-clock-guard).
 - **Expect a first-pass retention decline on the AGENT, and only conditionally on
   the server.** The two guards differ here and the difference matters:
   - **TAR declines on a missing anchor, by design.** It checks per warehouse
