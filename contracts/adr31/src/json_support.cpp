@@ -5,8 +5,10 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <set>
 #include <string>
@@ -238,6 +240,11 @@ encode_contract_json(const nlohmann::json& document) {
             return std::unexpected(error(ContractErrorCode::InvalidValue, "",
                                          "contract contains a non-JSON value"));
         }
+        if (value->is_number_float() &&
+            !std::isfinite(value->get<nlohmann::json::number_float_t>())) {
+            return std::unexpected(error(ContractErrorCode::InvalidValue, "",
+                                         "contract contains a non-finite number"));
+        }
         if (!value->is_structured()) continue;
         if (depth > kMaxContractNestingDepth) {
             return std::unexpected(error(ContractErrorCode::TooDeep, "",
@@ -270,7 +277,7 @@ reject_forbidden_authority_fields(const nlohmann::json& root) {
             if (normalised == forbidden) {
                 return std::unexpected(ContractError{
                     ContractErrorCode::ForbiddenAuthorityField,
-                    "/" + std::string{forbidden},
+                    "/" + escape_json_pointer(it.key()),
                     "caller-authored identity or authentication context is forbidden",
                 });
             }

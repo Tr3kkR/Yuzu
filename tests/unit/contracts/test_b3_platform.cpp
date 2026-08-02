@@ -6,6 +6,7 @@
 
 #include <array>
 #include <expected>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -80,6 +81,7 @@ TEST_CASE("ADR-0031 B3 rejects caller-authored authority context",
         CAPTURE(field);
         REQUIRE_FALSE(decoded.has_value());
         CHECK(decoded.error().code == contracts::ContractErrorCode::ForbiddenAuthorityField);
+        CHECK(decoded.error().path == "/" + std::string{field});
     }
 }
 
@@ -202,6 +204,20 @@ TEST_CASE("ADR-0031 B3 encoder owns validation failures", "[adr31][contract][b3]
         const auto encoded = contracts::encode_b3_platform_request(request);
         REQUIRE_FALSE(encoded.has_value());
         CHECK(encoded.error().code == contracts::ContractErrorCode::TooDeep);
+    }
+
+    SECTION("non-finite numbers") {
+        constexpr std::array invalid_numbers{
+            std::numeric_limits<double>::quiet_NaN(),
+            std::numeric_limits<double>::infinity(),
+            -std::numeric_limits<double>::infinity(),
+        };
+        for (const auto invalid : invalid_numbers) {
+            request.scope["invalid"] = invalid;
+            const auto encoded = contracts::encode_b3_platform_request(request);
+            REQUIRE_FALSE(encoded.has_value());
+            CHECK(encoded.error().code == contracts::ContractErrorCode::InvalidValue);
+        }
     }
 }
 
