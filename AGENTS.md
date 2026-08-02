@@ -109,7 +109,7 @@ docs/             Architecture docs, conventions, roadmap, capability map
 
 `proto/meson.build` invokes `proto/gen_proto.py`, which runs `protoc` and rewrites `#include` paths to flatten subdirectory prefixes — generated headers ship as `"common.pb.h"` rather than `"yuzu/common/v1/common.pb.h"`; the result is the `yuzu_proto` static library, exposed via `yuzu_proto_dep` (owned by `build-ci`).
 
-Domain docs: `CONTEXT.md` at the repo root, ADRs under `docs/adr/` (see `docs/agents/domain.md`).
+Domain docs: `CONTEXT.md` at the repo root, ADRs under `docs/adr/` (see `docs/agents/domain.md`). **Numbering a new ADR:** the number space is author-namespaced — `0xxx` platform · `1xxx` Dave Rae · `2xxx` Fraser Jarvis · `3xxx` Alex Young · `4xxx` Andy Younie. Take the next free number **in your own block**, not the next free number overall. Two numbers currently host two accepted ADRs each (`0016`, `0031`), so cite those by filename rather than number. Full convention + collision table: `docs/adr/README.md`.
 
 ## Workflows
 
