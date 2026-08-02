@@ -3040,7 +3040,10 @@ Per-policy compliance detail with per-agent statuses.
 
 ### Runtime Configuration
 
-Runtime configuration endpoints allow reading and updating server settings without a restart. Only a predefined set of keys can be changed at runtime.
+Runtime configuration endpoints read and update a predefined set of server settings. Every accepted
+write is persisted immediately; **whether it also takes effect immediately depends on the key** - see
+[When a change takes effect](#when-a-change-takes-effect). In particular, writing an OIDC key through
+this API does **not** re-initialise the running OIDC provider.
 
 #### `GET /api/config`
 
@@ -3070,6 +3073,10 @@ Returns current configuration values and any active runtime overrides.
 }
 ```
 
+`allowed_keys` above is abridged for readability; the real response lists every key in the
+[allowed-keys table](#put-apiconfigkey). `config` reports effective values and `overrides` only the
+keys with a stored override, so a key can appear in `config` without appearing in `overrides`.
+
 ---
 
 #### `PUT /api/config/:key`
@@ -3078,15 +3085,51 @@ Update a single runtime configuration value. The key must be one of the allowed 
 
 **Permission:** `Infrastructure:Write`
 
-**Allowed keys:**
+**Allowed keys** (the full set; source of truth is `kAllowedKeys` in
+`server/core/src/runtime_config_store.cpp`):
 
-| Key | Type | Description |
-|---|---|---|
-| `heartbeat_timeout` | integer | Seconds before an agent is considered offline |
-| `response_retention_days` | integer | Days to retain command response data |
-| `audit_retention_days` | integer | Days to retain audit log entries |
-| `auto_approve_enabled` | boolean | Whether auto-approve rules are active |
-| `log_level` | string | Server log verbosity (`trace`, `debug`, `info`, `warn`, `error`) |
+| Key | Type | Takes effect | Description |
+|---|---|---|---|
+| `heartbeat_timeout` | integer | immediately | Seconds before an agent is considered offline |
+| `response_retention_days` | integer | immediately | Days to retain command response data |
+| `audit_retention_days` | integer | immediately | Days to retain audit log entries |
+| `guardian_event_retention_days` | integer | immediately | Days to retain guaranteed-state events |
+| `log_level` | string | immediately | Server log verbosity (`trace`, `debug`, `info`, `warn`, `error`) |
+| `auto_approve_enabled` | boolean | **never - see note** | Accepted and stored, but no consumer reads it back |
+| `plugin_signing_required` | boolean | on next check | Whether plugins must be signed |
+| `oidc_issuer` | string | **see note** | OIDC issuer URL |
+| `oidc_client_id` | string | **see note** | OIDC client ID |
+| `oidc_client_secret` | string | **see note** | OIDC client secret (write-only through this API) |
+| `oidc_redirect_uri` | string | **see note** | OIDC redirect URI |
+| `oidc_admin_group` | string | **see note** | OIDC admin group ID |
+| `oidc_skip_tls_verify` | boolean | **see note** | Skip TLS verification to the IdP (test only) |
+| `dex_alert_routing` | string (JSON array) | on next use | Routed DEX observation types |
+| `dex_blast_min_devices` | integer | on next use | Blast-radius alert threshold (clamped on apply) |
+| `dex_blast_window_seconds` | integer | on next use | Blast-radius window |
+| `dex_blast_cooldown_seconds` | integer | on next use | Blast-radius cooldown |
+| `dex_cohort_export_key` | string | on next gauge sweep | Cohort export tag key; `""` disables export |
+
+##### When a change takes effect
+
+Persisting a value and applying it are separate steps, and this endpoint only does the first for
+most keys:
+
+- **immediately** - the handler assigns the new value into the live server config
+  (`heartbeat_timeout`, `response_retention_days`, `audit_retention_days`,
+  `guardian_event_retention_days`), or `RuntimeConfigStore::set()` applies it directly (`log_level`,
+  which calls `spdlog::set_level`).
+- **on next use / on next gauge sweep** - nothing is assigned, but the consumer reads the store each
+  time it needs the value, so the next read observes the change.
+- **never** - `auto_approve_enabled` is accepted by the allow-list and written to the store, but no
+  code reads it back from there. `GET /api/config` reports `auto_approve_enabled` **derived from
+  whether any auto-approve rule exists**, not from the stored value, so a `PUT` of this key can
+  appear to have no effect - because it has none. Manage auto-approve through its own rules API.
+- **OIDC keys (see note)** - persisted only. **The running `OidcProvider` is not rebuilt**, so
+  logins continue to use the previously loaded settings until the server restarts. To change OIDC
+  configuration and have it take effect at once, use the Settings UI (`POST /api/settings/oidc`),
+  which constructs a new provider and swaps it in. This matters most for a credential rotation: a
+  `PUT` of `oidc_client_secret` returns `"applied": true` meaning *persisted and accepted*, not
+  *now in use by the live provider*.
 
 **Request body:**
 
@@ -3096,20 +3139,32 @@ Update a single runtime configuration value. The key must be one of the allowed 
 }
 ```
 
-**Response:**
+**Response** (flat, not a `data`/`meta` envelope). `applied` means *persisted and accepted* - see
+[When a change takes effect](#when-a-change-takes-effect) for whether the running server is using it
+yet:
 
 ```json
-{
-  "data": { "updated": true, "key": "heartbeat_timeout", "value": 180 },
-  "meta": { "api_version": "v1" }
-}
+{ "key": "heartbeat_timeout", "value": 180, "applied": true }
 ```
 
-**Error (400) -- invalid key:**
+For a secret-valued key the response **omits `value`**, for the same reason `GET /api/config` does:
+
+```json
+{ "key": "oidc_client_secret", "applied": true }
+```
+
+**Error (400) - key not configurable.** Note this route emits two different error shapes; this one
+is a bare `error` string with no envelope:
+
+```json
+{ "error": "key 'foo' is not a configurable runtime setting" }
+```
+
+**Error (400) - bad value for an integer key**, which uses the A4 envelope:
 
 ```json
 {
-  "error": "unknown config key 'foo'; allowed: heartbeat_timeout, response_retention_days, audit_retention_days, auto_approve_enabled, log_level",
+  "error": { "code": 400, "message": "value must be a non-negative integer" },
   "meta": { "api_version": "v1" }
 }
 ```
