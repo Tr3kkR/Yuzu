@@ -34,6 +34,16 @@ log line (step 3 below); it names its own trigger.
 operational fault drains roughly 600k rows/day. The alert is the control. The
 guard is the seatbelt.
 
+**Known gap (#2579), and it is the one this page cannot alert you to.** A pass
+that begins with no readable stored reading has no missing-anchor trigger, so on
+a host whose clock is ALREADY skewed forward it deletes without declining - and
+keeps doing so on every later pass while the skew persists, because there is then
+no step to detect and no wipe to declare. The 600k rows/day figure above IS that
+case. It reaches this page's alerts only when the backlog binds the cap
+(`YuzuAuditRetentionCapBinding`); a sub-cap pass moves no counter here at all and
+looks exactly like routine expiry. Bound, signals and the retrospective check:
+[Limits](../user-manual/audit-log.md#the-retention-clock-guard).
+
 ## YuzuAuditPersistFailures - audit WRITES are failing
 
 Not a retention problem, and much louder than one:
