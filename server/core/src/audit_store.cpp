@@ -438,9 +438,9 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_
         e.target_type = col_text(5);
         e.target_id = col_text(6);
         // Sanitised at the single point where a stored row becomes a value a caller
-        // can hold, so every reader (REST v1, legacy REST, MCP) is covered by
+        // can hold, so every reader is covered by
         // construction rather than by three of them remembering to call it.
-        e.detail = sanitized_detail(e.action, e.target_id, col_text(7));
+        e.detail = sanitized_detail(e.target_type, e.target_id, col_text(7));
         e.source_ip = col_text(8);
         e.user_agent = col_text(9);
         e.session_id = col_text(10);
@@ -467,17 +467,27 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_
     return results;
 }
 
-std::string AuditStore::sanitized_detail(const std::string& action, const std::string& target_id,
+std::string AuditStore::sanitized_detail(const std::string& target_type,
+                                         const std::string& target_id,
                                          const std::string& detail) {
-    // Narrow by construction: ONLY the config.update/secret-key pair is rewritten.
-    // A blanket "redact anything that looks secret" over every audit detail would
-    // silently gut the evidence value of the log, which is the thing this store
-    // exists to provide.
-    if (action != "config.update" || !RuntimeConfigStore::is_secret_key(target_id))
+    // Keyed on the TARGET (a runtime-config row naming a secret key), not on one
+    // writer's action string. `config.update` is the only such writer today, but
+    // keying on it would leave a future writer -- a settings handler recording the
+    // same key under its own verb -- outside the rule, and nothing would fail.
+    // Still narrow: a blanket "redact anything that looks secret" across every audit
+    // detail would gut the evidence value of the log, which is what this store is for.
+    if (target_type != "RuntimeConfig" || !RuntimeConfigStore::is_secret_key(target_id))
         return detail;
     if (detail.empty())
         return detail;
-    return "value=" + std::string(RuntimeConfigStore::redacted_placeholder());
+
+    // Replace only the `value=` segment, so a row that also records WHY the change
+    // was made keeps that context. If there is no such segment we cannot tell which
+    // part is the credential, so the whole detail goes -- fail safe, not fail open.
+    const auto pos = detail.find("value=");
+    if (pos == std::string::npos)
+        return std::string(RuntimeConfigStore::redacted_placeholder());
+    return detail.substr(0, pos) + "value=" + RuntimeConfigStore::redacted_placeholder();
 }
 
 std::size_t AuditStore::total_count() const {

@@ -42,8 +42,9 @@ TEST_CASE("AuditStore: open in-memory", "[audit_store][db]") {
 TEST_CASE("AuditStore: a pre-existing config.update secret detail is redacted on READ",
           "[audit_store][secret]") {
     // The writer-side fix is prospective only. A row written BEFORE it holds the
-    // plaintext and is served verbatim by all three readers (REST v1, legacy REST,
-    // MCP), so an install that set the secret pre-upgrade and did not rotate still
+    // plaintext and is served verbatim by every reader (six query() call sites across
+    // REST v1, the legacy REST route, MCP and Settings), so an install that set the
+    // secret pre-upgrade and did not rotate still
     // discloses a live credential to any AuditLog:Read holder -- seeded Operator
     // among them. `log()` plants the row exactly as the old writer would have; the
     // assertion is on what `query()` hands back.
@@ -69,8 +70,10 @@ TEST_CASE("AuditStore: a pre-existing config.update secret detail is redacted on
     ordinary.result = "success";
     CHECK(store.log(ordinary));
 
-    // A DIFFERENT action naming a secret-shaped target is untouched -- the rule is
-    // deliberately the (action, key) PAIR, not "anything mentioning a secret".
+    // A row on a DIFFERENT target type is untouched: the rule is the (RuntimeConfig,
+    // secret key) pair, not "anything mentioning a secret". oidc.configure records
+    // the issuer as its target and carries no value, so redacting it would cost
+    // evidence for nothing.
     AuditEvent other;
     other.principal = "admin";
     other.action = "oidc.configure";
@@ -79,6 +82,19 @@ TEST_CASE("AuditStore: a pre-existing config.update secret detail is redacted on
     other.detail = "issuer=https://idp.example.com";
     other.result = "success";
     CHECK(store.log(other));
+
+    // A DIFFERENT WRITER recording the same key under its own verb IS covered --
+    // this is why the predicate keys on target_type, not on the action string. An
+    // earlier revision keyed on action == "config.update" and would have served this
+    // row's plaintext, with a green test pinning that gap shut.
+    AuditEvent future_writer;
+    future_writer.principal = "admin";
+    future_writer.action = "settings.oidc.secret_rotated";
+    future_writer.target_type = "RuntimeConfig";
+    future_writer.target_id = "oidc_client_secret";
+    future_writer.detail = "reason=rotation value=another-secret";
+    future_writer.result = "success";
+    CHECK(store.log(future_writer));
 
     std::string secret_detail, ordinary_detail, other_detail;
     for (const auto& e : store.query()) {
@@ -90,21 +106,35 @@ TEST_CASE("AuditStore: a pre-existing config.update secret detail is redacted on
             other_detail = e.detail;
     }
 
+    std::string future_detail;
+    for (const auto& e : store.query()) {
+        if (e.action == "settings.oidc.secret_rotated")
+            future_detail = e.detail;
+    }
+
     CHECK(secret_detail.find("s3cr3t-from-before-the-fix") == std::string::npos);
     CHECK(secret_detail == "value=<redacted>");
     CHECK(ordinary_detail == "value=debug");
     CHECK(other_detail == "issuer=https://idp.example.com");
+    // Covered by target_type, and the non-secret context survives: only the value=
+    // segment is replaced, so "why" is still readable as evidence.
+    CHECK(future_detail.find("another-secret") == std::string::npos);
+    CHECK(future_detail == "reason=rotation value=<redacted>");
 }
 
 TEST_CASE("AuditStore::sanitized_detail is idempotent and leaves an empty detail alone",
           "[audit_store][secret]") {
     // Rows written after the writer fix already hold the placeholder; applying the
     // read-time rule again must not double-wrap or invent content.
-    CHECK(AuditStore::sanitized_detail("config.update", "oidc_client_secret",
+    CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_client_secret",
                                        "value=<redacted>") == "value=<redacted>");
-    CHECK(AuditStore::sanitized_detail("config.update", "oidc_client_secret", "").empty());
-    CHECK(AuditStore::sanitized_detail("config.update", "oidc_issuer", "value=https://idp") ==
+    CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_client_secret", "").empty());
+    CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_issuer", "value=https://idp") ==
           "value=https://idp");
+    // No `value=` segment: we cannot tell which part is the credential, so the whole
+    // detail goes. Fail safe, not fail open.
+    CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_client_secret", "raw-leak") ==
+          "<redacted>");
 }
 
 TEST_CASE("AuditStore: log and retrieve", "[audit_store]") {

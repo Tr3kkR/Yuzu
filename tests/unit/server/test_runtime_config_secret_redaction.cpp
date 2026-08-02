@@ -169,3 +169,83 @@ TEST_CASE("an EMPTY secret survives redaction as empty, so is_set can be false",
     std::error_code ec;
     std::filesystem::remove(db, ec);
 }
+
+TEST_CASE("build_overrides_json omits a secret's value and reports is_set",
+          "[runtime_config][secret]") {
+    // Covers the GET /api/config shape directly. That route lives in server.cpp and is
+    // not TestRouteSink-registered, so before this was extracted the omission rule -
+    // one of the three sites the secret leaked from - had no test at all, and the
+    // suite was green through two rounds of getting it wrong.
+    std::vector<yuzu::server::RuntimeConfigEntry> entries = {
+        {"oidc_client_secret", RuntimeConfigStore::redacted_placeholder(), "admin", 1754150400},
+        {"oidc_issuer", "https://idp.example.com", "admin", 1754150401},
+    };
+
+    const auto j = RuntimeConfigStore::build_overrides_json(entries);
+
+    // The secret carries NO value field at all - not the real one, and not the
+    // placeholder either, because the placeholder is a legal value a round-tripping
+    // client would write back as the credential.
+    REQUIRE(j.contains("oidc_client_secret"));
+    const auto& sec = j.at("oidc_client_secret");
+    CHECK_FALSE(sec.contains("value"));
+    CHECK(sec.at("is_set").get<bool>());
+    // Attribution survives: an operator still sees THAT it is set and who set it.
+    CHECK(sec.at("updated_by").get<std::string>() == "admin");
+    CHECK(sec.at("updated_at").get<int64_t>() == 1754150400);
+
+    // A non-secret key keeps its value and gains no is_set.
+    const auto& iss = j.at("oidc_issuer");
+    CHECK(iss.at("value").get<std::string>() == "https://idp.example.com");
+    CHECK_FALSE(iss.contains("is_set"));
+
+    // An UNSET secret reports is_set=false. This is the pairing that broke: blanket
+    // redaction made the value non-empty, so is_set could never be false.
+    std::vector<yuzu::server::RuntimeConfigEntry> unset = {
+        {"oidc_client_secret", "", "admin", 1754150400},
+    };
+    const auto j2 = RuntimeConfigStore::build_overrides_json(unset);
+    CHECK_FALSE(j2.at("oidc_client_secret").at("is_set").get<bool>());
+    CHECK_FALSE(j2.at("oidc_client_secret").contains("value"));
+}
+
+TEST_CASE("the single-key accessors redact too, and the _with_secrets pair does not",
+          "[runtime_config][secret]") {
+    // get()/get_value() were the asymmetry: get_all() redacted while the single-key
+    // reads returned plaintext, so the header's "every accessor is safe by default"
+    // was false for half the API. Mutation testing caught that closing the gap left
+    // NO failing test - this is that test.
+    auto db = yuzu::test::unique_temp_path("yuzu_test_rtcfg_single");
+    {
+        RuntimeConfigStore store(db);
+        REQUIRE(store.is_open());
+        REQUIRE(store.set("oidc_client_secret", "s3cr3t-value", "tester"));
+        REQUIRE(store.set("oidc_issuer", "https://idp.example.com", "tester"));
+
+        auto sec = store.get("oidc_client_secret");
+        REQUIRE(sec.has_value());
+        CHECK(sec->value == RuntimeConfigStore::redacted_placeholder());
+        CHECK(sec->value != "s3cr3t-value");
+        CHECK(store.get_value("oidc_client_secret") ==
+              RuntimeConfigStore::redacted_placeholder());
+
+        // The named variants still hand back the real credential, or the startup
+        // override pass and any future legitimate consumer break.
+        auto real = store.get_with_secrets("oidc_client_secret");
+        REQUIRE(real.has_value());
+        CHECK(real->value == "s3cr3t-value");
+        CHECK(store.get_value_with_secrets("oidc_client_secret") == "s3cr3t-value");
+
+        // A non-secret key is untouched by any of the four.
+        CHECK(store.get("oidc_issuer")->value == "https://idp.example.com");
+        CHECK(store.get_value("oidc_issuer") == "https://idp.example.com");
+        CHECK(store.get_with_secrets("oidc_issuer")->value == "https://idp.example.com");
+        CHECK(store.get_value_with_secrets("oidc_issuer") == "https://idp.example.com");
+
+        // An empty secret stays empty here too, matching get_all().
+        REQUIRE(store.set("oidc_client_secret", "", "tester"));
+        CHECK(store.get_value("oidc_client_secret").empty());
+    }
+    std::error_code ec;
+    std::filesystem::remove(db, ec);
+}

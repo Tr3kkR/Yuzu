@@ -3096,7 +3096,7 @@ Update a single runtime configuration value. The key must be one of the allowed 
 | `guardian_event_retention_days` | integer | immediately | Days to retain guaranteed-state events |
 | `log_level` | string | immediately | Server log verbosity (`trace`, `debug`, `info`, `warn`, `error`) |
 | `auto_approve_enabled` | boolean | **never - see note** | Accepted and stored, but no consumer reads it back |
-| `plugin_signing_required` | boolean | on next check | Whether plugins must be signed |
+| `plugin_signing_required` | boolean | **records intent only - see note** | Server-side record of the Settings "Require signed plugins" toggle |
 | `oidc_issuer` | string | **see note** | OIDC issuer URL |
 | `oidc_client_id` | string | **see note** | OIDC client ID |
 | `oidc_client_secret` | string | **see note** | OIDC client secret (write-only through this API) |
@@ -3118,8 +3118,12 @@ most keys:
   (`heartbeat_timeout`, `response_retention_days`, `audit_retention_days`,
   `guardian_event_retention_days`), or `RuntimeConfigStore::set()` applies it directly (`log_level`,
   which calls `spdlog::set_level`).
-- **on next check** - nothing is assigned, but the consumer reads the store each time it needs the
-  value, so the next read observes the change (`plugin_signing_required`).
+- **records intent only** - `plugin_signing_required` is read in exactly two places, both of which
+  render the Settings status badge. **No server or agent code consumes it to require signatures**,
+  and it is not carried in any proto field, so it never reaches an agent. Agent-side enforcement is
+  the agent's own `--plugin-require-signature` flag paired with an operator-distributed
+  `--plugin-trust-bundle`. Setting this key records the operator's intent and changes what Settings
+  displays; **it does not harden anything by itself**.
 - **persisted only, applied at next boot or next DEX-alerts Settings save** - `dex_alert_routing`,
   `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`,
   `dex_cohort_export_key`. The live consumers (`DexAlertRouter`, the blast-radius detector, the

@@ -178,7 +178,14 @@ public:
                                   std::size_t* out_pool_size = nullptr) const;
     std::size_t total_count() const;
 
-    /// The `detail` a reader should see for a row, given its action and target.
+    /// The `detail` a reader should see for a row, given its target.
+    ///
+    /// Keyed on the TARGET -- a `RuntimeConfig` row naming a secret-valued key --
+    /// rather than on a writer's action string, so a future writer recording the same
+    /// key under a different verb is covered without anyone remembering to extend a
+    /// list. Only the `value=` segment is replaced, so a row that also records why a
+    /// change was made keeps that context; a detail with no such segment is replaced
+    /// wholesale, because then we cannot tell which part is the credential.
     ///
     /// A `config.update` on a secret-valued key recorded `value=<the secret>` in
     /// `detail` before that write path was fixed. Those rows are ALREADY on disk on
@@ -194,8 +201,8 @@ public:
     /// DISCLOSED. Operators who set the secret pre-upgrade should still rotate it.
     ///
     /// Idempotent: rows written after the writer fix already hold the placeholder.
-    static std::string sanitized_detail(const std::string& action, const std::string& target_id,
-                                        const std::string& detail);
+    static std::string sanitized_detail(const std::string& target_type,
+                                        const std::string& target_id, const std::string& detail);
 
     /// Cumulative audit-event write counts grouped by `result` value. Exposed for
     /// Prometheus scraping; reset at process start. Lock-free reads.

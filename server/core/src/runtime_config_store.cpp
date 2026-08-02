@@ -152,6 +152,14 @@ std::vector<RuntimeConfigEntry> RuntimeConfigStore::get_all_with_secrets() const
 }
 
 std::optional<RuntimeConfigEntry> RuntimeConfigStore::get(const std::string& key) const {
+    auto entry = get_with_secrets(key);
+    if (entry && is_secret_key(entry->key) && !entry->value.empty())
+        entry->value = redacted_placeholder();
+    return entry;
+}
+
+std::optional<RuntimeConfigEntry>
+RuntimeConfigStore::get_with_secrets(const std::string& key) const {
     if (!db_)
         return std::nullopt;
 
@@ -186,6 +194,28 @@ std::optional<RuntimeConfigEntry> RuntimeConfigStore::get(const std::string& key
 std::string RuntimeConfigStore::get_value(const std::string& key) const {
     auto entry = get(key);
     return entry ? entry->value : std::string{};
+}
+
+std::string RuntimeConfigStore::get_value_with_secrets(const std::string& key) const {
+    auto entry = get_with_secrets(key);
+    return entry ? entry->value : std::string{};
+}
+
+nlohmann::json
+RuntimeConfigStore::build_overrides_json(const std::vector<RuntimeConfigEntry>& entries) {
+    nlohmann::json overrides = nlohmann::json::object();
+    for (const auto& e : entries) {
+        if (is_secret_key(e.key)) {
+            overrides[e.key] = {{"is_set", !e.value.empty()},
+                                {"updated_by", e.updated_by},
+                                {"updated_at", e.updated_at}};
+        } else {
+            overrides[e.key] = {{"value", e.value},
+                                {"updated_by", e.updated_by},
+                                {"updated_at", e.updated_at}};
+        }
+    }
+    return overrides;
 }
 
 // ── Mutations ────────────────────────────────────────────────────────────────

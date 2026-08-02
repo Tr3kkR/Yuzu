@@ -2,6 +2,8 @@
 
 #include <sqlite3.h>
 
+#include <nlohmann/json.hpp>
+
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -35,11 +37,18 @@ public:
 
     bool is_open() const;
 
-    /// Get all config entries.
-    /// All entries, with the value of any secret key REPLACED by
-    /// redacted_placeholder(). This is the default deliberately: an emitter that
-    /// forgets to think about secrets gets the safe behaviour. Use
-    /// get_all_with_secrets() only where the real value is genuinely required.
+    /// ALL FOUR READ ACCESSORS REDACT BY DEFAULT. The `_with_secrets` variants are
+    /// the only way to obtain a credential, and naming them at the call site is the
+    /// point: an emitter that does not think about secrets gets the safe behaviour.
+    /// Redaction being opt-in is how the plaintext secret reached an audit row that
+    /// Operator can read, surviving the first round of the fix (governance, this
+    /// branch) -- so it is not opt-in on any accessor.
+    ///
+    /// A secret's value is replaced by redacted_placeholder(). An EMPTY secret is
+    /// left empty: there is nothing to protect, and the emptiness is the only
+    /// set-vs-unset signal a caller has (GET /api/config derives `is_set` from it).
+
+    /// All entries, secrets redacted.
     std::vector<RuntimeConfigEntry> get_all() const;
 
     /// All entries with real values. ONE legitimate caller today: the startup
@@ -49,11 +58,18 @@ public:
     /// row that Operator can read (governance, this branch).
     std::vector<RuntimeConfigEntry> get_all_with_secrets() const;
 
-    /// Get a single config entry.
+    /// A single config entry, secret redacted.
     std::optional<RuntimeConfigEntry> get(const std::string& key) const;
 
-    /// Get the value of a config key, or empty string if not set.
+    /// A single entry with its real value. Same rule as get_all_with_secrets().
+    std::optional<RuntimeConfigEntry> get_with_secrets(const std::string& key) const;
+
+    /// The value of a config key, secret redacted, or empty string if not set.
     std::string get_value(const std::string& key) const;
+
+    /// The real value of a config key, or empty string if not set. Same rule as
+    /// get_all_with_secrets(): use only where the credential itself is required.
+    std::string get_value_with_secrets(const std::string& key) const;
 
     /// Set a config value. Returns error if the key is not in the allow-list.
     std::expected<void, std::string> set(const std::string& key, const std::string& value,
@@ -76,6 +92,23 @@ public:
     /// What to print in place of a secret. Single spelling so log scrapers and API
     /// consumers see one token.
     static const char* redacted_placeholder() { return "<redacted>"; }
+
+    /// The `overrides` object `GET /api/config` returns, built from `get_all()`.
+    ///
+    /// A free function taking the entries rather than inline route code, so the
+    /// omission rule is reachable from a unit test. The route lives in server.cpp and
+    /// is not TestRouteSink-registered, so an inline loop here would be untested --
+    /// and this is one of the three sites where the secret leaked twice.
+    ///
+    /// A secret's `value` is OMITTED and replaced by `is_set`, NOT placeholdered: the
+    /// placeholder is itself a legal value, so a config-as-code or backup-restore
+    /// client reading it and writing it back would silently set the literal string as
+    /// the credential. `updated_by`/`updated_at` are kept for both kinds so an
+    /// operator can still see that a secret is set and who set it.
+    ///
+    /// Returns a JSON object, keyed by config key. Takes the REDACTED entries, so an
+    /// `is_set` of true means "non-empty", which is why get_all() preserves emptiness.
+    static nlohmann::json build_overrides_json(const std::vector<RuntimeConfigEntry>& entries);
 
     /// Returns the list of allowed config keys.
     static const std::vector<std::string>& allowed_keys();

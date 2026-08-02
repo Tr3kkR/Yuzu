@@ -6528,7 +6528,10 @@ private:
                     cfg_.guardian_event_retention_days = std::stoi(e.value);
                 } catch (...) {}
             }
-            // auto_approve_enabled is read dynamically, no startup action needed
+            // auto_approve_enabled is deliberately NOT applied here -- and nothing
+            // else reads it back from this store either. GET /api/config reports it
+            // derived from whether any auto-approve rule exists, so a stored value
+            // has no effect at all. See docs/user-manual/rest-api.md.
             // OIDC settings — runtime-configurable via Settings UI
             else if (e.key == "oidc_issuer" && !e.value.empty())
                 cfg_.oidc_issuer = e.value;
@@ -7824,31 +7827,14 @@ private:
             config_obj["log_level"] =
                 spdlog::level::to_string_view(spdlog::default_logger()->level()).data();
 
-            // Overrides from store
+            // Overrides from store. The omission rule lives in
+            // RuntimeConfigStore::build_overrides_json so it is unit-testable -- this
+            // route is not TestRouteSink-registered, and it is one of the sites the
+            // secret leaked from twice.
             nlohmann::json overrides = nlohmann::json::object();
             if (runtime_config_store_ && runtime_config_store_->is_open()) {
-                auto entries = runtime_config_store_->get_all();
-                for (const auto& e : entries) {
-                    // Same rule as the startup log: the value of a secret key is not
-                    // returned. This route is gated only on Infrastructure:Read, and the
-                    // settings UI already masks the same field as "********" -- the API
-                    // was the inconsistent one. updated_by/updated_at are kept so an
-                    // operator can still see THAT it is set and who set it.
-                    // A secret's value is OMITTED, not placeholdered. A placeholder is
-                    // a legal value, so a config-as-code or backup-restore client that
-                    // reads this and writes it back would silently set the literal
-                    // string as the client secret and break SSO. `is_set` carries the
-                    // only part an operator needs.
-                    if (RuntimeConfigStore::is_secret_key(e.key)) {
-                        overrides[e.key] = {{"is_set", !e.value.empty()},
-                                            {"updated_by", e.updated_by},
-                                            {"updated_at", e.updated_at}};
-                    } else {
-                        overrides[e.key] = {{"value", e.value},
-                                            {"updated_by", e.updated_by},
-                                            {"updated_at", e.updated_at}};
-                    }
-                }
+                overrides = RuntimeConfigStore::build_overrides_json(
+                    runtime_config_store_->get_all());
             }
 
             nlohmann::json allowed = nlohmann::json::array();
