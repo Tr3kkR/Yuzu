@@ -409,7 +409,7 @@ int ApprovalManager::pending_count_for(const std::string& submitted_by) const {
 
 std::optional<Approval> ApprovalManager::get(const std::string& id) const {
     auto r = get_checked(id);
-    return r ? *r : std::nullopt;
+    return r ? std::move(*r) : std::nullopt;
 }
 
 std::expected<std::optional<Approval>, std::string>
@@ -538,9 +538,11 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
         } catch (const std::exception& e) {
             spdlog::warn("ApprovalManager: pre-consume recheck threw for ticket {}: {}",
                          redact_id(id), e.what());
-            return std::unexpected(ConsumeError{ConsumeFailure::kStoreError,
-                                                std::string("pre-consume recheck failed: ") +
-                                                    e.what()});
+            // e.what() goes to the LOG, not into the message: this string
+            // reaches the MCP error envelope, which is documented as carrying
+            // no caller-derived text, and the callback is caller code.
+            return std::unexpected(
+                ConsumeError{ConsumeFailure::kStoreError, "pre-consume recheck failed"});
         } catch (...) {
             spdlog::warn("ApprovalManager: pre-consume recheck threw a non-std exception for "
                          "ticket {}",

@@ -207,25 +207,35 @@ gate, per-handler RBAC and a human approval, so this closes a namespace confusio
 open escalation.
 
 **What changes.** Creating a definition whose id starts `mcp.` is refused with a 400 on every
-authoring route — `POST /api/instructions`, `POST /api/instructions/yaml`, `POST
-/api/instructions/import`, and product-pack install — and such a definition is skipped (counted
-in `defs_errored`) at boot auto-import. The dashboard's YAML validator refuses it too, so
-Validate and Save agree.
+authoring route that accepts an explicit id — `POST /api/instructions`, `POST
+/api/instructions/yaml`, and `POST /api/instructions/import` — and such a definition is skipped
+(counted in `defs_errored`) at boot auto-import. The dashboard's YAML validator refuses it too,
+so Validate and Save agree on the create path. Product-pack install is unaffected because it
+never carries a declared id through at all: the store assigns one, so a pack's own id, reserved
+or not, has never been honoured.
 
-**What does NOT change.** The rule applies at creation only. A definition that already carries
-such an id keeps executing, stays editable, and can still be saved through `PUT` — an update
-cannot originate an id, so blocking it there would strand content rather than protect anything.
+**What does NOT change.** The store applies the rule at creation only, so a definition that
+already carries such an id keeps executing and can still be saved through `PUT
+/api/instructions/{id}` — an update cannot originate an id, so blocking it there would strand
+content rather than protect anything. One exception, and it is the reason to rename rather than
+live with it: the dashboard's YAML editor runs the same validation on every save, create or
+update, so an existing `mcp.`-prefixed definition cannot be edited there.
 
-**What to do.** Before upgrading, check for affected content:
+**What to do.** Before upgrading, check for affected content. Query the instruction database
+directly rather than the REST list route: `GET /api/v1/definitions` caps its result at 100
+definitions, and the shipped content alone exceeds that, so an API-based check can report a
+false all-clear.
 
 ```bash
-curl -s -H "Authorization: Bearer $TOKEN" \
-  http://localhost:8080/api/v1/instructions | jq -r '.data[].id | select(startswith("mcp."))'
+sqlite3 /var/lib/yuzu/instructions.db \
+  "SELECT id FROM instruction_definitions WHERE id LIKE 'mcp.%';"
 ```
 
-Any id listed will keep running after the upgrade, but re-importing an export of it, or
-reinstalling a product pack containing it, will fail. Rename those definitions — create a
-replacement under a different id and delete the original.
+Any id listed keeps executing after the upgrade and can still be edited through
+`PUT /api/instructions/{id}`, but re-importing an export of it will fail, and so will saving it
+from the dashboard's YAML editor (that path validates the id on every save, not only on
+create). Rename those definitions before upgrading — create a replacement under a different id
+and delete the original.
 
 ### vNEXT — behind a reverse proxy, declare your external origin or CSRF-gated dashboard actions keep failing (#2537)
 

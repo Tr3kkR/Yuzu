@@ -227,7 +227,8 @@ public:
     /// ticket is still recallable once the operator resolves the drift.
     ///
     /// `precondition` runs WITHOUT `mtx_` held, deliberately: it inspects state
-    /// OUTSIDE this store (RBAC, rotation status, device state), which no lock
+    /// OUTSIDE this store (rotation status, device state — never authority; see
+    /// ConsumePrecondition), which no lock
     /// here can freeze, so holding the store mutex across an arbitrary caller
     /// callback would buy no atomicity while adding a lock-order hazard and
     /// serialising the store behind caller I/O. The consequence is honest rather

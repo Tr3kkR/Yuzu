@@ -741,7 +741,7 @@ TEST_CASE("ApprovalManager: a throwing recheck denies without consuming and does
     CHECK(mgr.get(*id)->consumed_at == 0);
 }
 
-TEST_CASE("ApprovalManager: the recheck may read the store without deadlocking",
+TEST_CASE("ApprovalManager: a store failure during the recheck is not reported as spent",
           "[approval_manager][approval]") {
     TestDb tdb;
     ApprovalManager mgr(tdb.db);
@@ -751,33 +751,125 @@ TEST_CASE("ApprovalManager: the recheck may read the store without deadlocking",
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
+    // The defect this whole seam re-introduced once: the pre-consume read used
+    // get(), which reports a FAILED read and a missing row identically. Drop
+    // the table to force a real read failure and confirm the caller is told the
+    // store broke, NOT that its human-approved capability is spent.
+    REQUIRE(sqlite3_exec(tdb.db, "DROP TABLE approvals", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    bool ran = false;
+    auto r = mgr.consume_ticket(*id, "operator1",
+                                [&ran](const Approval&) -> std::expected<void, std::string> {
+                                    ran = true;
+                                    return {};
+                                });
+    REQUIRE(!r.has_value());
+    CHECK(r.error().kind == ConsumeFailure::kStoreError); // NOT kNotConsumable
+    CHECK(!ran); // no row to hand the callback
+
+    // And the same read through get_checked directly.
+    CHECK(!mgr.get_checked(*id).has_value());
+}
+
+TEST_CASE("ApprovalManager: migration v6 applies to an existing v5 store",
+          "[approval_manager][db]") {
+    TestDb tdb;
+    // A v5-shaped store: every column through `origin`, schema_meta pinned at 5,
+    // and only the four pre-v6 indexes.
+    REQUIRE(sqlite3_exec(tdb.db,
+                         "CREATE TABLE schema_meta (store TEXT PRIMARY KEY,"
+                         " version INTEGER NOT NULL, upgraded_at INTEGER NOT NULL DEFAULT 0);"
+                         "INSERT INTO schema_meta (store, version, upgraded_at)"
+                         " VALUES ('approval_manager', 5, 0);"
+                         "CREATE TABLE approvals ("
+                         "id TEXT PRIMARY KEY, definition_id TEXT NOT NULL,"
+                         "status TEXT NOT NULL DEFAULT 'pending',"
+                         "submitted_by TEXT NOT NULL DEFAULT '',"
+                         "submitted_at INTEGER NOT NULL DEFAULT 0,"
+                         "reviewed_by TEXT NOT NULL DEFAULT '',"
+                         "reviewed_at INTEGER NOT NULL DEFAULT 0,"
+                         "review_comment TEXT NOT NULL DEFAULT '',"
+                         "scope_expression TEXT NOT NULL DEFAULT '',"
+                         "consumed_at INTEGER NOT NULL DEFAULT 0,"
+                         "consumed_by TEXT NOT NULL DEFAULT '',"
+                         "schedule_id TEXT NOT NULL DEFAULT '',"
+                         "origin TEXT NOT NULL DEFAULT '');"
+                         "INSERT INTO approvals (id, definition_id, status, submitted_by)"
+                         " VALUES ('v5-row', 'inventory.audit', 'approved', 'operator1');",
+                         nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+    REQUIRE(mgr.is_open()); // a failed v6 would null db_ and fail the probes
+
+    // Both v6 indexes exist, and the pre-existing row is untouched.
+    auto has_index = [&tdb](const char* name) {
+        sqlite3_stmt* st = nullptr;
+        REQUIRE(sqlite3_prepare_v2(tdb.db,
+                                   "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", -1,
+                                   &st, nullptr) == SQLITE_OK);
+        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+        const bool found = sqlite3_step(st) == SQLITE_ROW;
+        sqlite3_finalize(st);
+        return found;
+    };
+    CHECK(has_index("idx_approvals_status_submitted"));
+    CHECK(has_index("idx_approvals_status_consumed_reviewed"));
+    auto row = mgr.get("v5-row");
+    REQUIRE(row.has_value());
+    CHECK(row->definition_id == "inventory.audit");
+}
+
+TEST_CASE("ApprovalManager: the recheck may read the store without deadlocking",
+          "[approval_manager][approval]") {
     // The callback runs with mtx_ RELEASED, so a precondition that consults the
     // approval store (a plausible shape: "no newer ticket supersedes this one")
     // is safe. Under a lock-held design this self-deadlocks on the
     // non-recursive mutex.
     //
-    // Run it on its own thread with a bounded wait: a regression here is a
-    // DEADLOCK, and a deadlocked assertion inside the test body would hang the
-    // whole binary until the CI job times out. This way the regression is a
-    // clean FAIL with a message, and the detached thread is parked on a mutex
-    // rather than corrupting anything.
-    std::promise<bool> done;
-    auto fut = done.get_future();
-    std::thread worker([&mgr, &id, &done] {
-        auto consumed = mgr.consume_ticket(
-            *id, "operator1", [&mgr](const Approval& a) -> std::expected<void, std::string> {
-                (void)mgr.get(a.id);
-                (void)mgr.pending_count();
-                (void)mgr.query({});
+    // Three things about the shape below, each from a reviewer who reproduced
+    // the alternative. It runs on its own thread with a bounded wait, because a
+    // deadlocked assertion in the test body hangs the whole binary until the CI
+    // job times out. On timeout the thread is DETACHED before the assertion
+    // fires: a joinable std::thread destroyed during an assertion's unwind
+    // calls std::terminate, which aborts the run and loses every remaining
+    // test — worse than the hang it replaced. And joining instead is not an
+    // option, because by then the thread is genuinely deadlocked.
+    //
+    // Detaching is only safe because the fixture is shared_ptr-owned and
+    // captured BY VALUE: a thread parked on the mutex outlives this scope, and
+    // under by-reference captures it would hold a dangling ApprovalManager and
+    // a closed sqlite3*.
+    struct Fixture {
+        TestDb tdb;
+        ApprovalManager mgr{tdb.db};
+        std::promise<bool> done;
+    };
+    auto fx = std::make_shared<Fixture>();
+    fx->mgr.create_tables();
+
+    auto id = fx->mgr.submit("mcp.delete_tag", "operator1", "{}");
+    REQUIRE(id.has_value());
+    REQUIRE(fx->mgr.approve(*id, "admin1", "").has_value());
+
+    auto fut = fx->done.get_future();
+    std::thread worker([fx, ticket = *id] {
+        auto consumed = fx->mgr.consume_ticket(
+            ticket, "operator1", [fx](const Approval& a) -> std::expected<void, std::string> {
+                (void)fx->mgr.get(a.id);
+                (void)fx->mgr.pending_count();
+                (void)fx->mgr.query({});
                 return {};
             });
-        done.set_value(consumed.has_value());
+        fx->done.set_value(consumed.has_value());
     });
 
     const bool finished = fut.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
-    INFO("a timeout here means the precondition ran with mtx_ held — self-deadlock on the "
-         "non-recursive mutex");
-    REQUIRE(finished);
+    if (!finished) {
+        worker.detach(); // deadlocked: unjoinable, and must not terminate the run
+        FAIL("timed out - the precondition ran with mtx_ held, self-deadlocking on the "
+             "non-recursive mutex");
+    }
     CHECK(fut.get());
     worker.join();
 }
