@@ -15,8 +15,6 @@
 namespace yuzu::contracts::adr31 {
 namespace {
 
-constexpr std::size_t kMaxWireBytes = 64 * 1024;
-
 ContractError error(ContractErrorCode code, std::string path, std::string message) {
     return ContractError{code, std::move(path), std::move(message)};
 }
@@ -158,39 +156,31 @@ encode_b3_platform_request(const B3PlatformRequest& request) {
         {"scope", request.scope},
         {"securable", request.securable},
     };
-    return root.dump();
+    return detail::encode_contract_json(root);
 }
 
 std::expected<B3PlatformRequest, ContractError>
 decode_b3_platform_request(std::string_view wire_json) {
-    if (wire_json.size() > kMaxWireBytes) {
-        return std::unexpected(
-            error(ContractErrorCode::TooLarge, "", "contract body exceeds 65536 bytes"));
-    }
-
-    const auto root = nlohmann::json::parse(wire_json, nullptr, false);
-    if (root.is_discarded()) {
-        return std::unexpected(
-            error(ContractErrorCode::MalformedJson, "", "contract body is not valid JSON"));
-    }
-    if (!root.is_object()) {
+    auto root = detail::parse_contract_json(wire_json);
+    if (!root) return std::unexpected(root.error());
+    if (!root->is_object()) {
         return std::unexpected(
             error(ContractErrorCode::RootNotObject, "", "contract body must be an object"));
     }
 
-    if (const auto authority_fields = detail::reject_forbidden_authority_fields(root);
+    if (const auto authority_fields = detail::reject_forbidden_authority_fields(*root);
         !authority_fields) {
         return std::unexpected(authority_fields.error());
     }
 
-    const auto version = decode_contract_header(root);
+    const auto version = decode_contract_header(*root);
     if (!version) return std::unexpected(version.error());
 
-    auto correlation_id = required_string(root, "correlation_id");
+    auto correlation_id = required_string(*root, "correlation_id");
     if (!correlation_id) return std::unexpected(correlation_id.error());
-    auto securable = required_string(root, "securable");
+    auto securable = required_string(*root, "securable");
     if (!securable) return std::unexpected(securable.error());
-    auto operation = required_string(root, "operation");
+    auto operation = required_string(*root, "operation");
     if (!operation) return std::unexpected(operation.error());
 
     const auto typed_operation = [&]() -> std::expected<CoreOperation, ContractError> {
@@ -205,8 +195,8 @@ decode_b3_platform_request(std::string_view wire_json) {
     }();
     if (!typed_operation) return std::unexpected(typed_operation.error());
 
-    const auto scope_it = root.find("scope");
-    if (scope_it == root.end()) {
+    const auto scope_it = root->find("scope");
+    if (scope_it == root->end()) {
         return std::unexpected(
             error(ContractErrorCode::MissingField, "/scope", "scope is required"));
     }

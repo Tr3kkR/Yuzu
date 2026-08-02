@@ -1,11 +1,14 @@
 #include <yuzu/contracts/adr31/b3_platform.hpp>
+#include <yuzu/contracts/adr31/contract_limits.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <expected>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace contracts = yuzu::contracts::adr31;
 
@@ -48,7 +51,7 @@ TEST_CASE("ADR-0031 B3 rejects caller-authored authority context",
           "[adr31][contract][b3][security]") {
     const auto base = nlohmann::json::parse(
         R"({"contract":{"id":"yuzu.b3.platform.request","version":{"major":1,"minor":0}},"correlation_id":"req-contract-0001","operation":"Read","scope":{"kind":"fleet"},"securable":"GuaranteedState"})");
-    constexpr std::array<std::string_view, 15> forbidden{
+    constexpr std::array<std::string_view, 19> forbidden{
         "principal_credential",
         "credential",
         "authorization",
@@ -64,6 +67,10 @@ TEST_CASE("ADR-0031 B3 rejects caller-authored authority context",
         "audience",
         "scope_ceiling",
         "grant",
+        "x-on-behalf-of",
+        "x-yuzu-on-behalf-of",
+        "delegationArtifact",
+        "result_grant",
     };
 
     for (const auto field : forbidden) {
@@ -87,6 +94,192 @@ TEST_CASE("ADR-0031 B3 tolerates safe additive fields", "[adr31][contract][b3][c
     const auto decoded = contracts::decode_b3_platform_request(wire.dump());
     REQUIRE(decoded.has_value());
     CHECK(decoded->scope == wire["scope"]);
+}
+
+TEST_CASE("ADR-0031 B3 rejects ambiguous or unbounded JSON", "[adr31][contract][b3][security]") {
+    SECTION("duplicate object key") {
+        const auto decoded = contracts::decode_b3_platform_request(
+            R"({"contract":{"id":"yuzu.b3.platform.request","version":{"major":1,"minor":0}},"correlation_id":"req-contract-0001","operation":"Read","operation":"Write","scope":{"kind":"fleet"},"securable":"GuaranteedState"})");
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::DuplicateKey);
+        CHECK(decoded.error().path == "/operation");
+    }
+
+    SECTION("duplicate nested version key") {
+        const auto decoded = contracts::decode_b3_platform_request(
+            R"({"contract":{"id":"yuzu.b3.platform.request","version":{"major":1,"major":2,"minor":0}},"correlation_id":"req-contract-0001","operation":"Read","scope":{"kind":"fleet"},"securable":"GuaranteedState"})");
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::DuplicateKey);
+        CHECK(decoded.error().path == "/contract/version/major");
+    }
+
+    SECTION("duplicate nested scope key") {
+        const auto decoded = contracts::decode_b3_platform_request(
+            R"({"contract":{"id":"yuzu.b3.platform.request","version":{"major":1,"minor":0}},"correlation_id":"req-contract-0001","operation":"Read","scope":{"kind":"fleet","kind":"group"},"securable":"GuaranteedState"})");
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::DuplicateKey);
+        CHECK(decoded.error().path == "/scope/kind");
+    }
+
+    SECTION("excessive nesting") {
+        auto scope = nlohmann::json::object();
+        for (std::size_t depth = 0; depth < contracts::kMaxContractNestingDepth; ++depth) {
+            scope = nlohmann::json{{"nested", std::move(scope)}};
+        }
+        auto wire = nlohmann::json{
+            {"contract",
+             {{"id", "yuzu.b3.platform.request"}, {"version", {{"major", 1}, {"minor", 0}}}}},
+            {"correlation_id", "req-contract-0001"},
+            {"operation", "Read"},
+            {"scope", std::move(scope)},
+            {"securable", "GuaranteedState"},
+        };
+        const auto decoded = contracts::decode_b3_platform_request(wire.dump());
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::TooDeep);
+    }
+
+    SECTION("oversized decode") {
+        const auto decoded = contracts::decode_b3_platform_request(
+            std::string(contracts::kMaxContractWireBytes + 1, ' '));
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::TooLarge);
+    }
+
+    SECTION("exact nesting and wire-size limits remain valid") {
+        auto scope = nlohmann::json::object();
+        for (std::size_t depth = 0; depth < contracts::kMaxContractNestingDepth - 2; ++depth) {
+            scope = nlohmann::json{{"nested", std::move(scope)}};
+        }
+        auto wire = nlohmann::json{
+            {"contract",
+             {{"id", "yuzu.b3.platform.request"}, {"version", {{"major", 1}, {"minor", 0}}}}},
+            {"correlation_id", "req-contract-0001"},
+            {"operation", "Read"},
+            {"scope", std::move(scope)},
+            {"securable", "GuaranteedState"},
+            {"padding", ""},
+        };
+        const auto empty_size = wire.dump().size();
+        REQUIRE(empty_size < contracts::kMaxContractWireBytes);
+        wire["padding"] = std::string(contracts::kMaxContractWireBytes - empty_size, 'x');
+        const auto encoded = wire.dump();
+        REQUIRE(encoded.size() == contracts::kMaxContractWireBytes);
+
+        const auto decoded = contracts::decode_b3_platform_request(encoded);
+        REQUIRE(decoded.has_value());
+    }
+}
+
+TEST_CASE("ADR-0031 B3 encoder owns validation failures", "[adr31][contract][b3][negative]") {
+    contracts::B3PlatformRequest request{
+        .correlation_id = "req-contract-0001",
+        .securable = "GuaranteedState",
+        .operation = contracts::CoreOperation::Read,
+        .scope = nlohmann::json{{"kind", "fleet"}},
+    };
+
+    SECTION("oversized output") {
+        request.scope["padding"] = std::string(contracts::kMaxContractWireBytes, 'x');
+        const auto encoded = contracts::encode_b3_platform_request(request);
+        REQUIRE_FALSE(encoded.has_value());
+        CHECK(encoded.error().code == contracts::ContractErrorCode::TooLarge);
+    }
+
+    SECTION("invalid UTF-8") {
+        request.scope["invalid"] = std::string(1, static_cast<char>(0xff));
+        std::expected<std::string, contracts::ContractError> encoded;
+        REQUIRE_NOTHROW(encoded = contracts::encode_b3_platform_request(request));
+        REQUIRE_FALSE(encoded.has_value());
+        CHECK(encoded.error().code == contracts::ContractErrorCode::InvalidValue);
+    }
+
+    SECTION("excessive nesting") {
+        request.scope = nlohmann::json::object();
+        for (std::size_t depth = 0; depth < contracts::kMaxContractNestingDepth; ++depth) {
+            request.scope = nlohmann::json{{"nested", std::move(request.scope)}};
+        }
+        const auto encoded = contracts::encode_b3_platform_request(request);
+        REQUIRE_FALSE(encoded.has_value());
+        CHECK(encoded.error().code == contracts::ContractErrorCode::TooDeep);
+    }
+}
+
+TEST_CASE("ADR-0031 B3 encoding is independent of object insertion order",
+          "[adr31][contract][b3][compatibility]") {
+    const contracts::B3PlatformRequest first{
+        .correlation_id = "req-contract-0001",
+        .securable = "GuaranteedState",
+        .operation = contracts::CoreOperation::Read,
+        .scope = nlohmann::json{{"kind", "group"}, {"id", "engineering"}},
+    };
+    auto reversed_scope = nlohmann::json::object();
+    reversed_scope["id"] = "engineering";
+    reversed_scope["kind"] = "group";
+    const contracts::B3PlatformRequest second{
+        .correlation_id = first.correlation_id,
+        .securable = first.securable,
+        .operation = first.operation,
+        .scope = std::move(reversed_scope),
+    };
+
+    const auto first_wire = contracts::encode_b3_platform_request(first);
+    const auto second_wire = contracts::encode_b3_platform_request(second);
+    REQUIRE(first_wire.has_value());
+    REQUIRE(second_wire.has_value());
+    CHECK(*first_wire == *second_wire);
+}
+
+TEST_CASE("ADR-0031 B3 rejects malformed documents and unknown versions",
+          "[adr31][contract][b3][negative]") {
+    const auto base = nlohmann::json::parse(
+        R"({"contract":{"id":"yuzu.b3.platform.request","version":{"major":1,"minor":0}},"correlation_id":"req-contract-0001","operation":"Read","scope":{"kind":"fleet"},"securable":"GuaranteedState"})");
+
+    SECTION("trailing data") {
+        const auto decoded = contracts::decode_b3_platform_request(base.dump() + " trailing");
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::MalformedJson);
+    }
+
+    SECTION("invalid UTF-8") {
+        auto wire = base.dump();
+        wire.insert(wire.size() - 1,
+                    std::string{",\"future\":\""} + static_cast<char>(0xff) + "\"");
+        const auto decoded = contracts::decode_b3_platform_request(wire);
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::MalformedJson);
+    }
+
+    SECTION("non-object root") {
+        const auto decoded = contracts::decode_b3_platform_request("[]");
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::RootNotObject);
+    }
+
+    SECTION("unsupported minor") {
+        auto wire = base;
+        wire["contract"]["version"]["minor"] = 1;
+        const auto decoded = contracts::decode_b3_platform_request(wire.dump());
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::UnsupportedVersion);
+    }
+
+    SECTION("unsupported major") {
+        auto wire = base;
+        wire["contract"]["version"]["major"] = 2;
+        const auto decoded = contracts::decode_b3_platform_request(wire.dump());
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::UnsupportedVersion);
+    }
+
+    SECTION("negative version") {
+        auto wire = base;
+        wire["contract"]["version"]["major"] = -1;
+        const auto decoded = contracts::decode_b3_platform_request(wire.dump());
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::WrongType);
+        CHECK(decoded.error().path == "/contract/version/major");
+    }
 }
 
 TEST_CASE("ADR-0031 B3 decoder distinguishes absent, null, and mistyped fields",

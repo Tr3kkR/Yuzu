@@ -2,11 +2,19 @@
 
 #include <yuzu/contracts/adr31/contract_error.hpp>
 
-#include <nlohmann/json_fwd.hpp>
+#include <nlohmann/json.hpp>
 
 #include <expected>
+#include <string>
+#include <string_view>
 
 namespace yuzu::contracts::adr31::detail {
+
+[[nodiscard]] std::expected<nlohmann::json, ContractError>
+parse_contract_json(std::string_view wire_json);
+
+[[nodiscard]] std::expected<std::string, ContractError>
+encode_contract_json(const nlohmann::json& document);
 
 [[nodiscard]] std::expected<void, ContractError>
 reject_forbidden_authority_fields(const nlohmann::json& root);
