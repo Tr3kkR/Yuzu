@@ -321,6 +321,7 @@ jobs:
           bash tests/shell/test_check_compose_versions.sh
           bash tests/shell/test_detect_code_change.sh   # docs-only gate classifier (#1978)
           python3 scripts/ci/test_runner_health_check.py
+          bash tests/shell/test_review_driver_substitution.sh  # patsub_replacement prompt corruption (#2644)
 
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──
   # lint:

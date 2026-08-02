@@ -23,6 +23,15 @@
 
 set -euo pipefail
 
+# LOAD-BEARING — do not remove. Bash >= 5.2 defaults `patsub_replacement` ON, which
+# makes an unescaped `&` in a ${var//pat/repl} replacement expand to the MATCH. Every
+# `&` in an injected value then becomes the literal token being replaced, silently
+# corrupting `&&` in anchors, C++ reference types (`bool& x`) and URL query strings
+# in the text under review. run-kimi-reviewer.sh carries the same guard (added in the
+# same change — neither driver had it before) — keep the two in sync; the regression
+# test drives BOTH drivers.
+shopt -u patsub_replacement 2>/dev/null || true
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROMPT_TEMPLATE="$SCRIPT_DIR/review-prompt.md"
 
@@ -50,7 +59,7 @@ while [[ $# -gt 0 ]]; do
     --model)       MODEL="$2"; shift 2 ;;
     --static-only) STATIC_ONLY="true"; shift ;;
     --prompt-template) PROMPT_TEMPLATE="$2"; shift 2 ;;
-    -h|--help)     grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)     awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
