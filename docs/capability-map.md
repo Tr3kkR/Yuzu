@@ -921,7 +921,7 @@ Kubernetes-style health probes: `/livez` (always 200) and `/readyz` (checks stor
 
 ### 22.4 Platform Configuration (TTLs, Limits) :white_check_mark: `T2`
 
-`RuntimeConfigStore` (219 LOC). Persistent runtime configuration overrides in SQLite. Allow-listed safe keys only (no secrets). Set/get/remove with `updated_by` attribution. Changes take effect without restart. REST API for configuration CRUD. Startup defaults overridden by stored values.
+`RuntimeConfigStore`. Persistent runtime configuration overrides in SQLite. Allow-listed keys only, **including one credential** (`oidc_client_secret`, plaintext at rest until ADR-0010 envelope encryption reaches this store) - `is_secret_key` gates every emitter (startup log, `GET /api/config`, audit detail) so the value is not returned or logged. Set/get/remove with `updated_by` attribution. **Only some keys take effect without a restart**: OIDC and DEX-alert keys are persisted-only until a restart or a Settings-UI save, and `auto_approve_enabled` is never read back from this store - see `docs/user-manual/rest-api.md` "Runtime Configuration". REST API for configuration CRUD. Startup defaults overridden by stored values.
 
 ### 22.5 Gateway / Scale-Out Architecture :white_check_mark: `T2`
 

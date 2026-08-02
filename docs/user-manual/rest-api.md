@@ -3103,11 +3103,11 @@ Update a single runtime configuration value. The key must be one of the allowed 
 | `oidc_redirect_uri` | string | **see note** | OIDC redirect URI |
 | `oidc_admin_group` | string | **see note** | OIDC admin group ID |
 | `oidc_skip_tls_verify` | boolean | **see note** | Skip TLS verification to the IdP (test only) |
-| `dex_alert_routing` | string (JSON array) | on next use | Routed DEX observation types |
-| `dex_blast_min_devices` | integer | on next use | Blast-radius alert threshold (clamped on apply) |
-| `dex_blast_window_seconds` | integer | on next use | Blast-radius window |
-| `dex_blast_cooldown_seconds` | integer | on next use | Blast-radius cooldown |
-| `dex_cohort_export_key` | string | on next gauge sweep | Cohort export tag key; `""` disables export |
+| `dex_alert_routing` | string (JSON array) | **persisted only - see note** | Routed DEX observation types |
+| `dex_blast_min_devices` | integer | **persisted only - see note** | Blast-radius alert threshold (clamped on apply) |
+| `dex_blast_window_seconds` | integer | **persisted only - see note** | Blast-radius window |
+| `dex_blast_cooldown_seconds` | integer | **persisted only - see note** | Blast-radius cooldown |
+| `dex_cohort_export_key` | string | **persisted only - see note** | Cohort export tag key; `""` disables export |
 
 ##### When a change takes effect
 
@@ -3118,8 +3118,15 @@ most keys:
   (`heartbeat_timeout`, `response_retention_days`, `audit_retention_days`,
   `guardian_event_retention_days`), or `RuntimeConfigStore::set()` applies it directly (`log_level`,
   which calls `spdlog::set_level`).
-- **on next use / on next gauge sweep** - nothing is assigned, but the consumer reads the store each
-  time it needs the value, so the next read observes the change.
+- **on next check** - nothing is assigned, but the consumer reads the store each time it needs the
+  value, so the next read observes the change (`plugin_signing_required`).
+- **persisted only, applied at next boot or next DEX-alerts Settings save** - `dex_alert_routing`,
+  `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`,
+  `dex_cohort_export_key`. The live consumers (`DexAlertRouter`, the blast-radius detector, the
+  cohort-gauge export key) are **cached in memory** and refreshed only by `apply_dex_alert_config()`,
+  which runs at server startup and from the Settings -> DEX alerts save handler - never from this
+  endpoint. A `PUT` through this API is inert on the running server until one of those two happens.
+  To change DEX alerting and have it apply at once, use Settings -> DEX alerts.
 - **never** - `auto_approve_enabled` is accepted by the allow-list and written to the store, but no
   code reads it back from there. `GET /api/config` reports `auto_approve_enabled` **derived from
   whether any auto-approve rule exists**, not from the stored value, so a `PUT` of this key can
@@ -3168,6 +3175,13 @@ is a bare `error` string with no envelope:
   "meta": { "api_version": "v1" }
 }
 ```
+
+A value of `0` for `heartbeat_timeout`, `response_retention_days` or `audit_retention_days` passes
+the route's `>= 0` pre-check and is then rejected by the store's own `> 0` check, so it returns the
+**bare** shape with a different message: `{ "error": "value must be a positive integer" }`.
+
+**Audit:** a successful write emits `config.update` / `RuntimeConfig` with `target_id` = the key.
+See [Audit log](audit-log.md) for the `detail` contract, which differs for secret-valued keys.
 
 ---
 

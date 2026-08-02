@@ -444,3 +444,15 @@ When using OIDC/Entra ID:
 - Configure the OIDC provider to require MFA
 - Restrict the app registration to your tenant (single-tenant)
 - Rotate the client secret regularly
+
+> **Upgrading: if `oidc_client_secret` was ever set on this install, rotate it.**
+> Earlier versions emitted the value in the clear to three places - the server log
+> (written by the startup override pass on every boot), `GET /api/config` (gated only
+> on `Infrastructure:Read`), and the `config.update` audit detail (readable by every
+> role seeded `AuditLog:Read`, which includes the seeded `Operator` role). Those paths
+> are now closed, and audit rows written before the fix are redacted when read. **The
+> stored value itself is unchanged**, so anyone or anything that already read it still
+> holds a working credential. Treat a secret set before this upgrade as disclosed and
+> rotate it at the IdP. Note that rotating via `PUT /api/config/oidc_client_secret`
+> persists the new value but does **not** rebuild the running OIDC provider - use
+> Settings -> OIDC, or restart the server, for it to take effect.
