@@ -13044,9 +13044,23 @@ private:
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
         viz_routes_ = std::make_unique<VizRoutes>();
+        // Asset-tag join for the fleet topology. A null TagStore yields a null
+        // fn, which means no `tags` on the wire AND no Tag:Read gate — i.e.
+        // exactly the pre-tags behaviour, so a tagless deployment is unchanged.
+        // Captures the raw pointer (owned by this ServerImpl, outlives
+        // web_server_) the same way tag_store_ is handed to other consumers.
+        VizRoutes::TagsFn viz_tags_fn;
+        if (tag_store_) {
+            viz_tags_fn = [ts = tag_store_.get()](const std::string& agent_id) {
+                std::map<std::string, std::string> out;
+                for (const auto& kv : ts->get_tag_map(agent_id))
+                    out.emplace(kv.first, kv.second);
+                return out;
+            };
+        }
         viz_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
                                      fleet_topology_store_.get(), &metrics_, &viz_disabled_,
-                                     offline_endpoint_store_.get());
+                                     offline_endpoint_store_.get(), std::move(viz_tags_fn));
 
         // DashboardRoutes — /fragments/results, /fragments/results/filter-bar,
         //                   /fragments/create-group-form, /api/dashboard/group-from-results

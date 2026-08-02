@@ -38,6 +38,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -80,11 +81,24 @@ struct VizHarness {
     yuzu::MetricsRegistry metrics;
     std::atomic<bool> kill_switch{false};
     bool perm_grant{true};
+    /// Deny only the Tag:Read check while leaving Response:Read granted, so
+    /// the tag gate can be exercised without also failing the base RBAC.
+    bool tag_read_grant{true};
+    /// agent_id -> asset tags. Empty (the default) leaves tags_fn null, which
+    /// is the "server has no TagStore" wiring and must reproduce the exact
+    /// pre-tags behaviour.
+    std::map<std::string, std::map<std::string, std::string>> tags;
     std::vector<AuditRecord> audit_log;
     VizRoutes routes;
 
+    /// `seed_tags` must arrive via the ctor, not by assigning `h.tags` after
+    /// construction: register_routes runs here and decides whether to install
+    /// a TagsFn at all (null fn == server with no TagStore == no Tag:Read
+    /// gate), so a later assignment would never be observed.
     explicit VizHarness(std::vector<RawAgentSnapshot> seed = {}, bool with_store = true,
-                        bool fetcher_throws = false) {
+                        bool fetcher_throws = false,
+                        std::map<std::string, std::map<std::string, std::string>> seed_tags = {}) {
+        tags = std::move(seed_tags);
         if (with_store) {
             auto fetcher = fetcher_throws ? throwing_fetcher() : fixed_fetcher(std::move(seed));
             store = std::make_unique<FleetTopologyStore>(
@@ -102,9 +116,13 @@ struct VizHarness {
             s.role = auth::Role::admin;
             return s;
         };
-        auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
-                              const std::string&) -> bool {
+        auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
+                              const std::string& securable, const std::string&) -> bool {
             if (!perm_grant) {
+                res.status = 403;
+                return false;
+            }
+            if (securable == "Tag" && !tag_read_grant) {
                 res.status = 403;
                 return false;
             }
@@ -115,8 +133,16 @@ struct VizHarness {
             audit_log.push_back({a, r, tt, ti, d});
         };
 
+        VizRoutes::TagsFn tags_fn;
+        if (!tags.empty()) {
+            tags_fn = [this](const std::string& agent_id) {
+                auto it = tags.find(agent_id);
+                return it == tags.end() ? std::map<std::string, std::string>{} : it->second;
+            };
+        }
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn, with_store ? store.get() : nullptr,
-                               &metrics, &kill_switch);
+                               &metrics, &kill_switch, /*offline_store=*/nullptr,
+                               std::move(tags_fn));
     }
 };
 
@@ -139,7 +165,7 @@ TEST_CASE("REST viz: GET JSON returns fleet_topology.v1 envelope", "[viz][routes
     REQUIRE(j.contains("schema"));
     CHECK(j["schema"].get<std::string>() == "fleet_topology.v1");
     REQUIRE(j.contains("schema_minor"));
-    CHECK(j["schema_minor"].get<int>() == 4); // PR 12: ListenerSocket.local_addr added
+    CHECK(j["schema_minor"].get<int>() == 5); // MachineNode.tags added (asset-tag tiering)
     REQUIRE(j.contains("machines"));
     REQUIRE(j["machines"].is_array());
     CHECK(j["machines"].size() == 2);
@@ -173,7 +199,7 @@ TEST_CASE("REST viz: GET fragment wraps the same JSON in <script> tag", "[viz][r
     REQUIRE(j.contains("schema"));
     CHECK(j["schema"].get<std::string>() == "fleet_topology.v1");
     REQUIRE(j.contains("schema_minor"));
-    CHECK(j["schema_minor"].get<int>() == 4); // PR 12: ListenerSocket.local_addr added
+    CHECK(j["schema_minor"].get<int>() == 5); // MachineNode.tags added (asset-tag tiering)
 
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].detail.find("fragment=1") != std::string::npos);
@@ -611,4 +637,89 @@ TEST_CASE("REST viz: host endpoint returns 404 for unknown agent + audit row", "
     CHECK(h.audit_log[0].result == "failure");
     CHECK(h.audit_log[0].target_id == "bogus-id");
     CHECK(h.audit_log[0].detail == "not_found");
+}
+
+// =============================================================================
+// Asset-tag join + Tag:Read gate (tag-driven tier classification)
+// =============================================================================
+
+TEST_CASE("REST viz: machines carry operator asset tags when Tag:Read is held", "[viz][tags]") {
+    std::vector<RawAgentSnapshot> seed{mk_agent("a1", "host-1"), mk_agent("a2", "host-2")};
+    std::map<std::string, std::map<std::string, std::string>> tags{
+        {"a1", {{"role", "Presentation"}, {"environment", "Production"}}},
+        {"a2", {{"role", "EUS"}}}};
+    VizHarness h(std::move(seed), /*with_store=*/true, /*fetcher_throws=*/false, std::move(tags));
+
+    auto res = h.sink.Get("/api/v1/viz/fleet/topology");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = json::parse(res->body);
+    REQUIRE(j.contains("machines"));
+
+    bool saw_a1 = false;
+    bool saw_a2 = false;
+    for (const auto& m : j["machines"]) {
+        const auto id = m.value("agent_id", std::string{});
+        if (id == "a1") {
+            saw_a1 = true;
+            REQUIRE(m.contains("tags"));
+            CHECK(m["tags"]["role"].get<std::string>() == "Presentation");
+            CHECK(m["tags"]["environment"].get<std::string>() == "Production");
+        } else if (id == "a2") {
+            saw_a2 = true;
+            REQUIRE(m.contains("tags"));
+            CHECK(m["tags"]["role"].get<std::string>() == "EUS");
+        }
+    }
+    CHECK(saw_a1);
+    CHECK(saw_a2);
+    // schema_minor advertises the additive `tags` field.
+    CHECK(j["schema_minor"].get<int>() == 5);
+}
+
+TEST_CASE("REST viz: no TagStore wired leaves the payload tag-free", "[viz][tags]") {
+    // Null TagsFn is the "server has no TagStore" wiring. The response must be
+    // byte-compatible with the pre-tags shape AND must not consult Tag:Read --
+    // otherwise every tagless deployment starts 403ing on upgrade.
+    VizHarness h({mk_agent("a1", "host-1")});
+    h.tag_read_grant = false; // would 403 if the gate ran
+
+    auto res = h.sink.Get("/api/v1/viz/fleet/topology");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = json::parse(res->body);
+    for (const auto& m : j["machines"])
+        CHECK_FALSE(m.contains("tags"));
+}
+
+TEST_CASE("REST viz: Tag:Read denial blocks the topology when tags are wired", "[viz][tags]") {
+    // Response:Read alone must not reach tag values through the viz side door.
+    std::map<std::string, std::map<std::string, std::string>> tags{
+        {"a1", {{"role", "Data"}, {"location", "Hyderabad"}}}};
+    VizHarness h({mk_agent("a1", "host-1")}, /*with_store=*/true, /*fetcher_throws=*/false,
+                 std::move(tags));
+    h.tag_read_grant = false;
+
+    auto res = h.sink.Get("/api/v1/viz/fleet/topology");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    // The denial must not leak the tag values it was protecting.
+    CHECK(res->body.find("Hyderabad") == std::string::npos);
+}
+
+TEST_CASE("REST viz: untagged machine omits the tags key entirely", "[viz][tags]") {
+    // Absence must be indistinguishable from "no tags set" so an operator
+    // cannot infer tag existence from payload shape.
+    std::map<std::string, std::map<std::string, std::string>> tags{{"a1", {{"role", "Data"}}}};
+    VizHarness h({mk_agent("a1", "host-1"), mk_agent("a2", "host-2")}, /*with_store=*/true,
+                 /*fetcher_throws=*/false, std::move(tags));
+
+    auto res = h.sink.Get("/api/v1/viz/fleet/topology");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = json::parse(res->body);
+    for (const auto& m : j["machines"]) {
+        if (m.value("agent_id", std::string{}) == "a2")
+            CHECK_FALSE(m.contains("tags"));
+    }
 }

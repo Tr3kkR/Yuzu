@@ -501,7 +501,7 @@ TEST_CASE("topology: dst_pid serializes only when non-zero; schema_minor bumped"
     auto snap = store.get(false);
     json j = *snap;
 
-    CHECK(j["schema_minor"] == 4); // PR 12: ListenerSocket.local_addr added
+    CHECK(j["schema_minor"] == 5); // MachineNode.tags added (asset-tag tiering)
 
     const auto& edges = j["machines"][0]["connections"];
     REQUIRE(edges.size() == 3);

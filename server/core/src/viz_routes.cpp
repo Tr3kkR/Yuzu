@@ -107,17 +107,17 @@ void VizRoutes::register_routes(httplib::Server& svr, AuthFn /*auth_fn*/, PermFn
                                 AuditFn audit_fn, FleetTopologyStore* store,
                                 yuzu::MetricsRegistry* metrics,
                                 const std::atomic<bool>* kill_switch,
-                                OfflineEndpointStore* offline_store) {
+                                OfflineEndpointStore* offline_store, TagsFn tags_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, AuthFn{}, std::move(perm_fn), std::move(audit_fn), store, metrics,
-                    kill_switch, offline_store);
+                    kill_switch, offline_store, std::move(tags_fn));
 }
 
 void VizRoutes::register_routes(HttpRouteSink& sink, AuthFn /*auth_fn*/, PermFn perm_fn,
                                 AuditFn audit_fn, FleetTopologyStore* store,
                                 yuzu::MetricsRegistry* metrics,
                                 const std::atomic<bool>* kill_switch,
-                                OfflineEndpointStore* offline_store) {
+                                OfflineEndpointStore* offline_store, TagsFn tags_fn) {
     // auth_fn is accepted in the signature for parity with sibling
     // register_routes overloads but never invoked here -- require_permission
     // (which the perm_fn lambda wraps) calls require_auth internally, so a
@@ -129,6 +129,7 @@ void VizRoutes::register_routes(HttpRouteSink& sink, AuthFn /*auth_fn*/, PermFn 
     metrics_ = metrics;
     kill_switch_ = kill_switch;
     offline_store_ = offline_store;
+    tags_fn_ = std::move(tags_fn);
 
     sink.Get("/api/v1/viz/fleet/topology",
              [this](const httplib::Request& req, httplib::Response& res) {
@@ -187,6 +188,17 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     // ── 3. RBAC ───────────────────────────────────────────────────────────
     // perm_fn_ writes the 401/403 body and status itself; bail on false.
     if (!perm_fn_(req, res, "Response", "Read"))
+        return;
+    // The payload carries operator-asserted asset tags, which are gated on
+    // Tag:Read everywhere else (PUT/GET /api/v1/tags). Requiring it here too
+    // keeps the viz from becoming a side channel that leaks Environment /
+    // Service / Location to a principal holding only Response:Read.
+    //
+    // NOTE this TIGHTENS the route: a principal with Response:Read but not
+    // Tag:Read used to get a topology and now gets 403. Deliberate — see the
+    // fleet-viz invariants doc. The alternative (omit tags, still serve the
+    // topology) was considered and rejected in favour of one obvious rule.
+    if (tags_fn_ && !perm_fn_(req, res, "Tag", "Read"))
         return;
 
     // ── 4. Parse query params ────────────────────────────────────────────
@@ -312,6 +324,29 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
 
     // ── 8. Serialise + respond ───────────────────────────────────────────
     nlohmann::json j = *snap;
+
+    // Join operator-asserted asset tags onto each machine. Injected into the
+    // already-materialised JSON rather than into the snapshot: `snap` aliases
+    // the store's cached object (shared_ptr<const>), so mutating it would both
+    // race other in-flight requests and poison the cache for the TTL. The
+    // copy-on-write dance used for offline merges above would cost a second
+    // full deep copy of up to machines_max nodes purely to attach four short
+    // strings each -- injecting post-serialisation is the same result for one
+    // map lookup per machine.
+    if (tags_fn_) {
+        auto machines_it = j.find("machines");
+        if (machines_it != j.end() && machines_it->is_array()) {
+            for (auto& jm : *machines_it) {
+                const auto aid = jm.value("agent_id", std::string{});
+                if (aid.empty())
+                    continue;
+                auto tags = tags_fn_(aid);
+                if (!tags.empty())
+                    jm["tags"] = std::move(tags);
+            }
+        }
+    }
+
     auto body = j.dump();
 
     if (as_fragment) {

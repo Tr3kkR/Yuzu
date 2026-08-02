@@ -22,6 +22,7 @@
 #include "process_category.hpp"
 
 #include <cstdint>
+#include <map>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
@@ -139,6 +140,13 @@ struct MachineNode {
     /// Truncation flags propagated from fleet_snapshot.v1.
     bool truncated_processes{false};
     bool truncated_connections{false};
+    /// Operator-asserted asset tags (`role`, `environment`, `location`,
+    /// `service`) joined in at the route layer from TagStore — NOT agent
+    /// reported. Empty unless the caller holds Tag:Read; the renderer's
+    /// tier classification prefers `role` over the port heuristic because
+    /// this map is operator-controlled and the heuristic's inputs are not.
+    /// `std::map` (not unordered) so the emitted JSON key order is stable.
+    std::map<std::string, std::string> tags;
 };
 
 /// Aggregate snapshot returned by FleetTopologyStore::get.
@@ -253,6 +261,11 @@ inline void to_json(nlohmann::json& j, const MachineNode& m) {
         j["truncated_processes"] = true;
     if (m.truncated_connections)
         j["truncated_connections"] = true;
+    // Omitted entirely when empty so a caller without Tag:Read gets a payload
+    // byte-identical to the pre-tags shape — absence is indistinguishable from
+    // "no tags set", which is the intended non-disclosure.
+    if (!m.tags.empty())
+        j["tags"] = m.tags;
 }
 
 inline void to_json(nlohmann::json& j, const HostTopologySnapshot& s) {
@@ -272,9 +285,13 @@ inline void to_json(nlohmann::json& j, const TopologySnapshot& s) {
          // `local_addr` (bind address) field. Additive — older renderers
          // ignore. The renderer filters out loopback bind addresses so
          // only externally-reachable listeners appear on the cube surface.
+         // schema_minor bump 4 → 5: MachineNode grows an optional `tags`
+         // object (operator-asserted asset tags, present only for callers
+         // holding Tag:Read). Additive — older renderers ignore it and keep
+         // using the port/process tier heuristic.
          // Prior bumps: 2 → 3 added per-MachineNode `listeners` array
          // (PR 9 / UAT 2026-05-12); 1 → 2 added `dst_pid` on Local edges.
-         {"schema_minor", 4},
+         {"schema_minor", 5},
          {"generated_at", s.generated_at},
          {"include_vuln", s.include_vuln},
          {"machines", s.machines}};

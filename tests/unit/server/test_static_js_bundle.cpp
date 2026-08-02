@@ -383,9 +383,13 @@ TEST_CASE("static_js_bundle: kYuzuVizJs stacks machines into three architecture 
     // frontend on top, application middle, database on the bottom. Pin
     // the classifier name + the TIER_Y dict + the per-tier Y derivations
     // so a refactor that collapses the layout back to a single grid (or
-    // that re-orders the tiers — top tier MUST be frontend, bottom MUST
-    // be database) fails the test instead of silently producing a flat
-    // grid with surprised operators.
+    // that re-orders the tiers — bottom tier MUST be database) fails the
+    // test instead of silently producing a flat grid with surprised
+    // operators.
+    //
+    // Asset-tag tiering added a FOURTH plane, 'eus', above 'frontend' for
+    // operator-tagged client endpoints. 'frontend' is therefore no longer
+    // the top plane; the service stack below it is unchanged.
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("classifyTier"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("TIER_Y"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("database: CUBE_SIZE / 2,"));
@@ -406,6 +410,48 @@ TEST_CASE("static_js_bundle: kYuzuVizJs stacks machines into three architecture 
     REQUIRE(pos_default != std::string::npos);
     CHECK(pos_db < pos_web);
     CHECK(pos_web < pos_default);
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs prefers the operator role tag over the port heuristic",
+          "[static-js][viz]") {
+    // Asset-tag tiering. The `role` tag is operator-asserted (server-side
+    // TagStore) whereas the port/process heuristic reads agent-controlled
+    // fields, so the tag MUST win. Pin the ordering: tierFromRoleTag has to
+    // be consulted and returned from BEFORE the first heuristic scoring
+    // line, otherwise a refactor could silently demote tags to a tiebreak
+    // and operators would see their explicit tiering ignored.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("tierFromRoleTag"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("ROLE_TIER"));
+    const auto pos_tagcall =
+        yuzu::server::kYuzuVizJs.find("const tagged = tierFromRoleTag(machine)");
+    const auto pos_tagreturn = yuzu::server::kYuzuVizJs.find("if (tagged) return tagged");
+    const auto pos_score = yuzu::server::kYuzuVizJs.find("let dbScore = 0");
+    REQUIRE(pos_tagcall != std::string::npos);
+    REQUIRE(pos_tagreturn != std::string::npos);
+    REQUIRE(pos_score != std::string::npos);
+    CHECK(pos_tagcall < pos_tagreturn);
+    CHECK(pos_tagreturn < pos_score);
+
+    // The 'eus' client plane sits above 'frontend'. Pin the Y derivation and
+    // the layout order so the top-down request-flow reading (clients →
+    // presentation → application → data) can't be silently reordered.
+    CHECK_THAT(yuzu::server::kYuzuVizJs,
+               ContainsSubstring("eus:      CUBE_SIZE / 2 + 3 * TIER_GAP"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs,
+               ContainsSubstring("const order = ['eus', 'frontend', 'app', 'database']"));
+
+    // Camera pivot must be the derived stack centre, not TIER_Y.app. Adding
+    // the fourth plane made 'app' no longer the midpoint; framing on it
+    // leaves the fleet sitting low in the viewport.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("const TIER_CENTER_Y"));
+    CHECK(yuzu::server::kYuzuVizJs.find("controls.target.set(0, TIER_Y.app, 0)") ==
+          std::string::npos);
+    CHECK(yuzu::server::kYuzuVizJs.find("camera.lookAt(0, TIER_Y.app, 0)") == std::string::npos);
+
+    // An unknown / typo'd role must fall through to the heuristic rather than
+    // defaulting to a plane — pin the hasOwnProperty guard that does it.
+    CHECK_THAT(yuzu::server::kYuzuVizJs,
+               ContainsSubstring("Object.prototype.hasOwnProperty.call(ROLE_TIER, key)"));
 }
 
 TEST_CASE("static_js_bundle: WEB_PORTS contains only classic frontend-tier ports",

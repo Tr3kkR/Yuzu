@@ -30,6 +30,7 @@
 
 #include <atomic>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 
@@ -53,6 +54,12 @@ public:
     using AuditFn = std::function<void(const httplib::Request&, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
+    /// Operator-asserted asset tags for one agent, keyed by category
+    /// (`role`, `environment`, `location`, `service`). Injected rather than
+    /// taking a TagStore* so the route stays testable without a live SQLite
+    /// store. May be null — then no machine carries tags and the renderer
+    /// falls back to its port/process tier heuristic.
+    using TagsFn = std::function<std::map<std::string, std::string>(const std::string& agent_id)>;
 
     /// Per-route limit on materialised machine count. Requests that would
     /// produce a snapshot larger than this respond 413; the operator must
@@ -79,14 +86,14 @@ public:
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          FleetTopologyStore* store, yuzu::MetricsRegistry* metrics,
                          const std::atomic<bool>* kill_switch,
-                         OfflineEndpointStore* offline_store = nullptr);
+                         OfflineEndpointStore* offline_store = nullptr, TagsFn tags_fn = nullptr);
 
     /// Sink-based overload for in-process unit tests (#438 — TestRouteSink).
     /// Same registration semantics as the httplib::Server overload.
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                          FleetTopologyStore* store, yuzu::MetricsRegistry* metrics,
                          const std::atomic<bool>* kill_switch,
-                         OfflineEndpointStore* offline_store = nullptr);
+                         OfflineEndpointStore* offline_store = nullptr, TagsFn tags_fn = nullptr);
 
 private:
     /// Shared handler body used by both routes. `as_fragment` controls whether
@@ -108,6 +115,8 @@ private:
     const std::atomic<bool>* kill_switch_{nullptr};
     /// Durable last-known endpoint store (#1320 PR 3). Borrowed; may be null.
     OfflineEndpointStore* offline_store_{nullptr};
+    /// Asset-tag lookup. Null when the server wires no TagStore.
+    TagsFn tags_fn_;
 };
 
 } // namespace yuzu::server

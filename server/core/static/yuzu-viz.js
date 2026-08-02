@@ -162,16 +162,31 @@ function hash32(str) {
 const CUBE_SIZE = 8;
 const CUBE_SPACING = 18;
 const TIER_GAP = 22;
-// Tier order is fixed: 'frontend' renders highest, 'database' lowest.
+// Tier order is fixed: 'eus' renders highest, 'database' lowest.
 // The dict is the source of truth for the layout AND camera framing; the
 // per-tier Y is derived from CUBE_SIZE so cubes rest on each plane the
 // way the lone tier did before (gov R5 UP-7 mirror — non-finite TIER_Y
 // would crash WebGL; the constants are arithmetic, no agent input).
+//
+// 'eus' (End User Systems) is the client plane: the laptops/desktops that
+// consume the service stack below them. It sits ABOVE 'frontend' so the
+// canvas reads top-down in request order — clients hit presentation, which
+// calls application, which reads data. Reachable only via an operator-set
+// `role` tag; the port heuristic never yields 'eus' (a client endpoint is
+// characterised by what it does NOT listen on, which ports cannot express).
 const TIER_Y = {
   database: CUBE_SIZE / 2,
   app:      CUBE_SIZE / 2 + TIER_GAP,
-  frontend: CUBE_SIZE / 2 + 2 * TIER_GAP
+  frontend: CUBE_SIZE / 2 + 2 * TIER_GAP,
+  eus:      CUBE_SIZE / 2 + 3 * TIER_GAP
 };
+
+// Vertical centre of the full stack — the OrbitControls pivot and camera
+// look-at. Derived rather than hardcoded to TIER_Y.app: 'app' happened to
+// be the midpoint of the old three-plane stack, so adding 'eus' on top
+// silently pushed the pivot off-centre and framed the fleet low. Computed
+// from the dict so any future plane keeps this honest.
+const TIER_CENTER_Y = (TIER_Y.database + TIER_Y.eus) / 2;
 
 // Listener-port hints. The classifier prefers listener ports over process
 // category because a host bound to a DB/HTTP port is by definition serving
@@ -213,8 +228,57 @@ const WEB_PORTS = new Set([
 // agent-controlled fields (listener ports + process category). It carries
 // NO authorization or trust weight. Do not use the tier output as a
 // security signal — a hostile agent could place itself on any plane.
+// Operator-asserted `role` tag → plane. Matched case-insensitively so
+// "Presentation"/"presentation"/"PRESENTATION" all land the same; the
+// synonyms cover the vocabularies operators actually use (a fleet tagged
+// role=web or role=frontend means the same plane as role=Presentation).
+// Unknown role values deliberately fall through to the port heuristic
+// rather than defaulting to a plane — a typo'd tag should look like an
+// untagged host, not silently relocate the machine.
+const ROLE_TIER = {
+  eus:          'eus',
+  client:       'eus',
+  workstation:  'eus',
+  desktop:      'eus',
+  laptop:       'eus',
+  enduser:      'eus',
+  presentation: 'frontend',
+  frontend:     'frontend',
+  web:          'frontend',
+  proxy:        'frontend',
+  application:  'app',
+  app:          'app',
+  middleware:   'app',
+  data:         'database',
+  database:     'database',
+  db:           'database'
+};
+
+// Resolve the operator-set role tag to a plane, or '' when absent/unknown.
+// `tags` is present only when the caller holds Tag:Read (server omits the
+// key otherwise), so this silently no-ops for under-privileged viewers and
+// the port heuristic carries the layout exactly as it did before.
+function tierFromRoleTag(machine) {
+  const tags = machine && machine.tags;
+  if (!tags || typeof tags !== 'object') return '';
+  const role = tags.role;
+  if (typeof role !== 'string' || role.length === 0) return '';
+  // Bound the key before lookup: `tags` is server-supplied but the value
+  // originates from operator input, and an unbounded string as an object
+  // key is needless work on a per-machine hot path.
+  const key = role.slice(0, 64).trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(ROLE_TIER, key) ? ROLE_TIER[key] : '';
+}
+
 function classifyTier(machine) {
   if (!machine) return 'app';
+  // Tag first: operator-asserted beats inferred. This is also the only
+  // classification input that is NOT agent-controlled — the port/process
+  // heuristic below reads fields a hostile agent chooses, whereas `role`
+  // comes from the server's TagStore. Tier placement remains a VISUAL cue
+  // either way and still carries no authorization weight.
+  const tagged = tierFromRoleTag(machine);
+  if (tagged) return tagged;
   let dbScore = 0;
   let webScore = 0;
   const sockets = extractListenSockets(machine);
@@ -237,17 +301,20 @@ function classifyTier(machine) {
 function layoutMachines(machines) {
   if (!machines || machines.length === 0) return [];
   // Bucket each machine into its tier.
-  const tiers = {frontend: [], app: [], database: []};
+  const tiers = {eus: [], frontend: [], app: [], database: []};
   for (let i = 0; i < machines.length; i++) {
     const m = machines[i];
     if (!m) continue;
     const t = classifyTier(m);
-    tiers[t].push(m);
+    // Defensive: classifyTier is the only writer of this value, but an
+    // unknown key would push onto `undefined` and throw mid-layout, taking
+    // the whole canvas down. Fall back to the middle plane instead.
+    (tiers[t] || tiers.app).push(m);
   }
   // Per-tier sort + per-tier grid. Top-to-bottom order in the output is
-  // frontend → app → database; the consumer is order-agnostic but this
-  // keeps stack traces / dev-console inspection top-down readable.
-  const order = ['frontend', 'app', 'database'];
+  // eus → frontend → app → database; the consumer is order-agnostic but
+  // this keeps stack traces / dev-console inspection top-down readable.
+  const order = ['eus', 'frontend', 'app', 'database'];
   const out = [];
   for (let ti = 0; ti < order.length; ti++) {
     const name = order[ti];
@@ -864,16 +931,16 @@ function mount() {
 
   const camera = new THREE.PerspectiveCamera(
     FOV, canvas.clientWidth / Math.max(canvas.clientHeight, 1), NEAR, FAR);
-  // Frame the three-tier stack. Target sits at the middle tier's Y so
+  // Frame the stacked planes. Target sits at the stack's vertical centre so
   // OrbitControls rotates around the visual centre of the stack instead
   // of the floor grid (which was the old single-grid default).
   camera.position.set(45, 60, 45);
-  camera.lookAt(0, TIER_Y.app, 0);
+  camera.lookAt(0, TIER_CENTER_Y, 0);
 
   // OrbitControls drives drag-to-rotate + wheel-zoom; pan is disabled so
   // the WASD listener owns translation in screen space.
   const controls = new OrbitControls(camera, canvas);
-  controls.target.set(0, TIER_Y.app, 0);
+  controls.target.set(0, TIER_CENTER_Y, 0);
   controls.enablePan = false;
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
@@ -1807,8 +1874,8 @@ function mount() {
       if (!Number.isFinite(cp.x) || !Number.isFinite(cp.y) || !Number.isFinite(cp.z) ||
           !Number.isFinite(ct.x) || !Number.isFinite(ct.y) || !Number.isFinite(ct.z)) {
         camera.position.set(45, 60, 45);
-        controls.target.set(0, TIER_Y.app, 0);
-        camera.lookAt(0, TIER_Y.app, 0);
+        controls.target.set(0, TIER_CENTER_Y, 0);
+        camera.lookAt(0, TIER_CENTER_Y, 0);
       }
       applyWasdPan();
       controls.update();
