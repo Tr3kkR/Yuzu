@@ -37,15 +37,16 @@ guard is the seatbelt.
 **Known gap (#2579), and this page alerts on it late at best.** A pass that
 begins with NO stored reading has no missing-anchor trigger, so on a host whose
 clock is ALREADY skewed forward it deletes without declining, and keeps doing so
-while the skew persists. The 600k rows/day figure above is one such case. It
+until the rows stamped before the skew are exhausted (a still-drifting clock is
+the open-ended case). The 600k rows/day figure above is one such case. It
 reaches the alerts on this page only once a backlog binds the cap
 (`YuzuAuditRetentionCapBinding`, and only after six such passes - roughly 150,000
 rows); a sub-cap pass never fires anything here, and looks exactly like routine
 expiry. `yuzu_server_audit_rows_deleted_total` does move throughout, so it is
 evidence, but on its own it does not distinguish this from healthy expiry. There
 is no reliable retrospective test today - read the Limits note before improvising
-one. The trigger list, the bound and the signal set all live on the canonical
-page, deliberately not here:
+one. The full trigger list and the reasoning behind these signals live on the
+canonical page:
 [Limits](../user-manual/audit-log.md#the-retention-clock-guard).
 
 ## YuzuAuditPersistFailures - audit WRITES are failing

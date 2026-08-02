@@ -553,7 +553,8 @@ Before upgrading any component:
 - [ ] **Correct the server's clock before upgrading** (`timedatectl status` or
   `chronyc tracking`; under Docker it is the host's clock that matters). A
   forward-skewed clock can delete audit rows on the first retention pass after the
-  upgrade with no decline recorded, and keeps doing so while the skew persists -
+  upgrade with no decline recorded, and keeps doing so until the rows stamped
+  before the skew are exhausted -
   see [Retention clock
   guards](#retention-clock-guards-2360-server-audit-store-2361-tar-agent-warehouse)
   below and #2579. If you cannot establish that the clock is right, defer the

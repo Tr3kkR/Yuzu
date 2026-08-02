@@ -11,7 +11,8 @@ Elastic.
 > the first pass after upgrading to schema v3 --- and any later pass that again
 > starts with no stored reading --- deletes up to 25,000 rows with no decline and no
 > `yuzu_server_audit_clock_anomaly_skips_total` increment. **The exposure does not
-> end after that one pass:** it persists while the clock stays skewed. There is no
+> end after that one pass:** it keeps deleting rows stamped before the skew until
+> that cohort is exhausted. There is no
 > reliable way to detect it after the fact today. Bounds and signals are under
 > [Limits](#the-retention-clock-guard) below. **Correct the clock before
 > upgrading**; if you cannot, defer the upgrade.
