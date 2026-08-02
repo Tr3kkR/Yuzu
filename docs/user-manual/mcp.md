@@ -179,7 +179,10 @@ change: a notification POST now answers `202` instead of `204`).
 - **`GET /mcp/v1/`** is the session's server→client **SSE channel**. It requires the
   session's `Mcp-Session-Id` (`400` if absent; `404` if unknown, expired, or another
   principal's) and `Accept: text/event-stream` (`-32011` / `406` otherwise — wildcards
-  like `*/*` do not opt in). The stream sends heartbeats every ~3 s and supports
+  like `*/*` do not opt in). The stream sends a heartbeat on any ~3 s tick that delivers
+  nothing else — a stream busy delivering real frames emits no heartbeat filler, so do
+  not key liveness detection on heartbeat cadence: any delivered frame proves liveness.
+  It supports
   **`Last-Event-ID` resume**: reconnect with the last id you saw and the server replays
   exactly the frames you missed from a bounded per-session ring. If your cursor has
   already been evicted from that ring, the session is terminated and the request `404`s
@@ -191,7 +194,8 @@ change: a notification POST now answers `202` instead of `204`).
   stream. A second `GET` on the same session **takes over** (the older stream closes with
   `superseded`), so a client reconnecting across a dead TCP connection is never locked
   out by its own zombie.
-  The credential that opened a stream is re-checked on every heartbeat. On a
+  The credential that opened a stream is re-checked once per tick (~3 s), whether or
+  not a heartbeat frame is emitted. On a
   single-server deployment, revoking it ends the stream within one tick
   (`credential_revoked`). On a **multi-replica** deployment, revocation of an
   **API token** is not instantaneous: the token cache is per-process, so a revoke

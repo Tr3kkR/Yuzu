@@ -6519,8 +6519,9 @@ The MCP Streamable HTTP **SSE channel** — the server→client half of a sessio
 (`notifications/progress`) arrive with the next 2f rung.
 
 **Permission:** the same credential as `POST /mcp/v1/`, plus the session's
-`Mcp-Session-Id` header. The credential is re-checked on every heartbeat, so revoking it
-ends a *live* stream, not just future ones.
+`Mcp-Session-Id` header. The credential is re-checked once per tick (~3 s), whether or
+not a heartbeat frame is emitted, so revoking it ends a *live* stream, not just future
+ones.
 
 **Required headers:** `Mcp-Session-Id` (from `initialize`), `Accept: text/event-stream`.
 **Optional:** `Last-Event-ID` to resume.
