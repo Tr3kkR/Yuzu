@@ -390,30 +390,120 @@ TEST_CASE("ApprovalManager: consume_ticket replay is rejected and keeps the orig
     CHECK(row->consumed_by == "operator1"); // the losing recall never overwrites
 }
 
-// ── Mint-surface origin + reserved namespace (#2442) ───────────────────────
+// ── Mint-surface origin + the redemption guard (#2442) ─────────────────────
 // The MCP recall matches a ticket on (definition_id, scope_expression) and
 // does not bind the submitter, so a ticket minted elsewhere under an `mcp.`
-// definition id is a ticket the MCP gate would accept.
+// definition id is a ticket the MCP gate would otherwise accept. The refusal
+// lives at REDEMPTION, keyed on the recorded origin — minting is a legitimate
+// act, redeeming on a foreign surface is not. These cases are the tether on
+// that: they are what stops the guard being dropped or narrowed unnoticed.
 
-TEST_CASE("ApprovalManager: a declared non-MCP origin cannot mint into the mcp. namespace",
+TEST_CASE("ApprovalManager: a ticket minted by a declared non-MCP surface cannot be redeemed",
           "[approval_manager][approval][security]") {
     TestDb tdb;
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
     // The REST instruction gate: definition id caller-influenced, scope
-    // expression caller-supplied verbatim.
+    // expression caller-supplied verbatim. The mint SUCCEEDS — refusing it here
+    // is what stranded pre-existing operator content, and is deliberately gone.
     auto forged = mgr.submit("mcp.quarantine_device", "attacker", "{\"agent_id\":\"a1\"}", "",
                              ApprovalOrigin::kInstruction);
-    REQUIRE(!forged.has_value());
-    CHECK(forged.error().find("reserved") != std::string::npos);
+    REQUIRE(forged.has_value());
+    REQUIRE(mgr.approve(*forged, "admin1", "").has_value());
 
-    auto from_schedule = mgr.submit("mcp.delete_tag", "attacker", "{}", "sched-1",
-                                    ApprovalOrigin::kSchedule);
-    CHECK(!from_schedule.has_value());
+    // The redemption is where it dies. This is the MCP recall's call shape.
+    auto redeemed = mgr.consume_ticket(*forged, "attacker");
+    REQUIRE(!redeemed.has_value());
 
-    // Nothing was written.
-    CHECK(mgr.query({}).empty());
+    // And the ticket is UNTOUCHED — a refused forgery must not burn it.
+    auto row = mgr.get(*forged);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0);
+    CHECK(row->consumed_by.empty());
+    CHECK(row->status == "approved");
+
+    // Same for the scheduler surface.
+    auto sched = mgr.submit("mcp.delete_tag", "attacker", "{}", "sched-1",
+                            ApprovalOrigin::kSchedule);
+    REQUIRE(sched.has_value());
+    REQUIRE(mgr.approve(*sched, "admin1", "").has_value());
+    CHECK(!mgr.consume_ticket(*sched, "attacker").has_value());
+    CHECK(mgr.get(*sched)->consumed_at == 0);
+}
+
+TEST_CASE("ApprovalManager: the redemption refusal is a distinct kind but not a distinct message",
+          "[approval_manager][approval][security]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto forged = mgr.submit("mcp.quarantine_device", "attacker", "{}", "",
+                             ApprovalOrigin::kInstruction);
+    REQUIRE(forged.has_value());
+    REQUIRE(mgr.approve(*forged, "admin1", "").has_value());
+
+    auto denied = mgr.consume_ticket(*forged, "attacker", {});
+    REQUIRE(!denied.has_value());
+    // The KIND separates a forgery attempt from a replay, so the log and any
+    // future audit row can tell them apart.
+    CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin);
+
+    // The MESSAGE deliberately does not. A spent ordinary ticket and a refused
+    // forgery must read identically to a remote caller, or the recall becomes an
+    // oracle for which definition ids exist and which surface minted them.
+    auto spent = mgr.submit("inventory.audit", "operator1", "{}", "", ApprovalOrigin::kMcp);
+    REQUIRE(spent.has_value());
+    REQUIRE(mgr.approve(*spent, "admin1", "").has_value());
+    REQUIRE(mgr.consume_ticket(*spent, "operator1").has_value()); // first use succeeds
+    auto replay = mgr.consume_ticket(*spent, "operator1", {});    // second does not
+    REQUIRE(!replay.has_value());
+    CHECK(replay.error().kind == ConsumeFailure::kNotConsumable);
+    CHECK(denied.error().message == replay.error().message);
+}
+
+TEST_CASE("ApprovalManager: an MCP-minted ticket under the reserved prefix still redeems",
+          "[approval_manager][approval][security]") {
+    // The positive control. Without it, a guard that refused EVERYTHING would
+    // pass every assertion above.
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto declared = mgr.submit("mcp.quarantine_device", "operator1", "{\"agent_id\":\"a1\"}", "",
+                               ApprovalOrigin::kMcp);
+    REQUIRE(declared.has_value());
+    REQUIRE(mgr.approve(*declared, "admin1", "").has_value());
+    CHECK(mgr.consume_ticket(*declared, "operator1").has_value());
+    CHECK(mgr.get(*declared)->consumed_at != 0);
+
+    // And the undeclared mint — which is what the frozen MCP gate actually does
+    // today — must also still redeem, or the guard breaks the live MCP flow.
+    auto undeclared = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    REQUIRE(undeclared.has_value());
+    REQUIRE(mgr.approve(*undeclared, "admin1", "").has_value());
+    CHECK(mgr.consume_ticket(*undeclared, "operator1").has_value());
+}
+
+TEST_CASE("ApprovalManager: an ordinary non-MCP ticket is refused at redemption too",
+          "[approval_manager][approval][security]") {
+    // The guard is keyed on ORIGIN, not on the `mcp.` id prefix — so a REST-
+    // minted ticket for an ordinary definition is equally unredeemable through
+    // the recall. This is the property that survives the MCP mint changing how
+    // it builds its ids, which the prefix rule did not. It costs nothing: no
+    // legitimate flow redeems a REST-minted ticket here (the REST gate matches
+    // its own approvals by field comparison, it does not call consume_ticket).
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto rest = mgr.submit("inventory.audit", "operator1", "{}", "", ApprovalOrigin::kInstruction);
+    REQUIRE(rest.has_value());
+    REQUIRE(mgr.approve(*rest, "admin1", "").has_value());
+    auto denied = mgr.consume_ticket(*rest, "operator1", {});
+    REQUIRE(!denied.has_value());
+    CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin);
+    CHECK(mgr.get(*rest)->consumed_at == 0);
 }
 
 TEST_CASE("ApprovalManager: a declared origin is recorded on the ticket",

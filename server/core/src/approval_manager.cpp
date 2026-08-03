@@ -204,17 +204,9 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
         return std::unexpected("definition_id is required");
     if (submitted_by.empty())
         return std::unexpected("submitted_by is required");
-    // Namespace reservation (#2442): a surface that has declared itself as
-    // something other than MCP may not mint into the MCP ticket namespace. The
-    // MCP recall matches on (definition_id, scope_expression) and does not bind
-    // the submitter, so without this a ticket minted through the REST
-    // instruction gate — where the definition id is caller-influenced and the
-    // scope expression is caller-supplied verbatim — is a ticket the MCP recall
-    // will accept. Undeclared mints are exempt because the MCP gate itself is
-    // still one of them (ApprovalOrigin::kUnspecified).
-    if (origin != ApprovalOrigin::kMcp && origin != ApprovalOrigin::kUnspecified &&
-        is_reserved_definition_id(definition_id))
-        return std::unexpected(std::string(kReservedDefinitionIdError));
+    // #2442 is enforced at REDEMPTION, not here — see consume_ticket and the
+    // `origin` contract in the header. `origin` is recorded on the row written
+    // below and is the sole input to that guard.
 
     std::lock_guard lock(mtx_);
 
@@ -507,17 +499,59 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
         return std::unexpected(
             ConsumeError{ConsumeFailure::kStoreError, "consumed_by is required"});
 
-    // Pre-consume recheck (#2443). Skipped entirely when no precondition was
-    // supplied, so the two-argument path issues the exact same single statement
-    // it always has.
+    // ONE read serves both the #2442 redemption guard and the #2443 pre-consume
+    // recheck. get_checked, not get: a FAILED read must not be reported as a row
+    // that is not there. Telling the operator a live human-approved ticket is
+    // spent, because SQLite was busy for a moment, is the burn class #2443
+    // exists to close, re-entered through the taxonomy.
+    //
+    // This read is now UNCONDITIONAL. It used to happen only when a precondition
+    // was supplied, and the two-argument path issued a single statement; it now
+    // issues two. That cost buys the guard below and is paid on a path that has
+    // already waited for a human to click approve.
+    auto row = get_checked(id); // takes mtx_ itself — must be outside the lock below
+    if (!row)
+        return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, row.error()});
+
+    // #2442 — the redemption guard, and the reason this whole function reads the
+    // row. A ticket minted by a declared non-MCP surface is refused HERE, at the
+    // only production caller of consume_ticket, which is the MCP recall. The
+    // recall matches on (definition_id, scope_expression) and binds neither the
+    // submitter nor the surface, and on the REST instruction gate both of those
+    // fields are caller-influenced — so without this, a REST-minted ticket lines
+    // up with an MCP tool's canonical arguments and redeems against it. What the
+    // attacker gains is not a new permission: it is the HUMAN APPROVAL. An admin
+    // who approved an instruction execution would have unknowingly authorised an
+    // MCP tool invocation.
+    //
+    // Checked BEFORE consumability on purpose: a forgery attempt is a security
+    // event whatever the ticket's status, and letting a spent forgery report as
+    // an ordinary replay would lose it. The distinction is carried by the KIND
+    // and by the warn line — the operator-facing MESSAGE is deliberately the
+    // same string kNotConsumable uses, so a remote caller cannot use the recall
+    // to learn which ids exist or which surface minted them. That divergence
+    // between kind and message is intentional and is the only place in this
+    // function where the two disagree.
+    //
+    // The ticket is left UNTOUCHED either way — refusing a forgery must never
+    // burn a real operator's approval.
+    //
+    // `origin` is written once at INSERT and never UPDATEd, so reading it here
+    // rather than inside the CAS below is race-free for this field. Do not fold
+    // it into the CAS WHERE clause: that would collapse it into SQLITE_DONE and
+    // make a forgery indistinguishable from a replay in the log, which is the
+    // distinction this exists to record.
+    if (*row && declares_non_mcp_surface((*row)->origin)) {
+        spdlog::warn("ApprovalManager: refused recall of ticket {} minted by {} — "
+                     "cross-surface redemption (#2442)",
+                     redact_id(id), to_string((*row)->origin));
+        return std::unexpected(
+            ConsumeError{ConsumeFailure::kForeignOrigin,
+                         "approval not consumable (already used, not approved, or absent)"});
+    }
+
+    // Pre-consume recheck (#2443).
     if (precondition) {
-        // get_checked, not get: a FAILED read must not be reported as a row that
-        // is not there. Telling the operator a live human-approved ticket is
-        // spent, because SQLite was busy for a moment, is the burn class #2443
-        // exists to close, re-entered through the taxonomy.
-        auto row = get_checked(id); // takes mtx_ itself — must be outside the lock below
-        if (!row)
-            return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, row.error()});
         // A row that cannot transition is reported WITHOUT running the
         // precondition: the callback may be costly or emit audit, and the CAS
         // below would decline this row anyway. Same message as the CAS decline,

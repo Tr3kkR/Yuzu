@@ -1,6 +1,5 @@
 #pragma once
 
-#include "reserved_definition_id.hpp" // is_reserved_definition_id (#2442)
 
 #include <sqlite3.h>
 
@@ -45,6 +44,32 @@ enum class ApprovalOrigin {
 /// stayed silent.
 const char* to_string(ApprovalOrigin origin);
 ApprovalOrigin approval_origin_from_string(std::string_view text);
+
+/// True iff the ticket's recorded origin names a minting surface that is NOT
+/// MCP. This is the whole of the #2442 anti-forgery rule, stated once because it
+/// has to mean the same thing everywhere it is asked.
+///
+/// It is a DENY predicate for the MCP recall, and it is deliberately phrased
+/// over the ORIGIN rather than over the definition id. The forgery it stops is a
+/// ticket minted on one surface being redeemed on another; the `mcp.` id prefix
+/// was only ever a proxy for that, and a proxy with two defects. It could not
+/// tell a pre-existing operator definition from a hostile one, so it refused
+/// content it could not help — see the removed mint-side check in `submit`. And
+/// it would stop covering the real case the moment the MCP mint stopped building
+/// its id as `"mcp." + tool_name`, which nothing forces it to keep doing.
+///
+/// `kUnspecified` is ALLOWED, and that is the loose end. It has to be: the MCP
+/// mint itself still records `kUnspecified` (see the enum above), and migration
+/// v5 back-fills pre-existing rows to it. So a ticket minted by ANY surface
+/// before v5 ran is still redeemable here. Those rows age out on the 7-day
+/// approval TTL, and the exemption closes when the MCP mint declares `kMcp` and
+/// this allow-set narrows from two values to one — the same unfreeze that the
+/// `kUnspecified` comment above already waits on. Until then the guard is
+/// complete for every mint made after v5 by a surface that declares itself,
+/// which is both non-MCP surfaces.
+[[nodiscard]] constexpr bool declares_non_mcp_surface(ApprovalOrigin origin) {
+    return origin != ApprovalOrigin::kMcp && origin != ApprovalOrigin::kUnspecified;
+}
 
 struct Approval {
     std::string id;
@@ -103,6 +128,14 @@ enum class ConsumeFailure {
     kPrecondition,  ///< precondition denied — ticket UNTOUCHED, still recallable
     kNotConsumable, ///< absent / not approved / already consumed (the CAS lost)
     kStoreError,    ///< store unavailable, missing argument, or a SQLite failure
+    /// The ticket was minted by a declared non-MCP surface (#2442). Ticket
+    /// UNTOUCHED — a refused forgery must not burn a real operator's ticket.
+    /// This is a security event, not an operational one: it is logged at warn
+    /// with the origin named, while the CALLER is expected to keep reporting it
+    /// indistinguishably from kNotConsumable, so the recall is not an oracle for
+    /// which ids exist. Distinct from kNotConsumable so the log and any future
+    /// audit row can tell a forgery attempt from a replay.
+    kForeignOrigin,
 };
 
 struct ConsumeError {
@@ -138,14 +171,22 @@ public:
     /// the owning schedule's id for a scheduled-fire submission — see the
     /// `Approval::schedule_id` doc comment for why this matters.
     ///
-    /// `origin` (#2442) declares the minting surface. A caller that declares a
-    /// non-MCP origin may NOT mint a `mcp.`-prefixed definition_id: that is the
-    /// forgeable half of the cross-surface confusion, since the REST
-    /// instruction gate mints with a caller-influenced definition id and a
-    /// fully caller-controlled scope expression, which the MCP recall matches
-    /// on. Declaring no origin still permits the prefix, because the MCP mint
-    /// itself is the one caller that cannot yet declare — see
-    /// ApprovalOrigin::kUnspecified.
+    /// `origin` (#2442) declares the minting surface, and is RECORDED here
+    /// rather than enforced here. Minting is a legitimate act by a legitimately
+    /// authorised caller; the illegitimate act is redeeming that ticket on a
+    /// different surface, so the refusal lives at the redemption — see
+    /// `declares_non_mcp_surface` and `consume_ticket`.
+    ///
+    /// This function used to refuse a `mcp.`-prefixed definition_id from a
+    /// declared non-MCP origin. That check was removed deliberately: it stopped
+    /// the forgery, but it also failed closed on every PRE-EXISTING operator
+    /// definition under the prefix, on a path the store cannot tell apart from
+    /// an attack. On the scheduler that meant a permanently dropped occurrence
+    /// whose row is indistinguishable from a successful run in every field
+    /// `GET /api/schedules` exposes, with no safe rebuild available. Do not
+    /// reinstate it: the redemption guard closes the same hole and strands
+    /// nothing. Authoring a NEW definition under the prefix is still refused, at
+    /// `instruction_store.cpp` and `instruction_yaml.cpp`.
     std::expected<std::string, std::string>
     submit(const std::string& definition_id, const std::string& submitted_by,
            const std::string& scope_expression, const std::string& schedule_id = "",
