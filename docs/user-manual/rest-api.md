@@ -3195,9 +3195,10 @@ remove the secret either: a blank field there means "leave the stored value unch
 
 **After clearing, do not save the Settings → OIDC form with the secret field blank.** That form falls
 back to the secret the process is currently holding, rebuilds the live provider with it, and — because
-the field was blank — does not write the store. The result is the previously loaded secret live in the
-running process while `GET /api/config` still reports `"is_set": false`. If you have cleared the secret
-and need to change another OIDC field, restart first so the process is not holding the old value.
+the field was blank — does not write **the secret** back to the store (the form's other OIDC fields are
+persisted as normal). The result is the previously loaded secret live in the running process while
+`GET /api/config` still reports `"is_set": false`. If you have cleared the secret and need to change
+another OIDC field, restart first so the process is not holding the old value.
 
 > **Two different error sources, two different shapes.** The shared authorization gate in front of
 > this route **does** emit the A4 envelope: a `401`, a `403` permission denial, or a `503`

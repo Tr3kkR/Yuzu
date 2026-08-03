@@ -57,29 +57,34 @@ environment variable at runtime.
 
 ### Remediate: rotate the client secret at your IdP, and revoke the old one
 
-**This is the remediation, and it is complete on its own.** The upgrade closes the disclosure paths but
-**does not change the stored value** — anything that already read it still holds a working credential.
-Only the IdP can invalidate that credential.
+The upgrade closes the disclosure paths but **does not change the stored value** — anything that
+already read it still holds a working credential. Only the IdP can invalidate it.
 
 Most IdPs let you *add* a second client secret without removing the first, and adding one is **not**
 remediation: the disclosed secret keeps working until it is deleted. **Delete it at the IdP.** Until you
 do, a successful Yuzu login proves nothing about which secret is in use, because both are valid.
 
+**Deleting the secret does not revoke what it has already bought.** Access and refresh tokens minted
+with the disclosed secret generally outlive the secret itself — refresh tokens by a long way. If the app
+registration carries anything beyond bare delegated sign-in, run your IdP's token and session revocation
+for that client too. Treat the deletion and the revocation as one job, not two.
+
 ### Then re-point Yuzu at the new secret
 
-Once the old secret is revoked, Yuzu is still holding it and **SSO will fail until you update it**. That
-is an outage, not a continuing disclosure — the security work is already done at this point.
+Once the old secret is deleted, Yuzu is still holding it and **SSO will fail until you update it**.
+Assuming you have also revoked the issued tokens above, what remains is an outage rather than a
+continuing disclosure.
 
 Updating it is **not a single step**, and exactly what it takes depends on how OIDC was configured on
-your install: the running process and the next restart read the secret from different places, and a
-Settings-only install may need its issuer and client ID moved alongside it. Getting this wrong costs
-availability, not confidentiality.
+your install: the running process and the next restart read the secret from different places. If OIDC
+was configured entirely through Settings, the issuer and client ID have to move to the command line or
+environment as well — otherwise the restart builds no OIDC provider at all and SSO is absent rather
+than misconfigured. Getting this wrong costs availability, not confidentiality.
 
 Because that procedure is configuration-specific and easy to get subtly wrong, it is being written up
 and reviewed separately rather than summarised here. Until it lands, work from
-[`authentication.md`](authentication.md) ("OIDC Single Sign-On") and
-[`server-admin.md`](server-admin.md) ("SSO / OIDC Configuration") for how your install supplies these
-values, and treat these two rules as the ones that matter:
+[`authentication.md`](authentication.md) ("OIDC Single Sign-On"), which sets out the durable and
+non-durable ways to configure it, and treat these two rules as the ones that matter:
 
 - **Verify by restarting.** Log in over SSO, then restart the server and log in again. Only the
   post-restart login shows that the change survives a restart.
