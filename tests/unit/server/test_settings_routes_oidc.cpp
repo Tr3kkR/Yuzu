@@ -128,10 +128,6 @@ struct OidcHarness {
 // test_runtime_config_secret_redaction.cpp; this file covers the caller, which is
 // where the real regression was: the handler discarded all six set() results and
 // reported "saved" regardless.
-//
-// No OidcProvider mocking is needed. Its constructor skips discovery when
-// redirect_uri is empty (oidc_provider.cpp: "validate-only" path), so the handler
-// reaches the persist block without any network.
 
 namespace {
 std::string oidc_form(const std::string& secret, const std::string& issuer = "https://idp.example",

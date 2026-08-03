@@ -240,7 +240,7 @@ Yuzu supports OpenID Connect with PKCE for browser-based SSO. This has been test
 
 OIDC can be configured in two ways:
 
-**Option 1: Dashboard Settings (recommended)**
+**Option 1: Dashboard Settings** (convenient, but NOT durable on its own - see below; set Option 2 as well)
 
 Navigate to **Settings > Directory Integration / OIDC SSO** in the dashboard. Enter the issuer URL, client ID, client secret, and admin group ID. Click "Test Connection" to verify discovery, then "Save OIDC Configuration". Changes take effect immediately on the running server - but **only on the running server**. The provider is rebuilt at the next startup from the command-line or environment values, before the stored settings are read, and nothing rebuilds it afterwards. **If you configure OIDC only here, SSO stops working after the next restart** (the dashboard and `GET /api/config` will still show it as configured). Set the same values as CLI flags or environment variables per Option 2 as well, and see [Security hardening -> OIDC](security-hardening.md#oidc-hardening) before rotating a secret.
 
