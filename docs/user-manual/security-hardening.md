@@ -454,11 +454,8 @@ When using OIDC/Entra ID:
 > value itself is unchanged**, so anyone or anything that already read it still holds a
 > working credential.
 >
-> **The rotation procedure lives in one place:**
-> [`upgrading.md`](upgrading.md) → "⚠️ Security: rotate `oidc_client_secret` if it was ever
-> set on this install". Follow it there rather than from a summary here. It is not a
-> one-step rotation: the old secret must be **revoked** at the IdP (adding a second secret
-> is not remediation), the change must be applied through **both** Settings → OIDC and
-> `--oidc-client-secret`/`YUZU_OIDC_CLIENT_SECRET`, and the result has to be verified after
-> a restart because neither `GET /api/config` nor a `PUT` returning `"applied": true`
-> reflects what the running provider is using.
+> **Remediation lives in one place:** [`upgrading.md`](upgrading.md) → "⚠️ Security: rotate
+> `oidc_client_secret` if it was ever set on this install". Follow it there rather than from
+> a summary here. The essential point: rotating at the IdP is not enough on its own — the old
+> secret must be **deleted** at the IdP, because adding a second one leaves the disclosed
+> value working.

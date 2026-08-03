@@ -55,54 +55,40 @@ unlike `cmdline` — but it is *not* better if the value is written into a Compo
 `docker inspect` exposes it to anyone in the `docker` group. Prefer a secrets manager that injects the
 environment variable at runtime.
 
-**Before you start, make sure you can sign in as a local administrator.** Revoking at the IdP stops new
-SSO logins immediately, and the restart in the verification step below ends every active session
-(sessions are held in memory, not persisted). Your existing session survives the revocation itself, but
-not the restart. **If you have no local administrator account, create one now**, while you still hold a
-session in which to do it — an SSO-only install that revokes first and restarts has no way back in.
+### Remediate: rotate the client secret at your IdP, and revoke the old one
 
-**Remediate: rotate the client secret at your IdP, and revoke the old one.** The upgrade closes the
-disclosure paths but **does not change the stored value** — anything that already read it still holds a
-live credential. Most IdPs let you *add* a second client secret without removing the first; adding one
-is not remediation. **The old secret must be deleted at the IdP**, or the disclosed value stays valid
-and everything below will appear to succeed while the leak remains exploitable.
+**This is the remediation, and it is complete on its own.** The upgrade closes the disclosure paths but
+**does not change the stored value** — anything that already read it still holds a working credential.
+Only the IdP can invalidate that credential.
 
-**Rotating durably takes TWO steps.** `PUT /api/config/oidc_client_secret` persists the new value but
-never reaches the running OIDC provider; Settings -> OIDC reaches the running process but not the next
-restart, because the provider is rebuilt at startup from the command-line or environment value before
-stored runtime-config overrides are applied. So rotate through **Settings -> OIDC** *and* update
-`--oidc-client-secret` (or `YUZU_OIDC_CLIENT_SECRET`).
+Most IdPs let you *add* a second client secret without removing the first, and adding one is **not**
+remediation: the disclosed secret keeps working until it is deleted. **Delete it at the IdP.** Until you
+do, a successful Yuzu login proves nothing about which secret is in use, because both are valid.
 
-**Why the second step matters.** The OIDC provider is built once at startup, from the command-line and
-environment values, *before* stored runtime-config overrides are applied. Nothing rebuilds it
-automatically afterwards — only a Settings → OIDC save does, and only in the running process. A secret
-that lives only in the store therefore never reaches the restarted provider.
+### Then re-point Yuzu at the new secret
 
-**If OIDC was configured entirely through Settings, the secret is not the only thing missing.** The
-provider is built only when `--oidc-issuer` *and* `--oidc-client-id` are both present at startup
-(`server.cpp`), and on a Settings-only install those are store-only too — so the restart builds **no
-provider at all** and SSO is absent rather than misconfigured. Supplying `--oidc-client-secret` alone
-does not fix that. Move the issuer and client ID to the command line or environment as well.
+Once the old secret is revoked, Yuzu is still holding it and **SSO will fail until you update it**. That
+is an outage, not a continuing disclosure — the security work is already done at this point.
 
-Beyond that case, what a restart produces depends on the rest of your configuration and on your IdP's
-client-authentication policy, so verify it rather than predicting it. Note that `GET /api/config`
-answers from the **store**, not from the running provider: it reports the key as set whichever secret
-the process is actually using, which is why the verification below restarts and logs in.
+Updating it is **not a single step**, and exactly what it takes depends on how OIDC was configured on
+your install: the running process and the next restart read the secret from different places, and a
+Settings-only install may need its issuer and client ID moved alongside it. Getting this wrong costs
+availability, not confidentiality.
 
-**Expect a brief SSO outage.** Between revoking at the IdP and completing both Yuzu-side steps, new
-logins fail — Yuzu still presents the old secret to an IdP that no longer accepts it. Do the Yuzu-side
-steps immediately after the IdP change to keep the window short.
+Because that procedure is configuration-specific and easy to get subtly wrong, it is being written up
+and reviewed separately rather than summarised here. Until it lands, work from
+[`authentication.md`](authentication.md) ("OIDC Single Sign-On") and
+[`server-admin.md`](server-admin.md) ("SSO / OIDC Configuration") for how your install supplies these
+values, and treat these two rules as the ones that matter:
 
-**Verify before you consider it done.** Perform an SSO login, then **restart the server and log in
-again** — only the post-restart login proves the durable half took effect. Do not treat
-`GET /api/config` reporting the key as set, or a `PUT` returning `"applied": true`, as confirmation:
-both report stored state, not whether the running provider uses it, and both stay green in exactly the
-failure cases above. **A successful login proves rotation only if the old secret was revoked** — if it
-is still valid at the IdP, logins succeed whichever secret Yuzu is presenting, and this step proves
-nothing.
+- **Verify by restarting.** Log in over SSO, then restart the server and log in again. Only the
+  post-restart login shows that the change survives a restart.
+- **Do not treat a green API response as confirmation.** Neither `GET /api/config` reporting the key as
+  set nor a `PUT` returning `"applied": true` tells you what the running OIDC provider is using — both
+  answer from stored configuration.
 
-This section is the canonical procedure; [`security-hardening.md`](security-hardening.md) ("OIDC
-Hardening") points here rather than restating it, and carries the surrounding hardening guidance.
+If SSO is down and you are locked out, sign in with a local administrator account. On an SSO-only
+install, create one **before** you revoke anything.
 
 ## Behaviour change: `mcp.bridge.*` audit rows can now carry `result=failure` (#2487 / #2506)
 
