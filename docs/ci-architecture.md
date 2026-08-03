@@ -104,6 +104,34 @@ or exposing the administration-scoped PAT to fork-controlled code.
 
 ## Gates outside the tier ladder
 
+### Capability matrix drift gate (`check-capability-matrix.sh`, #2204)
+
+Runs on every Linux CI leg immediately after `Build`, once
+`capmatrix-gen` and every `agents/plugins/*/` shared object already
+exist. The script discovers the full plugin set from the source tree
+itself — not a hand-maintained subset — so a missing capability-matrix
+artifact for **any** plugin is a hard failure, never a silent skip,
+and a stale generated block in `docs/os-capability-matrix.md` fails
+the same way. It currently runs in **ratchet mode only**: the
+undeclared-plugin count must not grow PR-over-PR; it does not yet
+hard-fail on any plugin being undeclared (that is a later PR). A
+companion step, `tests/shell/test_capability_matrix_gate.sh` (#2204
+finding F10), exercises both the "renders a DECLARED descriptor" path
+and both ratchet-rejection branches against the real built binary and
+the real gate script, using the `tests/fixtures/abi4/` declaring
+fixture plugin inside throwaway git repos — it also runs right after
+`Build` for the same reason (needs the built artifacts), not on the
+preflight shell-gate step.
+
+Both steps are **merge-blocking** required checks. A red
+capability-matrix gate on a fork or source build is remediated by
+running `capmatrix-gen` against the local build and committing the
+refreshed generated block between the `<!-- BEGIN GENERATED -->` /
+`<!-- END GENERATED -->` markers in `docs/os-capability-matrix.md`, or
+by declaring the newly undeclared plugin(s) so the ratchet count stops
+growing — `check-capability-matrix.sh`'s own header spells out the
+three drifts it catches and the ratchet-baseline mechanics.
+
 ### Docker healthcheck invariants (`docker-healthcheck-invariants.yml`, #751)
 
 The five Yuzu **application** images' compose healthchecks depend on a tool baked
