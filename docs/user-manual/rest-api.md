@@ -5814,7 +5814,7 @@ Returned when the definition's `approval_mode` is `role-gated` or `always` and t
 }
 ```
 
-**Errors:** 404 (definition not found), 400 (invalid body), 202 (approval required -- execution queued, not yet dispatched), 403 (workflow blocked by approval-gated instruction and caller lacks execute-bypass permission), 503 (no agents reached or store unavailable).
+**Errors:** 404 (definition not found), 400 (invalid body, or the definition id is under the reserved `mcp.` prefix -- see the reservation note under `POST /api/instructions` above; that refusal carries a `remediation` and is returned *instead of* the 202 below), 202 (approval required -- execution queued, not yet dispatched), 403 (workflow blocked by approval-gated instruction and caller lacks execute-bypass permission), 503 (no agents reached or store unavailable).
 
 ---
 

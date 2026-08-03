@@ -25,6 +25,7 @@
 #include "instruction_store.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
+#include "approval_manager.hpp"
 #include "workflow_engine.hpp"
 #include "workflow_routes.hpp"
 
@@ -79,6 +80,12 @@ struct ExecHarness {
     fs::path tracker_db, instr_db, resp_db, wf_db;
     std::unique_ptr<ExecutionTracker> tracker;
     std::unique_ptr<InstructionStore> instructions;
+    /// #2442: the approval gate needs a live ApprovalManager or an
+    /// approval-gated execute short-circuits to 503 before the reserved-id
+    /// pre-check. ApprovalManager BORROWS its handle, so the harness owns one
+    /// on the same file (SQLite permits several connections to one database).
+    sqlite3* appr_db{nullptr};
+    std::unique_ptr<ApprovalManager> approvals;
     std::unique_ptr<ResponseStore> responses;
     /// CDX-FV-03: opt-in WorkflowEngine so POST /api/workflows/:id/execute is
     /// reachable. Opt-in rather than always-on because every other test in this
@@ -270,12 +277,26 @@ struct ExecHarness {
         wf_deps.execution_event_bus = event_bus.get();
         wf_deps.stream_budget = stream_budget; // ADR-0034 admission (nullptr = unmetered)
         wf_deps.metrics = &metrics;            // #2500 targeting-refusal counter
+        // #2442: the approval gate must be live, or an approval-gated execute
+        // short-circuits to 503 before reaching the reserved-id pre-check.
+        REQUIRE(sqlite3_open(instr_db.string().c_str(), &appr_db) == SQLITE_OK);
+        approvals = std::make_unique<ApprovalManager>(appr_db);
+        approvals->create_tables();
+        wf_deps.approval_manager = approvals.get();
         routes.register_routes(sink, std::move(wf_deps));
     }
 
     ~ExecHarness() {
         workflows.reset();
         responses.reset();
+        // Drop the borrower before closing the handle it borrows, then close
+        // it before the file is removed below (Windows refuses to unlink an
+        // open file — the same reason the tracker handle is closed here).
+        approvals.reset();
+        if (appr_db) {
+            sqlite3_close(appr_db);
+            appr_db = nullptr;
+        }
         instructions.reset();
         // PR 3: drop tracker BEFORE the bus — tracker borrows event_bus_,
         // so the bus must outlive the tracker through its destructor.
@@ -878,6 +899,69 @@ TEST_CASE("PR2 hardening — UP2-4: cmd_dispatch receives non-empty execution_id
     // which is what we're pinning here.
     REQUIRE(res);
     CHECK(!h.last_dispatch_execution_id.empty());
+}
+
+TEST_CASE("#2442 — executing a legacy mcp.-prefixed approval-gated definition is a 400, not a 500",
+          "[workflow][execute][approval][security]") {
+    // A definition created BEFORE the reservation can still carry an `mcp.` id.
+    // Executing it mints an approval ticket, the mint refuses the reserved id,
+    // and that used to surface as a generic 500 — indistinguishable from a
+    // store fault, on a problem the operator fixes by renaming.
+    ExecHarness h;
+
+    // The store now refuses this id, which is the point: insert the legacy row
+    // directly, the way an upgraded deployment already holds one.
+    REQUIRE(sqlite3_exec(h.appr_db,
+                         "INSERT INTO instruction_definitions "
+                         "(id, name, type, plugin, action, approval_mode, enabled) "
+                         "VALUES ('mcp.legacy_tool', 'Legacy', 'question', 'test', 'list',"
+                         " 'always', 1)",
+                         nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    auto res = h.sink.Post("/api/instructions/mcp.legacy_tool/execute",
+                           R"({"params":{},"agent_ids":["agent-1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 400); // not 500, and not a mint
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // The instruction has to be in `message`: the dashboard renders only that
+    // field, so guidance living solely in `remediation` is invisible there.
+    const std::string message = body["error"].value("message", "");
+    CHECK(message.find(std::string(yuzu::server::kReservedDefinitionIdError)) !=
+          std::string::npos);
+    CHECK(message.find("rename") != std::string::npos);
+    CHECK(body["error"].contains("remediation"));
+    // Neither field may tell the operator to delete before moving schedules —
+    // delete_definition has no referential guard, so that strands them.
+    CHECK(message.find("delete this") == std::string::npos);
+
+    // No ticket was minted: the refusal happens before the gate is reached.
+    CHECK(h.approvals->query({}).empty());
+}
+
+TEST_CASE("#2442 — an UNGATED legacy mcp.-prefixed definition still executes",
+          "[workflow][execute][approval][security]") {
+    // The pre-check sits on the approval-gated branch deliberately: the
+    // reservation exists to stop a ticket being minted, so a run that mints no
+    // ticket is not its business. Without this control the previous test would
+    // also pass if the check had been hoisted to refuse every reserved id,
+    // which would break far more than it fixed.
+    ExecHarness h;
+    REQUIRE(sqlite3_exec(h.appr_db,
+                         "INSERT INTO instruction_definitions "
+                         "(id, name, type, plugin, action, approval_mode, enabled) "
+                         "VALUES ('mcp.legacy_auto', 'Legacy Auto', 'question', 'test', 'list',"
+                         " 'auto', 1)",
+                         nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    auto res = h.sink.Post("/api/instructions/mcp.legacy_auto/execute",
+                           R"({"params":{},"agent_ids":["agent-1"]})");
+    REQUIRE(res);
+    // The dispatch stub reports nothing sent, so this route answers 503 — the
+    // point is that it got PAST the reserved-id branch rather than 400ing.
+    CHECK(res->status != 400);
+    CHECK(h.approvals->query({}).empty()); // auto: no ticket either way
 }
 
 TEST_CASE("#1088 — POST /api/instructions/:id/execute response includes execution_id",

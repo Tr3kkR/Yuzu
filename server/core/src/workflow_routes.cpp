@@ -1580,17 +1580,27 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                         nlohmann::json(
                             {{"error",
                               {{"code", 400},
+                               // The essential instruction lives in `message`,
+                               // not `remediation`: the dashboard's error
+                               // renderer reads only `message`
+                               // (instruction_ui.cpp), so guidance placed in
+                               // `remediation` alone is invisible on the surface
+                               // most operators hit this from.
+                               //
+                               // Neither field says "delete this definition" on
+                               // its own. Deleting one does not re-point the
+                               // schedules that reference it, so a delete-first
+                               // rename strands them silently — the ordered
+                               // procedure is in the upgrade note.
                                {"message", std::string(kReservedDefinitionIdError) +
-                                               "; rename this definition"},
-                               // Deliberately does NOT say "and delete this one":
-                               // deleting a definition does not re-point the
-                               // schedules that reference it, and this field is
-                               // what the operator reads first.
+                                               "; rename this definition, following the "
+                                               "upgrade note in server-admin.md - deleting it "
+                                               "before moving its schedules strands them"},
                                {"remediation",
-                                "rename this definition - create a replacement under an id "
-                                "outside the mcp. namespace, move any schedules to it, and "
-                                "only then delete the original (see the upgrade note in "
-                                "docs/user-manual/server-admin.md for the order)"}}},
+                                "create a replacement under an id outside the mcp. namespace, "
+                                "rebuild any schedules against it (copying every field - the "
+                                "create defaults widen scope and drop the approval gate), and "
+                                "only then delete the original"}}},
                              {"meta", {{"api_version", "v1"}}}})
                             .dump(),
                         "application/json");

@@ -293,19 +293,45 @@ it.
 1. Create the replacement under an id outside the `mcp.` namespace. This is an ordinary create,
    so the reservation applies to the new id too; a collision with an existing id fails with 409.
 2. List **every** schedule on the old definition — not just the ones the triage flagged, since
-   an ungated schedule on an `auto` definition is stranded by the delete just the same:
+   an ungated schedule on an `auto` definition is stranded by the delete just the same. Select
+   the whole row, because you are about to rebuild it and `POST /api/schedules` defaults every
+   field you omit:
 
    ```bash
-   sqlite3 /var/lib/yuzu/instructions.db \
-     "SELECT id, name, created_by, enabled FROM schedules WHERE definition_id = '<old-id>';"
+   sqlite3 -line /var/lib/yuzu/instructions.db \
+     "SELECT id, name, created_by, enabled, frequency_type, interval_minutes,
+             time_of_day, day_of_week, day_of_month, scope_expression, requires_approval
+        FROM schedules WHERE definition_id = '<old-id>';"
    ```
 
-3. Recreate each of those against the new definition id, then delete the old schedule. Note
-   what does not survive: the schedule's id, its `execution_count` and `last_executed_at`, and
-   any approval ticket already raised for it (a pending or granted approval is matched on the
-   schedule id and creator, so it is discarded and the next occurrence asks again). Schedule
-   delete is owner-scoped — a schedule created by another operator has to be recreated by them,
-   or by an administrator acting as them.
+3. Recreate each one against the new definition id, carrying **every** field from step 2, then
+   delete the old schedule.
+
+   Read this before you start, because the defaults are dangerous. `POST /api/schedules` fills
+   in anything you leave out: an omitted `scope_expression` becomes empty, and an empty scope
+   **dispatches to the entire fleet**; an omitted `requires_approval` becomes `false`, which
+   **drops the approval gate**; an omitted `frequency_type` becomes `once`. Rebuild a daily,
+   group-scoped, approval-gated schedule from a partial copy and you get a one-shot, fleet-wide,
+   ungated one — and the first occurrence can fire within a tick. Copy the whole row.
+
+   Three things cannot be carried across at all:
+
+   - **`enabled`** is not a create field, so every recreated schedule starts enabled *and*
+     armed — a `once` schedule's first occurrence is due immediately, and the tick is 30
+     seconds. If the original was disabled, `POST /api/schedules/{id}/enable` with
+     `{"enabled": false}` on the replacement before it reaches that first occurrence. Otherwise
+     the rename silently arms a schedule somebody had deliberately parked.
+   - **`created_by`** is taken from the session that creates it, so a schedule has to be
+     recreated by its own owner. There is no act-as and no admin override — deleting is scoped
+     to the creator at the SQL seam, and a non-owner `DELETE /api/schedules/{id}` answers
+     `200 {"deleted": false}` with no audit row, so a failed delete looks like a successful one.
+     Check that response rather than assuming. An administrator who recreates the schedule
+     becomes its owner, which changes who can delete it later and which approvals it matches;
+     and if the original owner's account is gone, the row cannot be removed through the API at
+     all.
+   - **The schedule id, `execution_count` and `last_executed_at`** are new. Any approval ticket
+     already raised for the old schedule is matched on its id and creator, so it is discarded
+     and the next occurrence asks again.
 4. Re-point anything else that references the old id by name — automation calling
    `POST /api/instructions/{id}/execute`, saved views, product packs you re-install.
 5. Only then delete the original definition.
@@ -321,8 +347,8 @@ it.
    This is the check the triage queries cannot do for you: they join to a definition that
    exists, so once the old one is deleted an orphaned schedule appears in neither. Any row here
    is a schedule that will never fire again. For an enabled schedule, confirm its next run
-   actually dispatches; a schedule that was disabled when you started is the same trap deferred,
-   so re-point it too rather than leaving it for whoever re-enables it.
+   actually dispatches. A schedule that was disabled when you started is the same trap deferred
+   rather than avoided, so rebuild it too — and disable the rebuilt one, per step 3.
 
 Execution history keeps referencing the old id after the delete. Past runs stay readable, but
 history is split across the two ids — filtering executions by the new definition returns
