@@ -55,12 +55,14 @@ unlike `cmdline` — but it is *not* better if the value is written into a Compo
 `docker inspect` exposes it to anyone in the `docker` group. Prefer a secrets manager that injects the
 environment variable at runtime.
 
-### Before you start: check you can get back in
+### Before you start: check you can get back in without SSO
 
-Revoking at the IdP stops new SSO logins immediately, and the verification restart below ends every
-active session — Yuzu holds them in memory for at most 8 hours and never re-validates them against the
-IdP. **On an SSO-only install, create a local administrator account now**, while you still have a
-session in which to do it. There is no offline recovery path once you are locked out.
+Revoking stops new SSO logins immediately, and the verification restart below ends every active session.
+**Confirm now, while you still have one, that you have a working non-SSO way in** — every recovery route
+needs a local account that already exists. Under `--auth-mode=sso-only` an ordinary local admin will not
+do: local-password login is disabled fleet-wide except for the armed break-glass account. See
+[Hardened auth mode](#hardened-auth-mode---auth-modesso-only--opt-in-soc-2-cc63cc66) for its
+prerequisites and [`auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md) for the procedures.
 
 ### Remediate: rotate the client secret at your IdP, and revoke the old one
 
@@ -78,10 +80,11 @@ requires client authentication, which the deletion breaks — but IdP sessions c
 app registration carries anything beyond bare delegated sign-in, run your IdP's token and session
 revocation for that client too, as one job with the deletion rather than a follow-up.
 
-Yuzu's own sessions are separate and the IdP cannot reach them: they live in memory for up to 8 hours
-and are never re-validated against the IdP, so an IdP revocation does not end them. If you have reason
-to think the secret was actually used, restart the server to clear live sessions and review any API
-tokens minted since.
+Yuzu's own sessions are separate and the IdP cannot reach them: they are held in memory for at most 8
+hours and are never re-validated against the IdP, so revoking there does not end them. If you have
+reason to think the secret was actually used, revoke them directly —
+`DELETE /api/v1/sessions?username=<user>`, per
+[`auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md) — and review any API tokens minted since.
 
 ### Then re-point Yuzu at the new secret
 
@@ -106,7 +109,7 @@ non-durable ways to configure it, and treat these two rules as the ones that mat
   set nor a `PUT` returning `"applied": true` tells you what the running OIDC provider is using — both
   answer from stored configuration.
 
-If SSO is down and you are locked out, sign in with the local administrator account you created above.
+If SSO is down and you are locked out, use the non-SSO route you confirmed before starting.
 
 ## Behaviour change: `mcp.bridge.*` audit rows can now carry `result=failure` (#2487 / #2506)
 

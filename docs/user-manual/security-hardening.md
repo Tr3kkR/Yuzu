@@ -457,5 +457,6 @@ When using OIDC/Entra ID:
 > **Remediation lives in one place:** [`upgrading.md`](upgrading.md) → "⚠️ Security: rotate
 > `oidc_client_secret` if it was ever set on this install". Follow it there rather than from
 > a summary here. Two things that catch people out: adding a second client secret is not a
-> rotation, so the old one must be **deleted** at the IdP; and deleting it does not revoke the
-> access tokens and sessions already issued under it, which have to be revoked separately.
+> rotation, so the old one must be **deleted** at the IdP; and deletion does not reach what was
+> already issued under it — access tokens stay valid until they expire, and sessions have to be
+> ended separately at the IdP and in Yuzu.
