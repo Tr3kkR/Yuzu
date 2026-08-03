@@ -3157,9 +3157,10 @@ most keys:
   same startup (`server.cpp:3466`); nothing rebuilds the provider afterwards. So a value written
   through this API never reaches the live provider, on this boot or any later one.
   **Only Settings -> OIDC (`POST /api/settings/oidc`) applies OIDC settings**, because that handler
-  constructs a new provider and swaps it in - but that swap is **process-local**. It is not written
-  back to the boot path, and the boot path does not read the store for OIDC, so a restart returns to
-  whatever the command line or environment supplies. To change OIDC durably you must update BOTH. This matters most for a credential rotation: a `PUT` of
+  constructs a new provider and swaps it in - but that swap is **process-local**. The startup path
+  DOES read these keys out of the store, just too late to matter - the provider is already built and
+  nothing rebuilds it - so a restart runs on whatever the command line or environment supplies. To
+  change OIDC durably, update that value as well as saving through Settings. This matters most for a credential rotation: a `PUT` of
   `oidc_client_secret` returns `"applied": true` meaning *persisted and accepted*, never *in use*.
 
 **Request body:**
@@ -5358,7 +5359,7 @@ The one device list behind every network-quality drill: worst devices by a metri
 | `skip_tls_verify` | string | No | `"true"` to disable TLS cert verification for OIDC endpoints (insecure, dev only) |
 
 - **Response:** Re-rendered Settings fragment (HTMX). Returns toast notification on success.
-- **Effect:** Immediately reinitializes the OIDC provider with the new configuration. No server restart required.
+- **Effect:** Immediately reinitializes the OIDC provider with the new configuration - in THIS process only. The swap is NOT durable: the provider is rebuilt at the next startup from the command-line/environment value, not from the stored runtime config, so a restart reverts to that value. Rotating a credential durably requires updating `--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET` as well - see [When a change takes effect](#when-a-change-takes-effect).
 
 **`POST /api/settings/oidc/test`** — Test OIDC discovery connectivity.
 

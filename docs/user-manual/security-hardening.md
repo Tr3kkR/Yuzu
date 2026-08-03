@@ -453,15 +453,15 @@ When using OIDC/Entra ID:
 > are now closed, and audit rows written before the fix are redacted when read. **The
 > stored value itself is unchanged**, so anyone or anything that already read it still
 > holds a working credential. Treat a secret set before this upgrade as disclosed and
-> rotate it at the IdP. Note that rotating via `PUT /api/config/oidc_client_secret`
-> persists the new value but does **not** rebuild the running OIDC provider, **and a restart does
-> **Rotate through Settings -> OIDC**, which is the only path that applies an OIDC
-> change to the RUNNING server. **That swap is process-local, so it does not survive a
-> restart on its own.** The provider is rebuilt at startup from the command-line or
-> environment configuration, before the stored runtime-config overrides are read, and
-> nothing rebuilds it afterwards. So you must ALSO update the secret wherever the server
-> reads it at boot (`--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET`, or the
-> `--oidc-client-secret-file`). If you rotate only through Settings, the next restart
-> brings the OLD - disclosed - secret back into use; and if OIDC was only ever configured
-> through Settings, the next restart leaves no provider at all and SSO stops working,
-> while `GET /api/config` still reports the key as set.
+> rotate it at the IdP.
+>
+> **Rotating durably takes TWO steps.** `PUT /api/config/oidc_client_secret` persists the
+> new value but never reaches the running OIDC provider. Settings -> OIDC does reach it,
+> but only in the running process: the provider is rebuilt at startup from the
+> command-line or environment value, before the stored runtime-config overrides are
+> applied, and nothing rebuilds it afterwards. So rotate through **Settings -> OIDC** to
+> change the running server, **and** update `--oidc-client-secret` (or
+> `YUZU_OIDC_CLIENT_SECRET`) so the next restart starts from the new value. If you do
+> only the first, the next restart puts the OLD - disclosed - secret back in force; and
+> if OIDC was only ever configured through Settings, the next restart leaves no provider
+> at all and SSO stops working, while `GET /api/config` still reports the key as set.
