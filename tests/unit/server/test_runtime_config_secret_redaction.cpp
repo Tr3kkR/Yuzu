@@ -268,3 +268,37 @@ TEST_CASE("set() refuses the redaction placeholder as a credential",
     CHECK(store.set("oidc_issuer", RuntimeConfigStore::redacted_placeholder(),
                     "tester").has_value());
 }
+
+TEST_CASE("set() refuses a WHITESPACE-PADDED placeholder, not just the exact string",
+          "[runtime_config][secret]") {
+    // The guard first shipped as an exact `==` at one caller, so `PUT
+    // /api/config/oidc_client_secret` with "<redacted>\n" reached the sink and
+    // overwrote the real credential with a non-credential -- the precise outcome the
+    // guard exists to prevent. Governance caught it; a mutation then showed the fix
+    // itself had no failing test. This is that test.
+    yuzu::test::TempDbFile db{"yuzu_test_rtcfg_ws"};
+    RuntimeConfigStore store(db.path);
+    REQUIRE(store.is_open());
+    REQUIRE(store.set("oidc_client_secret", "real-secret", "tester").has_value());
+
+    for (const char* padded : {"<redacted>\n", " <redacted>", "<redacted> ", "\t<redacted>\r\n",
+                               "  <redacted>  "}) {
+        auto rejected = store.set("oidc_client_secret", padded, "tester");
+        INFO("padded form: [" << padded << "]");
+        REQUIRE_FALSE(rejected.has_value());
+        // ...and the real credential is still intact after every refused write.
+        CHECK(store.get_value_with_secrets("oidc_client_secret") == "real-secret");
+    }
+
+    // A value CONTAINING the placeholder is refused too, deliberately. No trim charset
+    // is exhaustive against every invisible code point that can survive a paste
+    // (U+FEFF and U+200B defeated the first byte-set version), so the substring rule is
+    // the catch-all. It fails closed: an implausible secret is refused with a clear
+    // message, rather than a padded placeholder silently destroying a real credential.
+    CHECK_FALSE(store.set("oidc_client_secret", "prefix<redacted>suffix", "tester").has_value());
+    CHECK(store.get_value_with_secrets("oidc_client_secret") == "real-secret");
+    // Zero-width paste artefacts are covered by the same rule.
+    CHECK_FALSE(store.set("oidc_client_secret", "\xef\xbb\xbf<redacted>", "tester").has_value());
+    // A normal secret is unaffected.
+    CHECK(store.set("oidc_client_secret", "a-normal-secret", "tester").has_value());
+}

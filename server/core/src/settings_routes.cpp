@@ -3922,18 +3922,12 @@ void SettingsRoutes::register_routes(
         // an operator copies it out of the startup log or an API response, and the store
         // refuses it further down -- but by then cfg_ and the live provider have already
         // been updated, so the two would diverge behind a "saved" toast.
-        // Trimmed for the COMPARISON only -- never for the value actually stored. An
-        // exact-match check lets a paste that picked up a trailing space or newline
-        // through both this guard and the store's, persisting it as the client secret
-        // and destroying the real one: precisely the outcome the guard exists to stop.
-        {
-            const auto b = client_secret.find_first_not_of(" \t\r\n");
-            const auto e = client_secret.find_last_not_of(" \t\r\n");
-            const std::string trimmed =
-                (b == std::string::npos) ? std::string{} : client_secret.substr(b, e - b + 1);
-            if (trimmed == RuntimeConfigStore::redacted_placeholder())
-                client_secret.clear();
-        }
+        // Same predicate the store uses, so the two cannot drift. Here it means
+        // "leave the stored secret alone"; at the sink it is a refusal. Both are needed:
+        // this one keeps a placeholder paste from reaching cfg_ and the live provider,
+        // the sink's covers every other caller (PUT /api/config included).
+        if (is_redaction_placeholder(client_secret))
+            client_secret.clear();
         auto effective_secret = client_secret.empty() ? cfg_->oidc_client_secret : client_secret;
         bool skip_tls = (skip_tls_verify == "true");
 

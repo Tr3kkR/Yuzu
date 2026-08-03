@@ -209,7 +209,7 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
     // startup log prints it, and a human copying that line reaches the same place.
     // Storing it would break SSO and destroy the real secret, so refuse at the sink
     // rather than relying on every caller to notice.
-    if (is_secret_key(key) && value == redacted_placeholder())
+    if (is_secret_key(key) && is_redaction_placeholder(value))
         return std::unexpected("value is the redaction placeholder, not a credential; send the "
                                "real secret, or omit the key to leave it unchanged");
 

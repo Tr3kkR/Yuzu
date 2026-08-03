@@ -1,19 +1,31 @@
 /**
- * test_settings_routes_dex_alerts.cpp — route-level tests for the Settings →
- * DEX alerts handlers against a REAL RuntimeConfigStore.
+ * test_settings_routes_oidc.cpp - Settings -> OIDC persist honesty.
  *
- * Why this file exists (governance G3 QE + UAT live-fire 2026-06-12): the
- * cohort-export POST shipped 500ing in production because
- * `dex_cohort_export_key` was missing from RuntimeConfigStore's allowlist —
- * the handler had been exercised only against fakes, so the store's key
- * gate never ran. These tests put the real store behind every assertion.
+ * Covers the CALLER half of the OIDC-secret redaction work. The sink half
+ * (RuntimeConfigStore::set() refusing the redaction placeholder) lives in
+ * test_runtime_config_secret_redaction.cpp.
  *
- * Covers POST /api/settings/dex-alerts/cohort-export:
- *   - valid key → 200 + persisted + audited + live-apply fn fired
- *   - empty key → 200 + persisted "" (export disabled) + audited as disabled
- *   - invalid key → 400 + store unchanged + apply fn NOT fired
- *   - store closed → 503
- *   - non-admin → 403 + nothing persisted
+ * Why the caller needs its own cover: the handler discarded all six set() results and
+ * reported "OIDC configuration saved" regardless, so a refused write left the live
+ * provider and the store diverged behind a success toast, and a restart healed it
+ * silently. Governance caught that twice - once as the discarded result, once as a
+ * missing `else` on the store guard producing the same false success.
+ *
+ * Cases:
+ *   1. the placeholder means UNCHANGED, never a new secret
+ *   2. the placeholder with stray whitespace also means UNCHANGED
+ *   3. a real secret persists and is reported saved
+ *   4. a NULL store reports NOT SAVED (defensive; unreachable in the shipped server)
+ *   5. a non-admin is refused and nothing persists
+ *
+ * KNOWN GAP: the production-reachable degraded state is a NON-NULL store whose
+ * is_open() is false (unwritable db_dir, failed migration). Nothing covers it -- the
+ * NULL case above is defensive only, since server.cpp constructs the store
+ * unconditionally. Two reviewers asked for that case; it is not here yet.
+ *
+ * No OidcProvider mocking is needed: the handler populates authorization_endpoint in
+ * both branches, so the provider ctor returns at its pre-configured-endpoints guard
+ * without any network I/O.
  */
 
 #include "settings_routes.hpp"
@@ -67,7 +79,7 @@ struct OidcHarness {
     std::vector<std::string> audited; // "action|target_id|detail"
 
     explicit OidcHarness(bool open_store = true)
-        : tmp(yuzu::test::unique_temp_path("settings-oidc-")) {
+        : tmp(yuzu::test::unique_temp_path("yuzu_test_settings_oidc_")) {
         if (open_store) {
             runtime_config = std::make_unique<RuntimeConfigStore>(tmp.path / "runtime.db");
             REQUIRE(runtime_config->is_open());
@@ -186,4 +198,21 @@ TEST_CASE("Settings OIDC: a degraded store reports NOT SAVED instead of success"
     REQUIRE_FALSE(h.audited.empty());
     CHECK(h.audited.back().find("oidc.configure") != std::string::npos);
     CHECK(h.audited.back().find("persist failed") != std::string::npos);
+}
+
+TEST_CASE("Settings OIDC: a non-admin cannot set the client secret and nothing persists",
+          "[settings][oidc][secret]") {
+    // The admin gate is the outermost control on this handler. Asserting it here keeps
+    // the redaction work from being the only thing standing between a lower-privileged
+    // operator and the OIDC credential.
+    OidcHarness h;
+    h.is_admin = false;
+    REQUIRE(h.runtime_config->set("oidc_client_secret", "real-secret", "seed").has_value());
+
+    auto res = h.sink.Post("/api/settings/oidc", oidc_form("attacker-supplied"),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.runtime_config->get_value_with_secrets("oidc_client_secret") == "real-secret");
+    CHECK(h.audited.empty());
 }

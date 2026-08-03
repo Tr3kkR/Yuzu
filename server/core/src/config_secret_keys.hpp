@@ -29,4 +29,14 @@ bool is_secret_config_key(std::string_view key);
 /// compiler.
 inline constexpr const char* kRedactedPlaceholder = "<redacted>";
 
+/// True if `value` is the redaction placeholder, ignoring surrounding whitespace.
+///
+/// Trimming is the point. An exact comparison let a paste that picked up a trailing
+/// newline through the guard and be stored AS the client secret, destroying the real
+/// one - the exact outcome the guard exists to prevent. It lives here, and is called
+/// from the STORE, so every caller is covered: putting it only in the Settings handler
+/// left `PUT /api/config/oidc_client_secret` wide open, which is the same
+/// fix-the-instance-not-the-sink mistake in a second costume.
+bool is_redaction_placeholder(std::string_view value);
+
 } // namespace yuzu::server
