@@ -55,61 +55,24 @@ unlike `cmdline` — but it is *not* better if the value is written into a Compo
 `docker inspect` exposes it to anyone in the `docker` group. Prefer a secrets manager that injects the
 environment variable at runtime.
 
-### Before you start: check you can get back in without SSO
+**What to do: rotate the client secret at your IdP, and delete the old one.** The upgrade closes the
+disclosure paths but **does not change the stored value** — anything that already read it still holds a
+working credential, and only the IdP can invalidate it. Most IdPs let you *add* a second client secret
+without removing the first; adding one is not a rotation, because the disclosed secret keeps working
+until it is deleted.
 
-Revoking stops new SSO logins immediately, and the verification restart below ends every active session.
-**Confirm now, while you still have one, that you have a working non-SSO way in** — every recovery route
-needs a local account that already exists. Under `--auth-mode=sso-only` an ordinary local admin will not
-do: local-password login is disabled fleet-wide except for the armed break-glass account. See
-[Hardened auth mode](#hardened-auth-mode---auth-modesso-only--opt-in-soc-2-cc63cc66) for its
-prerequisites and [`auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md) for the procedures.
+Deletion does not reach what the secret already bought: access tokens minted with it are signed JWTs
+that stay valid until they expire, and IdP sessions can outlast them. Treat revoking those as part of
+the same job. Yuzu's own sessions are separate again — the IdP cannot reach them — and are held in
+memory for at most 8 hours.
 
-### Remediate: rotate the client secret at your IdP, and revoke the old one
-
-The upgrade closes the disclosure paths but **does not change the stored value** — anything that
-already read it still holds a working credential. Only the IdP can invalidate it.
-
-Most IdPs let you *add* a second client secret without removing the first, and adding one is **not**
-remediation: the disclosed secret keeps working until it is deleted. **Delete it at the IdP.** Until you
-do, a successful Yuzu login proves nothing about which secret is in use, because both are valid.
-
-**Deleting the secret does not revoke what it has already bought.** Access tokens minted with the
-disclosed secret are signed JWTs and stay valid until they expire, whatever you do to the secret
-afterwards. Refresh tokens are a smaller risk to someone holding only the secret — redeeming one
-requires client authentication, which the deletion breaks — but IdP sessions can outlast both. If the
-app registration carries anything beyond bare delegated sign-in, run your IdP's token and session
-revocation for that client too, as one job with the deletion rather than a follow-up.
-
-Yuzu's own sessions are separate and the IdP cannot reach them: they are held in memory for at most 8
-hours and are never re-validated against the IdP, so revoking there does not end them. If you have
-reason to think the secret was actually used, revoke them directly —
-`DELETE /api/v1/sessions?username=<user>`, per
-[`auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md) — and review any API tokens minted since.
-
-### Then re-point Yuzu at the new secret
-
-Once the old secret is deleted, Yuzu is still holding it and **SSO will fail until you update it**.
-Assuming you have also revoked the issued tokens above, what remains is an outage rather than a
-continuing disclosure.
-
-Updating it is **not a single step**, and exactly what it takes depends on how OIDC was configured on
-your install: the running process and the next restart read the secret from different places. If OIDC
-was configured entirely through Settings, the issuer and client ID have to move to the command line or
-environment as well — otherwise the restart builds no OIDC provider at all and SSO is absent rather
-than misconfigured. Getting this wrong costs availability, not confidentiality.
-
-Because that procedure is configuration-specific and easy to get subtly wrong, it is being written up
-and reviewed separately rather than summarised here. Until it lands, work from
-[`authentication.md`](authentication.md) ("OIDC Single Sign-On"), which sets out the durable and
-non-durable ways to configure it, and treat these two rules as the ones that matter:
-
-- **Verify by restarting.** Log in over SSO, then restart the server and log in again. Only the
-  post-restart login shows that the change survives a restart.
-- **Do not treat a green API response as confirmation.** Neither `GET /api/config` reporting the key as
-  set nor a `PUT` returning `"applied": true` tells you what the running OIDC provider is using — both
-  answer from stored configuration.
-
-If SSO is down and you are locked out, use the non-SSO route you confirmed before starting.
+Re-pointing Yuzu at the new secret is a configuration task rather than a remediation one: once the
+deletion and revocation above are done, SSO failing until you update it is an outage, not a continuing
+disclosure. It is also configuration-specific and
+easy to get subtly wrong, so it is being written up as a reviewed runbook rather than summarised here.
+Until that lands, see [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable
+and non-durable ways to configure OIDC, and
+[`auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md) if you lose access while doing it.
 
 ## Behaviour change: `mcp.bridge.*` audit rows can now carry `result=failure` (#2487 / #2506)
 
