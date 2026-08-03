@@ -38,6 +38,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -75,10 +76,16 @@ inline std::wstring expand_env_strings(const std::wstring& in) {
 // kMaxProfiles, with ProfileImagePath already environment-expanded. `ok` is
 // set false only when the ProfileList key itself could not be opened -- a
 // per-profile ProfileImagePath read failure is reported as an empty
-// profile_image_path on that one record, never a dropped record.
-inline std::vector<yuzu::profiles::RawProfileRecord> enumerate_profile_records(bool& ok) {
+// profile_image_path on that one record, never a dropped record. `truncated`,
+// if non-null, is set true when the cap was reached -- a caller that cares
+// about completeness (list_profiles) surfaces this; one that's looking up a
+// single profile (get_user_value) may pass nullptr and ignore it.
+inline std::vector<yuzu::profiles::RawProfileRecord> enumerate_profile_records(
+    bool& ok, bool* truncated = nullptr) {
     std::vector<yuzu::profiles::RawProfileRecord> out;
     ok = false;
+    if (truncated)
+        *truncated = false;
 
     RegKey profiles;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
@@ -122,6 +129,8 @@ inline std::vector<yuzu::profiles::RawProfileRecord> enumerate_profile_records(b
         }
         out.push_back(std::move(rec));
     }
+    if (truncated)
+        *truncated = (out.size() >= kMaxProfiles);
     return out;
 }
 
@@ -142,32 +151,65 @@ inline std::vector<std::string> enumerate_hku_subkeys() {
     return out;
 }
 
-// Enables a token privilege the service account holds but which may start
-// disabled. RegLoadKeyW requires BOTH SeBackupPrivilege and
-// SeRestorePrivilege enabled (granted by scripts/install-agent-user.ps1; a
-// hardened install may strip them). Checks GetLastError()==ERROR_SUCCESS
-// after AdjustTokenPrivileges, which "succeeds" even when the privilege is
-// absent from the token entirely (ERROR_NOT_ALL_ASSIGNED) -- a bare
-// return-value check would misreport that case as success.
-inline bool enable_privilege(const wchar_t* name) {
-    HANDLE token{};
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
-        return false;
-    struct TokenCloser {
-        HANDLE h;
-        ~TokenCloser() { CloseHandle(h); }
-    } token_guard{token};
+// RAII scope that enables a token privilege the service account holds but
+// which may start disabled -- RegLoadKeyW requires BOTH SeBackupPrivilege
+// and SeRestorePrivilege enabled (granted by
+// scripts/install-agent-user.ps1; a hardened install may strip them) -- and
+// restores the token's PRIOR attributes for that privilege on scope exit.
+// licensing_win.cpp's enable_privilege (the accepted precedent this ladder
+// was ported from) leaves the privilege enabled for the rest of the
+// process; this type closes that gap without touching that file. Checks
+// GetLastError()==ERROR_SUCCESS after the enabling AdjustTokenPrivileges,
+// which "succeeds" even when the privilege is absent from the token
+// entirely (ERROR_NOT_ALL_ASSIGNED) -- a bare return-value check would
+// misreport that case as success. Move-only via deleted copy ops; not
+// move-enabled either since every call site constructs it in place.
+class PrivilegeScope {
+public:
+    explicit PrivilegeScope(const wchar_t* name) {
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token_))
+            return;
 
-    LUID luid{};
-    if (!LookupPrivilegeValueW(nullptr, name, &luid))
-        return false;
-    TOKEN_PRIVILEGES tp{};
-    tp.PrivilegeCount = 1;
-    tp.Privileges[0].Luid = luid;
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    return AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) &&
-           GetLastError() == ERROR_SUCCESS;
-}
+        LUID luid{};
+        if (!LookupPrivilegeValueW(nullptr, name, &luid)) {
+            CloseHandle(token_);
+            token_ = nullptr;
+            return;
+        }
+
+        TOKEN_PRIVILEGES tp{};
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Luid = luid;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+        const BOOL adjusted =
+            AdjustTokenPrivileges(token_, FALSE, &tp, sizeof(previous_), &previous_, nullptr);
+        ok_ = adjusted && GetLastError() == ERROR_SUCCESS;
+        have_previous_ = adjusted;
+    }
+
+    PrivilegeScope(const PrivilegeScope&) = delete;
+    PrivilegeScope& operator=(const PrivilegeScope&) = delete;
+
+    ~PrivilegeScope() {
+        // Restore whatever AdjustTokenPrivileges reported as the PRIOR
+        // state, even when this scope failed to enable the privilege (a
+        // partial/no-op adjustment still needs no undo, and previous_ is
+        // zero-initialised in that case, making this a harmless no-op).
+        if (token_ && have_previous_)
+            AdjustTokenPrivileges(token_, FALSE, &previous_, 0, nullptr, nullptr);
+        if (token_)
+            CloseHandle(token_);
+    }
+
+    [[nodiscard]] bool ok() const { return ok_; }
+
+private:
+    HANDLE token_{};
+    TOKEN_PRIVILEGES previous_{};
+    bool have_previous_ = false;
+    bool ok_ = false;
+};
 
 /// Outcome of with_user_hive's access ladder, rendered honestly by the
 /// caller instead of collapsing every non-ok case to silence.
@@ -206,8 +248,13 @@ HiveAccessStatus with_user_hive(const std::string& sid, const std::string& profi
 
     // R15: the offline-hive fallback rides SeBackupPrivilege/SeRestorePrivilege,
     // which the agent account already holds (docs/agent-privilege-model.md) --
-    // this introduces no new privilege grant.
-    if (!enable_privilege(L"SeBackupPrivilege") || !enable_privilege(L"SeRestorePrivilege"))
+    // this introduces no new privilege grant. Scoped to this function so both
+    // privileges revert to their PRIOR token attributes once the offline
+    // mount is no longer needed, rather than staying enabled for the rest of
+    // the process.
+    PrivilegeScope backup_priv(L"SeBackupPrivilege");
+    PrivilegeScope restore_priv(L"SeRestorePrivilege");
+    if (!backup_priv.ok() || !restore_priv.ok())
         return HiveAccessStatus::privilege_missing;
 
     const std::wstring ntuser = to_wide(profile_path_utf8) + L"\\NTUSER.DAT";
@@ -222,22 +269,41 @@ HiveAccessStatus with_user_hive(const std::string& sid, const std::string& profi
     return called ? HiveAccessStatus::ok : HiveAccessStatus::mount_failed;
 }
 
+/// Outcome of read_reg_value -- distinct from a plain bool so the caller can
+/// report an honest reason instead of collapsing every failure into "not
+/// found" (an oversized value and a genuinely absent one are different
+/// facts and deserve different error text).
+enum class ReadValueStatus {
+    ok,        // out_value/out_type_name populated
+    not_found, // the key or value does not exist
+    oversized, // exists but exceeds kMaxRegValueBytes
+    malformed, // exists with a declared numeric type but a size too small
+              // for that type (e.g. a REG_DWORD value under 4 bytes)
+};
+
 // Reads a single string/DWORD/QWORD/binary value under `root`, formatting it
 // the same way registry_plugin.cpp's existing do_get_value does (hex-encode
-// for anything else). Returns false if the value does not exist; on success
-// fills `out_value` and `out_type_name`. Bounded to kMaxRegValueBytes.
-inline bool read_reg_value(HKEY root, const std::string& value_name, std::string& out_value,
-                           std::string& out_type_name) {
+// for anything else). On ok, fills `out_value` and `out_type_name`. Bounded
+// to kMaxRegValueBytes.
+inline ReadValueStatus read_reg_value(HKEY root, const std::string& value_name,
+                                      std::string& out_value, std::string& out_type_name) {
     const std::wstring wname = to_wide(value_name);
     DWORD type = 0, size = 0;
     if (RegQueryValueExW(root, wname.c_str(), nullptr, &type, nullptr, &size) != ERROR_SUCCESS)
-        return false;
-    if (size > kMaxRegValueBytes)
+        return ReadValueStatus::not_found;
+
+    const bool exceeds_cap = size > kMaxRegValueBytes;
+    if (exceeds_cap)
         size = kMaxRegValueBytes;
 
     std::vector<BYTE> data(size);
-    if (RegQueryValueExW(root, wname.c_str(), nullptr, &type, data.data(), &size) != ERROR_SUCCESS)
-        return false;
+    if (RegQueryValueExW(root, wname.c_str(), nullptr, &type, data.data(), &size) != ERROR_SUCCESS) {
+        // A capped buffer that was too small for the real value surfaces
+        // here as ERROR_MORE_DATA -- an honestly oversized value, not a
+        // missing one. Any other failure at this point is a genuine miss
+        // (e.g. the value was deleted between the two queries).
+        return exceeds_cap ? ReadValueStatus::oversized : ReadValueStatus::not_found;
+    }
 
     switch (type) {
     case REG_SZ:
@@ -245,18 +311,24 @@ inline bool read_reg_value(HKEY root, const std::string& value_name, std::string
         out_value = reg_sz_to_utf8(reinterpret_cast<const wchar_t*>(data.data()), size);
         out_type_name = (type == REG_SZ) ? "REG_SZ" : "REG_EXPAND_SZ";
         break;
-    case REG_DWORD:
-        if (size >= sizeof(DWORD)) {
-            out_value = std::to_string(*reinterpret_cast<const DWORD*>(data.data()));
-        }
+    case REG_DWORD: {
+        if (size < sizeof(DWORD))
+            return ReadValueStatus::malformed;
+        DWORD v = 0;
+        std::memcpy(&v, data.data(), sizeof(v));
+        out_value = std::to_string(v);
         out_type_name = "REG_DWORD";
         break;
-    case REG_QWORD:
-        if (size >= sizeof(std::uint64_t)) {
-            out_value = std::to_string(*reinterpret_cast<const std::uint64_t*>(data.data()));
-        }
+    }
+    case REG_QWORD: {
+        if (size < sizeof(std::uint64_t))
+            return ReadValueStatus::malformed;
+        std::uint64_t v = 0;
+        std::memcpy(&v, data.data(), sizeof(v));
+        out_value = std::to_string(v);
         out_type_name = "REG_QWORD";
         break;
+    }
     default:
         out_value.clear();
         for (DWORD i = 0; i < size; ++i) {
@@ -267,7 +339,7 @@ inline bool read_reg_value(HKEY root, const std::string& value_name, std::string
         out_type_name = (type == REG_BINARY) ? "REG_BINARY" : "REG_UNKNOWN";
         break;
     }
-    return true;
+    return ReadValueStatus::ok;
 }
 
 } // namespace yuzu::win

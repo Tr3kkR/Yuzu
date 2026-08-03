@@ -35,22 +35,29 @@ TEST_CASE("is_system_sid: a real user SID is not a system SID", "[profiles]") {
     CHECK_FALSE(is_system_sid("S-1-5-80-1234"));
 }
 
-// ── is_user_sid ───────────────────────────────────────────────────────────
+// ── iequals_ascii ─────────────────────────────────────────────────────────
 
-TEST_CASE("is_user_sid: a well-formed domain/local user SID", "[profiles]") {
-    CHECK(is_user_sid(kAliceSid));
-    CHECK(is_user_sid("S-1-5-21-1-2-3-1000")); // short components are still well-formed
+TEST_CASE("iequals_ascii: identical strings match", "[profiles]") {
+    CHECK(iequals_ascii("alice", "alice"));
 }
 
-TEST_CASE("is_user_sid: rejects system SIDs and malformed input", "[profiles]") {
-    CHECK_FALSE(is_user_sid("S-1-5-18"));
-    CHECK_FALSE(is_user_sid(""));
-    CHECK_FALSE(is_user_sid("S-1-5-21-"));                    // prefix only, no components
-    CHECK_FALSE(is_user_sid("S-1-5-21-1-2-3"));                // only 3 components (needs 4)
-    CHECK_FALSE(is_user_sid("S-1-5-21-1-2-3-4-5"));            // 5 components
-    CHECK_FALSE(is_user_sid("S-1-5-21-1-2-abc-1000"));         // non-digit component
-    CHECK_FALSE(is_user_sid("S-1-5-21-1-2--1000"));            // empty component
-    CHECK_FALSE(is_user_sid("not-a-sid-at-all"));
+TEST_CASE("iequals_ascii: differing case matches (ordinal, not locale)", "[profiles]") {
+    CHECK(iequals_ascii("Alice", "alice"));
+    CHECK(iequals_ascii("ALICE", "alice"));
+    CHECK(iequals_ascii("aLiCe", "AlIcE"));
+}
+
+TEST_CASE("iequals_ascii: different length never matches", "[profiles]") {
+    CHECK_FALSE(iequals_ascii("alice", "alices"));
+    CHECK_FALSE(iequals_ascii("alice", ""));
+}
+
+TEST_CASE("iequals_ascii: different content does not match", "[profiles]") {
+    CHECK_FALSE(iequals_ascii("alice", "bob!!"));
+}
+
+TEST_CASE("iequals_ascii: two empty strings match", "[profiles]") {
+    CHECK(iequals_ascii("", ""));
 }
 
 // ── profile_name_from_path ───────────────────────────────────────────────
@@ -176,6 +183,20 @@ TEST_CASE("find_sid_by_username: exact match", "[profiles]") {
     auto sid = find_sid_by_username(profiles, "bob");
     REQUIRE(sid.has_value());
     CHECK(*sid == kBobSid);
+}
+
+TEST_CASE("find_sid_by_username: case-insensitive match (Windows profile folder semantics)",
+          "[profiles]") {
+    // Regression pin: the pre-PR1.7 code built the NTUSER.DAT path directly
+    // against a case-insensitive filesystem, so case never mattered for the
+    // case it could reach. A case-sensitive comparison here would regress
+    // that behaviour for no benefit.
+    std::vector<ProfileInfo> profiles{
+        {std::string{kAliceSid}, "alice", "C:\\Users\\alice", HiveState::loaded},
+    };
+    auto sid = find_sid_by_username(profiles, "Alice");
+    REQUIRE(sid.has_value());
+    CHECK(*sid == kAliceSid);
 }
 
 TEST_CASE("find_sid_by_username: no match", "[profiles]") {

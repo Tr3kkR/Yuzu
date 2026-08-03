@@ -18,6 +18,7 @@
  * rule; this header deliberately does not clone it.
  */
 
+#include <cctype>
 #include <optional>
 #include <span>
 #include <string>
@@ -72,33 +73,19 @@ struct ProfileInfo {
     return sid == "S-1-5-18" || sid == "S-1-5-19" || sid == "S-1-5-20";
 }
 
-/// Structural well-formedness check for a domain/local Windows user SID
-/// (S-1-5-21-<a>-<b>-<c>-<rid>): the "S-1-5-21-" prefix followed by exactly
-/// four non-empty, all-digit, dash-separated components. Purely syntactic —
-/// a well-formed SID may still not correspond to a resolvable profile.
-[[nodiscard]] inline bool is_user_sid(std::string_view sid) {
-    constexpr std::string_view kPrefix = "S-1-5-21-";
-    if (!sid.starts_with(kPrefix))
+/// Ordinal (byte-wise ASCII) case-insensitive equality. Windows profile
+/// folder names are case-insensitive by convention -- this deliberately
+/// does NOT use locale-aware comparison; it matches Windows identifier
+/// semantics, not natural-language casing rules.
+[[nodiscard]] inline bool iequals_ascii(std::string_view a, std::string_view b) {
+    if (a.size() != b.size())
         return false;
-    std::string_view rest = sid.substr(kPrefix.size());
-    if (rest.empty())
-        return false;
-    int component_count = 0;
-    while (!rest.empty()) {
-        auto dash = rest.find('-');
-        std::string_view component = (dash == std::string_view::npos) ? rest : rest.substr(0, dash);
-        if (component.empty())
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i])))
             return false;
-        for (char c : component) {
-            if (c < '0' || c > '9')
-                return false;
-        }
-        ++component_count;
-        if (dash == std::string_view::npos)
-            break;
-        rest = rest.substr(dash + 1);
     }
-    return component_count == 4;
+    return true;
 }
 
 /// Last '\' or '/' separated component of `profile_image_path`, with any
@@ -174,20 +161,23 @@ struct ProfileInfo {
     return out;
 }
 
-/// Finds the SID whose resolved profile_name equals `username` (exact,
-/// case-sensitive match) — the pure half of registry.get_user_value's
-/// username-to-SID resolution. Returns the FIRST match in `profiles` order
-/// when more than one profile resolves to the same name (redirected/renamed
-/// profiles can collide); ambiguity is resolved by discovery order, not
-/// reported. Never matches an entry whose profile_name is empty — an
-/// unresolved name coincidentally equal to a lookup would hide a real
-/// ambiguity rather than answer it.
+/// Finds the SID whose resolved profile_name equals `username` (ordinal
+/// case-insensitive match -- Windows profile folder names are case-
+/// insensitive by convention; the pre-PR1.7 code built the NTUSER.DAT path
+/// directly against a case-insensitive filesystem, so matching case-
+/// sensitively here would regress that behaviour for no benefit) — the pure
+/// half of registry.get_user_value's username-to-SID resolution. Returns
+/// the FIRST match in `profiles` order when more than one profile resolves
+/// to the same name (redirected/renamed profiles can collide); ambiguity is
+/// resolved by discovery order, not reported. Never matches an entry whose
+/// profile_name is empty — an unresolved name coincidentally equal to a
+/// lookup would hide a real ambiguity rather than answer it.
 [[nodiscard]] inline std::optional<std::string> find_sid_by_username(
     std::span<const ProfileInfo> profiles, std::string_view username) {
     if (username.empty())
         return std::nullopt;
     for (const auto& p : profiles) {
-        if (!p.profile_name.empty() && p.profile_name == username)
+        if (!p.profile_name.empty() && iequals_ascii(p.profile_name, username))
             return p.sid;
     }
     return std::nullopt;

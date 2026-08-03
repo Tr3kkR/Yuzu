@@ -346,12 +346,27 @@ private:
         std::string resolved_sid;
         std::string display_name;
         if (!sid_param.empty()) {
+            // Reject a sid that isn't one of the enumerated, non-system
+            // profiles list_profiles itself would report -- an unvalidated
+            // sid previously flowed straight into RegOpenKeyExW/the mount
+            // name (a '\'-bearing or system-SID input would corrupt the
+            // mount name or read a hive list_profiles deliberately
+            // excludes). Membership in profile_list is both necessary and
+            // sufficient here: it structurally can't match anything
+            // malformed, so there is no separate syntax pre-check to add.
             resolved_sid = std::string{sid_param};
+            bool matched = false;
             for (const auto& p : profile_list) {
                 if (p.sid == resolved_sid) {
                     display_name = p.profile_name;
+                    matched = true;
                     break;
                 }
+            }
+            if (!matched) {
+                ctx.write_output(std::format("error|sid '{}' not found in enumerated profiles",
+                                              sanitize_field(resolved_sid)));
+                return 1;
             }
         } else {
             auto found_sid = yuzu::profiles::find_sid_by_username(profile_list, username);
@@ -374,6 +389,7 @@ private:
 
         bool found_value = false;
         bool unload_failed = false;
+        auto read_status = yuzu::win::ReadValueStatus::not_found;
         std::string value, type_name;
         auto status = yuzu::win::with_user_hive(
             resolved_sid, profile_path,
@@ -381,9 +397,25 @@ private:
                 yuzu::win::RegKey opened;
                 if (RegOpenKeyExW(root, to_wide(key).c_str(), 0, KEY_READ, opened.put()) != ERROR_SUCCESS)
                     return;
-                found_value = yuzu::win::read_reg_value(opened.get(), std::string{val_name}, value, type_name);
+                read_status = yuzu::win::read_reg_value(opened.get(), std::string{val_name}, value, type_name);
+                found_value = (read_status == yuzu::win::ReadValueStatus::ok);
             },
             &unload_failed);
+
+        // Surface a failed offline-mount unload on EVERY exit path from here
+        // on -- not just the success path below. A leaked mount is
+        // system-wide and locks the profile's NTUSER.DAT until reboot, and
+        // it is exactly the failure mode installed_apps_plugin.cpp/
+        // licensing_win.cpp/tar_mapdrive_collector.cpp each independently
+        // hit. unload_failed can be true even on HiveAccessStatus::
+        // mount_failed (RegLoadKeyW itself can succeed while the subsequent
+        // root re-open inside with_root() fails), so this check must run
+        // before the switch below, not only after a full-success read.
+        if (unload_failed) {
+            ctx.write_output(std::format(
+                "warning|hive_unload_failed: offline mount for sid '{}' may remain loaded",
+                sanitize_field(resolved_sid)));
+        }
 
         switch (status) {
         case yuzu::win::HiveAccessStatus::not_found:
@@ -404,7 +436,18 @@ private:
         }
 
         if (!found_value) {
-            ctx.write_output("error|key or value not found in user hive");
+            switch (read_status) {
+            case yuzu::win::ReadValueStatus::oversized:
+                ctx.write_output("error|value exceeds 1 MiB limit");
+                break;
+            case yuzu::win::ReadValueStatus::malformed:
+                ctx.write_output("error|value size too small for its declared type");
+                break;
+            case yuzu::win::ReadValueStatus::not_found:
+            case yuzu::win::ReadValueStatus::ok: // unreachable: found_value would be true
+                ctx.write_output("error|key or value not found in user hive");
+                break;
+            }
             return 1;
         }
 
@@ -419,17 +462,6 @@ private:
         ctx.write_output(std::format("username|{}", sanitize_field(effective_name)));
         ctx.write_output(std::format("value|{}", value));
         ctx.write_output(std::format("type|{}", type_name));
-        if (unload_failed) {
-            // The read itself succeeded (the value above is valid) but the
-            // offline mount's RegUnLoadKeyW failed on the way out -- the
-            // profile's NTUSER.DAT may remain locked until reboot. Surfaced,
-            // never dropped: a leaked mount with no visible trace is exactly
-            // the failure mode installed_apps_plugin.cpp/licensing_win.cpp/
-            // tar_mapdrive_collector.cpp each independently hit.
-            ctx.write_output(std::format(
-                "warning|hive_unload_failed: offline mount for sid '{}' may remain loaded",
-                sanitize_field(resolved_sid)));
-        }
         return 0;
     }
 
@@ -440,7 +472,8 @@ private:
     // error — it emits no rows and returns 0.
     int do_list_profiles(yuzu::CommandContext& ctx, yuzu::Params) {
         bool profiles_ok = false;
-        auto records = yuzu::win::enumerate_profile_records(profiles_ok);
+        bool truncated = false;
+        auto records = yuzu::win::enumerate_profile_records(profiles_ok, &truncated);
         if (!profiles_ok) {
             ctx.write_output("error|profile_list_unreadable");
             return 1;
@@ -450,6 +483,10 @@ private:
 
         for (const auto& info : profile_list) {
             ctx.write_output(yuzu::profiles::render_profile_row(info));
+        }
+        if (truncated) {
+            ctx.write_output(std::format("warning|profile_list_truncated at {} entries",
+                                          yuzu::win::kMaxProfiles));
         }
         return 0;
     }

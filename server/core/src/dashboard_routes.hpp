@@ -143,6 +143,19 @@ private:
 
     // -- Fragment renderers ---------------------------------------------------
 
+    /// Resolves the column-name list @ref render_results and @ref
+    /// col_index_for_name should render/sort against: index 0 is always
+    /// "Agent", followed by the InstructionDefinition's `result_schema`-
+    /// derived columns (via ResponseTemplatesEngine::synthesise_default)
+    /// when @p definition_id names a definition with a non-empty schema,
+    /// falling back to `columns_for_plugin(plugin)` otherwise. This is the
+    /// PR1.7 remediation fix for issue where a schema-only action (no
+    /// `spec.visualization`, e.g. registry's list_profiles) rendered every
+    /// data column as suppressed because `columns_for_plugin` only knows a
+    /// fixed per-plugin schema, not a per-action one.
+    std::vector<std::string> resolve_render_columns(const std::string& plugin,
+                                                     const std::string& definition_id) const;
+
     /// Render filtered/sorted/paginated result rows + OOB thead, pagination,
     /// summary. When @p definition_id is non-empty AND the definition has a
     /// `spec.visualization`, an OOB chart deck fragment is appended to

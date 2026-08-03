@@ -55,14 +55,15 @@ kind: InstructionDefinition
 metadata:
   id: windows.registry.get_user_value
   displayName: Get Per-User Registry Value
-  version: 1.1.0
+  version: 1.2.0
   description: >
     Read a registry value from a specific user's registry hive. Resolves
     the target profile via ProfileList (by username or an explicit SID),
     then reads the live HKEY_USERS\<SID> hive if the user is logged in,
     or loads that profile's NTUSER.DAT via RegLoadKey as a fallback.
-    Requires SE_RESTORE_NAME and SE_BACKUP_NAME privileges (i.e., run
-    as SYSTEM or elevated admin). Windows-only.
+    SeBackupPrivilege and SeRestorePrivilege are required only for the
+    offline fallback when the target user is not logged in; reading an
+    already-loaded live hive needs no elevated privilege. Windows-only.
   tags: [registry, windows, per-user, configuration]
 spec:
   type: question
@@ -79,9 +80,11 @@ spec:
         type: string
         displayName: Username
         description: >
-          Windows profile name to resolve via ProfileList (e.g., the local
-          account name). Either username or sid is required; sid takes
-          precedence if both are given.
+          Windows profile folder name to resolve via ProfileList (see
+          list_profiles), matched case-insensitively. This is not always
+          the same as the account name (renamed accounts, domain profiles).
+          Either username or sid is required; sid takes precedence if both
+          are given.
         validation:
           maxLength: 256
       sid:
@@ -90,7 +93,9 @@ spec:
         description: >
           Windows security identifier (e.g.,
           "S-1-5-21-...-1001") of the target profile, as an alternative to
-          username. Either username or sid is required.
+          username. Must match one of the profiles list_profiles would
+          report; a sid not found there is rejected. Either username or sid
+          is required.
         validation:
           maxLength: 256
       key:
