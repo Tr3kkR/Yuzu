@@ -1,4 +1,5 @@
 #include "runtime_config_store.hpp"
+#include "config_secret_keys.hpp"
 #include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
@@ -34,15 +35,6 @@ static const std::vector<std::string> kAllowedKeys = {
     "dex_cohort_export_key",         // tag key; "" = export disabled (validated on apply)
 };
 
-// Keys whose VALUE is a credential. Adding a secret-valued key above without adding
-// it here is the mistake this list exists to make hard: the value was previously
-// written verbatim to the startup log AND returned by GET /api/config, which is
-// gated only on Infrastructure:Read, while the settings UI has always masked it as
-// "********" -- so the API contradicted the UI's own posture.
-const std::vector<std::string> kSecretKeys = {
-    "oidc_client_secret",
-};
-
 const std::vector<std::string>& RuntimeConfigStore::allowed_keys() {
     return kAllowedKeys;
 }
@@ -52,7 +44,7 @@ bool RuntimeConfigStore::is_allowed_key(const std::string& key) {
 }
 
 bool RuntimeConfigStore::is_secret_key(const std::string& key) {
-    return std::find(kSecretKeys.begin(), kSecretKeys.end(), key) != kSecretKeys.end();
+    return is_secret_config_key(key); // the shared leaf; see config_secret_keys.hpp
 }
 
 // ── Constructor / destructor ─────────────────────────────────────────────────
@@ -201,23 +193,6 @@ std::string RuntimeConfigStore::get_value_with_secrets(const std::string& key) c
     return entry ? entry->value : std::string{};
 }
 
-nlohmann::json
-RuntimeConfigStore::build_overrides_json(const std::vector<RuntimeConfigEntry>& entries) {
-    nlohmann::json overrides = nlohmann::json::object();
-    for (const auto& e : entries) {
-        if (is_secret_key(e.key)) {
-            overrides[e.key] = {{"is_set", !e.value.empty()},
-                                {"updated_by", e.updated_by},
-                                {"updated_at", e.updated_at}};
-        } else {
-            overrides[e.key] = {{"value", e.value},
-                                {"updated_by", e.updated_by},
-                                {"updated_at", e.updated_at}};
-        }
-    }
-    return overrides;
-}
-
 // ── Mutations ────────────────────────────────────────────────────────────────
 
 std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
@@ -228,6 +203,15 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
 
     if (!is_allowed_key(key))
         return std::unexpected("key '" + key + "' is not a configurable runtime setting");
+
+    // The redaction placeholder is not a credential. GET /api/config omits a secret's
+    // value precisely so a round-tripping client cannot write this back -- but the
+    // startup log prints it, and a human copying that line reaches the same place.
+    // Storing it would break SSO and destroy the real secret, so refuse at the sink
+    // rather than relying on every caller to notice.
+    if (is_secret_key(key) && value == redacted_placeholder())
+        return std::unexpected("value is the redaction placeholder, not a credential; send the "
+                               "real secret, or omit the key to leave it unchanged");
 
     // Basic validation per key
     if (key == "heartbeat_timeout" || key == "response_retention_days" ||

@@ -1,8 +1,9 @@
 #include "audit_store.hpp"
 #include "migration_runner.hpp"
-// For the secret-key predicate + placeholder only (both static); no store instance
-// is constructed here and no ownership relationship is implied.
-#include "runtime_config_store.hpp"
+// A zero-dependency leaf holding the secret-key predicate + placeholder. Deliberately
+// NOT runtime_config_store.hpp: the evidence store has no business depending on a
+// domain store (or, transitively, on nlohmann) to answer "is this key a credential".
+#include "config_secret_keys.hpp"
 #include "sqlite_raii.hpp"
 
 #include <spdlog/spdlog.h>
@@ -439,7 +440,7 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_
         e.target_id = col_text(6);
         // Sanitised at the single point where a stored row becomes a value a caller
         // can hold, so every reader is covered by
-        // construction rather than by three of them remembering to call it.
+        // construction rather than by each reader remembering to call it.
         e.detail = sanitized_detail(e.target_type, e.target_id, col_text(7));
         e.source_ip = col_text(8);
         e.user_agent = col_text(9);
@@ -467,27 +468,34 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_
     return results;
 }
 
-std::string AuditStore::sanitized_detail(const std::string& target_type,
-                                         const std::string& target_id,
-                                         const std::string& detail) {
+std::string AuditStore::sanitized_detail(std::string_view target_type, std::string_view target_id,
+                                         std::string detail) {
     // Keyed on the TARGET (a runtime-config row naming a secret key), not on one
     // writer's action string. `config.update` is the only such writer today, but
     // keying on it would leave a future writer -- a settings handler recording the
     // same key under its own verb -- outside the rule, and nothing would fail.
     // Still narrow: a blanket "redact anything that looks secret" across every audit
     // detail would gut the evidence value of the log, which is what this store is for.
-    if (target_type != "RuntimeConfig" || !RuntimeConfigStore::is_secret_key(target_id))
+    if (target_type != "RuntimeConfig" || !is_secret_config_key(target_id))
         return detail;
     if (detail.empty())
         return detail;
 
-    // Replace only the `value=` segment, so a row that also records WHY the change
-    // was made keeps that context. If there is no such segment we cannot tell which
-    // part is the credential, so the whole detail goes -- fail safe, not fail open.
-    const auto pos = detail.find("value=");
-    if (pos == std::string::npos)
-        return std::string(RuntimeConfigStore::redacted_placeholder());
-    return detail.substr(0, pos) + "value=" + RuntimeConfigStore::redacted_placeholder();
+    // ONLY the exact shape today's writer emits -- a detail that STARTS `value=` --
+    // keeps its `value=` label. Anything else is replaced wholesale.
+    //
+    // An earlier revision preserved `detail.substr(0, pos)` for a `value=` found at
+    // ANY offset, to keep a future writer's surrounding context. Two reviewers
+    // independently rejected that, and both were right: a writer that placed the
+    // credential BEFORE a `value=` token would have had it preserved verbatim, and
+    // the comment promising that context is kept held only for one token ordering
+    // that nothing enforces. No writer of either shape exists today, so this gives
+    // up nothing real and removes a trap that fires the moment someone trusts the
+    // comment. If a future writer needs context to survive, give `detail` structure
+    // (named JSON fields) rather than adding a second string-surgery rule.
+    if (detail.rfind("value=", 0) == 0)
+        return "value=" + std::string(kRedactedPlaceholder);
+    return std::string(kRedactedPlaceholder);
 }
 
 std::size_t AuditStore::total_count() const {

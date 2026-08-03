@@ -116,10 +116,13 @@ TEST_CASE("AuditStore: a pre-existing config.update secret detail is redacted on
     CHECK(secret_detail == "value=<redacted>");
     CHECK(ordinary_detail == "value=debug");
     CHECK(other_detail == "issuer=https://idp.example.com");
-    // Covered by target_type, and the non-secret context survives: only the value=
-    // segment is replaced, so "why" is still readable as evidence.
+    // Covered by target_type. Context is NOT preserved: a credential could equally
+    // have been written before the token, so any shape but a leading `value=` is
+    // dropped entirely.
     CHECK(future_detail.find("another-secret") == std::string::npos);
-    CHECK(future_detail == "reason=rotation value=<redacted>");
+    // Wholesale: the detail does not START with `value=`, so we cannot tell which
+    // part is the credential and none of it is preserved.
+    CHECK(future_detail == "<redacted>");
 }
 
 TEST_CASE("AuditStore::sanitized_detail is idempotent and leaves an empty detail alone",
@@ -131,10 +134,14 @@ TEST_CASE("AuditStore::sanitized_detail is idempotent and leaves an empty detail
     CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_client_secret", "").empty());
     CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_issuer", "value=https://idp") ==
           "value=https://idp");
-    // No `value=` segment: we cannot tell which part is the credential, so the whole
+    // No leading `value=`: we cannot tell which part is the credential, so the whole
     // detail goes. Fail safe, not fail open.
     CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_client_secret", "raw-leak") ==
           "<redacted>");
+    // The credential written BEFORE a value= token -- the case the old prefix-
+    // preserving rule leaked verbatim.
+    CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_client_secret",
+                                       "s3cr3t value=x") == "<redacted>");
 }
 
 TEST_CASE("AuditStore: log and retrieve", "[audit_store]") {

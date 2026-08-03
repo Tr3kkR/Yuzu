@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "runtime_config_store.hpp"
+#include "runtime_config_view.hpp"
 #include "../test_helpers.hpp"
 
 using yuzu::server::RuntimeConfigStore;
@@ -106,9 +107,9 @@ TEST_CASE("every registered secret key is actually storable", "[runtime_config][
 // because they only checked key REGISTRATION, never emitter consultation.
 TEST_CASE("get_all() redacts secrets; get_all_with_secrets() does not",
           "[runtime_config][secret]") {
-    auto db = yuzu::test::unique_temp_path("yuzu_test_rtcfg");
+    yuzu::test::TempDbFile db{"yuzu_test_rtcfg"};
     {
-        RuntimeConfigStore store(db);
+        RuntimeConfigStore store(db.path);
         REQUIRE(store.is_open());
         REQUIRE(store.set("oidc_client_secret", "s3cr3t-value", "tester"));
         REQUIRE(store.set("oidc_issuer", "https://idp.example.com", "tester"));
@@ -133,8 +134,6 @@ TEST_CASE("get_all() redacts secrets; get_all_with_secrets() does not",
         CHECK(real_secret == "s3cr3t-value");
         CHECK(real_issuer == "https://idp.example.com");
     }
-    std::error_code ec;
-    std::filesystem::remove(db, ec);
 }
 
 TEST_CASE("an EMPTY secret survives redaction as empty, so is_set can be false",
@@ -143,9 +142,9 @@ TEST_CASE("an EMPTY secret survives redaction as empty, so is_set can be false",
     // Replacing every secret value -- including "" -- with the non-empty placeholder
     // made that unconditionally true: no stored secret could report unset. Caught by
     // review after the redaction landed, which is why it has its own case.
-    auto db = yuzu::test::unique_temp_path("yuzu_test_rtcfg_empty");
+    yuzu::test::TempDbFile db{"yuzu_test_rtcfg_empty"};
     {
-        RuntimeConfigStore store(db);
+        RuntimeConfigStore store(db.path);
         REQUIRE(store.is_open());
         REQUIRE(store.set("oidc_client_secret", "", "tester"));
 
@@ -166,22 +165,20 @@ TEST_CASE("an EMPTY secret survives redaction as empty, so is_set can be false",
                 CHECK(e.value == RuntimeConfigStore::redacted_placeholder());
         }
     }
-    std::error_code ec;
-    std::filesystem::remove(db, ec);
 }
 
 TEST_CASE("build_overrides_json omits a secret's value and reports is_set",
           "[runtime_config][secret]") {
     // Covers the GET /api/config shape directly. That route lives in server.cpp and is
     // not TestRouteSink-registered, so before this was extracted the omission rule -
-    // one of the three sites the secret leaked from - had no test at all, and the
+    // one of the sites the secret leaked from - had no test at all, and the
     // suite was green through two rounds of getting it wrong.
     std::vector<yuzu::server::RuntimeConfigEntry> entries = {
         {"oidc_client_secret", RuntimeConfigStore::redacted_placeholder(), "admin", 1754150400},
         {"oidc_issuer", "https://idp.example.com", "admin", 1754150401},
     };
 
-    const auto j = RuntimeConfigStore::build_overrides_json(entries);
+    const auto j = yuzu::server::build_overrides_json(entries);
 
     // The secret carries NO value field at all - not the real one, and not the
     // placeholder either, because the placeholder is a legal value a round-tripping
@@ -204,7 +201,7 @@ TEST_CASE("build_overrides_json omits a secret's value and reports is_set",
     std::vector<yuzu::server::RuntimeConfigEntry> unset = {
         {"oidc_client_secret", "", "admin", 1754150400},
     };
-    const auto j2 = RuntimeConfigStore::build_overrides_json(unset);
+    const auto j2 = yuzu::server::build_overrides_json(unset);
     CHECK_FALSE(j2.at("oidc_client_secret").at("is_set").get<bool>());
     CHECK_FALSE(j2.at("oidc_client_secret").contains("value"));
 }
@@ -215,9 +212,9 @@ TEST_CASE("the single-key accessors redact too, and the _with_secrets pair does 
     // reads returned plaintext, so the header's "every accessor is safe by default"
     // was false for half the API. Mutation testing caught that closing the gap left
     // NO failing test - this is that test.
-    auto db = yuzu::test::unique_temp_path("yuzu_test_rtcfg_single");
+    yuzu::test::TempDbFile db{"yuzu_test_rtcfg_single"};
     {
-        RuntimeConfigStore store(db);
+        RuntimeConfigStore store(db.path);
         REQUIRE(store.is_open());
         REQUIRE(store.set("oidc_client_secret", "s3cr3t-value", "tester"));
         REQUIRE(store.set("oidc_issuer", "https://idp.example.com", "tester"));
@@ -246,6 +243,28 @@ TEST_CASE("the single-key accessors redact too, and the _with_secrets pair does 
         REQUIRE(store.set("oidc_client_secret", "", "tester"));
         CHECK(store.get_value("oidc_client_secret").empty());
     }
-    std::error_code ec;
-    std::filesystem::remove(db, ec);
+}
+
+TEST_CASE("set() refuses the redaction placeholder as a credential",
+          "[runtime_config][secret]") {
+    // The read side omits a secret's value so a config-as-code client cannot round-
+    // trip the placeholder back as the credential -- but the startup log PRINTS it,
+    // and a human copying that line arrives at the same place. Refusing at the sink
+    // covers every caller, present and future.
+    yuzu::test::TempDbFile db{"yuzu_test_rtcfg_ph"};
+    RuntimeConfigStore store(db.path);
+    REQUIRE(store.is_open());
+    REQUIRE(store.set("oidc_client_secret", "real-secret", "tester").has_value());
+
+    auto rejected = store.set("oidc_client_secret",
+                              RuntimeConfigStore::redacted_placeholder(), "tester");
+    REQUIRE_FALSE(rejected.has_value());
+    CHECK(rejected.error().find("placeholder") != std::string::npos);
+
+    // And the real secret is still intact -- a refused write must not clobber.
+    CHECK(store.get_value_with_secrets("oidc_client_secret") == "real-secret");
+
+    // The same literal is a legal value for a NON-secret key; the guard is scoped.
+    CHECK(store.set("oidc_issuer", RuntimeConfigStore::redacted_placeholder(),
+                    "tester").has_value());
 }

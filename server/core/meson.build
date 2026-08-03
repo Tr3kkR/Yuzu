@@ -351,6 +351,9 @@ yuzu_server_core_lib = static_library(
    yuzu_viz_host_js_embed, cytoscape_js_embed,
    yuzu_css_embed, inter_embed, content_embed, cpe_map_embed,
   files(
+    'src/config_secret_keys.cpp',
+    'src/runtime_config_store.cpp',
+    'src/runtime_config_view.cpp',
     'src/server.cpp',
     'src/agent_registry.cpp',
     'src/agent_service_impl.cpp',
@@ -433,7 +436,6 @@ yuzu_server_core_lib = static_library(
     'src/guardian_form_render.cpp',
     'src/dex_alert_router.cpp',
     'src/dex_blast_radius.cpp',
-    'src/runtime_config_store.cpp',
     'src/custom_properties_store.cpp',
     'src/mcp_server.cpp',
     'src/mcp_input_schema.cpp',

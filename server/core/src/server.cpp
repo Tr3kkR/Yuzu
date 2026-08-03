@@ -135,6 +135,7 @@
 #include "webhook_routes.hpp"
 #include "workflow_routes.hpp"
 #include "runtime_config_store.hpp"
+#include "runtime_config_view.hpp"
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
 #include "instruction_db_pool.hpp"
@@ -7833,8 +7834,7 @@ private:
             // secret leaked from twice.
             nlohmann::json overrides = nlohmann::json::object();
             if (runtime_config_store_ && runtime_config_store_->is_open()) {
-                overrides = RuntimeConfigStore::build_overrides_json(
-                    runtime_config_store_->get_all());
+                overrides = build_overrides_json(runtime_config_store_->get_all());
             }
 
             nlohmann::json allowed = nlohmann::json::array();

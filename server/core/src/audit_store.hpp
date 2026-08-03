@@ -183,9 +183,11 @@ public:
     /// Keyed on the TARGET -- a `RuntimeConfig` row naming a secret-valued key --
     /// rather than on a writer's action string, so a future writer recording the same
     /// key under a different verb is covered without anyone remembering to extend a
-    /// list. Only the `value=` segment is replaced, so a row that also records why a
-    /// change was made keeps that context; a detail with no such segment is replaced
-    /// wholesale, because then we cannot tell which part is the credential.
+    /// list. A detail that STARTS `value=` keeps that label and loses the value; ANY
+    /// other shape is replaced wholesale, because we cannot then tell which part is
+    /// the credential. Deliberately not "preserve everything before the first
+    /// `value=`" -- that preserved a credential written before the token, and made
+    /// the guarantee depend on an ordering nothing enforces.
     ///
     /// A `config.update` on a secret-valued key recorded `value=<the secret>` in
     /// `detail` before that write path was fixed. Those rows are ALREADY on disk on
@@ -201,8 +203,12 @@ public:
     /// DISCLOSED. Operators who set the secret pre-upgrade should still rotate it.
     ///
     /// Idempotent: rows written after the writer fix already hold the placeholder.
-    static std::string sanitized_detail(const std::string& target_type,
-                                        const std::string& target_id, const std::string& detail);
+    /// `detail` is taken BY VALUE and moved through on the common pass-through path:
+    /// this runs per row on every audit read (up to kAuditSampleScanCap rows under
+    /// the reader lock), and a const-ref parameter forced a copy of every row's
+    /// detail whether or not it needed redacting.
+    static std::string sanitized_detail(std::string_view target_type, std::string_view target_id,
+                                        std::string detail);
 
     /// Cumulative audit-event write counts grouped by `result` value. Exposed for
     /// Prometheus scraping; reset at process start. Lock-free reads.

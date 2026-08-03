@@ -1,8 +1,8 @@
 #pragma once
 
-#include <sqlite3.h>
+#include "config_secret_keys.hpp"
 
-#include <nlohmann/json.hpp>
+#include <sqlite3.h>
 
 #include <cstdint>
 #include <expected>
@@ -37,9 +37,9 @@ public:
 
     bool is_open() const;
 
-    /// ALL FOUR READ ACCESSORS REDACT BY DEFAULT. The `_with_secrets` variants are
-    /// the only way to obtain a credential, and naming them at the call site is the
-    /// point: an emitter that does not think about secrets gets the safe behaviour.
+    /// THE THREE PLAIN READ ACCESSORS REDACT; plaintext requires a `_with_secrets`
+    /// name. Naming it at the call site is the point: an emitter that does not think
+    /// about secrets gets the safe behaviour.
     /// Redaction being opt-in is how the plaintext secret reached an audit row that
     /// Operator can read, surviving the first round of the fix (governance, this
     /// branch) -- so it is not opt-in on any accessor.
@@ -89,26 +89,9 @@ public:
     /// past the first version of this fix).
     static bool is_secret_key(const std::string& key);
 
-    /// What to print in place of a secret. Single spelling so log scrapers and API
-    /// consumers see one token.
-    static const char* redacted_placeholder() { return "<redacted>"; }
-
-    /// The `overrides` object `GET /api/config` returns, built from `get_all()`.
-    ///
-    /// A free function taking the entries rather than inline route code, so the
-    /// omission rule is reachable from a unit test. The route lives in server.cpp and
-    /// is not TestRouteSink-registered, so an inline loop here would be untested --
-    /// and this is one of the three sites where the secret leaked twice.
-    ///
-    /// A secret's `value` is OMITTED and replaced by `is_set`, NOT placeholdered: the
-    /// placeholder is itself a legal value, so a config-as-code or backup-restore
-    /// client reading it and writing it back would silently set the literal string as
-    /// the credential. `updated_by`/`updated_at` are kept for both kinds so an
-    /// operator can still see that a secret is set and who set it.
-    ///
-    /// Returns a JSON object, keyed by config key. Takes the REDACTED entries, so an
-    /// `is_set` of true means "non-empty", which is why get_all() preserves emptiness.
-    static nlohmann::json build_overrides_json(const std::vector<RuntimeConfigEntry>& entries);
+    /// What to print in place of a secret. Delegates to the shared leaf so there is
+    /// exactly one spelling in the tree (see config_secret_keys.hpp).
+    static const char* redacted_placeholder() { return kRedactedPlaceholder; }
 
     /// Returns the list of allowed config keys.
     static const std::vector<std::string>& allowed_keys();
