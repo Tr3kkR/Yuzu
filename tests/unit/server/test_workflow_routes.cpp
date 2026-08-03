@@ -69,9 +69,10 @@ struct ExecHarness {
     /// approval-gated execute short-circuits to 503 before the reserved-id
     /// pre-check. ApprovalManager BORROWS its handle, so the harness owns one
     /// on the same file (SQLite permits several connections to one database).
-    /// Held by the guard, declared first, for the reason the guard exists: a
-    /// REQUIRE later in the constructor throws, ~ExecHarness never runs, and a
-    /// raw member would leak the handle and the temp files with it.
+    /// Held by the guard for the reason the guard exists: a REQUIRE later in
+    /// the constructor throws, ~ExecHarness never runs, and a raw member would
+    /// leak the handle. (The temp files leak on that path either way — the
+    /// guard closes the handle, it does not remove them.)
     SqliteHandleGuard appr_guard;
     /// Declared BEFORE `sink`, so it destructs AFTER it. `sink` — not `routes` —
     /// owns the route lambdas that capture `&metrics`, so this ordering is what
@@ -302,10 +303,11 @@ struct ExecHarness {
         // Drop the borrower before closing the handle it borrows, then close
         // it before the file is removed below (Windows refuses to unlink an
         // open file — the same reason the tracker handle is closed here).
-        // Drop the borrower before the guard closes the handle it borrows.
-        // The guard itself closes after the file-removal below only because it
-        // is declared first; close it here so the unlink can succeed on
-        // Windows, the same reason the tracker handle is closed here.
+        // Drop the borrower, then close the handle HERE rather than leaving it
+        // to ~SqliteHandleGuard: member destructors run after this body, so the
+        // guard would close only after the file-removal below, and Windows
+        // refuses to unlink an open file. Same reason the tracker handle is
+        // closed here.
         approvals.reset();
         if (appr_guard.db) {
             sqlite3_close_v2(appr_guard.db);
@@ -954,8 +956,10 @@ TEST_CASE("#2442 — executing a legacy mcp.-prefixed approval-gated definition 
     // strands them silently. Checked as a stem list rather than one literal —
     // any paraphrase reintroduces the hazard, and a single substring would
     // still pass.
-    for (const auto& phrase : {"delete this", "delete it", "remove this", "erase this"})
+    for (const auto& phrase : {"delete this", "delete it", "remove this", "erase this"}) {
         CHECK(message.find(phrase) == std::string::npos);
+        CHECK(remediation.find(phrase) == std::string::npos);
+    }
 
     // The audit token is a PUBLISHED contract: docs/user-manual/audit-log.md
     // documents it as SIEM-keyable on instruction.execute denials, so a rename
@@ -1001,9 +1005,10 @@ TEST_CASE("#2442 — an UNGATED legacy mcp.-prefixed definition still executes",
     auto res = h.sink.Post("/api/instructions/mcp.legacy_auto/execute",
                            R"({"params":{},"agent_ids":["agent-1"]})");
     REQUIRE(res);
-    // The dispatch stub reports nothing sent, so this route answers 503 — the
-    // point is that it got PAST the reserved-id branch rather than 400ing.
-    CHECK(res->status != 400);
+    // The dispatch stub reports nothing sent, so this route answers 503. Pinned
+    // exactly rather than "not 400": a future 403/404 regression would also be
+    // "not 400" and would silently satisfy a loose check.
+    CHECK(res->status == 503);
     CHECK(h.approvals->query({}).empty()); // auto: no ticket either way
 }
 

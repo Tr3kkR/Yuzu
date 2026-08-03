@@ -550,9 +550,9 @@ The ScheduleEngine supports recurring instruction executions with four frequency
 
 | Type | Fields Used | Description |
 |---|---|---|
-| `daily` | `time_of_day` | Runs once per day at the specified time. |
-| `weekly` | `time_of_day`, `day_of_week` | Runs once per week. `day_of_week`: 0=Sunday through 6=Saturday. |
-| `monthly` | `time_of_day`, `day_of_month` | Runs once per month. `day_of_month`: 1-28 (no 29/30/31 to avoid month-length issues). |
+| `daily` | -- | Runs every 24 hours, counted from when the schedule was created. |
+| `weekly` | -- | Runs every 7 days, counted from when the schedule was created. |
+| `monthly` | -- | Runs every 30 days, counted from when the schedule was created -- a flat period, so it does not track a calendar day. |
 | `interval` | `interval_minutes` | Runs every N minutes. Minimum: 1 minute. |
 
 ### Execution semantics
@@ -584,9 +584,9 @@ and `yuzu_schedule_tick_errors_total` counters.
 | `definition_id` | string | The instruction definition to execute. |
 | `frequency_type` | string | `daily`, `weekly`, `monthly`, or `interval`. |
 | `interval_minutes` | int | Minutes between executions (for `interval` type). |
-| `time_of_day` | string | HH:MM format (for `daily`, `weekly`, `monthly`). |
-| `day_of_week` | int | 0-6 (for `weekly`). |
-| `day_of_month` | int | 1-28 (for `monthly`). |
+| `time_of_day` | string | **Accepted and stored, but NOT honoured** -- the scheduler does not read it, so the firing time is set by when the schedule was created, not by this value (#2746). |
+| `day_of_week` | int | **Accepted and stored, but NOT honoured** (#2746). |
+| `day_of_month` | int | **Accepted and stored, but NOT honoured** (#2746). |
 | `scope_expression` | string | Scope DSL expression evaluated at dispatch time. |
 | `requires_approval` | bool | If `true`, each scheduled run goes through the approval workflow. |
 | `enabled` | bool | Toggle the schedule on or off without deleting it. |

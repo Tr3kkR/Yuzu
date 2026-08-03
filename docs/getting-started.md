@@ -853,9 +853,9 @@ Expected response:
 | `definition_id` | string | ID of the instruction definition to execute |
 | `frequency_type` | string | `"once"`, `"interval"`, `"daily"`, `"weekly"`, `"monthly"` |
 | `interval_minutes` | int | Minutes between executions (for `interval` type) |
-| `time_of_day` | string | `"HH:MM"` time for daily/weekly/monthly schedules |
-| `day_of_week` | int | 0-6 (Sunday=0) for weekly schedules |
-| `day_of_month` | int | 1-31 for monthly schedules |
+| `time_of_day` | string | Accepted and stored, but **not honoured** -- daily/weekly/monthly fire on a flat period counted from creation (#2746) |
+| `day_of_week` | int | Accepted and stored, but **not honoured** (#2746) |
+| `day_of_month` | int | Accepted and stored, but **not honoured** (#2746) |
 | `scope_expression` | string | Scope expression to target agents |
 | `requires_approval` | bool | Whether each scheduled run needs approval |
 

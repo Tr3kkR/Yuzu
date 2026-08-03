@@ -280,100 +280,61 @@ create). Renaming it is still the durable fix.
 Re-run both queries immediately before you upgrade. They are two separate reads of a live
 database, so a schedule added or an `approval_mode` edited in between is missed.
 
-**To rename.** Read this whole section before starting: a rename is delete-and-recreate at
-every level, and doing it in the wrong order strands state silently.
+**To rename — and why this is deliberately not a step-by-step.** Renaming a definition that
+has a schedule cannot be done losslessly today. Earlier drafts of this note gave a detailed
+procedure; each revision was found to strand or silently alter something, because the procedure
+was compensating for product gaps rather than describing a supported operation. The gaps are
+tracked, and until they are closed the honest advice is short.
 
-Two constraints shape the procedure. Deleting a definition does not touch the schedules that
-reference it — there is no referential guard — so a schedule left pointing at a deleted id
-fails with `definition_unknown`, advances, and still shows enabled with a next run it never
-makes. And a schedule cannot be re-pointed: the API exposes create, delete and enable/disable
-only, with no update, so moving a schedule to the new definition means deleting and recreating
-it.
+What you need to know before you touch anything:
 
-1. Create the replacement under an id outside the `mcp.` namespace. This is an ordinary create,
-   so the reservation applies to the new id too; a collision with an existing id fails with 409.
+- **A schedule cannot be moved to another definition.** The API offers create, delete and
+  enable/disable — there is no update. Moving one means deleting and recreating it (#2742).
+- **Deleting a definition does not touch its schedules.** They are left pointing at an id that
+  no longer exists, and then fail every occurrence while still showing as enabled with a next
+  run (#2742).
+- **A rebuilt schedule does not keep its firing time.** The scheduler does not read
+  `time_of_day`, `day_of_week` or `day_of_month` at all — the next run is computed from the
+  moment of creation plus a flat period — so a rebuild moves a maintenance-window job to
+  whenever you rebuilt it, permanently (#2746).
+- **`POST /api/schedules` defaults every field you omit**, and the defaults are dangerous: an
+  omitted `scope_expression` becomes empty, which dispatches to the **entire fleet**; an omitted
+  `requires_approval` drops the schedule's half of the approval gate; an omitted
+  `frequency_type` becomes `once`, due immediately. A rebuild must copy the whole row.
+- **Delete is owner-scoped and its failure is silent** — a non-owner `DELETE /api/schedules/{id}`
+  answers `200 {"deleted": false}` with no audit row.
 
-   Carry the definition's `mode:` across explicitly. It defaults to `auto` when absent, so a
-   replacement built from a trimmed copy drops the approval gate at the definition level — the
-   same defaulting trap as the schedule below, one level up. Re-run triage query 1 after
-   creating it: the replacement should appear if and only if the original did.
-2. List **every** schedule on the old definition — not just the ones the triage flagged, since
-   an ungated schedule on an `auto` definition is stranded by the delete just the same. Select
-   the whole row, because you are about to rebuild it and `POST /api/schedules` defaults every
-   field you omit:
+So:
 
-   ```bash
-   sqlite3 -line /var/lib/yuzu/instructions.db \
-     "SELECT id, name, created_by, enabled, frequency_type, interval_minutes,
-             time_of_day, day_of_week, day_of_month, scope_expression, requires_approval
-        FROM schedules WHERE definition_id = '<old-id>';"
-   ```
+- **A definition with no schedule** renames cleanly: create the replacement under an id outside
+  the `mcp.` namespace, carrying its `mode:` (which defaults to `auto` if omitted, dropping the
+  gate), re-point anything that calls it by id, then delete the original.
+- **A definition with a schedule** — do not attempt a lossless rename. Either leave it in place
+  (it keeps working unless it is approval-gated, per the section above) and wait for #2742/#2746,
+  or accept that the rebuilt schedule starts a new firing cycle from the moment you create it,
+  and rebuild it inside the window you want it to keep. That is achievable for `daily` and
+  `interval`; `weekly` additionally has to land on the right weekday, and `monthly` cannot be
+  held to a calendar day at all, because its period is a flat 30 days.
 
-3. Recreate each one against the new definition id, carrying **every** field from step 2, then
-   delete the old schedule.
+After any rename, check that nothing was orphaned:
 
-   Read this before you start, because the defaults are dangerous. `POST /api/schedules` fills
-   in anything you leave out: an omitted `scope_expression` becomes empty, and an empty scope
-   **dispatches to the entire fleet**; an omitted `requires_approval` becomes `false`, which
-   **drops the schedule's half of the approval gate** (the run is still gated if the definition's
-   own `approval_mode` is not `auto`, since the two are OR-ed — but do not rely on that, because
-   step 1 can drop the definition's half too); an omitted `frequency_type` becomes `once`. Rebuild a daily,
-   group-scoped, approval-gated schedule from a partial copy and you get a one-shot, fleet-wide,
-   ungated one — and the first occurrence can fire within a tick. Copy the whole row.
+```bash
+sqlite3 /var/lib/yuzu/instructions.db \
+  "SELECT s.id, s.definition_id FROM schedules s
+     LEFT JOIN instruction_definitions d ON d.id = s.definition_id
+    WHERE d.id IS NULL;"
+```
 
-   Four things cannot be carried across at all:
+The triage queries above cannot do this for you — they join to a definition that exists, so once
+the original is deleted an orphaned schedule appears in neither. Any row here will never fire
+again.
 
-   - **The firing time re-anchors to the moment you recreate it.** This is the one that moves
-     a fleet-wide dispatch out of its maintenance window. `time_of_day`, `day_of_week` and
-     `day_of_month` are stored and echoed back, but the scheduler does not read them: the next
-     run is computed as *now* plus the period, so a `daily` schedule rebuilt at 14:00 fires at
-     14:00 from then on, not at its original 02:00. Rebuild inside the window you want it to
-     keep, or accept the shift and say so to whoever owns that window.
-
-   - **`enabled`** is not a create field, so every recreated schedule starts enabled *and*
-     armed — a `once` schedule's first occurrence is due immediately, and the tick is 30
-     seconds. If the original was disabled, `POST /api/schedules/{id}/enable` with
-     `{"enabled": false}` on the replacement before it reaches that first occurrence. Otherwise
-     the rename silently arms a schedule somebody had deliberately parked. That call echoes back
-     what you asked for rather than what it changed, the same way the delete does, so confirm the
-     schedule's state rather than trusting the response.
-   - **`created_by`** is taken from the session that creates it. Nothing *requires* the
-     recreator to be the original owner — but it should be, because an administrator who
-     rebuilds it becomes its owner. There is no act-as and no admin override — deleting is scoped
-     to the creator at the SQL seam, and a non-owner `DELETE /api/schedules/{id}` answers
-     `200 {"deleted": false}` with no audit row, so a failed delete looks like a successful one.
-     Check that response rather than assuming. An administrator who recreates the schedule
-     becomes its owner, which changes who can delete it later and which approvals it matches;
-     and if the original owner's account is gone, the row cannot be removed through the API at
-     all.
-   - **The schedule id, `execution_count` and `last_executed_at`** are new. Any approval ticket
-     already raised for the old schedule is matched on its id and creator, so it is discarded
-     and the next occurrence asks again.
-4. Re-point anything else that references the old id by name — automation calling
-   `POST /api/instructions/{id}/execute`, saved views, product packs you re-install.
-5. Only then delete the original definition.
-6. Verify no schedule was left behind:
-
-   ```bash
-   sqlite3 /var/lib/yuzu/instructions.db \
-     "SELECT s.id, s.definition_id FROM schedules s
-        LEFT JOIN instruction_definitions d ON d.id = s.definition_id
-       WHERE d.id IS NULL;"
-   ```
-
-   This is the check the triage queries cannot do for you: they join to a definition that
-   exists, so once the old one is deleted an orphaned schedule appears in neither. Any row here
-   is a schedule that will never fire again. For an enabled schedule, confirm its next run
-   actually dispatches. A schedule that was disabled when you started is the same trap deferred
-   rather than avoided, so rebuild it too — and disable the rebuilt one, per step 3.
-
-Execution history keeps referencing the old id after the delete. Past runs stay readable, but
-history is split across the two ids — filtering executions by the new definition returns
-nothing from before the rename, and re-running a historical execution re-uses the recorded id.
+Execution history keeps referencing the old id. Past runs stay readable, but history is split
+across the two ids: filtering by the new definition returns nothing from before the rename.
 
 These commands assume the `sqlite3` CLI on the server host. It is not present in the slim
-container images; run them from a host with the tool and access to the database file, or copy
-the file aside first.
+container images; run them from a host with the tool and access to the database file.
+
 
 ### vNEXT — behind a reverse proxy, declare your external origin or CSRF-gated dashboard actions keep failing (#2537)
 
