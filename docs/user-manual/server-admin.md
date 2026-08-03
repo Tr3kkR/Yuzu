@@ -241,34 +241,76 @@ approve/reject routes refuse any ticket that is not still `pending`
 pending ones achieves nothing — a pending ticket is not redeemable in the first place. If you
 need the window shut before the sweep runs:
 
-First, size the population — do not assume it is small. On a long-lived install the REST
-instruction gate never redeems its own approvals, so approved-unconsumed rows accumulate for the
-life of the deployment:
+Run every command below **as the `yuzu` service user**, not as root — a `sqlite3` session
+interrupted as root leaves root-owned `-wal`/`-shm` files that the service cannot open on its next
+boot.
+
+**Step 1 — establish the cutoff.** Only the submission timestamp separates the carried-across rows
+from the ones your running system depends on: both carry a blank surface. Ideally record
+`date +%s` *before* you first start the upgraded binary. If you are reading this afterwards — the
+common case — recover it instead, since the first row carrying a declared surface can only have
+been written by the upgraded server:
+
+```bash
+sqlite3 /var/lib/yuzu/instructions.db \
+  "SELECT MIN(submitted_at) FROM approvals WHERE origin != '';"
+```
+
+If that returns empty, no declared-origin ticket has been minted yet, so no blank-origin row
+post-dates the upgrade and any cutoff at or after the upgrade works.
+
+**Step 2 — size the population.** Do not assume it is small: the REST instruction gate never
+redeems its own approvals, so on a long-lived install these rows accumulate for the life of the
+deployment.
 
 ```bash
 sqlite3 /var/lib/yuzu/instructions.db \
   "SELECT COUNT(*) FROM approvals
-    WHERE status = 'approved' AND consumed_at = 0 AND origin = '';"
+    WHERE status = 'approved' AND consumed_at = 0 AND origin = ''
+      AND definition_id GLOB 'mcp.*'
+      AND submitted_at < <cutoff from step 1>;"
 ```
 
-**Capture the upgrade time before starting the new binary.** Carried-across rows and the ones your
-running system depends on both carry a blank surface, so the submission timestamp is what
-distinguishes them:
+**Step 3 — stop the server**, and confirm it is stopped before continuing.
+
+**Step 4 — take a real backup.** `instructions.db` runs in WAL mode, so a plain `cp` copies the
+main file and silently omits any committed transactions still in `instructions.db-wal` — which is
+exactly what a prior unclean shutdown leaves behind. Use SQLite's own backup, which is WAL-aware:
 
 ```bash
-date +%s   # record this BEFORE the first start of the upgraded server
+sqlite3 /var/lib/yuzu/instructions.db ".backup /var/lib/yuzu/instructions.db.pre-2442"
 ```
 
-```bash
-# Stop the server. Back up first — nothing un-expires a row, and this
-# transition writes no audit entry.
-cp /var/lib/yuzu/instructions.db /var/lib/yuzu/instructions.db.pre-2442
+**This backup is not scoped to approvals.** `instructions.db` also holds instruction definitions,
+schedules, and execution-tracking state. Restoring it rolls those back too, so treat it as a
+whole-database restore point and not an approvals undo:
 
+```bash
+# To restore: stop the server, remove any stale WAL alongside the live file,
+# then put the backup back. Do NOT copy over a database that still has a -wal.
+rm -f /var/lib/yuzu/instructions.db-wal /var/lib/yuzu/instructions.db-shm
+cp /var/lib/yuzu/instructions.db.pre-2442 /var/lib/yuzu/instructions.db
+```
+
+**Step 5 — retire the tickets.**
+
+```bash
 sqlite3 /var/lib/yuzu/instructions.db \
   "UPDATE approvals SET status = 'expired'
     WHERE status = 'approved' AND consumed_at = 0 AND origin = ''
-      AND submitted_at < <the epoch you recorded above>;"
+      AND definition_id GLOB 'mcp.*'
+      AND submitted_at < <cutoff from step 1>;"
 ```
+
+**Both extra predicates are load-bearing — do not drop either.**
+
+`definition_id GLOB 'mcp.*'` narrows this to the tickets that could actually be forged. The MCP
+recall only ever looks up `mcp.<tool_name>`, so a blank-surface ticket for any other definition can
+never be redeemed there — it is inert. Without this predicate the statement also expires two
+populations that are not at risk: REST-gate approvals, which are never redeemed at all and simply
+accumulate, and **scheduler approvals, which are live** — expiring one holds that scheduled run
+pending a fresh human approval. On a deployment running only shipped content the correctly narrowed
+count is zero, and that is the honest number.
 
 **The `submitted_at` bound is load-bearing — do not drop it.** A blank surface means *not
 recorded*, and the MCP gate does not record its own surface yet, so **every currently-approved
@@ -277,8 +319,10 @@ and re-running it periodically livelocks MCP approvals entirely: mint, human app
 expires it, recall reports it expired, worker mints again.
 
 Even bounded, this revokes capabilities an administrator granted — anyone holding one of those
-`approval_id`s must request approval again. Do it only if you have reason to think an
-`mcp.`-prefixed definition was raised through the instruction gate before the upgrade.
+`approval_id`s must request approval again — and the transition writes **no audit row**, so it is
+indistinguishable in the audit trail from the automatic 7-day expiry. Record that you ran it
+through your own change-control. Do it only if you have reason to think an `mcp.`-prefixed
+definition was raised through the instruction gate before the upgrade.
 
 **What changes.** Creating a definition whose id starts `mcp.` is refused with a 400 on every
 authoring route that accepts an explicit id — `POST /api/instructions`, `POST

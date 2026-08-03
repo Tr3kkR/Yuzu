@@ -549,6 +549,17 @@ public:
                           "spike on one tool means a supervised worker is submitting "
                           "malformed arguments or probing",
                           "counter");
+        metrics_.describe("yuzu_mcp_approval_denied_total",
+                          "MCP approval-recall denials by reason (#2442). store_error is a "
+                          "transient approvals-store read failure and leaves the ticket "
+                          "untouched; not_consumable is an ordinary replay of a spent ticket",
+                          "counter");
+        metrics_.describe("yuzu_mcp_approval_forgery_total",
+                          "Cross-surface approval redemption attempts (#2442): a ticket minted "
+                          "by the REST instruction gate or the scheduler, presented to the MCP "
+                          "recall. A legitimate client cannot produce this, so any non-zero "
+                          "value is an attack or a mint/recall pairing bug",
+                          "counter");
         // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
         // degrade reason is a static literal inside the bridge, never derived
         // from caller input.
@@ -655,6 +666,21 @@ public:
         // Pre-seed the #2405 schema-denial counter for every approval-gated
         // tool — the closed label set that can reach the gate — so absent()
         // alerts stay meaningful (observability-conventions.md).
+        // #2442 approval-recall denials. Closed on both axes: `tool` is the same
+        // gated set, `reason` is a fixed literal triple, never caller-derived.
+        // Seeded so absent() on a healthy server means "server down", not "no
+        // forgery attempt yet". The forgery signal rides its OWN family rather
+        // than an event="security" label on one series of the family below —
+        // inconsistent label sets within a family are a Prometheus smell, and
+        // the SIEM filters on `event` (observability-conventions.md).
+        for (const auto& tool : mcp::approval_gated_tool_names()) {
+            for (const char* reason : {"foreign_origin", "store_error", "not_consumable"}) {
+                metrics_.counter("yuzu_mcp_approval_denied_total",
+                                 {{"tool", tool}, {"reason", reason}});
+            }
+            metrics_.counter("yuzu_mcp_approval_forgery_total",
+                             {{"tool", tool}, {"event", "security"}});
+        }
         for (const auto& tool : mcp::approval_gated_tool_names()) {
             metrics_.counter("yuzu_mcp_tool_args_invalid_total", {{"tool", tool}});
         }

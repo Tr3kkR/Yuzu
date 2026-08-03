@@ -74,12 +74,19 @@ ApprovalOrigin approval_origin_from_string(std::string_view text);
 ///
 /// Those rows age out on the 7-day approval expiry, but that sweep is LAZY — it
 /// runs inside `submit()` and nowhere else, so an approval queue receiving no new
-/// mint ages nothing out. It also sits AFTER the pending-cap check in `submit`,
-/// so a queue saturated at the cap never reaches it either, and approved-
-/// unconsumed rows do not count toward that cap and so cannot drain it. The
-/// residual is bounded by 7 days AND a subsequent SUCCESSFUL submission, not by
-/// 7 days alone. There is no API that retires an approved-unconsumed ticket —
-/// approve/reject both refuse a non-pending row.
+/// mint ages nothing out. The residual is bounded by 7 days AND a subsequent
+/// submission — and by the server clock being sane. A row stamped with a FUTURE
+/// `submitted_at` (a host whose clock ran ahead, or a database restored from one)
+/// is invisible to the cutoff until the wall clock passes it, so it never
+/// expires; 1000 such pending rows wedge the cap permanently. Nothing detects
+/// that today. There is no API that retires an approved-unconsumed ticket either
+/// — approve/reject both refuse a non-pending row.
+///
+/// This paragraph previously claimed the sweep sits AFTER the pending-cap check
+/// and so could never drain a saturated queue. That was true when written and was
+/// inverted by the fix in `submit()` — the sweep now runs first, deliberately.
+/// Left as a note because the stale version OVERSTATED the residual, which pushes
+/// an operator toward the direct-database remediation they no longer need.
 ///
 /// The exemption closes when the MCP mint declares `kMcp` and this allow-set
 /// narrows from two values to one — the same unfreeze that the `kUnspecified`
