@@ -171,6 +171,7 @@ expected, and exactly what the ratchet baseline reflects today.
      tools/capmatrix-gen, verified by scripts/ci/check-capability-matrix.sh -->
 | Plugin | Action | OS | Support | Rung | Mechanism | Fallback |
 |---|---|---|---|---|---|---|
+| _(none yet)_ | - | - | - | - | - | - |
 
 **Undeclared plugins** (ABI<4, or ABI4 with no capability declarations yet — RATCHET: this count must never grow):
 

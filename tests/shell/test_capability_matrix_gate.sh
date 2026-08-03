@@ -88,7 +88,7 @@ _none — every built plugin has adopted the ABI4 capability descriptor._
 EXPECTED
 
 "$CAPGEN" --out "$tmp/declared.md" "$ABI4" >/dev/null 2>&1
-if diff -u "$tmp/expected_declared.md" "$tmp/declared.md" > "$tmp/declared.diff"; then
+if git diff --no-index -- "$tmp/expected_declared.md" "$tmp/declared.md" > "$tmp/declared.diff"; then
   ok "declared ABI4 descriptor renders every per-OS leg byte-exactly"
 else
   bad "declared ABI4 descriptor render drifted"
@@ -99,7 +99,7 @@ fi
 # plugin lands in the undeclared list (the RATCHET input the gate counts).
 sed 's/^_none — .*$/- `abi3_fixture`/' "$tmp/expected_declared.md" > "$tmp/expected_mixed.md"
 "$CAPGEN" --out "$tmp/mixed.md" "$ABI4" "$ABI3" >/dev/null 2>&1
-if diff -u "$tmp/expected_mixed.md" "$tmp/mixed.md" > "$tmp/mixed.diff"; then
+if git diff --no-index -- "$tmp/expected_mixed.md" "$tmp/mixed.md" > "$tmp/mixed.diff"; then
   ok "mixed declared + undeclared set renders rows and the undeclared bullet"
 else
   bad "mixed declared + undeclared render drifted"

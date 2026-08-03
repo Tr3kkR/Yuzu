@@ -147,7 +147,13 @@ if [ ! -s "$committed_block" ]; then
   exit 1
 fi
 
-if ! diff -u "$committed_block" "$regen" > "$tmp/diff.txt"; then
+# git diff --no-index, not the `diff` binary: git is a hard build/CI
+# dependency on every leg (unlike diffutils, which the Windows runner's
+# msys2 bash does not carry) and --no-index is explicitly designed to work
+# on two arbitrary files outside a repo. Exit codes match diff's (0 = no
+# difference, 1 = differs, both with a unified diff on stdout) so the
+# surrounding control flow needs no change.
+if ! git diff --no-index -- "$committed_block" "$regen" > "$tmp/diff.txt"; then
   echo "::error::docs/os-capability-matrix.md's generated block is stale relative to the built plugins." >&2
   echo "::error::regenerate it: \"$capmatrix_gen\" --out <tmp-file> <plugin .so paths...>, then splice the" >&2
   echo "::error::<!-- BEGIN GENERATED --> .. <!-- END GENERATED --> block in docs/os-capability-matrix.md and commit." >&2
