@@ -934,10 +934,12 @@ TEST_CASE("ApprovalManager: an unrecognised origin column value is refused, not 
 
 TEST_CASE("ApprovalManager: a saturated pending queue drains itself instead of wedging",
           "[approval_manager][approval]") {
-    // The sweep is the ONLY thing that expires an approval and it runs only
-    // inside submit(). With the pending cap checked BEFORE it, a queue at 1000
-    // returned early forever: nothing aged out, the count never fell, and every
-    // approval surface was permanently denied. This pins the ordering.
+    // Two `UPDATE approvals SET status = 'expired'` statements exist in the
+    // tree, both inside submit() (approval_manager.cpp:264 and :278), so a mint
+    // is the only event that ages anything out. With the pending cap checked
+    // BEFORE them, a queue at 1000 returned early forever: nothing aged out, the
+    // count never fell, and every approval surface was permanently denied. This
+    // pins the ordering.
     TestDb tdb;
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();

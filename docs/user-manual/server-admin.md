@@ -251,8 +251,9 @@ sqlite3 /var/lib/yuzu/instructions.db \
     WHERE status = 'approved' AND consumed_at = 0 AND origin = '';"
 ```
 
-**Capture the upgrade time before starting the new binary**, because it is the only thing that
-separates the carried-across rows from the ones your running system depends on:
+**Capture the upgrade time before starting the new binary.** Carried-across rows and the ones your
+running system depends on both carry a blank surface, so the submission timestamp is what
+distinguishes them:
 
 ```bash
 date +%s   # record this BEFORE the first start of the upgraded server
