@@ -456,6 +456,6 @@ When using OIDC/Entra ID:
 >
 > **Remediation lives in one place:** [`upgrading.md`](upgrading.md) → "⚠️ Security: rotate
 > `oidc_client_secret` if it was ever set on this install". Follow it there rather than from
-> a summary here. The essential point: rotating at the IdP is not enough on its own — the old
-> secret must be **deleted** at the IdP, because adding a second one leaves the disclosed
-> value working.
+> a summary here. Two things that catch people out: adding a second client secret is not a
+> rotation, so the old one must be **deleted** at the IdP; and deleting it does not revoke the
+> access tokens and sessions already issued under it, which have to be revoked separately.
