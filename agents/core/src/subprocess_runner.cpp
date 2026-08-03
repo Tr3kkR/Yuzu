@@ -77,16 +77,18 @@
 
 #include <atomic>
 
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstring> // std::memcpy (spawn_errno decode below)
+
 #ifndef _WIN32
 #include <yuzu/agent/fork_lock.hpp>
 
 #include <spdlog/spdlog.h>
 
-#include <algorithm>
-#include <array>
 #include <cerrno>
 #include <csignal>
-#include <cstdint>
 #include <cstdio> // std::fopen/std::fscanf — read Linux fs.nr_open for the fd ceiling
 #include <cstdlib> // std::getenv (TZ passthrough)
 #include <ctime>
@@ -111,6 +113,24 @@
 #include <thread>
 #include <unistd.h>
 #include <utility>
+#else // _WIN32
+// Hoisted out of the yuzu::agent-namespaced #else branch below (which used to
+// #include these headers directly inside `namespace yuzu::agent { ... }`) --
+// MSVC was compiling all of <array>'s std:: contents as yuzu::agent::std::,
+// producing the class-template/syntax errors this fix eliminates. Every
+// standard/system header belongs in the unnamespaced top-of-file preamble,
+// never inside an open namespace.
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#include <psapi.h>
+
+#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (CDX-R4-05, #1681)
+
+#include <cctype> // std::toupper in the env-sort comparator below -- <cwctype>
+                  // supplies towupper, NOT toupper, and this branch is compiled
+                  // only by MSVC, which no reviewer on a POSIX host can check.
+#include <cwctype>
 #endif
 
 namespace yuzu::agent {
@@ -903,6 +923,21 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     // "resolved before any kill was ever sent" reasoning).
     bool natural_signaled = false;
 
+    // K-5: true iff try_reap() ever observes WIFEXITED. SIGKILL/SIGTERM can
+    // never produce a WIFEXITED status (only WIFSIGNALED) -- so this is
+    // unconditional proof the child ran to completion and exited ON ITS OWN
+    // strictly before any of our kills could have taken effect, regardless
+    // of which kill category (line_cap/cancel/deadline) happened to be
+    // in-flight when we noticed. Without this, a child that exits naturally
+    // in the same instant its output trips killed_by_line_cap (or any other
+    // kill trigger) races try_reap() against the kill-decision branch below:
+    // if the kill decision runs one loop iteration before try_reap() catches
+    // up, killed_by_line_cap latches true even though our kill lands on an
+    // already-exited (zombie) pid and does nothing. Deciding purely from the
+    // reaped status -- rather than from child_reaped's value at kill-decision
+    // time -- closes that race outright instead of narrowing the window.
+    bool child_exited_normally = false;
+
     // ADR-3002 soft-terminate grace (SubprocessOptions::soft_terminate_grace,
     // 0 by default): when set, a deadline/cancel trigger sends SIGTERM to the
     // process group and waits up to the grace period before escalating to
@@ -991,6 +1026,7 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
             // no path here that fabricates a WEXITSTATUS for one.
             if (WIFEXITED(status)) {
                 result.exit_code = WEXITSTATUS(status);
+                child_exited_normally = true; // see the K-5 comment above
             } else if (WIFSIGNALED(status) && !killed) {
                 // A signal death this runner did NOT initiate (killed is
                 // still false) -- the child crashed or was signalled by
@@ -1020,6 +1056,13 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         ssize_t n = read(err_read_fd.get(), probe.data(), probe.size());
         if (n > 0) {
             exec_failed = true;
+            // Surface WHY, not just THAT: report_setup_failure_and_exit's
+            // write() is a single sizeof(int) shot (well under PIPE_BUF, so
+            // POSIX guarantees it lands atomically) -- only trust a
+            // full-width read as the errno; a short read stays the honest
+            // 0/"unknown" default rather than reinterpreting partial bytes.
+            if (n == static_cast<ssize_t>(sizeof(int)))
+                std::memcpy(&result.spawn_errno, probe.data(), sizeof(int));
             err_pipe_open = false; // outcome decided; nothing more to learn
         } else if (n == 0) {
             err_pipe_open = false; // EOF: write end closed (CLOEXEC-on-exec, or child died)
@@ -1248,9 +1291,20 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     // Deliberately NOT fabricating an exit_code=0 for the line_cap case (the
     // removed pre-ADR-3002 sentinel fixup) -- callers distinguish "deliberate
     // clean stop" from "failure" via this field, never via a synthesized code.
+    //
+    // K-5: killed_by_line_cap is deliberately overridden by child_exited_
+    // normally (WIFEXITED observed) -- see its declaration comment for why a
+    // genuine WIFEXITED always outranks a killed_by_line_cap that raced it
+    // (our kill decision can latch true one loop iteration before try_reap()
+    // catches up to a child that already exited on its own). This does NOT
+    // extend to killed_by_cancel/killed_by_deadline: those can escalate via
+    // soft_terminate_grace's SIGTERM first, which a child may legitimately
+    // trap and voluntarily exit(0) from -- a WIFEXITED our own signal
+    // directly caused, unlike line_cap's SIGKILL-only path (never catchable,
+    // so WIFEXITED there is unconditional proof of a natural exit).
     if (exec_failed) {
         result.termination_reason = TerminationReason::spawn_error;
-    } else if (killed_by_line_cap) {
+    } else if (killed_by_line_cap && !child_exited_normally) {
         result.termination_reason = TerminationReason::line_limit;
     } else if (killed_by_cancel) {
         result.termination_reason = TerminationReason::cancelled;
@@ -1282,20 +1336,8 @@ std::string probe_tool_path(const std::vector<std::string>& candidates) {
 
 #else // _WIN32
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-
-#include <psapi.h>
-
-#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (CDX-R4-05, #1681)
-
-#include <algorithm>
-#include <array>
-#include <cctype> // std::toupper in the env-sort comparator below -- <cwctype>
-                  // supplies towupper, NOT toupper, and this branch is compiled
-                  // only by MSVC, which no reviewer on a POSIX host can check.
-#include <cstdint>
-#include <cwctype>
+// Windows system/standard headers live in the top-of-file preamble (see the
+// #else _WIN32 branch there) -- NOT here, inside namespace yuzu::agent.
 
 namespace {
 

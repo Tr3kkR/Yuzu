@@ -239,6 +239,16 @@ struct SubprocessResult {
     // returns.
     TerminationReason termination_reason = TerminationReason::spawn_error;
 
+    // POSIX errno the child reported over the exec-error pipe (report_setup_
+    // failure_and_exit's `err` argument) when termination_reason ==
+    // spawn_error and the child positively reported a failure -- e.g. ENOENT
+    // (missing binary), EACCES/EPERM (not executable, or a B6 exec_verify
+    // gate rejection), ETXTBSY (B6 retries exhausted). 0 when no such report
+    // was ever read (an unresolved outcome, or a non-POSIX/no-report failure
+    // path) -- 0 is never itself a reported failure errno, so it is
+    // unambiguous as "unknown"/not-applicable here, unlike exit_code's -1.
+    int spawn_errno = 0;
+
     // Captured stdout (+stderr if merge_stderr), split on '\n', blank lines
     // dropped, a trailing '\r' stripped from each line. Capped at
     // opts.max_lines when nonzero.

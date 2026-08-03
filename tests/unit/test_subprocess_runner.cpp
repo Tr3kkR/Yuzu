@@ -37,6 +37,7 @@
 #include <barrier>
 #include <chrono>
 #include <cstdint>
+#include <cstring> // std::strerror (B6 spawn_errno diagnostic)
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -862,6 +863,13 @@ TEST_CASE("exec_verify (B6) accepts a correctly-sized target and execs it via th
     opts.exec_verify.require_root_owned = false; // test binaries aren't root-owned in CI
     opts.exec_verify.expected_size = static_cast<std::uint64_t>(st.st_size);
     SubprocessResult r = run_bounded_subprocess({"/bin/echo", "hi"}, opts);
+    // Diagnostic only, printed by Catch2 solely on a failing CHECK below:
+    // names the exact reason toctou_verified_exec's child branch gave up
+    // (report_setup_failure_and_exit's errno), so a CI failure on an
+    // unfamiliar runner environment (e.g. a syscall filter blocking
+    // execveat, or an unexpected /bin/echo mode) is diagnosable from the
+    // log instead of a bare "tool_ran == false".
+    INFO("spawn_errno=" << r.spawn_errno << " (" << std::strerror(r.spawn_errno) << ")");
     CHECK(r.tool_ran);
     CHECK(r.exit_code == 0);
 }
