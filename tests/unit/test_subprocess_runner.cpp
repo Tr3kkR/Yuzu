@@ -856,22 +856,36 @@ TEST_CASE("run_bounded_subprocess: soft_terminate escalates via the process GROU
 TEST_CASE("exec_verify (B6) accepts a correctly-sized target and execs it via the verified path "
           "(Linux execveat -- an atomic fd-based exec primitive exists here)",
           "[subprocess][exec_verify]") {
+    // toctou_verified_exec() opens argv[0] with O_NOFOLLOW (by design: a
+    // symlink swap between the caller's stat and this open() is exactly the
+    // TOCTOU it exists to close), so it fails closed with ELOOP if argv[0]
+    // itself is a symlink -- observed for real on a CI runner where
+    // /bin/echo IS one (deterministic on that host, not a flake). A system
+    // path's symlink-ness varies by distro/runner and isn't this test's
+    // concern; make a throwaway REGULAR-file copy so the test exercises the
+    // documented happy path (a genuine regular file) regardless of host
+    // layout. std::filesystem::copy_file follows symlinks by default, so the
+    // copy is a plain file even when the source isn't.
+    std::filesystem::path exe_copy = yuzu::test::unique_temp_path("yuzu_test_b6_echo_");
+    std::filesystem::copy_file("/bin/echo", exe_copy);
+    REQUIRE(::chmod(exe_copy.c_str(), 0755) == 0);
     struct stat st{};
-    REQUIRE(::stat("/bin/echo", &st) == 0);
+    REQUIRE(::stat(exe_copy.c_str(), &st) == 0);
     SubprocessOptions opts{.deadline = 5000ms};
     opts.exec_verify.enabled = true;
     opts.exec_verify.require_root_owned = false; // test binaries aren't root-owned in CI
     opts.exec_verify.expected_size = static_cast<std::uint64_t>(st.st_size);
-    SubprocessResult r = run_bounded_subprocess({"/bin/echo", "hi"}, opts);
+    SubprocessResult r = run_bounded_subprocess({exe_copy.string(), "hi"}, opts);
     // Diagnostic only, printed by Catch2 solely on a failing CHECK below:
     // names the exact reason toctou_verified_exec's child branch gave up
     // (report_setup_failure_and_exit's errno), so a CI failure on an
     // unfamiliar runner environment (e.g. a syscall filter blocking
-    // execveat, or an unexpected /bin/echo mode) is diagnosable from the
-    // log instead of a bare "tool_ran == false".
+    // execveat) is diagnosable from the log instead of a bare
+    // "tool_ran == false".
     INFO("spawn_errno=" << r.spawn_errno << " (" << std::strerror(r.spawn_errno) << ")");
     CHECK(r.tool_ran);
     CHECK(r.exit_code == 0);
+    std::filesystem::remove(exe_copy);
 }
 #else
 TEST_CASE("exec_verify (B6) fails CLOSED on this platform even for a fully-matching target -- no "
