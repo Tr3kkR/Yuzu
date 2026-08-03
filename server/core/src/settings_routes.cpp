@@ -3927,7 +3927,9 @@ void SettingsRoutes::register_routes(
         // this one keeps a placeholder paste from reaching cfg_ and the live provider,
         // the sink's covers every other caller (PUT /api/config included).
         // ONLY an exact placeholder means "leave the stored secret unchanged" - that is
-        // the operator re-submitting a form pre-filled with the redacted value. A secret
+        // the operator pasting the token back from the startup log or an API response
+        // (the form itself renders an empty field with a ******** placeholder, so the
+        // literal never comes from here). A secret
         // that merely CONTAINS the token falls through deliberately: the store refuses
         // it and the failure branch below tells the operator. Clearing it here instead
         // discarded a real credential and reported SAVED, which is the same

@@ -101,9 +101,9 @@ struct OidcHarness {
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
                           const std::string&) { return true; };
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
-                               const std::string& /*result*/, const std::string& /*ttype*/,
+                               const std::string& result, const std::string& /*ttype*/,
                                const std::string& tid, const std::string& detail) -> bool {
-            audited.push_back(action + "|" + tid + "|" + detail);
+            audited.push_back(action + "|" + result + "|" + tid + "|" + detail);
             return true;
         };
         routes.set_dex_alert_apply_fn([this]() { ++apply_calls; });
@@ -199,6 +199,7 @@ TEST_CASE("Settings OIDC: a NULL store reports NOT SAVED instead of success",
     REQUIRE_FALSE(h.audited.empty());
     CHECK(h.audited.back().find("oidc.configure") != std::string::npos);
     CHECK(h.audited.back().find("persist failed") != std::string::npos);
+    CHECK(h.audited.back().find("|failure|") != std::string::npos);
 }
 
 TEST_CASE("Settings OIDC: a non-admin cannot set the client secret and nothing persists",
@@ -239,12 +240,13 @@ TEST_CASE("Settings OIDC: a secret CONTAINING the placeholder is refused, not si
     // ...and it is audited as a failure.
     REQUIRE_FALSE(h.audited.empty());
     CHECK(h.audited.back().find("persist failed") != std::string::npos);
+    CHECK(h.audited.back().find("|failure|") != std::string::npos);
 }
 
 TEST_CASE("Settings OIDC: an EXACT placeholder still means unchanged, and reports saved",
           "[settings][oidc][secret]") {
-    // The benign case the CONTAINS rule was over-serving: re-submitting a form that was
-    // pre-filled with the redacted value must remain a no-op, not an error.
+    // The benign case the CONTAINS rule was over-serving: pasting the token back from the
+    // startup log or an API response must remain a no-op, not an error.
     OidcHarness h;
     REQUIRE(h.runtime_config->set("oidc_client_secret", "real-secret", "seed").has_value());
 

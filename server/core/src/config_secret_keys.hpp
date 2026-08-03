@@ -48,8 +48,9 @@ bool is_redaction_placeholder(std::string_view value);
 /// control bytes - not merely contains it.
 ///
 /// The Settings handler needs this narrower question. It maps a placeholder paste to
-/// "leave the stored secret unchanged", which is right for someone re-submitting a
-/// form pre-filled with the redacted value. Using the CONTAINS predicate there meant a
+/// "leave the stored secret unchanged", which is right for someone pasting the
+/// token back from the startup log or an API response. (The Settings form renders an
+/// empty field with a ******** placeholder - it never pre-fills the literal.) Using the CONTAINS predicate there meant a
 /// real secret that happened to contain the token was silently discarded and reported
 /// SAVED - the same false-success this whole change exists to remove. Containment now
 /// falls through to the sink, which refuses it with a message the operator sees.
