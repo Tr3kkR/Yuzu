@@ -239,6 +239,7 @@ agent_test_exe = executable(
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
     'unit/test_users_macos_last.cpp',         # qe-M1: pure `last -y` timestamp/weekday parsers
+    'unit/test_user_profile_model.cpp',       # PR1.7: pure ProfileList/HKU model (runs on every host)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp

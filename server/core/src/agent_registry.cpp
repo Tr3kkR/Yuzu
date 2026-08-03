@@ -531,7 +531,8 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"registry.key_exists", "Check if a registry key exists"},
         {"registry.enumerate_keys", "List subkeys under a registry key"},
         {"registry.enumerate_values", "List values in a registry key"},
-        {"registry.get_user_value", "Get a registry value for a specific user SID"},
+        {"registry.get_user_value", "Get a registry value from a specific user's hive (by username or SID)"},
+        {"registry.list_profiles", "List local user profiles (SID, name, path, hive-load state)"},
         // rdp_control
         {"rdp_control.set_state",
          "Enable or disable Remote Desktop (registry + firewall group + TermService)"},

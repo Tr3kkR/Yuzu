@@ -1680,6 +1680,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | `registry.enumerate_keys` | `registry` | Y | - | - | Verified |
 | `registry.enumerate_values` | `registry` | Y | - | - | Verified |
 | `registry.get_user_value` | `registry` | Y | - | - | Verified |
+| `registry.list_profiles` | `registry` | Y | - | - | Verified |
 | `wmi.query` | `wmi` | Y | - | - | Verified |
 | `wmi.get_instance` | `wmi` | Y | - | - | Verified |
 | `rdp_control.set_state` | `rdp_control` | Y | - | - | Verified |
