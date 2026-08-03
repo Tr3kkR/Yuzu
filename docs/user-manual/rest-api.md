@@ -3185,12 +3185,17 @@ For a secret-valued key the response **omits `value`**, for the same reason `GET
 { "key": "oidc_client_secret", "applied": true }
 ```
 
-> **None of this route's error bodies use the A4 envelope.** `/api/config` is a legacy
-> non-`/api/v1` route; every error it emits is either a bare `error` string or a nested
-> `{"error":{"code","message"},"meta":{"api_version"}}` object, and neither carries the
-> `correlation_id` or `retry_after_ms` that A4 requires. Besides the two shown below, the handler
-> also emits nested bodies for `503` "runtime config store unavailable", `400` "missing 'value' in
-> request body", and `400` "invalid JSON body". Do not parse these as A4.
+> **Two different error sources, two different shapes.** The shared authorization gate in front of
+> this route **does** emit the A4 envelope: a `401`, a `403` permission denial, or a `503`
+> authorization-store failure carries `correlation_id` (echoed on `X-Correlation-Id`) like any other
+> gated route. The bodies **the handler itself** emits do not — `/api/config` is a legacy
+> non-`/api/v1` route, and its own errors are either a bare `error` string or a nested
+> `{"error":{"code","message"},"meta":{"api_version"}}` object with no `correlation_id` and no
+> `retry_after_ms`. Besides the two shown below, the handler emits nested bodies for `400` "missing
+> 'value' in request body", `400` "invalid JSON body", and a `503` when the runtime-config store is
+> unavailable (`GET` says "runtime configuration store unavailable", `PUT` says "runtime config store
+> unavailable"). So: branch on the status first, and do not assume a `correlation_id` on the
+> handler's own 4xx.
 
 **Error (400) - key not configurable.** This one is a bare `error` string with no envelope:
 

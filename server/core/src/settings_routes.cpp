@@ -3919,12 +3919,12 @@ void SettingsRoutes::register_routes(
         }
 
         // The redaction placeholder is not a credential. It reaches this handler when an
-        // operator copies it out of the startup log -- the only surface that emits it, since
-        // GET /api/config omits a secret's value rather than substituting a placeholder. So
-        // an exact one is treated like a blank field, meaning "leave the stored secret
-        // alone". Without that the store still refuses it further down -- but by then cfg_
-        // and the live provider have already been updated, so the two would diverge behind
-        // a "saved" toast.
+        // operator copies it out of the startup log or a config.update audit detail -- the
+        // two surfaces that emit it. GET /api/config is NOT one of them: it omits a
+        // secret's value rather than substituting a placeholder. So an exact one is treated
+        // like a blank field, meaning "leave the stored secret alone". Without that the
+        // store still refuses it further down -- but by then cfg_ and the live provider
+        // have already been updated, so the two would diverge behind a "saved" toast.
         //
         // The predicate here and the one at the sink are deliberately DIFFERENT, and both
         // are needed. This one is EXACT: only the bare placeholder means "unchanged" (the
