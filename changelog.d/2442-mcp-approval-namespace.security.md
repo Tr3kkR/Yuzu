@@ -36,5 +36,9 @@
   have come from, and the MCP mint is itself unlabelled until its own follow-up lands, so unlabelled
   tickets are still redeemable. Carried-across rows clear on the existing 7-day approval expiry —
   but that sweep is **lazy**, running only when an approval is submitted, so a queue receiving no
-  new submissions does not age anything out. Reject any outstanding tickets at upgrade time to close
-  the window immediately. The exemption itself closes when the MCP mint declares its own surface.
+  new submissions does not age anything out. **Closing the window immediately needs a direct
+  database statement, not the API**: the redeemable rows are `approved` and unconsumed, and the
+  reject route refuses anything that is not still `pending`, so rejecting the pending tickets
+  destroys legitimate un-reviewed requests without touching a single redeemable one. The statement,
+  and what it costs, are in `docs/user-manual/server-admin.md`. The exemption itself closes when the
+  MCP mint declares its own surface.

@@ -768,9 +768,12 @@ proposes.
    tool + arguments, not yet consumed, and **not recorded as raised by the REST
    instruction gate or the scheduler** — #2442) and **atomically consumes** the
    ticket (one-time — a replay, a mismatched tool/args, or a ticket recorded as
-   raised on one of those surfaces all return `-32003` `PermissionDenied`, and
-   deliberately all return the *same* message so the recall cannot be used to
-   enumerate approval ids), then executes.
+   raised on one of those surfaces all return `-32003` `PermissionDenied`), then
+   executes. A replay and a foreign-surface refusal are deliberately
+   **indistinguishable from each other**, so a refused ticket cannot be
+   identified as foreign. A tool/args mismatch has its own message — the same one
+   an unknown `approval_id` gets, so that too reveals nothing about which ids
+   exist.
 
    That last check is a denial rather than a permission, deliberately: a ticket
    carrying no recorded surface is still accepted, which today includes every

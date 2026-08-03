@@ -27,7 +27,7 @@ sqlite3 /var/lib/yuzu/instructions.db \
   "SELECT id FROM instruction_definitions WHERE id GLOB 'mcp.*';"
 ```
 
-**What changes.** Creating or importing a definition under that prefix is refused with a 400, and such a definition is skipped at boot auto-import. Separately, every approval ticket now records the surface that raised it, and the MCP approval recall refuses a ticket raised anywhere else — closing a case where an approval an administrator granted for an instruction execution could be redeemed as an MCP tool invocation instead.
+**What changes.** Creating or importing a definition under that prefix is refused with a 400, and such a definition is skipped at boot auto-import. Separately, an approval ticket now records the surface that raised it *where that surface declares one* — the REST instruction gate and the scheduler do; the MCP gate does not yet — and the MCP approval recall refuses any ticket **recorded as** raised elsewhere. That closes a case where an approval an administrator granted for an instruction execution could be redeemed as an MCP tool invocation instead. A ticket carrying no recorded surface is still accepted, which today means every ticket MCP itself raises as well as any approval predating the field.
 
 **A definition that already exists under the prefix keeps working, and needs no action.** It still executes, its schedules still fire, and its approval gate is unchanged. What does stop: the dashboard's YAML editor validates a declared id on *every* save, so such a definition can no longer be edited there if its document declares `metadata.id`, and re-importing an export of it fails. Renaming is optional housekeeping — and if the definition carries a schedule, leave it alone for now (#2742, #2746).
 

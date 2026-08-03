@@ -241,16 +241,42 @@ approve/reject routes refuse any ticket that is not still `pending`
 pending ones achieves nothing — a pending ticket is not redeemable in the first place. If you
 need the window shut before the sweep runs:
 
+First, size the population — do not assume it is small. On a long-lived install the REST
+instruction gate never redeems its own approvals, so approved-unconsumed rows accumulate for the
+life of the deployment:
+
 ```bash
-# Stop the server first. Retires every approved-but-unredeemed ticket that
-# carries no recorded surface — the exempt population, and only that.
 sqlite3 /var/lib/yuzu/instructions.db \
-  "UPDATE approvals SET status = 'expired'
+  "SELECT COUNT(*) FROM approvals
     WHERE status = 'approved' AND consumed_at = 0 AND origin = '';"
 ```
 
-This revokes real capabilities an administrator granted: anyone holding one of those
-`approval_id`s will have to request approval again. Do it only if you have reason to think an
+**Capture the upgrade time before starting the new binary**, because it is the only thing that
+separates the carried-across rows from the ones your running system depends on:
+
+```bash
+date +%s   # record this BEFORE the first start of the upgraded server
+```
+
+```bash
+# Stop the server. Back up first — nothing un-expires a row, and this
+# transition writes no audit entry.
+cp /var/lib/yuzu/instructions.db /var/lib/yuzu/instructions.db.pre-2442
+
+sqlite3 /var/lib/yuzu/instructions.db \
+  "UPDATE approvals SET status = 'expired'
+    WHERE status = 'approved' AND consumed_at = 0 AND origin = ''
+      AND submitted_at < <the epoch you recorded above>;"
+```
+
+**The `submitted_at` bound is load-bearing — do not drop it.** A blank surface means *not
+recorded*, and the MCP gate does not record its own surface yet, so **every currently-approved
+MCP ticket also carries `origin = ''`**. Without the time bound this statement revokes those too,
+and re-running it periodically livelocks MCP approvals entirely: mint, human approves, statement
+expires it, recall reports it expired, worker mints again.
+
+Even bounded, this revokes capabilities an administrator granted — anyone holding one of those
+`approval_id`s must request approval again. Do it only if you have reason to think an
 `mcp.`-prefixed definition was raised through the instruction gate before the upgrade.
 
 **What changes.** Creating a definition whose id starts `mcp.` is refused with a 400 on every
@@ -306,14 +332,14 @@ occurrence logs `instruction.schedule_fired / failure / definition_unknown` and 
 `yuzu_schedule_fire_failures_total`, while the schedule still shows as enabled.
 
 **One or more schedules — leave it alone for now.** A schedule cannot be moved between
-definitions, and rebuilding one is not possible from what the API exposes: `GET /api/schedules`
-returns neither `scope_expression` nor `requires_approval` nor `interval_minutes`. Those values
-*are* readable by querying `schedules` directly, so a rebuild is mechanically
-possible — but no procedure is published for it, deliberately: recreating a schedule moves its
-firing time silently and irreversibly (#2746), and a `weekly` or `monthly` one cannot be held to
-its calendar day at all. Getting `scope_expression` or `requires_approval` wrong turns a
+definitions (#2742), and rebuilding one is not possible from what the API exposes:
+`GET /api/schedules` returns neither `scope_expression` nor `requires_approval` nor
+`interval_minutes`. Those values *are* readable by querying `schedules` directly, so a rebuild is
+mechanically possible — but no procedure is published for it, deliberately: recreating a schedule
+moves its firing time silently and irreversibly (#2746), and a `weekly` or `monthly` one cannot be
+held to its calendar day at all. Getting `scope_expression` or `requires_approval` wrong turns a
 group-scoped, approval-gated job into an ungated fleet-wide one, and both default to the
-permissive value when omitted (#2742).
+permissive value when omitted.
 
 ### vNEXT — behind a reverse proxy, declare your external origin or CSRF-gated dashboard actions keep failing (#2537)
 
