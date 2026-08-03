@@ -235,6 +235,15 @@ private:
     // HTTP server needs to wire them directly. Test-only; grants no runtime
     // surface. See tests/unit/server/test_dashboard_tar_retention.cpp.
     friend struct DashboardTarRetentionTestAccess;
+
+    // Unit-test seam (PR1.7 remediation, Gate 3 architect + quality-engineer
+    // finding): resolve_render_columns/render_results and their inputs
+    // (instruction_store_, response_store_) are private, and the schema-aware
+    // column resolution this fix added had no test at this layer -- only the
+    // ResponseTemplatesEngine::synthesise_default primitive it calls was
+    // pinned. Test-only; grants no runtime surface. See
+    // tests/unit/server/test_dashboard_results_columns.cpp.
+    friend struct DashboardResultsColumnsTestAccess;
 };
 
 } // namespace yuzu::server

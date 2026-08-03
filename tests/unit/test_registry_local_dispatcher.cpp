@@ -46,6 +46,14 @@
 #include <yuzu/plugin.h>
 
 #include "local_dispatcher.hpp"
+#include "test_helpers.hpp" // process_random_salt -- Wee Tam runs 4 runner
+                            // agents as ONE shared LOCAL SYSTEM identity, so
+                            // a PID-only scratch key name is a weaker
+                            // uniqueness guarantee than this codebase's own
+                            // convention (test_guard_registry.cpp's
+                            // TempRegKey/TempEnforceKey; CLAUDE.md's
+                            // "Test conventions" section) -- match it rather
+                            // than rely on PID non-reuse alone.
 
 #include <cstdlib>
 #include <cwchar>
@@ -206,8 +214,10 @@ TEST_CASE("registry plugin: list_profiles + get_user_value live-hive round-trip 
     // is always the calling process's own already-loaded HKU\<own sid> --
     // guaranteed live + writable without admin rights, unlike any other
     // logged-in user's hive.
+    const std::string salt = std::to_string(yuzu::test::process_random_salt());
     const std::wstring key_path =
-        L"Software\\YuzuTest\\RegistryPr17Ld_" + std::to_wstring(GetCurrentProcessId());
+        L"Software\\YuzuTest\\RegistryPr17Ld_" +
+        std::wstring(salt.begin(), salt.end());
     HKEY scratch{};
     REQUIRE(RegCreateKeyExW(HKEY_CURRENT_USER, key_path.c_str(), 0, nullptr, 0,
                             KEY_READ | KEY_WRITE, nullptr, &scratch, nullptr) == ERROR_SUCCESS);
@@ -226,8 +236,7 @@ TEST_CASE("registry plugin: list_profiles + get_user_value live-hive round-trip 
     REQUIRE(RegSetValueExW(scratch, L"ScratchValue", 0, REG_SZ,
                            reinterpret_cast<const BYTE*>(value), bytes) == ERROR_SUCCESS);
 
-    const std::string key_path_utf8 =
-        "Software\\YuzuTest\\RegistryPr17Ld_" + std::to_string(GetCurrentProcessId());
+    const std::string key_path_utf8 = "Software\\YuzuTest\\RegistryPr17Ld_" + salt;
 
     SECTION("live-hive-first path resolves by sid and returns the scratch value") {
         std::vector<YuzuParam> params{
