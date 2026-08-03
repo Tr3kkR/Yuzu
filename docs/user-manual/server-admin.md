@@ -214,12 +214,24 @@ so Validate and Save agree on the create path. Product-pack install is unaffecte
 never carries a declared id through at all: the store assigns one, so a pack's own id, reserved
 or not, has never been honoured.
 
+**What ALSO breaks, and this is the one to plan around.** A legacy `mcp.`-prefixed definition
+that is **approval-gated cannot execute after this upgrade**. Executing it mints an approval
+ticket, that mint declares the instruction origin, and the reservation refuses it — so the
+execute request fails. This covers `approval_mode: always`, `role-gated` for any caller who is
+not an admin, and any unrecognised mode (which fails closed to requiring approval). Scheduled
+fires of such a definition are skipped occurrence by occurrence, counted in
+`yuzu_schedule_fire_failures_total` and audited as `instruction.schedule_fired` /
+`approval_submit_failed`.
+
+It fails closed — nothing is bypassed, and no approval is granted that should not be — but the
+definition stops working rather than degrading. Only `approval_mode: auto`, or an admin
+bypassing `role-gated`, keeps running.
+
 **What does NOT change.** The store applies the rule at creation only, so a definition that
-already carries such an id keeps executing and can still be saved through `PUT
-/api/instructions/{id}` — an update cannot originate an id, so blocking it there would strand
-content rather than protect anything. One exception, and it is the reason to rename rather than
-live with it: the dashboard's YAML editor runs the same validation on every save, create or
-update, so an existing `mcp.`-prefixed definition cannot be edited there if its document
+already carries such an id can still be saved through `PUT /api/instructions/{id}` — an update
+cannot originate an id, so blocking it there would strand content rather than protect anything.
+Two exceptions to "still editable": the dashboard's YAML editor runs the same validation on
+every save, create or update, so such a definition cannot be edited there if its document
 declares `metadata.id` (one that omits it still saves, since the validator only checks a
 declared id).
 
@@ -235,11 +247,21 @@ sqlite3 /var/lib/yuzu/instructions.db \
   "SELECT id FROM instruction_definitions WHERE id GLOB 'mcp.*';"
 ```
 
-Any id listed keeps executing after the upgrade and can still be edited through
-`PUT /api/instructions/{id}`, but re-importing an export of it will fail, and so will saving it
-from the dashboard's YAML editor (that path validates the id on every save, not only on
-create). Rename those definitions before upgrading — create a replacement under a different id
-and delete the original.
+For each id listed, check its `approval_mode`:
+
+```bash
+sqlite3 /var/lib/yuzu/instructions.db \
+  "SELECT id, approval_mode FROM instruction_definitions WHERE id GLOB 'mcp.*';"
+```
+
+Anything other than `auto` stops executing after the upgrade — rename those first. An `auto`
+one keeps running and can still be edited through `PUT /api/instructions/{id}`, but re-importing
+an export of it will fail, and so will saving it from the dashboard's YAML editor (that path
+validates the id on every save, not only on create).
+
+To rename: create a replacement under a different id and delete the original. The replacement
+is an ordinary create, so it is subject to the same reservation — pick an id outside the `mcp.`
+namespace.
 
 ### vNEXT — behind a reverse proxy, declare your external origin or CSRF-gated dashboard actions keep failing (#2537)
 

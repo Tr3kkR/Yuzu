@@ -406,7 +406,12 @@ TEST_CASE("ApprovalManager: a declared non-MCP origin cannot mint into the mcp. 
     auto forged = mgr.submit("mcp.quarantine_device", "attacker", "{\"agent_id\":\"a1\"}", "",
                              ApprovalOrigin::kInstruction);
     REQUIRE(!forged.has_value());
-    CHECK(forged.error().find("reserved") != std::string::npos);
+    // EXACT equality, not a substring: WorkflowRoutes distinguishes this
+    // deterministic policy refusal from a store failure by comparing the error
+    // against kReservedDefinitionIdError, and answers 400 rather than 500 on a
+    // match. If this message ever stops being exactly that constant, the route
+    // silently falls back to an opaque 500 and nothing else would notice.
+    CHECK(forged.error() == std::string(kReservedDefinitionIdError));
 
     auto from_schedule = mgr.submit("mcp.delete_tag", "attacker", "{}", "sched-1",
                                     ApprovalOrigin::kSchedule);

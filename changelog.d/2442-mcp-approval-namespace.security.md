@@ -12,10 +12,12 @@
   400 on every authoring route that accepts an explicit id (`POST /api/instructions`,
   `/api/instructions/yaml`, `/api/instructions/import`), and such a definition is skipped at boot
   auto-import. Product-pack install is unaffected — it never carries a declared id through. No
-  shipped content uses the prefix. The store applies the rule at create time, so a definition that
-  already exists under it keeps working and can still be saved through `PUT`; the dashboard's YAML
-  editor is stricter and refuses it on every save. Rename such a definition before upgrading — see
-  the upgrade note in `docs/user-manual/server-admin.md` for a query that finds them.
+  shipped content uses the prefix. A definition that already exists under the prefix and is
+  **approval-gated stops executing**: the mint declares an origin, the reservation refuses it, and
+  the execute fails closed (nothing is bypassed, but the definition stops working). An
+  `approval_mode: auto` one keeps running and can still be saved through `PUT`, though the
+  dashboard's YAML editor refuses it on every save. Rename affected definitions before upgrading —
+  see the upgrade note in `docs/user-manual/server-admin.md` for the queries that find them.
 
   The minting surface is recorded with each approval; rows predating the column are left unlabelled
   rather than assigned a surface they may not have come from, and the MCP mint itself is unlabelled

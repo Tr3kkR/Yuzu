@@ -1552,10 +1552,19 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 auto result = approval_manager->submit(def_id, session->username, scope_expr, "",
                                                        ApprovalOrigin::kInstruction);
                 if (!result) {
+                    // A reserved-namespace refusal is a deterministic, actionable
+                    // config problem, not a server fault: answer 400 and name it,
+                    // or the operator of a legacy `mcp.`-prefixed definition gets
+                    // an opaque 500 on every execute with nothing to act on.
+                    // Compared against the shared constant, not a substring —
+                    // both sides use the one definition, so this is exact.
+                    const bool reserved = result.error() == kReservedDefinitionIdError;
                     spdlog::error("approval submit failed for '{}': {}", def_id, result.error());
-                    res.status = 500;
+                    res.status = reserved ? 400 : 500;
                     res.set_content(
-                        R"({"error":{"code":500,"message":"failed to create approval request"},"meta":{"api_version":"v1"}})",
+                        reserved
+                            ? R"({"error":{"code":400,"message":"definition id may not use the reserved 'mcp.' prefix (reserved for MCP approvals); rename this definition","remediation":"create a replacement under an id outside the mcp. namespace and delete this one"},"meta":{"api_version":"v1"}})"
+                            : R"({"error":{"code":500,"message":"failed to create approval request"},"meta":{"api_version":"v1"}})",
                         "application/json");
                     return;
                 }
