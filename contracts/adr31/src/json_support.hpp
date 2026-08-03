@@ -28,6 +28,9 @@ decode_contract_header(const nlohmann::json& root, const ContractDescriptor& des
 validate_opaque_run_id(std::string_view value, std::string_view path);
 
 [[nodiscard]] std::expected<void, ContractError>
+validate_correlation_id(std::string_view value, std::string_view path = "/correlation_id");
+
+[[nodiscard]] std::expected<void, ContractError>
 reject_forbidden_authority_fields(const nlohmann::json& root);
 
 [[nodiscard]] std::expected<void, ContractError>

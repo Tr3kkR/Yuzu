@@ -321,6 +321,24 @@ std::expected<void, ContractError> validate_opaque_run_id(std::string_view value
     return {};
 }
 
+std::expected<void, ContractError> validate_correlation_id(std::string_view value,
+                                                           std::string_view path) {
+    if (value.empty() || value.size() > kMaxCorrelationIdCharacters) {
+        return std::unexpected(error(ContractErrorCode::InvalidValue, std::string{path},
+                                     "correlation identifier length is outside the contract"));
+    }
+    for (const unsigned char byte : value) {
+        const bool allowed = (byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') ||
+                             (byte >= '0' && byte <= '9') || byte == '-' || byte == '_' ||
+                             byte == '.' || byte == ':' || byte == '=';
+        if (!allowed) {
+            return std::unexpected(error(ContractErrorCode::InvalidValue, std::string{path},
+                                         "correlation identifier is not an opaque ASCII token"));
+        }
+    }
+    return {};
+}
+
 std::expected<nlohmann::json, ContractError> parse_contract_json(std::string_view wire_json) {
     if (wire_json.size() > kMaxContractWireBytes) {
         return std::unexpected(error(ContractErrorCode::TooLarge, "",

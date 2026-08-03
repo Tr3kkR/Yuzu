@@ -48,6 +48,27 @@ TEST_CASE("ADR-0031 B3 rejects an untyped operation", "[adr31][contract][b3][neg
     CHECK(decoded.error().path == "/operation");
 }
 
+TEST_CASE("ADR-0031 B3 correlation is a bounded diagnostic token",
+          "[adr31][contract][b3][security]") {
+    contracts::B3PlatformRequest request{
+        .correlation_id = "req-contract-0001",
+        .securable = "GuaranteedState",
+        .operation = contracts::CoreOperation::Read,
+        .scope = nlohmann::json{{"kind", "fleet"}},
+    };
+
+    for (const std::string& invalid :
+         {std::string{}, std::string{"contains space"}, std::string{"contains\nnewline"},
+          std::string(contracts::kMaxCorrelationIdCharacters + 1, 'x')}) {
+        request.correlation_id = invalid;
+        const auto encoded = contracts::encode_b3_platform_request(request);
+        CAPTURE(invalid.size());
+        REQUIRE_FALSE(encoded.has_value());
+        CHECK(encoded.error().code == contracts::ContractErrorCode::InvalidValue);
+        CHECK(encoded.error().path == "/correlation_id");
+    }
+}
+
 TEST_CASE("ADR-0031 B3 rejects caller-authored authority context",
           "[adr31][contract][b3][security]") {
     const auto base = nlohmann::json::parse(

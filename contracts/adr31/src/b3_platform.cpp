@@ -17,9 +17,9 @@ ContractError error(ContractErrorCode code, std::string path, std::string messag
 }
 
 std::expected<void, ContractError> validate_request(const B3PlatformRequest& request) {
-    if (request.correlation_id.empty()) {
-        return std::unexpected(error(ContractErrorCode::InvalidValue, "/correlation_id",
-                                     "correlation_id must not be empty"));
+    if (const auto correlation = detail::validate_correlation_id(request.correlation_id);
+        !correlation) {
+        return std::unexpected(correlation.error());
     }
     if (request.securable.empty()) {
         return std::unexpected(error(ContractErrorCode::InvalidValue, "/securable",
@@ -76,6 +76,10 @@ decode_b3_platform_request(std::string_view wire_json) {
 
     auto correlation_id = detail::required_string(*root, "correlation_id");
     if (!correlation_id) return std::unexpected(correlation_id.error());
+    if (const auto valid_correlation = detail::validate_correlation_id(*correlation_id);
+        !valid_correlation) {
+        return std::unexpected(valid_correlation.error());
+    }
     auto securable = detail::required_string(*root, "securable");
     if (!securable) return std::unexpected(securable.error());
     auto operation = detail::required_string(*root, "operation");
