@@ -625,7 +625,10 @@ curl -s -b cookies.txt \
 curl -s -b cookies.txt \
   -X POST http://localhost:8080/api/schedules/SCHED-001/enable \
   -H "Content-Type: application/json" \
-  -d '{"enabled": false}'
+  -d '{"enabled": "false"}'
+
+# NOTE: the value must be the STRING "false". A JSON boolean is ignored and the
+# call ENABLES the schedule instead (#2747).
 
 # Delete a schedule
 curl -s -b cookies.txt \

@@ -19,7 +19,8 @@
   reservation refuses it, and the run fails closed — with a 400 naming the prefix on the two
   request paths, and a dropped occurrence on the scheduler. A run is
   approval-gated if the definition's `approval_mode` is not `auto` OR the schedule carries its own
-  `requires_approval`, so an `auto` definition on a gated schedule is affected too. **The scheduled
+  `requires_approval`, so an `auto` definition on a gated schedule is affected too — except that an
+  administrator bypasses `role-gated` entirely, so a `role-gated` definition keeps running for them. **The scheduled
   case fails silently and permanently** — occurrences are dropped rather than retried while the
   schedule still shows as enabled and advertises a next run it can never make, and nothing
   self-corrects. MCP is unaffected (`execute_instruction` takes a plugin and action, not a

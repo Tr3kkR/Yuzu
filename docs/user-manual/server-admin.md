@@ -230,9 +230,12 @@ definition stops working rather than degrading.
 
 The scheduled case is the one to fix first, because it fails silently and permanently.
 Occurrences are dropped rather than retried, counted in `yuzu_schedule_fire_failures_total` and
-audited as `instruction.schedule_fired` / `approval_submit_failed` — but from the dashboard the
-schedule stays enabled and keeps advertising a next run it can never make, and nothing
-self-corrects. There is no alert rule shipped for that counter today.
+audited as `instruction.schedule_fired` / `approval_submit_failed` — but the dashboard does not
+show it as broken, and nothing self-corrects. What you see depends on the frequency: a recurring
+schedule stays enabled and keeps advertising a next run it can never make; a `once` schedule
+advances to no next run and increments its execution count, so a dropped occurrence is
+**indistinguishable from a successful one**. There is no alert rule shipped for that counter
+today.
 
 (MCP is not affected: `execute_instruction` takes a plugin and action rather than a definition
 id, so it never mints under a definition's namespace. This is a REST, dashboard and scheduler
@@ -300,21 +303,36 @@ What you need to know before you touch anything:
 - **`POST /api/schedules` defaults every field you omit**, and the defaults are dangerous: an
   omitted `scope_expression` becomes empty, which dispatches to the **entire fleet**; an omitted
   `requires_approval` drops the schedule's half of the approval gate; an omitted
-  `frequency_type` becomes `once`, due immediately. A rebuild must copy the whole row.
+  `frequency_type` becomes `once`, due immediately. A rebuild must therefore reproduce the whole
+  row — and it cannot, through the API: `GET /api/schedules` returns neither
+  `scope_expression` nor `requires_approval` (nor the three time fields), so the two values whose
+  absence causes an ungated fleet-wide dispatch are not readable back. Only a direct database
+  query can see them.
+- **A rebuilt schedule always comes back enabled and armed.** `enabled` is not a create field,
+  and a `once` schedule's first occurrence is immediately due, against a 30-second tick.
 - **Delete is owner-scoped and its failure is silent** — a non-owner `DELETE /api/schedules/{id}`
   answers `200 {"deleted": false}` with no audit row.
 
-So:
+Which branch you are on:
 
-- **A definition with no schedule** renames cleanly: create the replacement under an id outside
-  the `mcp.` namespace, carrying its `mode:` (which defaults to `auto` if omitted, dropping the
-  gate), re-point anything that calls it by id, then delete the original.
-- **A definition with a schedule** — do not attempt a lossless rename. Either leave it in place
-  (it keeps working unless it is approval-gated, per the section above) and wait for #2742/#2746,
-  or accept that the rebuilt schedule starts a new firing cycle from the moment you create it,
-  and rebuild it inside the window you want it to keep. That is achievable for `daily` and
-  `interval`; `weekly` additionally has to land on the right weekday, and `monthly` cannot be
-  held to a calendar day at all, because its period is a flat 30 days.
+```bash
+sqlite3 /var/lib/yuzu/instructions.db \
+  "SELECT d.id, COUNT(s.id) AS schedules
+     FROM instruction_definitions d
+     LEFT JOIN schedules s ON s.definition_id = d.id
+    WHERE d.id GLOB 'mcp.*' GROUP BY d.id;"
+```
+
+- **No schedules** — rename normally: create the replacement under an id outside the `mcp.`
+  namespace, carrying the approval mode across (`approval_mode` on the JSON routes, `mode:` in
+  the YAML `spec.approval` block; it defaults to `auto` when absent, which drops the gate),
+  re-point anything that calls it by id, then delete the original.
+- **One or more schedules — do not rename it yet.** There is no supported way to move a schedule,
+  and rebuilding one correctly requires values the API will not show you. Leave the definition in
+  place: it keeps working unless it is approval-gated, per the section above. If it *is*
+  approval-gated and therefore already stopped, treat that as an outage to raise against #2742
+  and #2746 rather than a rename to attempt — a rebuild done from partial data is how a
+  group-scoped gated job becomes an ungated fleet-wide one.
 
 After any rename, check that nothing was orphaned:
 

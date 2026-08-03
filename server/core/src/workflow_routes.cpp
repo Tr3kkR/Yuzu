@@ -1587,25 +1587,38 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                // `remediation` alone is invisible on the surface
                                // most operators hit this from.
                                //
-                               // Neither field says "delete this definition" on
-                               // its own. Deleting one does not re-point the
-                               // schedules that reference it, so a delete-first
-                               // rename strands them silently — the ordered
-                               // procedure is in the upgrade note.
-                               {"message", std::string(kReservedDefinitionIdError) +
-                                               "; rename this definition, following the "
-                                               "upgrade note in server-admin.md - deleting it "
-                                               "before moving its schedules strands them"},
+                               // Neither field prescribes an order on its own,
+                               // and neither says "delete this definition":
+                               // deleting one does not re-point the schedules
+                               // that reference it, and for a definition that
+                               // HAS a schedule there is no safe rename to
+                               // prescribe at all (#2742, #2746). The upgrade
+                               // note carries the detail; this text must not
+                               // drift ahead of it.
+                               {"message",
+                                std::string(kReservedDefinitionIdError) +
+                                    "; this definition has to be renamed, and if it has a "
+                                    "schedule that cannot be done safely yet - see the upgrade "
+                                    "note in docs/user-manual/server-admin.md"},
                                {"remediation",
-                                "create a replacement under an id outside the mcp. namespace, "
-                                "rebuild any schedules against it (copying every field - the "
-                                "create defaults widen scope and drop the approval gate), and "
-                                "only then delete the original"}}},
+                                "if the definition has no schedule, create a replacement under "
+                                "an id outside the mcp. namespace, re-point callers, and delete "
+                                "the original; if it has one, do not rename it yet - moving a "
+                                "schedule is unsupported and rebuilding one from what the API "
+                                "exposes widens its scope and drops its approval gate"}}},
                              {"meta", {{"api_version", "v1"}}}})
                             .dump(),
                         "application/json");
                     return;
                 }
+                // kInstruction is what makes ApprovalManager's own chokepoint
+                // refuse a reserved id independently of the pre-check above.
+                // Note the pre-check MASKS its loss: drop this argument and
+                // this route still answers 400, so no test here would notice.
+                // The chokepoint is pinned directly in test_approval_manager
+                // ("a declared non-MCP origin cannot mint into the mcp.
+                // namespace"); keep that test, it is the only thing holding
+                // this line.
                 auto result = approval_manager->submit(def_id, session->username, scope_expr, "",
                                                        ApprovalOrigin::kInstruction);
                 if (!result) {

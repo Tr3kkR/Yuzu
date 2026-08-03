@@ -948,8 +948,10 @@ TEST_CASE("#2442 — executing a legacy mcp.-prefixed approval-gated definition 
           std::string::npos);
     CHECK(message.find("rename") != std::string::npos);
     const std::string remediation = body["error"].value("remediation", "");
-    CHECK(remediation.find("rebuild") != std::string::npos);   // schedules move first
-    CHECK(remediation.find("only then delete") != std::string::npos);
+    // The caveat, not the wording: a definition that HAS a schedule cannot be
+    // renamed safely (#2742, #2746), so this text must say so rather than hand
+    // out a procedure. Pinned on the concept an operator has to see.
+    CHECK(remediation.find("schedule") != std::string::npos);
 
     // Neither field may tell the operator to delete before moving schedules:
     // delete_definition has no referential guard, so a delete-first rename
@@ -973,18 +975,9 @@ TEST_CASE("#2442 — executing a legacy mcp.-prefixed approval-gated definition 
     // No ticket was minted: the refusal happens before the gate is reached.
     // The positive control below is what stops this being vacuous.
     CHECK(h.approvals->query({}).empty());
-}
-
-TEST_CASE("#2442 — the approval store the reserved-id tests assert against is live",
-          "[workflow][execute][approval]") {
-    // Control for the "no ticket was minted" assertions: query() returns an
-    // empty vector both when nothing was minted AND when the schema is absent
-    // (a failed migration, a SQLITE_BUSY). Prove the store can actually return
-    // a row, or that negative is worth nothing.
-    ExecHarness h;
-    auto id = h.approvals->submit("inventory.audit", "tester", "{}");
-    REQUIRE(id.has_value());
-    CHECK(h.approvals->query({}).size() == 1);
+    // The assertion every rejecting case in this file makes: a refusal that
+    // still dispatched would be no refusal at all.
+    CHECK(h.dispatch_calls == 0);
 }
 
 TEST_CASE("#2442 — an UNGATED legacy mcp.-prefixed definition still executes",

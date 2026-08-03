@@ -5672,10 +5672,12 @@ originate an id. It does NOT keep running: executing an approval-gated
 definition mints an approval ticket, and that mint is refused, so
 `POST /api/instructions/{id}/execute` answers **400** with the reserved-prefix
 message and a `remediation`. That covers `approval_mode: always`, `role-gated`
-for a non-admin, any unrecognised mode, and — for scheduled runs — a schedule
-carrying its own `requires_approval` even when the definition is `auto`. What
-keeps working is an ungated run: a fully `auto` one, or a `role-gated` one
-executed by an admin, who bypasses approval entirely. See the upgrade note in
+for a non-admin, and any unrecognised mode. What keeps working through this
+route is an ungated run: a fully `auto` one, or a `role-gated` one executed by
+an admin, who bypasses approval entirely. Scheduled runs of the same definition
+are gated separately — a schedule carrying its own `requires_approval` is
+refused even when the definition is `auto` — but the scheduler produces no HTTP
+response; it drops the occurrence and audits it. See the upgrade note in
 `docs/user-manual/server-admin.md` for the queries that find affected content
 and the order to rename it in.
 
