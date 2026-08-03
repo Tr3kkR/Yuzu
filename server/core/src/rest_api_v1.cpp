@@ -1281,6 +1281,40 @@ void RestApiV1::register_routes(
     EnginePrincipalStore* eps = engine_principal_store_;
     UserExistsFn user_exists_fn = user_exists_fn_;
 
+    // #1788: resolve the caller's confinement set on a route whose PRIMARY
+    // authorization is the per-target `scoped_perm_fn` gate — the TAR retention
+    // purge and the DEX live query. Both had ~20 byte-identical lines of this,
+    // comments included, which is precisely the duplication the dispatch seam
+    // exists to prevent one layer down; one helper, two call sites.
+    //
+    // Call it AFTER the scope gate has passed, never at the top of a handler:
+    // that gate has already emitted 401 for an unauthenticated caller, so
+    // resolving late cannot change any status-code ordering the route already
+    // had (notably 400-before-401 on body validation).
+    //
+    // Returns nullopt iff the session could not be resolved after all — the
+    // caller must RETURN without dispatching, because dispatching a deny-all
+    // set instead would reach nobody and be reported as "device offline",
+    // a false answer to what is really an authentication failure. `auth_fn`
+    // has already written its own 401 envelope in that case.
+    //
+    // Unwired `exec_visible_fn` yields deny_all() (present-empty), NOT nullopt:
+    // this layer is defense-in-depth, and the routed-concern clause on
+    // `nullopt` vs present-empty is what makes those two non-interchangeable.
+    auto resolve_secondary_exec_visible =
+        [auth_fn, exec_visible_fn](const httplib::Request& req, httplib::Response& res)
+        -> std::optional<yuzu::server::authz::VisibleSet> {
+        std::optional<auth::Session> sess;
+        if (auth_fn) {
+            sess = auth_fn(req, res);
+            if (!sess)
+                return std::nullopt;
+        }
+        if (exec_visible_fn && sess)
+            return exec_visible_fn(*sess);
+        return yuzu::server::authz::deny_all();
+    };
+
     // ── CORS preflight handler for /api/v1/* ─────────────────────────────
     // Actual CORS headers are added by the post-routing handler in server.cpp
     // with origin allowlist validation.
@@ -1487,7 +1521,7 @@ void RestApiV1::register_routes(
                       auto exec_visible =
                           exec_visible_fn && session
                               ? exec_visible_fn(*session)
-                              : yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{}};
+                              : yuzu::server::authz::deny_all();
                       r = bundle_orch->dispatch(agent_id, *specs, principal, audit, exec_visible);
                   } catch (const std::exception& e) {
                       audit_fn(req, "bundle.dispatch", "failure", "Execution", "",
@@ -1517,8 +1551,8 @@ void RestApiV1::register_routes(
     // HIGH #3/#4.
     sink.Post(
         "/api/v1/tar/retention-paused/purge",
-        [scoped_perm_fn, command_dispatch_fn, audit_fn, metrics_registry, auth_fn,
-         exec_visible_fn](const httplib::Request& req, httplib::Response& res) {
+        [scoped_perm_fn, command_dispatch_fn, audit_fn, metrics_registry,
+         resolve_secondary_exec_visible](const httplib::Request& req, httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
             auto bump = [&](const char* result) {
@@ -1589,36 +1623,26 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
-            // #1788 defense-in-depth. `scoped_perm_fn` above is the PRIMARY gate
+            // #1788 defense-in-depth: `scoped_perm_fn` above is the PRIMARY gate
             // and has already authorized this exact device_id, so the seam's
             // intersection is a second, independent check rather than the thing
-            // standing between a caller and the fleet. Resolve the session HERE,
-            // after that gate has passed, rather than at the top of the handler:
-            // scoped_perm_fn already emitted 401 for an unauthenticated caller,
-            // so this cannot fail in practice, and doing it late leaves the
-            // existing 400-before-401 validation ordering untouched.
-            //
-            // If the session cannot be resolved after all, RETURN rather than
-            // dispatch with a deny-all set: reaching nobody would be reported
-            // as the 404 "device offline" below, which is a false answer to
-            // what is really an authentication failure. auth_fn has already
-            // written its own 401 envelope in that case.
-            std::optional<auth::Session> purge_session;
-            if (auth_fn) {
-                purge_session = auth_fn(req, res);
-                if (!purge_session) {
-                    bump("denied");
-                    return;
-                }
+            // standing between this caller and the fleet.
+            const auto exec_visible = resolve_secondary_exec_visible(req, res);
+            if (!exec_visible) {
+                bump("denied");
+                return;
             }
-            const yuzu::server::authz::VisibleSet exec_visible =
-                exec_visible_fn && purge_session
-                    ? exec_visible_fn(*purge_session)
-                    : yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{}};
             const auto [command_id, sent] =
                 command_dispatch_fn("tar", "purge_source", {device_id}, "", {{"source", source}},
-                                    /*execution_id=*/"", exec_visible);
+                                    /*execution_id=*/"", *exec_visible);
             if (sent == 0) {
+                // NOTE: a confinement drop also lands here and is reported as
+                // "offline" + counted as agent_not_connected. The RESPONSE
+                // being indistinguishable is deliberate — a distinct status
+                // would disclose that a device exists but is out of reach. The
+                // METRIC is a known small imprecision, and the path is only
+                // reachable at all if scoped_perm_fn and the derived set
+                // disagree about this device, which is itself a bug.
                 res.status = 404;
                 bump("agent_not_connected");
                 res.set_content(
@@ -8424,8 +8448,8 @@ void RestApiV1::register_routes(
     // (architect B1). The read model above stays GET.
     sink.Post(
         R"(/api/v1/dex/devices/([^/]+)/live)",
-        [scoped_perm_fn, response_store, command_dispatch_fn, audit_fn, metrics_registry, auth_fn,
-         exec_visible_fn](const httplib::Request& req, httplib::Response& res) {
+        [scoped_perm_fn, response_store, command_dispatch_fn, audit_fn, metrics_registry,
+         resolve_secondary_exec_visible](const httplib::Request& req, httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
             // Echo the correlation id on EVERY response path (A3), parity with the
@@ -8482,6 +8506,17 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
+            // #1788 defense-in-depth, behind the per-device `gate(...)` above.
+            // Resolved HERE — after the dependency checks, but BEFORE the
+            // in-flight slot and before the audit "requested" row — so a failure
+            // cannot leave an audited request that never dispatched, and cannot
+            // consume a concurrency slot it will not use. (Doing it after the
+            // audit was the original shape and is the ordering defect this
+            // moves; the scope gate above has already answered 401, so this
+            // still cannot fail in practice and no status ordering shifts.)
+            const auto exec_visible = resolve_secondary_exec_visible(req, res);
+            if (!exec_visible)
+                return;
             // Concurrency cap (UP-1/2/3): acquire an in-flight slot BEFORE dispatch so
             // an over-budget caller gets 429 without orphaning a command. RAII releases
             // the slot on every return below; the gauge mirrors current depth.
@@ -8522,26 +8557,8 @@ void RestApiV1::register_routes(
                              audit_action, cid, agent_id);
                 return;
             }
-            // #1788 defense-in-depth, same posture as the TAR purge route: the
-            // per-device `gate(...)` above (scoped_perm_fn on THIS agent_id) is
-            // the primary authorization and has already run, so this is a
-            // second, independent check at the seam. Resolved late for the same
-            // reason — the gate has emitted 401 already if it had to, and doing
-            // it here leaves the existing status-code ordering untouched. An
-            // unresolvable session returns rather than dispatching deny-all,
-            // which the sent==0 branch would misreport as "device offline".
-            std::optional<auth::Session> live_session;
-            if (auth_fn) {
-                live_session = auth_fn(req, res);
-                if (!live_session)
-                    return;
-            }
-            const yuzu::server::authz::VisibleSet exec_visible =
-                exec_visible_fn && live_session
-                    ? exec_visible_fn(*live_session)
-                    : yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{}};
             const auto [command_id, sent] = command_dispatch_fn(plugin, action, {agent_id}, "", {},
-                                                                /*execution_id=*/"", exec_visible);
+                                                                /*execution_id=*/"", *exec_visible);
             if (sent == 0) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(

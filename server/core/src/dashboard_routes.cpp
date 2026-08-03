@@ -729,8 +729,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // reaches nobody), never nullopt/unfiltered.
                  yuzu::server::authz::VisibleSet exec_visible =
                      exec_visible_fn_ ? exec_visible_fn_(req)
-                                      : yuzu::server::authz::VisibleSet{
-                                            std::unordered_set<std::string>{}};
+                                      : yuzu::server::authz::deny_all();
                  auto [command_id, sent] =
                      dispatch_fn_(plugin, action, agent_ids, scope_expr, inline_params, exec_visible);
                  if (sent == 0) {
@@ -920,8 +919,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // to the operator's visible set, fail CLOSED if unwired.
                  yuzu::server::authz::VisibleSet exec_visible =
                      exec_visible_fn_ ? exec_visible_fn_(req)
-                                      : yuzu::server::authz::VisibleSet{
-                                            std::unordered_set<std::string>{}};
+                                      : yuzu::server::authz::deny_all();
                  auto [command_id, sent] =
                      dispatch_fn_("tar", "sql", agent_ids, scope_expr, params, exec_visible);
 
@@ -1131,8 +1129,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // Fail CLOSED (present-empty) if the derivation is unwired.
                  yuzu::server::authz::VisibleSet exec_visible =
                      exec_visible_fn_ ? exec_visible_fn_(req)
-                                      : yuzu::server::authz::VisibleSet{
-                                            std::unordered_set<std::string>{}};
+                                      : yuzu::server::authz::deny_all();
                  auto [command_id, sent] = dispatch_fn_(
                      "tar", "status", agent_ids, /*scope_expr=*/"", params, exec_visible);
 
@@ -1344,8 +1341,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // outside its service. Fail CLOSED if the derivation is unwired.
                  yuzu::server::authz::VisibleSet exec_visible =
                      exec_visible_fn_ ? exec_visible_fn_(req)
-                                      : yuzu::server::authz::VisibleSet{
-                                            std::unordered_set<std::string>{}};
+                                      : yuzu::server::authz::deny_all();
                  auto [command_id, sent] = dispatch_fn_(
                      "tar", "configure", {device_id}, /*scope_expr=*/"",
                      params, exec_visible);
@@ -1512,8 +1508,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // out-of-scope device_id; fail CLOSED if the derivation is unwired.
                  yuzu::server::authz::VisibleSet exec_visible =
                      exec_visible_fn_ ? exec_visible_fn_(req)
-                                      : yuzu::server::authz::VisibleSet{
-                                            std::unordered_set<std::string>{}};
+                                      : yuzu::server::authz::deny_all();
                  auto [command_id, sent] =
                      dispatch_fn_("tar", "purge_source", {device_id}, /*scope_expr=*/"", params,
                                   exec_visible);

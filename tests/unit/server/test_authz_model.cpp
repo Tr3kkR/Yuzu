@@ -337,6 +337,46 @@ VisibleSet compose_exec_visible(const yuzu::server::RbacStore& rbac, const std::
 
 } // namespace
 
+// CDX-001, store-free arm. Deliberately UNTAGGED so it runs everywhere,
+// including a dev box with no Postgres.
+//
+// The `[pg]` sibling below proves the same precedence against real stores, but
+// porting this fixture to Postgres (ADR-0042) meant the single highest-value
+// assertion in the file — that a service-scoped token is never unfiltered even
+// when its minter holds a global grant — would SKIP wherever a database is
+// absent, which is most local runs. The precedence lives in the pure production
+// composer, so it can be asserted with no stores at all: hand
+// `compose_exec_visible` the facts directly. Deleting the CDX-001 branch from
+// production fails THIS case with no database in sight.
+TEST_CASE("authz_model #1788: a service-scoped token is narrowed even when the minter holds a "
+          "GLOBAL grant (CDX-001 precedence, store-free)",
+          "[authz_model][1788][service]") {
+    yuzu::server::authz::ExecVisibleFacts f;
+    f.service_scoped = true;
+    f.service_tagged = std::unordered_set<std::string>{"a_svcA1", "a_svcA2"};
+    f.global_grant = true; // THE VECTOR: the minting principal is a global admin
+    f.elevated = true;     // and JIT-elevated, the other full-fleet bypass
+
+    auto visible = yuzu::server::authz::compose_exec_visible(f);
+    REQUIRE(visible.has_value()); // never unfiltered, DESPITE both bypasses
+    CHECK(visible->contains("a_svcA1"));
+    CHECK(!visible->contains("a_svcB1"));
+
+    SECTION("a degraded tag store fails closed to deny-all, never unfiltered") {
+        f.service_tagged = std::nullopt; // store unavailable
+        auto broken = yuzu::server::authz::compose_exec_visible(f);
+        REQUIRE(broken.has_value());
+        CHECK(broken->empty());
+    }
+
+    SECTION("the SAME facts without the token scope are unfiltered — the token, not the "
+            "user, is what narrows") {
+        f.service_scoped = false;
+        f.service_tagged.reset();
+        CHECK_FALSE(yuzu::server::authz::compose_exec_visible(f).has_value());
+    }
+}
+
 TEST_CASE("authz_model #1788: a service-scoped token narrows to its service, over a global grant "
           "(CDX-001, live arm)",
           "[pg][authz_model][1788][service]") {

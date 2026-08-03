@@ -106,6 +106,10 @@ struct AsyncHarness {
         std::string action, result, detail;
     };
     std::vector<AuditCall> audits;
+    /// AuditFn return value. false models a lost evidence row, which must
+    /// surface as `Sec-Audit-Failed: true` on the response rather than being
+    /// swallowed — a refusal nobody can prove happened is not fail-closed.
+    bool audit_ok{true};
 
     // Fake-dispatch knobs / recording.
     std::vector<DispatchCall> calls;
@@ -164,7 +168,7 @@ struct AsyncHarness {
                                const std::string& result, const std::string&, const std::string&,
                                const std::string& detail) -> bool {
             audits.push_back({action, result, detail});
-            return true;
+            return audit_ok;
         };
 
         RestApiV1::CommandDispatchFn dispatch_fn;
@@ -212,10 +216,16 @@ struct AsyncHarness {
                             /*stream_budget=*/nullptr, exec_visible_fn);
     }
 
+    /// Header value from the most recent `post`, "" if absent. Kept so a test
+    /// can assert `Sec-Audit-Failed` without every call site switching to the
+    /// raw response.
+    std::string last_sec_audit_failed;
+
     nlohmann::json post(const std::string& path, const std::string& body, int& status) {
         auto res = sink.dispatch("POST", path, body);
         REQUIRE(res != nullptr);
         status = res->status;
+        last_sec_audit_failed = res->get_header_value("Sec-Audit-Failed");
         return nlohmann::json::parse(res->body, nullptr, false);
     }
 
@@ -823,6 +833,24 @@ TEST_CASE("async producers: an UNWIRED exec-visible derivation is an audited 500
                    a.detail.find("exec_visible_unwired") != std::string::npos;
         });
     CHECK(audited);
+}
+
+TEST_CASE("async producers: a LOST evidence row on the unwired-gate refusal is surfaced, not "
+          "swallowed",
+          "[pg][result_set][async][security][1788][fail-closed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool, /*with_dispatch=*/true, /*inv=*/nullptr, /*with_exec_visible=*/false);
+    // A refusal nobody can prove happened is not fail-closed: if the denial
+    // audit cannot be persisted, the response must say so.
+    h.audit_ok = false;
+
+    int status = 0;
+    h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    CHECK(status == 500);
+    CHECK(h.last_sec_audit_failed == "true");
+    CHECK(h.calls.empty()); // still no dispatch
 }
 
 TEST_CASE("async producers: an unfiltered (nullopt) VisibleSet still dispatches — non-regression",

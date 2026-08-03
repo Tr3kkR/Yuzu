@@ -5866,7 +5866,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     // posture as the tag ScopedPermFn, K-06). Production
                                     // always wires it (server.cpp); a test wanting unfiltered
                                     // wires a callback that returns nullopt.
-                                    : yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{}};
+                                    : yuzu::server::authz::deny_all();
                 std::string command_id;
                 int agents_reached = 0;
                 try {
@@ -6390,7 +6390,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     // posture as the tag ScopedPermFn, K-06). Production
                                     // always wires it (server.cpp); a test wanting unfiltered
                                     // wires a callback that returns nullopt.
-                                    : yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{}};
+                                    : yuzu::server::authz::deny_all();
                 if (!yuzu::server::authz::in_scope(exec_visible, agent_id)) {
                     mcp_audit("failure", "agent_id=" + agent_id + " out_of_scope");
                     res.set_content(

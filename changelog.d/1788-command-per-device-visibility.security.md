@@ -38,7 +38,10 @@
   producers, where it is the only per-device authorization they have. The REST layer's dispatch
   callback now REQUIRES the caller's visible set as a parameter, so the unconfined system closure
   the background engines use is no longer type-compatible with it — the wrong closure stopped
-  being available to pick rather than merely being avoided. (Still deferred: the BACKGROUND
+  being available to pick rather than merely being avoided. The fail-closed set itself is now
+  spelled by a named constructor (`authz::deny_all()`) at every one of its call sites, because the
+  bug above was a hand-written `VisibleSet{}` — which *looks* like an empty set and in fact
+  default-constructs the optional to "unfiltered", the exact inverse. (Still deferred: the BACKGROUND
   dispatch paths — the scheduler, Guardian push, the policy evaluator — which dispatch as system
   rather than on behalf of an operator. Those belong to the core-owned dispatch chokepoint tracked
   with the capability-registry work: the ADR-1005 / ADR-0017 gate, #1714/#1715.)

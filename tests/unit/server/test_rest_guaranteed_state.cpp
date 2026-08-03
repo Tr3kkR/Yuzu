@@ -34,9 +34,11 @@
 
 #include "../test_helpers.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -143,9 +145,15 @@ struct RestGsHarness {
     // unwired so a test can prove /live → 503. wire_scoped_perm=false registers the
     // device-compliance route with an EMPTY ScopedPermFn, exercising its fail-closed-503
     // path. Both default true so every existing test is unchanged.
+    /// false → register with an EMPTY `exec_visible_fn`, modelling a deployment
+    /// that never wired the #1788 derivation. Not a synonym for
+    /// `exec_visible_override` being nullopt: that is a callback ANSWERING
+    /// "unfiltered".
+    bool wire_exec_visible{true};
+
     explicit RestGsHarness(bool live_deps = true, bool wire_scoped_perm = true,
-                           bool wire_app_perf = true)
-        : wire_live_deps(live_deps) {
+                           bool wire_app_perf = true, bool with_exec_visible = true)
+        : wire_live_deps(live_deps), wire_exec_visible(with_exec_visible) {
         // retention=0 keeps the reaper out of the way for ingest tests.
         store = std::make_unique<GuaranteedStateStore>(db_file.path, /*retention_days=*/0,
                                                        /*cleanup_interval_min=*/60);
@@ -159,14 +167,23 @@ struct RestGsHarness {
         // pre-insert the matching response row; live_sent toggles offline (0).
         auto command_dispatch_fn =
             [this](const std::string& plugin, const std::string& action,
-                   const std::vector<std::string>&, const std::string&,
+                   const std::vector<std::string>& ids, const std::string&,
                    const std::unordered_map<std::string, std::string>&, const std::string&,
                    const yuzu::server::authz::VisibleSet& exec_visible)
             -> std::pair<std::string, int> {
             last_live_plugin = plugin;
             last_live_action = action;
             last_live_exec_visible = exec_visible;
-            return {plugin + "-live", live_sent};
+            // Model what the production seam does to the Ids arm rather than
+            // ignoring the set the route just derived — otherwise this fake
+            // reports a successful dispatch whatever confinement decided, which
+            // is how the handoff went unasserted. nullopt admits everything, so
+            // every pre-existing case here is unaffected.
+            const bool admitted =
+                std::all_of(ids.begin(), ids.end(), [&](const std::string& id) {
+                    return yuzu::server::authz::in_scope(exec_visible, id);
+                });
+            return {plugin + "-live", admitted ? live_sent : 0};
         };
         // When wire_live_deps is off, leave the dispatch closure empty so the /live
         // handler hits its "substrate unavailable → 503" branch.
@@ -294,14 +311,17 @@ struct RestGsHarness {
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
                             /*stream_budget=*/nullptr,
-                            // #1788: a derivation that ANSWERS (nullopt default =
-                            // unfiltered). Left empty it would fail closed to
-                            // present-empty and reach nobody, which is the right
-                            // production posture but would silently disarm this
-                            // file's /live dispatch assertions.
-                            [this](const auth::Session&) -> yuzu::server::authz::VisibleSet {
-                                return exec_visible_override;
-                            });
+                            // #1788: by default a derivation that ANSWERS
+                            // (nullopt = unfiltered), so this file's existing
+                            // /live dispatch assertions keep their meaning;
+                            // `wire_exec_visible=false` models the genuinely
+                            // unwired deployment, which fails closed.
+                            wire_exec_visible
+                                ? RestApiV1::ExecVisibleFn{[this](const auth::Session&)
+                                                               -> yuzu::server::authz::VisibleSet {
+                                      return exec_visible_override;
+                                  }}
+                                : RestApiV1::ExecVisibleFn{});
     }
 
     // Seed a Guard rule (name resolves in the route's list_rules() lookup).
@@ -978,6 +998,57 @@ TEST_CASE("REST dex/devices/{id}: out-of-scope device → 403, no data leak, no 
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(h.audit_log.empty()); // the scope gate runs BEFORE any audit emission
+}
+
+// ── #1788 per-device dispatch confinement on /live ───────────────────────
+// The per-device `scoped_perm_fn` gate remains this route's PRIMARY
+// authorization; the derived VisibleSet is a SECOND, independent check at the
+// dispatch seam. These exist because the handoff was added with nothing reading
+// it — a review confirmed empirically that forcing the route to pass `nullopt`
+// left this whole suite green, so the layer could not be verified at all.
+
+TEST_CASE("REST dex/devices/{id}/live: the caller's confined VisibleSet reaches dispatch",
+          "[rest][dex][device][live][scope][1788]") {
+    RestGsHarness h;
+    h.exec_visible_override = std::unordered_set<std::string>{"WS-1"};
+    StoredResponse r;
+    r.instruction_id = "os_info-live";
+    r.agent_id = "WS-1";
+    r.status = 0;
+    r.output = "uptime_seconds|1\nuptime_display|1s";
+    h.resp_store->store(r);
+
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(h.last_live_exec_visible.has_value()); // CONFINED, not unfiltered
+    CHECK(h.last_live_exec_visible->count("WS-1") == 1);
+    CHECK(h.last_live_exec_visible->count("WS-9") == 0);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: a device the caller cannot see is not reached, even though "
+          "the per-device gate admitted it",
+          "[rest][dex][device][live][scope][1788]") {
+    // The scope gate is left ADMITTING on purpose, so the confinement layer is
+    // the only thing that can refuse this dispatch.
+    RestGsHarness h;
+    h.exec_visible_override = std::unordered_set<std::string>{"WS-OTHER"};
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 503); // "device offline" — deliberately indistinguishable
+    REQUIRE(h.last_live_exec_visible.has_value());
+    CHECK(h.last_live_exec_visible->count("WS-1") == 0);
+}
+
+TEST_CASE("REST dex/devices/{id}/live: an UNWIRED ExecVisibleFn fails CLOSED (present-empty)",
+          "[rest][dex][device][live][scope][fail-closed][1788]") {
+    RestGsHarness h(/*live_deps=*/true, /*wire_scoped_perm=*/true, /*wire_app_perf=*/true,
+                    /*with_exec_visible=*/false);
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    REQUIRE(h.last_live_exec_visible.has_value()); // PRESENT (deny-all), never nullopt
+    CHECK(h.last_live_exec_visible->empty());
 }
 
 TEST_CASE("REST dex/devices/{id}/live uptime: dispatches + returns parsed JSON, audited",

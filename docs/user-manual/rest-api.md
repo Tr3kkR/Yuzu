@@ -3701,6 +3701,40 @@ the server row cap or 8 MiB aggregate payload cap, the route returns **503**
 persisting a silently-incomplete set — a fleet-targeting set is never silently
 narrowed.
 
+#### `POST /api/v1/result-sets/from-tar-query`<br>`POST /api/v1/result-sets/from-instruction-result`<br>`POST /api/v1/result-sets/{id}/re-eval`
+
+The three **asynchronous** result-set producers. Unlike `from-inventory-query`,
+which answers from server-side inventory, these **dispatch a command to agents**
+and materialise the set once the responses land — so they are operator dispatch
+surfaces, not reads. `from-tar-query` runs SQL on TAR agents; `from-instruction-result`
+runs an `InstructionDefinition` and filters responders by `matcher`; `{id}/re-eval`
+re-runs a set's own source query and creates a **sibling** (same parent, new id).
+
+**Permission:** `Execution:Execute`, **confined per device**
+
+> **Per-device confinement (#1788).** These routes admit on a global
+> `Execution:Execute` grant and then reach the fleet by scope (`parent_id`) or
+> `__all__` broadcast, so the caller's derived visible set is their only
+> per-device authorization. A service-scoped token reaches only agents tagged
+> with its own service; devices outside the caller's reach are dropped from the
+> send set rather than refused individually. A global administrator or a
+> JIT-elevated session keeps full-fleet reach — that is their actual authority.
+
+**Targeting:** omit `parent_id` to dispatch to `__all__` deliberately. A
+**supplied** `parent_id` that is empty, non-string, or `null` is refused with
+`400 RESULT_SET_BAD_PARENT` rather than silently widening to the fleet.
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent; or missing `sql` / `instruction_id` |
+| 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
+| 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
+| 500 | `RESULT_SET_GATE_UNCONFIGURED` — the server's dispatch-visibility gate is not wired. Fails **closed**: nothing is dispatched, and the refusal is audited. An operator seeing this has a server misconfiguration, not an authorization problem |
+| 503 | `RESULT_SET_NO_AGENTS` — no agents were reached in the target scope. Deliberately indistinguishable from "every resolved target was outside your reach": a distinct status would disclose devices the caller may not see |
+| 503 | `RESULT_SET_DISPATCH_UNAVAILABLE` / `RESULT_SET_DISPATCH_FAILED` — dispatch not wired, or the dispatch itself raised |
+
 #### `GET /api/v1/inventory/{plugin}/{agent_id}`
 
 Get inventory data for a specific plugin and agent.

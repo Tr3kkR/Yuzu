@@ -1183,7 +1183,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // UNWIRED derivation fails CLOSED (present-empty set → reaches nobody).
         const yuzu::server::authz::VisibleSet exec_visible =
             exec_visible_fn ? exec_visible_fn(req)
-                            : yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{}};
+                            : yuzu::server::authz::deny_all();
 
         // --- Pre-validate approval gates on all workflow steps ---------------
         // If any instruction in the workflow requires approval, reject the
@@ -1618,7 +1618,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // callback is unwired — present-empty set → reaches nobody).
             const yuzu::server::authz::VisibleSet exec_visible =
                 exec_visible_fn ? exec_visible_fn(req)
-                                : yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{}};
+                                : yuzu::server::authz::deny_all();
             std::tie(command_id, sent) = cmd_dispatch(def->plugin, def->action, agent_ids,
                                                       dispatch_scope, params, execution_id,
                                                       exec_visible);

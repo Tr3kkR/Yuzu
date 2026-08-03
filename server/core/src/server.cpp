@@ -14617,7 +14617,7 @@ private:
         auto sess = require_auth(req, res);
         const yuzu::server::authz::VisibleSet exec_visible =
             sess ? derive_exec_visible(*sess)
-                 : yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{}};
+                 : yuzu::server::authz::deny_all();
         const yuzu::server::ConfinedDispatchSink sink{
             [&](const std::string& aid) { return registry_.send_to(aid, cmd); },
             [&] { return registry_.send_to_all(cmd); },

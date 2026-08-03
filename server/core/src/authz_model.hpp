@@ -327,6 +327,21 @@ inline constexpr std::array<CapabilitySeed, 5> kSeedCatalogue{{
 /// for every dispatch arm.
 using VisibleSet = std::optional<std::unordered_set<std::string>>;
 
+/// The deny-all set: PRESENT but empty, admitting nothing.
+///
+/// Spell the fail-closed fallback with this, never by hand. `VisibleSet{}`
+/// looks like it means "empty set" and in fact default-constructs the optional
+/// to `nullopt` — UNFILTERED, the exact inverse — and that one-character class
+/// of slip is not hypothetical: the REST bundle route shipped it, so its
+/// defense-in-depth confinement silently became permissive on any deployment
+/// that had not wired the derivation, while a green test asserted the
+/// behaviour was intended. Thirteen hand-spelled copies of the correct literal
+/// existed across the dispatch surfaces when that one was found wrong; a named
+/// constructor makes the wrong spelling something you have to go out of your
+/// way to write, which is the same argument `RestApiV1::CommandDispatchFn`
+/// makes for requiring its `VisibleSet` parameter rather than defaulting it.
+[[nodiscard]] inline VisibleSet deny_all() { return VisibleSet{std::unordered_set<std::string>{}}; }
+
 /// Whether `agent_id` is admitted by `visible` — the ONE predicate every
 /// `/api/command` dispatch arm applies before `send_to` (#1788: explicit
 /// `agent_ids`, broadcast, Group, Scope all call this same function so a
