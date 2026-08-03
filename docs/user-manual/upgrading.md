@@ -36,9 +36,9 @@ Audit rows written before the upgrade are now redacted when read, so the value s
 through that path too. The rows themselves are deliberately left intact: an audit row is compliance
 evidence, and rewriting history to conceal a mistake is a worse posture than declining to disclose it.
 **So the plaintext remains at rest** in those rows, and a direct database read or a restored backup
-still shows it. Do not assume a fixed expiry: `audit_retention_days` defaults to 365, but the retention
-guard deliberately declines a pass after a clock anomaly, a long outage, or a *reduction* of the
-retention window, so rows can outlive the nominal figure. The secret also remains stored in plaintext
+still shows it. Do not assume a fixed expiry: `audit_retention_days` defaults to 365, but each prune
+pass is capped, and the retention guard deliberately declines a pass after a clock anomaly or a long
+outage, so rows can outlive the nominal figure. The secret also remains stored in plaintext
 in runtime-config; this fix closes disclosure paths and does not encrypt it at rest (see
 `security-hardening.md`, "Current encryption posture").
 
@@ -55,6 +55,11 @@ unlike `cmdline` — but it is *not* better if the value is written into a Compo
 `docker inspect` exposes it to anyone in the `docker` group. Prefer a secrets manager that injects the
 environment variable at runtime.
 
+**Before you start, make sure you can sign in as a local administrator.** Revoking at the IdP stops new
+SSO logins immediately, and the restart in the verification step below ends every active session
+(sessions are held in memory, not persisted). Your existing session survives the revocation itself, but
+not the restart — so on an SSO-only install, confirm a local admin route in before you revoke anything.
+
 **Remediate: rotate the client secret at your IdP, and revoke the old one.** The upgrade closes the
 disclosure paths but **does not change the stored value** — anything that already read it still holds a
 live credential. Most IdPs let you *add* a second client secret without removing the first; adding one
@@ -67,20 +72,17 @@ restart, because the provider is rebuilt at startup from the command-line or env
 stored runtime-config overrides are applied. So rotate through **Settings -> OIDC** *and* update
 `--oidc-client-secret` (or `YUZU_OIDC_CLIENT_SECRET`).
 
-Skipping the second step breaks the next restart, and how it breaks turns on **where the secret comes
-from at startup** rather than on how you configured OIDC overall. If the secret was never on the
-command line or in the environment, the restart has no secret to use: depending on whether
-`--oidc-issuer` and `--oidc-client-id` are also absent, it either builds **no provider at all** or
-builds one with an **empty** secret. Either way SSO fails — it does not fall back to the stored value.
-If the secret *was* on the command line or in the environment and you rotated only through Settings,
-the restart rebuilds from that old value, putting the **old, disclosed secret back in force**. In every
-case `GET /api/config` still reports the key as set.
+**Why the second step matters.** The OIDC provider is built once at startup, from the command-line and
+environment values, *before* stored runtime-config overrides are applied — and nothing rebuilds it
+afterwards. A secret that lives only in the store therefore never reaches the restarted provider. What
+that produces depends on the rest of your configuration and on your IdP's client-authentication policy:
+the restart may reinstate the old, disclosed secret, or come up with no usable secret at all. Yuzu does
+not tell you which — `GET /api/config` reports the stored value regardless, and reports the key as set
+in both cases. Do not predict the outcome; verify it after restarting.
 
 **Expect a brief SSO outage.** Between revoking at the IdP and completing both Yuzu-side steps, new
 logins fail — Yuzu still presents the old secret to an IdP that no longer accepts it. Do the Yuzu-side
-steps immediately after the IdP change to keep the window short. Note the restart in the verification
-below drops every active session (sessions are in-memory), so make sure you can still reach a local
-administrator account before you start.
+steps immediately after the IdP change to keep the window short.
 
 **Verify before you consider it done.** Perform an SSO login, then **restart the server and log in
 again** — only the post-restart login proves the durable half took effect. Do not treat
@@ -90,8 +92,8 @@ failure cases above. **A successful login proves rotation only if the old secret
 is still valid at the IdP, logins succeed whichever secret Yuzu is presenting, and this step proves
 nothing.
 
-See [`security-hardening.md`](security-hardening.md) ("Upgrading: if `oidc_client_secret` was ever set
-on this install, rotate it") for the same procedure in its hardening context.
+This section is the canonical procedure; [`security-hardening.md`](security-hardening.md) ("OIDC
+Hardening") points here rather than restating it, and carries the surrounding hardening guidance.
 
 ## Behaviour change: `mcp.bridge.*` audit rows can now carry `result=failure` (#2487 / #2506)
 

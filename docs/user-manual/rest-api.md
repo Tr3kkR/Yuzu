@@ -3185,17 +3185,25 @@ For a secret-valued key the response **omits `value`**, for the same reason `GET
 { "key": "oidc_client_secret", "applied": true }
 ```
 
+**Removing a stored secret.** Send an empty value — `{"value": ""}` — and `GET /api/config` then
+reports `"is_set": false` for that key. Two things to know before relying on this. It clears only the
+stored **override**: an empty stored value is skipped at startup, so if `--oidc-client-secret` or
+`YUZU_OIDC_CLIENT_SECRET` is still set, that value takes effect again on the next restart. And like
+every write to this route, it does **not** reach the running OIDC provider — the process keeps using
+whatever secret it started with until it restarts. Clearing the Settings → OIDC form field does *not*
+remove the secret either: a blank field there means "leave the stored value unchanged".
+
 > **Two different error sources, two different shapes.** The shared authorization gate in front of
 > this route **does** emit the A4 envelope: a `401`, a `403` permission denial, or a `503`
 > authorization-store failure carries `correlation_id` (echoed on `X-Correlation-Id`) like any other
 > gated route. The bodies **the handler itself** emits do not — `/api/config` is a legacy
 > non-`/api/v1` route, and its own errors are either a bare `error` string or a nested
 > `{"error":{"code","message"},"meta":{"api_version"}}` object with no `correlation_id` and no
-> `retry_after_ms`. Besides the two shown below, the handler emits nested bodies for `400` "missing
+> `retry_after_ms`. Besides those shown below, the handler emits nested bodies for `400` "missing
 > 'value' in request body", `400` "invalid JSON body", and a `503` when the runtime-config store is
 > unavailable (`GET` says "runtime configuration store unavailable", `PUT` says "runtime config store
-> unavailable"). So: branch on the status first, and do not assume a `correlation_id` on the
-> handler's own 4xx.
+> unavailable"). Note `503` is emitted by **both** sources, so status alone does not tell you which
+> shape you have: test for `error.correlation_id` rather than assuming it, on every status.
 
 **Error (400) - key not configurable.** This one is a bare `error` string with no envelope:
 

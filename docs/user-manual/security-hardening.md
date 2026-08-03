@@ -446,22 +446,19 @@ When using OIDC/Entra ID:
 - Rotate the client secret regularly
 
 > **Upgrading: if `oidc_client_secret` was ever set on this install, rotate it.**
-> Earlier versions emitted the value in the clear to three places - the server log
-> (written by the startup override pass on every boot), `GET /api/config` (gated only
-> on `Infrastructure:Read`), and the `config.update` audit detail (readable by every
-> role seeded `AuditLog:Read`, which includes the seeded `Operator` role). Those paths
-> are now closed, and audit rows written before the fix are redacted when read. **The
-> stored value itself is unchanged**, so anyone or anything that already read it still
-> holds a working credential. Treat a secret set before this upgrade as disclosed and
-> rotate it at the IdP.
+> Releases up to and including v0.13.0 emitted the value in the clear to three places - the
+> server log (written by the startup override pass on every boot), `GET /api/config` (gated
+> only on `Infrastructure:Read`), and the `config.update` audit detail (readable by every
+> role seeded `AuditLog:Read`, which includes the seeded `Operator` role). Those paths are
+> now closed, and audit rows written before the fix are redacted when read. **The stored
+> value itself is unchanged**, so anyone or anything that already read it still holds a
+> working credential.
 >
-> **Rotating durably takes TWO steps.** `PUT /api/config/oidc_client_secret` persists the
-> new value but never reaches the running OIDC provider. Settings -> OIDC does reach it,
-> but only in the running process: the provider is rebuilt at startup from the
-> command-line or environment value, before the stored runtime-config overrides are
-> applied, and nothing rebuilds it afterwards. So rotate through **Settings -> OIDC** to
-> change the running server, **and** update `--oidc-client-secret` (or
-> `YUZU_OIDC_CLIENT_SECRET`) so the next restart starts from the new value. If you do
-> only the first, the next restart puts the OLD - disclosed - secret back in force; and
-> if OIDC was only ever configured through Settings, the next restart leaves no provider
-> at all and SSO stops working, while `GET /api/config` still reports the key as set.
+> **The rotation procedure lives in one place:**
+> [`upgrading.md`](upgrading.md) → "⚠️ Security: rotate `oidc_client_secret` if it was ever
+> set on this install". Follow it there rather than from a summary here. It is not a
+> one-step rotation: the old secret must be **revoked** at the IdP (adding a second secret
+> is not remediation), the change must be applied through **both** Settings → OIDC and
+> `--oidc-client-secret`/`YUZU_OIDC_CLIENT_SECRET`, and the result has to be verified after
+> a restart because neither `GET /api/config` nor a `PUT` returning `"applied": true`
+> reflects what the running provider is using.
