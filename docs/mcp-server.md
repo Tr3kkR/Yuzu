@@ -89,7 +89,15 @@ JSON-RPC error responses from the denial paths (read-only mode, tier policy, app
 > `mcp`. The condition therefore refuses the two surfaces that do declare, and
 > admits everything else. It tightens to a positive check when the MCP mint
 > declares its own surface, which must not happen until outstanding blank-origin
-> tickets have drained or it strands legitimate approved ones. It then
+> tickets have drained or it strands legitimate approved ones.
+>
+> There is no check on **who** presents the ticket. The list (a)–(e) is complete:
+> `submitted_by` is not compared against the recalling session, so a valid
+> `approval_id` is redeemable by any principal that also passes the tier gate and
+> the tool's own RBAC — the approval is bound to the request, not to the
+> requester. `GET /api/approvals` returns ids in full to any `Approval:Read`
+> holder, so treat an `approval_id` as a secret in transit and at rest. Tracked as
+> #2442 (binding the submitter) and #1803 (the read exposure). It then
 > **atomically consumes it** (one-time; a replay of a consumed ticket, or a
 > concurrent second recall, is rejected — the mutating op runs at most once) and
 > lets the call through to the handler. A recall against a still-**pending**

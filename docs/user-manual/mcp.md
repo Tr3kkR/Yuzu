@@ -779,6 +779,14 @@ proposes.
    carrying no recorded surface is still accepted, which today includes every
    ticket MCP itself mints as well as any approval predating the field.
 
+   The ticket is bound to the request, not to the requester: `submitted_by` is
+   not compared against the recalling session, so anyone holding a valid
+   `approval_id` who also passes the tier gate and the tool's own RBAC can redeem
+   it. `GET /api/approvals` returns ids in full to any `Approval:Read` holder, so
+   treat an `approval_id` as a secret — do not log it, echo it, or pass it
+   through a channel you would not send a token through. Tracked as #2442 and
+   #1803.
+
 ### What requires approval
 
 The following table shows which operations require approval, by tier:

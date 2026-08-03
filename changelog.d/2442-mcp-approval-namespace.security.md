@@ -19,6 +19,13 @@
   see the last paragraph. The refusal is deliberately indistinguishable from an ordinary
   spent-ticket response, so the recall cannot be used to probe which definition ids exist.
 
+  **This binds the surface, not the submitter.** The recall still does not compare who obtained the
+  approval against who presents it, so a valid `approval_id` remains redeemable by any principal
+  that also passes the tier gate and the tool's own RBAC — and `GET /api/approvals` returns approval
+  ids in full to any `Approval:Read` holder, which the seeded Viewer role has. Treat an
+  `approval_id` as a secret. Both halves are tracked: #2442 stays open for the submitter binding,
+  #1803 for the read exposure.
+
   **What changes for operators:** creating or importing a definition whose id starts `mcp.` is
   refused with a 400 on every authoring route that accepts an explicit id (`POST /api/instructions`,
   `/api/instructions/yaml`, `/api/instructions/import`), and such a definition is skipped at boot

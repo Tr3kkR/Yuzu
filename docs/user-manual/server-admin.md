@@ -221,6 +221,15 @@ cannot be used to probe which definition ids exist. Reserving the prefix at auth
 below, is forward-only hygiene on top of that — it is not the thing that stops the forgery, and
 nothing you have to rename.
 
+**What the recall still does not bind: the submitter.** It compares the definition id, the scope
+expression and now the minting surface — not who obtained the approval. Anyone holding a valid
+`approval_id`, plus the RBAC the tool itself requires, can redeem it, whoever it was granted to.
+That matters because the id is not hard to come by: `GET /api/approvals` returns approval ids in
+full to any holder of `Approval:Read`, which the seeded **Viewer** role has, and the audit row for
+a redemption attempt carries the id in full as well. So the surface binding closes the cross-surface
+path described above; it does not make an approval usable only by the operator who asked for it.
+Tracked as #2442 (the submitter binding) and #1803 (the read exposure).
+
 **One exemption, and what bounds it.** A ticket with *no* recorded surface reads as
 *surface unknown* rather than *surface wrong*, and is still redeemable. That covers every
 approval row created before this upgrade — the column is added with an empty default and is
@@ -259,9 +268,9 @@ sqlite3 /var/lib/yuzu/instructions.db \
 If that returns empty, no declared-origin ticket has been minted yet, so no blank-origin row
 post-dates the upgrade and any cutoff at or after the upgrade works.
 
-**Step 2 — size the population.** Do not assume it is small: the REST instruction gate never
-redeems its own approvals, so on a long-lived install these rows accumulate for the life of the
-deployment.
+**Step 2 — size the population, and capture it.** Do not assume it is small: the REST instruction
+gate never redeems its own approvals, so on a long-lived install these rows accumulate for the life
+of the deployment.
 
 ```bash
 sqlite3 /var/lib/yuzu/instructions.db \
@@ -270,6 +279,26 @@ sqlite3 /var/lib/yuzu/instructions.db \
       AND definition_id GLOB 'mcp.*'
       AND submitted_at < <cutoff from step 1>;"
 ```
+
+**Capturing the rows themselves is mandatory, not optional.** Step 5 writes no audit row (see the
+note below it), so this output is the only record of which capabilities were revoked and whose they
+were. Take it *immediately* before step 5, with the identical `WHERE` clause, and file it with the
+change record:
+
+```bash
+sqlite3 -header -csv /var/lib/yuzu/instructions.db \
+  "SELECT id, definition_id, submitted_by, submitted_at, reviewed_by, reviewed_at
+     FROM approvals
+    WHERE status = 'approved' AND consumed_at = 0 AND origin = ''
+      AND definition_id GLOB 'mcp.*'
+      AND submitted_at < <cutoff from step 1>;" \
+  > approvals-revoked-$(date +%Y%m%dT%H%M%S).csv
+```
+
+`submitted_by` and `reviewed_by` are the two fields that make the record answerable afterwards:
+they name who loses a capability and which administrator originally granted it. Treat the file as
+sensitive — the `id` column is the approval id, which is a bearer capability for any ticket the
+statement does not in fact retire.
 
 **Step 3 — stop the server**, and confirm it is stopped before continuing.
 
@@ -319,10 +348,18 @@ and re-running it periodically livelocks MCP approvals entirely: mint, human app
 expires it, recall reports it expired, worker mints again.
 
 Even bounded, this revokes capabilities an administrator granted — anyone holding one of those
-`approval_id`s must request approval again — and the transition writes **no audit row**, so it is
-indistinguishable in the audit trail from the automatic 7-day expiry. Record that you ran it
-through your own change-control. Do it only if you have reason to think an `mcp.`-prefixed
-definition was raised through the instruction gate before the upgrade.
+`approval_id`s must request approval again — and because it is a direct database write rather than
+a server operation, the transition writes **no audit row**. In the audit trail the result is
+indistinguishable from the automatic 7-day expiry: same terminal status, no principal, no reason.
+That is why the step 2 capture is mandatory. Attach the CSV to your change record, and record the
+operator and the reason there, because nothing in the product will do it for you. Do it only if you
+have reason to think an `mcp.`-prefixed definition was raised through the instruction gate before
+the upgrade.
+
+Bulk-revoking granted approvals by hand is a gap, not a design: there is no audited server-side
+route for it. Doing this properly means an `Approval:Revoke` operation that emits its own audit row
+with the acting principal and the selection it applied — which would also let this whole SQL section
+be deleted. Tracked as #2761; until it exists, the change record is the evidence.
 
 **What changes.** Creating a definition whose id starts `mcp.` is refused with a 400 on every
 authoring route that accepts an explicit id — `POST /api/instructions`, `POST
