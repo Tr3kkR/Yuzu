@@ -6285,8 +6285,31 @@ McpServer::HandlerFn McpServer::build_handler(
                         // The sink is a WAKE CHANNEL, not a frame queue: a streamed
                         // record publishes ring-only, so the pump asks the bridge
                         // what to write and the projector pokes this to say "now".
-                        auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
-                        auto key = bridge->bind_post_sink(bridge_sid, id, sink);
+                        // CONTAINED (safe-1): arm() has ALREADY moved the record to
+                        // kStreaming, and both calls below allocate - make_shared
+                        // obviously, bind_post_sink through make_key. A throw from
+                        // either landed in the OUTER catch, whose
+                        // park_after_dispatch_failure CASes from kArming and so
+                        // returns false for a kStreaming record: the record was
+                        // stranded kStreaming with no sink and no provider until the
+                        // 600 s streaming_park_after backstop, holding a global
+                        // record slot and one of the session's four streamed charges,
+                        // with NO audit row for a 500 on a dispatched, still-running
+                        // MUTATING fleet command. The comment below already named
+                        // that failure as the reason the cid mint moved inside its
+                        // try; these two siblings were left outside it.
+                        //
+                        // A throw here is the same EVENT as bind returning nullopt -
+                        // no sink was installed - so it takes the identical degrade
+                        // path rather than inventing a second one.
+                        std::shared_ptr<mcp::sse_bus::SseSinkState> sink;
+                        std::optional<std::string> key;
+                        try {
+                            sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+                            key = bridge->bind_post_sink(bridge_sid, id, sink);
+                        } catch (...) { // NOLINT(bugprone-empty-catch) - degrade below
+                            key.reset();
+                        }
                         if (!key.has_value()) {
                             // Nothing was installed, so the record must not stay
                             // kStreaming waiting for a closer that will never come.
@@ -6304,7 +6327,12 @@ McpServer::HandlerFn McpServer::build_handler(
                             // catch owns BOTH the park and the answer. Two arms are
                             // needed because the key exists only inside this branch:
                             // before bind there is no key to close by.
-                            const std::string record_key = *key;
+                            // A REFERENCE, not a copy (safe-1): a copy allocates, and
+                            // it allocated here - outside the try below, with the
+                            // record already kStreaming. `key` outlives every use, so
+                            // binding by reference removes the hazard outright rather
+                            // than containing it.
+                            const std::string& record_key = *key;
                             // DECLARED outside the try so the catch can stamp the
                             // same id into its audit row and its A4 body; MINTED
                             // inside it, because minting allocates and by this point
@@ -6312,9 +6340,11 @@ McpServer::HandlerFn McpServer::build_handler(
                             // throw from the mint out here would miss this branch's
                             // catch and land in the outer one, whose
                             // park_after_dispatch_failure CASes from kArming and so
-                            // returns false for a kStreaming record: no park, no
-                            // lease release, and NO audit row for a 500 on a
-                            // dispatched, still-running MUTATING fleet command. The
+                            // returns false for a kStreaming record: no park, and NO
+                            // audit row for a 500 on a dispatched, still-running
+                            // MUTATING fleet command. (The lease IS released on that
+                            // path - stream_lease.reset() below, and ~optional
+                            // regardless - so this used to overclaim, safe-2.) The
                             // catch reads an empty cid only in the single case where
                             // no id was ever stamped anywhere.
                             std::string cid;

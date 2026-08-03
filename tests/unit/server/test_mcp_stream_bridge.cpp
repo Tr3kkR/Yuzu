@@ -1008,7 +1008,7 @@ TEST_CASE("bridge pressure - one sweep is bounded by the population it started w
     constexpr int kMainSessions = 8;   // 32 records parked before the sweep
     constexpr int kProdSessions = 40;  // up to 160 arrivals during it
     bool observed = false;
-    for (int attempt = 0; attempt < 5 && !observed; ++attempt) {
+    for (int attempt = 0; attempt < 12 && !observed; ++attempt) {
         // The per-principal SESSION cap (8, Decision 15(d)) would otherwise bound the
         // pool to 32 records - exactly the pre-sweep population, leaving the producer
         // nothing to add. Raised here only to reach a population big enough for the
@@ -1041,16 +1041,13 @@ TEST_CASE("bridge pressure - one sweep is bounded by the population it started w
         }
 
         std::atomic<bool> stop{false};
-        std::atomic<int> parked_during{0};
         auto producer = std::async(std::launch::async, [&] {
             for (int i = kMainSessions; i < kMainSessions + kProdSessions; ++i) {
                 for (int slot = 0; slot < kPerSession; ++slot) {
                     if (stop.load(std::memory_order_relaxed)) {
                         return;
                     }
-                    if (park(pool[static_cast<std::size_t>(i)], slot)) {
-                        parked_during.fetch_add(1, std::memory_order_relaxed);
-                    }
+                    (void)park(pool[static_cast<std::size_t>(i)], slot);
                 }
             }
         });
@@ -1059,13 +1056,30 @@ TEST_CASE("bridge pressure - one sweep is bounded by the population it started w
         stop.store(true, std::memory_order_relaxed);
         producer.get();
 
-        if (parked_during.load() > 0) {
-            // It stopped on its budget with the cap still exceeded, and said so.
-            CHECK(fx.reg.counter("yuzu_mcp_bridge_pressure_budget_exhausted_total").value() > 0.0);
+        // THE COUNTER IS THE CONDITION, not a proxy for it. An earlier version
+        // gated on a producer-side arrival count and then hard-CHECKed the
+        // counter - but that count also included parks completing AFTER sweep()
+        // returned, because `stop` is only stored post-sweep and the producer
+        // re-reads it per slot. So a run where nothing arrived DURING the sweep
+        // still entered the
+        // branch, found the budget legitimately unexhausted, and failed. It went red
+        // 2 of 3 times at 1.5x CPU oversubscription - which is the ordinary state of
+        // both self-hosted pools, four runner agents to a box - while passing 8/8
+        // unloaded. The in-file claim that it "cannot false-RED into a wrong
+        // conclusion" was simply wrong, and measuring only on an idle machine is
+        // what hid it.
+        //
+        // Reading the counter directly is sound in both directions: it is written
+        // ONLY in the budget-exhausted branch, so it can never move without the fix,
+        // and a run where the producer did not interleave just retries instead of
+        // asserting something it did not establish.
+        if (fx.reg.counter("yuzu_mcp_bridge_pressure_budget_exhausted_total").value() > 0.0) {
             observed = true;
         }
     }
-    CHECK(observed);  // producer never won a race in 5 attempts - scenario not exercised
+    // Honest failure, not a silent pass: if the producer never interleaved in any
+    // attempt the scenario was never exercised, and that is a result worth seeing.
+    CHECK(observed);
 }
 
 TEST_CASE("bridge pressure - two concurrent sweeps reap a victim exactly once (#2409 qa-S5, TSan)",
@@ -3325,10 +3339,38 @@ TEST_CASE("CH-16: progress reaches the wire on publication, not on the tick",
         "exec-ch16");
     PostWire wire;
 
+    // CLEAR THE RESIDUAL BIND POKE FIRST. bind_post_sink pokes the sink as part of
+    // its handshake, so the pump's predicate is already satisfied before it ever
+    // parks: the first pass returns immediately having drained nothing, and asserting
+    // on that single pass reads a heartbeat and no progress frame. This failed 3 of 3
+    // at 1.5x CPU oversubscription for exactly that reason while passing 8/8
+    // unloaded - and oversubscription is the ordinary state of both self-hosted
+    // pools, four runner agents to a box. Clearing under the sink mutex, the same
+    // lock poke_post_sink and the wait predicate both take, makes the publication the
+    // only thing that can wake this pump.
+    {
+        std::lock_guard<std::mutex> lk(sink->mu);
+        sink->poked.store(false, std::memory_order_release);
+    }
+
     std::atomic<bool> about_to_pump{false};
     auto pumping = std::async(std::launch::async, [&] {
         about_to_pump.store(true, std::memory_order_release);
-        return pump.pump_once(wire.writer());  // parks in wait_for
+        // LOOP, bounded by the wire content. `about_to_pump` proves only that this
+        // thread entered the lambda, never that the pump is parked in wait_for, and
+        // the wake is forwarded by the PROJECTOR thread - so on a contended box a
+        // pass can still return before the frame is latched. A pass with nothing to
+        // do blocks the full 30 s tick, so this cannot spin, and the elapsed-time
+        // assertion below is still what proves a publication rather than a timeout
+        // delivered the frame.
+        for (;;) {
+            if (!pump.pump_once(wire.writer())) {
+                return false;  // stream ended without ever carrying progress
+            }
+            if (wire.contains("notifications/progress")) {
+                return true;
+            }
+        }
     });
     while (!about_to_pump.load(std::memory_order_acquire)) {
         std::this_thread::yield();
@@ -3336,7 +3378,7 @@ TEST_CASE("CH-16: progress reaches the wire on publication, not on the tick",
 
     const auto t0 = std::chrono::steady_clock::now();
     fx.bus.publish("exec-ch16", "execution-progress", prog(1, 3));
-    pumping.wait();  // returns only when the pump actually wakes
+    CHECK(pumping.get());  // returns only once the pump actually carried the frame
     const auto waited = std::chrono::steady_clock::now() - t0;
 
     CHECK(wire.contains("notifications/progress"));
