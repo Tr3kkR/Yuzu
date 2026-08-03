@@ -277,21 +277,60 @@ A definition that appears in neither query keeps running, and can still be edite
 it from the dashboard's YAML editor (that path validates the id on every save, not only on
 create). Renaming it is still the durable fix.
 
-**To rename, in this order.** Deleting a definition does not update the schedules that point at
-it — there is no referential guard — so a rename done in the wrong order swaps one silent
-failure for another: the schedule then fails with `definition_unknown`, and still shows enabled
-with a next run it never makes.
+Re-run both queries immediately before you upgrade. They are two separate reads of a live
+database, so a schedule added or an `approval_mode` edited in between is missed.
+
+**To rename.** Read this whole section before starting: a rename is delete-and-recreate at
+every level, and doing it in the wrong order strands state silently.
+
+Two constraints shape the procedure. Deleting a definition does not touch the schedules that
+reference it — there is no referential guard — so a schedule left pointing at a deleted id
+fails with `definition_unknown`, advances, and still shows enabled with a next run it never
+makes. And a schedule cannot be re-pointed: the API exposes create, delete and enable/disable
+only, with no update, so moving a schedule to the new definition means deleting and recreating
+it.
 
 1. Create the replacement under an id outside the `mcp.` namespace. This is an ordinary create,
-   so the reservation applies to the new id too.
-2. Re-point every schedule found by query 2 at the new definition id, and confirm each one's
-   next run actually dispatches.
-3. Re-point anything else that references the old id by name — saved searches, automation
-   calling `POST /api/instructions/{id}/execute`, product packs you re-install.
-4. Only then delete the original.
+   so the reservation applies to the new id too; a collision with an existing id fails with 409.
+2. List **every** schedule on the old definition — not just the ones the triage flagged, since
+   an ungated schedule on an `auto` definition is stranded by the delete just the same:
 
-Execution history keeps referencing the old id after the delete; that is expected and only
-affects how past runs are labelled.
+   ```bash
+   sqlite3 /var/lib/yuzu/instructions.db \
+     "SELECT id, name, created_by, enabled FROM schedules WHERE definition_id = '<old-id>';"
+   ```
+
+3. Recreate each of those against the new definition id, then delete the old schedule. Note
+   what does not survive: the schedule's id, its `execution_count` and `last_executed_at`, and
+   any approval ticket already raised for it (a pending or granted approval is matched on the
+   schedule id and creator, so it is discarded and the next occurrence asks again). Schedule
+   delete is owner-scoped — a schedule created by another operator has to be recreated by them,
+   or by an administrator acting as them.
+4. Re-point anything else that references the old id by name — automation calling
+   `POST /api/instructions/{id}/execute`, saved views, product packs you re-install.
+5. Only then delete the original definition.
+6. Verify no schedule was left behind:
+
+   ```bash
+   sqlite3 /var/lib/yuzu/instructions.db \
+     "SELECT s.id, s.definition_id FROM schedules s
+        LEFT JOIN instruction_definitions d ON d.id = s.definition_id
+       WHERE d.id IS NULL;"
+   ```
+
+   This is the check the triage queries cannot do for you: they join to a definition that
+   exists, so once the old one is deleted an orphaned schedule appears in neither. Any row here
+   is a schedule that will never fire again. For an enabled schedule, confirm its next run
+   actually dispatches; a schedule that was disabled when you started is the same trap deferred,
+   so re-point it too rather than leaving it for whoever re-enables it.
+
+Execution history keeps referencing the old id after the delete. Past runs stay readable, but
+history is split across the two ids — filtering executions by the new definition returns
+nothing from before the rename, and re-running a historical execution re-uses the recorded id.
+
+These commands assume the `sqlite3` CLI on the server host. It is not present in the slim
+container images; run them from a host with the tool and access to the database file, or copy
+the file aside first.
 
 ### vNEXT — behind a reverse proxy, declare your external origin or CSRF-gated dashboard actions keep failing (#2537)
 

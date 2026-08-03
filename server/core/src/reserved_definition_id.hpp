@@ -21,8 +21,9 @@
 //   * WorkflowRoutes' instruction-execute handler — a caller-side PRE-CHECK, so
 //     a doomed execute answers 400 naming the id instead of the chokepoint's
 //     refusal surfacing as a 500. Note its condition is not the chokepoint's:
-//     submit() gates on the declared origin, this site checks the id
-//     unconditionally, and the two agree only because that route always
+//     submit() gates on the declared origin, this site checks the id without
+//     regard to origin (it sits on the approval-gated branch, so an ungated
+//     run never reaches it), and the two agree only because that route always
 //     declares kInstruction.
 //
 // A fifth site would be a fifth chance to diverge: call `is_reserved_definition_id`

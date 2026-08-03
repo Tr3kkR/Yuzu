@@ -16,7 +16,8 @@
 
   A definition that already exists under the prefix and is **approval-gated also stops running**,
   on the REST execute route, the dashboard and the scheduler: the mint declares an origin, the
-  reservation refuses it, and the run fails closed with a 400 naming the prefix. A run is
+  reservation refuses it, and the run fails closed — with a 400 naming the prefix on the two
+  request paths, and a dropped occurrence on the scheduler. A run is
   approval-gated if the definition's `approval_mode` is not `auto` OR the schedule carries its own
   `requires_approval`, so an `auto` definition on a gated schedule is affected too. **The scheduled
   case fails silently and permanently** — occurrences are dropped rather than retried while the

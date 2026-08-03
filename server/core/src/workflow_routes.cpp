@@ -1582,8 +1582,15 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                               {{"code", 400},
                                {"message", std::string(kReservedDefinitionIdError) +
                                                "; rename this definition"},
-                               {"remediation", "create a replacement under an id outside the "
-                                               "mcp. namespace and delete this one"}}},
+                               // Deliberately does NOT say "and delete this one":
+                               // deleting a definition does not re-point the
+                               // schedules that reference it, and this field is
+                               // what the operator reads first.
+                               {"remediation",
+                                "rename this definition - create a replacement under an id "
+                                "outside the mcp. namespace, move any schedules to it, and "
+                                "only then delete the original (see the upgrade note in "
+                                "docs/user-manual/server-admin.md for the order)"}}},
                              {"meta", {{"api_version", "v1"}}}})
                             .dump(),
                         "application/json");
