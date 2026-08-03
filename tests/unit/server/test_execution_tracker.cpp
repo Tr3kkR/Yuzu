@@ -540,3 +540,239 @@ TEST_CASE("ExecutionTracker: mark_cancelled sets completed_at", "[execution_trac
     REQUIRE(after.has_value());
     CHECK(after->completed_at > 0);
 }
+
+// ── CC-07 typed plugin result status (PR1.1 finding F11) ───────────────────
+//
+// update_agent_status binds plugin_result_status into agent_exec_status and
+// get_agent_statuses reads it back, but no test set it to anything but the
+// 0/UNDECLARED default — so binding a literal 0, or dropping the column from
+// the ON CONFLICT update list, would have left the suite green while the
+// executions drawer silently lost every plugin-reported status. Values mirror
+// YuzuResultStatus in sdk/include/yuzu/plugin.h (4 = CONSTRAINED, 2 =
+// UNAVAILABLE), chosen distinct from exit_code so a crossed bind is caught.
+
+TEST_CASE("ExecutionTracker: plugin_result_status round-trips through update/get (CC-07)",
+          "[execution_tracker][cc07]") {
+    TestDb tdb;
+    ExecutionTracker tracker(tdb.db);
+    tracker.create_tables();
+
+    auto id_result = tracker.create_execution(make_execution());
+    REQUIRE(id_result.has_value());
+
+    AgentExecStatus s;
+    s.agent_id = "agent-1";
+    s.status = "success";
+    s.exit_code = 0;
+    s.plugin_result_status = 4; // CONSTRAINED
+    tracker.update_agent_status(*id_result, s);
+
+    // An agent whose plugin reported nothing stays honestly undeclared.
+    AgentExecStatus silent;
+    silent.agent_id = "agent-2";
+    silent.status = "success";
+    tracker.update_agent_status(*id_result, silent);
+
+    auto statuses = tracker.get_agent_statuses(*id_result);
+    REQUIRE(statuses.size() == 2);
+    int seen = 0;
+    for (const auto& st : statuses) {
+        if (st.agent_id == "agent-1") {
+            CHECK(st.plugin_result_status == 4);
+            ++seen;
+        } else if (st.agent_id == "agent-2") {
+            CHECK(st.plugin_result_status == 0);
+            ++seen;
+        }
+    }
+    CHECK(seen == 2);
+}
+
+TEST_CASE("ExecutionTracker: a later frame overwrites the typed status via ON CONFLICT (CC-07)",
+          "[execution_tracker][cc07]") {
+    TestDb tdb;
+    ExecutionTracker tracker(tdb.db);
+    tracker.create_tables();
+
+    auto id_result = tracker.create_execution(make_execution());
+    REQUIRE(id_result.has_value());
+
+    AgentExecStatus running;
+    running.agent_id = "agent-1";
+    running.status = "running";
+    running.plugin_result_status = 0; // nothing reported yet
+    tracker.update_agent_status(*id_result, running);
+
+    AgentExecStatus terminal;
+    terminal.agent_id = "agent-1";
+    terminal.status = "failure";
+    terminal.exit_code = 1;
+    terminal.plugin_result_status = 2; // UNAVAILABLE
+    tracker.update_agent_status(*id_result, terminal);
+
+    auto statuses = tracker.get_agent_statuses(*id_result);
+    REQUIRE(statuses.size() == 1);
+    CHECK(statuses[0].status == "failure");
+    CHECK(statuses[0].plugin_result_status == 2);
+}
+
+// ── UP-12 / A-5 / D4(a): v2 pre-migration predecessor guard ─────────────────
+//
+// The v2 probe pre-stamps schema_meta to 2 when it finds plugin_result_status
+// already present on a schema_meta=0 dev DB (an iterated build that manually
+// added the column ahead of time), so MigrationRunner's ALTER doesn't hit
+// "duplicate column name". Because v1 creates the tables AND their indexes
+// in one migration, the guard must also confirm v1's index actually exists
+// before stamping — otherwise it silently skips v1's CREATE INDEX forever.
+
+namespace {
+// CDX-P1-04: `omit_index` lets a test build a schema where SOME but not ALL of
+// v1's four indexes exist — the exact partial-repair state the single-index
+// guard (checking only idx_agent_exec_agent) could not distinguish from a
+// fully-applied v1.
+void create_v1_schema_by_hand(sqlite3* db, bool with_index, const char* omit_index = nullptr) {
+    std::string sql = R"(
+        CREATE TABLE executions (
+            id TEXT PRIMARY KEY,
+            definition_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            scope_expression TEXT NOT NULL DEFAULT '',
+            parameter_values TEXT NOT NULL DEFAULT '',
+            dispatched_by TEXT NOT NULL DEFAULT '',
+            dispatched_at INTEGER NOT NULL DEFAULT 0,
+            agents_targeted INTEGER NOT NULL DEFAULT 0,
+            agents_responded INTEGER NOT NULL DEFAULT 0,
+            agents_success INTEGER NOT NULL DEFAULT 0,
+            agents_failure INTEGER NOT NULL DEFAULT 0,
+            completed_at INTEGER NOT NULL DEFAULT 0,
+            parent_id TEXT NOT NULL DEFAULT '',
+            rerun_of TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE agent_exec_status (
+            execution_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            dispatched_at INTEGER NOT NULL DEFAULT 0,
+            first_response_at INTEGER NOT NULL DEFAULT 0,
+            completed_at INTEGER NOT NULL DEFAULT 0,
+            exit_code INTEGER NOT NULL DEFAULT 0,
+            error_detail TEXT NOT NULL DEFAULT '',
+            plugin_result_status INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (execution_id, agent_id)
+        );
+    )";
+    if (with_index) {
+        for (const auto& [name, stmt] :
+             {std::pair{"idx_executions_status",
+                        "CREATE INDEX idx_executions_status ON executions(status);"},
+              std::pair{"idx_agent_exec_agent",
+                        "CREATE INDEX idx_agent_exec_agent ON agent_exec_status(agent_id);"},
+              std::pair{"idx_executions_dispatched",
+                        "CREATE INDEX idx_executions_dispatched ON executions(dispatched_at);"},
+              std::pair{"idx_executions_definition",
+                        "CREATE INDEX idx_executions_definition ON executions(definition_id);"}}) {
+            if (omit_index && std::string(name) == omit_index)
+                continue;
+            sql += stmt;
+        }
+    }
+    REQUIRE(sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+}
+
+bool index_exists(sqlite3* db, const char* name) {
+    sqlite3_stmt* stmt = nullptr;
+    bool exists = false;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", -1,
+                          &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC);
+        exists = (sqlite3_step(stmt) == SQLITE_ROW);
+    }
+    sqlite3_finalize(stmt);
+    return exists;
+}
+} // namespace
+
+TEST_CASE("ExecutionTracker: v2 probe stamps straight through when v1's index is "
+          "also already present",
+          "[execution_tracker][migration]") {
+    TestDb tdb;
+    // The realistic "iterated build" case: v1 fully happened by hand (table +
+    // index), and the column was pre-added too, but schema_meta reads as
+    // untracked (0) — e.g. the meta table was reset independently of the
+    // data. The guard should stamp straight to v2 without re-running v1 or
+    // hitting the v2 ALTER's duplicate-column error.
+    create_v1_schema_by_hand(tdb.db, /*with_index=*/true);
+
+    ExecutionTracker tracker(tdb.db);
+    tracker.create_tables();
+
+    CHECK(tracker.schema_ok());
+    CHECK(index_exists(tdb.db, "idx_agent_exec_agent"));
+
+    // And the store is actually usable afterward.
+    auto id_result = tracker.create_execution(make_execution());
+    REQUIRE(id_result.has_value());
+    AgentExecStatus s;
+    s.agent_id = "agent-1";
+    s.status = "success";
+    s.plugin_result_status = 4;
+    tracker.update_agent_status(*id_result, s);
+    auto statuses = tracker.get_agent_statuses(*id_result);
+    REQUIRE(statuses.size() == 1);
+    CHECK(statuses[0].plugin_result_status == 4);
+}
+
+TEST_CASE("ExecutionTracker: v2 probe does not silently skip v1's CREATE INDEX "
+          "when only the column pre-exists",
+          "[execution_tracker][migration]") {
+    TestDb tdb;
+    // The inconsistent state the missing guard let through: the v2 column is
+    // present but v1's index never was (hand-rolled schema surgery), and
+    // schema_meta reads as untracked (0). Without the predecessor guard, the
+    // probe stamps schema_meta straight to 2, MigrationRunner::run() then has
+    // nothing left with version > 2 to apply, and idx_agent_exec_agent is
+    // never created — silently, with no error. The guard must refuse to
+    // stamp in this case instead.
+    create_v1_schema_by_hand(tdb.db, /*with_index=*/false);
+    REQUIRE(index_exists(tdb.db, "idx_agent_exec_agent") == false);
+
+    ExecutionTracker tracker(tdb.db);
+    tracker.create_tables();
+
+    // v1 (idempotent CREATE TABLE/INDEX) now runs and creates the index —
+    // the guard no longer lets it be skipped silently.
+    CHECK(index_exists(tdb.db, "idx_agent_exec_agent"));
+    // v2's ALTER then genuinely collides with the pre-added column: the
+    // failure surfaces loudly via schema_ok(), which is the documented
+    // contract (see ExecutionTracker::schema_ok()) for a migration that
+    // didn't fully apply — not a silent, permanently-missing index.
+    CHECK_FALSE(tracker.schema_ok());
+}
+
+TEST_CASE("ExecutionTracker: v2 probe refuses to stamp when only SOME of v1's "
+          "indexes are present (CDX-P1-04)",
+          "[execution_tracker][migration]") {
+    TestDb tdb;
+    // idx_agent_exec_agent (the ONE index the pre-fix guard checked) is
+    // present, but idx_executions_status — one of v1's other three — is
+    // missing (e.g. hand-rolled schema surgery that only rebuilt one index).
+    // A guard that checks only idx_agent_exec_agent cannot see this and would
+    // stamp straight to v2, permanently skipping v1's CREATE INDEX for the
+    // missing one. Requiring ALL FOUR must refuse to stamp here too.
+    create_v1_schema_by_hand(tdb.db, /*with_index=*/true,
+                             /*omit_index=*/"idx_executions_status");
+    REQUIRE(index_exists(tdb.db, "idx_agent_exec_agent"));
+    REQUIRE(index_exists(tdb.db, "idx_executions_status") == false);
+
+    ExecutionTracker tracker(tdb.db);
+    tracker.create_tables();
+
+    // v1 (idempotent CREATE TABLE/INDEX) now re-runs and creates the missing
+    // index — under the pre-fix single-index guard this assertion fails,
+    // because that guard stamped schema_meta straight to 2 and v1 never ran.
+    CHECK(index_exists(tdb.db, "idx_executions_status"));
+    // v2's ALTER then genuinely collides with the pre-added column, exactly
+    // as the all-indexes-missing case above — the documented loud-failure
+    // contract, not a silent gap.
+    CHECK_FALSE(tracker.schema_ok());
+}

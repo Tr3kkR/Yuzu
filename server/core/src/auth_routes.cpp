@@ -792,11 +792,12 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
         // mcp_server.cpp is the authoritative approval gate (ticket-then-recall,
         // #289) — skip the denial there so a recall isn't consume-then-denied.
         // Enforced on every other transport so a REST route hit by an MCP token
-        // cannot bypass the ticket flow (#520). NOTE: no MCP write tool is wired
-        // to require_scoped_permission today (they all use require_permission),
-        // so there is no live double-gate here — this guard + the aligned message
-        // are defense-in-depth so a future scoped-auth MCP tool (e.g. an ADR-0017
-        // agent-confined one) can't silently reintroduce consume-then-deny.
+        // cannot bypass the ticket flow (#520). NOTE (updated K-06/CDX-R4-09):
+        // the MCP set_tag/delete_tag write tools NOW route through
+        // require_scoped_permission (mcp_server.cpp), so this `req.path !=
+        // "/mcp/v1/"` skip is LOAD-BEARING for them — it is what keeps an
+        // approval-gated tag delete on the MCP transport from being
+        // consume-then-denied. Do not remove it as "dead defense-in-depth".
         // Mirrors require_permission exactly (gov: architect/consistency/security).
         if (req.path != "/mcp/v1/" &&
             mcp::requires_approval(session->mcp_tier, securable_type, operation)) {

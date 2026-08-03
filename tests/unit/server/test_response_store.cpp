@@ -582,3 +582,92 @@ TEST_CASE("ResponseStore: distinct_agent_ids returns nullopt on an unopenable st
     aq.op = AggregateOp::Count;
     CHECK(store.aggregate("instr-1", aq).empty());
 }
+
+// ── CC-07 typed plugin result status (PR1.1 finding F11) ───────────────────
+//
+// The typed status is written at response_store.cpp's insert bind and again by
+// finalize_terminal_status, but nothing asserted it survives the round trip:
+// every existing test leaves it at its 0/UNDECLARED default, so binding a
+// literal 0 at either site would have kept the suite green while silently
+// discarding every plugin-reported status. These pin both write paths against
+// the read path (`COALESCE(plugin_result_status, 0)` in query/get_by_instruction).
+//
+// Values mirror YuzuResultStatus in sdk/include/yuzu/plugin.h — 3 =
+// PERMISSION_DENIED, 4 = CONSTRAINED — deliberately not 1, so a bind that
+// accidentally reused `status` (also an int, also on this row) is caught too.
+
+TEST_CASE("ResponseStore: plugin_result_status round-trips through store/read (CC-07)",
+          "[response_store][cc07]") {
+    ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+
+    StoredResponse resp;
+    resp.instruction_id = "cmd-cc07";
+    resp.agent_id = "agent-1";
+    resp.status = 1; // SUCCESS — distinct from the typed status below
+    resp.plugin_result_status = 3;
+    resp.output = "firewall|blocked";
+    store.store(resp);
+
+    auto results = store.get_by_instruction("cmd-cc07");
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].status == 1);
+    CHECK(results[0].plugin_result_status == 3);
+
+    // A response whose plugin never reported one stays honestly undeclared
+    // rather than inheriting the neighbouring row's value.
+    StoredResponse silent;
+    silent.instruction_id = "cmd-cc07";
+    silent.agent_id = "agent-2";
+    silent.status = 1;
+    silent.output = "no typed status";
+    store.store(silent);
+
+    auto both = store.get_by_instruction("cmd-cc07");
+    REQUIRE(both.size() == 2);
+    int declared = 0, undeclared = 0;
+    for (const auto& r : both) {
+        if (r.agent_id == "agent-1") {
+            CHECK(r.plugin_result_status == 3);
+            ++declared;
+        } else {
+            CHECK(r.plugin_result_status == 0);
+            ++undeclared;
+        }
+    }
+    CHECK(declared == 1);
+    CHECK(undeclared == 1);
+}
+
+TEST_CASE("ResponseStore: finalize_terminal_status writes the typed status onto the RUNNING row "
+          "(CC-07)",
+          "[response_store][cc07]") {
+    ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+
+    // The normal shape for a command that streamed output: a RUNNING row
+    // (status 0, no typed status yet) followed by an empty-output terminal
+    // frame that carries the real one.
+    StoredResponse running;
+    running.instruction_id = "cmd-final";
+    running.agent_id = "agent-1";
+    running.status = 0; // RUNNING
+    running.execution_id = "exec-1";
+    running.output = "streamed line";
+    store.store(running);
+
+    auto before = store.get_by_instruction("cmd-final");
+    REQUIRE(before.size() == 1);
+    REQUIRE(before[0].plugin_result_status == 0);
+
+    auto res = store.finalize_terminal_status("cmd-final", "agent-1", /*terminal_status=*/2,
+                                              "denied by policy", "exec-1",
+                                              /*plugin_result_status=*/4);
+    REQUIRE(res == ResponseStore::FinalizeResult::Updated);
+
+    auto after = store.get_by_instruction("cmd-final");
+    REQUIRE(after.size() == 1);
+    CHECK(after[0].status == 2);
+    CHECK(after[0].error_detail == "denied by policy");
+    CHECK(after[0].plugin_result_status == 4);
+}

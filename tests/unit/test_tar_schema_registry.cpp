@@ -423,3 +423,56 @@ TEST_CASE("TAR schema: netconn source is registered live-only with Windows wevta
                                                "capability", "iface_kind", "reason_code"};
     CHECK(cols == expected);
 }
+
+// ── #2204 unification: OsSupportStatus <-> the ABI4 descriptor enum ────────
+//
+// PR1.1 pins OsSupportStatus's four values 1:1 onto YuzuSupportLevel
+// (sdk/include/yuzu/plugin.h) as the single source of truth; do_compatibility()
+// (tar_plugin.cpp) derives its output from support_level_name() rather than
+// keeping its own private switch. These tests anchor that pin so a future
+// edit to either enum can't silently desynchronize the two — that would
+// either misreport a source's status to operators or, worse, break
+// tar_plugin.cpp's do_compatibility() switch silently (a value the switch
+// doesn't expect maps through a shared function, so a compiler would catch
+// an unhandled case at the ONE definition site, not at every call site).
+
+TEST_CASE("TAR schema: OsSupportStatus values are pinned 1:1 to YuzuSupportLevel",
+         "[tar][schema][abi4]") {
+    CHECK(static_cast<int>(to_yuzu_support_level(OsSupportStatus::kSupported)) ==
+         static_cast<int>(YUZU_SUPPORT_SUPPORTED));
+    CHECK(static_cast<int>(to_yuzu_support_level(OsSupportStatus::kSupportedConstrained)) ==
+         static_cast<int>(YUZU_SUPPORT_CONSTRAINED));
+    CHECK(static_cast<int>(to_yuzu_support_level(OsSupportStatus::kPlanned)) ==
+         static_cast<int>(YUZU_SUPPORT_PLANNED));
+    CHECK(static_cast<int>(to_yuzu_support_level(OsSupportStatus::kUnsupported)) ==
+         static_cast<int>(YUZU_SUPPORT_UNSUPPORTED));
+    // The descriptor's own "no data" value is deliberately unreachable from a
+    // registry row — every row always declares one of the four above.
+    CHECK(static_cast<int>(YUZU_SUPPORT_UNDECLARED) == 0);
+}
+
+TEST_CASE("TAR schema: support_level_name matches do_compatibility()'s prior literal strings",
+         "[tar][schema][abi4]") {
+    // These four strings are do_compatibility()'s wire contract (the
+    // `compatibility` action's 3rd column) — pinning them here means a
+    // future edit to support_level_name() that silently changes them is
+    // caught at the single shared definition, not per-call-site.
+    CHECK(support_level_name(OsSupportStatus::kSupported) == "supported");
+    CHECK(support_level_name(OsSupportStatus::kSupportedConstrained) == "constrained");
+    CHECK(support_level_name(OsSupportStatus::kPlanned) == "planned");
+    CHECK(support_level_name(OsSupportStatus::kUnsupported) == "unsupported");
+}
+
+TEST_CASE("TAR schema: every registered source's every OS row round-trips through "
+         "support_level_name without hitting the undeclared fallback",
+         "[tar][schema][abi4]") {
+    // Exercises the real registry data (build_sources()) through the shared
+    // conversion, proving no row's status value has drifted outside the
+    // four declared OsSupportStatus values.
+    for (const auto& src : capture_sources()) {
+        for (const auto& os : src.os_support) {
+            INFO("source=" << src.name << " os=" << os.os);
+            CHECK(support_level_name(os.status) != "undeclared");
+        }
+    }
+}

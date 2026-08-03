@@ -343,6 +343,22 @@ load_plugin_allowlist(const std::filesystem::path& allowlist_path) {
 
 // ── PluginHandle ──────────────────────────────────────────────────────────────
 
+// #2204 / plugin B2 — single source of truth for the ABI-gate on
+// action_descriptor_count: action_descriptors/action_descriptor_count exist
+// ONLY at ABI v4+ (sdk/include/yuzu/plugin.h). An ABI<4 plugin's actual
+// in-memory descriptor (tests/fixtures/abi3/plugin_abi3.h is the frozen,
+// real-world proof) ends at sdk_version — reading action_descriptor_count
+// off it is not merely wrong data, it is a read past the end of the real
+// allocation. Kept as the one place that computes this value (PluginHandle::
+// load()'s diagnostic log line below calls it) so nothing can silently read
+// the raw field instead. No public header — tests/unit/
+// test_capability_descriptor.cpp forward-declares it directly, the same
+// convention agents/core/src/agent.cpp uses for
+// derive_effective_result_status()/dispatch_with_capture().
+YUZU_EXPORT std::size_t gated_action_descriptor_count(const YuzuPluginDescriptor* desc) {
+    return (desc->abi_version >= 4) ? desc->action_descriptor_count : 0;
+}
+
 PluginHandle::PluginHandle(PluginHandle&& o) noexcept
     : handle_{o.handle_}, descriptor_{o.descriptor_}, path_{std::move(o.path_)} {
     o.handle_ = nullptr;
@@ -410,8 +426,13 @@ std::expected<PluginHandle, LoadError> PluginHandle::load(const std::filesystem:
     // ABI v3+ includes sdk_version for diagnostics
     const char* sdk_ver =
         (desc->abi_version >= 3 && desc->sdk_version) ? desc->sdk_version : "unknown";
-    spdlog::info("Loaded plugin '{}' v{} (ABI={}, SDK={})", desc->name, desc->version,
-                 desc->abi_version, sdk_ver);
+    // ABI v4+ includes per-action capability declarations (#2204); ABI<4
+    // plugins (or an ABI4 plugin that simply never populated the array)
+    // report 0 here, which the capability-matrix generator reads as
+    // "undeclared" for every action rather than an error.
+    const std::size_t action_descriptor_count = gated_action_descriptor_count(desc);
+    spdlog::info("Loaded plugin '{}' v{} (ABI={}, SDK={}, capability declarations={})", desc->name,
+                 desc->version, desc->abi_version, sdk_ver, action_descriptor_count);
 
     PluginHandle ph;
     ph.handle_ = handle;

@@ -87,7 +87,7 @@ The core unit of the content model. Every ad-hoc command, scheduled task, policy
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `id` | string | Yes | -- | Globally unique identifier. Convention: `<scope>.<domain>.<action>` (e.g., `crossplatform.service.inspect`). |
+| `id` | string | Yes | -- | Globally unique identifier. Convention: `<scope>.<domain>.<action>` (e.g., `crossplatform.service.inspect`). The `mcp.` prefix is **reserved** and cannot be authored (#2442) — it names MCP approval tickets, whose recall matches on the definition id. |
 | `displayName` | string | Yes | -- | Human-readable name shown in the dashboard. |
 | `version` | string | Yes | -- | Semantic version (e.g., `1.2.0`). Used for compatibility checks and pack versioning. |
 | `description` | string | No | `""` | Detailed description of what this definition does. |

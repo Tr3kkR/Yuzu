@@ -824,7 +824,7 @@ The following plugins are defined in the roadmap but not yet implemented. They a
 
 ### Overview
 
-All agent plugins share a common architecture based on a **stable C ABI** defined in `sdk/include/yuzu/plugin.h`. This ABI is designed to remain binary-compatible across compiler versions and agent upgrades, so plugins can be updated independently of the agent binary.
+All agent plugins share a common architecture based on a **stable C ABI** defined in `sdk/include/yuzu/plugin.h`. This ABI is designed to remain binary-compatible across compiler versions and agent upgrades, so plugins can be updated independently of the agent binary. The ABI is currently at version 4 (`YUZU_PLUGIN_ABI_VERSION`); the agent still loads plugins built against any version back to `YUZU_PLUGIN_ABI_VERSION_MIN` (1) — a major-version bump does not mean existing plugins need recompiling. See `sdk/README.md`'s ABI compatibility table for the full version-by-version breakdown.
 
 A **C++23 CRTP wrapper** (`sdk/include/yuzu/plugin.hpp`) provides ergonomic C++ authoring on top of the C ABI. The `YUZU_PLUGIN_EXPORT` macro handles symbol visibility and the export table automatically.
 

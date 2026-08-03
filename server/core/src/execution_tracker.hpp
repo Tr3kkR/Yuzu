@@ -69,6 +69,11 @@ struct AgentExecStatus {
     int64_t completed_at{0};
     int exit_code{0};
     std::string error_detail;
+    /// CC-07 plugin→host typed result status (agent.proto CommandResponse
+    /// .plugin_result_status, mirrors YuzuResultStatus from
+    /// sdk/include/yuzu/plugin.h). 0 (PLUGIN_RESULT_UNDECLARED) for legacy
+    /// rows and for any response whose plugin never reported a typed status.
+    int plugin_result_status{0};
 };
 
 // ── Execution statistics (capability 1.9) ────────────────────────────
@@ -153,8 +158,21 @@ public:
     std::vector<DefinitionExecutionStats> get_definition_statistics(const ExecutionStatsQuery& q = {}) const;
     FleetExecutionSummary get_fleet_summary(int64_t since = 0) const;
 
+    /// Whether the schema is USABLE — i.e. every migration applied.
+    ///
+    /// This store shares the instructions pool, so it must NOT close the
+    /// connection on a migration failure the way `ResponseStore` (which owns
+    /// its own) does; a flag is the only honest signal available. Without it a
+    /// failed migration is invisible: `/readyz` probes the shared pool, which is
+    /// still open, and reports ready while every `update_agent_status` INSERT
+    /// references a column that does not exist — wedging every execution at
+    /// `dispatched` forever. The failure mode became reachable when this store
+    /// gained its FIRST migration (v2, the typed plugin_result_status column).
+    [[nodiscard]] bool schema_ok() const noexcept { return db_ != nullptr && migration_ok_; }
+
 private:
     sqlite3* db_;
+    bool migration_ok_{true};
     mutable std::recursive_mutex mtx_;
     /// Borrowed — owned by the server. nullptr = no SSE publishing.
     ExecutionEventBus* event_bus_{nullptr};
