@@ -6585,9 +6585,13 @@ TEST_CASE("MCP: a schema-inexpressible violation never mints or consumes a ticke
     }
     SECTION("empty plugin/action is refused BEFORE a ticket is minted") {
         // Sol's find, and the FIFTH instance of the burn class: the schema
-        // marks plugin/action `required` (which C8 enforces) but the closed
-        // subset has no minLength, so "" passes every published check and the
-        // handler refused it only after the ticket had been consumed.
+        // marks plugin/action `required` (which C8 enforces) but the SERVED
+        // schema puts no floor on their length, so "" passes every published
+        // check and the handler refused it only after the ticket had been
+        // consumed. The compiler gained `minLength` in #2444, so the served
+        // schema can express the floor directly once kTools[] in the frozen
+        // mcp_server.cpp reopens; check_exec_instruction_shape holds the line
+        // until then, and afterwards for the tiers that never reach C8.
         auto res = call_with(R"({"plugin":"","action":""})");
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);
@@ -7325,10 +7329,53 @@ TEST_CASE("MCP 2405: subset compiler enforces every supported keyword",
         CHECK_FALSE(z->validate(nlohmann::json::parse(R"({"none":[]})")));
         CHECK(z->validate(nlohmann::json::parse(R"({"none":["a"]})")));
     }
+    // minLength (#2444): the catalogue could bound a string's ceiling but not
+    // its floor, so a required string could be satisfied by "".
+    {
+        auto s = compile_input_schema(
+            R"({"type":"object","properties":{"tag":{"type":"string","minLength":1,"maxLength":8}}})");
+        REQUIRE(s);
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"tag":"a"})")));
+        auto empty = s->validate(nlohmann::json::parse(R"({"tag":""})"));
+        REQUIRE(empty);
+        CHECK(empty->path == "/tag");
+        CHECK(empty->reason.find("shorter than minLength 1 (bytes)") != std::string::npos);
+        // The ceiling still applies alongside the floor.
+        CHECK(s->validate(nlohmann::json::parse(R"({"tag":"aaaaaaaaa"})")));
+        // Bytes, not codepoints: a 2-byte single character satisfies
+        // minLength:2. The header says so explicitly — do not read a
+        // minLength above 1 as a character count.
+        auto b = compile_input_schema(
+            R"({"type":"object","properties":{"t":{"type":"string","minLength":2}}})");
+        REQUIRE(b);
+        CHECK_FALSE(b->validate(nlohmann::json::parse(R"({"t":"é"})")));
+    }
+    // minLength operands are validated at COMPILE time, so a schema the gate
+    // cannot enforce is unbootable rather than partially enforced.
+    {
+        CHECK_FALSE(compile_input_schema(
+                        R"({"type":"object","properties":{"t":{"type":"string","minLength":-1}}})")
+                        .has_value());
+        CHECK_FALSE(compile_input_schema(
+                        R"({"type":"object","properties":{"t":{"type":"string","minLength":"1"}}})")
+                        .has_value());
+        // string-only, like maxLength
+        CHECK_FALSE(compile_input_schema(
+                        R"({"type":"object","properties":{"n":{"type":"integer","minLength":1}}})")
+                        .has_value());
+        // an unsatisfiable window is an authoring error, not a runtime denial
+        auto inverted = compile_input_schema(
+            R"({"type":"object","properties":{"t":{"type":"string","minLength":5,"maxLength":2}}})");
+        REQUIRE_FALSE(inverted.has_value());
+        bool named = false;
+        for (const auto& e : inverted.error())
+            named = named || e.find("'minLength' exceeds 'maxLength'") != std::string::npos;
+        CHECK(named);
+    }
     // Catalogue drift tether: growing kSupportedKeywords must be a deliberate
     // act that also revisits the header contract comment and the
     // docs/mcp-server.md bullet (both enumerate the same closed list).
-    CHECK(yuzu::server::mcp::supported_keyword_count() == 15);
+    CHECK(yuzu::server::mcp::supported_keyword_count() == 16);
     // additionalProperties:false rejects undeclared keys at the WILDCARD path.
     {
         auto s = compile_input_schema(

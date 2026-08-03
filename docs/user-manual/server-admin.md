@@ -193,6 +193,54 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — the `mcp.` instruction-definition id prefix is reserved (#2442) (breaking)
+
+**Who this affects.** Anyone whose instruction definitions include an id beginning `mcp.`. No
+shipped or bundled content uses that prefix, so a deployment running only Yuzu-supplied content
+is unaffected and needs no action.
+
+**Why.** `mcp.<tool>` names an MCP approval ticket. The MCP recall matches a ticket on its
+definition id and scope expression and does not bind the submitter, so a definition authored
+under that prefix could line up with an MCP tool's canonical arguments — a ticket raised on one
+surface being redeemable on another. Consuming it still required the schema check, the tier
+gate, per-handler RBAC and a human approval, so this closes a namespace confusion rather than an
+open escalation.
+
+**What changes.** Creating a definition whose id starts `mcp.` is refused with a 400 on every
+authoring route that accepts an explicit id — `POST /api/instructions`, `POST
+/api/instructions/yaml`, and `POST /api/instructions/import` — and such a definition is skipped
+(counted in `defs_errored`) at boot auto-import. The dashboard's YAML validator refuses it too,
+so Validate and Save agree on the create path. Product-pack install is unaffected because it
+never carries a declared id through at all: the store assigns one, so a pack's own id, reserved
+or not, has never been honoured.
+
+**What does NOT change.** The store applies the rule at creation only, so a definition that
+already carries such an id keeps executing and can still be saved through `PUT
+/api/instructions/{id}` — an update cannot originate an id, so blocking it there would strand
+content rather than protect anything. One exception, and it is the reason to rename rather than
+live with it: the dashboard's YAML editor runs the same validation on every save, create or
+update, so an existing `mcp.`-prefixed definition cannot be edited there if its document
+declares `metadata.id` (one that omits it still saves, since the validator only checks a
+declared id).
+
+**What to do.** Before upgrading, check for affected content. Query the instruction database
+directly rather than the REST list route: `GET /api/v1/definitions` caps its result at 100
+definitions, and the shipped content alone exceeds that, so an API-based check can report a
+false all-clear. `GLOB` rather than `LIKE` because SQLite's `LIKE` is case-insensitive and
+the reservation is not — `MCP.foo` is a different id everywhere else in the system and is
+not reserved.
+
+```bash
+sqlite3 /var/lib/yuzu/instructions.db \
+  "SELECT id FROM instruction_definitions WHERE id GLOB 'mcp.*';"
+```
+
+Any id listed keeps executing after the upgrade and can still be edited through
+`PUT /api/instructions/{id}`, but re-importing an export of it will fail, and so will saving it
+from the dashboard's YAML editor (that path validates the id on every save, not only on
+create). Rename those definitions before upgrading — create a replacement under a different id
+and delete the original.
+
 ### vNEXT — behind a reverse proxy, declare your external origin or CSRF-gated dashboard actions keep failing (#2537)
 
 **Who this affects.** Anyone running the dashboard behind nginx, Envoy, HAProxy, an ALB or

@@ -1530,7 +1530,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
 
             if (needs_approval) {
-                auto result = approval_manager->submit(def_id, session->username, scope_expr);
+                // Declaring the origin (#2442) is what bars this path from
+                // minting into the reserved `mcp.` ticket namespace: def_id is
+                // caller-influenced and scope_expr is caller-supplied verbatim,
+                // and the MCP recall matches on exactly that pair.
+                auto result = approval_manager->submit(def_id, session->username, scope_expr, "",
+                                                       ApprovalOrigin::kInstruction);
                 if (!result) {
                     spdlog::error("approval submit failed for '{}': {}", def_id, result.error());
                     res.status = 500;
