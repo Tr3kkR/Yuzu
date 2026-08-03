@@ -65,6 +65,14 @@ struct ExecHarness {
     // alive while ~ExecutionTracker runs (it doesn't close, only finalizes
     // statements), then SqliteHandleGuard closes the handle on destruction.
     SqliteHandleGuard tracker_guard;
+    /// #2442: the approval gate needs a live ApprovalManager or an
+    /// approval-gated execute short-circuits to 503 before the reserved-id
+    /// pre-check. ApprovalManager BORROWS its handle, so the harness owns one
+    /// on the same file (SQLite permits several connections to one database).
+    /// Held by the guard, declared first, for the reason the guard exists: a
+    /// REQUIRE later in the constructor throws, ~ExecHarness never runs, and a
+    /// raw member would leak the handle and the temp files with it.
+    SqliteHandleGuard appr_guard;
     /// Declared BEFORE `sink`, so it destructs AFTER it. `sink` — not `routes` —
     /// owns the route lambdas that capture `&metrics`, so this ordering is what
     /// keeps the borrowed pointer valid for as long as a handler could run. An
@@ -80,11 +88,6 @@ struct ExecHarness {
     fs::path tracker_db, instr_db, resp_db, wf_db;
     std::unique_ptr<ExecutionTracker> tracker;
     std::unique_ptr<InstructionStore> instructions;
-    /// #2442: the approval gate needs a live ApprovalManager or an
-    /// approval-gated execute short-circuits to 503 before the reserved-id
-    /// pre-check. ApprovalManager BORROWS its handle, so the harness owns one
-    /// on the same file (SQLite permits several connections to one database).
-    sqlite3* appr_db{nullptr};
     std::unique_ptr<ApprovalManager> approvals;
     std::unique_ptr<ResponseStore> responses;
     /// CDX-FV-03: opt-in WorkflowEngine so POST /api/workflows/:id/execute is
@@ -279,9 +282,16 @@ struct ExecHarness {
         wf_deps.metrics = &metrics;            // #2500 targeting-refusal counter
         // #2442: the approval gate must be live, or an approval-gated execute
         // short-circuits to 503 before reaching the reserved-id pre-check.
-        REQUIRE(sqlite3_open(instr_db.string().c_str(), &appr_db) == SQLITE_OK);
-        approvals = std::make_unique<ApprovalManager>(appr_db);
+        REQUIRE(sqlite3_open(instr_db.string().c_str(), &appr_guard.db) == SQLITE_OK);
+        // Same busy timeout the instruction store sets on its own connection:
+        // two connections on one file, and a SQLITE_BUSY here would leave the
+        // approvals schema absent, which every "no ticket was minted" check
+        // would then satisfy vacuously.
+        REQUIRE(sqlite3_exec(appr_guard.db, "PRAGMA busy_timeout=5000", nullptr, nullptr,
+                             nullptr) == SQLITE_OK);
+        approvals = std::make_unique<ApprovalManager>(appr_guard.db);
         approvals->create_tables();
+        REQUIRE(approvals->is_open()); // a failed migration must fail the test, not pass it
         wf_deps.approval_manager = approvals.get();
         routes.register_routes(sink, std::move(wf_deps));
     }
@@ -292,10 +302,14 @@ struct ExecHarness {
         // Drop the borrower before closing the handle it borrows, then close
         // it before the file is removed below (Windows refuses to unlink an
         // open file — the same reason the tracker handle is closed here).
+        // Drop the borrower before the guard closes the handle it borrows.
+        // The guard itself closes after the file-removal below only because it
+        // is declared first; close it here so the unlink can succeed on
+        // Windows, the same reason the tracker handle is closed here.
         approvals.reset();
-        if (appr_db) {
-            sqlite3_close(appr_db);
-            appr_db = nullptr;
+        if (appr_guard.db) {
+            sqlite3_close_v2(appr_guard.db);
+            appr_guard.db = nullptr;
         }
         instructions.reset();
         // PR 3: drop tracker BEFORE the bus — tracker borrows event_bus_,
@@ -911,7 +925,7 @@ TEST_CASE("#2442 — executing a legacy mcp.-prefixed approval-gated definition 
 
     // The store now refuses this id, which is the point: insert the legacy row
     // directly, the way an upgraded deployment already holds one.
-    REQUIRE(sqlite3_exec(h.appr_db,
+    REQUIRE(sqlite3_exec(h.appr_guard.db,
                          "INSERT INTO instruction_definitions "
                          "(id, name, type, plugin, action, approval_mode, enabled) "
                          "VALUES ('mcp.legacy_tool', 'Legacy', 'question', 'test', 'list',"
@@ -931,13 +945,42 @@ TEST_CASE("#2442 — executing a legacy mcp.-prefixed approval-gated definition 
     CHECK(message.find(std::string(yuzu::server::kReservedDefinitionIdError)) !=
           std::string::npos);
     CHECK(message.find("rename") != std::string::npos);
-    CHECK(body["error"].contains("remediation"));
-    // Neither field may tell the operator to delete before moving schedules —
-    // delete_definition has no referential guard, so that strands them.
-    CHECK(message.find("delete this") == std::string::npos);
+    const std::string remediation = body["error"].value("remediation", "");
+    CHECK(remediation.find("rebuild") != std::string::npos);   // schedules move first
+    CHECK(remediation.find("only then delete") != std::string::npos);
+
+    // Neither field may tell the operator to delete before moving schedules:
+    // delete_definition has no referential guard, so a delete-first rename
+    // strands them silently. Checked as a stem list rather than one literal —
+    // any paraphrase reintroduces the hazard, and a single substring would
+    // still pass.
+    for (const auto& phrase : {"delete this", "delete it", "remove this", "erase this"})
+        CHECK(message.find(phrase) == std::string::npos);
+
+    // The audit token is a PUBLISHED contract: docs/user-manual/audit-log.md
+    // documents it as SIEM-keyable on instruction.execute denials, so a rename
+    // here breaks detection rules silently.
+    REQUIRE(!h.audit_calls.empty());
+    const auto& row = h.audit_calls.back();
+    CHECK(row.action == "instruction.execute");
+    CHECK(row.result == "denied");
+    CHECK(row.detail == "reason=reserved_definition_id");
 
     // No ticket was minted: the refusal happens before the gate is reached.
+    // The positive control below is what stops this being vacuous.
     CHECK(h.approvals->query({}).empty());
+}
+
+TEST_CASE("#2442 — the approval store the reserved-id tests assert against is live",
+          "[workflow][execute][approval]") {
+    // Control for the "no ticket was minted" assertions: query() returns an
+    // empty vector both when nothing was minted AND when the schema is absent
+    // (a failed migration, a SQLITE_BUSY). Prove the store can actually return
+    // a row, or that negative is worth nothing.
+    ExecHarness h;
+    auto id = h.approvals->submit("inventory.audit", "tester", "{}");
+    REQUIRE(id.has_value());
+    CHECK(h.approvals->query({}).size() == 1);
 }
 
 TEST_CASE("#2442 — an UNGATED legacy mcp.-prefixed definition still executes",
@@ -948,7 +991,7 @@ TEST_CASE("#2442 — an UNGATED legacy mcp.-prefixed definition still executes",
     // also pass if the check had been hoisted to refuse every reserved id,
     // which would break far more than it fixed.
     ExecHarness h;
-    REQUIRE(sqlite3_exec(h.appr_db,
+    REQUIRE(sqlite3_exec(h.appr_guard.db,
                          "INSERT INTO instruction_definitions "
                          "(id, name, type, plugin, action, approval_mode, enabled) "
                          "VALUES ('mcp.legacy_auto', 'Legacy Auto', 'question', 'test', 'list',"

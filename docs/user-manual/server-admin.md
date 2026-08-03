@@ -292,6 +292,11 @@ it.
 
 1. Create the replacement under an id outside the `mcp.` namespace. This is an ordinary create,
    so the reservation applies to the new id too; a collision with an existing id fails with 409.
+
+   Carry the definition's `mode:` across explicitly. It defaults to `auto` when absent, so a
+   replacement built from a trimmed copy drops the approval gate at the definition level — the
+   same defaulting trap as the schedule below, one level up. Re-run triage query 1 after
+   creating it: the replacement should appear if and only if the original did.
 2. List **every** schedule on the old definition — not just the ones the triage flagged, since
    an ungated schedule on an `auto` definition is stranded by the delete just the same. Select
    the whole row, because you are about to rebuild it and `POST /api/schedules` defaults every
@@ -310,19 +315,31 @@ it.
    Read this before you start, because the defaults are dangerous. `POST /api/schedules` fills
    in anything you leave out: an omitted `scope_expression` becomes empty, and an empty scope
    **dispatches to the entire fleet**; an omitted `requires_approval` becomes `false`, which
-   **drops the approval gate**; an omitted `frequency_type` becomes `once`. Rebuild a daily,
+   **drops the schedule's half of the approval gate** (the run is still gated if the definition's
+   own `approval_mode` is not `auto`, since the two are OR-ed — but do not rely on that, because
+   step 1 can drop the definition's half too); an omitted `frequency_type` becomes `once`. Rebuild a daily,
    group-scoped, approval-gated schedule from a partial copy and you get a one-shot, fleet-wide,
    ungated one — and the first occurrence can fire within a tick. Copy the whole row.
 
-   Three things cannot be carried across at all:
+   Four things cannot be carried across at all:
+
+   - **The firing time re-anchors to the moment you recreate it.** This is the one that moves
+     a fleet-wide dispatch out of its maintenance window. `time_of_day`, `day_of_week` and
+     `day_of_month` are stored and echoed back, but the scheduler does not read them: the next
+     run is computed as *now* plus the period, so a `daily` schedule rebuilt at 14:00 fires at
+     14:00 from then on, not at its original 02:00. Rebuild inside the window you want it to
+     keep, or accept the shift and say so to whoever owns that window.
 
    - **`enabled`** is not a create field, so every recreated schedule starts enabled *and*
      armed — a `once` schedule's first occurrence is due immediately, and the tick is 30
      seconds. If the original was disabled, `POST /api/schedules/{id}/enable` with
      `{"enabled": false}` on the replacement before it reaches that first occurrence. Otherwise
-     the rename silently arms a schedule somebody had deliberately parked.
-   - **`created_by`** is taken from the session that creates it, so a schedule has to be
-     recreated by its own owner. There is no act-as and no admin override — deleting is scoped
+     the rename silently arms a schedule somebody had deliberately parked. That call echoes back
+     what you asked for rather than what it changed, the same way the delete does, so confirm the
+     schedule's state rather than trusting the response.
+   - **`created_by`** is taken from the session that creates it. Nothing *requires* the
+     recreator to be the original owner — but it should be, because an administrator who
+     rebuilds it becomes its owner. There is no act-as and no admin override — deleting is scoped
      to the creator at the SQL seam, and a non-owner `DELETE /api/schedules/{id}` answers
      `200 {"deleted": false}` with no audit row, so a failed delete looks like a successful one.
      Check that response rather than assuming. An administrator who recreates the schedule
