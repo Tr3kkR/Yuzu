@@ -576,7 +576,10 @@ message names the offending field as a JSON-pointer-style path (e.g.
 `/steps/1`), and `error.data` carries a `correlation_id` plus a `remediation`
 confirming no ticket was created or consumed. Two strictness notes: `integer`
 parameters must be JSON integers (an integral float like `1.0` is rejected),
-and `maxLength` limits are byte counts.
+and `minLength`/`maxLength` limits are byte counts. The two directions are not
+symmetric: bytes are never fewer than codepoints, so a byte-counted `maxLength`
+is stricter than a character count while a byte-counted `minLength` is looser
+above 1 — and exact at `minLength: 1`, the not-empty case.
 
 Targeting arguments are **type-checked and never coerced**, and an empty target
 set is an error rather than a widening:

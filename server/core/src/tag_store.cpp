@@ -321,12 +321,11 @@ void TagStore::delete_all_tags(const std::string& agent_id) {
     sqlite3_finalize(stmt);
 }
 
-std::vector<std::string> TagStore::agents_with_tag(const std::string& key,
-                                                   const std::string& value) const {
+std::optional<std::vector<std::string>>
+TagStore::agents_with_tag_checked(const std::string& key, const std::string& value) const {
     std::shared_lock lock(mtx_);
-    std::vector<std::string> result;
     if (!db_)
-        return result;
+        return std::nullopt; // degraded: no connection, not "no agents" (B-2b)
 
     std::string sql = "SELECT DISTINCT agent_id FROM tags WHERE key = ?";
     if (!value.empty())
@@ -334,13 +333,14 @@ std::vector<std::string> TagStore::agents_with_tag(const std::string& key,
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
-        return result;
+        return std::nullopt; // degraded: prepare failed, not "no agents" (B-2b)
 
     sqlite3_bind_text(stmt, 1, key.c_str(), -1, SQLITE_TRANSIENT);
     if (!value.empty()) {
         sqlite3_bind_text(stmt, 2, value.c_str(), -1, SQLITE_TRANSIENT);
     }
 
+    std::vector<std::string> result;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         auto t = sqlite3_column_text(stmt, 0);
         if (t)
@@ -348,6 +348,11 @@ std::vector<std::string> TagStore::agents_with_tag(const std::string& key,
     }
     sqlite3_finalize(stmt);
     return result;
+}
+
+std::vector<std::string> TagStore::agents_with_tag(const std::string& key,
+                                                   const std::string& value) const {
+    return agents_with_tag_checked(key, value).value_or(std::vector<std::string>{});
 }
 
 std::expected<void, std::string>

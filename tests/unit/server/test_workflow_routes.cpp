@@ -25,6 +25,7 @@
 #include "instruction_store.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
+#include "workflow_engine.hpp"
 #include "workflow_routes.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -75,10 +76,15 @@ struct ExecHarness {
     /// pre-existing test on the unmetered path; the admission tests pass one in.
     yuzu::server::detail::StreamBudget* stream_budget{nullptr};
 
-    fs::path tracker_db, instr_db, resp_db;
+    fs::path tracker_db, instr_db, resp_db, wf_db;
     std::unique_ptr<ExecutionTracker> tracker;
     std::unique_ptr<InstructionStore> instructions;
     std::unique_ptr<ResponseStore> responses;
+    /// CDX-FV-03: opt-in WorkflowEngine so POST /api/workflows/:id/execute is
+    /// reachable. Opt-in rather than always-on because every other test in this
+    /// file leaves it nullptr, and a fourth SQLite file per harness would be
+    /// unpaid cost on ~60 constructions (CLAUDE.md test-efficiency discipline).
+    std::unique_ptr<WorkflowEngine> workflows;
     /// PR 3: per-execution SSE bus. Constructed BEFORE the tracker (see
     /// member-order comment) so the tracker can attach. Pointer is also
     /// passed into WorkflowRoutes::Deps so the SSE handler is registered.
@@ -117,6 +123,15 @@ struct ExecHarness {
     int dispatch_calls{0};
     std::vector<std::string> last_dispatch_agent_ids;
     std::string last_dispatch_scope;
+    /// K-R7-02: the exec_visible set the execute handler derived and threaded
+    /// into the dispatch stub (the confinement the production dispatch_confined
+    /// seam then applies). Mirrors test_mcp_server.cpp's last_dispatch_exec_visible.
+    yuzu::server::authz::VisibleSet last_dispatch_exec_visible;
+    /// K-R7-02: the reassignable per-request exec-visible derivation. Default
+    /// returns nullopt (UNFILTERED) so every pre-existing workflow test keeps the
+    /// full-fleet path; a confinement test overrides it with a specific set.
+    WorkflowRoutes::ExecVisibleFn exec_visible_fn{
+        [](const httplib::Request&) { return yuzu::server::authz::VisibleSet{}; }};
     WorkflowRoutes routes;
 
     /// Per-process monotonic counter for execution IDs. Replaces the prior
@@ -130,12 +145,20 @@ struct ExecHarness {
     /// bus so SSE-handler 503-on-no-bus tests can exercise the path where
     /// the route is registered but the underlying bus is intentionally
     /// not wired (governance qe-S1).
+    /// `wire_exec_visible = false` registers with an EMPTY ExecVisibleFn so the
+    /// production execute handler's own fail-closed branch (unwired → present-
+    /// empty deny-all) is exercised (K-R7-02).
+    bool wire_exec_visible{true};
+
     explicit ExecHarness(bool with_bus = true,
-                         yuzu::server::detail::StreamBudget* budget = nullptr)
+                         yuzu::server::detail::StreamBudget* budget = nullptr,
+                         bool wire_exec_visible_arg = true,
+                         bool with_workflow_engine = false)
         : stream_budget(budget),
           tracker_db(uniq("wf-routes-exec")), instr_db(uniq("wf-routes-inst")),
-          resp_db(uniq("wf-routes-resp")) {
-        for (auto& p : {tracker_db, instr_db, resp_db})
+          resp_db(uniq("wf-routes-resp")), wf_db(uniq("wf-routes-wf")) {
+        wire_exec_visible = wire_exec_visible_arg;
+        for (auto& p : {tracker_db, instr_db, resp_db, wf_db})
             fs::remove(p);
 
         // ExecutionTracker takes a raw sqlite3* — open it via the guard so a
@@ -159,6 +182,14 @@ struct ExecHarness {
         responses = std::make_unique<ResponseStore>(resp_db, /*retention_days=*/0,
                                                     /*cleanup_interval_min=*/60);
         REQUIRE(responses->is_open());
+
+        // CDX-FV-03: a plain on-disk SQLite file — the engine's whole ctor is
+        // sqlite3_open_v2 + CREATE TABLE, so the "disproportionate scaffolding"
+        // this file previously claimed does not exist.
+        if (with_workflow_engine) {
+            workflows = std::make_unique<WorkflowEngine>(wf_db);
+            REQUIRE(workflows->is_open());
+        }
 
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
@@ -196,12 +227,16 @@ struct ExecHarness {
                                    const std::vector<std::string>& agent_ids,
                                    const std::string& scope_expr,
                                    const std::unordered_map<std::string, std::string>&,
-                                   const std::string& execution_id) -> std::pair<std::string, int> {
+                                   const std::string& execution_id,
+                                   const yuzu::server::authz::VisibleSet& exec_visible)
+            -> std::pair<std::string, int> {
             last_dispatch_execution_id = execution_id;
             // #2500: capture what the sink was actually asked to target.
             ++dispatch_calls;
             last_dispatch_agent_ids = agent_ids;
             last_dispatch_scope = scope_expr;
+            // K-R7-02: capture the confinement threaded into dispatch.
+            last_dispatch_exec_visible = exec_visible;
             return {dispatch_cmd_override, dispatch_sent_override};
         };
 
@@ -217,7 +252,18 @@ struct ExecHarness {
         wf_deps.execution_tracker = tracker.get();
         wf_deps.instruction_store = instructions.get();
         wf_deps.command_dispatch_fn = cmd_dispatch;
+        // K-R7-02: wire the exec-visible derivation (or leave it EMPTY so the
+        // handler's own fail-closed path runs). The wired form delegates to the
+        // reassignable member so a test can override it after construction.
+        if (wire_exec_visible) {
+            wf_deps.exec_visible_fn = [this](const httplib::Request& req) {
+                return exec_visible_fn ? exec_visible_fn(req) : yuzu::server::authz::VisibleSet{};
+            };
+        }
         wf_deps.response_store = responses.get();
+        // CDX-FV-03: nullptr unless opted in, so /api/workflows/* keeps its 503
+        // path for every pre-existing test.
+        wf_deps.workflow_engine = workflows.get();
         // PR 3 — wire the per-execution event bus. The SSE handler at
         // /sse/executions/{id} returns 503 at request time when this is
         // nullptr but is still registered, which is the qe-S1 path.
@@ -228,6 +274,7 @@ struct ExecHarness {
     }
 
     ~ExecHarness() {
+        workflows.reset();
         responses.reset();
         instructions.reset();
         // PR 3: drop tracker BEFORE the bus — tracker borrows event_bus_,
@@ -251,7 +298,7 @@ struct ExecHarness {
         // a separate remove failure (e.g. file already gone, parent dir
         // missing) happens.
         std::error_code ec;
-        for (auto& p : {tracker_db, instr_db, resp_db}) {
+        for (auto& p : {tracker_db, instr_db, resp_db, wf_db}) {
             fs::remove(p, ec);
             fs::remove(p.string() + "-wal", ec);
             fs::remove(p.string() + "-shm", ec);
@@ -268,6 +315,24 @@ struct ExecHarness {
         d.action = "list";
         auto created = instructions->create_definition(d);
         REQUIRE(created.has_value());
+    }
+
+    /// CDX-FV-03: single-step workflow whose one step runs `instruction_id`.
+    /// Returns the engine-minted workflow id for the execute URL.
+    std::string make_workflow(const std::string& display_name, const std::string& instruction_id) {
+        REQUIRE(workflows); // constructed with with_workflow_engine=true
+        const std::string yaml = "kind: Workflow\n"
+                                 "metadata:\n"
+                                 "  displayName: " +
+                                 display_name +
+                                 "\n"
+                                 "spec:\n"
+                                 "  steps:\n"
+                                 "    - instruction: " +
+                                 instruction_id + "\n";
+        auto id = workflows->create_workflow(yaml);
+        REQUIRE(id.has_value());
+        return *id;
     }
 
     /// Create an execution row and return its id.
@@ -1595,4 +1660,141 @@ TEST_CASE("#2500 — an explicit agent_ids list wins over a broadcast request",
     CHECK(h.dispatch_calls == 1);
     REQUIRE(h.last_dispatch_agent_ids.size() == 1);
     CHECK(h.last_dispatch_agent_ids[0] == "agent-1");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// K-R7-02 — instruction execute dispatch confinement handoff
+//
+// POST /api/instructions/:id/execute now routes through the shared
+// `dispatch_confined` seam via the CONFINED 7-param command_dispatch_fn,
+// narrowing every arm to the operator's Execution:Execute visible set. As with
+// the MCP (CDX-R5-02) and dashboard (CDX-R7-02) handoff tests, this route-level
+// harness wires a MOCK dispatch, so it asserts the HANDOFF — the handler
+// derived the caller's visible set and threaded it in — while the per-arm
+// narrowing (filter_to_scope / in_scope) is pinned by the authz_model unit
+// tests and the single shared dispatch_confined seam.
+//
+// The sibling POST /api/workflows/:id/execute path threads the SAME
+// per-request `exec_visible` (derived once at the top of the handler) into its
+// inner step-dispatch lambda, and is covered by the CDX-FV-03 cases at the
+// bottom of this file. An earlier revision waived that route as
+// "disproportionate scaffolding"; it was not — WorkflowEngine's ctor is a
+// single sqlite3_open_v2 (workflow_engine.hpp:104), so the waiver is gone and
+// the route is tested, not asserted by inspection.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("K-R7-02 — instruction execute threads the caller's exec_visible into dispatch",
+          "[workflow][executions][execute][scope]") {
+    ExecHarness h;
+    h.make_def("def-CONF1", "conf1");
+    h.dispatch_cmd_override = "cmd-x";
+    h.dispatch_sent_override = 1;
+    // Service-scoped confinement: the caller can see only agent-A.
+    h.exec_visible_fn = [](const httplib::Request&) {
+        return yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+    };
+    // Target agent-B (an id-list arm), OUTSIDE the caller's visible set.
+    auto res = h.sink.Post("/api/instructions/def-CONF1/execute", R"({"agent_ids":["agent-B"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.dispatch_calls == 1);
+    REQUIRE(h.last_dispatch_agent_ids == std::vector<std::string>{"agent-B"});
+    // The handoff: a PRESENT (confined) set, agent-A in / agent-B out. The
+    // production dispatch_confined then drops agent-B via filter_to_scope.
+    REQUIRE(h.last_dispatch_exec_visible.has_value());
+    CHECK(h.last_dispatch_exec_visible->count("agent-A") == 1);
+    CHECK(h.last_dispatch_exec_visible->count("agent-B") == 0);
+}
+
+TEST_CASE("K-R7-02 — instruction execute broadcast still carries the caller's exec_visible",
+          "[workflow][executions][execute][scope]") {
+    ExecHarness h;
+    h.make_def("def-CONF3", "conf3");
+    h.dispatch_cmd_override = "cmd-z";
+    h.dispatch_sent_override = 1;
+    h.exec_visible_fn = [](const httplib::Request&) {
+        return yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+    };
+    // Omitted target → the handler names __all__ (broadcast). Even that composes
+    // with the visible set.
+    auto res = h.sink.Post("/api/instructions/def-CONF3/execute", R"({})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.dispatch_calls == 1);
+    CHECK(h.last_dispatch_scope == "__all__");
+    REQUIRE(h.last_dispatch_exec_visible.has_value());
+    CHECK(h.last_dispatch_exec_visible->count("agent-A") == 1);
+}
+
+TEST_CASE("K-R7-02 — instruction execute FAILS CLOSED when the exec-visible derivation is unwired",
+          "[workflow][executions][execute][scope][security]") {
+    // Genuinely UNWIRED ExecVisibleFn: the production handler must hand dispatch
+    // a PRESENT EMPTY visible set (deny all), never nullopt (unfiltered).
+    ExecHarness h(/*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/false);
+    h.make_def("def-CONF2", "conf2");
+    h.dispatch_cmd_override = "cmd-fc";
+    h.dispatch_sent_override = 1;
+    auto res = h.sink.Post("/api/instructions/def-CONF2/execute", R"({"agent_ids":["agent-A"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.dispatch_calls == 1);
+    REQUIRE(h.last_dispatch_exec_visible.has_value()); // PRESENT (deny), not nullopt
+    CHECK(h.last_dispatch_exec_visible->empty());       // EMPTY → production sink reaches no one
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CDX-FV-03 — workflow execute dispatch confinement handoff
+//
+// POST /api/workflows/:id/execute is the primary operator dispatch surface and
+// was the only one with no automated confinement test: loss of the `exec_visible`
+// value capture on the step-dispatch lambda, or of the seventh dispatch argument,
+// would have been unobserved. These cases pin the handoff at the route — the
+// per-arm narrowing itself stays with the shared `dispatch_confined` seam, as in
+// the K-R7-02 instruction cases above.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("CDX-FV-03 — workflow execute threads the caller's exec_visible into step dispatch",
+          "[workflow][executions][execute][scope]") {
+    ExecHarness h(/*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-WF1", "wf1");
+    auto wf_id = h.make_workflow("wf-conf-1", "def-WF1");
+    h.dispatch_cmd_override = "cmd-wf1";
+    h.dispatch_sent_override = 1;
+    // Service-scoped confinement: the caller can see only agent-A.
+    h.exec_visible_fn = [](const httplib::Request&) {
+        return yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+    };
+
+    // Target agent-B — an id-list arm OUTSIDE the caller's visible set. The
+    // route still forwards it; the production dispatch_confined drops it.
+    auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", R"({"agent_ids":["agent-B"]})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(h.dispatch_calls == 1);
+    REQUIRE(h.last_dispatch_agent_ids == std::vector<std::string>{"agent-B"});
+    // The handoff: a PRESENT (confined) set, agent-A in / agent-B out.
+    REQUIRE(h.last_dispatch_exec_visible.has_value());
+    CHECK(h.last_dispatch_exec_visible->count("agent-A") == 1);
+    CHECK(h.last_dispatch_exec_visible->count("agent-B") == 0);
+}
+
+TEST_CASE("CDX-FV-03 — workflow execute FAILS CLOSED when the exec-visible derivation is unwired",
+          "[workflow][executions][execute][scope][security]") {
+    // Genuinely UNWIRED ExecVisibleFn. ADR-0033 §1: the handler must hand step
+    // dispatch a PRESENT EMPTY visible set (deny all), never nullopt — nullopt
+    // means UNFILTERED at the shared seam, i.e. the whole fleet.
+    ExecHarness h(/*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/false,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-WF2", "wf2");
+    auto wf_id = h.make_workflow("wf-conf-2", "def-WF2");
+    h.dispatch_cmd_override = "cmd-wf2";
+    h.dispatch_sent_override = 1;
+
+    auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", R"({"agent_ids":["agent-A"]})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(h.dispatch_calls == 1);
+    REQUIRE(h.last_dispatch_exec_visible.has_value()); // PRESENT (deny), not nullopt
+    CHECK(h.last_dispatch_exec_visible->empty());      // EMPTY → production sink reaches no one
 }
