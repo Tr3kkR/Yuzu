@@ -3059,6 +3059,17 @@ Returns current configuration values and any active runtime overrides.
 > returned. `PUT /api/config/oidc_client_secret` sets it, and its 200 response omits
 > the value too.
 
+**Error (503) - runtime config store unavailable.** If the store is closed or failed to open, this
+returns 503 rather than an empty `overrides`, so a degraded store is never read as "nothing is
+configured". That distinction matters here specifically: this route no longer returns a secret's
+value, so key presence and `is_set` are the only way to answer "is the OIDC secret set on this
+server?" - the question [Security hardening](security-hardening.md#oidc-hardening) sends operators to
+before deciding whether to rotate.
+
+```json
+{ "error": { "code": 503, "message": "runtime configuration store unavailable" }, "meta": { "api_version": "v1" } }
+```
+
 **Response** (shape corrected - the handler returns `config`, `overrides` and
 `allowed_keys`, not a `data`/`meta` envelope):
 

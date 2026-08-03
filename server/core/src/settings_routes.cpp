@@ -3922,8 +3922,18 @@ void SettingsRoutes::register_routes(
         // an operator copies it out of the startup log or an API response, and the store
         // refuses it further down -- but by then cfg_ and the live provider have already
         // been updated, so the two would diverge behind a "saved" toast.
-        if (client_secret == RuntimeConfigStore::redacted_placeholder())
-            client_secret.clear();
+        // Trimmed for the COMPARISON only -- never for the value actually stored. An
+        // exact-match check lets a paste that picked up a trailing space or newline
+        // through both this guard and the store's, persisting it as the client secret
+        // and destroying the real one: precisely the outcome the guard exists to stop.
+        {
+            const auto b = client_secret.find_first_not_of(" \t\r\n");
+            const auto e = client_secret.find_last_not_of(" \t\r\n");
+            const std::string trimmed =
+                (b == std::string::npos) ? std::string{} : client_secret.substr(b, e - b + 1);
+            if (trimmed == RuntimeConfigStore::redacted_placeholder())
+                client_secret.clear();
+        }
         auto effective_secret = client_secret.empty() ? cfg_->oidc_client_secret : client_secret;
         bool skip_tls = (skip_tls_verify == "true");
 
@@ -3980,7 +3990,16 @@ void SettingsRoutes::register_routes(
         spdlog::info("OIDC provider reinitialized via Settings UI (issuer={})", issuer);
 
         std::vector<std::string> persist_errors;
-        if (runtime_config_store_ && runtime_config_store_->is_open()) {
+        // NO silent else. Guarding the whole persist block on is_open() and falling
+        // through to the success toast is the same false-success this fold exists to
+        // remove -- a degraded store would report "saved" for a save that never
+        // happened. A null store is recorded as an error here; a store that is merely
+        // not open reports itself, because every set() below returns "store not open"
+        // and the failure branch renders it (the DEX siblings at :3300/:3351 already
+        // rely on that and carry no is_open() guard).
+        if (!runtime_config_store_) {
+            persist_errors.emplace_back("store: runtime configuration store unavailable");
+        } else {
             auto who = std::string("admin");
             auto session = auth_fn_(req, res);
             if (session)
@@ -4008,9 +4027,16 @@ void SettingsRoutes::register_routes(
             // The live provider is already swapped in, but the store refused part of the
             // write, so the running config and the persisted config disagree and a restart
             // would silently revert. Say so instead of reporting success.
-            const std::string joined = persist_errors.size() == 1
-                                           ? persist_errors.front()
-                                           : std::to_string(persist_errors.size()) + " settings";
+            // Every component is a hardcoded key plus a fixed error literal -- no value
+            // is ever in here -- so there is no disclosure reason to collapse the list,
+            // and collapsing it discarded WHICH key failed from the one audit row that
+            // documents a partial persist.
+            std::string joined;
+            for (const auto& e : persist_errors) {
+                if (!joined.empty())
+                    joined += ", ";
+                joined += e;
+            }
             audit_fn_(req, "oidc.configure", "failure", "OidcConfig", issuer,
                       "persist failed: " + joined);
             auto html = render_directory_fragment() +
