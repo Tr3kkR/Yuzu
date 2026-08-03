@@ -16,7 +16,8 @@
 ///   * The replay ring is BOUNDED (Decision 15(d)). A cursor whose frames have
 ///     been evicted is never silently gapped: the caller 404s and the client
 ///     re-initializes, refetching durable state by `execution_id`.
-///   * A live stream re-validates its credential every heartbeat tick and dies
+///   * A live stream re-validates its credential once per tick (~3 s), independent
+///     of whether a heartbeat frame is emitted that tick, and dies
 ///     within one tick of a revocation (Decision 15(c)); an INDETERMINATE auth
 ///     backend (a blip, not a revocation) gets a bounded grace window instead of
 ///     a mass kill (Decision 15(i)).
@@ -333,15 +334,25 @@ public:
     std::uint64_t publish_ring_only(std::string_view event_type, std::string_view data) noexcept;
 
     /// Commit a streamed request's FINAL response frame: ring-only (as publish_ring_only)
-    /// AND eviction-EXEMPT (pinned) while the session lives, so a resume always recovers the
-    /// terminal even after the ring wraps (Decision 15(f), bounded one pending per streamed
-    /// request by kMaxStreamedPostsPerSession).
+    /// AND eviction-EXEMPT (pinned), so a resume recovers the terminal even after the ring
+    /// wraps (Decision 15(f), bounded one pending per streamed request by
+    /// kMaxStreamedPostsPerSession).
+    ///
+    /// The exemption holds for the **kMaxStreamedPostsPerSession most recent** pinned
+    /// terminals, not unconditionally: see the degraded case below.
     ///
     /// The pin is written only AFTER the frame commits, so a pre-commit failure leaves no
-    /// ghost pin and consumes no id. A committed final with no free pin slot (never expected -
-    /// the bridge caps streamed records at the pin count) still commits, unpinned, rather
-    /// than losing a real terminal. The pin is released by unpin() (final written on the POST
-    /// wire), by attach_and_replay when a cursor proves consumption (Last-Event-ID >= its id),
+    /// ghost pin and consumes no id. A committed final with no free pin slot should be
+    /// unreachable - the bridge admits streamed records against `pinned_count() + unpinned`
+    /// and this array is sized to exactly that cap - so reaching it means ADMISSION
+    /// ACCOUNTING HAS DRIFTED, reported by `yuzu_mcp_stream_pin_displaced_total` (alertable
+    /// on > 0). In that state the slots degrade as an LRU: the OLDEST pin yields to the
+    /// newest, because the newest terminal is the one a client is likeliest still waiting to
+    /// resume while the oldest has almost certainly been consumed. The displaced final stays
+    /// committed and delivered - it merely loses its eviction exemption.
+    ///
+    /// The pin is released by unpin() (final written on the POST wire), by attach_and_replay
+    /// when a cursor proves consumption (Last-Event-ID >= its id), by displacement as above,
     /// or with the whole object. Same return contract and boundary as publish().
     std::uint64_t publish_final(std::string_view event_type, std::string_view data) noexcept;
 
@@ -661,6 +672,17 @@ private:
     std::function<bool()> session_alive_;
     Config cfg_;
     yuzu::MetricsRegistry* metrics_ = nullptr;
+    ClockFn clock_; ///< copy of the injected clock; `grace_` owns the other one
+    /// When the next credential re-check falls due. SEEDED IN THE CTOR to
+    /// `now + cfg_.tick`, never left default-constructed: a default `time_point` is the
+    /// steady_clock EPOCH, which would make the first pass's wait budget zero and turn it
+    /// into an instant no-op pass. That is not hypothetical - it shipped on an earlier
+    /// attempt at this fix and silently invalidated the test that certified the wake path.
+    ///
+    /// This drives the GATE only. The DRAIN still runs on every wake, so progress reaches
+    /// the wire as it happens; only the two store round trips (credential re-validation and
+    /// the session TTL slide) ride the tick.
+    std::chrono::steady_clock::time_point next_check_{};
     // The credential re-validation grace policy (revoke/indeterminate/valid/stale, jitter,
     // #2367 staleness clamp). Owns all of the grace state + the injected clock; this pump keeps
     // only the wire action taken on its verdict. Constructed from cfg_ + the ClockFn.

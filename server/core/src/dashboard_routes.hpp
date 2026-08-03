@@ -19,6 +19,8 @@
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
+#include "authz_model.hpp" // yuzu::server::authz::VisibleSet (#1788 / CDX-R7-02)
+
 namespace yuzu::server {
 
 // Forward declarations
@@ -48,10 +50,25 @@ public:
     using AgentsJsonFn = std::function<std::string()>;
 
     /// Send command callback — dispatches a command and returns (command_id, agents_reached).
+    ///
+    /// CDX-R7-02: carries the caller's Execution:Execute visible set as a
+    /// trailing param so the dashboard execute surface narrows to it via the
+    /// shared `dispatch_confined` seam, exactly as /api/command and MCP do.
+    /// nullopt == unfiltered.
     using DispatchFn = std::function<std::pair<std::string, int>(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-        const std::unordered_map<std::string, std::string>& parameters)>;
+        const std::unordered_map<std::string, std::string>& parameters,
+        const yuzu::server::authz::VisibleSet& exec_visible)>;
+
+    /// CDX-R7-02: resolves the caller's Execution:Execute visible set from the
+    /// request (the dashboard execute handlers gate via `perm_fn_` and hold no
+    /// Session object at the dispatch site). Wired in server.cpp to a closure
+    /// that resolves the session and calls `derive_exec_visible`; an UNWIRED
+    /// callback fails CLOSED (the handler passes a present-EMPTY set — deny all,
+    /// never nullopt).
+    using ExecVisibleFn =
+        std::function<yuzu::server::authz::VisibleSet(const httplib::Request&)>;
 
     /// Resolve instruction text → (plugin, action). Empty strings on failure.
     using ResolveFn = std::function<std::pair<std::string, std::string>(
@@ -68,6 +85,7 @@ public:
                          detail::EventBus* event_bus,
                          AgentsJsonFn agents_json_fn,
                          DispatchFn dispatch_fn,
+                         ExecVisibleFn exec_visible_fn,
                          ResolveFn resolve_fn,
                          yuzu::MetricsRegistry* metrics = nullptr,
                          InstructionStore* instruction_store = nullptr);
@@ -88,6 +106,7 @@ public:
                          detail::EventBus* event_bus,
                          AgentsJsonFn agents_json_fn,
                          DispatchFn dispatch_fn,
+                         ExecVisibleFn exec_visible_fn,
                          ResolveFn resolve_fn,
                          yuzu::MetricsRegistry* metrics = nullptr,
                          InstructionStore* instruction_store = nullptr);
@@ -118,6 +137,7 @@ private:
     InstructionStore* instruction_store_{nullptr};
     AgentsJsonFn agents_json_fn_;
     DispatchFn dispatch_fn_;
+    ExecVisibleFn exec_visible_fn_;
     ResolveFn resolve_fn_;
     yuzu::MetricsRegistry* metrics_{nullptr};
 
