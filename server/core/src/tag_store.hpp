@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -56,6 +57,24 @@ public:
                          const std::unordered_map<std::string, std::string>& tags);
 
     void delete_all_tags(const std::string& agent_id);
+
+    /// nullopt == the store was unavailable OR the query itself failed to
+    /// PREPARE (a degraded db_, not "no agents"); a step-time failure mid-scan
+    /// is not distinguished from "no more rows" (pre-existing — not changed
+    /// here). Existing callers use the value_or({})-collapsing
+    /// `agents_with_tag` below; a caller for whom the prepare-failure
+    /// distinction is security-relevant (B-2b — a degraded tag DB must not
+    /// silently read as "genuinely zero agents" on a fail-closed confinement
+    /// path) should use this instead.
+    std::optional<std::vector<std::string>>
+    agents_with_tag_checked(const std::string& key, const std::string& value = {}) const;
+
+    /// Collapses `agents_with_tag_checked`'s nullopt (degraded) into an empty
+    /// vector — the pre-existing contract every current caller depends on.
+    /// Kept as the stable, unchecked entry point rather than widening this
+    /// signature: callers across the tree already destructure a plain
+    /// vector, and only the confinement seam in derive_exec_visible needs to
+    /// tell "no agents" from "could not ask".
     std::vector<std::string> agents_with_tag(const std::string& key,
                                              const std::string& value = {}) const;
 

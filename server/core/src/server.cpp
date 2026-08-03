@@ -90,6 +90,9 @@
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "dispatch_target_shape.hpp" // check_targeting_shape / targeting_supplied (#2500)
+#include "authz_model.hpp" // #1788: per-arm visibility intersection (in_scope/filter_to_scope)
+#include "dispatch_confined_arms.hpp" // the ONE per-arm intersection, shared with /api/command
+#include "dispatch_scope_ladder.hpp" // A-3/QE-2: the shared scope-resolution ladder + caller wiring
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -6230,6 +6233,208 @@ private:
                                                        agent_id);
     }
 
+    /// #1788: the per-caller Execution:Execute visible set (nullopt == unfiltered),
+    /// extracted verbatim from the `/api/command` handler so the MCP dispatch path
+    /// (execute_instruction / execute_bundle) can intersect against the SAME
+    /// confinement. Composes with — never re-decides — the frozen #1715/INV-7
+    /// lattice `RbacStore` already resolves; any store error narrows to "nothing
+    /// visible", never "everything" (fail-closed).
+    /// Resolve the facts, then hand the DECISION to the one pure composer
+    /// (`authz::compose_exec_visible`, authz_model.hpp). This function does
+    /// lookups only — it must contain no ordering logic, because the ordering
+    /// IS the CDX-001 fix and it belongs somewhere a test can reach without an
+    /// RbacStore. It previously lived here, which forced its tests to
+    /// re-implement it; the two copies diverged and the precedence ended up
+    /// composed by neither.
+    yuzu::server::authz::VisibleSet derive_exec_visible(const auth::Session& sess) {
+        yuzu::server::authz::ExecVisibleFacts facts;
+        facts.service_scoped = !sess.token_scope_service.empty();
+        if (facts.service_scoped) {
+            if (tag_store_) {
+                // B-2b: agents_with_tag_checked distinguishes "genuinely no
+                // agents carry this tag" (present, possibly empty) from "the
+                // tag DB is degraded" (nullopt on a missing connection or a
+                // failed prepare) — the plain agents_with_tag collapsed both
+                // to an empty vector, so a degraded read was indistinguishable
+                // from a legitimate empty answer.
+                // compose_exec_visible's own contract already treats both as
+                // deny-all (never unfiltered on a service-scoped token), so
+                // the DISPATCH outcome is unchanged; the distinction is what
+                // makes a degraded read observable instead of silently
+                // indistinguishable from "no agents" at /readyz.
+                if (auto svc = tag_store_->agents_with_tag_checked("service",
+                                                                   sess.token_scope_service)) {
+                    facts.service_tagged = std::unordered_set<std::string>(svc->begin(), svc->end());
+                } else {
+                    spdlog::error("derive_exec_visible: tag store degraded resolving service "
+                                 "scope '{}' — failing closed (deny-all), not open",
+                                 sess.token_scope_service);
+                    metrics_.counter("yuzu_server_tag_store_degraded_total",
+                                     {{"path", "derive_exec_visible"}})
+                        .increment();
+                    // service_tagged stays nullopt -> compose_exec_visible's
+                    // value_or({}) still denies all, same as a present-empty read.
+                }
+            }
+            // tag store absent -> service_tagged stays nullopt -> fail closed.
+            return yuzu::server::authz::compose_exec_visible(facts);
+        }
+        // Legacy-open is RBAC loaded-but-DISABLED. A null / load-failed store is
+        // NOT legacy-open (rbac_enforcement_in_effect returns true -> enforce),
+        // so a broken store stays fail-closed (BR-002).
+        facts.legacy_open = !rbac_enforcement_in_effect(rbac_store_.get());
+        facts.elevated = auth::is_elevated(sess);
+        facts.global_grant =
+            rbac_store_ && rbac_store_->check_permission(sess.username, "Execution", "Execute");
+        if (rbac_store_) {
+            if (auto v = rbac_store_->visible_agents_for_permission(
+                    sess.username, "Execution", "Execute", mgmt_group_store_.get()))
+                facts.scoped_visible = std::unordered_set<std::string>(v->begin(), v->end());
+            // else: store error -> scoped_visible stays nullopt -> fail closed.
+        }
+        return yuzu::server::authz::compose_exec_visible(facts);
+    }
+
+    /// A-3: the `ConfinedDispatchSink` literal both `dispatch_confined` and
+    /// `/api/command` built by hand — byte-identical apart from the local
+    /// name (`sink` vs `confined_sink`) — is the same sink because the two
+    /// callers dispatch through the SAME registry_. `cmd` is captured by
+    /// reference: the returned sink must not outlive it.
+    yuzu::server::ConfinedDispatchSink
+    make_confined_dispatch_sink(const detail::pb::CommandRequest& cmd) {
+        return yuzu::server::ConfinedDispatchSink{
+            [this, &cmd](const std::string& aid) { return registry_.send_to(aid, cmd); },
+            [this, &cmd] { return registry_.send_to_all(cmd); },
+            [this] {
+                // all_ids() copies only the ids under the registry lock — NOT
+                // to_json_obj()'s full 5-field-per-agent JSON serialisation under
+                // the heartbeat/dispatch hot-path mutex (gov perf-S2, the same
+                // rationale recorded at the inventory site ~12706). A confined
+                // operator broadcasting `__all__` is the enterprise-normal case.
+                return registry_.all_ids();
+            }};
+    }
+
+    /// The SINGLE confined dispatch seam — the one place the target "arm"
+    /// (Group / Scope / Ids / Broadcast / None) is resolved and a
+    /// `CommandRequest` is handed to `registry_`. Shared by the shared
+    /// `command_dispatch_fn` closure (background engines + REST + workflow),
+    /// the MCP `execute_instruction`/`execute_bundle` path, and the dashboard
+    /// execute closure — so a fifth caller cannot reintroduce an unconfined
+    /// copy of the arm logic (CDX-R7-02 / K-R7-02 / #1788).
+    ///
+    /// EVERY arm intersects the caller's `exec_visible` (nullopt == unfiltered):
+    /// a group / scope / id-list / broadcast is a TARGETING mechanism, never an
+    /// authz exemption (#1788). `broadcast_on_none` distinguishes callers whose
+    /// empty target means "reach nobody, a target was expected" (the shared
+    /// closure — `false`, #2500) from those whose UI/tool already normalised an
+    /// empty selection into a deliberate fleet broadcast (dashboard + MCP —
+    /// `true`). This is the seam #1714/#1715's core chokepoint will EXTEND, not
+    /// a per-route copy to be forked.
+    /// `principal_role` (C5): carried alongside `principal` on the
+    /// scope-evaluation audit rows this seam emits. Defaulted so the four
+    /// existing callers (all wired through Deps/DispatchFn shapes owned by
+    /// other files — dashboard_routes.hpp, mcp_server.hpp, PolicyEvaluator —
+    /// this wave does not touch) keep compiling unchanged and keep emitting
+    /// role="" exactly as before; a caller updated in a later wave to thread
+    /// its live session's role through can now do so without a second seam.
+    ///
+    /// CDX-P1-03/K-3 (adv-fix11): attempted widening McpServer::DispatchFn by
+    /// one param for exactly this — the session is already in scope at both
+    /// MCP call sites (execute_instruction, quarantine_device) via
+    /// ExecVisibleFn. Reverted: the typedef is reused verbatim by 18+ fake
+    /// DispatchFn lambdas in test_mcp_server.cpp alone (each would need
+    /// updating for a signature-only change), plus BundleOrchestrator::
+    /// DispatchFn (execute_bundle) is a SEPARATE, REST-shared typedef with no
+    /// role concept on its REST side — disproportionate blast radius for an
+    /// audit-completeness LOW both external reviewers graded non-blocking.
+    /// Still open for a future wave willing to touch those call sites.
+    std::pair<std::string, int> dispatch_confined(
+        const std::string& plugin, const std::string& action,
+        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+        const std::unordered_map<std::string, std::string>& parameters,
+        const std::string& execution_id,
+        const yuzu::server::authz::VisibleSet& exec_visible,
+        bool broadcast_on_none, const std::string& principal_role = {}) {
+        // Normalize action to lowercase — agent plugins register actions in
+        // lowercase and match case-sensitively (was implicit on the MCP path
+        // via upstream lowercasing; a safe superset here).
+        auto norm_action = action;
+        for (auto& c : norm_action)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        auto command_id =
+            plugin + "-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+
+        detail::pb::CommandRequest cmd;
+        cmd.set_command_id(command_id);
+        cmd.set_plugin(plugin);
+        cmd.set_action(norm_action);
+        for (const auto& [k, v] : parameters)
+            (*cmd.mutable_parameters())[k] = v;
+        agent_service_.record_send_time(command_id);
+        // PR 2 / UP2-4: register command_id -> execution_id BEFORE any RPC.
+        if (!execution_id.empty()) {
+            agent_service_.record_execution_id(command_id, execution_id);
+        }
+
+        // Same classifier as the /api/command handler (#2500): an explicit
+        // agent_ids list ALWAYS wins over a broadcast request; `__all__` is
+        // treated as "no scope expression", never a first-wins broadcast.
+        // Computed here (in addition to inside resolve_and_dispatch_confined,
+        // which is pure and cheap to call twice) ONLY to decide the
+        // None-arm observability below, which is specific to this seam and
+        // not something dispatch_confined_arms itself emits.
+        const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+        if (arm == DispatchArm::None && !broadcast_on_none) {
+            // Shared closure: NO TARGET NAMED AT ALL — reach NOBODY, not
+            // everybody (#2500). COUNTED, not just logged: this branch is
+            // the last line of defence across all callers that dispatch as
+            // system, and an unintended fleet-wide dispatch that reports
+            // success is the worst failure available. There is no `req`
+            // here (background runners call this too), so the counter is
+            // the durable signal — no audit row is possible.
+            metrics_
+                .counter("yuzu_server_dispatch_target_rejected_total",
+                         {{"route", "dispatch_closure"},
+                          {"reason", std::string(kReasonClosureNoTarget)}})
+                .increment();
+            spdlog::warn("dispatch {}:{} named no target (no agent_ids, no scope) — reaching "
+                         "no agents; pass scope \"{}\" to broadcast deliberately",
+                         plugin, norm_action, kBroadcastScope);
+        }
+
+        // K-1/QE-2: the ladder resolution + per-arm visible-set intersection
+        // (A-3) is the ONE call every caller makes — no per-arm branch is
+        // hand-rolled here. The resolvers-and-sink WIRING itself (previously
+        // inline here) is extracted to `wire_and_dispatch_confined`
+        // (dispatch_scope_ladder.hpp) so it is callable — and testable — with
+        // a real AgentRegistry independent of ServerImpl. A parse failure has
+        // no `res` to answer on this path (matching pre-existing behaviour):
+        // reach nobody, no audit.
+        const auto [ignored_command_id, sent] = yuzu::server::wire_and_dispatch_confined(
+            registry_, mgmt_group_store_.get(), result_set_store_.get(), tag_store_.get(),
+            custom_properties_store_.get(), execution_tracker_.get(),
+            [this](const std::string& principal, const std::string& role,
+                   const std::string& cmd_id, const std::string& ref) {
+                // Governance M1: BINDING owner check — a failing ref aborts
+                // dispatch (see the REST raw-dispatch site's comment).
+                audit_scope_resolution_failed(principal, role, cmd_id, ref);
+            },
+            [this](const std::string& principal, const std::string& role,
+                   const std::string& cmd_id, const std::string& reason) {
+                audit_scope_evaluation_aborted(principal, role, cmd_id, reason);
+            },
+            command_id, execution_id, principal_role, agent_ids, scope_expr, exec_visible,
+            broadcast_on_none, cmd);
+        (void)ignored_command_id; // always == command_id, minted above
+
+        forward_gateway_pending();
+        if (sent > 0)
+            metrics_.counter("yuzu_commands_dispatched_total").increment();
+        return {command_id, sent};
+    }
+
     /// #1634: the SINGLE per-agent Response-scope predicate — every Response:Read
     /// fan-out reader routes through this (legacy `/api/responses/*`, the REST
     /// visualization ResponseScopeFn, and the MCP query_responses/aggregate_responses
@@ -8840,6 +9045,40 @@ private:
                 }
             }
 
+            // ── #1788: per-device visibility on EVERY dispatch arm ──────────────
+            // Everything above gates a possibly-GLOBAL Execution:Execute (or the
+            // destructive-action securable) and, for the destructive list only,
+            // narrows `agent_ids` to a coarser ManagementGroupStore visibility.
+            // Nothing narrowed the actual send set on ANY of the four dispatch
+            // arms below (explicit agent_ids, broadcast, Group, Scope) to the
+            // operator's own Execution:Execute visibility — a management-group-
+            // confined operator could reach a device outside their confinement
+            // through any of them. Derive ONE permission-specific visible set
+            // here and intersect every arm against it before send_to
+            // (`yuzu::server::authz::in_scope`/`filter_to_scope`).
+            //
+            // Composition mirrors `RbacStore::check_scoped_permission`'s OWN
+            // internal order (global first, else the ADR-0017 scoped set) —
+            // #1715(b): a global ALLOW overrides any group deny, so it is read
+            // via the SAME public `check_permission` call, never re-derived.
+            // JIT admin elevation and a service-scoped token's ITServiceOwner
+            // grant are the two OTHER ways `require_permission` above already
+            // admits a caller with no matching `principal_roles` row (neither
+            // is stored as a group-scoped grant `visible_agents_for_permission`
+            // could see) — both are treated as unfiltered here too, or a caller
+            // `require_permission` deliberately admitted would be silently
+            // emptied out below. Fail-closed: any store error narrows to
+            // "nothing visible", never "everything" — never re-decides the
+            // frozen #1715/INV-7 precedence those RbacStore calls already
+            // resolve, only composes on top of it.
+            auto sess = require_auth(req, res);
+            if (!sess)
+                return; // require_auth already wrote the response
+
+            // D3: the no-agent 503 short-circuit sits BEFORE deriving
+            // exec_visible — that derivation runs an RBAC/tag-store lookup
+            // that is wasted work on the (common, cheap-to-detect) no-agent
+            // path, which never reaches a dispatch decision anyway.
             if (!registry_.has_any()) {
                 res.status = 503;
                 res.set_content(
@@ -8847,6 +9086,8 @@ private:
                     "application/json");
                 return;
             }
+
+            yuzu::server::authz::VisibleSet exec_visible = derive_exec_visible(*sess);
 
             auto command_id =
                 plugin + "-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
@@ -8890,17 +9131,34 @@ private:
             // sibling instruction-execute route broadcast on the same string. One
             // advertised scope kind must not mean two things across sibling REST
             // routes (governance, security MEDIUM).
+            // #1788: the injected sink shared with `ServerImpl::dispatch_confined`
+            // (dispatch_confined_arms.hpp / A-3's make_confined_dispatch_sink).
+            // This route keeps its own target resolution, audit rows and HTTP
+            // shaping — which is why it is not simply absorbed by that seam —
+            // but the DECISION OF WHO IS REACHED is the shared one, so the two
+            // can no longer drift.
+            const auto confined_sink = make_confined_dispatch_sink(cmd);
+            const auto dispatch_broadcast = [&]() -> int {
+                return yuzu::server::dispatch_confined_arms(
+                    yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
+                    /*broadcast_on_none=*/true, confined_sink);
+            };
+
             const auto arm = yuzu::server::classify_dispatch_arm(!agent_ids.empty(), scope_expr);
             if (arm == yuzu::server::DispatchArm::Group) {
-                // Group-based dispatch — resolve group members
+                // Group-based dispatch — resolve group members here, then let the
+                // shared seam intersect (#1788): a management group is a targeting
+                // mechanism, not an authz exemption from it.
                 auto group_id = scope_expr.substr(6);
-                if (mgmt_group_store_) {
-                    auto members = mgmt_group_store_->get_members(group_id);
-                    for (const auto& m : members) {
-                        if (registry_.send_to(m.agent_id, cmd))
-                            ++sent;
-                    }
-                }
+                std::vector<std::string> members;
+                if (mgmt_group_store_)
+                    for (const auto& m : mgmt_group_store_->get_members(group_id))
+                        members.push_back(m.agent_id);
+                yuzu::server::ConfinedDispatchTargets t;
+                t.group_members = &members;
+                sent = yuzu::server::dispatch_confined_arms(arm, t, exec_visible,
+                                                            /*broadcast_on_none=*/true,
+                                                            confined_sink);
             } else if (arm == yuzu::server::DispatchArm::Scope) {
                 // Scope expression dispatch.
                 // Owner principal for from_result_set: resolution (review B1).
@@ -8911,85 +9169,72 @@ private:
                     principal = s->username;
                     principal_role = auth::role_to_string(s->role);
                 }
-                // Resolve from_result_set: aliases against the operator's owned
-                // sets before parsing (PR-E): the scope resolver does not.
-                // ADR-0036 fail-closed contract: a DB error at ANY step below
-                // ABORTS this branch — `sent` stays 0, so the shared
-                // "sent == 0 -> 503" fallback below fires. Leaving an atom
-                // unresolved or a preload partial would silently no-match
-                // downstream and, under a NOT combinator, invert to
-                // match-the-entire-fleet (the concrete fail-open this guards).
-                auto resolved_scope =
-                    resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
-                if (!resolved_scope) {
-                    spdlog::error("scope dispatch: resolve_scope_aliases degraded ({})",
-                                  to_string(resolved_scope.error()));
-                    audit_scope_evaluation_aborted(principal, principal_role, command_id,
-                                                   "db_degraded");
-                } else {
-                    // Forensic row when a referenced set is absent/expired/unowned
-                    // (design §7 rule 3) — and, per governance M1 (2026-07-29),
-                    // the check is BINDING: a failing ref ABORTS dispatch. The
-                    // prior audit-then-dispatch-anyway behaviour let
-                    // `NOT from_result_set:<absent-or-unowned-id>` proceed with
-                    // the atom resolving no-match for every agent — which NOT
-                    // inverts to match-ALL: an operator-intent inversion (the
-                    // successful-empty read from member_set_owned is
-                    // deliberately absent/unowned-indistinguishable, so the
-                    // owner check here is the only seam that can refuse).
-                    std::vector<std::string> failing_refs;
-                    const auto gate = gate_scope_dispatch(*resolved_scope, principal,
-                                                          result_set_store_.get(), failing_refs);
-                    if (gate == ScopeDispatchGate::AbortDbDegraded) {
-                        spdlog::error("scope dispatch: owner-check scan degraded");
-                        audit_scope_evaluation_aborted(principal, principal_role, command_id,
-                                                       "db_degraded");
-                    } else if (gate == ScopeDispatchGate::AbortOwnerCheck) {
-                        for (const auto& ref : failing_refs)
-                            audit_scope_resolution_failed(principal, principal_role, command_id,
-                                                          ref);
-                        audit_scope_evaluation_aborted(principal, principal_role, command_id,
-                                                       "owner_check_failed");
-                    } else {
-                        auto parsed = yuzu::scope::parse(*resolved_scope);
-                        if (!parsed) {
-                            res.status = 400;
-                            res.set_content(nlohmann::json(
-                                                {{"error", "invalid scope: " + parsed.error()}})
-                                                .dump(),
-                                            "application/json");
-                            return;
-                        }
-                        if (auto matched_ids = registry_.evaluate_scope(
-                                *parsed, tag_store_.get(), custom_properties_store_.get(),
-                                result_set_store_.get(), principal)) {
-                            for (const auto& aid : *matched_ids) {
-                                if (registry_.send_to(aid, cmd)) {
-                                    ++sent;
-                                }
-                            }
-                        } else {
-                            spdlog::error("scope dispatch: evaluate_scope degraded (result-set "
-                                          "membership preload failed)");
-                            // B2: evaluate_scope's own guard order means a nullopt with an
-                            // empty principal is ALWAYS the principal_unresolved case (it
-                            // aborts before ever touching the store); a non-empty principal
-                            // means the abort came from a genuine member_set_owned DB error.
-                            audit_scope_evaluation_aborted(
-                                principal, principal_role, command_id,
-                                principal.empty() ? "principal_unresolved" : "db_degraded");
-                        }
-                    }
+                // A-3: the ladder itself (alias resolution -> owner-check gate
+                // -> parse -> registry evaluation, each step fail-closed per
+                // ADR-0036) is the ~55 lines that were byte-identical with
+                // `ServerImpl::dispatch_confined`'s Scope arm — shared now via
+                // `resolve_scope_targets` (dispatch_scope_ladder.hpp). A DB
+                // error or failed owner check at any step ABORTS (nullopt),
+                // `sent` stays 0, and the shared "sent == 0 -> 503" fallback
+                // below fires. This route ALONE reacts to a parse failure with
+                // its own 400 (no `res` to write to on the dispatch_confined
+                // side), which is why it is not simply absorbed by that seam.
+                yuzu::server::ScopeLadderAudit audit;
+                audit.resolution_failed = [this, &principal, &principal_role,
+                                           &command_id](const std::string& ref) {
+                    audit_scope_resolution_failed(principal, principal_role, command_id, ref);
+                };
+                audit.evaluation_aborted = [this, &principal, &principal_role,
+                                            &command_id](const std::string& reason) {
+                    audit_scope_evaluation_aborted(principal, principal_role, command_id, reason);
+                };
+                auto ladder = yuzu::server::resolve_scope_targets(
+                    scope_expr, principal, result_set_store_.get(),
+                    [this, &principal](const yuzu::scope::Expression& parsed) {
+                        return registry_.evaluate_scope(parsed, tag_store_.get(),
+                                                        custom_properties_store_.get(),
+                                                        result_set_store_.get(), principal);
+                    },
+                    audit);
+                if (ladder.parse_error) {
+                    res.status = 400;
+                    res.set_content(
+                        nlohmann::json({{"error", "invalid scope: " + *ladder.parse_error}})
+                            .dump(),
+                        "application/json");
+                    return;
                 }
+                if (ladder.matched) {
+                    // #1788: a scope match is a targeting mechanism, not an
+                    // authz exemption — the shared seam intersects it against
+                    // the operator's Execution:Execute visible set before
+                    // dispatch.
+                    yuzu::server::ConfinedDispatchTargets t;
+                    t.scope_matched = &*ladder.matched;
+                    sent = yuzu::server::dispatch_confined_arms(
+                        arm, t, exec_visible, /*broadcast_on_none=*/true, confined_sink);
+                }
+                // else: the ladder already audited the abort (db_degraded /
+                // owner_check_failed / principal_unresolved) — sent stays 0.
             } else if (arm == yuzu::server::DispatchArm::Ids) {
-                for (const auto& aid : agent_ids) {
-                    if (registry_.send_to(aid, cmd)) {
-                        ++sent;
-                    }
-                }
+                // #1788: an explicit id list is the arm #1788 named directly —
+                // the shared seam intersects it against the operator's
+                // Execution:Execute visible set before dispatch; a hidden id is
+                // silently dropped, not an error (matching how a scope/group
+                // match that resolves to nothing behaves here — the shape check
+                // above already refused an EMPTY supplied list, this is a
+                // non-empty list narrowed by visibility, a different thing).
+                yuzu::server::ConfinedDispatchTargets t;
+                t.agent_ids = &agent_ids;
+                sent = yuzu::server::dispatch_confined_arms(arm, t, exec_visible,
+                                                            /*broadcast_on_none=*/true,
+                                                            confined_sink);
             } else if (arm == yuzu::server::DispatchArm::Broadcast) {
-                // Explicitly asked for the fleet by its published name.
-                sent = registry_.send_to_all(cmd);
+                // Explicitly asked for the fleet by its published name — #1788
+                // still narrows delivery to the operator's visible set; the
+                // NAME `__all__` is preserved (never rejected, never reread as
+                // "no target"), only the SEND SET composes with visibility.
+                sent = dispatch_broadcast();
             } else {
                 // Broadcast ONLY when the caller named no target at all (#2500).
                 // A target that was SUPPLIED but resolved to nothing must never
@@ -9046,7 +9291,10 @@ private:
                     res.set_content(err.dump(), "application/json");
                     return;
                 }
-                sent = registry_.send_to_all(cmd);
+                // #1788: an omitted target means "the whole fleet" (#2500) —
+                // still narrowed to the operator's visible set, same as the
+                // named Broadcast arm above.
+                sent = dispatch_broadcast();
             }
 
             // Forward commands queued for gateway agents
@@ -9089,21 +9337,21 @@ private:
                           [this](const httplib::Request& req, httplib::Response& res) {
                               if (!require_permission(req, res, "Execution", "Execute"))
                                   return;
-                              forward_legacy_command("chargen", "chargen_start", res);
+                              forward_legacy_command(req, "chargen", "chargen_start", res);
                           });
 
         web_server_->Post("/api/chargen/stop",
                           [this](const httplib::Request& req, httplib::Response& res) {
                               if (!require_permission(req, res, "Execution", "Execute"))
                                   return;
-                              forward_legacy_command("chargen", "chargen_stop", res);
+                              forward_legacy_command(req, "chargen", "chargen_stop", res);
                           });
 
         web_server_->Post("/api/procfetch/fetch",
                           [this](const httplib::Request& req, httplib::Response& res) {
                               if (!require_permission(req, res, "Execution", "Execute"))
                                   return;
-                              forward_legacy_command("procfetch", "procfetch_fetch", res);
+                              forward_legacy_command(req, "procfetch", "procfetch_fetch", res);
                           });
 
         web_server_->Get(
@@ -9540,7 +9788,8 @@ private:
 
         web_server_->Post("/api/tags/set", [this](const httplib::Request& req,
                                                   httplib::Response& res) {
-            if (!require_permission(req, res, "Tag", "Write"))
+            // CDX-R4-02: authenticate BEFORE any store/body work (401 first).
+            if (!require_auth(req, res))
                 return;
             if (!tag_store_) {
                 res.status = 503;
@@ -9570,6 +9819,17 @@ private:
                 return;
             }
 
+            // K-04/CDX-R4-08: per-TARGET authorization -- NOT a global Tag:Write
+            // gate. The old require_permission("Tag","Write") admitted a
+            // service-scoped token on its ITServiceOwner grant with no target
+            // check, so a service-A token could rewrite the `service` tag on a
+            // service-B agent and escape its own #1788 dispatch confinement (and
+            // it 403'd management-group-scoped operators). require_scoped_permission
+            // enforces Tag:Write scoped to agent_id, the same gate the REST v1
+            // twin (rest_api_v1.cpp) and MCP set_tag (mcp_server.cpp) use.
+            if (!require_scoped_permission(req, res, "Tag", "Write", agent_id))
+                return;
+
             tag_store_->set_tag(agent_id, key, value, "api");
             if (key == "service")
                 ensure_service_management_group(value);
@@ -9594,7 +9854,8 @@ private:
 
         web_server_->Post("/api/tags/delete", [this](const httplib::Request& req,
                                                      httplib::Response& res) {
-            if (!require_permission(req, res, "Tag", "Delete"))
+            // CDX-R4-02: authenticate BEFORE any store/body work (401 first).
+            if (!require_auth(req, res))
                 return;
             if (!tag_store_) {
                 res.status = 503;
@@ -9614,6 +9875,13 @@ private:
                     "application/json");
                 return;
             }
+
+            // K-04/CDX-R4-08: per-TARGET authorization (see /api/tags/set) --
+            // a service-scoped token must not delete a tag on an out-of-scope
+            // agent, and a group-scoped operator must be admitted on in-scope
+            // targets. Same gate as the REST v1 twin and MCP delete_tag.
+            if (!require_scoped_permission(req, res, "Tag", "Delete", agent_id))
+                return;
 
             bool deleted = tag_store_->delete_tag(agent_id, key);
             (void)audit_log(req, "tag.delete", deleted ? "success" : "not_found", "tag",
@@ -11647,165 +11915,30 @@ private:
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& parameters,
                    const std::string& execution_id) -> std::pair<std::string, int> {
-            // Normalize action to lowercase — agent plugins register actions
-            // in lowercase and match case-sensitively.
-            auto norm_action = action;
-            for (auto& c : norm_action)
-                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            auto command_id =
-                plugin + "-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
-            detail::pb::CommandRequest cmd;
-            cmd.set_command_id(command_id);
-            cmd.set_plugin(plugin);
-            cmd.set_action(norm_action);
-            for (const auto& [k, v] : parameters)
-                (*cmd.mutable_parameters())[k] = v;
-            agent_service_.record_send_time(command_id);
-            // PR 2 / UP2-4: register command_id -> execution_id BEFORE any RPC.
-            if (!execution_id.empty()) {
-                agent_service_.record_execution_id(command_id, execution_id);
-            }
-            int sent = 0;
-            // Broadcast is something a caller ASKS FOR by name (#2500).
-            // `__all__` is not new vocabulary: the MCP closure below has always
-            // special-cased it, and this closure's own callers already
-            // described their untargeted path as "__all__" in their comments —
-            // they simply passed empty and relied on the fall-through.
-            //
-            // ORDERING IS LOAD-BEARING and mirrors the MCP closure exactly:
-            // `__all__` is treated as "no scope expression", NOT as a
-            // first-wins broadcast. An earlier revision of this commit put the
-            // broadcast branch at the TOP of the chain, which made
-            // {agent_ids:["a"], scope:"__all__"} reach the whole fleet here
-            // while the MCP closure reached exactly agent "a" — a widening
-            // introduced by the commit that exists to remove widenings, and a
-            // fourth dialect of a token that already had three. An explicit id
-            // list must always win over a broadcast request.
-            const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
-            if (arm == DispatchArm::Group) {
-                auto group_id = scope_expr.substr(6);
-                if (mgmt_group_store_) {
-                    auto members = mgmt_group_store_->get_members(group_id);
-                    for (const auto& m : members)
-                        if (registry_.send_to(m.agent_id, cmd))
-                            ++sent;
-                }
-            } else if (arm == DispatchArm::Scope) {
-                // from_result_set: is owner-scoped; recover the dispatching
-                // operator from the execution row (run_async / workflow /
-                // scheduled all create it with dispatched_by before dispatch).
-                // This is how owner-checked result-set resolution reaches the
-                // tracked dispatch paths without threading a param through the
-                // shared CommandDispatchFn (review finding B1).
-                std::string principal;
-                if (scope_expr.find("from_result_set:") != std::string::npos &&
-                    !execution_id.empty() && execution_tracker_) {
-                    if (auto ex = execution_tracker_->get_execution(execution_id))
-                        principal = ex->dispatched_by;
-                }
-                // Resolve from_result_set: aliases at the dispatch layer (PR-E).
-                // ADR-0036 fail-closed contract: a DB error at ANY step below
-                // (alias resolve / owner-check probe / membership preload)
-                // ABORTS this branch — `sent` stays 0 and the caller's normal
-                // "0 agents reached" handling applies. Leaving an atom
-                // unresolved or a preload partial would silently no-match
-                // downstream and, under a NOT combinator, invert to
-                // match-the-entire-fleet (the concrete fail-open this guards).
-                auto resolved_scope =
-                    resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
-                if (!resolved_scope) {
-                    spdlog::error("scope dispatch: resolve_scope_aliases degraded ({})",
-                                  to_string(resolved_scope.error()));
-                    audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,
-                                                   "db_degraded");
-                } else {
-                    // Role is not available on the tracked path (principal recovered
-                    // from the execution row, no live session); principal + command
-                    // id still identify the actor for the forensic chain.
-                    std::vector<std::string> failing_refs;
-                    const auto gate = gate_scope_dispatch(*resolved_scope, principal,
-                                                          result_set_store_.get(), failing_refs);
-                    if (gate == ScopeDispatchGate::AbortDbDegraded) {
-                        spdlog::error("scope dispatch: owner-check scan degraded");
-                        audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,
-                                                       "db_degraded");
-                    } else if (gate == ScopeDispatchGate::AbortOwnerCheck) {
-                        // Governance M1: BINDING owner check — a failing ref
-                        // aborts dispatch (see the REST raw-dispatch site's
-                        // comment for the NOT-inversion rationale).
-                        for (const auto& ref : failing_refs)
-                            audit_scope_resolution_failed(principal, /*role=*/"", command_id, ref);
-                        audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,
-                                                       "owner_check_failed");
-                    } else {
-                        auto parsed = yuzu::scope::parse(*resolved_scope);
-                        if (parsed) {
-                            if (auto matched = registry_.evaluate_scope(
-                                    *parsed, tag_store_.get(), custom_properties_store_.get(),
-                                    result_set_store_.get(), principal)) {
-                                for (const auto& aid : *matched)
-                                    if (registry_.send_to(aid, cmd))
-                                        ++sent;
-                            } else {
-                                spdlog::error("scope dispatch: evaluate_scope degraded (result-set "
-                                              "membership preload failed)");
-                                // B2: see the raw-dispatch site's identical comment — an
-                                // empty principal here means evaluate_scope aborted on the
-                                // principal_unresolved guard, never a DB error.
-                                audit_scope_evaluation_aborted(
-                                    principal, /*role=*/"", command_id,
-                                    principal.empty() ? "principal_unresolved" : "db_degraded");
-                            }
-                        }
-                    }
-                }
-            } else if (arm == DispatchArm::Ids) {
-                for (const auto& aid : agent_ids)
-                    if (registry_.send_to(aid, cmd))
-                        ++sent;
-            } else if (arm == DispatchArm::Broadcast) {
-                sent = registry_.send_to_all(cmd);
-            } else {
-                // NO TARGET NAMED AT ALL — reach NOBODY, not everybody (#2500).
-                //
-                // This closure has TEN callers (governance corrected an earlier
-                // count of eight: DexRoutes and TarTreeRoutes reach it through
-                // 5-param adapters). Eight were safe only because eight authors
-                // each remembered to guard their own inputs, and the two that
-                // did not were the pair #2500 was filed about. That is a single
-                // point of failure with a ten-way surface, and the failure mode
-                // is the worst one available: an unintended fleet-wide dispatch
-                // that reports success.
-                //
-                // Inverting the default makes the eleventh caller's omission
-                // harmless. Every caller that legitimately broadcasts names
-                // kBroadcastScope — a grep-able request, not the residue of an
-                // empty vector.
-                //
-                // No behaviour changed when this landed: every existing caller
-                // either guards its inputs, passes a specific id, or was updated
-                // in the same commit to name the sentinel.
-                // COUNTED, not just logged. This branch is the actual last line
-                // of defence across all ten callers of this closure, and it had
-                // strictly weaker observability than the `/api/command` inline
-                // branch that this PR's own argument called dead code — an
-                // invisible refusal cannot reach the alert this change ships
-                // (governance, SRE). There is no `req` here, so no audit row is
-                // possible: this closure is called by background runners as well
-                // as routes, and a fabricated request context would be worse
-                // evidence than none. The counter is the durable signal.
-                metrics_
-                    .counter("yuzu_server_dispatch_target_rejected_total",
-                             {{"route", "dispatch_closure"}, {"reason", std::string(kReasonClosureNoTarget)}})
-                    .increment();
-                spdlog::warn("dispatch {}:{} named no target (no agent_ids, no scope) — reaching "
-                             "no agents; pass scope \"{}\" to broadcast deliberately",
-                             plugin, norm_action, kBroadcastScope);
-            }
-            forward_gateway_pending();
-            if (sent > 0)
-                metrics_.counter("yuzu_commands_dispatched_total").increment();
-            return {command_id, sent};
+            // Background engines + legacy callers dispatch as SYSTEM (unfiltered):
+            // exec_visible = nullopt. Operator surfaces that must confine call the
+            // 7-param command_dispatch_confined_fn (below) instead. Both funnel
+            // through the ONE dispatch_confined seam. broadcast_on_none=false: an
+            // unnamed target here reaches nobody (#2500), never the fleet.
+            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
+                                     execution_id, /*exec_visible=*/std::nullopt,
+                                     /*broadcast_on_none=*/false);
+        };
+
+        // #1788 / CDX-R7-02 / K-R7-02: the operator-facing confined entry.
+        // Identical to command_dispatch_fn but carries the caller's
+        // Execution:Execute visible set so dashboard + workflow dispatch narrow
+        // to it, exactly as /api/command and MCP do. Same seam
+        // (dispatch_confined), one extra parameter.
+        auto command_dispatch_confined_fn =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                   const std::unordered_map<std::string, std::string>& parameters,
+                   const std::string& execution_id,
+                   const yuzu::server::authz::VisibleSet& exec_visible)
+            -> std::pair<std::string, int> {
+            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
+                                     execution_id, exec_visible, /*broadcast_on_none=*/false);
         };
 
         // PolicyEvaluator — drives the compliance check -> verdict pipeline.
@@ -13059,98 +13192,29 @@ private:
             *web_server_, auth_fn, perm_fn, audit_fn, response_store_.get(),
             mgmt_group_store_.get(), &registry_, tag_store_.get(), &event_bus_,
             [this]() -> std::string { return registry_.to_json(); },
-            // DispatchFn — reuses /api/command dispatch logic
+            // DispatchFn — the dashboard execute surface, now routed through the
+            // shared dispatch_confined seam exactly as /api/command and MCP are.
             //
-            // Fed into DashboardRoutes (legacy /api/command UI surface);
-            // signature MUST stay at 5 parameters. The MCP and REST
-            // execute-instruction surfaces have their own 6-parameter
-            // dispatch closures (see server.cpp ~5812 for WorkflowRoutes
-            // and ~6032 for McpServer) with `execution_id` threaded
-            // through for the ExecutionTracker mapping (PR 2 UP2-4
-            // race close + #1088 agentic-first bridging).
+            // CDX-R7-02: carries the operator's Execution:Execute visible set
+            // (`exec_visible`, derived per-request by the ExecVisibleFn below)
+            // and narrows every arm to it — a management group / scope / id-list
+            // / broadcast is a targeting mechanism, never an authz exemption
+            // (#1788). execution_id is empty (dashboard is the legacy untracked
+            // UI path). broadcast_on_none=true preserves the legacy UI contract
+            // that an OMITTED `scope` means the whole fleet. It is NOT about
+            // `__all__`: dashboard_routes passes that through by name (the
+            // Broadcast arm), and refuses a supplied-but-empty `scope=`, so None
+            // reaches here only when no targeting argument was supplied at all.
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-                   const std::unordered_map<std::string, std::string>& parameters)
+                   const std::unordered_map<std::string, std::string>& parameters,
+                   const yuzu::server::authz::VisibleSet& exec_visible)
                 -> std::pair<std::string, int> {
-                auto command_id =
-                    plugin + "-" +
-                    auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
-
-                detail::pb::CommandRequest cmd;
-                cmd.set_command_id(command_id);
-                cmd.set_plugin(plugin);
-                cmd.set_action(action);
-                for (const auto& [k, v] : parameters)
-                    (*cmd.mutable_parameters())[k] = v;
-                agent_service_.record_send_time(command_id);
-
-                int sent = 0;
-                // Same classifier as the other three sinks (#2500). This
-                // closure KEEPS broadcast-on-unnamed: dashboard_routes.cpp maps
-                // its form's `__all__` selection to empty+empty before calling,
-                // so `None` here means the operator picked "all agents" in the
-                // UI. Routed through the shared function anyway so a future
-                // refactor pointing this at command_dispatch_fn — whose `None`
-                // reaches nobody — becomes a visible decision rather than a
-                // silent conversion of every dashboard fleet-execute to a no-op.
-                //
-                // ONE ARM DID CHANGE, contrary to what an earlier version of
-                // this comment claimed: a literal `scope_expr == "__all__"` used
-                // to reach the Scope arm, fail `scope::parse`, and dispatch to
-                // NOBODY. It now broadcasts, matching every other sink. That is
-                // unreachable today because dashboard_routes.cpp strips the
-                // sentinel before calling, and it is the behaviour we want if it
-                // ever becomes reachable — but "no arm changed" was not true and
-                // is exactly the kind of preservation claim this PR keeps
-                // getting wrong (governance, consistency).
-                const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
-                if (arm == DispatchArm::Group) {
-                    auto group_id = scope_expr.substr(6);
-                    if (mgmt_group_store_) {
-                        auto members = mgmt_group_store_->get_members(group_id);
-                        for (const auto& m : members) {
-                            if (registry_.send_to(m.agent_id, cmd))
-                                ++sent;
-                        }
-                    }
-                } else if (arm == DispatchArm::Scope) {
-                    auto parsed = yuzu::scope::parse(scope_expr);
-                    if (parsed) {
-                        // B2 (2026-07-26): this closure has NO principal seam at all —
-                        // a from_result_set: scope here can NEVER be owner-resolved, so
-                        // evaluate_scope's principal_unresolved guard fires and returns
-                        // nullopt. value_or({}) correctly collapses that to "0 targets"
-                        // (never a fail-open — see evaluate_scope's header contract), but
-                        // the abort must still be audited/counted (B4) so it isn't
-                        // silently indistinguishable from a genuine "0 matched".
-                        auto matched_opt = registry_.evaluate_scope(
-                            *parsed, tag_store_.get(), custom_properties_store_.get(),
-                            result_set_store_.get());
-                        if (!matched_opt)
-                            audit_scope_evaluation_aborted(/*principal=*/"", /*role=*/"",
-                                                           command_id, "principal_unresolved");
-                        auto matched = matched_opt.value_or(std::vector<std::string>{});
-                        for (const auto& aid : matched) {
-                            if (registry_.send_to(aid, cmd))
-                                ++sent;
-                        }
-                    }
-                } else if (arm == DispatchArm::Ids) {
-                    for (const auto& aid : agent_ids) {
-                        if (registry_.send_to(aid, cmd))
-                            ++sent;
-                    }
-                } else if (arm == DispatchArm::Broadcast || arm == DispatchArm::None) {
-                    // Explicit for the same reason as the MCP sink: a future
-                    // DispatchArm must not become a fleet broadcast by falling
-                    // through an `else`.
-                    sent = registry_.send_to_all(cmd);
-                }
-
-                forward_gateway_pending();
+                auto [command_id, sent] = dispatch_confined(plugin, action, agent_ids, scope_expr,
+                                                            parameters, /*execution_id=*/std::string{},
+                                                            exec_visible, /*broadcast_on_none=*/true);
 
                 if (sent > 0) {
-                    metrics_.counter("yuzu_commands_dispatched_total").increment();
                     // Publish RUNNING status + clear results via SSE.
                     // This MUST happen via SSE (not in the POST response)
                     // because the POST response races with SSE output
@@ -13175,6 +13239,18 @@ private:
                                        "<strong id=\"row-count\" hx-swap-oob=\"true\">0</strong>");
                 }
                 return {command_id, sent};
+            },
+            // ExecVisibleFn — CDX-R7-02: resolve the caller's Execution:Execute
+            // visible set from the request. The dashboard execute handlers gate
+            // via perm_fn and hold no Session at the dispatch site, so resolve it
+            // here from a throwaway Response (never written back). A session that
+            // cannot be resolved yields a present-EMPTY set — fail CLOSED, deny
+            // all — never nullopt.
+            [this](const httplib::Request& req) -> yuzu::server::authz::VisibleSet {
+                httplib::Response throwaway;
+                if (auto s = require_auth(req, throwaway))
+                    return derive_exec_visible(*s);
+                return std::unordered_set<std::string>{};
             },
             // ResolveFn — resolve instruction text → (plugin, action)
             [this](const std::string& text) -> std::pair<std::string, std::string> {
@@ -13243,7 +13319,20 @@ private:
         wf_deps.product_pack_store = product_pack_store_.get();
         wf_deps.instruction_store = instruction_store_.get();
         wf_deps.policy_store = policy_store_.get();
-        wf_deps.command_dispatch_fn = command_dispatch_fn;
+        // K-R7-02: workflow + instruction dispatch is an OPERATOR surface, so it
+        // routes through the CONFINED 7-param sibling (carries the caller's
+        // Execution:Execute visible set), not the system 6-param command_dispatch_fn.
+        // Both funnel through the ONE dispatch_confined seam.
+        wf_deps.command_dispatch_fn = command_dispatch_confined_fn;
+        wf_deps.exec_visible_fn =
+            [this](const httplib::Request& req) -> yuzu::server::authz::VisibleSet {
+            // Resolve the session from a throwaway Response (never written back);
+            // an unresolved session yields a present-EMPTY set (fail CLOSED).
+            httplib::Response throwaway;
+            if (auto s = require_auth(req, throwaway))
+                return derive_exec_visible(*s);
+            return std::unordered_set<std::string>{};
+        };
         wf_deps.approval_manager = approval_manager_.get();
         wf_deps.response_store = response_store_.get();
         // PR 3 — SSE event bus for live execution updates. Server owns
@@ -13961,11 +14050,21 @@ private:
             // Scope-walking result-set store (capability §30). nullptr leaves
             // the /api/v1/result-sets routes unregistered.
             result_set_store_.get(),
-            // Same hoisted dispatch closure the workflow + policy engines use,
-            // so the async result-set producers (from-tar-query /
-            // from-instruction-result / re-eval) drive the exact dispatch path
-            // (PR-D). Empty closure would 503 those routes.
-            command_dispatch_fn,
+            // #1788: the CONFINED closure — the same one WorkflowRoutes and the
+            // dashboard execute surfaces take, NOT the system `command_dispatch_fn`.
+            //
+            // This wiring was the bug. RestApiV1 was handed the 6-arg system
+            // closure (exec_visible hardcoded nullopt = unfiltered, correct only
+            // for background engines), and the async result-set producers
+            // (from-tar-query / from-instruction-result / re-eval) dispatched
+            // through it — so a service-scoped token, admitted by their bare
+            // global Execution:Execute gate, reached every connected agent
+            // instead of its own service. RestApiV1::CommandDispatchFn is now
+            // the 7-arg confined signature, so the unconfined closure is no
+            // longer type-compatible with this parameter at all: the wrong
+            // choice stopped being available rather than merely being avoided.
+            // Empty closure would 503 those routes.
+            command_dispatch_confined_fn,
             // PR2 MFA step-up gate for the high-risk REST handlers; empty
             // closure disables the gate (preserves pre-PR2 behaviour).
             step_up_fn,
@@ -14153,7 +14252,13 @@ private:
             // lease would make the arithmetic here a fiction", and the documented 429 in
             // rest-api.md all asserted the opposite — and the plain-REST reserve was not
             // in fact reserved.
-            stream_budget_.get());
+            stream_budget_.get(),
+            // gov-fix(Gate-3-architect-F1): the same derive_exec_visible() the
+            // /api/command handler and every MCP dispatch surface use, so REST
+            // bundle dispatch gets the identical defense-in-depth confinement
+            // check as its MCP execute_bundle twin (the scoped_perm_fn gate at
+            // the handler remains the primary authorization).
+            [this](const auth::Session& sess) { return derive_exec_visible(sess); });
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -14264,127 +14369,19 @@ private:
                 [this](const std::string& plugin, const std::string& action,
                        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                        const std::unordered_map<std::string, std::string>& parameters,
-                       const std::string& execution_id) -> std::pair<std::string, int> {
-                    auto command_id =
-                        plugin + "-" +
-                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
-
-                    detail::pb::CommandRequest cmd;
-                    cmd.set_command_id(command_id);
-                    cmd.set_plugin(plugin);
-                    cmd.set_action(action);
-                    for (const auto& [k, v] : parameters)
-                        (*cmd.mutable_parameters())[k] = v;
-                    agent_service_.record_send_time(command_id);
-                    if (!execution_id.empty()) {
-                        agent_service_.record_execution_id(command_id, execution_id);
-                    }
-
-                    int sent = 0;
-                    // Same classifier as the other two sinks (#2500). MCP's
-                    // handler normalises an omitted target to kBroadcastScope
-                    // before dispatching (mcp_server.cpp), so `None` cannot
-                    // arrive here meaning "unnamed"; the tail maps it to
-                    // broadcast so MCP's deliberate broadcast-on-empty contract
-                    // is stated rather than left as a fallthrough.
-                    const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
-                    if (arm == DispatchArm::Group) {
-                        auto group_id = scope_expr.substr(6);
-                        if (mgmt_group_store_) {
-                            for (const auto& m : mgmt_group_store_->get_members(group_id))
-                                if (registry_.send_to(m.agent_id, cmd))
-                                    ++sent;
-                        }
-                    } else if (arm == DispatchArm::Scope) {
-                        // Owner-scoped from_result_set: recover the principal
-                        // from the MCP-created execution row (review B1).
-                        std::string principal;
-                        if (scope_expr.find("from_result_set:") != std::string::npos &&
-                            !execution_id.empty() && execution_tracker_) {
-                            if (auto ex = execution_tracker_->get_execution(execution_id))
-                                principal = ex->dispatched_by;
-                        }
-                        // Resolve from_result_set: aliases at the dispatch layer (PR-E).
-                        // ADR-0036 fail-closed contract: a DB error at ANY step
-                        // below ABORTS this branch — `sent` stays 0. Leaving an
-                        // atom unresolved or a preload partial would silently
-                        // no-match downstream and, under a NOT combinator,
-                        // invert to match-the-entire-fleet.
-                        auto resolved_scope = resolve_scope_aliases(scope_expr, principal,
-                                                                    result_set_store_.get());
-                        if (!resolved_scope) {
-                            spdlog::error("MCP scope dispatch: resolve_scope_aliases degraded "
-                                          "({})",
-                                          to_string(resolved_scope.error()));
-                            audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,
-                                                           "db_degraded");
-                        } else {
-                            // Role unavailable on the MCP path (principal recovered
-                            // from the MCP-created execution row); principal + command
-                            // id identify the actor for the forensic chain.
-                            std::vector<std::string> failing_refs;
-                            const auto gate = gate_scope_dispatch(
-                                *resolved_scope, principal, result_set_store_.get(), failing_refs);
-                            if (gate == ScopeDispatchGate::AbortDbDegraded) {
-                                spdlog::error("MCP scope dispatch: owner-check scan degraded");
-                                audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,
-                                                               "db_degraded");
-                            } else if (gate == ScopeDispatchGate::AbortOwnerCheck) {
-                                // Governance M1: BINDING owner check — a
-                                // failing ref aborts dispatch (see the REST
-                                // raw-dispatch site's comment).
-                                for (const auto& ref : failing_refs)
-                                    audit_scope_resolution_failed(principal, /*role=*/"",
-                                                                  command_id, ref);
-                                audit_scope_evaluation_aborted(principal, /*role=*/"", command_id,
-                                                               "owner_check_failed");
-                            } else {
-                                auto parsed = yuzu::scope::parse(*resolved_scope);
-                                if (parsed) {
-                                    if (auto matched = registry_.evaluate_scope(
-                                            *parsed, tag_store_.get(),
-                                            custom_properties_store_.get(),
-                                            result_set_store_.get(), principal)) {
-                                        for (const auto& aid : *matched)
-                                            if (registry_.send_to(aid, cmd))
-                                                ++sent;
-                                    } else {
-                                        spdlog::error("MCP scope dispatch: evaluate_scope "
-                                                      "degraded (result-set membership preload "
-                                                      "failed)");
-                                        // B2: see the raw-dispatch site's identical comment.
-                                        audit_scope_evaluation_aborted(
-                                            principal, /*role=*/"", command_id,
-                                            principal.empty() ? "principal_unresolved"
-                                                              : "db_degraded");
-                                    }
-                                }
-                            }
-                        }
-                    } else if (arm == DispatchArm::Ids) {
-                        for (const auto& aid : agent_ids)
-                            if (registry_.send_to(aid, cmd))
-                                ++sent;
-                    } else if (arm == DispatchArm::Broadcast || arm == DispatchArm::None) {
-                        // Broadcast, or None — which mcp_server.cpp has already
-                        // normalised to kBroadcastScope, so it cannot arrive
-                        // here meaning "unnamed". MCP keeps broadcast-on-empty
-                        // deliberately: its guard is upstream at the C8 gate and
-                        // in the handler, not at this sink.
-                        //
-                        // Named explicitly rather than left as a bare `else`: a
-                        // fifth DispatchArm added later would otherwise fall
-                        // into fleet-wide broadcast at this sink and the
-                        // dashboard's, silently, at two of four sites.
-                        sent = registry_.send_to_all(cmd);
-                    }
-
-                    forward_gateway_pending();
-                    if (sent > 0)
-                        metrics_.counter("yuzu_commands_dispatched_total").increment();
+                       const std::string& execution_id,
+                       const yuzu::server::authz::VisibleSet& exec_visible)
+                    -> std::pair<std::string, int> {
+                    // MCP normalises an omitted target to kBroadcastScope upstream
+                    // (mcp_server.cpp), so broadcast_on_none=true states its
+                    // deliberate broadcast-on-empty contract. Same seam as the
+                    // shared closure and the dashboard — one confined arm logic.
+                    auto r = dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
+                                               execution_id, exec_visible,
+                                               /*broadcast_on_none=*/true);
                     spdlog::info("MCP execute_instruction: {}:{} → {} agent(s)", plugin, action,
-                                 sent);
-                    return {command_id, sent};
+                                 r.second);
+                    return r;
                 },
                 // PR4 B-2: CA inventory + revoke MCP tools (parity with /api/v1/ca/*).
                 ca_store_.get(), [this]() { return publish_crl(); },
@@ -14504,6 +14501,12 @@ private:
                     return auth_routes_->audit_log_for_principal(req, action, result, principal.id,
                                                                  principal.role, target_type,
                                                                  target_id, detail, principal.cls);
+                },
+                // #1788: per-request Execution:Execute visible-set deriver, so the MCP
+                // execute_instruction / execute_bundle dispatch confines to the caller's
+                // visible device set — the SAME derivation /api/command uses.
+                [this](const auth::Session& s) -> yuzu::server::authz::VisibleSet {
+                    return derive_exec_visible(s);
                 });
         }
 
@@ -14574,8 +14577,21 @@ private:
         });
     }
 
-    void forward_legacy_command(const std::string& plugin, const std::string& action,
-                                httplib::Response& res) {
+    /// The legacy `/api/chargen/*` + `/api/procfetch/fetch` sink.
+    ///
+    /// #1788: these are OPERATOR dispatch surfaces and are confined like every
+    /// other one. They were missed by the original sweep because they do not
+    /// route through `command_dispatch_fn` — they call the registry directly —
+    /// and their bare global `require_permission("Execution","Execute")` gate
+    /// admits a SERVICE-SCOPED token on its `ITServiceOwner` role grant with no
+    /// target check, so before this they reached the entire fleet: verbatim the
+    /// escape #1788 exists to close, on three routes the changelog claimed were
+    /// already covered.
+    ///
+    /// An omitted target means the fleet (#2500), so this is the Broadcast arm —
+    /// narrowed to the caller's visible set, exactly as a named `__all__` is.
+    void forward_legacy_command(const httplib::Request& req, const std::string& plugin,
+                                const std::string& action, httplib::Response& res) {
         if (!registry_.has_any()) {
             res.status = 503;
             res.set_content(
@@ -14593,7 +14609,22 @@ private:
         cmd.set_action(action);
 
         agent_service_.record_send_time(command_id);
-        int sent = registry_.send_to_all(cmd);
+        // Resolve the session ONCE — require_auth writes an error response on
+        // failure, so calling it twice could emit two. Fail CLOSED to a
+        // present-empty set (reaches nobody), never nullopt (unfiltered);
+        // the permission gate above has already admitted the caller, so this
+        // only bites if the session vanished between the two.
+        auto sess = require_auth(req, res);
+        const yuzu::server::authz::VisibleSet exec_visible =
+            sess ? derive_exec_visible(*sess)
+                 : yuzu::server::authz::deny_all();
+        const yuzu::server::ConfinedDispatchSink sink{
+            [&](const std::string& aid) { return registry_.send_to(aid, cmd); },
+            [&] { return registry_.send_to_all(cmd); },
+            [&] { return registry_.all_ids(); }};
+        int sent = yuzu::server::dispatch_confined_arms(
+            yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
+            /*broadcast_on_none=*/false, sink);
 
         if (sent == 0) {
             res.status = 503;

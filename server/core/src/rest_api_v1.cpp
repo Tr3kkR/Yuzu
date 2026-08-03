@@ -757,11 +757,11 @@ const std::string& openapi_spec() {
         // form.
         R"json(,
     "/quarantine": {
-      "get": {"summary": "List quarantined devices", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices"}}},
-      "post": {"summary": "Quarantine a device", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}}}
+      "get": {"summary": "List quarantined devices visible to the caller (admit-then-filter — #1788)", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices in the caller's scope"}, "403": {"description": "Requires Security:Read"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}}},
+      "post": {"summary": "Quarantine a device (per-target scoped — #1788)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}}}
     },
     "/quarantine/{agent_id}": {
-      "delete": {"summary": "Release a device from quarantine", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}}}
+      "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}}}
     },
     "/rbac/roles": {
       "get": {"summary": "List RBAC roles", "tags": ["RBAC"], "responses": {"200": {"description": "List of roles"}}}
@@ -1233,7 +1233,8 @@ void RestApiV1::register_routes(
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
-    AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget) {
+    AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
+    ExecVisibleFn exec_visible_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1247,7 +1248,7 @@ void RestApiV1::register_routes(
                     std::move(scoped_perm_fn), software_inventory_store,
                     std::move(inventory_scope_fn), std::move(response_scope_fn),
                     std::move(app_perf_providers), engine_principal_store, access_review_store,
-                    auth_db, directory_sync, stream_budget);
+                    auth_db, directory_sync, stream_budget, std::move(exec_visible_fn));
 }
 
 void RestApiV1::register_routes(
@@ -1267,7 +1268,8 @@ void RestApiV1::register_routes(
     SoftwareInventoryStore* software_inventory_store, InventoryScopeFn inventory_scope_fn,
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
-    AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget) {
+    AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
+    ExecVisibleFn exec_visible_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -1278,6 +1280,40 @@ void RestApiV1::register_routes(
     // route lambdas below capture plain values, not `this`.
     EnginePrincipalStore* eps = engine_principal_store_;
     UserExistsFn user_exists_fn = user_exists_fn_;
+
+    // #1788: resolve the caller's confinement set on a route whose PRIMARY
+    // authorization is the per-target `scoped_perm_fn` gate — the TAR retention
+    // purge and the DEX live query. Both had ~20 byte-identical lines of this,
+    // comments included, which is precisely the duplication the dispatch seam
+    // exists to prevent one layer down; one helper, two call sites.
+    //
+    // Call it AFTER the scope gate has passed, never at the top of a handler:
+    // that gate has already emitted 401 for an unauthenticated caller, so
+    // resolving late cannot change any status-code ordering the route already
+    // had (notably 400-before-401 on body validation).
+    //
+    // Returns nullopt iff the session could not be resolved after all — the
+    // caller must RETURN without dispatching, because dispatching a deny-all
+    // set instead would reach nobody and be reported as "device offline",
+    // a false answer to what is really an authentication failure. `auth_fn`
+    // has already written its own 401 envelope in that case.
+    //
+    // Unwired `exec_visible_fn` yields deny_all() (present-empty), NOT nullopt:
+    // this layer is defense-in-depth, and the routed-concern clause on
+    // `nullopt` vs present-empty is what makes those two non-interchangeable.
+    auto resolve_secondary_exec_visible =
+        [auth_fn, exec_visible_fn](const httplib::Request& req, httplib::Response& res)
+        -> std::optional<yuzu::server::authz::VisibleSet> {
+        std::optional<auth::Session> sess;
+        if (auth_fn) {
+            sess = auth_fn(req, res);
+            if (!sess)
+                return std::nullopt;
+        }
+        if (exec_visible_fn && sess)
+            return exec_visible_fn(*sess);
+        return yuzu::server::authz::deny_all();
+    };
 
     // ── CORS preflight handler for /api/v1/* ─────────────────────────────
     // Actual CORS headers are added by the post-routing handler in server.cpp
@@ -1336,7 +1372,38 @@ void RestApiV1::register_routes(
     std::shared_ptr<BundleOrchestrator> bundle_orch;
     if (command_dispatch_fn && response_store) {
         bundle_orch = std::make_shared<BundleOrchestrator>(
-            command_dispatch_fn, response_store,
+            // #1788/Gate-3-architect-F1: BundleOrchestrator::DispatchFn gained a
+            // trailing exec_visible param (kept identical to the MCP DispatchFn).
+            // The REST bundle route's PRIMARY authorization is still the
+            // per-target scoped_perm_fn gate at the HANDLER (K-R6-01, before
+            // dispatch runs) — this adapter's `in_scope` check is a SECOND,
+            // independent confinement check (defense-in-depth, matching MCP's
+            // execute_bundle in_scope check), not a replacement for the handler
+            // gate. A caller-visible VisibleSet that doesn't admit the single
+            // target refuses the dispatch (agents_reached=0) before
+            // command_dispatch_fn ever runs.
+            //
+            // The early `in_scope` return is retained rather than left to the
+            // seam because it is what makes the refusal OBSERVABLE at the
+            // orchestrator (agents_reached=0 without a dispatch attempt); the
+            // set is ALSO forwarded, so the seam re-applies the intersection on
+            // the authoritative candidate list. Two independent checks, one
+            // shared rule — not a second copy of the arm classification.
+            [command_dispatch_fn](const std::string& plugin, const std::string& action,
+                                  const std::vector<std::string>& agent_ids,
+                                  const std::string& scope,
+                                  const std::unordered_map<std::string, std::string>& params,
+                                  const std::string& correlation_id,
+                                  const yuzu::server::authz::VisibleSet& exec_visible)
+                -> std::pair<std::string, int> {
+                for (const auto& id : agent_ids) {
+                    if (!yuzu::server::authz::in_scope(exec_visible, id))
+                        return {correlation_id, 0};
+                }
+                return command_dispatch_fn(plugin, action, agent_ids, scope, params,
+                                           correlation_id, exec_visible);
+            },
+            response_store,
             [] {
                 std::random_device rd;
                 const std::uint64_t r = (static_cast<std::uint64_t>(rd()) << 32) ^ rd();
@@ -1350,9 +1417,18 @@ void RestApiV1::register_routes(
     // POST /api/v1/bundles — dispatch (async). Returns the correlation id; poll
     // GET /api/v1/bundles/{id} for the collated result.
     sink.Post("/api/v1/bundles",
-              [auth_fn, perm_fn, audit_fn, bundle_orch](const httplib::Request& req,
-                                                        httplib::Response& res) {
-                  if (!perm_fn(req, res, "Execution", "Execute"))
+              [auth_fn, scoped_perm_fn, audit_fn, bundle_orch,
+               exec_visible_fn](const httplib::Request& req, httplib::Response& res) {
+                  // K-R6-01/CDX-R5-02: a bundle targets ONE device, so
+                  // authorization is the per-target scoped gate on agent_id
+                  // (below, once parsed) -- NOT the targetless global
+                  // Execution:Execute perm_fn, which admitted a service-scoped
+                  // token on its ITServiceOwner grant with no target check and so
+                  // let it dispatch a live bundle to an out-of-scope agent (the
+                  // escape closed on the MCP execute_bundle twin, mcp_server.cpp).
+                  // Authenticate first (CDX-R4-02) so no store/body work precedes
+                  // a 401.
+                  if (!auth_fn(req, res))
                       return;
                   if (!bundle_orch) {
                       res.status = 503;
@@ -1399,6 +1475,20 @@ void RestApiV1::register_routes(
                       return;
                   }
                   const std::string agent_id = body["agent_id"].get<std::string>();
+                  // K-R6-01: per-target authorization -- Execution:Execute scoped
+                  // to THIS agent. A service-A token cannot bundle-dispatch to a
+                  // service-B agent; a management-group operator is admitted on
+                  // in-scope targets. Fail CLOSED if the scope fn is unwired
+                  // (never widen to a global gate), the same posture as the tag
+                  // routes and the sibling sites.
+                  if (!scoped_perm_fn) {
+                      res.status = 500;
+                      res.set_content(detail::a4_error(res, "scope gate not configured"),
+                                      "application/json");
+                      return;
+                  }
+                  if (!scoped_perm_fn(req, res, "Execution", "Execute", agent_id))
+                      return;
                   // Per-step audit bound to this request; the orchestrator stays req-free.
                   auto audit = [&audit_fn, &req](const std::string& verb, const std::string& result,
                                                  const std::string& type, const std::string& id,
@@ -1410,7 +1500,29 @@ void RestApiV1::register_routes(
                   // with the MCP wrapper; governance UP-1 / sec-M1 / comp-S2).
                   BundleOrchestrator::DispatchResult r;
                   try {
-                      r = bundle_orch->dispatch(agent_id, *specs, principal, audit);
+                      // governance UP-8/Gate-3-architect-F1: the per-target
+                      // scoped_perm_fn gate above (already checked agent_id) remains
+                      // the PRIMARY authorization; thread the real derived
+                      // VisibleSet too (matching the MCP execute_bundle twin) as a
+                      // second, independent confinement check at the orchestrator —
+                      // defense-in-depth so a future scoped_perm_fn regression is
+                      // still caught here rather than reaching dispatch unfiltered.
+                      //
+                      // An unwired derivation substitutes a present-EMPTY set —
+                      // deny-all, NEVER `VisibleSet{}`, which default-constructs
+                      // the optional to nullopt and therefore means UNFILTERED.
+                      // That inversion was the review finding: a defense-in-depth
+                      // layer that becomes PERMISSIVE when unconfigured is the
+                      // exact fail-open ADR-0033 §1 forbids, and it made the
+                      // layer decorative on any deployment that missed the
+                      // wiring. Same spelling as dashboard_routes.cpp and
+                      // mcp_server.cpp; a harness wanting genuinely unfiltered
+                      // dispatch wires a callback RETURNING nullopt.
+                      auto exec_visible =
+                          exec_visible_fn && session
+                              ? exec_visible_fn(*session)
+                              : yuzu::server::authz::deny_all();
+                      r = bundle_orch->dispatch(agent_id, *specs, principal, audit, exec_visible);
                   } catch (const std::exception& e) {
                       audit_fn(req, "bundle.dispatch", "failure", "Execution", "",
                                std::string("agent=") + agent_id + " error=" + e.what());
@@ -1439,8 +1551,8 @@ void RestApiV1::register_routes(
     // HIGH #3/#4.
     sink.Post(
         "/api/v1/tar/retention-paused/purge",
-        [scoped_perm_fn, command_dispatch_fn, audit_fn, metrics_registry](
-            const httplib::Request& req, httplib::Response& res) {
+        [scoped_perm_fn, command_dispatch_fn, audit_fn, metrics_registry,
+         resolve_secondary_exec_visible](const httplib::Request& req, httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
             auto bump = [&](const char* result) {
@@ -1511,9 +1623,26 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
-            const auto [command_id, sent] = command_dispatch_fn(
-                "tar", "purge_source", {device_id}, "", {{"source", source}}, /*execution_id=*/"");
+            // #1788 defense-in-depth: `scoped_perm_fn` above is the PRIMARY gate
+            // and has already authorized this exact device_id, so the seam's
+            // intersection is a second, independent check rather than the thing
+            // standing between this caller and the fleet.
+            const auto exec_visible = resolve_secondary_exec_visible(req, res);
+            if (!exec_visible) {
+                bump("denied");
+                return;
+            }
+            const auto [command_id, sent] =
+                command_dispatch_fn("tar", "purge_source", {device_id}, "", {{"source", source}},
+                                    /*execution_id=*/"", *exec_visible);
             if (sent == 0) {
+                // NOTE: a confinement drop also lands here and is reported as
+                // "offline" + counted as agent_not_connected. The RESPONSE
+                // being indistinguishable is deliberate — a distinct status
+                // would disclose that a device exists but is out of reach. The
+                // METRIC is a known small imprecision, and the path is only
+                // reachable at all if scoped_perm_fn and the derived set
+                // disagree about this device, which is itself a bug.
                 res.status = 404;
                 bump("agent_not_connected");
                 res.set_content(
@@ -3616,34 +3745,53 @@ void RestApiV1::register_routes(
 
     // ── Quarantine (/api/v1/quarantine) ──────────────────────────────────
 
-    sink.Get("/api/v1/quarantine",
-             [perm_fn, quarantine_store](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn(req, res, "Security", "Read"))
-                     return;
-                 if (!quarantine_store) {
-                     res.status = 503;
-                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
-                     return;
-                 }
+    sink.Get(
+        "/api/v1/quarantine",
+        [auth_fn, scoped_perm_fn, quarantine_store](const httplib::Request& req,
+                                                     httplib::Response& res) {
+            // gov-fix(consistency-auditor): admit-then-filter, matching POST/DELETE
+            // (CDX-P1-02) rather than the flat global gate this route shipped with —
+            // a management-group-confined operator who can act on a device via
+            // POST/DELETE must also be able to SEE it here, and must not see
+            // quarantine records for devices outside their scope. Fail CLOSED (500)
+            // if scoped_perm_fn is unwired, never fall back to an unfiltered list.
+            if (!auth_fn(req, res))
+                return;
+            if (!quarantine_store) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            if (!scoped_perm_fn) {
+                res.status = 500;
+                res.set_content(detail::a4_error(res, "scope gate not configured"),
+                                "application/json");
+                return;
+            }
 
-                 auto records = quarantine_store->list_quarantined();
-                 JArr arr;
-                 for (const auto& r : records) {
-                     arr.add(JObj()
-                                 .add("agent_id", r.agent_id)
-                                 .add("status", r.status)
-                                 .add("quarantined_by", r.quarantined_by)
-                                 .add("quarantined_at", r.quarantined_at)
-                                 .add("whitelist", r.whitelist)
-                                 .add("reason", r.reason));
-                 }
-                 res.set_content(list_json(arr.str(), static_cast<int64_t>(records.size())),
-                                 "application/json");
-             });
+            auto records = quarantine_store->list_quarantined();
+            JArr arr;
+            int64_t visible = 0;
+            for (const auto& r : records) {
+                httplib::Response probe; // throwaway: per-record admit probe, never sent
+                if (!scoped_perm_fn(req, probe, "Security", "Read", r.agent_id))
+                    continue;
+                arr.add(JObj()
+                            .add("agent_id", r.agent_id)
+                            .add("status", r.status)
+                            .add("quarantined_by", r.quarantined_by)
+                            .add("quarantined_at", r.quarantined_at)
+                            .add("whitelist", r.whitelist)
+                            .add("reason", r.reason));
+                ++visible;
+            }
+            res.set_content(list_json(arr.str(), visible), "application/json");
+        });
 
-    sink.Post("/api/v1/quarantine", [auth_fn, perm_fn, audit_fn, quarantine_store](
+    sink.Post("/api/v1/quarantine", [auth_fn, scoped_perm_fn, audit_fn, quarantine_store](
                                         const httplib::Request& req, httplib::Response& res) {
-        if (!perm_fn(req, res, "Security", "Execute"))
+        // CDX-P1-02: authenticate first (401 before any store/body work).
+        if (!auth_fn(req, res))
             return;
         if (!quarantine_store) {
             res.status = 503;
@@ -3652,9 +3800,33 @@ void RestApiV1::register_routes(
         }
 
         auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.is_object()) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "body must be a JSON object"),
+                            "application/json");
+            return;
+        }
         auto agent_id = body.value("agent_id", "");
         auto reason = body.value("reason", "");
         auto whitelist = body.value("whitelist", "");
+
+        // CDX-P1-02: the SOLE per-target authorization, applied once agent_id
+        // is known — a management-group-confined operator with Security:Execute
+        // ONLY through a group was previously 403'd by the flat global gate
+        // while the MCP quarantine_device twin (mcp_server.cpp) admitted the
+        // identical caller via scoped_perm_fn. Fail CLOSED if unwired (never
+        // widen to a global gate), matching set_tag/delete_tag above and the
+        // MCP twin.
+        if (!scoped_perm_fn) {
+            res.status = 500;
+            res.set_content(detail::a4_error(res, "scope gate not configured"),
+                            "application/json");
+            audit_fn(req, "quarantine.enable", "failure", "Security", agent_id,
+                     "scope gate not configured");
+            return;
+        }
+        if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
+            return;
 
         auto session = auth_fn(req, res);
         std::string by = session ? session->username : "system";
@@ -3672,8 +3844,10 @@ void RestApiV1::register_routes(
 
     sink.Delete(
         R"(/api/v1/quarantine/(.+))",
-        [perm_fn, audit_fn, quarantine_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "Security", "Execute"))
+        [auth_fn, scoped_perm_fn, audit_fn, quarantine_store](const httplib::Request& req,
+                                                              httplib::Response& res) {
+            // CDX-P1-02: authenticate first (401 before any store work).
+            if (!auth_fn(req, res))
                 return;
             if (!quarantine_store) {
                 res.status = 503;
@@ -3682,6 +3856,20 @@ void RestApiV1::register_routes(
             }
 
             auto agent_id = req.matches[1].str();
+            // CDX-P1-02: same sole per-target gate as POST above, mirroring
+            // set_tag/delete_tag and the MCP quarantine_device twin — fail
+            // CLOSED if unwired.
+            if (!scoped_perm_fn) {
+                res.status = 500;
+                res.set_content(detail::a4_error(res, "scope gate not configured"),
+                                "application/json");
+                audit_fn(req, "quarantine.disable", "failure", "Security", agent_id,
+                         "scope gate not configured");
+                return;
+            }
+            if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
+                return;
+
             auto result = quarantine_store->release_device(agent_id);
             if (!result) {
                 res.status = 400;
@@ -3826,10 +4014,20 @@ void RestApiV1::register_routes(
                  res.set_content(ok_json(obj.str()), "application/json");
              });
 
-    sink.Put("/api/v1/tags", [perm_fn, audit_fn, tag_store, service_group_fn,
+    sink.Put("/api/v1/tags", [auth_fn, scoped_perm_fn, audit_fn, tag_store, service_group_fn,
                               tag_push_fn](const httplib::Request& req, httplib::Response& res) {
-        if (!perm_fn(req, res, "Tag", "Write"))
+        // CDX-R4-02: authenticate BEFORE any store/body work (401 first, never a
+        // 503/400 to an unauthenticated caller).
+        if (!auth_fn(req, res))
             return;
+        // CDX-R2-003/CDX-03: authorization is the per-target scoped gate ALONE
+        // (below, once agent_id is parsed) — no global Tag:Write pre-gate. The
+        // old global `perm_fn` pre-check consulted no management-group
+        // assignments, so it 403'd an operator holding Tag:Write only THROUGH a
+        // group before the target-aware scoped check could admit them
+        // (ADR-0017). scoped_perm_fn (require_scoped_permission) also enforces
+        // Tag:Write per-target, exactly as the MCP set_tag twin does
+        // (mcp_server.cpp) — one gate, management-group-aware, fail-closed.
         if (!tag_store) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
@@ -3863,6 +4061,24 @@ void RestApiV1::register_routes(
             return;
         }
 
+        // H1 / CDX-P2-003 / K-01: the SOLE per-target authorization, applied
+        // once agent_id is known (the scope needs the target). It enforces
+        // Tag:Write scoped to the target: a service-A token may tag only
+        // Service-A agents (else it could rewrite the `service` tag that
+        // confines its own /api/command dispatch, #1788); a management-group
+        // operator only agents in its groups. CDX-R2-003 / ADR-0033 §1: fail
+        // CLOSED if the scope fn is unwired (never widen to a global gate), the
+        // same posture the sibling sites (:1480, :7881, :7961, :8082, :9339)
+        // take.
+        if (!scoped_perm_fn) {
+            res.status = 500;
+            res.set_content(detail::a4_error(res, "scope gate not configured"),
+                            "application/json");
+            return;
+        }
+        if (!scoped_perm_fn(req, res, "Tag", "Write", agent_id))
+            return;
+
         auto result = tag_store->set_tag_checked(agent_id, key, value, "api");
         if (!result) {
             res.status = 400;
@@ -3879,9 +4095,14 @@ void RestApiV1::register_routes(
 
     sink.Delete(
         R"(/api/v1/tags/([^/]+)/([^/]+))",
-        [perm_fn, audit_fn, tag_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "Tag", "Delete"))
+        [auth_fn, scoped_perm_fn, audit_fn, tag_store](const httplib::Request& req,
+                                                       httplib::Response& res) {
+            // CDX-R4-02: authenticate BEFORE any store/body work (401 first).
+            if (!auth_fn(req, res))
                 return;
+            // CDX-R2-003/CDX-03: scoped gate ALONE (no global Tag:Delete
+            // pre-gate that would 403 a management-group-scoped operator before
+            // the target-aware check) — see the PUT twin above.
             if (!tag_store) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
@@ -3890,6 +4111,19 @@ void RestApiV1::register_routes(
 
             auto agent_id = req.matches[1].str();
             auto key = req.matches[2].str();
+            // H1 / CDX-P2-003 / K-01: the SOLE per-target authorization — same
+            // tag-boundary confinement as the PUT twin above. A service-scoped
+            // token must not delete a tag (e.g. `service`) on an agent outside
+            // its scope. CDX-R2-003 / ADR-0033 §1: fail CLOSED when the scope fn
+            // is unwired, never widen to a global gate.
+            if (!scoped_perm_fn) {
+                res.status = 500;
+                res.set_content(detail::a4_error(res, "scope gate not configured"),
+                                "application/json");
+                return;
+            }
+            if (!scoped_perm_fn(req, res, "Tag", "Delete", agent_id))
+                return;
             bool deleted = tag_store->delete_tag(agent_id, key);
             if (!deleted) {
                 res.status = 404;
@@ -5992,18 +6226,48 @@ void RestApiV1::register_routes(
         // only for `parent_id`; everything else is passed explicitly so
         // re-eval can synthesise a body. Writes the 202 (or an error) on res.
         auto run_async = [result_set_store, execution_tracker, command_dispatch_fn, audit_fn,
-                          metrics_registry, rs_to_json, rs_err, resolve_owned_parent](
+                          metrics_registry, rs_to_json, rs_err, resolve_owned_parent,
+                          exec_visible_fn](
                              const httplib::Request& req, httplib::Response& res,
-                             const std::string& owner, const std::string& plugin,
+                             const auth::Session& session, const std::string& plugin,
                              const std::string& action,
                              const std::unordered_map<std::string, std::string>& params,
                              std::string_view src_kind, const std::string& source_payload,
                              const std::string& matcher, const nlohmann::json& body,
                              const std::string& name) {
+            const std::string& owner = session.username;
             if (!command_dispatch_fn || !execution_tracker) {
                 rs_err(res, 503, "RESULT_SET_DISPATCH_UNAVAILABLE: command dispatch not wired");
                 return;
             }
+            // #1788: these three producers are OPERATOR dispatch surfaces that
+            // admit on a bare GLOBAL Execution:Execute gate and then reach the
+            // fleet by scope or `__all__` broadcast. The derived VisibleSet is
+            // therefore their ONLY per-device authorization — the primary gate,
+            // not defense-in-depth (contrast POST /api/v1/bundles, where
+            // scoped_perm_fn has already authorized the single named target).
+            //
+            // They previously dispatched through the SYSTEM closure, whose
+            // exec_visible is hardcoded nullopt, so a service-A-scoped token
+            // reached every connected agent. An unwired derivation here is a
+            // server misconfiguration, not a caller error: refuse with an
+            // AUDITED 500 — the same posture the bundle and TAR-purge routes
+            // take on a missing scoped_perm_fn — rather than substituting
+            // present-empty and answering the operator "no agents reached in
+            // the target scope", which reads as an empty fleet and hides it.
+            if (!exec_visible_fn) {
+                bool audit_ok = true;
+                if (audit_fn)
+                    audit_ok = audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                        std::string("reason=exec_visible_unwired source_kind=") +
+                                            std::string(src_kind));
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                rs_err(res, 500,
+                       "RESULT_SET_GATE_UNCONFIGURED: dispatch visibility gate not configured");
+                return;
+            }
+            const yuzu::server::authz::VisibleSet exec_visible = exec_visible_fn(session);
             // Resolve the parent scope. parent_id present → dispatch is scoped
             // to that set's CURRENT members via the `from_result_set:` scope
             // kind; absent → broadcast to all connected agents (__all__).
@@ -6104,8 +6368,14 @@ void RestApiV1::register_routes(
             const std::string dispatch_scope =
                 scope_expr.empty() ? std::string(kBroadcastScope) : scope_expr;
             try {
-                std::tie(command_id, sent) =
-                    command_dispatch_fn(plugin, action, {}, dispatch_scope, params, exec_id);
+                // #1788: `exec_visible` narrows whichever arm `dispatch_scope`
+                // selects — Scope for `from_result_set:<id>`, Broadcast for
+                // `__all__` — inside dispatch_confined_arms. Nothing is
+                // pre-filtered here on purpose: the candidate set for both arms
+                // lives in the server's AgentRegistry, and a second copy of the
+                // intersection is the drift that seam exists to prevent.
+                std::tie(command_id, sent) = command_dispatch_fn(plugin, action, {}, dispatch_scope,
+                                                                 params, exec_id, exec_visible);
             } catch (const std::exception& e) {
                 spdlog::error("result-set async producer dispatch failed: {}", e.what());
                 execution_tracker->mark_cancelled(exec_id, owner);
@@ -6116,6 +6386,13 @@ void RestApiV1::register_routes(
                 // No agents in scope — record the attempt (forensic) and tell
                 // the operator rather than leaking a pending row that idles to
                 // the 300s timeout and then materialises empty.
+                //
+                // This is ALSO where a confinement drop lands: a caller whose
+                // VisibleSet admits none of the resolved targets is answered
+                // identically to a caller whose scope genuinely matched nobody.
+                // That indistinguishability is deliberate — a distinct "refused
+                // by confinement" status would disclose the existence of
+                // devices the caller is not allowed to see.
                 execution_tracker->mark_cancelled(exec_id, owner);
                 rs_err(res, 503, "RESULT_SET_NO_AGENTS: no agents reached in the target scope");
                 return;
@@ -6423,10 +6700,23 @@ void RestApiV1::register_routes(
         // SQL is sandboxed AGENT-side by TarDatabase::execute_user_query
         // (read-only authorizer, #760/#631) — the server only length-checks.
         sink.Post("/api/v1/result-sets/from-tar-query",
-                  [auth_fn, rs_err, run_async](const httplib::Request& req,
+                  [auth_fn, perm_fn, rs_err, run_async](const httplib::Request& req,
                                                httplib::Response& res) {
                       auto session = auth_fn(req, res);
                       if (!session)
+                          return;
+                      // SECURITY (CWE-862, missing authorization): these three
+                      // producers DISPATCH to the fleet — they are operator
+                      // dispatch surfaces, not reads. They authenticated the
+                      // caller and then performed NO authorization check at all:
+                      // `perm_fn` was not even captured, so ANY authenticated
+                      // session — including one holding no Execution grant —
+                      // reached `command_dispatch_fn` with scope `__all__`.
+                      // Shipped ungated since e7b47ca3 (2026-05-31, in v0.13.0);
+                      // found by the Gate 4 consistency sweep, not by the diff
+                      // review, because every SIBLING dispatch surface was
+                      // confined and these were the last ones left.
+                      if (!perm_fn(req, res, "Execution", "Execute"))
                           return;
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
                       if (body.is_discarded() || !body.is_object()) {
@@ -6453,7 +6743,7 @@ void RestApiV1::register_routes(
                       if (body.contains("parent_id") && body["parent_id"].is_string())
                           payload["scope_input_id"] = body["parent_id"];
                       std::unordered_map<std::string, std::string> params{{"sql", sql}};
-                      run_async(req, res, session->username, "tar", "sql", params,
+                      run_async(req, res, *session, "tar", "sql", params,
                                 source_kind::kTarQuery, payload.dump(), matcher.dump(), body,
                                 body.value("name", ""));
                   });
@@ -6464,10 +6754,23 @@ void RestApiV1::register_routes(
         // (column/op/value — design §3.2, applied by the maintenance thread via
         // rs_matcher). Mirrors the Chrome-IR hash-check step (design §10).
         sink.Post("/api/v1/result-sets/from-instruction-result",
-                  [auth_fn, rs_err, instruction_store, run_async](const httplib::Request& req,
+                  [auth_fn, perm_fn, rs_err, instruction_store, run_async](const httplib::Request& req,
                                                                   httplib::Response& res) {
                       auto session = auth_fn(req, res);
                       if (!session)
+                          return;
+                      // SECURITY (CWE-862, missing authorization): these three
+                      // producers DISPATCH to the fleet — they are operator
+                      // dispatch surfaces, not reads. They authenticated the
+                      // caller and then performed NO authorization check at all:
+                      // `perm_fn` was not even captured, so ANY authenticated
+                      // session — including one holding no Execution grant —
+                      // reached `command_dispatch_fn` with scope `__all__`.
+                      // Shipped ungated since e7b47ca3 (2026-05-31, in v0.13.0);
+                      // found by the Gate 4 consistency sweep, not by the diff
+                      // review, because every SIBLING dispatch surface was
+                      // confined and these were the last ones left.
+                      if (!perm_fn(req, res, "Execution", "Execute"))
                           return;
                       if (!instruction_store || !instruction_store->is_open()) {
                           rs_err(res, 503, "instruction store not available");
@@ -6504,7 +6807,7 @@ void RestApiV1::register_routes(
                           payload["matcher"] = body["matcher"];
                       if (body.contains("parent_id") && body["parent_id"].is_string())
                           payload["scope_input_id"] = body["parent_id"];
-                      run_async(req, res, session->username, def->plugin, def->action, params,
+                      run_async(req, res, *session, def->plugin, def->action, params,
                                 source_kind::kInstructionResult, payload.dump(), matcher, body,
                                 body.value("name", ""));
                   });
@@ -6515,10 +6818,23 @@ void RestApiV1::register_routes(
         // dispatch and land a new pending row; sync sources are deferred to
         // PR-G (their re-eval needs the inventory evaluator on this path).
         sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/re-eval)",
-                  [auth_fn, rs_err, load_owned, run_async, instruction_store](
+                  [auth_fn, perm_fn, rs_err, load_owned, run_async, instruction_store](
                       const httplib::Request& req, httplib::Response& res) {
                       auto session = auth_fn(req, res);
                       if (!session)
+                          return;
+                      // SECURITY (CWE-862, missing authorization): these three
+                      // producers DISPATCH to the fleet — they are operator
+                      // dispatch surfaces, not reads. They authenticated the
+                      // caller and then performed NO authorization check at all:
+                      // `perm_fn` was not even captured, so ANY authenticated
+                      // session — including one holding no Execution grant —
+                      // reached `command_dispatch_fn` with scope `__all__`.
+                      // Shipped ungated since e7b47ca3 (2026-05-31, in v0.13.0);
+                      // found by the Gate 4 consistency sweep, not by the diff
+                      // review, because every SIBLING dispatch surface was
+                      // confined and these were the last ones left.
+                      if (!perm_fn(req, res, "Execution", "Execute"))
                           return;
                       auto id = req.matches[1].str();
                       auto orig = load_owned(req, id, session->username, res);
@@ -6545,7 +6861,7 @@ void RestApiV1::register_routes(
                               return;
                           }
                           std::unordered_map<std::string, std::string> params{{"sql", sql}};
-                          run_async(req, res, session->username, "tar", "sql", params,
+                          run_async(req, res, *session, "tar", "sql", params,
                                     source_kind::kTarQuery, orig->source_payload, orig->matcher,
                                     synth, reeval_name);
                       } else if (orig->source_kind == source_kind::kInstructionResult) {
@@ -6563,7 +6879,7 @@ void RestApiV1::register_routes(
                           if (sp.contains("params") && sp["params"].is_object())
                               for (auto& [k, v] : sp["params"].items())
                                   params[k] = v.is_string() ? v.get<std::string>() : v.dump();
-                          run_async(req, res, session->username, def->plugin, def->action, params,
+                          run_async(req, res, *session, def->plugin, def->action, params,
                                     source_kind::kInstructionResult, orig->source_payload,
                                     orig->matcher, synth, reeval_name);
                       } else {
@@ -8132,8 +8448,8 @@ void RestApiV1::register_routes(
     // (architect B1). The read model above stays GET.
     sink.Post(
         R"(/api/v1/dex/devices/([^/]+)/live)",
-        [scoped_perm_fn, response_store, command_dispatch_fn, audit_fn, metrics_registry](
-            const httplib::Request& req, httplib::Response& res) {
+        [scoped_perm_fn, response_store, command_dispatch_fn, audit_fn, metrics_registry,
+         resolve_secondary_exec_visible](const httplib::Request& req, httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
             // Echo the correlation id on EVERY response path (A3), parity with the
@@ -8190,6 +8506,17 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
+            // #1788 defense-in-depth, behind the per-device `gate(...)` above.
+            // Resolved HERE — after the dependency checks, but BEFORE the
+            // in-flight slot and before the audit "requested" row — so a failure
+            // cannot leave an audited request that never dispatched, and cannot
+            // consume a concurrency slot it will not use. (Doing it after the
+            // audit was the original shape and is the ordering defect this
+            // moves; the scope gate above has already answered 401, so this
+            // still cannot fail in practice and no status ordering shifts.)
+            const auto exec_visible = resolve_secondary_exec_visible(req, res);
+            if (!exec_visible)
+                return;
             // Concurrency cap (UP-1/2/3): acquire an in-flight slot BEFORE dispatch so
             // an over-budget caller gets 429 without orphaning a command. RAII releases
             // the slot on every return below; the gauge mirrors current depth.
@@ -8230,8 +8557,8 @@ void RestApiV1::register_routes(
                              audit_action, cid, agent_id);
                 return;
             }
-            const auto [command_id, sent] =
-                command_dispatch_fn(plugin, action, {agent_id}, "", {}, /*execution_id=*/"");
+            const auto [command_id, sent] = command_dispatch_fn(plugin, action, {agent_id}, "", {},
+                                                                /*execution_id=*/"", *exec_visible);
             if (sent == 0) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(

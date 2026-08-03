@@ -61,7 +61,8 @@ void BundleOrchestrator::maybe_sweep_locked(std::int64_t now) {
 
 BundleOrchestrator::DispatchResult
 BundleOrchestrator::dispatch(const std::string& agent_id, const std::vector<BundleStepSpec>& steps,
-                             const std::string& principal, const AuditSink& audit) {
+                             const std::string& principal, const AuditSink& audit,
+                             const yuzu::server::authz::VisibleSet& exec_visible) {
     const std::string correlation = std::string(kCorrelationPrefix) + mint_();
     // Time the synchronous fan-out so the cost of holding the HTTP worker through
     // N gRPC writes is observable BEFORE it becomes a thread-pool-starvation
@@ -89,7 +90,13 @@ BundleOrchestrator::dispatch(const std::string& agent_id, const std::vector<Bund
         try {
             int sent = 0;
             std::tie(command_id, sent) =
-                dispatch_(s.plugin, s.action, {agent_id}, /*scope=*/"", params, correlation);
+                // governance UP-8: thread the CALLER's exec_visible through
+                // unchanged rather than hardcoding an unfiltered set here — the
+                // wrapper (REST scoped_perm_fn / MCP in_scope) already confined
+                // `agent_id` against it, so this is a defense-in-depth pass-
+                // through, not a re-decision.
+                dispatch_(s.plugin, s.action, {agent_id}, /*scope=*/"", params, correlation,
+                          exec_visible);
             ok = sent > 0 && !command_id.empty();
         } catch (const std::exception& e) {
             spdlog::warn("BundleOrchestrator: dispatch threw for step {}.{} ({}): {}", s.plugin,
