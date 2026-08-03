@@ -58,7 +58,8 @@ environment variable at runtime.
 **Before you start, make sure you can sign in as a local administrator.** Revoking at the IdP stops new
 SSO logins immediately, and the restart in the verification step below ends every active session
 (sessions are held in memory, not persisted). Your existing session survives the revocation itself, but
-not the restart — so on an SSO-only install, confirm a local admin route in before you revoke anything.
+not the restart. **If you have no local administrator account, create one now**, while you still hold a
+session in which to do it — an SSO-only install that revokes first and restarts has no way back in.
 
 **Remediate: rotate the client secret at your IdP, and revoke the old one.** The upgrade closes the
 disclosure paths but **does not change the stored value** — anything that already read it still holds a
@@ -73,12 +74,20 @@ stored runtime-config overrides are applied. So rotate through **Settings -> OID
 `--oidc-client-secret` (or `YUZU_OIDC_CLIENT_SECRET`).
 
 **Why the second step matters.** The OIDC provider is built once at startup, from the command-line and
-environment values, *before* stored runtime-config overrides are applied — and nothing rebuilds it
-afterwards. A secret that lives only in the store therefore never reaches the restarted provider. What
-that produces depends on the rest of your configuration and on your IdP's client-authentication policy:
-the restart may reinstate the old, disclosed secret, or come up with no usable secret at all. Yuzu does
-not tell you which — `GET /api/config` reports the stored value regardless, and reports the key as set
-in both cases. Do not predict the outcome; verify it after restarting.
+environment values, *before* stored runtime-config overrides are applied. Nothing rebuilds it
+automatically afterwards — only a Settings → OIDC save does, and only in the running process. A secret
+that lives only in the store therefore never reaches the restarted provider.
+
+**If OIDC was configured entirely through Settings, the secret is not the only thing missing.** The
+provider is built only when `--oidc-issuer` *and* `--oidc-client-id` are both present at startup
+(`server.cpp`), and on a Settings-only install those are store-only too — so the restart builds **no
+provider at all** and SSO is absent rather than misconfigured. Supplying `--oidc-client-secret` alone
+does not fix that. Move the issuer and client ID to the command line or environment as well.
+
+Beyond that case, what a restart produces depends on the rest of your configuration and on your IdP's
+client-authentication policy, so verify it rather than predicting it. Note that `GET /api/config`
+answers from the **store**, not from the running provider: it reports the key as set whichever secret
+the process is actually using, which is why the verification below restarts and logs in.
 
 **Expect a brief SSO outage.** Between revoking at the IdP and completing both Yuzu-side steps, new
 logins fail — Yuzu still presents the old secret to an IdP that no longer accepts it. Do the Yuzu-side
