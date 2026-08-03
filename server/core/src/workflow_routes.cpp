@@ -1,5 +1,7 @@
 #include "workflow_routes.hpp"
 
+#include "reserved_definition_id.hpp" // is_reserved_definition_id (#2442)
+
 #include "compliance_eval.hpp"
 #include "dispatch_target_shape.hpp" // check_targeting_shape — the omitted-vs-supplied rule (#2500)
 #include "event_bus.hpp"
@@ -1549,22 +1551,51 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // minting into the reserved `mcp.` ticket namespace: def_id is
                 // caller-influenced and scope_expr is caller-supplied verbatim,
                 // and the MCP recall matches on exactly that pair.
+                // A reserved-namespace id can never mint a ticket (#2442), so
+                // this execute can never succeed. Answer that as the
+                // deterministic, renameable config problem it is rather than
+                // letting submit()'s refusal surface as a generic 500 — the
+                // operator of a legacy `mcp.`-prefixed definition would
+                // otherwise get an opaque server error on every execute with
+                // nothing to act on.
+                //
+                // Checked here through the shared predicate rather than by
+                // matching submit()'s error text: the message is
+                // operator-facing prose, and a status code must not be coupled
+                // to it. submit() keeps its own check as the fail-closed
+                // chokepoint, which is what makes this a pre-check and not a
+                // relocation of the rule.
+                //
+                // Deliberate: if the store is ALSO unavailable, this still
+                // answers 400. The id is the permanent, actionable problem and
+                // no store state makes this request succeed; a store fault
+                // surfaces on every request that is not already doomed.
+                if (is_reserved_definition_id(def_id)) {
+                    if (audit_fn) {
+                        audit_fn(req, "instruction.execute", "denied", "instruction", def_id,
+                                 "reason=reserved_definition_id");
+                    }
+                    res.status = 400;
+                    res.set_content(
+                        nlohmann::json(
+                            {{"error",
+                              {{"code", 400},
+                               {"message", std::string(kReservedDefinitionIdError) +
+                                               "; rename this definition"},
+                               {"remediation", "create a replacement under an id outside the "
+                                               "mcp. namespace and delete this one"}}},
+                             {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
+                        "application/json");
+                    return;
+                }
                 auto result = approval_manager->submit(def_id, session->username, scope_expr, "",
                                                        ApprovalOrigin::kInstruction);
                 if (!result) {
-                    // A reserved-namespace refusal is a deterministic, actionable
-                    // config problem, not a server fault: answer 400 and name it,
-                    // or the operator of a legacy `mcp.`-prefixed definition gets
-                    // an opaque 500 on every execute with nothing to act on.
-                    // Compared against the shared constant, not a substring —
-                    // both sides use the one definition, so this is exact.
-                    const bool reserved = result.error() == kReservedDefinitionIdError;
                     spdlog::error("approval submit failed for '{}': {}", def_id, result.error());
-                    res.status = reserved ? 400 : 500;
+                    res.status = 500;
                     res.set_content(
-                        reserved
-                            ? R"({"error":{"code":400,"message":"definition id may not use the reserved 'mcp.' prefix (reserved for MCP approvals); rename this definition","remediation":"create a replacement under an id outside the mcp. namespace and delete this one"},"meta":{"api_version":"v1"}})"
-                            : R"({"error":{"code":500,"message":"failed to create approval request"},"meta":{"api_version":"v1"}})",
+                        R"({"error":{"code":500,"message":"failed to create approval request"},"meta":{"api_version":"v1"}})",
                         "application/json");
                     return;
                 }

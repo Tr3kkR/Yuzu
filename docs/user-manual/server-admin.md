@@ -221,7 +221,10 @@ execute request fails. This covers `approval_mode: always`, `role-gated` for any
 not an admin, and any unrecognised mode (which fails closed to requiring approval). Scheduled
 fires of such a definition are skipped occurrence by occurrence, counted in
 `yuzu_schedule_fire_failures_total` and audited as `instruction.schedule_fired` /
-`approval_submit_failed`.
+`approval_submit_failed`. Note what that looks like from the dashboard: the schedule stays
+enabled and keeps advertising a next run it can never make, and each occurrence is dropped
+rather than retried. Nothing self-corrects, so a scheduled `mcp.`-prefixed definition is the
+case to rename first.
 
 It fails closed — nothing is bypassed, and no approval is granted that should not be — but the
 definition stops working rather than degrading. Only `approval_mode: auto`, or an admin
@@ -230,7 +233,7 @@ bypassing `role-gated`, keeps running.
 **What does NOT change.** The store applies the rule at creation only, so a definition that
 already carries such an id can still be saved through `PUT /api/instructions/{id}` — an update
 cannot originate an id, so blocking it there would strand content rather than protect anything.
-Two exceptions to "still editable": the dashboard's YAML editor runs the same validation on
+One exception to "still editable": the dashboard's YAML editor runs the same validation on
 every save, create or update, so such a definition cannot be edited there if its document
 declares `metadata.id` (one that omits it still saves, since the validator only checks a
 declared id).
