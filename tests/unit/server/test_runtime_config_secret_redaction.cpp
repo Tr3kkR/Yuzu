@@ -60,7 +60,7 @@ TEST_CASE("TRIPWIRE: every credential-shaped allowed key is registered as secret
           "[runtime_config][secret][tripwire]") {
     // If you are here because this failed, you added a key to `allowed_keys()` whose
     // NAME says it carries a credential. Either add it to `kSecretKeys` in
-    // runtime_config_store.cpp so the log line and GET /api/config redact it, or --
+    // config_secret_keys.cpp so the log line and GET /api/config redact it, or --
     // if the name is misleading and the value is not a credential -- rename the key.
     // Do not relax this test to make it pass.
     //

@@ -3917,6 +3917,13 @@ void SettingsRoutes::register_routes(
             return;
         }
 
+        // The redaction placeholder is not a credential. Treat it exactly like a blank
+        // field (meaning "leave the stored secret alone"): it reaches this handler when
+        // an operator copies it out of the startup log or an API response, and the store
+        // refuses it further down -- but by then cfg_ and the live provider have already
+        // been updated, so the two would diverge behind a "saved" toast.
+        if (client_secret == RuntimeConfigStore::redacted_placeholder())
+            client_secret.clear();
         auto effective_secret = client_secret.empty() ? cfg_->oidc_client_secret : client_secret;
         bool skip_tls = (skip_tls_verify == "true");
 
@@ -3972,18 +3979,47 @@ void SettingsRoutes::register_routes(
         }
         spdlog::info("OIDC provider reinitialized via Settings UI (issuer={})", issuer);
 
+        std::vector<std::string> persist_errors;
         if (runtime_config_store_ && runtime_config_store_->is_open()) {
             auto who = std::string("admin");
             auto session = auth_fn_(req, res);
             if (session)
                 who = session->username;
-            runtime_config_store_->set("oidc_issuer", issuer, who);
-            runtime_config_store_->set("oidc_client_id", client_id, who);
+            // Every result is observed. `set()` is [[nodiscard]] for this reason: a
+            // discarded rejection reported "saved" for a write the store refused.
+            auto note = [&](const char* k, std::expected<void, std::string> r) {
+                if (!r)
+                    persist_errors.push_back(std::string(k) + ": " + r.error());
+            };
+            note("oidc_issuer", runtime_config_store_->set("oidc_issuer", issuer, who));
+            note("oidc_client_id", runtime_config_store_->set("oidc_client_id", client_id, who));
             if (!client_secret.empty())
-                runtime_config_store_->set("oidc_client_secret", client_secret, who);
-            runtime_config_store_->set("oidc_redirect_uri", redirect_uri, who);
-            runtime_config_store_->set("oidc_admin_group", admin_group, who);
-            runtime_config_store_->set("oidc_skip_tls_verify", skip_tls ? "true" : "false", who);
+                note("oidc_client_secret",
+                     runtime_config_store_->set("oidc_client_secret", client_secret, who));
+            note("oidc_redirect_uri",
+                 runtime_config_store_->set("oidc_redirect_uri", redirect_uri, who));
+            note("oidc_admin_group",
+                 runtime_config_store_->set("oidc_admin_group", admin_group, who));
+            note("oidc_skip_tls_verify",
+                 runtime_config_store_->set("oidc_skip_tls_verify", skip_tls ? "true" : "false", who));
+        }
+
+        if (!persist_errors.empty()) {
+            // The live provider is already swapped in, but the store refused part of the
+            // write, so the running config and the persisted config disagree and a restart
+            // would silently revert. Say so instead of reporting success.
+            const std::string joined = persist_errors.size() == 1
+                                           ? persist_errors.front()
+                                           : std::to_string(persist_errors.size()) + " settings";
+            audit_fn_(req, "oidc.configure", "failure", "OidcConfig", issuer,
+                      "persist failed: " + joined);
+            auto html = render_directory_fragment() +
+                        "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
+                        "hx-swap-oob=\"true\">OIDC applied to the running server but NOT saved (" +
+                        html_escape(joined) +
+                        "). It will revert on restart - fix the value and save again.</div>";
+            res.set_content(html, "text/html; charset=utf-8");
+            return;
         }
 
         audit_fn_(req, "oidc.configure", "success", "OidcConfig", issuer, "");

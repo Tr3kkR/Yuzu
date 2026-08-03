@@ -66,6 +66,14 @@ Structured JSON envelope:
   read-time sanitiser exists to withhold - converting the redaction into a disclosure oracle. The
   absence of that filter is what makes read-time redaction sufficient rather than cosmetic, so it is
   a standing constraint, not an unimplemented feature.
+- **A raw database extract will NOT match API or export output**, for rows predating the read-time
+  sanitiser. The rows are deliberately left byte-unchanged - rewriting audit history to remove
+  embarrassing content is a worse posture than declining to disclose it, and there is no hash chain
+  over `audit_events` that would make such a rewrite distinguishable from concealment. The
+  consequence is a real discrepancy: an auditor given DB-level access sees the stored plaintext,
+  while the same row sampled through `GET /api/v1/audit` shows `value=<redacted>`. **Disclose that
+  discrepancy proactively** rather than letting it be discovered - it is a compensating disclosure
+  control operating at the read layer, not a claim about what is stored.
 - Denied operations MUST emit an audit event — `spdlog::warn` alone breaks the SOC 2 CC7.2 evidence chain. Example: the MCP Streamable HTTP transport (track 2f) emits `mcp.session.open` / `mcp.session.close` (`result="success"`) and `mcp.session.reject` (`result="failure"`, `detail="reason=origin|protocol_version|unknown_session|missing_session_header|per_principal_cap|global_cap"`) on `target_type="McpSession"` — the reject verb fires on **every** transport denial (origin, protocol-version, unknown/expired session, cap), routed through the shared `try_persist_audit` kernel so a persist failure is logged, never silently swallowed. (Note: the MCP surface uses `"success"`/`"failure"` result tokens, not the `"ok"`/`"denied"` of the envelope example above — a pre-existing surface-wide convention across all `mcp.*` verbs; author SIEM rules for `mcp.*` accordingly.)
 
 **MCP Streamable HTTP streams (track 2f PR 2)** add two verbs — `mcp.stream.attach` and `mcp.stream.close` (the latter carrying `reason=` from the closed set `client_disconnect|superseded|session_terminated|credential_revoked|auth_unavailable|internal_error|cancelled|cap_expired|completed` — the last three are the streamed-POST surface, pre-seeded from 2f PR 3b but emitted only once its producers land) — and widen the `mcp.session.reject` `reason=` set with `not_acceptable`, `per_principal_stream_cap`, `global_stream_cap`, `stream_handover_pending`, and `replay_window_exceeded` (the last on `mcp.session.close`). Every value is a static literal, pre-seeded on the matching `yuzu_mcp_stream_rejects_total{reason}` / `yuzu_mcp_stream_closes_total{reason}` counter — no label is ever derived from caller input.

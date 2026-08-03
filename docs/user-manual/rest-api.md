@@ -3091,9 +3091,9 @@ Update a single runtime configuration value. The key must be one of the allowed 
 | Key | Type | Takes effect | Description |
 |---|---|---|---|
 | `heartbeat_timeout` | integer | immediately | Seconds before an agent is considered offline |
-| `response_retention_days` | integer | immediately | Days to retain command response data |
-| `audit_retention_days` | integer | immediately | Days to retain audit log entries |
-| `guardian_event_retention_days` | integer | immediately | Days to retain guaranteed-state events |
+| `response_retention_days` | integer | **stored only, applied at next restart** | Days to retain command response data |
+| `audit_retention_days` | integer | **stored only, applied at next restart** | Days to retain audit log entries |
+| `guardian_event_retention_days` | integer | **stored only, applied at next restart** | Days to retain guaranteed-state events |
 | `log_level` | string | immediately | Server log verbosity (`trace`, `debug`, `info`, `warn`, `error`) |
 | `auto_approve_enabled` | boolean | **never - see note** | Accepted and stored, but no consumer reads it back |
 | `plugin_signing_required` | boolean | **records intent only - see note** | Server-side record of the Settings "Require signed plugins" toggle |
@@ -3114,10 +3114,15 @@ Update a single runtime configuration value. The key must be one of the allowed 
 Persisting a value and applying it are separate steps, and this endpoint only does the first for
 most keys:
 
-- **immediately** - the handler assigns the new value into the live server config
-  (`heartbeat_timeout`, `response_retention_days`, `audit_retention_days`,
-  `guardian_event_retention_days`), or `RuntimeConfigStore::set()` applies it directly (`log_level`,
-  which calls `spdlog::set_level`).
+- **immediately** - only two keys. `heartbeat_timeout` is assigned into the live server config and
+  re-read on every stale-session sweep; `log_level` is applied by `RuntimeConfigStore::set()` itself
+  via `spdlog::set_level`.
+- **stored only, applied at next restart** - `response_retention_days`, `audit_retention_days`,
+  `guardian_event_retention_days`. The handler updates the in-memory config, so `GET /api/config`
+  and the Settings page immediately report the NEW value - but each store captured its retention
+  window when it was constructed and exposes no setter, so the store still enforcing retention keeps
+  the old value until the server restarts. **The API reports the stored value, not the value being
+  enforced.** Restart after changing a retention window.
 - **records intent only** - `plugin_signing_required` is read in exactly two places, both of which
   render the Settings status badge. **No server or agent code consumes it to require signatures**,
   and it is not carried in any proto field, so it never reaches an agent. Agent-side enforcement is
@@ -3135,12 +3140,14 @@ most keys:
   code reads it back from there. `GET /api/config` reports `auto_approve_enabled` **derived from
   whether any auto-approve rule exists**, not from the stored value, so a `PUT` of this key can
   appear to have no effect - because it has none. Manage auto-approve through its own rules API.
-- **OIDC keys (see note)** - persisted only. **The running `OidcProvider` is not rebuilt**, so
-  logins continue to use the previously loaded settings until the server restarts. To change OIDC
-  configuration and have it take effect at once, use the Settings UI (`POST /api/settings/oidc`),
-  which constructs a new provider and swaps it in. This matters most for a credential rotation: a
-  `PUT` of `oidc_client_secret` returns `"applied": true` meaning *persisted and accepted*, not
-  *now in use by the live provider*.
+- **OIDC keys (see note)** - persisted only, and **a restart does not apply them either.** The
+  `OidcProvider` is constructed early in server startup (`server.cpp:1894`) from CLI/environment
+  configuration, whereas the stored runtime-config overrides are not read until much later in the
+  same startup (`server.cpp:3466`); nothing rebuilds the provider afterwards. So a value written
+  through this API never reaches the live provider, on this boot or any later one.
+  **Only Settings -> OIDC (`POST /api/settings/oidc`) applies OIDC settings**, because that handler
+  constructs a new provider and swaps it in. This matters most for a credential rotation: a `PUT` of
+  `oidc_client_secret` returns `"applied": true` meaning *persisted and accepted*, never *in use*.
 
 **Request body:**
 
@@ -3183,6 +3190,14 @@ is a bare `error` string with no envelope:
 A value of `0` for `heartbeat_timeout`, `response_retention_days` or `audit_retention_days` passes
 the route's `>= 0` pre-check and is then rejected by the store's own `> 0` check, so it returns the
 **bare** shape with a different message: `{ "error": "value must be a positive integer" }`.
+
+**Error (400) - the redaction placeholder submitted as a secret.** `GET /api/config` omits a
+secret's value and the startup log prints `<redacted>` in its place; that literal is refused as a
+value for a secret-valued key, so copying it back cannot destroy the stored credential. Bare shape:
+
+```json
+{ "error": "value is the redaction placeholder, not a credential; send the real secret, or omit the key to leave it unchanged" }
+```
 
 **Audit:** a successful write emits `config.update` / `RuntimeConfig` with `target_id` = the key.
 See [Audit log](audit-log.md) for the `detail` contract, which differs for secret-valued keys.

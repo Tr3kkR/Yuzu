@@ -454,5 +454,6 @@ When using OIDC/Entra ID:
 > stored value itself is unchanged**, so anyone or anything that already read it still
 > holds a working credential. Treat a secret set before this upgrade as disclosed and
 > rotate it at the IdP. Note that rotating via `PUT /api/config/oidc_client_secret`
-> persists the new value but does **not** rebuild the running OIDC provider - use
-> Settings -> OIDC, or restart the server, for it to take effect.
+> persists the new value but does **not** rebuild the running OIDC provider, **and a restart does
+> not apply it either** (the provider is built before the stored overrides are read). **Rotate
+> through Settings -> OIDC**, which is the only path that applies an OIDC change.

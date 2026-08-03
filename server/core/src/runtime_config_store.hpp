@@ -71,8 +71,16 @@ public:
     /// get_all_with_secrets(): use only where the credential itself is required.
     std::string get_value_with_secrets(const std::string& key) const;
 
-    /// Set a config value. Returns error if the key is not in the allow-list.
-    std::expected<void, std::string> set(const std::string& key, const std::string& value,
+    /// Set a config value. Returns an error if the key is not in the allow-list, if
+    /// validation fails, or if the value is the redaction placeholder for a secret key.
+    ///
+    /// [[nodiscard]] deliberately: discarding this used to be harmless because the only
+    /// failure was an unknown key, which no in-tree caller could produce. The
+    /// placeholder guard made it reachable, and a caller that ignored it reported
+    /// "saved" for a write the store refused -- with the live in-memory config already
+    /// updated, so the two diverged and a restart silently healed it.
+    [[nodiscard]] std::expected<void, std::string> set(const std::string& key,
+                                                       const std::string& value,
                                          const std::string& updated_by);
 
     /// Delete a config override (revert to default).

@@ -7829,13 +7829,25 @@ private:
                 spdlog::level::to_string_view(spdlog::default_logger()->level()).data();
 
             // Overrides from store. The omission rule lives in
-            // RuntimeConfigStore::build_overrides_json so it is unit-testable -- this
+            // build_overrides_json (runtime_config_view.hpp) so it is unit-testable -- this
             // route is not TestRouteSink-registered, and it is one of the sites the
             // secret leaked from twice.
-            nlohmann::json overrides = nlohmann::json::object();
-            if (runtime_config_store_ && runtime_config_store_->is_open()) {
-                overrides = build_overrides_json(runtime_config_store_->get_all());
+            // A degraded store must NOT read as "nothing is configured". This route no
+            // longer returns a secret's value, so the PRESENCE of the key and its
+            // `is_set` are the only way to answer "is the OIDC secret set here?" -- and
+            // security-hardening.md tells operators to answer exactly that before
+            // deciding whether to rotate a disclosed credential. Returning 200 with an
+            // empty `overrides` would answer "never set, nothing to rotate". The PUT twin
+            // below already 503s on this condition; this matches it.
+            if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"runtime configuration store unavailable"},)"
+                    R"("meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
             }
+            nlohmann::json overrides = build_overrides_json(runtime_config_store_->get_all());
 
             nlohmann::json allowed = nlohmann::json::array();
             for (const auto& k : RuntimeConfigStore::allowed_keys())
