@@ -3926,8 +3926,10 @@ void SettingsRoutes::register_routes(
         //
         // The predicate here and the one at the sink are deliberately DIFFERENT, and both
         // are needed. This one is EXACT: only the bare placeholder means "unchanged" (the
-        // form renders an empty field with a ******** placeholder attribute, so the literal
-        // never originates here). A secret that merely CONTAINS the token falls through on
+        // form renders the field with `value=""` unconditionally, so the literal never
+        // originates here -- only the greyed placeholder ATTRIBUTE varies with whether a
+        // secret is stored, and an attribute is never submitted). A secret that merely
+        // CONTAINS the token falls through on
         // purpose -- the sink refuses it and the failure branch below tells the operator.
         // Clearing it here instead discarded a real credential and reported SAVED, the same
         // false-success this change exists to remove (found by four reviewers). The sink's

@@ -22,11 +22,13 @@ bool is_secret_config_key(std::string_view key);
 /// What to print in place of a secret. ONE spelling, so log scrapers and API
 /// consumers see a single token.
 ///
-/// Deliberately `const char*` rather than `std::string_view`: it is concatenated
-/// with `std::string` at several call sites, and `std::string + std::string_view`
-/// is a C++26 addition (P2591), not available in the C++23 baseline this project
-/// builds against. The declaration itself would compile fine as a `string_view`;
-/// it is those call sites that would not.
+/// Deliberately `const char*` rather than `std::string_view`. The declaration itself
+/// would compile fine either way; the constraint is at the call sites. Concretely:
+/// `RuntimeConfigStore::redacted_placeholder()` (`runtime_config_store.hpp`) returns
+/// this as a `const char*`, and `std::string_view` does not convert to one. Related,
+/// though no site relies on it today: `std::string + std::string_view` is a C++26
+/// addition (P2591), absent from the C++23 baseline this project builds against, so
+/// a `string_view` here would also foreclose direct concatenation.
 /// DO NOT respell this to a common word. `is_redaction_placeholder()` refuses any
 /// value CONTAINING this token, which is safe only because `<redacted>` is implausible
 /// as a substring of a real credential (`<` and `>` are outside the alphabet of every
@@ -49,8 +51,9 @@ bool is_redaction_placeholder(std::string_view value);
 ///
 /// The Settings handler needs this narrower question. It maps a placeholder paste to
 /// "leave the stored secret unchanged", which is right for someone pasting the
-/// token back from the startup log or an API response. (The Settings form renders an
-/// empty field with a ******** placeholder - it never pre-fills the literal.) Using the CONTAINS predicate there meant a
+/// token back from the startup log or an API response. (The Settings form renders the
+/// field with `value=""` unconditionally, so it never pre-fills the literal - only the
+/// greyed placeholder ATTRIBUTE varies, and an attribute is never submitted.) Using the CONTAINS predicate there meant a
 /// real secret that happened to contain the token was silently discarded and reported
 /// SAVED - the same false-success this whole change exists to remove. Containment now
 /// falls through to the sink, which refuses it with a message the operator sees.

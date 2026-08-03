@@ -20,8 +20,8 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 ## ⚠️ Security: rotate `oidc_client_secret` if it was ever set on this install
 
-Releases **v0.10.0 through v0.13.0** emitted the OIDC client secret in the clear to three places, and
-this upgrade closes all three:
+**Every release up to and including v0.13.0** emitted the OIDC client secret in the clear to three
+places, and this upgrade closes all three:
 
 - the **server log**, written verbatim by the startup override pass on **every boot**;
 - `GET /api/config`, a route gated only on `Infrastructure:Read`;
@@ -33,9 +33,10 @@ through that path too. The rows themselves are deliberately left intact: an audi
 evidence, and rewriting history to conceal a mistake is a worse posture than declining to disclose it.
 
 **Who this affects:** any install where `oidc_client_secret` was ever set through **Settings -> OIDC**
-or `PUT /api/config/oidc_client_secret` on v0.10.0 or later. All three paths above read from
-runtime-config, so a secret supplied **only** via `--oidc-client-secret` or `YUZU_OIDC_CLIENT_SECRET`,
-and never written through Settings or the API, was not disclosed by any of them.
+or `PUT /api/config/oidc_client_secret` on **any release up to and including v0.13.0**. All three
+paths above read from runtime-config, so a secret supplied **only** via `--oidc-client-secret` or
+`YUZU_OIDC_CLIENT_SECRET`, and never written through Settings or the API, was not disclosed by any of
+them.
 
 **Remediate: rotate the client secret at your IdP.** The upgrade closes the disclosure paths but **does
 not change the stored value** - anything that already read it still holds a live credential. Rotation is
