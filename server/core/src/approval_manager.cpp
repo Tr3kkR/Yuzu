@@ -477,8 +477,15 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
     // copy of the rule, free to drift from the predicate the recall actually
     // applies. That is the whole reason the predicate exists. The cost is that
     // the scan takes the newest ELIGIBLE row rather than trusting `LIMIT 1`, so
-    // a foreign ticket in front of a valid one no longer hides it. Bounded
-    // because the tuple is narrow and the global pending cap is 1000.
+    // a foreign ticket in front of a valid one does not hide it.
+    //
+    // `LIMIT 64` does truncate: an eligible row past position 64 IS hidden. The
+    // bound that makes that harmless is NOT the global 1000-pending cap — it is
+    // `kMcpSubmitterPendingCap` (25) in mcp_server.cpp, checked per submitter
+    // before this is ever reached. The tuple pins `submitted_by`, so 64 same-
+    // tuple pending rows implies 64 pending for that submitter, and the mint is
+    // denied well before the scan can truncate. The visible effect of hitting it
+    // would be a "too many pending approvals" denial, never a duplicate mint.
     std::string sql = std::string("SELECT ") + kSelectAllCols +
                       " FROM approvals WHERE definition_id = ? AND submitted_by = ? "
                       "AND scope_expression = ? AND status = 'pending' "

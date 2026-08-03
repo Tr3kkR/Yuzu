@@ -45,7 +45,8 @@ enum class ApprovalOrigin {
 };
 
 /// Column text for `origin`. `kUnspecified` stores the empty string, which is
-/// also what migration v5 back-fills into pre-existing rows, so "no declared
+/// also what a row predating migration v5 reads as — the migration adds the
+/// column with `DEFAULT ''` and does not rewrite existing rows — so "no declared
 /// origin" reads identically whether the row predates the column or the caller
 /// stayed silent.
 const char* to_string(ApprovalOrigin origin);
@@ -94,9 +95,13 @@ ApprovalOrigin approval_origin_from_string(std::string_view text);
 /// presentation binary redeeming core-minted grants, and a parallel
 /// `declares_non_gateway_surface` would be a fork of a single-chokepoint rule.
 /// Written as an ALLOW-LIST switch rather than `!= kMcp && != kUnspecified`, and
-/// deliberately with no `default:`. Adding a fifth ApprovalOrigin then fails the
-/// build HERE, at the security gate, instead of silently inheriting whichever
-/// side of the inequality it happens to land on. The trailing `return true` is
+/// deliberately with no `default:`. Adding another ApprovalOrigin then fails the
+/// build HERE, at the security gate — and at `to_string`, which is the site that
+/// would otherwise fail OPEN, since an unhandled enumerator falls out to `""`
+/// and decodes straight back to the exempt `kUnspecified`. That guarantee is
+/// real rather than asserted: `meson.build` carries `-Werror=switch` (`/we4062`
+/// on MSVC) precisely so these two switches are enforced. The trailing
+/// `return true` is
 /// unreachable today and denies, which is the correct direction for the one
 /// value a future compiler could reach: a bit pattern outside the enumerators.
 [[nodiscard]] constexpr bool declares_non_mcp_surface(ApprovalOrigin origin) {
