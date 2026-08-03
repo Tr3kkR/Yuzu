@@ -6512,10 +6512,36 @@ McpServer::HandlerFn McpServer::build_handler(
                                     yuzu::server::detail::adopt_quota_slot_into_stream(
                                         std::move(releaser)));
 
-                                if (post_gauge != nullptr) {
-                                    post_gauge->increment();
-                                    *incremented = true;
-                                }
+                                // EVERYTHING FROM HERE TO THE `return` IS CONTAINED
+                                // (sec-S1). The rule stated above the pre-built
+                                // strings - "Nothing after
+                                // set_chunked_content_provider may allocate" - was
+                                // violated three times right here: Gauge::increment
+                                // takes a lock_guard and is not noexcept, the attach
+                                // audit passes a 17-char literal into a std::string
+                                // parameter (past libstdc++'s 15-char SSO), and
+                                // mcp_audit builds "mcp." + tool_name. A throw from
+                                // any of them reached the outer catch, which parks
+                                // the record, audits FAILURE for a stream that is
+                                // live and correct, and writes a 500 whose A4 body
+                                // httplib DISCARDS because the content provider is
+                                // already installed - so the client got a bare 500
+                                // plus a chunked SSE body and no execution_id for a
+                                // mutating fleet command that is still running, and
+                                // the parked record then answered on_final_written
+                                // false, leaking a pin and one of the session's four
+                                // streamed slots until session death.
+                                //
+                                // The stream is live and correct at this point. None
+                                // of the bookkeeping below is worth destroying a
+                                // correct response over: the attach-audit failure
+                                // already has its own counter, and a lost success
+                                // row is an evidence gap, not a wrong answer.
+                                try {
+                                    if (post_gauge != nullptr) {
+                                        post_gauge->increment();
+                                        *incremented = true;
+                                    }
                                 // AFTER the install, deliberately - an attach
                                 // audited before a failed install records a stream
                                 // that never existed. The cost is that the headers
@@ -6523,7 +6549,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                 // cannot answer a failed audit with Sec-Audit-Failed;
                                 // set-and-proceed is the only posture left, and the
                                 // stream is real either way.
-                                if (!yuzu::server::detail::try_persist_audit(
+                                    if (!yuzu::server::detail::try_persist_audit(
                                         audit_fn, req, "mcp.stream.attach", "success",
                                         "McpSession", audit_sid, attach_detail)) {
                                     // Its OWN counter, not a bridge_degrade reason:
@@ -6533,17 +6559,23 @@ McpServer::HandlerFn McpServer::build_handler(
                                     // The headers are sealed by the install, so unlike
                                     // GET there is no Sec-Audit-Failed to set; this
                                     // counter is the only signal.
-                                    if (metrics != nullptr) {
-                                        try {
-                                            metrics
-                                                ->counter(
-                                                    "yuzu_mcp_stream_attach_audit_failures_total")
-                                                .increment();
-                                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                                        if (metrics != nullptr) {
+                                            try {
+                                                metrics
+                                                    ->counter(
+                                                        "yuzu_mcp_stream_attach_audit_failures_"
+                                                        "total")
+                                                    .increment();
+                                            } catch (...) { // NOLINT(bugprone-empty-catch)
+                                            }
                                         }
                                     }
+                                    mcp_audit("success", success_detail);
+                                } catch (...) { // NOLINT(bugprone-empty-catch) - deliberate
+                                    // The response is already committed and the stream
+                                    // is live. There is nothing to answer a throw WITH,
+                                    // which is exactly why it must not propagate.
                                 }
-                                mcp_audit("success", success_detail);
                                 return; // the provider IS the response
                             } catch (...) {
                                 // Post-dispatch: park (the record keeps its
