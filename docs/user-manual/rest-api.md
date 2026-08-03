@@ -5654,7 +5654,24 @@ uniqueness against existing definitions.
 **Response (200):** `{"id": "<id>"}` for the newly-created definition.
 
 **Response (400):** Validation error (missing required field, invalid
-`approval_mode`, malformed JSON). Body is `{"error": "<reason>"}`.
+`approval_mode`, malformed JSON, or an `id` under the reserved `mcp.` prefix).
+Body is `{"error": "<reason>"}`.
+
+The `mcp.` definition-id prefix is **reserved** (#2442): it names MCP approval
+tickets, and the MCP recall matches a ticket on its definition id and scope
+expression without binding the submitter, so a definition authored under that
+prefix could line up with an MCP tool's canonical arguments. Every authoring
+route that accepts an explicit id refuses it — this one, `POST
+/api/instructions/yaml`, and `POST /api/instructions/import` — and boot-time
+auto-import skips such a definition. Product-pack install is unaffected: it
+never carries a declared id through, so the store always assigns one.
+
+The store applies this at **create time**, so an id that predates the rule stays
+executable and can still be saved through `PUT /api/instructions/{id}`, because
+an update cannot originate an id. Note the dashboard's YAML editor is stricter
+than the store here: `POST /api/instructions/yaml` validates a declared id on
+every save, so an existing `mcp.`-prefixed definition cannot be edited through
+it unless its document omits `metadata.id`.
 
 **Response (409):** Returned when an explicit `id` is supplied that already
 exists in the store. Body is
