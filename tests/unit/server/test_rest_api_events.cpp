@@ -1168,7 +1168,7 @@ struct RestApprovalsHarness {
 TEST_CASE("GET /api/v1/approvals/{id}: existing approval → 200 with full object",
           "[events][approvals][a4]") {
     RestApprovalsHarness h;
-    auto id = h.approvals->submit("def-123", "alice", "tag:prod");
+    auto id = h.approvals->submit("def-123", "alice", "tag:prod", "", ApprovalOrigin::kUnspecified);
     REQUIRE(id.has_value());
 
     auto res = h.sink.Get("/api/v1/approvals/" + *id);

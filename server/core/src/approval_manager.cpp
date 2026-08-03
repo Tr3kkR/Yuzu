@@ -241,21 +241,6 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
 
     // Queue size limit: prevent unbounded growth (G4-UHP-MCP-004)
     constexpr int kMaxPendingApprovals = 1000;
-    {
-        sqlite3_stmt* cnt = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM approvals WHERE status = 'pending'",
-                               -1, &cnt, nullptr) == SQLITE_OK) {
-            if (sqlite3_step(cnt) == SQLITE_ROW) {
-                int pending = sqlite3_column_int(cnt, 0);
-                if (pending >= kMaxPendingApprovals) {
-                    sqlite3_finalize(cnt);
-                    return std::unexpected("approval queue is full (" +
-                                           std::to_string(kMaxPendingApprovals) + " pending)");
-                }
-            }
-            sqlite3_finalize(cnt);
-        }
-    }
 
     // Lazy expiry sweep (runs on every mint, under mtx_). One shared 7-day
     // window, deliberately simple:
@@ -302,6 +287,35 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
             if (expired > 0)
                 spdlog::info("ApprovalManager: expired {} approved-but-unconsumed approval tickets",
                              expired);
+        }
+    }
+
+    // Queue size limit (G4-UHP-MCP-004) — checked AFTER the sweep above, and the
+    // order is the whole point. The sweep is the ONLY thing in the tree that
+    // expires an approval, and it runs only inside this function. With the cap
+    // checked first, a queue that reaches 1000 pending returns early forever:
+    // nothing ages out, the count never falls, and every approval surface — the
+    // REST instruction gate, every gated schedule occurrence, every MCP gated
+    // tool mint — is permanently denied, recoverable only by reviewing up to
+    // 1000 tickets by hand. The one event that would drain the queue was the one
+    // event the cap forbade.
+    //
+    // Sweeping first makes the bound the docs state actually hold: an idle queue
+    // still ages out on the next mint, and a saturated one drains itself as its
+    // rows pass 7 days. Do not move this above the sweep.
+    {
+        sqlite3_stmt* cnt = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM approvals WHERE status = 'pending'",
+                               -1, &cnt, nullptr) == SQLITE_OK) {
+            if (sqlite3_step(cnt) == SQLITE_ROW) {
+                int pending = sqlite3_column_int(cnt, 0);
+                if (pending >= kMaxPendingApprovals) {
+                    sqlite3_finalize(cnt);
+                    return std::unexpected("approval queue is full (" +
+                                           std::to_string(kMaxPendingApprovals) + " pending)");
+                }
+            }
+            sqlite3_finalize(cnt);
         }
     }
 

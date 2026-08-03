@@ -6994,7 +6994,8 @@ TEST_CASE("MCP 2405: approved ticket bound to schema-invalid args is rejected an
 
     // Seed the pre-#2405 state directly: a ticket already minted for
     // schema-invalid args (missing `key`) and approved by an admin.
-    auto seeded = h.appr->submit("mcp.delete_tag", "test-user", R"({"agent_id":"agent-1"})");
+    auto seeded = h.appr->submit("mcp.delete_tag", "test-user", R"({"agent_id":"agent-1"})", "",
+                                 ApprovalOrigin::kUnspecified);
     REQUIRE(seeded);
     REQUIRE(h.appr->approve(*seeded, "reviewer-bob", ""));
 
@@ -7945,7 +7946,7 @@ TEST_CASE("MCP approve_request approves a pending request as a second principal"
     REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
     yuzu::server::ApprovalManager appr(raw);
     appr.create_tables();
-    auto submitted = appr.submit("some.definition", "alice", "{}");
+    auto submitted = appr.submit("some.definition", "alice", "{}", "", ApprovalOrigin::kUnspecified);
     REQUIRE(submitted);
 
     McpTestServer ts;
@@ -7971,7 +7972,7 @@ TEST_CASE("MCP reject_request rejects a pending request", "[mcp][integration][ap
     REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
     yuzu::server::ApprovalManager appr(raw);
     appr.create_tables();
-    auto submitted = appr.submit("some.definition", "alice", "{}");
+    auto submitted = appr.submit("some.definition", "alice", "{}", "", ApprovalOrigin::kUnspecified);
     REQUIRE(submitted);
 
     McpTestServer ts;

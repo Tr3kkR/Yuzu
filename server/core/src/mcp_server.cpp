@@ -3178,7 +3178,18 @@ McpServer::HandlerFn McpServer::build_handler(
                             return;
                         }
                         auto submitted =
-                            approval_manager->submit(definition_id, session->username, canon);
+                            // kUnspecified is passed EXPLICITLY, and it is not a
+                            // placeholder: this mint genuinely does not declare
+                            // itself yet, and recording `kMcp` here would be
+                            // false evidence. It is spelled out because the
+                            // parameter has no default — see submit()'s contract:
+                            // kUnspecified is the value the redemption guard
+                            // exempts, so a surface must state it rather than
+                            // inherit it. TODO(#2442 follow-up): declare kMcp and
+                            // narrow the guard's allow-set, after a documented
+                            // drain of the blank-origin population.
+                            approval_manager->submit(definition_id, session->username, canon, "",
+                                                     ApprovalOrigin::kUnspecified);
                         if (!submitted) {
                             mcp_audit("failure", "approval submit failed: " + submitted.error());
                             res.set_content(
@@ -3282,6 +3293,42 @@ McpServer::HandlerFn McpServer::build_handler(
 #pragma GCC diagnostic pop
 #endif
                         mcp_audit("denied", "approval " + supplied_id + " " + why);
+                        // A cross-surface redemption attempt is the one event
+                        // this whole control exists to stop, and until now it
+                        // moved no metric — every sibling denial on this handler
+                        // counts, and the operator was left tailing logs for the
+                        // only case that matters. `reason` is a fixed literal,
+                        // never caller-derived, so the label set stays bounded.
+                        if (consumed.error().kind == ConsumeFailure::kForeignOrigin)
+                            count_denial("yuzu_mcp_approval_denied_total", "foreign_origin");
+                        else if (consumed.error().kind == ConsumeFailure::kStoreError)
+                            count_denial("yuzu_mcp_approval_denied_total", "store_error");
+                        else
+                            count_denial("yuzu_mcp_approval_denied_total", "not_consumable");
+                        // kStoreError is the ONE kind that gets its own response,
+                        // and the oracle argument does not cover it: a read
+                        // failure is decided before any id-specific
+                        // determination is made, so answering differently
+                        // discloses nothing about which ids exist or what they
+                        // are. Every other kind stays on the constant below,
+                        // which is what keeps a foreign ticket indistinguishable
+                        // from a spent one.
+                        //
+                        // It matters because the constant is actively harmful
+                        // here: it tells the caller a live, human-approved
+                        // ticket is spent and instructs it to throw the ticket
+                        // away, on what is usually a transient SQLITE_BUSY. The
+                        // ticket was NOT consumed — the guard leaves the row
+                        // untouched — so the correct advice is to retry the
+                        // identical call.
+                        if (consumed.error().kind == ConsumeFailure::kStoreError) {
+                            res.set_content(
+                                a4_error(kInternalError, "approval could not be verified",
+                                         "retry this call unchanged — the approval was NOT "
+                                         "consumed and remains valid"),
+                                "application/json");
+                            return;
+                        }
                         res.set_content(
                             a4_error(kPermissionDenied,
                                      "approval already used (one-time ticket)",

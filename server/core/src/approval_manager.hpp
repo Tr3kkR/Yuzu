@@ -266,10 +266,19 @@ public:
     /// reinstate it: the redemption guard closes the same hole and strands
     /// nothing. Authoring a NEW definition under the prefix is still refused, at
     /// `instruction_store.cpp` and `instruction_yaml.cpp`.
+    /// `origin` has NO DEFAULT, deliberately. It is the sole input to the
+    /// redemption guard, and the value a default would have to carry —
+    /// `kUnspecified` — is the one the guard EXEMPTS. A defaulted parameter here
+    /// means a new mint surface that simply forgets the argument produces a
+    /// whole population of tickets redeemable at the MCP recall, with no compile
+    /// error, no failing test and no log line. That is not hypothetical: the MCP
+    /// gate itself reached the 3-argument shape by exactly that route. Making it
+    /// explicit costs one token per call site and buys the same compile-time
+    /// guarantee the `-Wswitch` regions buy for the enum, for the input.
     std::expected<std::string, std::string>
     submit(const std::string& definition_id, const std::string& submitted_by,
-           const std::string& scope_expression, const std::string& schedule_id = "",
-           ApprovalOrigin origin = ApprovalOrigin::kUnspecified);
+           const std::string& scope_expression, const std::string& schedule_id,
+           ApprovalOrigin origin);
 
     std::vector<Approval> query(const ApprovalQuery& q = {}) const;
 
