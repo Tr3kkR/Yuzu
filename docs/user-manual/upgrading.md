@@ -55,9 +55,10 @@ unlike `cmdline` — but it is *not* better if the value is written into a Compo
 `docker inspect` exposes it to anyone in the `docker` group. Prefer a secrets manager that injects the
 environment variable at runtime.
 
-**Before you begin, check you have a local account you can sign in with.** Rotating breaks SSO until
-Yuzu is re-pointed, and the way back in needs an account that already exists — break-glass *names* one
-rather than creating it. On an install with none, the only fallback
+**Before you begin, check you have a local account you can sign in with** — and on
+`--auth-mode=sso-only`, that it is the configured break-glass account, MFA-enrolled and armable.
+Rotating breaks SSO until Yuzu is re-pointed, and the way back in needs an account that already exists:
+break-glass *names* one rather than creating it. On an install with none, the only fallback
 [`auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md) documents is destructive.
 
 **What to do: rotate the client secret at your IdP, and delete the old one.** The upgrade closes the
@@ -69,9 +70,10 @@ until it is deleted.
 Deletion does not reach what the secret already bought: access tokens minted with it are signed JWTs
 that stay valid until they expire, and IdP sessions can outlast them. Treat revoking those as part of
 the same job. Yuzu's own sessions are separate — the IdP cannot reach them — and are held in memory for
-at most 8 hours; they end on a restart or via `DELETE /api/v1/sessions`. **Neither reaches API tokens**:
-one minted under a session that used the disclosed secret survives every step above and has to be
-revoked on its own.
+at most 8 hours; they end on a restart, or per operator via
+`DELETE /api/v1/sessions?username=<name>` (admin, `UserManagement:Write`). **Neither reaches API
+tokens**: one minted under a session that used the disclosed secret survives every step above. List
+them with `GET /api/v1/tokens` and revoke with `DELETE /api/v1/tokens/{id}`.
 
 Re-pointing Yuzu at the new secret is a configuration task rather than a remediation one: once
 everything above is dealt with, SSO failing until you update it is an outage, not a continuing
