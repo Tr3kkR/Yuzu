@@ -44,4 +44,15 @@ inline constexpr const char* kRedactedPlaceholder = "<redacted>";
 /// fix-the-instance-not-the-sink mistake in a second costume.
 bool is_redaction_placeholder(std::string_view value);
 
+/// True only if `value` IS the placeholder, ignoring surrounding whitespace and
+/// control bytes - not merely contains it.
+///
+/// The Settings handler needs this narrower question. It maps a placeholder paste to
+/// "leave the stored secret unchanged", which is right for someone re-submitting a
+/// form pre-filled with the redacted value. Using the CONTAINS predicate there meant a
+/// real secret that happened to contain the token was silently discarded and reported
+/// SAVED - the same false-success this whole change exists to remove. Containment now
+/// falls through to the sink, which refuses it with a message the operator sees.
+bool is_exactly_redaction_placeholder(std::string_view value);
+
 } // namespace yuzu::server

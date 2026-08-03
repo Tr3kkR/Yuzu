@@ -3926,7 +3926,13 @@ void SettingsRoutes::register_routes(
         // "leave the stored secret alone"; at the sink it is a refusal. Both are needed:
         // this one keeps a placeholder paste from reaching cfg_ and the live provider,
         // the sink's covers every other caller (PUT /api/config included).
-        if (is_redaction_placeholder(client_secret))
+        // ONLY an exact placeholder means "leave the stored secret unchanged" - that is
+        // the operator re-submitting a form pre-filled with the redacted value. A secret
+        // that merely CONTAINS the token falls through deliberately: the store refuses
+        // it and the failure branch below tells the operator. Clearing it here instead
+        // discarded a real credential and reported SAVED, which is the same
+        // false-success this change exists to remove (found by four reviewers).
+        if (is_exactly_redaction_placeholder(client_secret))
             client_secret.clear();
         auto effective_secret = client_secret.empty() ? cfg_->oidc_client_secret : client_secret;
         bool skip_tls = (skip_tls_verify == "true");
@@ -4035,9 +4041,12 @@ void SettingsRoutes::register_routes(
                       "persist failed: " + joined);
             auto html = render_directory_fragment() +
                         "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
-                        "hx-swap-oob=\"true\">OIDC applied to the running server but NOT saved (" +
+                        "hx-swap-oob=\"true\">OIDC applied to the running server, but these "
+                        "settings could NOT be saved: " +
                         html_escape(joined) +
-                        "). It will revert on restart - fix the value and save again.</div>";
+                        ". Any other settings in this form WERE saved, so the stored "
+                        "configuration is now inconsistent with the running server. Fix the "
+                        "cause and save again.</div>";
             res.set_content(html, "text/html; charset=utf-8");
             return;
         }

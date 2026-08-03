@@ -156,7 +156,7 @@ TEST_CASE("Settings OIDC: the redaction placeholder means UNCHANGED, never a new
     CHECK(h.runtime_config->get_value_with_secrets("oidc_client_secret") == "real-secret");
     // And no failure was reported, because submitting the placeholder is a no-op on
     // the secret rather than an error.
-    CHECK(res->body.find("NOT saved") == std::string::npos);
+    CHECK(res->body.find("could NOT be saved") == std::string::npos);
 }
 
 TEST_CASE("Settings OIDC: a placeholder with stray whitespace is also treated as UNCHANGED",
@@ -180,7 +180,7 @@ TEST_CASE("Settings OIDC: a real secret is persisted and reported saved",
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(h.runtime_config->get_value_with_secrets("oidc_client_secret") == "brand-new-secret");
-    CHECK(res->body.find("NOT saved") == std::string::npos);
+    CHECK(res->body.find("could NOT be saved") == std::string::npos);
 }
 
 TEST_CASE("Settings OIDC: a NULL store reports NOT SAVED instead of success",
@@ -194,7 +194,7 @@ TEST_CASE("Settings OIDC: a NULL store reports NOT SAVED instead of success",
     auto res = h.sink.Post("/api/settings/oidc", oidc_form("brand-new-secret"),
                            "application/x-www-form-urlencoded");
     REQUIRE(res);
-    CHECK(res->body.find("NOT saved") != std::string::npos);
+    CHECK(res->body.find("could NOT be saved") != std::string::npos);
     // ...and it is audited as a failure, not a success.
     REQUIRE_FALSE(h.audited.empty());
     CHECK(h.audited.back().find("oidc.configure") != std::string::npos);
@@ -216,4 +216,41 @@ TEST_CASE("Settings OIDC: a non-admin cannot set the client secret and nothing p
     CHECK(res->status == 403);
     CHECK(h.runtime_config->get_value_with_secrets("oidc_client_secret") == "real-secret");
     CHECK(h.audited.empty());
+}
+
+TEST_CASE("Settings OIDC: a secret CONTAINING the placeholder is refused, not silently dropped",
+          "[settings][oidc][secret]") {
+    // CH-4. The handler used the CONTAINS predicate to mean "leave unchanged", so a real
+    // credential containing the token was discarded and the operator was told SAVED -
+    // the same false-success this branch exists to remove, re-entering through the guard
+    // added to remove it. Four reviewers found it independently. Only an EXACT
+    // placeholder means unchanged now; containment reaches the sink and is reported.
+    OidcHarness h;
+    REQUIRE(h.runtime_config->set("oidc_client_secret", "real-secret", "seed").has_value());
+
+    auto res = h.sink.Post("/api/settings/oidc", oidc_form("abc<redacted>def"),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    // The operator is TOLD, rather than getting a success toast.
+    CHECK(res->body.find("could NOT be saved") != std::string::npos);
+    CHECK(res->body.find("oidc_client_secret") != std::string::npos);
+    // The stored credential is untouched either way - the sink refused the write.
+    CHECK(h.runtime_config->get_value_with_secrets("oidc_client_secret") == "real-secret");
+    // ...and it is audited as a failure.
+    REQUIRE_FALSE(h.audited.empty());
+    CHECK(h.audited.back().find("persist failed") != std::string::npos);
+}
+
+TEST_CASE("Settings OIDC: an EXACT placeholder still means unchanged, and reports saved",
+          "[settings][oidc][secret]") {
+    // The benign case the CONTAINS rule was over-serving: re-submitting a form that was
+    // pre-filled with the redacted value must remain a no-op, not an error.
+    OidcHarness h;
+    REQUIRE(h.runtime_config->set("oidc_client_secret", "real-secret", "seed").has_value());
+
+    auto res = h.sink.Post("/api/settings/oidc", oidc_form("  <redacted>\n"),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->body.find("could NOT be saved") == std::string::npos);
+    CHECK(h.runtime_config->get_value_with_secrets("oidc_client_secret") == "real-secret");
 }

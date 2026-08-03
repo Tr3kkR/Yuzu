@@ -3157,7 +3157,9 @@ most keys:
   same startup (`server.cpp:3466`); nothing rebuilds the provider afterwards. So a value written
   through this API never reaches the live provider, on this boot or any later one.
   **Only Settings -> OIDC (`POST /api/settings/oidc`) applies OIDC settings**, because that handler
-  constructs a new provider and swaps it in. This matters most for a credential rotation: a `PUT` of
+  constructs a new provider and swaps it in - but that swap is **process-local**. It is not written
+  back to the boot path, and the boot path does not read the store for OIDC, so a restart returns to
+  whatever the command line or environment supplies. To change OIDC durably you must update BOTH. This matters most for a credential rotation: a `PUT` of
   `oidc_client_secret` returns `"applied": true` meaning *persisted and accepted*, never *in use*.
 
 **Request body:**

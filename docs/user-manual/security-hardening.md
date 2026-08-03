@@ -455,5 +455,13 @@ When using OIDC/Entra ID:
 > holds a working credential. Treat a secret set before this upgrade as disclosed and
 > rotate it at the IdP. Note that rotating via `PUT /api/config/oidc_client_secret`
 > persists the new value but does **not** rebuild the running OIDC provider, **and a restart does
-> not apply it either** (the provider is built before the stored overrides are read). **Rotate
-> through Settings -> OIDC**, which is the only path that applies an OIDC change.
+> **Rotate through Settings -> OIDC**, which is the only path that applies an OIDC
+> change to the RUNNING server. **That swap is process-local, so it does not survive a
+> restart on its own.** The provider is rebuilt at startup from the command-line or
+> environment configuration, before the stored runtime-config overrides are read, and
+> nothing rebuilds it afterwards. So you must ALSO update the secret wherever the server
+> reads it at boot (`--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET`, or the
+> `--oidc-client-secret-file`). If you rotate only through Settings, the next restart
+> brings the OLD - disclosed - secret back into use; and if OIDC was only ever configured
+> through Settings, the next restart leaves no provider at all and SSO stops working,
+> while `GET /api/config` still reports the key as set.
