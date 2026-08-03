@@ -76,7 +76,7 @@ struct OidcHarness {
 
     bool is_admin{true};
     int apply_calls{0};
-    std::vector<std::string> audited; // "action|target_id|detail"
+    std::vector<std::string> audited; // "action|result|target_id|detail"
 
     explicit OidcHarness(bool open_store = true)
         : tmp(yuzu::test::unique_temp_path("yuzu_test_settings_oidc_")) {
@@ -199,7 +199,7 @@ TEST_CASE("Settings OIDC: a NULL store reports NOT SAVED instead of success",
     REQUIRE_FALSE(h.audited.empty());
     CHECK(h.audited.back().find("oidc.configure") != std::string::npos);
     CHECK(h.audited.back().find("persist failed") != std::string::npos);
-    CHECK(h.audited.back().find("|failure|") != std::string::npos);
+    CHECK(h.audited.back().find("oidc.configure|failure|") != std::string::npos);
 }
 
 TEST_CASE("Settings OIDC: a non-admin cannot set the client secret and nothing persists",
@@ -240,7 +240,7 @@ TEST_CASE("Settings OIDC: a secret CONTAINING the placeholder is refused, not si
     // ...and it is audited as a failure.
     REQUIRE_FALSE(h.audited.empty());
     CHECK(h.audited.back().find("persist failed") != std::string::npos);
-    CHECK(h.audited.back().find("|failure|") != std::string::npos);
+    CHECK(h.audited.back().find("oidc.configure|failure|") != std::string::npos);
 }
 
 TEST_CASE("Settings OIDC: an EXACT placeholder still means unchanged, and reports saved",
