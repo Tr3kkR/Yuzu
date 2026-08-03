@@ -1,5 +1,6 @@
 #include <yuzu/contracts/adr31/b3_platform.hpp>
 #include <yuzu/contracts/adr31/contract_limits.hpp>
+#include <yuzu/contracts/adr31/contract_version.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -7,9 +8,11 @@
 #include <array>
 #include <expected>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 
 namespace contracts = yuzu::contracts::adr31;
 
@@ -317,6 +320,302 @@ TEST_CASE("ADR-0031 B3 rejects malformed documents and unknown versions",
         CHECK(decoded.error().code == contracts::ContractErrorCode::WrongType);
         CHECK(decoded.error().path == "/contract/version/major");
     }
+}
+
+TEST_CASE("ADR-0031 B3 success response preserves the public REST envelope",
+          "[adr31][contract][b3][result]") {
+    const contracts::B3PlatformResponse response{contracts::B3PlatformResult{
+        .correlation_id = "req-contract-0001",
+        .data = nlohmann::json{{"rules", nlohmann::json::array({"baseline-a"})}},
+    }};
+
+    const auto encoded = contracts::encode_b3_platform_response(response);
+    REQUIRE(encoded.has_value());
+    CHECK(
+        *encoded ==
+        R"({"contract":{"id":"yuzu.b3.platform.result","version":{"major":1,"minor":0}},"correlation_id":"req-contract-0001","data":{"rules":["baseline-a"]},"meta":{"api_version":"v1"}})");
+
+    const auto decoded = contracts::decode_b3_platform_response(*encoded);
+    REQUIRE(decoded.has_value());
+    REQUIRE(std::holds_alternative<contracts::B3PlatformResult>(*decoded));
+    CHECK(std::get<contracts::B3PlatformResult>(*decoded) ==
+          std::get<contracts::B3PlatformResult>(response));
+
+    const contracts::B3PlatformRequest request{
+        .correlation_id = "req-contract-0001",
+        .securable = "GuaranteedState",
+        .operation = contracts::CoreOperation::Read,
+        .scope = nlohmann::json{{"kind", "fleet"}},
+    };
+    CHECK(contracts::validate_b3_platform_exchange(request, *decoded).has_value());
+}
+
+TEST_CASE("ADR-0031 B3 failure response carries the A4 fields",
+          "[adr31][contract][b3][result][a4]") {
+    const contracts::B3PlatformResponse response{contracts::A4ErrorEnvelope{
+        .code = 403,
+        .message = "permission denied",
+        .correlation_id = "req-contract-0001",
+        .retry_after_ms = std::nullopt,
+        .remediation = "request GuaranteedState:Read",
+        .permission = "GuaranteedState:Read",
+        .approval_id = std::nullopt,
+        .status_url = std::nullopt,
+    }};
+
+    const auto encoded = contracts::encode_b3_platform_response(response);
+    REQUIRE(encoded.has_value());
+    CHECK(
+        *encoded ==
+        R"({"error":{"code":403,"correlation_id":"req-contract-0001","message":"permission denied","permission":"GuaranteedState:Read","remediation":"request GuaranteedState:Read","retry_after_ms":null},"meta":{"api_version":"v1"}})");
+    CHECK(encoded->find("yuzu.b3.platform.result") == std::string::npos);
+
+    const auto decoded = contracts::decode_b3_platform_response(*encoded);
+    REQUIRE(decoded.has_value());
+    REQUIRE(std::holds_alternative<contracts::A4ErrorEnvelope>(*decoded));
+    CHECK(std::get<contracts::A4ErrorEnvelope>(*decoded) ==
+          std::get<contracts::A4ErrorEnvelope>(response));
+
+    const contracts::B3PlatformRequest request{
+        .correlation_id = "req-contract-0001",
+        .securable = "GuaranteedState",
+        .operation = contracts::CoreOperation::Read,
+        .scope = nlohmann::json{{"kind", "fleet"}},
+    };
+    CHECK(contracts::validate_b3_platform_exchange(request, *decoded).has_value());
+}
+
+TEST_CASE("ADR-0031 B3 A4 approval and retry metadata is typed",
+          "[adr31][contract][b3][result][a4]") {
+    SECTION("approval required") {
+        const contracts::B3PlatformResponse response{contracts::A4ErrorEnvelope{
+            .code = 202,
+            .message = "approval required",
+            .correlation_id = "req-contract-0001",
+            .retry_after_ms = std::nullopt,
+            .remediation = "poll approval status",
+            .permission = std::nullopt,
+            .approval_id = "approval-0001",
+            .status_url = "/api/v1/approvals/approval-0001",
+        }};
+        const auto encoded = contracts::encode_b3_platform_response(response);
+        REQUIRE(encoded.has_value());
+        const auto decoded = contracts::decode_b3_platform_response(*encoded);
+        REQUIRE(decoded.has_value());
+        CHECK(*decoded == response);
+    }
+
+    SECTION("retryable unavailable") {
+        const contracts::B3PlatformResponse response{contracts::A4ErrorEnvelope{
+            .code = 503,
+            .message = "service unavailable",
+            .correlation_id = "req-contract-0001",
+            .retry_after_ms = 5000,
+            .remediation = std::nullopt,
+            .permission = std::nullopt,
+            .approval_id = std::nullopt,
+            .status_url = std::nullopt,
+        }};
+        const auto encoded = contracts::encode_b3_platform_response(response);
+        REQUIRE(encoded.has_value());
+        CHECK(encoded->find(R"("retry_after_ms":5000)") != std::string::npos);
+    }
+}
+
+TEST_CASE("ADR-0031 B3 response rejects ambiguous and malformed outcomes",
+          "[adr31][contract][b3][result][negative]") {
+    const auto success = nlohmann::json::parse(
+        R"({"contract":{"id":"yuzu.b3.platform.result","version":{"major":1,"minor":0}},"correlation_id":"req-contract-0001","data":{},"meta":{"api_version":"v1"}})");
+    const auto failure = nlohmann::json::parse(
+        R"({"error":{"code":503,"message":"service unavailable","correlation_id":"req-contract-0001","retry_after_ms":null},"meta":{"api_version":"v1"}})");
+
+    SECTION("neither success nor error") {
+        const auto decoded =
+            contracts::decode_b3_platform_response(R"({"meta":{"api_version":"v1"}})");
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::MissingField);
+    }
+
+    SECTION("both success and error") {
+        auto wire = success;
+        wire["error"] = failure["error"];
+        const auto decoded = contracts::decode_b3_platform_response(wire.dump());
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::InvalidValue);
+    }
+
+    SECTION("ambiguous arm precedes an unsupported success version") {
+        auto wire = success;
+        wire["error"] = failure["error"];
+        wire["contract"]["version"]["major"] = 2;
+        const auto decoded = contracts::decode_b3_platform_response(wire.dump());
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::InvalidValue);
+    }
+
+    SECTION("null success data") {
+        auto wire = success;
+        wire["data"] = nullptr;
+        const auto decoded = contracts::decode_b3_platform_response(wire.dump());
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::NullField);
+        CHECK(decoded.error().path == "/data");
+    }
+
+    SECTION("unsupported result version") {
+        auto wire = success;
+        wire["contract"]["version"]["major"] = 2;
+        const auto decoded = contracts::decode_b3_platform_response(wire.dump());
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::UnsupportedVersion);
+    }
+
+    SECTION("A4 has no contract header") {
+        auto wire = failure;
+        wire["contract"] = success["contract"];
+        const auto decoded = contracts::decode_b3_platform_response(wire.dump());
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::InvalidValue);
+        CHECK(decoded.error().path == "/contract");
+    }
+
+    SECTION("A4 retry field is required") {
+        auto wire = failure;
+        wire["error"].erase("retry_after_ms");
+        const auto decoded = contracts::decode_b3_platform_response(wire.dump());
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::MissingField);
+        CHECK(decoded.error().path == "/error/retry_after_ms");
+    }
+
+    SECTION("A4 retry cannot be negative") {
+        auto wire = failure;
+        wire["error"]["retry_after_ms"] = -1;
+        const auto decoded = contracts::decode_b3_platform_response(wire.dump());
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::InvalidValue);
+        CHECK(decoded.error().path == "/error/retry_after_ms");
+    }
+
+    SECTION("approval fields are atomic") {
+        auto wire = failure;
+        wire["error"]["code"] = 202;
+        wire["error"]["approval_id"] = "approval-0001";
+        const auto decoded = contracts::decode_b3_platform_response(wire.dump());
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::InvalidValue);
+        CHECK(decoded.error().path == "/error");
+    }
+
+    SECTION("REST API version is explicit") {
+        auto wire = success;
+        wire["meta"]["api_version"] = "v2";
+        const auto decoded = contracts::decode_b3_platform_response(wire.dump());
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == contracts::ContractErrorCode::UnsupportedVersion);
+        CHECK(decoded.error().path == "/meta/api_version");
+    }
+}
+
+TEST_CASE("ADR-0031 B3 response tolerates domain additions without treating them as authority",
+          "[adr31][contract][b3][result][compatibility][security]") {
+    auto wire = nlohmann::json::parse(
+        R"({"contract":{"id":"yuzu.b3.platform.result","version":{"major":1,"minor":0}},"correlation_id":"req-contract-0001","data":{"principal":{"id":"domain-result"}},"meta":{"api_version":"v1"}})");
+    wire["future_envelope_hint"] = true;
+    wire["contract"]["future_header_hint"] = 1;
+    wire["meta"]["future_meta_hint"] = 2;
+
+    const auto decoded = contracts::decode_b3_platform_response(wire.dump());
+    REQUIRE(decoded.has_value());
+    REQUIRE(std::holds_alternative<contracts::B3PlatformResult>(*decoded));
+    CHECK(std::get<contracts::B3PlatformResult>(*decoded).data == wire["data"]);
+
+    wire["credential"] = "attacker-authored";
+    const auto unsafe = contracts::decode_b3_platform_response(wire.dump());
+    REQUIRE_FALSE(unsafe.has_value());
+    CHECK(unsafe.error().code == contracts::ContractErrorCode::ForbiddenAuthorityField);
+
+    auto a4 = nlohmann::json::parse(
+        R"({"error":{"code":503,"message":"service unavailable","correlation_id":"req-contract-0001","retry_after_ms":null},"meta":{"api_version":"v1"}})");
+    a4["future_envelope_hint"] = true;
+    a4["error"]["future_error_hint"] = "safe";
+    a4["meta"]["future_meta_hint"] = 1;
+    CHECK(contracts::decode_b3_platform_response(a4.dump()).has_value());
+
+    a4["credential"] = "attacker-authored";
+    const auto unsafe_a4 = contracts::decode_b3_platform_response(a4.dump());
+    REQUIRE_FALSE(unsafe_a4.has_value());
+    CHECK(unsafe_a4.error().code == contracts::ContractErrorCode::ForbiddenAuthorityField);
+}
+
+TEST_CASE("ADR-0031 B3 consumer rejects mismatched correlation and permission",
+          "[adr31][contract][b3][result][security]") {
+    const contracts::B3PlatformRequest request{
+        .correlation_id = "req-contract-0001",
+        .securable = "GuaranteedState",
+        .operation = contracts::CoreOperation::Read,
+        .scope = nlohmann::json{{"kind", "fleet"}},
+    };
+
+    SECTION("correlation mismatch") {
+        const contracts::B3PlatformResponse response{contracts::B3PlatformResult{
+            .correlation_id = "req-contract-0002",
+            .data = nlohmann::json::object(),
+        }};
+        const auto valid = contracts::validate_b3_platform_exchange(request, response);
+        REQUIRE_FALSE(valid.has_value());
+        CHECK(valid.error().path == "/correlation_id");
+    }
+
+    SECTION("denial correlation mismatch") {
+        const contracts::B3PlatformResponse response{contracts::A4ErrorEnvelope{
+            .code = 503,
+            .message = "service unavailable",
+            .correlation_id = "req-contract-0002",
+            .retry_after_ms = std::nullopt,
+            .remediation = std::nullopt,
+            .permission = std::nullopt,
+            .approval_id = std::nullopt,
+            .status_url = std::nullopt,
+        }};
+        const auto valid = contracts::validate_b3_platform_exchange(request, response);
+        REQUIRE_FALSE(valid.has_value());
+        CHECK(valid.error().path == "/correlation_id");
+    }
+
+    SECTION("permission mismatch") {
+        const contracts::B3PlatformResponse response{contracts::A4ErrorEnvelope{
+            .code = 403,
+            .message = "permission denied",
+            .correlation_id = "req-contract-0001",
+            .retry_after_ms = std::nullopt,
+            .remediation = std::nullopt,
+            .permission = "Tag:Write",
+            .approval_id = std::nullopt,
+            .status_url = std::nullopt,
+        }};
+        const auto valid = contracts::validate_b3_platform_exchange(request, response);
+        REQUIRE_FALSE(valid.has_value());
+        CHECK(valid.error().path == "/error/permission");
+    }
+}
+
+TEST_CASE("ADR-0031 B3 publishes no fabricated previous result version",
+          "[adr31][contract][b3][result][compatibility]") {
+    REQUIRE(contracts::kB3PlatformResult.supported_versions.size() == 1);
+    CHECK(contracts::kB3PlatformResult.supported_versions.front() == contracts::kVersion1_0);
+}
+
+TEST_CASE("ADR-0031 B3 rejects an unsupported version before request semantics",
+          "[adr31][contract][b3][compatibility][security]") {
+    auto wire = nlohmann::json::parse(
+        R"({"contract":{"id":"yuzu.b3.platform.request","version":{"major":2,"minor":0}},"correlation_id":"req-contract-0001","operation":"Read","scope":{"kind":"fleet"},"securable":"GuaranteedState"})");
+    wire["operator_id"] = "attacker-authored";
+
+    const auto decoded = contracts::decode_b3_platform_request(wire.dump());
+    REQUIRE_FALSE(decoded.has_value());
+    CHECK(decoded.error().code == contracts::ContractErrorCode::UnsupportedVersion);
+    CHECK(decoded.error().path == "/contract/version");
 }
 
 TEST_CASE("ADR-0031 B3 decoder distinguishes absent, null, and mistyped fields",
