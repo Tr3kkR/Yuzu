@@ -219,16 +219,20 @@ already carries such an id keeps executing and can still be saved through `PUT
 /api/instructions/{id}` — an update cannot originate an id, so blocking it there would strand
 content rather than protect anything. One exception, and it is the reason to rename rather than
 live with it: the dashboard's YAML editor runs the same validation on every save, create or
-update, so an existing `mcp.`-prefixed definition cannot be edited there.
+update, so an existing `mcp.`-prefixed definition cannot be edited there if its document
+declares `metadata.id` (one that omits it still saves, since the validator only checks a
+declared id).
 
 **What to do.** Before upgrading, check for affected content. Query the instruction database
 directly rather than the REST list route: `GET /api/v1/definitions` caps its result at 100
 definitions, and the shipped content alone exceeds that, so an API-based check can report a
-false all-clear.
+false all-clear. `GLOB` rather than `LIKE` because SQLite's `LIKE` is case-insensitive and
+the reservation is not — `MCP.foo` is a different id everywhere else in the system and is
+not reserved.
 
 ```bash
 sqlite3 /var/lib/yuzu/instructions.db \
-  "SELECT id FROM instruction_definitions WHERE id LIKE 'mcp.%';"
+  "SELECT id FROM instruction_definitions WHERE id GLOB 'mcp.*';"
 ```
 
 Any id listed keeps executing after the upgrade and can still be edited through

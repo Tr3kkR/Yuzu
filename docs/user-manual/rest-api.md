@@ -5624,8 +5624,9 @@ never carries a declared id through, so the store always assigns one.
 The store applies this at **create time**, so an id that predates the rule stays
 executable and can still be saved through `PUT /api/instructions/{id}`, because
 an update cannot originate an id. Note the dashboard's YAML editor is stricter
-than the store here: `POST /api/instructions/yaml` validates the id on every
-save, so an existing `mcp.`-prefixed definition cannot be edited through it.
+than the store here: `POST /api/instructions/yaml` validates a declared id on
+every save, so an existing `mcp.`-prefixed definition cannot be edited through
+it unless its document omits `metadata.id`.
 
 **Response (409):** Returned when an explicit `id` is supplied that already
 exists in the store. Body is

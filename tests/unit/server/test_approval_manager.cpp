@@ -7,6 +7,8 @@
  */
 
 #include "approval_manager.hpp"
+#include "migration_runner.hpp"
+#include "sqlite_raii.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <sqlite3.h>
@@ -730,6 +732,10 @@ TEST_CASE("ApprovalManager: a throwing recheck denies without consuming and does
     REQUIRE(!threw.has_value());
     CHECK(threw.error().kind == ConsumeFailure::kStoreError); // NOT kPrecondition
     CHECK(threw.error().message.find("pre-consume recheck failed") != std::string::npos);
+    // The callback's own text must NOT ride along: this message reaches the MCP
+    // envelope, and e.what() is unvetted. Asserting only the inclusion above
+    // would still pass if someone appended it again.
+    CHECK(threw.error().message.find("rotation lookup failed") == std::string::npos);
     CHECK(mgr.get(*id)->consumed_at == 0); // still recallable
 
     // A non-std throw takes the same path.
@@ -804,17 +810,18 @@ TEST_CASE("ApprovalManager: migration v6 applies to an existing v5 store",
 
     // Both v6 indexes exist, and the pre-existing row is untouched.
     auto has_index = [&tdb](const char* name) {
-        sqlite3_stmt* st = nullptr;
+        SqliteStmt st;
         REQUIRE(sqlite3_prepare_v2(tdb.db,
                                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", -1,
-                                   &st, nullptr) == SQLITE_OK);
-        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
-        const bool found = sqlite3_step(st) == SQLITE_ROW;
-        sqlite3_finalize(st);
-        return found;
+                                   st.addr(), nullptr) == SQLITE_OK);
+        sqlite3_bind_text(st.get(), 1, name, -1, SQLITE_TRANSIENT);
+        return sqlite3_step(st.get()) == SQLITE_ROW;
     };
     CHECK(has_index("idx_approvals_status_submitted"));
     CHECK(has_index("idx_approvals_status_consumed_reviewed"));
+    // And that migration SIX is what put them there: index existence alone
+    // would also hold if v6 were folded back into an earlier migration.
+    CHECK(MigrationRunner::current_version(tdb.db, "approval_manager") == 6);
     auto row = mgr.get("v5-row");
     REQUIRE(row.has_value());
     CHECK(row->definition_id == "inventory.audit");
@@ -864,9 +871,23 @@ TEST_CASE("ApprovalManager: the recheck may read the store without deadlocking",
         fx->done.set_value(consumed.has_value());
     });
 
+    // Under `--abort` even a CHECK throws, so the join below can be unwound past.
+    // The guard makes "joined or detached exactly once" true on every path
+    // rather than on the paths we thought of.
+    struct Reaper {
+        std::thread& t;
+        ~Reaper() {
+            if (t.joinable())
+                t.detach();
+        }
+    } reaper{worker};
+
     const bool finished = fut.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
     if (!finished) {
-        worker.detach(); // deadlocked: unjoinable, and must not terminate the run
+        // Deadlocked, so unjoinable. The Fixture outlives this scope through the
+        // worker's own shared_ptr and leaks for the process lifetime — a
+        // deliberate trade on an already-failing run, and the reason the
+        // captures are by value.
         FAIL("timed out - the precondition ran with mtx_ held, self-deadlocking on the "
              "non-recursive mutex");
     }

@@ -538,9 +538,11 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
         } catch (const std::exception& e) {
             spdlog::warn("ApprovalManager: pre-consume recheck threw for ticket {}: {}",
                          redact_id(id), e.what());
-            // e.what() goes to the LOG, not into the message: this string
-            // reaches the MCP error envelope, which is documented as carrying
-            // no caller-derived text, and the callback is caller code.
+            // e.what() goes to the LOG, not into the returned message: this
+            // string reaches the MCP error envelope, and e.what() is unvetted
+            // text from caller code. A precondition's OWN error message does
+            // ride along, deliberately — it is authored under the constraints
+            // on ConsumePrecondition. Unvetted is the distinction, not origin.
             return std::unexpected(
                 ConsumeError{ConsumeFailure::kStoreError, "pre-consume recheck failed"});
         } catch (...) {

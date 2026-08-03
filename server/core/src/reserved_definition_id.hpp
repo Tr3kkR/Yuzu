@@ -19,8 +19,11 @@
 //     times, which is why the predicate is no longer copied)
 //
 // A fourth site would be a fourth chance to diverge: call `is_reserved_definition_id`
-// and report `kReservedDefinitionIdError`; never re-implement the comparison,
-// and never write the prefix as a literal.
+// and report `kReservedDefinitionIdError` rather than re-implementing either.
+// One place still writes the prefix as a literal — mcp_server.cpp builds
+// `"mcp." + tool_name` at the MINTING site the reservation exists to protect —
+// because that file is frozen for a parallel rebase. It is tracked, and it is
+// the reason this rule is stated here rather than assumed.
 namespace yuzu::server {
 
 /// Definition-id prefix reserved for MCP-minted approval tickets.
