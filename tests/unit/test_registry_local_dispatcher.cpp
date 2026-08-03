@@ -244,8 +244,12 @@ TEST_CASE("registry plugin: list_profiles + get_user_value live-hive round-trip 
     }
 
     SECTION("username resolves case-insensitively to the same sid (fix #5)") {
+        // upper_name must outlive `params` -- YuzuParam::value is a
+        // non-owning const char*, and .c_str() on the to_upper(...)
+        // temporary directly would dangle the instant this statement ends.
+        const std::string upper_name = to_upper(own_row->name);
         std::vector<YuzuParam> params{
-            {"username", to_upper(own_row->name).c_str()},
+            {"username", upper_name.c_str()},
             {"key", key_path_utf8.c_str()},
             {"name", "ScratchValue"},
         };
