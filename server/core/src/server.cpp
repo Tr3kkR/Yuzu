@@ -14050,11 +14050,21 @@ private:
             // Scope-walking result-set store (capability §30). nullptr leaves
             // the /api/v1/result-sets routes unregistered.
             result_set_store_.get(),
-            // Same hoisted dispatch closure the workflow + policy engines use,
-            // so the async result-set producers (from-tar-query /
-            // from-instruction-result / re-eval) drive the exact dispatch path
-            // (PR-D). Empty closure would 503 those routes.
-            command_dispatch_fn,
+            // #1788: the CONFINED closure — the same one WorkflowRoutes and the
+            // dashboard execute surfaces take, NOT the system `command_dispatch_fn`.
+            //
+            // This wiring was the bug. RestApiV1 was handed the 6-arg system
+            // closure (exec_visible hardcoded nullopt = unfiltered, correct only
+            // for background engines), and the async result-set producers
+            // (from-tar-query / from-instruction-result / re-eval) dispatched
+            // through it — so a service-scoped token, admitted by their bare
+            // global Execution:Execute gate, reached every connected agent
+            // instead of its own service. RestApiV1::CommandDispatchFn is now
+            // the 7-arg confined signature, so the unconfined closure is no
+            // longer type-compatible with this parameter at all: the wrong
+            // choice stopped being available rather than merely being avoided.
+            // Empty closure would 503 those routes.
+            command_dispatch_confined_fn,
             // PR2 MFA step-up gate for the high-risk REST handlers; empty
             // closure disables the gate (preserves pre-PR2 behaviour).
             step_up_fn,

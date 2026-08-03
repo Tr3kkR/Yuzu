@@ -70,6 +70,12 @@ struct RestGsHarness {
     std::unique_ptr<ResponseStore> resp_store;
     int live_sent{1};
     std::string last_live_plugin, last_live_action;
+    /// #1788: the confinement set the /live handler derived and threaded into
+    /// dispatch. The per-device scoped_perm_fn gate remains this route's
+    /// PRIMARY authorization; this is the second, independent check.
+    yuzu::server::authz::VisibleSet last_live_exec_visible;
+    /// What the wired derivation answers; nullopt = unfiltered.
+    yuzu::server::authz::VisibleSet exec_visible_override{};
 
     // BaselineStore for the baseline-anchored per-device status route.
     yuzu::test::TempDbFile bl_db_file{"yuzu_test_rest_gs_bl-"};
@@ -154,10 +160,12 @@ struct RestGsHarness {
         auto command_dispatch_fn =
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>&, const std::string&,
-                   const std::unordered_map<std::string, std::string>&,
-                   const std::string&) -> std::pair<std::string, int> {
+                   const std::unordered_map<std::string, std::string>&, const std::string&,
+                   const yuzu::server::authz::VisibleSet& exec_visible)
+            -> std::pair<std::string, int> {
             last_live_plugin = plugin;
             last_live_action = action;
+            last_live_exec_visible = exec_visible;
             return {plugin + "-live", live_sent};
         };
         // When wire_live_deps is off, leave the dispatch closure empty so the /live
@@ -282,7 +290,18 @@ struct RestGsHarness {
                             wire_scoped_perm ? RestApiV1::ScopedPermFn{scoped_perm_fn}
                                              : RestApiV1::ScopedPermFn{},
                             /*software_inventory_store=*/nullptr,
-                            /*inventory_scope_fn=*/{}, /*response_scope_fn=*/{}, app_perf_providers_);
+                            /*inventory_scope_fn=*/{}, /*response_scope_fn=*/{}, app_perf_providers_,
+                            /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
+                            /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
+                            /*stream_budget=*/nullptr,
+                            // #1788: a derivation that ANSWERS (nullopt default =
+                            // unfiltered). Left empty it would fail closed to
+                            // present-empty and reach nobody, which is the right
+                            // production posture but would silently disarm this
+                            // file's /live dispatch assertions.
+                            [this](const auth::Session&) -> yuzu::server::authz::VisibleSet {
+                                return exec_visible_override;
+                            });
     }
 
     // Seed a Guard rule (name resolves in the route's list_rules() lookup).

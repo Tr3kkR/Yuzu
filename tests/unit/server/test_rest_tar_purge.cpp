@@ -55,6 +55,12 @@ struct PurgeHarness {
     bool scope_allow{true}; // scoped_perm_fn verdict
     bool audit_ok{true};    // AuditFn return (false → fail-closed 503, no dispatch)
     int dispatch_sent{1};   // agents reached per dispatch
+    /// #1788: what the route derived and handed to dispatch. The per-device
+    /// scoped_perm_fn above remains this route's PRIMARY authorization — the
+    /// VisibleSet is a second, independent confinement check at the seam.
+    yuzu::server::authz::VisibleSet last_exec_visible;
+    /// The VisibleSet the wired derivation returns; nullopt = unfiltered.
+    yuzu::server::authz::VisibleSet exec_visible_override{};
 
     PurgeHarness() {
         auto auth_fn = [](const httplib::Request&,
@@ -86,8 +92,10 @@ struct PurgeHarness {
         RestApiV1::CommandDispatchFn dispatch =
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& ids, const std::string&,
-                   const std::unordered_map<std::string, std::string>& params,
-                   const std::string&) -> std::pair<std::string, int> {
+                   const std::unordered_map<std::string, std::string>& params, const std::string&,
+                   const yuzu::server::authz::VisibleSet& exec_visible)
+            -> std::pair<std::string, int> {
+            last_exec_visible = exec_visible;
             calls.push_back({plugin, action, ids, params});
             return {"cmd-" + std::to_string(calls.size()), dispatch_sent};
         };
@@ -103,7 +111,18 @@ struct PurgeHarness {
             /*guaranteed_state_store=*/nullptr, &metrics, /*session_revoke_fn=*/{},
             /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr, dispatch,
             /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{}, /*net_perf_fn=*/{},
-            /*lockout_clear_fn=*/{}, /*baseline_store=*/nullptr, scoped);
+            /*lockout_clear_fn=*/{}, /*baseline_store=*/nullptr, scoped,
+            /*software_inventory_store=*/nullptr, /*inventory_scope_fn=*/{},
+            /*response_scope_fn=*/{}, /*app_perf_providers=*/{},
+            /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
+            /*auth_db=*/nullptr, /*directory_sync=*/nullptr, /*stream_budget=*/nullptr,
+            // #1788: wire a derivation that ANSWERS (nullopt by default =
+            // unfiltered). Leaving it empty would fail closed to present-empty
+            // and reach nobody — correct production posture, but it would make
+            // every pre-existing dispatch assertion in this file untestable.
+            [this](const auth::Session&) -> yuzu::server::authz::VisibleSet {
+                return exec_visible_override;
+            });
     }
 
     nlohmann::json post(const std::string& body, int& status) {

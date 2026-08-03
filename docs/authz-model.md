@@ -180,18 +180,39 @@ Two functions, each with exactly one implementation:
 
 Every OPERATOR dispatch surface reaches the second through one of two callers —
 `ServerImpl::dispatch_confined` (the shared closure behind MCP `execute_instruction` /
-`execute_bundle`, the dashboard execute and TAR `purge_source` routes, and
-`POST /api/instructions|workflows/{id}/execute`) or the `/api/command` inline handler. Those two
+`execute_bundle`, the dashboard execute and TAR `purge_source` routes, the per-device DEX live
+query, the three async result-set producers (`POST /api/v1/result-sets/from-tar-query`,
+`/from-instruction-result`, `/{id}/re-eval`), and `POST /api/instructions|workflows/{id}/execute`)
+or the `/api/command` inline handler. Those two
 callers legitimately differ in how they RESOLVE targets (management-group store, scope engine,
 principal from a live session versus an execution row) and in how they report failure
 (`/api/command` answers 400/503; the shared closure has no response object — background runners call
 it). They do not differ in who gets reached, and that is the part now held in one place.
 
+The REST layer reaches the shared closure through `RestApiV1::CommandDispatchFn`, whose signature
+**requires** the caller's `VisibleSet`. That is deliberate and load-bearing: the class was formerly
+handed the 6-argument SYSTEM closure (`exec_visible` hardcoded `nullopt` — correct for background
+engines, never for an operator surface), and the async result-set producers dispatched through it,
+so a service-scoped token admitted by their bare global `Execution:Execute` gate reached the whole
+fleet. Making the parameter mandatory means the unconfined closure is no longer type-compatible with
+the REST registration: a future dispatch caller in that file cannot pick the wrong one. Callers must
+not pre-intersect their own target list — for the Scope and Broadcast arms they could not anyway,
+since the candidate set lives in the `AgentRegistry`, not the route.
+
 Each surface supplies the caller's set via an `ExecVisibleFn`, derived per request by
 `derive_exec_visible`. **An unwired `ExecVisibleFn` substitutes a PRESENT-EMPTY set, never
 `nullopt`** — deny-all rather than unfiltered. That asymmetry is the whole fail-closed contract: the
 two states are not interchangeable, and treating a missing derivation as "no filter" is precisely
-the failure mode being guarded.
+the failure mode being guarded. A harness that wants genuinely unfiltered dispatch wires a callback
+**returning** `nullopt`; leaving the callback empty is a missing gate, not a synonym for it.
+
+One refinement on top of that floor, by route class. Where the derivation is defense-in-depth behind
+a per-target `scoped_perm_fn` gate (REST bundles, TAR purge, the DEX live query), present-empty is
+the whole answer — the primary gate already reports its own absence with a `500`. Where it is the
+**only** per-device authorization — the three async result-set producers, which admit on a bare
+global gate and then dispatch by scope or `__all__` — an unwired derivation answers an **audited
+`500`** instead. Both fail closed; the difference is only whether a misconfigured server can be
+distinguished from an empty fleet, and on a route with no other gate it must be.
 
 `broadcast_on_none` is the one thing a caller parameterises: it says what an UNNAMED target means.
 The shared closure passes `false` — no target named reaches NOBODY (#2500). Callers whose UI or tool

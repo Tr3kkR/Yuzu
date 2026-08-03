@@ -30,6 +30,7 @@
 #include "tag_store.hpp"
 
 #include "../test_helpers.hpp"
+#include "test_mgmt_group_pg_helper.hpp" // PG-backed ManagementGroupStore (ADR-0042)
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -252,8 +253,13 @@ namespace {
 /// Members: a_p∈P, a_c1∈C1, a_c2∈C2, a_s∈S.
 struct Rig {
     yuzu::server::RbacStore rbac{":memory:"};
-    yuzu::test::TempDbFile mgmt_db{"yuzu_test_authzmodel_mgmt-"};
-    yuzu::server::ManagementGroupStore mgmt{mgmt_db.path};
+    /// ADR-0042: ManagementGroupStore is Postgres-only — the SQLite temp-file
+    /// constructor this fixture used is gone. The bundle SKIPs the enclosing
+    /// TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset, so every case that
+    /// constructs a Rig carries the [pg] tag (same contract as
+    /// test_list_read_confinement.cpp, whose fixture pattern this mirrors).
+    yuzu::test::ManagementGroupStorePg mgmt_bundle;
+    yuzu::server::ManagementGroupStore& mgmt = *mgmt_bundle;
     std::string gP, gC1, gC2, gS;
 
     Rig() {
@@ -333,7 +339,7 @@ VisibleSet compose_exec_visible(const yuzu::server::RbacStore& rbac, const std::
 
 TEST_CASE("authz_model #1788: a service-scoped token narrows to its service, over a global grant "
           "(CDX-001, live arm)",
-          "[authz_model][1788][service]") {
+          "[pg][authz_model][1788][service]") {
     yuzu::test::TempDbFile tag_db{"yuzu_test_authzmodel_tags-"};
     yuzu::server::TagStore tags{tag_db.path};
     tags.set_tag("a_svcA1", "service", "serviceA");
@@ -377,7 +383,7 @@ TEST_CASE("authz_model #1788: a service-scoped token narrows to its service, ove
 }
 
 TEST_CASE("authz_model composition: global allow ⇒ unfiltered (#1715(b))",
-          "[authz_model][compose][1715]") {
+          "[pg][authz_model][compose][1715]") {
     Rig r;
     REQUIRE(r.rbac.assign_role({"user", "bob", "ExecReader"}).has_value()); // GLOBAL allow
     r.group_assign(r.gC2, "bob", "ExecDenier"); // a group deny must NOT carve out
@@ -388,7 +394,7 @@ TEST_CASE("authz_model composition: global allow ⇒ unfiltered (#1715(b))",
 }
 
 TEST_CASE("authz_model composition: global deny + group allow ⇒ scoped (additive, #1715(a))",
-          "[authz_model][compose][1715]") {
+          "[pg][authz_model][compose][1715]") {
     Rig r;
     REQUIRE(r.rbac.assign_role({"user", "carol", "ExecDenier"}).has_value()); // GLOBAL deny
     r.group_assign(r.gP, "carol", "ExecReader");                              // group allow
@@ -401,7 +407,7 @@ TEST_CASE("authz_model composition: global deny + group allow ⇒ scoped (additi
 }
 
 TEST_CASE("authz_model composition: no grant anywhere ⇒ empty visible set (fail-closed)",
-          "[authz_model][compose]") {
+          "[pg][authz_model][compose]") {
     Rig r;
     auto visible = compose_exec_visible(r.rbac, "nobody", &r.mgmt);
     REQUIRE(visible.has_value());
@@ -428,7 +434,7 @@ TEST_CASE("authz_model composition: null mgmt store ⇒ empty visible set, never
 // characteristic already-resolved target-set shape.
 
 TEST_CASE("authz_model #1788: Ids arm — an explicit agent_ids list drops a hidden device",
-          "[authz_model][1788][ids]") {
+          "[pg][authz_model][1788][ids]") {
     Rig r;
     r.group_assign(r.gP, "scoped_op", "ExecReader"); // visible: a_p, a_c1, a_c2 (not a_s)
     auto visible = compose_exec_visible(r.rbac, "scoped_op", &r.mgmt);
@@ -441,7 +447,7 @@ TEST_CASE("authz_model #1788: Ids arm — an explicit agent_ids list drops a hid
 }
 
 TEST_CASE("authz_model #1788: Group arm — resolved members outside scope are dropped",
-          "[authz_model][1788][group]") {
+          "[pg][authz_model][1788][group]") {
     Rig r;
     r.group_assign(r.gC1, "scoped_op", "ExecReader"); // visible: only a_c1
     auto visible = compose_exec_visible(r.rbac, "scoped_op", &r.mgmt);
@@ -455,7 +461,7 @@ TEST_CASE("authz_model #1788: Group arm — resolved members outside scope are d
 }
 
 TEST_CASE("authz_model #1788: Scope arm — evaluate_scope's matched ids are narrowed",
-          "[authz_model][1788][scope]") {
+          "[pg][authz_model][1788][scope]") {
     Rig r;
     r.group_assign(r.gP, "scoped_op", "ExecReader"); // visible: a_p, a_c1, a_c2
     auto visible = compose_exec_visible(r.rbac, "scoped_op", &r.mgmt);
@@ -471,7 +477,7 @@ TEST_CASE("authz_model #1788: Scope arm — evaluate_scope's matched ids are nar
 }
 
 TEST_CASE("authz_model #1788: Broadcast arm — __all__ narrows to the visible set, never widens",
-          "[authz_model][1788][broadcast]") {
+          "[pg][authz_model][1788][broadcast]") {
     Rig r;
     r.group_assign(r.gP, "scoped_op", "ExecReader"); // visible: a_p, a_c1, a_c2
     auto visible = compose_exec_visible(r.rbac, "scoped_op", &r.mgmt);
@@ -489,7 +495,7 @@ TEST_CASE("authz_model #1788: Broadcast arm — __all__ narrows to the visible s
 }
 
 TEST_CASE("authz_model #1788: Broadcast arm — a global grant stays truly unfiltered",
-          "[authz_model][1788][broadcast]") {
+          "[pg][authz_model][1788][broadcast]") {
     Rig r;
     REQUIRE(r.rbac.assign_role({"user", "admin_op", "ExecReader"}).has_value()); // GLOBAL
     auto visible = compose_exec_visible(r.rbac, "admin_op", &r.mgmt);
@@ -501,7 +507,7 @@ TEST_CASE("authz_model #1788: Broadcast arm — a global grant stays truly unfil
 }
 
 TEST_CASE("authz_model #1788: in_scope agrees with filter_to_scope per id",
-          "[authz_model][1788]") {
+          "[pg][authz_model][1788]") {
     Rig r;
     r.group_assign(r.gP, "scoped_op", "ExecReader");
     auto visible = compose_exec_visible(r.rbac, "scoped_op", &r.mgmt);

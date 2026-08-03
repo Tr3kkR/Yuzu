@@ -1346,8 +1346,15 @@ void RestApiV1::register_routes(
             // independent confinement check (defense-in-depth, matching MCP's
             // execute_bundle in_scope check), not a replacement for the handler
             // gate. A caller-visible VisibleSet that doesn't admit the single
-            // target refuses the dispatch (agents_reached=0) before the
-            // underlying 6-arg command_dispatch_fn ever runs.
+            // target refuses the dispatch (agents_reached=0) before
+            // command_dispatch_fn ever runs.
+            //
+            // The early `in_scope` return is retained rather than left to the
+            // seam because it is what makes the refusal OBSERVABLE at the
+            // orchestrator (agents_reached=0 without a dispatch attempt); the
+            // set is ALSO forwarded, so the seam re-applies the intersection on
+            // the authoritative candidate list. Two independent checks, one
+            // shared rule — not a second copy of the arm classification.
             [command_dispatch_fn](const std::string& plugin, const std::string& action,
                                   const std::vector<std::string>& agent_ids,
                                   const std::string& scope,
@@ -1360,7 +1367,7 @@ void RestApiV1::register_routes(
                         return {correlation_id, 0};
                 }
                 return command_dispatch_fn(plugin, action, agent_ids, scope, params,
-                                           correlation_id);
+                                           correlation_id, exec_visible);
             },
             response_store,
             [] {
@@ -1466,11 +1473,21 @@ void RestApiV1::register_routes(
                       // second, independent confinement check at the orchestrator —
                       // defense-in-depth so a future scoped_perm_fn regression is
                       // still caught here rather than reaching dispatch unfiltered.
-                      // `{}` (nullopt/unfiltered) if exec_visible_fn isn't wired,
-                      // preserving prior behaviour for test harnesses.
-                      auto exec_visible = exec_visible_fn && session
-                                              ? exec_visible_fn(*session)
-                                              : yuzu::server::authz::VisibleSet{};
+                      //
+                      // An unwired derivation substitutes a present-EMPTY set —
+                      // deny-all, NEVER `VisibleSet{}`, which default-constructs
+                      // the optional to nullopt and therefore means UNFILTERED.
+                      // That inversion was the review finding: a defense-in-depth
+                      // layer that becomes PERMISSIVE when unconfigured is the
+                      // exact fail-open ADR-0033 §1 forbids, and it made the
+                      // layer decorative on any deployment that missed the
+                      // wiring. Same spelling as dashboard_routes.cpp and
+                      // mcp_server.cpp; a harness wanting genuinely unfiltered
+                      // dispatch wires a callback RETURNING nullopt.
+                      auto exec_visible =
+                          exec_visible_fn && session
+                              ? exec_visible_fn(*session)
+                              : yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{}};
                       r = bundle_orch->dispatch(agent_id, *specs, principal, audit, exec_visible);
                   } catch (const std::exception& e) {
                       audit_fn(req, "bundle.dispatch", "failure", "Execution", "",
@@ -1500,8 +1517,8 @@ void RestApiV1::register_routes(
     // HIGH #3/#4.
     sink.Post(
         "/api/v1/tar/retention-paused/purge",
-        [scoped_perm_fn, command_dispatch_fn, audit_fn, metrics_registry](
-            const httplib::Request& req, httplib::Response& res) {
+        [scoped_perm_fn, command_dispatch_fn, audit_fn, metrics_registry, auth_fn,
+         exec_visible_fn](const httplib::Request& req, httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
             auto bump = [&](const char* result) {
@@ -1572,8 +1589,35 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
-            const auto [command_id, sent] = command_dispatch_fn(
-                "tar", "purge_source", {device_id}, "", {{"source", source}}, /*execution_id=*/"");
+            // #1788 defense-in-depth. `scoped_perm_fn` above is the PRIMARY gate
+            // and has already authorized this exact device_id, so the seam's
+            // intersection is a second, independent check rather than the thing
+            // standing between a caller and the fleet. Resolve the session HERE,
+            // after that gate has passed, rather than at the top of the handler:
+            // scoped_perm_fn already emitted 401 for an unauthenticated caller,
+            // so this cannot fail in practice, and doing it late leaves the
+            // existing 400-before-401 validation ordering untouched.
+            //
+            // If the session cannot be resolved after all, RETURN rather than
+            // dispatch with a deny-all set: reaching nobody would be reported
+            // as the 404 "device offline" below, which is a false answer to
+            // what is really an authentication failure. auth_fn has already
+            // written its own 401 envelope in that case.
+            std::optional<auth::Session> purge_session;
+            if (auth_fn) {
+                purge_session = auth_fn(req, res);
+                if (!purge_session) {
+                    bump("denied");
+                    return;
+                }
+            }
+            const yuzu::server::authz::VisibleSet exec_visible =
+                exec_visible_fn && purge_session
+                    ? exec_visible_fn(*purge_session)
+                    : yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{}};
+            const auto [command_id, sent] =
+                command_dispatch_fn("tar", "purge_source", {device_id}, "", {{"source", source}},
+                                    /*execution_id=*/"", exec_visible);
             if (sent == 0) {
                 res.status = 404;
                 bump("agent_not_connected");
@@ -6158,18 +6202,48 @@ void RestApiV1::register_routes(
         // only for `parent_id`; everything else is passed explicitly so
         // re-eval can synthesise a body. Writes the 202 (or an error) on res.
         auto run_async = [result_set_store, execution_tracker, command_dispatch_fn, audit_fn,
-                          metrics_registry, rs_to_json, rs_err, resolve_owned_parent](
+                          metrics_registry, rs_to_json, rs_err, resolve_owned_parent,
+                          exec_visible_fn](
                              const httplib::Request& req, httplib::Response& res,
-                             const std::string& owner, const std::string& plugin,
+                             const auth::Session& session, const std::string& plugin,
                              const std::string& action,
                              const std::unordered_map<std::string, std::string>& params,
                              std::string_view src_kind, const std::string& source_payload,
                              const std::string& matcher, const nlohmann::json& body,
                              const std::string& name) {
+            const std::string& owner = session.username;
             if (!command_dispatch_fn || !execution_tracker) {
                 rs_err(res, 503, "RESULT_SET_DISPATCH_UNAVAILABLE: command dispatch not wired");
                 return;
             }
+            // #1788: these three producers are OPERATOR dispatch surfaces that
+            // admit on a bare GLOBAL Execution:Execute gate and then reach the
+            // fleet by scope or `__all__` broadcast. The derived VisibleSet is
+            // therefore their ONLY per-device authorization — the primary gate,
+            // not defense-in-depth (contrast POST /api/v1/bundles, where
+            // scoped_perm_fn has already authorized the single named target).
+            //
+            // They previously dispatched through the SYSTEM closure, whose
+            // exec_visible is hardcoded nullopt, so a service-A-scoped token
+            // reached every connected agent. An unwired derivation here is a
+            // server misconfiguration, not a caller error: refuse with an
+            // AUDITED 500 — the same posture the bundle and TAR-purge routes
+            // take on a missing scoped_perm_fn — rather than substituting
+            // present-empty and answering the operator "no agents reached in
+            // the target scope", which reads as an empty fleet and hides it.
+            if (!exec_visible_fn) {
+                bool audit_ok = true;
+                if (audit_fn)
+                    audit_ok = audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                        std::string("reason=exec_visible_unwired source_kind=") +
+                                            std::string(src_kind));
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                rs_err(res, 500,
+                       "RESULT_SET_GATE_UNCONFIGURED: dispatch visibility gate not configured");
+                return;
+            }
+            const yuzu::server::authz::VisibleSet exec_visible = exec_visible_fn(session);
             // Resolve the parent scope. parent_id present → dispatch is scoped
             // to that set's CURRENT members via the `from_result_set:` scope
             // kind; absent → broadcast to all connected agents (__all__).
@@ -6270,8 +6344,14 @@ void RestApiV1::register_routes(
             const std::string dispatch_scope =
                 scope_expr.empty() ? std::string(kBroadcastScope) : scope_expr;
             try {
-                std::tie(command_id, sent) =
-                    command_dispatch_fn(plugin, action, {}, dispatch_scope, params, exec_id);
+                // #1788: `exec_visible` narrows whichever arm `dispatch_scope`
+                // selects — Scope for `from_result_set:<id>`, Broadcast for
+                // `__all__` — inside dispatch_confined_arms. Nothing is
+                // pre-filtered here on purpose: the candidate set for both arms
+                // lives in the server's AgentRegistry, and a second copy of the
+                // intersection is the drift that seam exists to prevent.
+                std::tie(command_id, sent) = command_dispatch_fn(plugin, action, {}, dispatch_scope,
+                                                                 params, exec_id, exec_visible);
             } catch (const std::exception& e) {
                 spdlog::error("result-set async producer dispatch failed: {}", e.what());
                 execution_tracker->mark_cancelled(exec_id, owner);
@@ -6282,6 +6362,13 @@ void RestApiV1::register_routes(
                 // No agents in scope — record the attempt (forensic) and tell
                 // the operator rather than leaking a pending row that idles to
                 // the 300s timeout and then materialises empty.
+                //
+                // This is ALSO where a confinement drop lands: a caller whose
+                // VisibleSet admits none of the resolved targets is answered
+                // identically to a caller whose scope genuinely matched nobody.
+                // That indistinguishability is deliberate — a distinct "refused
+                // by confinement" status would disclose the existence of
+                // devices the caller is not allowed to see.
                 execution_tracker->mark_cancelled(exec_id, owner);
                 rs_err(res, 503, "RESULT_SET_NO_AGENTS: no agents reached in the target scope");
                 return;
@@ -6632,7 +6719,7 @@ void RestApiV1::register_routes(
                       if (body.contains("parent_id") && body["parent_id"].is_string())
                           payload["scope_input_id"] = body["parent_id"];
                       std::unordered_map<std::string, std::string> params{{"sql", sql}};
-                      run_async(req, res, session->username, "tar", "sql", params,
+                      run_async(req, res, *session, "tar", "sql", params,
                                 source_kind::kTarQuery, payload.dump(), matcher.dump(), body,
                                 body.value("name", ""));
                   });
@@ -6696,7 +6783,7 @@ void RestApiV1::register_routes(
                           payload["matcher"] = body["matcher"];
                       if (body.contains("parent_id") && body["parent_id"].is_string())
                           payload["scope_input_id"] = body["parent_id"];
-                      run_async(req, res, session->username, def->plugin, def->action, params,
+                      run_async(req, res, *session, def->plugin, def->action, params,
                                 source_kind::kInstructionResult, payload.dump(), matcher, body,
                                 body.value("name", ""));
                   });
@@ -6750,7 +6837,7 @@ void RestApiV1::register_routes(
                               return;
                           }
                           std::unordered_map<std::string, std::string> params{{"sql", sql}};
-                          run_async(req, res, session->username, "tar", "sql", params,
+                          run_async(req, res, *session, "tar", "sql", params,
                                     source_kind::kTarQuery, orig->source_payload, orig->matcher,
                                     synth, reeval_name);
                       } else if (orig->source_kind == source_kind::kInstructionResult) {
@@ -6768,7 +6855,7 @@ void RestApiV1::register_routes(
                           if (sp.contains("params") && sp["params"].is_object())
                               for (auto& [k, v] : sp["params"].items())
                                   params[k] = v.is_string() ? v.get<std::string>() : v.dump();
-                          run_async(req, res, session->username, def->plugin, def->action, params,
+                          run_async(req, res, *session, def->plugin, def->action, params,
                                     source_kind::kInstructionResult, orig->source_payload,
                                     orig->matcher, synth, reeval_name);
                       } else {
@@ -8337,8 +8424,8 @@ void RestApiV1::register_routes(
     // (architect B1). The read model above stays GET.
     sink.Post(
         R"(/api/v1/dex/devices/([^/]+)/live)",
-        [scoped_perm_fn, response_store, command_dispatch_fn, audit_fn, metrics_registry](
-            const httplib::Request& req, httplib::Response& res) {
+        [scoped_perm_fn, response_store, command_dispatch_fn, audit_fn, metrics_registry, auth_fn,
+         exec_visible_fn](const httplib::Request& req, httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
             // Echo the correlation id on EVERY response path (A3), parity with the
@@ -8435,8 +8522,26 @@ void RestApiV1::register_routes(
                              audit_action, cid, agent_id);
                 return;
             }
-            const auto [command_id, sent] =
-                command_dispatch_fn(plugin, action, {agent_id}, "", {}, /*execution_id=*/"");
+            // #1788 defense-in-depth, same posture as the TAR purge route: the
+            // per-device `gate(...)` above (scoped_perm_fn on THIS agent_id) is
+            // the primary authorization and has already run, so this is a
+            // second, independent check at the seam. Resolved late for the same
+            // reason — the gate has emitted 401 already if it had to, and doing
+            // it here leaves the existing status-code ordering untouched. An
+            // unresolvable session returns rather than dispatching deny-all,
+            // which the sent==0 branch would misreport as "device offline".
+            std::optional<auth::Session> live_session;
+            if (auth_fn) {
+                live_session = auth_fn(req, res);
+                if (!live_session)
+                    return;
+            }
+            const yuzu::server::authz::VisibleSet exec_visible =
+                exec_visible_fn && live_session
+                    ? exec_visible_fn(*live_session)
+                    : yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{}};
+            const auto [command_id, sent] = command_dispatch_fn(plugin, action, {agent_id}, "", {},
+                                                                /*execution_id=*/"", exec_visible);
             if (sent == 0) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(

@@ -32,10 +32,12 @@
 #include <nlohmann/json.hpp>
 #include <sqlite3.h>
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "../test_helpers.hpp"
@@ -60,6 +62,16 @@ struct DispatchCall {
     std::vector<std::string> agent_ids;
     std::unordered_map<std::string, std::string> params;
     std::string execution_id;
+    /// #1788: the confinement set the handler derived and handed to dispatch.
+    ///
+    /// Its ABSENCE from this struct is why the fleet-wide escape on these three
+    /// routes survived eleven review rounds and an eight-gate governance pass.
+    /// The recorder captured plugin/action/scope/ids and nothing about WHO the
+    /// caller was allowed to reach, so every assertion in this file stayed
+    /// green while the routes dispatched through the system closure with
+    /// exec_visible hardcoded to nullopt (unfiltered). A test that cannot
+    /// observe the confinement decision cannot fail when it is absent.
+    yuzu::server::authz::VisibleSet exec_visible;
 };
 
 struct SqliteHandleGuard {
@@ -88,6 +100,13 @@ struct AsyncHarness {
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
 
+    /// Recorded audit events (verb, result, detail) — the unwired-gate refusal
+    /// must leave durable evidence, not just a status code.
+    struct AuditCall {
+        std::string action, result, detail;
+    };
+    std::vector<AuditCall> audits;
+
     // Fake-dispatch knobs / recording.
     std::vector<DispatchCall> calls;
     int dispatch_sent{2}; // agents "reached" by each dispatch
@@ -98,9 +117,22 @@ struct AsyncHarness {
     /// holds no such grant — the case that previously reached the fleet.
     static inline bool permit_exec{true};
 
+    /// #1788: the VisibleSet the wired `exec_visible_fn` returns.
+    ///
+    /// Default nullopt = genuinely unfiltered authority (a global admin), which
+    /// is what the pre-existing cases in this file model. Set to a present set
+    /// to model a confined caller — e.g. a service-scoped token.
+    yuzu::server::authz::VisibleSet exec_visible_override{};
+    /// Leave `exec_visible_fn` EMPTY at registration, modelling a server whose
+    /// visibility derivation was never wired. That is NOT a synonym for the
+    /// nullopt default above: unwired is a misconfiguration and must be refused
+    /// (audited 500), whereas a callback returning nullopt is a real answer
+    /// meaning "this caller sees the whole fleet".
+    bool wire_exec_visible{true};
+
     explicit AsyncHarness(pg::PgPool& pool, bool with_dispatch = true,
-                          InventoryStore* inv = nullptr)
-        : inventory(inv), wire_dispatch(with_dispatch) {
+                          InventoryStore* inv = nullptr, bool with_exec_visible = true)
+        : inventory(inv), wire_dispatch(with_dispatch), wire_exec_visible(with_exec_visible) {
         permit_exec = true; // each harness starts permissive
 
         store = std::make_unique<ResultSetStore>(pool);
@@ -128,8 +160,10 @@ struct AsyncHarness {
             }
             return true;
         };
-        auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
-                           const std::string&, const std::string&, const std::string&) -> bool {
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string&, const std::string&,
+                               const std::string& detail) -> bool {
+            audits.push_back({action, result, detail});
             return true;
         };
 
@@ -139,11 +173,21 @@ struct AsyncHarness {
                                  const std::vector<std::string>& agent_ids,
                                  const std::string& scope_expr,
                                  const std::unordered_map<std::string, std::string>& params,
-                                 const std::string& exec_id) -> std::pair<std::string, int> {
-                calls.push_back({plugin, action, scope_expr, agent_ids, params, exec_id});
+                                 const std::string& exec_id,
+                                 const yuzu::server::authz::VisibleSet& exec_visible)
+                -> std::pair<std::string, int> {
+                calls.push_back(
+                    {plugin, action, scope_expr, agent_ids, params, exec_id, exec_visible});
                 if (dispatch_throws)
                     throw std::runtime_error("simulated dispatch failure");
                 return {"cmd-" + std::to_string(calls.size()), dispatch_sent};
+            };
+        }
+
+        RestApiV1::ExecVisibleFn exec_visible_fn;
+        if (wire_exec_visible) {
+            exec_visible_fn = [this](const auth::Session&) -> yuzu::server::authz::VisibleSet {
+                return exec_visible_override;
             };
         }
 
@@ -157,7 +201,15 @@ struct AsyncHarness {
                             /*product_pack_store=*/nullptr, /*sw_deploy_store=*/nullptr,
                             /*device_token_store=*/nullptr, /*license_store=*/nullptr,
                             /*guaranteed_state_store=*/nullptr, &metrics, /*session_revoke_fn=*/{},
-                            /*execution_event_bus=*/nullptr, store.get(), dispatch_fn);
+                            /*execution_event_bus=*/nullptr, store.get(), dispatch_fn,
+                            /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{},
+                            /*net_perf_fn=*/{}, /*lockout_clear_fn=*/{},
+                            /*baseline_store=*/nullptr, /*scoped_perm_fn=*/{},
+                            /*software_inventory_store=*/nullptr, /*inventory_scope_fn=*/{},
+                            /*response_scope_fn=*/{}, /*app_perf_providers=*/{},
+                            /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
+                            /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
+                            /*stream_budget=*/nullptr, exec_visible_fn);
     }
 
     nlohmann::json post(const std::string& path, const std::string& body, int& status) {
@@ -644,4 +696,148 @@ TEST_CASE("re-eval: an authenticated caller WITHOUT Execution:Execute dispatches
 
     CHECK(status == 403);
     CHECK(h.calls.size() == calls_before); // no NEW dispatch
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #1788 — per-device dispatch confinement on the three async producers.
+//
+// The CWE-862 cases above cover the NO-GRANT-AT-ALL caller. They do not cover
+// the caller who legitimately holds `Execution:Execute` but may only reach SOME
+// devices — a service-scoped token being the live example — and that gap is
+// exactly what shipped: these routes admit on a bare GLOBAL perm_fn and then
+// dispatched through the SYSTEM closure, whose exec_visible is hardcoded
+// nullopt. A service-A token therefore reached every connected agent. Neither
+// the eleven adversarial rounds nor the eight-gate governance pass could catch
+// it, because `DispatchCall` had no field in which the confinement decision
+// could be observed at all.
+//
+// WHAT THESE ASSERT, precisely: the HANDOFF — that the route derived a present
+// (confined) VisibleSet and passed it to dispatch. They are NOT the proof that
+// confinement is enforced; enforcement is the intersection, which lives in
+// `dispatch_confined_arms` and is bound with exact-send-set assertions against
+// a real AgentRegistry in test_dispatch_confined_arms.cpp. Both layers are
+// required and neither substitutes for the other — a route mock that only
+// observes the set stays green while the intersection is deleted (CDX-R8-02),
+// which is why this comment says so rather than letting the next reader assume
+// otherwise. Shape follows the established precedent at
+// test_mcp_server.cpp's execute_instruction confinement cases.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("from-tar-query: a confined caller's VisibleSet is derived and threaded into dispatch",
+          "[pg][result_set][async][tar][security][1788]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    // A service-scoped token: holds Execution:Execute (perm_fn admits), but may
+    // reach only its own service's agents.
+    h.exec_visible_override = std::unordered_set<std::string>{"agent-A"};
+
+    int status = 0;
+    h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","name":"svc"})", status);
+    REQUIRE(status == 202);
+
+    REQUIRE(h.calls.size() == 1);
+    // The broadcast arm is still SELECTED (`__all__` is a targeting mechanism,
+    // never an authz exemption) — and it is narrowed at the seam by this set.
+    CHECK(h.calls[0].scope_expr == "__all__");
+    REQUIRE(h.calls[0].exec_visible.has_value()); // CONFINED, not unfiltered
+    CHECK(h.calls[0].exec_visible->count("agent-A") == 1);
+    CHECK(h.calls[0].exec_visible->count("agent-B") == 0);
+}
+
+TEST_CASE("from-instruction-result: a confined caller's VisibleSet reaches dispatch",
+          "[pg][result_set][async][instruction][security][1788]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    h.exec_visible_override = std::unordered_set<std::string>{"agent-A"};
+
+    int status = 0;
+    h.post("/api/v1/result-sets/from-instruction-result",
+           R"({"instruction_id":")" + iid + R"("})", status);
+    REQUIRE(status == 202);
+
+    REQUIRE(h.calls.size() == 1);
+    REQUIRE(h.calls[0].exec_visible.has_value());
+    CHECK(h.calls[0].exec_visible->count("agent-A") == 1);
+    CHECK(h.calls[0].exec_visible->count("agent-B") == 0);
+}
+
+TEST_CASE("re-eval: a confined caller's VisibleSet reaches the re-dispatch",
+          "[pg][result_set][async][reeval][security][1788]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+
+    int status = 0;
+    auto created =
+        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 7","name":"o"})", status);
+    REQUIRE(status == 202);
+    const auto rs_id = created["data"]["id"].get<std::string>();
+    h.calls.clear();
+
+    // Confinement applies to the RE-EVAL as its own dispatch, not inherited
+    // from whatever authority created the original set.
+    h.exec_visible_override = std::unordered_set<std::string>{"agent-A"};
+    h.post("/api/v1/result-sets/" + rs_id + "/re-eval", "", status);
+    REQUIRE(status == 202);
+
+    REQUIRE(h.calls.size() == 1);
+    REQUIRE(h.calls[0].exec_visible.has_value());
+    CHECK(h.calls[0].exec_visible->count("agent-A") == 1);
+    CHECK(h.calls[0].exec_visible->count("agent-B") == 0);
+}
+
+TEST_CASE("async producers: an UNWIRED exec-visible derivation is an audited 500, never a dispatch",
+          "[pg][result_set][async][security][1788][fail-closed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    // Genuinely unwired — NOT the harness's nullopt default. On these routes
+    // the derivation is the ONLY per-device authorization, so a missing one is
+    // a server misconfiguration: refuse loudly rather than substitute
+    // present-empty and report the operator "no agents reached", which reads as
+    // an empty fleet and hides the broken gate.
+    AsyncHarness h(pool, /*with_dispatch=*/true, /*inv=*/nullptr, /*with_exec_visible=*/false);
+    auto iid = make_instruction(*h.instr);
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    CHECK(status == 500);
+    CHECK(j.dump().find("RESULT_SET_GATE_UNCONFIGURED") != std::string::npos);
+    CHECK(h.calls.empty()); // THE assertion: nothing was dispatched
+
+    h.post("/api/v1/result-sets/from-instruction-result",
+           R"({"instruction_id":")" + iid + R"("})", status);
+    CHECK(status == 500);
+    CHECK(h.calls.empty());
+
+    // The refusal is durable evidence, not just a status code.
+    const bool audited =
+        std::any_of(h.audits.begin(), h.audits.end(), [](const AsyncHarness::AuditCall& a) {
+            return a.action == "result_set.create" && a.result == "denied" &&
+                   a.detail.find("exec_visible_unwired") != std::string::npos;
+        });
+    CHECK(audited);
+}
+
+TEST_CASE("async producers: an unfiltered (nullopt) VisibleSet still dispatches — non-regression",
+          "[pg][result_set][async][security][1788]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool); // exec_visible_override defaults to nullopt
+    int status = 0;
+    h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1"})", status);
+    REQUIRE(status == 202);
+    REQUIRE(h.calls.size() == 1);
+    // A genuine global administrator keeps full-fleet reach — that is their
+    // actual authority, not a bypass. Distinct from the unwired case above:
+    // wiring a callback that RETURNS nullopt is an answer; leaving the callback
+    // empty is a missing gate.
+    CHECK_FALSE(h.calls[0].exec_visible.has_value());
 }

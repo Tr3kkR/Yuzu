@@ -66,9 +66,16 @@ struct BundleHarness {
     // target to prove the adapter refuses dispatch even when scoped_perm_fn
     // (the primary gate) would have allowed it.
     std::optional<std::unordered_set<std::string>> exec_visible_override;
+    /// Leave `exec_visible_fn` EMPTY at registration, modelling a deployment
+    /// that never wired the derivation. Distinct from `exec_visible_override`
+    /// being nullopt: that is a callback ANSWERING "unfiltered", this is no
+    /// callback at all, which fails CLOSED (present-empty). See the case pair
+    /// at the bottom of this file.
+    bool wire_exec_visible{true};
 
-    explicit BundleHarness(bool with_dispatch = true, bool with_scope = true)
-        : wire_dispatch(with_dispatch) {
+    explicit BundleHarness(bool with_dispatch = true, bool with_scope = true,
+                           bool with_exec_visible = true)
+        : wire_dispatch(with_dispatch), wire_exec_visible(with_exec_visible) {
         REQUIRE(store.is_open());
 
         auto auth_fn = [this](const httplib::Request&,
@@ -93,7 +100,9 @@ struct BundleHarness {
                                  const std::vector<std::string>& agent_ids,
                                  const std::string& scope_expr,
                                  const std::unordered_map<std::string, std::string>&,
-                                 const std::string& exec_id) -> std::pair<std::string, int> {
+                                 const std::string& exec_id,
+                                 const yuzu::server::authz::VisibleSet&)
+                -> std::pair<std::string, int> {
                 calls.push_back({plugin, action, scope_expr, exec_id, agent_ids});
                 return {"cmd-" + plugin + "-" + action, dispatch_sent};
             };
@@ -131,9 +140,12 @@ struct BundleHarness {
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
                             /*stream_budget=*/nullptr,
-                            [this](const auth::Session&) -> yuzu::server::authz::VisibleSet {
-                                return exec_visible_override;
-                            });
+                            wire_exec_visible
+                                ? RestApiV1::ExecVisibleFn{[this](const auth::Session&)
+                                                               -> yuzu::server::authz::VisibleSet {
+                                      return exec_visible_override;
+                                  }}
+                                : RestApiV1::ExecVisibleFn{});
     }
 
     nlohmann::json post(const std::string& path, const std::string& body, int& status) {
@@ -246,6 +258,8 @@ TEST_CASE("POST /api/v1/bundles: the derived VisibleSet is a SECOND, independent
 TEST_CASE("POST /api/v1/bundles: an unfiltered (nullopt) VisibleSet still dispatches normally "
           "(Gate-3-architect-F1 non-regression)",
           "[bundle][rest][scope]") {
+    // A wired callback ANSWERING nullopt: a genuine global administrator, whose
+    // full-fleet reach is their actual authority rather than a bypass.
     BundleHarness h; // exec_visible_override defaults to nullopt (unfiltered)
     int status = 0;
     h.post("/api/v1/bundles",
@@ -253,6 +267,33 @@ TEST_CASE("POST /api/v1/bundles: an unfiltered (nullopt) VisibleSet still dispat
     CHECK(status == 202);
     REQUIRE(h.calls.size() == 1);
     CHECK(h.calls[0].agent_ids == std::vector<std::string>{"agent-B"});
+}
+
+TEST_CASE("POST /api/v1/bundles: an UNWIRED ExecVisibleFn fails CLOSED, it does not fall back to "
+          "unfiltered",
+          "[bundle][rest][scope][fail-closed][1788]") {
+    // This case previously asserted the OPPOSITE, and asserting it is how the
+    // defect held: the route's fallback was `VisibleSet{}`, which
+    // default-constructs the optional to NULLOPT — i.e. UNFILTERED — so a
+    // deployment that never wired the derivation silently lost the whole
+    // defense-in-depth layer while a green test said the behaviour was intended.
+    //
+    // ADR-0033 §1 is explicit that the two states are not interchangeable:
+    // nullopt means unfiltered, a present-empty set means deny-all, and a
+    // MISSING derivation must never be read as "no filter applies". Every
+    // sibling confined surface (dashboard execute, MCP execute_instruction /
+    // execute_bundle) already substituted present-empty here; this route was
+    // the one that inverted it.
+    //
+    // The per-target scoped_perm_fn gate is left ADMITTING on purpose, so the
+    // only thing that can refuse this dispatch is the fallback under test.
+    BundleHarness h(/*with_dispatch=*/true, /*with_scope=*/true, /*with_exec_visible=*/false);
+    h.scope_allow = true;
+    int status = 0;
+    h.post("/api/v1/bundles",
+           R"({"agent_id":"agent-B","steps":[{"plugin":"os_info","action":"uptime"}]})", status);
+    CHECK(status == 202);   // handler still mints the async correlation id
+    CHECK(h.calls.empty()); // THE assertion: deny-all, so nothing was reached
 }
 
 TEST_CASE("GET /api/v1/bundles/{id} collates the responses", "[bundle][rest]") {
