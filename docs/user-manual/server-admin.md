@@ -193,6 +193,54 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — the `mcp.` instruction-definition id prefix is reserved (#2442) (breaking)
+
+**Who this affects.** Anyone whose instruction definitions include an id beginning `mcp.`. No
+shipped or bundled content uses that prefix, so a deployment running only Yuzu-supplied content
+is unaffected and needs no action.
+
+**Why.** `mcp.<tool>` names an MCP approval ticket. The MCP recall matches a ticket on its
+definition id and scope expression and does not bind the submitter, so a definition authored
+under that prefix could line up with an MCP tool's canonical arguments — a ticket raised on one
+surface being redeemable on another. Consuming it still required the schema check, the tier
+gate, per-handler RBAC and a human approval, so this closes a namespace confusion rather than an
+open escalation.
+
+**What changes.** Creating a definition whose id starts `mcp.` is refused with a 400 on every
+authoring route that accepts an explicit id — `POST /api/instructions`, `POST
+/api/instructions/yaml`, and `POST /api/instructions/import` — and such a definition is skipped
+(counted in `defs_errored`) at boot auto-import. The dashboard's YAML validator refuses it too,
+so Validate and Save agree on the create path. Product-pack install is unaffected because it
+never carries a declared id through at all: the store assigns one, so a pack's own id, reserved
+or not, has never been honoured.
+
+**What does NOT change.** The store applies the rule at creation only, so a definition that
+already carries such an id keeps executing and can still be saved through `PUT
+/api/instructions/{id}` — an update cannot originate an id, so blocking it there would strand
+content rather than protect anything. One exception, and it is the reason to rename rather than
+live with it: the dashboard's YAML editor runs the same validation on every save, create or
+update, so an existing `mcp.`-prefixed definition cannot be edited there if its document
+declares `metadata.id` (one that omits it still saves, since the validator only checks a
+declared id).
+
+**What to do.** Before upgrading, check for affected content. Query the instruction database
+directly rather than the REST list route: `GET /api/v1/definitions` caps its result at 100
+definitions, and the shipped content alone exceeds that, so an API-based check can report a
+false all-clear. `GLOB` rather than `LIKE` because SQLite's `LIKE` is case-insensitive and
+the reservation is not — `MCP.foo` is a different id everywhere else in the system and is
+not reserved.
+
+```bash
+sqlite3 /var/lib/yuzu/instructions.db \
+  "SELECT id FROM instruction_definitions WHERE id GLOB 'mcp.*';"
+```
+
+Any id listed keeps executing after the upgrade and can still be edited through
+`PUT /api/instructions/{id}`, but re-importing an export of it will fail, and so will saving it
+from the dashboard's YAML editor (that path validates the id on every save, not only on
+create). Rename those definitions before upgrading — create a replacement under a different id
+and delete the original.
+
 ### vNEXT — behind a reverse proxy, declare your external origin or CSRF-gated dashboard actions keep failing (#2537)
 
 **Who this affects.** Anyone running the dashboard behind nginx, Envoy, HAProxy, an ALB or
@@ -321,6 +369,8 @@ device filter that matched nothing produces. Each of these is now `400`.
 | `POST /api/instructions/{id}/execute` | body is not a JSON object | treated as "no target" → broadcast | `400` |
 | `POST /api/command` | `scope` is `"__all__"` | `400 invalid scope` | dispatches to **all connected agents** |
 | `POST /api/v1/result-sets/from-*` | body is not a JSON object | `500` (uncaught type error) | `400` |
+| `POST /api/dashboard/execute` | form field `scope=` supplied but EMPTY | broadcast to all | refused, nothing dispatched |
+| `POST /api/dashboard/tar-execute` | query param `scope=` supplied but EMPTY | broadcast to all | refused, nothing dispatched |
 
 The two remediation rows matter for the same reason as the rest: on that route an **absent**
 `agent_ids` means "every non-compliant agent in this policy", so a supplied selector that named
@@ -355,8 +405,16 @@ change is that the dashboard's "All agents" button now sends `__all__` explicitl
 that way look different from before. A saved query selecting historical broadcasts by
 `scope_expression = ''` still matches everything except dashboard-initiated ones.
 
-**Dashboard users need do nothing** — the Instructions execute dialog's "All agents" option now
-sends `__all__` instead of an empty string.
+**Dashboard users driving the UI in a browser need do nothing** — the Instructions execute
+dialog's "All agents" option sends `__all__` instead of an empty string.
+
+**But automation that POSTs the dashboard forms directly does need attention.** As of the
+Wave-1 foundations change, `/api/dashboard/execute` and `/api/dashboard/tar-execute`
+distinguish an OMITTED `scope` from one SUPPLIED as empty (`scope=`): omitted still means the
+whole fleet, but supplied-but-empty is now refused and dispatches to nobody, where it
+previously broadcast. If a script builds the form body unconditionally and leaves `scope`
+blank when no device is selected, it will stop dispatching — which is the intended outcome,
+but a silent one. Send `scope=__all__` to keep the fleet-wide behaviour deliberately.
 
 **Detecting affected clients — and the limit of what is possible.** There is no reliable way to
 find them *before* upgrading. The audit trail records the OUTCOME of a dispatch, not the request
@@ -377,6 +435,28 @@ After upgrading, refusals are counted by
 `YuzuDispatchTargetRejected` alert fires when the 15-minute increase exceeds 3 — deliberately not
 on every single refusal, because a rule that pages on one malformed request gets silenced. Use the
 audit rows, not the alert, to find individual offenders.
+
+### vNEXT — MCP stream revalidation rides the tick, and the pin-drift alert moves to a new counter
+
+Two operator-visible changes to held-open MCP `GET` SSE streams. Neither changes a
+revocation bound: the documented one-tick single-server figure still holds and is now
+pinned by tests.
+
+**Credential re-checks are once per tick, and busy streams stop sending heartbeat
+filler.** A stream delivering frames continuously previously re-validated its
+credential and slid its session TTL on *every frame*; both now run once per ~3 s tick,
+and a pass that delivered real frames skips the redundant heartbeat. If anything on
+your side counts `event: heartbeat` frames as a liveness signal, key on *any*
+delivered frame instead.
+
+**The admission-drift reading moved counters.** `yuzu_mcp_stream_final_unpinned_total`
+used to carry the "replay-ring pin accounting has drifted" reading; that reading now
+belongs to the new `yuzu_mcp_stream_pin_displaced_total` (the server now displaces the
+oldest pinned terminal instead of committing the newest unprotected, which is strictly
+less bad). If you alert on `final_unpinned_total > 0`, keep that rule and add the same
+rule for `pin_displaced_total` — reference rules for both ship in
+`docs/prometheus/yuzu-alerts.yml`, and the response procedure is
+`docs/ops-runbooks/mcp-stream-pin-displacement.md` (diagnostic only — no restart).
 
 ### vNEXT — engine-principal streams: liveness re-checks are cached, and the outage grace window is measured differently (#2367)
 
