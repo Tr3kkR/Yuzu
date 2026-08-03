@@ -265,10 +265,8 @@ std::string_view response_correlation_id(const B3PlatformResponse& response) {
     return std::get<A4ErrorEnvelope>(response).correlation_id;
 }
 
-} // namespace
-
 std::expected<std::string, ContractError>
-encode_b3_platform_request(const B3PlatformRequest& request) {
+encode_platform_request(const B3PlatformRequest& request) {
     if (const auto valid = validate_request(request); !valid) {
         return std::unexpected(valid.error());
     }
@@ -284,6 +282,30 @@ encode_b3_platform_request(const B3PlatformRequest& request) {
         {"securable", request.securable},
     };
     return detail::encode_contract_json(root);
+}
+
+} // namespace
+
+B3PlatformCall::B3PlatformCall(std::string body,
+                               TransportAuthSlot authentication) noexcept
+    : body_(std::move(body)), authentication_(std::move(authentication)) {}
+
+std::expected<B3PlatformCall, B3PlatformCallError>
+make_b3_platform_call(B3PlatformRequest request, TransportAuthSlot authentication) {
+    if (!authentication.valid()) {
+        return std::unexpected(
+            B3PlatformCallError{B3AuthBindingError::MissingAuthentication});
+    }
+    if (authentication.kind() != TransportAuthKind::CallerCredential) {
+        return std::unexpected(
+            B3PlatformCallError{B3AuthBindingError::WrongAuthenticationKind});
+    }
+    auto body = encode_platform_request(request);
+    if (!body) {
+        return std::unexpected(B3PlatformCallError{std::in_place_type<ContractError>,
+                                                   std::move(body.error())});
+    }
+    return B3PlatformCall{std::move(*body), std::move(authentication)};
 }
 
 std::expected<B3PlatformRequest, ContractError>

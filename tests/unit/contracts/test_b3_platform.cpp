@@ -9,12 +9,70 @@
 #include <expected>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 
 namespace contracts = yuzu::contracts::adr31;
+
+namespace {
+
+struct LegacyPositionalB3Sink {
+    void operator()(std::string_view, std::string_view) const {}
+};
+
+struct BodyConsumer {
+    void operator()(contracts::B3RequestBodyView) const {}
+};
+
+struct CredentialConsumer {
+    void operator()(contracts::B3CallerCredentialView) const {}
+};
+
+std::expected<std::string, contracts::ContractError>
+encode_request_through_authenticated_carrier(contracts::B3PlatformRequest request) {
+    constexpr std::string_view credential = "fixture-b3-test-credential";
+    auto authentication = contracts::make_transport_auth_slot(
+        contracts::TransportAuthKind::CallerCredential, std::string{credential});
+    if (!authentication)
+        throw std::logic_error("test credential must be valid");
+
+    auto call = contracts::make_b3_platform_call(std::move(request), std::move(*authentication));
+    if (!call) {
+        if (const auto* contract_error = std::get_if<contracts::ContractError>(&call.error())) {
+            return std::unexpected(*contract_error);
+        }
+        throw std::logic_error("valid test authentication was rejected");
+    }
+
+    std::string body;
+    const auto applied =
+        std::move(*call).apply_to_transport([&](const contracts::B3TransportInputs& input) {
+            if (input.caller_credential().bytes() != credential) {
+                throw std::logic_error("carrier changed test authentication");
+            }
+            body = input.body().bytes();
+        });
+    if (!applied)
+        throw std::logic_error("fresh carrier was not consumable");
+    return body;
+}
+
+} // namespace
+
+static_assert(!std::is_default_constructible_v<contracts::B3PlatformCall>);
+static_assert(!std::is_copy_constructible_v<contracts::B3PlatformCall>);
+static_assert(!std::is_copy_assignable_v<contracts::B3PlatformCall>);
+static_assert(std::is_nothrow_move_constructible_v<contracts::B3PlatformCall>);
+static_assert(!std::is_move_assignable_v<contracts::B3PlatformCall>);
+static_assert(!std::is_default_constructible_v<contracts::B3TransportInputs>);
+static_assert(!std::is_copy_constructible_v<contracts::B3TransportInputs>);
+static_assert(!std::is_invocable_v<LegacyPositionalB3Sink, const contracts::B3TransportInputs&>);
+static_assert(!std::is_invocable_v<BodyConsumer, contracts::B3CallerCredentialView>);
+static_assert(!std::is_invocable_v<CredentialConsumer, contracts::B3RequestBodyView>);
 
 TEST_CASE("ADR-0031 B3 platform request has a deterministic round trip", "[adr31][contract][b3]") {
     contracts::B3PlatformRequest request{
@@ -24,7 +82,7 @@ TEST_CASE("ADR-0031 B3 platform request has a deterministic round trip", "[adr31
         .scope = nlohmann::json{{"kind", "fleet"}},
     };
 
-    const auto encoded = contracts::encode_b3_platform_request(request);
+    const auto encoded = encode_request_through_authenticated_carrier(request);
     REQUIRE(encoded.has_value());
     CHECK(
         *encoded ==
@@ -37,7 +95,7 @@ TEST_CASE("ADR-0031 B3 platform request has a deterministic round trip", "[adr31
     CHECK(decoded->operation == request.operation);
     CHECK(decoded->scope == request.scope);
 
-    const auto reencoded = contracts::encode_b3_platform_request(*decoded);
+    const auto reencoded = encode_request_through_authenticated_carrier(*decoded);
     REQUIRE(reencoded.has_value());
     CHECK(*reencoded == *encoded);
 }
@@ -64,11 +122,189 @@ TEST_CASE("ADR-0031 B3 correlation is a bounded diagnostic token",
          {std::string{}, std::string{"contains space"}, std::string{"contains\nnewline"},
           std::string(contracts::kMaxCorrelationIdCharacters + 1, 'x')}) {
         request.correlation_id = invalid;
-        const auto encoded = contracts::encode_b3_platform_request(request);
+        const auto encoded = encode_request_through_authenticated_carrier(request);
         CAPTURE(invalid.size());
         REQUIRE_FALSE(encoded.has_value());
         CHECK(encoded.error().code == contracts::ContractErrorCode::InvalidValue);
         CHECK(encoded.error().path == "/correlation_id");
+    }
+}
+
+TEST_CASE("ADR-0031 B3 call atomically applies JSON and caller authentication",
+          "[adr31][contract][b3][auth]") {
+    constexpr std::string_view secret = "fixture-b3-caller-credential";
+    const contracts::B3PlatformRequest request{
+        .correlation_id = "req-contract-0001",
+        .securable = "GuaranteedState",
+        .operation = contracts::CoreOperation::Read,
+        .scope = nlohmann::json{{"kind", "fleet"}},
+    };
+    auto authentication = contracts::make_transport_auth_slot(
+        contracts::TransportAuthKind::CallerCredential, std::string{secret});
+    REQUIRE(authentication.has_value());
+
+    auto call = contracts::make_b3_platform_call(request, std::move(*authentication));
+    REQUIRE(call.has_value());
+    CHECK_FALSE(authentication->valid());
+
+    bool invoked = false;
+    std::string owned_body;
+    std::string owned_authentication;
+    const auto applied =
+        std::move(*call).apply_to_transport([&](const contracts::B3TransportInputs& input) {
+            invoked = true;
+            owned_body = input.body().bytes();
+            owned_authentication = input.caller_credential().bytes();
+        });
+    REQUIRE(applied.has_value());
+    CHECK(invoked);
+    CHECK(owned_authentication == secret);
+    CHECK(owned_body.find(secret) == std::string::npos);
+
+    const auto decoded = contracts::decode_b3_platform_request(owned_body);
+    REQUIRE(decoded.has_value());
+    CHECK(decoded->correlation_id == request.correlation_id);
+    CHECK(decoded->securable == request.securable);
+    CHECK(decoded->operation == request.operation);
+    CHECK(decoded->scope == request.scope);
+
+    bool second_invoked = false;
+    const auto second = std::move(*call).apply_to_transport(
+        [&](const contracts::B3TransportInputs&) { second_invoked = true; });
+    REQUIRE_FALSE(second.has_value());
+    REQUIRE(std::holds_alternative<contracts::B3AuthBindingError>(second.error()));
+    CHECK(std::get<contracts::B3AuthBindingError>(second.error()) ==
+          contracts::B3AuthBindingError::Consumed);
+    CHECK_FALSE(second_invoked);
+}
+
+TEST_CASE("ADR-0031 B3 call moves ownership and fails closed at its source",
+          "[adr31][contract][b3][auth][negative]") {
+    const contracts::B3PlatformRequest request{
+        .correlation_id = "req-contract-0001",
+        .securable = "GuaranteedState",
+        .operation = contracts::CoreOperation::Read,
+        .scope = nlohmann::json{{"kind", "fleet"}},
+    };
+    auto authentication = contracts::make_transport_auth_slot(
+        contracts::TransportAuthKind::CallerCredential, "fixture-caller-credential");
+    REQUIRE(authentication.has_value());
+    auto call = contracts::make_b3_platform_call(request, std::move(*authentication));
+    REQUIRE(call.has_value());
+
+    auto moved = std::move(*call);
+    bool source_invoked = false;
+    const auto source = std::move(*call).apply_to_transport(
+        [&](const contracts::B3TransportInputs&) { source_invoked = true; });
+    REQUIRE_FALSE(source.has_value());
+    REQUIRE(std::holds_alternative<contracts::B3AuthBindingError>(source.error()));
+    CHECK(std::get<contracts::B3AuthBindingError>(source.error()) ==
+          contracts::B3AuthBindingError::Consumed);
+    CHECK_FALSE(source_invoked);
+
+    bool destination_invoked = false;
+    const auto destination =
+        std::move(moved).apply_to_transport([&](const contracts::B3TransportInputs& input) {
+            destination_invoked = true;
+            CHECK(input.caller_credential().bytes() == "fixture-caller-credential");
+        });
+    REQUIRE(destination.has_value());
+    CHECK(destination_invoked);
+}
+
+TEST_CASE("ADR-0031 B3 call stays consumed when a transport sink throws",
+          "[adr31][contract][b3][auth][negative]") {
+    const contracts::B3PlatformRequest request{
+        .correlation_id = "req-contract-0001",
+        .securable = "GuaranteedState",
+        .operation = contracts::CoreOperation::Read,
+        .scope = nlohmann::json{{"kind", "fleet"}},
+    };
+    auto authentication = contracts::make_transport_auth_slot(
+        contracts::TransportAuthKind::CallerCredential, "fixture-caller-credential");
+    REQUIRE(authentication.has_value());
+    auto call = contracts::make_b3_platform_call(request, std::move(*authentication));
+    REQUIRE(call.has_value());
+
+    REQUIRE_THROWS_AS(std::move(*call).apply_to_transport([](const contracts::B3TransportInputs&) {
+        throw std::runtime_error("fake transport failure");
+    }),
+                      std::runtime_error);
+
+    bool retry_invoked = false;
+    const auto retry = std::move(*call).apply_to_transport(
+        [&](const contracts::B3TransportInputs&) { retry_invoked = true; });
+    REQUIRE_FALSE(retry.has_value());
+    REQUIRE(std::holds_alternative<contracts::B3AuthBindingError>(retry.error()));
+    CHECK(std::get<contracts::B3AuthBindingError>(retry.error()) ==
+          contracts::B3AuthBindingError::Consumed);
+    CHECK_FALSE(retry_invoked);
+}
+
+TEST_CASE("ADR-0031 B3 call fails closed on missing, wrong-kind, or invalid inputs",
+          "[adr31][contract][b3][auth][negative]") {
+    contracts::B3PlatformRequest request{
+        .correlation_id = "req-contract-0001",
+        .securable = "GuaranteedState",
+        .operation = contracts::CoreOperation::Read,
+        .scope = nlohmann::json{{"kind", "fleet"}},
+    };
+
+    SECTION("wrong kind") {
+        auto grant = contracts::make_transport_auth_slot(
+            contracts::TransportAuthKind::InvocationGrant, "fixture-invocation-grant");
+        REQUIRE(grant.has_value());
+        const auto call = contracts::make_b3_platform_call(request, std::move(*grant));
+        REQUIRE_FALSE(call.has_value());
+        REQUIRE(std::holds_alternative<contracts::B3AuthBindingError>(call.error()));
+        CHECK(std::get<contracts::B3AuthBindingError>(call.error()) ==
+              contracts::B3AuthBindingError::WrongAuthenticationKind);
+    }
+
+    SECTION("moved-from authentication precedes request validation") {
+        auto authentication = contracts::make_transport_auth_slot(
+            contracts::TransportAuthKind::CallerCredential, "fixture-caller-credential");
+        REQUIRE(authentication.has_value());
+        auto owner = std::move(*authentication);
+        REQUIRE(owner.valid());
+        REQUIRE_FALSE(authentication->valid());
+        request.correlation_id = "invalid correlation";
+
+        const auto call =
+            contracts::make_b3_platform_call(std::move(request), std::move(*authentication));
+        REQUIRE_FALSE(call.has_value());
+        REQUIRE(std::holds_alternative<contracts::B3AuthBindingError>(call.error()));
+        CHECK(std::get<contracts::B3AuthBindingError>(call.error()) ==
+              contracts::B3AuthBindingError::MissingAuthentication);
+    }
+
+    SECTION("invalid typed request") {
+        auto authentication = contracts::make_transport_auth_slot(
+            contracts::TransportAuthKind::CallerCredential, "fixture-caller-credential");
+        REQUIRE(authentication.has_value());
+        request.scope = nlohmann::json::array();
+
+        const auto call =
+            contracts::make_b3_platform_call(std::move(request), std::move(*authentication));
+        REQUIRE_FALSE(call.has_value());
+        REQUIRE(std::holds_alternative<contracts::ContractError>(call.error()));
+        CHECK(std::get<contracts::ContractError>(call.error()).code ==
+              contracts::ContractErrorCode::WrongType);
+        CHECK(std::get<contracts::ContractError>(call.error()).path == "/scope");
+    }
+
+    SECTION("full encoder validation") {
+        auto authentication = contracts::make_transport_auth_slot(
+            contracts::TransportAuthKind::CallerCredential, "fixture-caller-credential");
+        REQUIRE(authentication.has_value());
+        request.scope["value"] = std::numeric_limits<double>::quiet_NaN();
+
+        const auto call =
+            contracts::make_b3_platform_call(std::move(request), std::move(*authentication));
+        REQUIRE_FALSE(call.has_value());
+        REQUIRE(std::holds_alternative<contracts::ContractError>(call.error()));
+        CHECK(std::get<contracts::ContractError>(call.error()).code ==
+              contracts::ContractErrorCode::InvalidValue);
     }
 }
 
@@ -207,7 +443,7 @@ TEST_CASE("ADR-0031 B3 encoder owns validation failures", "[adr31][contract][b3]
 
     SECTION("oversized output") {
         request.scope["padding"] = std::string(contracts::kMaxContractWireBytes, 'x');
-        const auto encoded = contracts::encode_b3_platform_request(request);
+        const auto encoded = encode_request_through_authenticated_carrier(request);
         REQUIRE_FALSE(encoded.has_value());
         CHECK(encoded.error().code == contracts::ContractErrorCode::TooLarge);
     }
@@ -215,7 +451,7 @@ TEST_CASE("ADR-0031 B3 encoder owns validation failures", "[adr31][contract][b3]
     SECTION("invalid UTF-8") {
         request.scope["invalid"] = std::string(1, static_cast<char>(0xff));
         std::expected<std::string, contracts::ContractError> encoded;
-        REQUIRE_NOTHROW(encoded = contracts::encode_b3_platform_request(request));
+        REQUIRE_NOTHROW(encoded = encode_request_through_authenticated_carrier(request));
         REQUIRE_FALSE(encoded.has_value());
         CHECK(encoded.error().code == contracts::ContractErrorCode::InvalidValue);
     }
@@ -225,7 +461,7 @@ TEST_CASE("ADR-0031 B3 encoder owns validation failures", "[adr31][contract][b3]
         for (std::size_t depth = 0; depth < contracts::kMaxContractNestingDepth; ++depth) {
             request.scope = nlohmann::json{{"nested", std::move(request.scope)}};
         }
-        const auto encoded = contracts::encode_b3_platform_request(request);
+        const auto encoded = encode_request_through_authenticated_carrier(request);
         REQUIRE_FALSE(encoded.has_value());
         CHECK(encoded.error().code == contracts::ContractErrorCode::TooDeep);
     }
@@ -238,7 +474,7 @@ TEST_CASE("ADR-0031 B3 encoder owns validation failures", "[adr31][contract][b3]
         };
         for (const auto invalid : invalid_numbers) {
             request.scope["invalid"] = invalid;
-            const auto encoded = contracts::encode_b3_platform_request(request);
+            const auto encoded = encode_request_through_authenticated_carrier(request);
             REQUIRE_FALSE(encoded.has_value());
             CHECK(encoded.error().code == contracts::ContractErrorCode::InvalidValue);
         }
@@ -263,8 +499,8 @@ TEST_CASE("ADR-0031 B3 encoding is independent of object insertion order",
         .scope = std::move(reversed_scope),
     };
 
-    const auto first_wire = contracts::encode_b3_platform_request(first);
-    const auto second_wire = contracts::encode_b3_platform_request(second);
+    const auto first_wire = encode_request_through_authenticated_carrier(first);
+    const auto second_wire = encode_request_through_authenticated_carrier(second);
     REQUIRE(first_wire.has_value());
     REQUIRE(second_wire.has_value());
     CHECK(*first_wire == *second_wire);

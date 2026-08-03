@@ -49,9 +49,18 @@ TEST_CASE("ADR-0031 transport authentication is a move-only redacted lease",
         .operation = contracts::CoreOperation::Read,
         .scope = nlohmann::json{{"kind", "fleet"}},
     };
-    const auto encoded = contracts::encode_b3_platform_request(request);
-    REQUIRE(encoded.has_value());
-    CHECK(encoded->find(secret) == std::string::npos);
+    auto call = contracts::make_b3_platform_call(request, std::move(moved));
+    REQUIRE(call.has_value());
+    std::string body;
+    std::string carried_secret;
+    const auto applied =
+        std::move(*call).apply_to_transport([&](const contracts::B3TransportInputs& input) {
+            body = input.body().bytes();
+            carried_secret = input.caller_credential().bytes();
+        });
+    REQUIRE(applied.has_value());
+    CHECK(carried_secret == secret);
+    CHECK(body.find(secret) == std::string::npos);
 }
 
 TEST_CASE("ADR-0031 transport authentication rejects empty and oversized material",
