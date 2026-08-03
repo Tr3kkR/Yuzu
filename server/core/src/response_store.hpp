@@ -39,6 +39,12 @@ struct StoredResponse {
     /// path; legacy callers continue to use `query()` keyed by
     /// instruction_id+timestamp window.
     std::string execution_id;
+    /// CC-07 plugin→host typed result status (agent.proto CommandResponse
+    /// .plugin_result_status, mirrors YuzuResultStatus from
+    /// sdk/include/yuzu/plugin.h). 0 (PLUGIN_RESULT_UNDECLARED) for legacy
+    /// rows written before this column existed and for any response whose
+    /// plugin never reported a typed status.
+    int plugin_result_status{0};
 };
 
 /// A facet value from the response_facets index.
@@ -129,10 +135,18 @@ public:
     /// command_ids (retry under a new execution row) don't fold a
     /// terminal frame back onto rows tagged with the old execution_id.
     /// Empty execution_id matches empty (legacy / out-of-band callers).
+    ///
+    /// `plugin_result_status` (CC-07, PR1.1) is written into the same
+    /// updated row(s) — without this the empty-output terminal frame path
+    /// (the normal shape for a command that already streamed output via
+    /// RUNNING frames) would silently leave the row's typed status at its
+    /// prior value (0/UNDECLARED for a freshly-inserted RUNNING row) even
+    /// though the terminal frame carried a real one.
     FinalizeResult finalize_terminal_status(const std::string& instruction_id,
                                             const std::string& agent_id, int terminal_status,
                                             const std::string& error_detail,
-                                            const std::string& execution_id);
+                                            const std::string& execution_id,
+                                            int plugin_result_status);
     std::vector<StoredResponse> query(const std::string& instruction_id,
                                       const ResponseQuery& q = {}) const;
     /// Exact-correlation lookup keyed on the new `execution_id` column

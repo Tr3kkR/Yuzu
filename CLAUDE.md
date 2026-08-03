@@ -241,7 +241,7 @@ The `frontend-design` plugin is **marketing / sales / demo surfaces only** — i
 
 ### Issue tracker, triage labels, domain docs
 
-Issues follow `docs/agents/issue-standard.md`: dedupe before filing; automation never closes `security`/`do-not-close` issues. Commands: `docs/agents/issue-tracker.md`; labels: `docs/agents/triage-labels.md`. Domain docs: `CONTEXT.md`, ADRs in `docs/adr/` (`docs/agents/domain.md`).
+Issues follow `docs/agents/issue-standard.md`: dedupe before filing; automation never closes `security`/`do-not-close` issues. Commands: `docs/agents/issue-tracker.md`; labels: `docs/agents/triage-labels.md`. Domain docs: `CONTEXT.md`, ADRs in `docs/adr/` (`docs/agents/domain.md`). ADR numbers are **author-namespaced** and `0016`/`0031` each host two accepted ADRs — cite those by filename, never number alone: `docs/adr/README.md`.
 
 ## CLAUDE.md updates
 
