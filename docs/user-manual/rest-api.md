@@ -3185,16 +3185,20 @@ For a secret-valued key the response **omits `value`**, for the same reason `GET
 { "key": "oidc_client_secret", "applied": true }
 ```
 
-**Error (400) - key not configurable.** Note this route emits two different error shapes; this one
-is a bare `error` string with no envelope:
+> **None of this route's error bodies use the A4 envelope.** `/api/config` is a legacy
+> non-`/api/v1` route; every error it emits is either a bare `error` string or a nested
+> `{"error":{"code","message"},"meta":{"api_version"}}` object, and neither carries the
+> `correlation_id` or `retry_after_ms` that A4 requires. Besides the two shown below, the handler
+> also emits nested bodies for `503` "runtime config store unavailable", `400` "missing 'value' in
+> request body", and `400` "invalid JSON body". Do not parse these as A4.
+
+**Error (400) - key not configurable.** This one is a bare `error` string with no envelope:
 
 ```json
 { "error": "key 'foo' is not a configurable runtime setting" }
 ```
 
-**Error (400) - bad value for an integer key**, which uses a nested error body. Note this is **not**
-the A4 envelope: `/api/config` is a legacy non-`/api/v1` route, and the body carries neither
-`correlation_id` nor `retry_after_ms`.
+**Error (400) - bad value for an integer key**, which uses a nested error body:
 
 ```json
 {

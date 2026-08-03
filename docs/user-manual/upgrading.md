@@ -20,8 +20,8 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 ## ⚠️ Security: rotate `oidc_client_secret` if it was ever set on this install
 
-**Every release up to and including v0.13.0** emitted the OIDC client secret in the clear to three
-places, and this upgrade closes all three:
+**Every release up to and including v0.13.0** — that is, every release before the one carrying this
+note — emitted the OIDC client secret in the clear to three places, and this upgrade closes all three:
 
 - the **server log**, written verbatim by the startup override pass on **every boot**;
 - `GET /api/config`, a route gated only on `Infrastructure:Read`;
@@ -31,12 +31,21 @@ places, and this upgrade closes all three:
 Audit rows written before the upgrade are now redacted when read, so the value stops being disclosed
 through that path too. The rows themselves are deliberately left intact: an audit row is compliance
 evidence, and rewriting history to conceal a mistake is a worse posture than declining to disclose it.
+**So the plaintext remains at rest** in those rows until retention expires — `audit_retention_days`
+defaults to **365** — and a direct database read, or a restored backup, still shows it. The secret also
+remains stored in plaintext in runtime-config; this fix closes disclosure paths and does not encrypt it
+at rest (see `security-hardening.md`, "Current encryption posture").
 
 **Who this affects:** any install where `oidc_client_secret` was ever set through **Settings -> OIDC**
 or `PUT /api/config/oidc_client_secret` on **any release up to and including v0.13.0**. All three
 paths above read from runtime-config, so a secret supplied **only** via `--oidc-client-secret` or
-`YUZU_OIDC_CLIENT_SECRET`, and never written through Settings or the API, was not disclosed by any of
-them.
+`YUZU_OIDC_CLIENT_SECRET`, and never written through Settings or the API, was not disclosed by *those
+three paths*.
+
+**That is not the same as "not disclosed".** A secret passed as `--oidc-client-secret` sits in the
+process command line, readable by any local user through `ps` or `/proc/<pid>/cmdline`, and it is
+typically also written into a systemd unit, a Compose file, or shell history. If you cannot rule those
+out, rotate anyway. Prefer `YUZU_OIDC_CLIENT_SECRET` or a secret file over the command-line flag.
 
 **Remediate: rotate the client secret at your IdP.** The upgrade closes the disclosure paths but **does
 not change the stored value** - anything that already read it still holds a live credential. Rotation is
@@ -46,10 +55,39 @@ the only remediation.
 never reaches the running OIDC provider; Settings -> OIDC reaches the running process but not the next
 restart, because the provider is rebuilt at startup from the command-line or environment value before
 stored runtime-config overrides are applied. So rotate through **Settings -> OIDC** *and* update
-`--oidc-client-secret` (or `YUZU_OIDC_CLIENT_SECRET`). Doing only the first puts the old, disclosed
-secret back in force on the next restart. See
-[`security-hardening.md`](security-hardening.md) ("Upgrading: if `oidc_client_secret` was ever set on
-this install, rotate it") for the full procedure and its SSO caveat.
+`--oidc-client-secret` (or `YUZU_OIDC_CLIENT_SECRET`).
+
+If you do only the first, what breaks on the next restart depends on how OIDC was configured:
+
+- **configured via command line or environment** (and rotated only through Settings) — the restart
+  rebuilds the provider from the old value, putting the **old, disclosed secret back in force**;
+- **configured only through Settings** — the restart builds **no provider at all** and SSO stops
+  working entirely, while `GET /api/config` still reports the key as set.
+
+**Expect a brief SSO outage.** Between rotating at the IdP and completing both Yuzu-side steps, new
+logins fail — Yuzu still presents the old secret to an IdP that has already moved. Existing sessions
+are unaffected. Do the Yuzu-side steps immediately after the IdP change to keep the window short.
+
+**Verify before you consider it done.** Perform an SSO login, then **restart the server and log in
+again**. Only the post-restart login proves the durable half took effect. Do not treat
+`GET /api/config` reporting the key as set, or a `PUT` returning `"applied": true`, as confirmation —
+both report stored state, not whether the running provider uses it, and both stay green in exactly the
+failure cases above.
+
+**Also deal with your logs.** Affected releases wrote the secret to the server log on **every boot**,
+so historical logs — and anything that ingested them, such as journald, a Docker log driver, or a SIEM
+— may still hold it in plaintext. Rotation at the IdP makes the leaked value useless, which is the
+remediation that matters; purge or restrict those logs as well if your retention policy keeps them.
+
+To **remove** the stored secret rather than rotate it (retiring OIDC, say), send an empty value:
+`PUT /api/config/oidc_client_secret` with `{"value": ""}`. `GET /api/config` then reports
+`"is_set": false`. Clearing the Settings field does **not** do this — a blank field means "leave
+unchanged". Note this clears only the stored override: an empty stored value is skipped at startup, so
+if `--oidc-client-secret` or `YUZU_OIDC_CLIENT_SECRET` is still set, that value takes effect again on
+the next restart. Remove it there too.
+
+See [`security-hardening.md`](security-hardening.md) ("Upgrading: if `oidc_client_secret` was ever set
+on this install, rotate it") for the same procedure in its hardening context.
 
 ## Behaviour change: `mcp.bridge.*` audit rows can now carry `result=failure` (#2487 / #2506)
 

@@ -50,8 +50,10 @@ bool is_redaction_placeholder(std::string_view value);
 /// control bytes - not merely contains it.
 ///
 /// The Settings handler needs this narrower question. It maps a placeholder paste to
-/// "leave the stored secret unchanged", which is right for someone pasting the
-/// token back from the startup log or an API response. (The Settings form renders the
+/// "leave the stored secret unchanged", which is right for someone pasting the token
+/// back from the startup log - the only surface that emits it. `GET /api/config` omits
+/// a secret's value entirely rather than substituting a placeholder, precisely so a
+/// round-tripping client cannot write one back. (The Settings form renders the
 /// field with `value=""` unconditionally, so it never pre-fills the literal - only the
 /// greyed placeholder ATTRIBUTE varies, and an attribute is never submitted.) Using
 /// the CONTAINS predicate there meant a

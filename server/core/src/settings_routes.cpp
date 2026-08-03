@@ -3919,22 +3919,23 @@ void SettingsRoutes::register_routes(
         }
 
         // The redaction placeholder is not a credential. It reaches this handler when an
-        // operator copies it out of the startup log or an API response, so an exact one is
-        // treated like a blank field, meaning "leave the stored secret alone". Without that
-        // the store still refuses it further down -- but by then cfg_ and the live provider
-        // have already been updated, so the two would diverge behind a "saved" toast.
+        // operator copies it out of the startup log -- the only surface that emits it, since
+        // GET /api/config omits a secret's value rather than substituting a placeholder. So
+        // an exact one is treated like a blank field, meaning "leave the stored secret
+        // alone". Without that the store still refuses it further down -- but by then cfg_
+        // and the live provider have already been updated, so the two would diverge behind
+        // a "saved" toast.
         //
         // The predicate here and the one at the sink are deliberately DIFFERENT, and both
         // are needed. This one is EXACT: only the bare placeholder means "unchanged" (the
         // form renders the field with `value=""` unconditionally, so the literal never
         // originates here -- only the greyed placeholder ATTRIBUTE varies with whether a
         // secret is stored, and an attribute is never submitted). A secret that merely
-        // CONTAINS the token falls through on
-        // purpose -- the sink refuses it and the failure branch below tells the operator.
-        // Clearing it here instead discarded a real credential and reported SAVED, the same
-        // false-success this change exists to remove (found by four reviewers). The sink's
-        // predicate is the broad CONTAINMENT one, and it covers every other caller
-        // (PUT /api/config included).
+        // CONTAINS the token falls through on purpose -- the sink refuses it and the
+        // failure branch below tells the operator. Clearing it here instead discarded a
+        // real credential and reported SAVED, the same false-success this change exists to
+        // remove (found by four reviewers). The sink's predicate is the broad CONTAINMENT
+        // one, and it covers every other caller (PUT /api/config included).
         if (is_exactly_redaction_placeholder(client_secret))
             client_secret.clear();
         auto effective_secret = client_secret.empty() ? cfg_->oidc_client_secret : client_secret;
