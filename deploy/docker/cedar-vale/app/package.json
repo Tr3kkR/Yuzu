@@ -8,9 +8,7 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "4.22.2",
-    "pg": "8.22.0"
     "express": "5.2.1",
-    "pg": "8.13.1"
+    "pg": "8.22.0"
   }
 }
