@@ -26,26 +26,16 @@ project(
 cxx = meson.get_compiler('cpp')
 host_os  = host_machine.system()   # 'linux', 'windows', 'darwin'
 host_cpu = host_machine.cpu_family() # 'x86_64', 'aarch64', ...
-# A `switch` over an enum with no `default:` is used deliberately in this codebase
-# as a compile-time completeness check — add an enumerator, and every switch that
-# must handle it stops building. `werror=false` project-wide meant that check was
-# only ever a warning, and on MSVC at /W3 not even that (C4062 is a level-4
-# diagnostic, so it was silent). Two security gates in `approval_manager` rest on
-# it (#2442), so the guarantee is made real here rather than asserted in comments.
-# Verified: a full Linux build emits ZERO -Wswitch warnings today, so this adds no
-# debt. The MSVC half is unverified locally — PR CI is the check.
 if cxx.get_id() == 'msvc'
   add_project_arguments(
     '/std:c++latest',           # meson's cpp_std has no MSVC c++23 option
     '/wd4251', '/wd4127', '/wd4275',
-    '/we4062',                  # unhandled enumerator in a default-less switch
     '/permissive-', '/Zc:__cplusplus', '/utf-8',
     language: 'cpp',
   )
 else
   add_project_arguments(
     '-std=c++23',
-    '-Werror=switch',           # see the note above
     '-Wno-unused-parameter',
     '-fvisibility=hidden',
     '-fstack-protector-strong',

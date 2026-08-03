@@ -104,6 +104,21 @@ ApprovalOrigin approval_origin_from_string(std::string_view text);
 /// `return true` is
 /// unreachable today and denies, which is the correct direction for the one
 /// value a future compiler could reach: a bit pattern outside the enumerators.
+// The `error` pragma is what turns the paragraph above from a claim into a fact:
+// the project builds with `werror=false`, so an unhandled enumerator would
+// otherwise be a warning here and — on MSVC at /W3, where C4062 is a level-4
+// diagnostic — nothing at all. Scoped to this switch rather than set
+// project-wide: `/we4062` outranks `/external:W0`, so a global setting would
+// also apply inside the vcpkg headers, which have never been built under it.
+// Because this function is header-defined, the diagnostic is emitted at the
+// definition and so lands inside this region for every including TU.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(error : 4062)
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+#endif
 [[nodiscard]] constexpr bool declares_non_mcp_surface(ApprovalOrigin origin) {
     switch (origin) {
     case ApprovalOrigin::kMcp:
@@ -116,6 +131,11 @@ ApprovalOrigin approval_origin_from_string(std::string_view text);
     }
     return true;
 }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 struct Approval {
     std::string id;

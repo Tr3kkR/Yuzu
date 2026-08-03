@@ -3256,6 +3256,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         // silently inherit "already used", which is how this site
                         // came to assert something false in the first place.
                         const char* why = "already used";
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(error : 4062)
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+#endif
                         switch (consumed.error().kind) {
                         case ConsumeFailure::kNotConsumable:
                             break;
@@ -3269,6 +3276,11 @@ McpServer::HandlerFn McpServer::build_handler(
                             why = "refused by pre-consume recheck";
                             break;
                         }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
                         mcp_audit("denied", "approval " + supplied_id + " " + why);
                         res.set_content(
                             a4_error(kPermissionDenied,

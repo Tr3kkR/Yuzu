@@ -46,6 +46,16 @@ std::string col_text(sqlite3_stmt* stmt, int col) {
 
 } // namespace
 
+// Enforced, not assumed — see the pragma note on declares_non_mcp_surface. THIS
+// is the switch that would fail OPEN: an unhandled enumerator falls out to `""`,
+// which decodes back to the exempt kUnspecified and is admitted at redemption.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(error : 4062)
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+#endif
 const char* to_string(ApprovalOrigin origin) {
     switch (origin) {
     case ApprovalOrigin::kInstruction:
@@ -66,6 +76,11 @@ const char* to_string(ApprovalOrigin origin) {
     }
     return "";
 }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 ApprovalOrigin approval_origin_from_string(std::string_view text) {
     if (text == "instruction")
@@ -479,13 +494,20 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
     // the scan takes the newest ELIGIBLE row rather than trusting `LIMIT 1`, so
     // a foreign ticket in front of a valid one does not hide it.
     //
-    // `LIMIT 64` does truncate: an eligible row past position 64 IS hidden. The
-    // bound that makes that harmless is NOT the global 1000-pending cap — it is
-    // `kMcpSubmitterPendingCap` (25) in mcp_server.cpp, checked per submitter
-    // before this is ever reached. The tuple pins `submitted_by`, so 64 same-
-    // tuple pending rows implies 64 pending for that submitter, and the mint is
-    // denied well before the scan can truncate. The visible effect of hitting it
-    // would be a "too many pending approvals" denial, never a duplicate mint.
+    // `LIMIT 64` does truncate: an eligible row past position 64 IS hidden. What
+    // makes that harmless is `kMcpSubmitterPendingCap` (25) in mcp_server.cpp —
+    // NOT the global 1000-pending cap. Note the ORDER: that check runs AFTER
+    // this call, on the nullopt path, not before it. So a truncated scan does
+    // not silently mint a duplicate; it falls through to the cap check, which
+    // denies with "too many pending approvals" — 64 same-tuple pending rows
+    // implies at least 64 pending for that submitter, and the tuple pins
+    // `submitted_by`.
+    //
+    // The invariant is therefore `LIMIT` > `kMcpSubmitterPendingCap`, and
+    // nothing couples the two numbers: they live in different translation units
+    // with no shared constant and no assert. Raise the cap above 64 and the
+    // dedup miss reopens silently, because foreign rows come from REST and the
+    // scheduler, which never consult that cap.
     std::string sql = std::string("SELECT ") + kSelectAllCols +
                       " FROM approvals WHERE definition_id = ? AND submitted_by = ? "
                       "AND scope_expression = ? AND status = 'pending' "
