@@ -866,7 +866,24 @@ TEST_CASE("exec_verify (B6) accepts a correctly-sized target and execs it via th
     // documented happy path (a genuine regular file) regardless of host
     // layout. std::filesystem::copy_file follows symlinks by default, so the
     // copy is a plain file even when the source isn't.
-    std::filesystem::path exe_copy = yuzu::test::unique_temp_path("yuzu_test_b6_echo_");
+    //
+    // The copy keeps argv[0]'s basename ("echo"): on that same runner /bin/echo
+    // resolves to a single-binary coreutils build that dispatches its behaviour
+    // by looking at basename(argv[0]) -- a copy under an unrelated name execs
+    // fine (spawn_errno=0) but the multiplexer doesn't recognise itself and
+    // exits 1, which a differently-named copy would misreport as an exec_verify
+    // failure when the exec actually succeeded.
+    std::filesystem::path tmp_dir = yuzu::test::unique_temp_path("yuzu_test_b6_echo_");
+    REQUIRE(std::filesystem::create_directory(tmp_dir));
+    struct Cleanup {
+        std::filesystem::path p;
+        ~Cleanup() {
+            std::error_code ec;
+            std::filesystem::remove_all(p, ec);
+        }
+    } cleanup{tmp_dir};
+
+    std::filesystem::path exe_copy = tmp_dir / "echo";
     std::filesystem::copy_file("/bin/echo", exe_copy);
     REQUIRE(::chmod(exe_copy.c_str(), 0755) == 0);
     struct stat st{};
@@ -885,7 +902,6 @@ TEST_CASE("exec_verify (B6) accepts a correctly-sized target and execs it via th
     INFO("spawn_errno=" << r.spawn_errno << " (" << std::strerror(r.spawn_errno) << ")");
     CHECK(r.tool_ran);
     CHECK(r.exit_code == 0);
-    std::filesystem::remove(exe_copy);
 }
 #else
 TEST_CASE("exec_verify (B6) fails CLOSED on this platform even for a fully-matching target -- no "
