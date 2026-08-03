@@ -1101,10 +1101,13 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // Scope dispatch to the operator's visible agents only —
                  // never fan out to devices the operator cannot see.
                  // Empty visible set = nobody to scan; return early.
+                 // ADR-0042: get_visible_agents is degrade-distinguishable —
+                 // nullopt (store degraded) is treated as an empty visible set
+                 // (fail-closed: scan nobody rather than fan out un-scoped).
                  std::vector<std::string> agent_ids;
                  if (mgmt_group_store_) {
-                     agent_ids = mgmt_group_store_->get_visible_agents(
-                         session->username);
+                     if (auto vis = mgmt_group_store_->get_visible_agents(session->username))
+                         agent_ids = std::move(*vis);
                  }
                  if (agent_ids.empty()) {
                      res.set_content(
@@ -1307,10 +1310,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // Audit detail records the real reason on the server side.
                  bool visible = false;
                  if (mgmt_group_store_) {
-                     auto visible_ids = mgmt_group_store_->get_visible_agents(
-                         session->username);
-                     for (const auto& vid : visible_ids) {
-                         if (vid == device_id) { visible = true; break; }
+                     // ADR-0042: nullopt (store degraded) → not visible (fail-closed).
+                     if (auto visible_ids = mgmt_group_store_->get_visible_agents(
+                             session->username)) {
+                         for (const auto& vid : *visible_ids) {
+                             if (vid == device_id) { visible = true; break; }
+                         }
                      }
                  }
 
@@ -1473,11 +1478,13 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // response cannot enumerate device existence; real reason audited).
                  bool visible = false;
                  if (mgmt_group_store_) {
-                     auto visible_ids = mgmt_group_store_->get_visible_agents(session->username);
-                     for (const auto& vid : visible_ids) {
-                         if (vid == device_id) {
-                             visible = true;
-                             break;
+                     // ADR-0042: nullopt (store degraded) → not visible (fail-closed).
+                     if (auto visible_ids = mgmt_group_store_->get_visible_agents(session->username)) {
+                         for (const auto& vid : *visible_ids) {
+                             if (vid == device_id) {
+                                 visible = true;
+                                 break;
+                             }
                          }
                      }
                  }
@@ -2207,11 +2214,14 @@ std::string DashboardRoutes::render_tar_retention_paused(
     // dispatch already scoped to visible agents, a separate operator who
     // shares the command_id (no longer possible after per-user state but
     // kept for layered safety) still cannot see out-of-scope data.
+    // ADR-0042: nullopt (store degraded) → empty visible set (fail-closed: the
+    // filter admits nothing rather than the un-scoped raw stream).
     std::unordered_set<std::string> visible_set;
     if (mgmt_group_store_) {
-        auto visible_ids = mgmt_group_store_->get_visible_agents(username);
-        visible_set.reserve(visible_ids.size());
-        for (auto& v : visible_ids) visible_set.insert(std::move(v));
+        if (auto visible_ids = mgmt_group_store_->get_visible_agents(username)) {
+            visible_set.reserve(visible_ids->size());
+            for (auto& v : *visible_ids) visible_set.insert(std::move(v));
+        }
     }
 
     // Pull every response stored for the scan command_id.

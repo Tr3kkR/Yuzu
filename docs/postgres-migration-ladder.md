@@ -52,7 +52,7 @@ hole — `security-guardian` gates each.
 | Store | Schema | Provisional posture | Notes |
 |---|---|---|---|
 | `RbacStore` | `rbac_store` | authoritative | authz; security-critical. |
-| `ManagementGroupStore` | `management_group_store` | authoritative | authz/targeting. |
+| `ManagementGroupStore` | `management_group_store` | authoritative | **In flight — ADR-0042** (Wave 2.2). Confinement hierarchy feeding RbacStore `authorize_list_read` (ADR-0017). Confinement-feeding reads made degrade-distinguishable (nullopt→DenyAll) — the DENY-set read is fail-OPEN if it silently degrades to empty. Recursive-CTE ancestors/descendants w/ cycle guard. MANDATORY backfill (confinement scope = irreducible operator intent). Coordinated with RbacStore #2703. |
 | `PolicyStore` | `policy_store` | authoritative | compliance evaluation. |
 | `BaselineStore` | `baseline_store` | authoritative | Guardian deployable unit; uses `SqliteTxn`/`SqliteStmt`. |
 | `TagStore` | `tag_store` | authoritative | scope/targeting. |

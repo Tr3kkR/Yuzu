@@ -532,6 +532,70 @@ for lockout/break-glass recovery — that runbook has been rewritten for this
 cutover and is Postgres-native throughout (`psql "$YUZU_POSTGRES_DSN"` against
 the `auth` schema).
 
+## Management-group confinement config migrates to Postgres (mandatory backfill, ADR-0042)
+
+The `ManagementGroupStore` — the confinement hierarchy that backs operator
+scoping and the ADR-0017 `authorize_list_read` gate — moves from the SQLite
+`management-groups.db` file to the server's PostgreSQL substrate in this release
+(ADR-0006 Wave 2.2), schema `management_group_store`. It reuses the existing
+shared connection pool, so **no new connection flag or config is required** —
+the same `--postgres-dsn` / `YUZU_POSTGRES_DSN` that every other server store
+uses.
+
+**This is NOT a fresh-start cutover.** Unlike the AuthDB/ScimStore/API-token
+migrations above (which deliberately reset), a management group's hierarchy,
+static memberships, and group→role assignments are irreducible operator intent —
+losing them would silently widen or narrow confinement. So the migration
+performs a **mandatory one-time backfill** on first Postgres boot:
+
+- **What is preserved:** every group (name, parent, membership type, scope
+  expression), every static membership record, and every group→role assignment
+  carry over exactly. Dynamic memberships re-resolve from their scope expression
+  on the next reconcile, as before.
+- **Fail-closed boot on backfill failure.** If the backfill cannot complete —
+  Postgres write error, unreadable legacy DB, or the safety check below — the
+  server **refuses to boot** rather than come up with an empty or partial
+  confinement hierarchy (which would fail-open, exposing out-of-scope devices).
+  The backfill marker is only stamped on success, so a failed attempt is
+  **retried on the next start** once you have fixed the underlying cause; it
+  never proceeds with partial state.
+- **Legacy file moved aside after a verified backfill.** Once the backfill is
+  confirmed complete, `management-groups.db` is renamed to
+  `management-groups.db.migrated-<epoch>` (the server never reads it again). If
+  you do not see this file appear, the backfill did not run to completion —
+  investigate before assuming confinement is intact. Keep the renamed file until
+  you have confirmed scoping behaves correctly, then treat it as an
+  operator-managed backup and dispose of it per your data-retention policy.
+- **The backfill REFUSES an over-deep or cyclic legacy tree.** If the legacy
+  hierarchy contains a parent cycle or exceeds the maximum depth of 10 levels,
+  the backfill fails closed (and, per above, blocks boot). This can only happen
+  on a legacy DB that was hand-edited or corrupted outside the API (the create
+  path caps depth at 5). **Remediate by repairing the legacy tree** (flatten it
+  below 10 levels / break the cycle) **or moving `management-groups.db` aside
+  yourself** to start fresh — then restart. Do not force-boot around this: a
+  malformed hierarchy is exactly the state confinement must not silently accept.
+- **Widened startup budget.** First boot takes longer than usual while the
+  backfill runs; the server's startup readiness budget is widened to accommodate
+  it. Do not treat a slower-than-normal first boot as a hang.
+
+**Operator-visible behaviour change (fail-closed reads).** After cutover, a
+confinement-feeding read that degrades (store not open, pool-acquire timeout, or
+query error) now returns a distinguishable failure that the caller resolves to
+**DenyAll** — a scoped operator sees a reduced or empty list rather than the
+store silently returning an empty deny-set and **under-restricting** (the old
+fail-open hazard). A re-parent (`PUT /api/v1/management-groups/{id}`) whose
+hierarchy reads degrade now returns **503** rather than a misleading success.
+Watch the new `yuzu_server_mgmt_group_read_degrade_total{reason}` counter — a
+non-zero rate means scoped operators are seeing reduced/empty lists because the
+confinement substrate is degraded, **not** that groups actually shrank (see
+`docs/user-manual/metrics.md` § "Management group metrics" and the shipped
+`YuzuMgmtGroupReadDegraded` alert). `yuzu_server_mgmt_group_backfill_total{result}`
+records the one-time backfill outcome (`completed` / `fresh` / `failed`).
+
+**Not affected:** the confinement hierarchy's semantics, the REST/MCP surface,
+and dynamic-group scope expressions are unchanged — only the storage substrate
+and the fail-closed read posture change.
+
 ## Upgrade Order
 
 Always upgrade in this order:
@@ -550,6 +614,14 @@ Before upgrading any component:
   - `yuzu-server.cfg`, `enrollment-tokens.cfg`, `pending-agents.cfg`
   - All `.db` files (response store, audit, policies, **auth.db**, etc.) — use `sqlite3 <path> ".backup ..."` rather than `cp` against live WAL databases
   - The **PostgreSQL database**, once your deployment carries one (ADR-0006 — bundled in the composes; provisioned natively by `install-server-postgres.sh`) — use `pg_dump --format=custom`; see [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate) for the full backup/restore procedure and the ADR-0010 restore-pairing invariant (DB and `KeyProvider` keys-dir backups restore **together**)
+- [ ] **Verify the server's clock before upgrading** (`timedatectl status` or
+  `chronyc tracking`; under Docker it is the host's clock that matters). Rows
+  already stamped cannot be protected retroactively by any setting, and a server
+  upgraded to schema v3 while its clock was skewed FORWARD could delete expired
+  audit rows unremarked on its first guarded pass - see [Retention clock
+  guards](#retention-clock-guards-2360-server-audit-store-2361-tar-agent-warehouse)
+  below and #2579. Fixed forward: that pass now declines instead, so the risk is
+  to servers upgrading FROM an affected version with a wrong clock.
 - [ ] Check the [CHANGELOG](../../CHANGELOG.md) for breaking changes
 - [ ] Verify disk space (at least 500 MB free for migration)
 - [ ] Note current version: `yuzu-server --version` / `yuzu-agent --version`
@@ -900,6 +972,25 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
 - **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
   table holding the durable clock reading - one row, instant) plus the
   best-effort index build described under Schema Migrations above.
+- **The first guarded pass now declines when it has no stored reading and rows
+  are already expired (#2579).** The stored clock reading (the anchor) is new in
+  schema v3, so every database starts its first guarded pass without one. An
+  ABSENT reading is not a statement about the clock - it is the ordinary
+  fresh-install case - which previously left one shape unguarded: a host already
+  skewed FORWARD, where rows written after the skew were still inside the window,
+  so the would-expire-everything test did not fire either, and the pass deleted up
+  to the 25,000-row cap unremarked. Such a pass now declines ONCE, warns, and
+  anchors the reading; the next pass proceeds normally, paced by the cap. A fresh
+  install with nothing expired does not decline at all. **Expect at most one such
+  decline per server on this upgrade**, counted by the new
+  `yuzu_server_audit_retention_bootstrap_declines_total` and NOT by
+  `yuzu_server_audit_clock_anomaly_skips_total` - so it does not fire
+  `YuzuAuditRetentionClockAnomaly`, and you should not stand that alert down for
+  it. Servers upgrading FROM an affected version with a wrong clock may already
+  have lost rows; there is no reliable retrospective test, and the loss is not
+  recoverable without a backup predating it. Detail:
+  [audit-log.md § The retention clock
+  guard](audit-log.md#the-retention-clock-guard).
 - **Expect a first-pass retention decline on the AGENT, and only conditionally on
   the server.** The two guards differ here and the difference matters:
   - **TAR declines on a missing anchor, by design.** It checks per warehouse

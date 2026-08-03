@@ -450,6 +450,23 @@ All validation runs at the `ManagementGroupStore` layer as well as the REST hand
 }
 ```
 
+**Error (503) -- store unavailable:**
+
+Cycle and depth validation walk the hierarchy via recursive ancestor/descendant
+reads against the `management_group_store` Postgres substrate (ADR-0042). If
+those reads degrade (store not open, connection-pool acquire timeout, or a query
+error) the re-parent cannot be validated safely, so it **fails closed with 503**
+rather than risk applying an unvalidated move — the caller did nothing wrong, the
+store did. This is distinct from the `400` validation errors above (a genuinely
+bad request); retry a `503` once the substrate recovers.
+
+```json
+{
+  "error": "management group store unavailable",
+  "meta": { "api_version": "v1" }
+}
+```
+
 ---
 
 #### `DELETE /api/v1/management-groups/{id}`
@@ -6513,8 +6530,9 @@ The MCP Streamable HTTP **SSE channel** — the server→client half of a sessio
 (`notifications/progress`) arrive with the next 2f rung.
 
 **Permission:** the same credential as `POST /mcp/v1/`, plus the session's
-`Mcp-Session-Id` header. The credential is re-checked on every heartbeat, so revoking it
-ends a *live* stream, not just future ones.
+`Mcp-Session-Id` header. The credential is re-checked once per tick (~3 s), whether or
+not a heartbeat frame is emitted, so revoking it ends a *live* stream, not just future
+ones.
 
 **Required headers:** `Mcp-Session-Id` (from `initialize`), `Accept: text/event-stream`.
 **Optional:** `Last-Event-ID` to resume.

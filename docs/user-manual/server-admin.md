@@ -388,6 +388,28 @@ After upgrading, refusals are counted by
 on every single refusal, because a rule that pages on one malformed request gets silenced. Use the
 audit rows, not the alert, to find individual offenders.
 
+### vNEXT — MCP stream revalidation rides the tick, and the pin-drift alert moves to a new counter
+
+Two operator-visible changes to held-open MCP `GET` SSE streams. Neither changes a
+revocation bound: the documented one-tick single-server figure still holds and is now
+pinned by tests.
+
+**Credential re-checks are once per tick, and busy streams stop sending heartbeat
+filler.** A stream delivering frames continuously previously re-validated its
+credential and slid its session TTL on *every frame*; both now run once per ~3 s tick,
+and a pass that delivered real frames skips the redundant heartbeat. If anything on
+your side counts `event: heartbeat` frames as a liveness signal, key on *any*
+delivered frame instead.
+
+**The admission-drift reading moved counters.** `yuzu_mcp_stream_final_unpinned_total`
+used to carry the "replay-ring pin accounting has drifted" reading; that reading now
+belongs to the new `yuzu_mcp_stream_pin_displaced_total` (the server now displaces the
+oldest pinned terminal instead of committing the newest unprotected, which is strictly
+less bad). If you alert on `final_unpinned_total > 0`, keep that rule and add the same
+rule for `pin_displaced_total` — reference rules for both ship in
+`docs/prometheus/yuzu-alerts.yml`, and the response procedure is
+`docs/ops-runbooks/mcp-stream-pin-displacement.md` (diagnostic only — no restart).
+
 ### vNEXT — engine-principal streams: liveness re-checks are cached, and the outage grace window is measured differently (#2367)
 
 Two operator-visible changes to held-open MCP/SSE streams authenticated by an
