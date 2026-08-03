@@ -3917,23 +3917,21 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        // The redaction placeholder is not a credential. Treat it exactly like a blank
-        // field (meaning "leave the stored secret alone"): it reaches this handler when
-        // an operator copies it out of the startup log or an API response, and the store
-        // refuses it further down -- but by then cfg_ and the live provider have already
-        // been updated, so the two would diverge behind a "saved" toast.
-        // Same predicate the store uses, so the two cannot drift. Here it means
-        // "leave the stored secret alone"; at the sink it is a refusal. Both are needed:
-        // this one keeps a placeholder paste from reaching cfg_ and the live provider,
-        // the sink's covers every other caller (PUT /api/config included).
-        // ONLY an exact placeholder means "leave the stored secret unchanged" - that is
-        // the operator pasting the token back from the startup log or an API response
-        // (the form itself renders an empty field with a ******** placeholder, so the
-        // literal never comes from here). A secret
-        // that merely CONTAINS the token falls through deliberately: the store refuses
-        // it and the failure branch below tells the operator. Clearing it here instead
-        // discarded a real credential and reported SAVED, which is the same
-        // false-success this change exists to remove (found by four reviewers).
+        // The redaction placeholder is not a credential. It reaches this handler when an
+        // operator copies it out of the startup log or an API response, so an exact one is
+        // treated like a blank field, meaning "leave the stored secret alone". Without that
+        // the store still refuses it further down -- but by then cfg_ and the live provider
+        // have already been updated, so the two would diverge behind a "saved" toast.
+        //
+        // The predicate here and the one at the sink are deliberately DIFFERENT, and both
+        // are needed. This one is EXACT: only the bare placeholder means "unchanged" (the
+        // form renders an empty field with a ******** placeholder attribute, so the literal
+        // never originates here). A secret that merely CONTAINS the token falls through on
+        // purpose -- the sink refuses it and the failure branch below tells the operator.
+        // Clearing it here instead discarded a real credential and reported SAVED, the same
+        // false-success this change exists to remove (found by four reviewers). The sink's
+        // predicate is the broad CONTAINMENT one, and it covers every other caller
+        // (PUT /api/config included).
         if (is_exactly_redaction_placeholder(client_secret))
             client_secret.clear();
         auto effective_secret = client_secret.empty() ? cfg_->oidc_client_secret : client_secret;

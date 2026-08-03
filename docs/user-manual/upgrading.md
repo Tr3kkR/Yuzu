@@ -18,6 +18,38 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## ⚠️ Security: rotate `oidc_client_secret` if it was ever set on this install
+
+Releases **v0.10.0 through v0.13.0** emitted the OIDC client secret in the clear to three places, and
+this upgrade closes all three:
+
+- the **server log**, written verbatim by the startup override pass on **every boot**;
+- `GET /api/config`, a route gated only on `Infrastructure:Read`;
+- the `config.update` **audit detail** written by `PUT /api/config/:key`, which is durably retained and
+  readable by every role seeded `AuditLog:Read` - the seeded `Operator` role among them.
+
+Audit rows written before the upgrade are now redacted when read, so the value stops being disclosed
+through that path too. The rows themselves are deliberately left intact: an audit row is compliance
+evidence, and rewriting history to conceal a mistake is a worse posture than declining to disclose it.
+
+**Who this affects:** any install where `oidc_client_secret` was ever set through **Settings -> OIDC**
+or `PUT /api/config/oidc_client_secret` on v0.10.0 or later. All three paths above read from
+runtime-config, so a secret supplied **only** via `--oidc-client-secret` or `YUZU_OIDC_CLIENT_SECRET`,
+and never written through Settings or the API, was not disclosed by any of them.
+
+**Remediate: rotate the client secret at your IdP.** The upgrade closes the disclosure paths but **does
+not change the stored value** - anything that already read it still holds a live credential. Rotation is
+the only remediation.
+
+**Rotating durably takes TWO steps.** `PUT /api/config/oidc_client_secret` persists the new value but
+never reaches the running OIDC provider; Settings -> OIDC reaches the running process but not the next
+restart, because the provider is rebuilt at startup from the command-line or environment value before
+stored runtime-config overrides are applied. So rotate through **Settings -> OIDC** *and* update
+`--oidc-client-secret` (or `YUZU_OIDC_CLIENT_SECRET`). Doing only the first puts the old, disclosed
+secret back in force on the next restart. See
+[`security-hardening.md`](security-hardening.md) ("Upgrading: if `oidc_client_secret` was ever set on
+this install, rotate it") for the full procedure and its SSO caveat.
+
 ## Behaviour change: `mcp.bridge.*` audit rows can now carry `result=failure` (#2487 / #2506)
 
 Audit rows for the MCP progress bridge (`mcp.bridge.done_reap`, `session_dead`, `arming_reaped`, `pin_acked`, `forced_expire`) were previously stamped `result=success` unconditionally, regardless of what actually happened. They now report the real outcome: `result=failure` when a background teardown could not release one of the resources it owns, or when the terminal-frame publish ladder poisoned the session, threw, or was never reached. The `detail` field names which, and no longer asserts a delivery or a poisoning that did not occur.
