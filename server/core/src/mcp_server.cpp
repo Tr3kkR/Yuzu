@@ -3239,9 +3239,37 @@ McpServer::HandlerFn McpServer::build_handler(
                     // H3/N2 (SOC-2 CC7.2): stamp WHO consumed the ticket — the
                     // authenticated principal recalling the tool.
                     if (auto consumed =
-                            approval_manager->consume_ticket(supplied_id, session->username);
+                            approval_manager->consume_ticket(supplied_id, session->username, {});
                         !consumed) {
-                        mcp_audit("denied", "approval " + supplied_id + " already used");
+                        // The RESPONSE below is deliberately identical for every
+                        // failure kind, so the recall cannot be used as an oracle
+                        // for which ids exist — see ConsumeFailure::kForeignOrigin.
+                        // The AUDIT DETAIL is the opposite case: server-side, behind
+                        // AuditLog:Read, and it must NOT be blurred. Recording a
+                        // cross-surface forgery attempt as "already used" asserts a
+                        // ticket state the approvals row contradicts — that row is
+                        // still `approved` with consumed_at == 0 — and a CC7.2
+                        // reviewer cannot tell it from a benign double-click (#2442).
+                        //
+                        // Exhaustive with no `default:` on purpose: a new
+                        // ConsumeFailure kind must fail the build here rather than
+                        // silently inherit "already used", which is how this site
+                        // came to assert something false in the first place.
+                        const char* why = "already used";
+                        switch (consumed.error().kind) {
+                        case ConsumeFailure::kNotConsumable:
+                            break;
+                        case ConsumeFailure::kForeignOrigin:
+                            why = "refused: minted by a non-MCP surface (#2442)";
+                            break;
+                        case ConsumeFailure::kStoreError:
+                            why = "not consumed: approvals store read failed";
+                            break;
+                        case ConsumeFailure::kPrecondition:
+                            why = "refused by pre-consume recheck";
+                            break;
+                        }
+                        mcp_audit("denied", "approval " + supplied_id + " " + why);
                         res.set_content(
                             a4_error(kPermissionDenied,
                                      "approval already used (one-time ticket)",

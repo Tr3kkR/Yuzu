@@ -11113,6 +11113,11 @@ private:
             auto approvals = approval_manager_->query(q);
             nlohmann::json arr = nlohmann::json::array();
             for (const auto& a : approvals) {
+                // `origin` (#2442) is additive, and it is the field that now
+                // decides whether a ticket can be redeemed at all — a reviewer
+                // approving one could not see it on any read surface. Empty for a
+                // mint that did not declare itself, which is what the MCP gate
+                // still records today.
                 arr.push_back({{"id", a.id},
                                {"definition_id", a.definition_id},
                                {"status", a.status},
@@ -11121,6 +11126,7 @@ private:
                                {"reviewed_by", a.reviewed_by},
                                {"reviewed_at", a.reviewed_at},
                                {"review_comment", a.review_comment},
+                               {"origin", to_string(a.origin)},
                                {"scope_expression", a.scope_expression}});
             }
             res.set_content(nlohmann::json({{"approvals", arr}}).dump(), "application/json");

@@ -765,9 +765,12 @@ proposes.
    an agentic worker cannot approve its own request.
 6. Once approved, the AI assistant **re-calls the same tool with the same
    arguments plus the `approval_id`**. The server validates (approved, matching
-   tool + arguments, not yet consumed) and **atomically consumes** the ticket
-   (one-time — a replay, or a mismatched tool/args, returns `-32003`
-   `PermissionDenied`), then executes.
+   tool + arguments, not yet consumed, and raised through MCP rather than
+   through the REST instruction gate or the scheduler — #2442) and **atomically
+   consumes** the ticket (one-time — a replay, a mismatched tool/args, or a
+   ticket raised on another surface all return `-32003` `PermissionDenied`, and
+   deliberately all return the *same* message so the recall cannot be used to
+   enumerate approval ids), then executes.
 
 ### What requires approval
 

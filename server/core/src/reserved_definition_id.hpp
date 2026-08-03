@@ -30,7 +30,10 @@
 //
 //   * InstructionStore::create_definition_impl — authoring (create + import,
 //     signed and unsigned, and the trusted boot auto-import; every route that
-//     writes `instruction_definitions` funnels through it)
+//     CREATES a definition funnels through it. `update_definition` and
+//     `delete_definition` write the table WITHOUT it, deliberately — an update
+//     cannot originate an id, so checking there would strand content rather than
+//     protect anything; see the create-path-only note in instruction_store.cpp)
 //   * validate_instruction_yaml        — the YAML validator, which MUST agree
 //     with the store or the "YAML that validates always saves" contract breaks
 //     (#1993, re-broken by #2010 and again by the first cut of #2442 — three

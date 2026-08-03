@@ -561,12 +561,19 @@ TEST_CASE("ApprovalManager: origin round-trips through its column text",
     CHECK(approval_origin_from_string("instruction") == ApprovalOrigin::kInstruction);
     CHECK(approval_origin_from_string("schedule") == ApprovalOrigin::kSchedule);
     CHECK(approval_origin_from_string("mcp") == ApprovalOrigin::kMcp);
-    // Empty (a pre-v5 row) and anything unrecognised both fall back to "no
-    // declared origin" — an unknown string must never be promoted into a
-    // surface.
+    CHECK(std::string_view(to_string(ApprovalOrigin::kUnrecognised)) == "unrecognised");
+
     CHECK(approval_origin_from_string("") == ApprovalOrigin::kUnspecified);
-    CHECK(approval_origin_from_string("MCP") == ApprovalOrigin::kUnspecified);
-    CHECK(approval_origin_from_string("nonsense") == ApprovalOrigin::kUnspecified);
+    // CHANGED by #2442, deliberately. These two used to decode to kUnspecified
+    // on the reasoning that an unknown string "must never be promoted into a
+    // surface". That reasoning inverted the moment kUnspecified became the value
+    // the redemption guard EXEMPTS: folding unknown into it made the composite
+    // parse-then-decide fail OPEN while the predicate itself failed closed.
+    // kUnrecognised is refused by declares_non_mcp_surface.
+    CHECK(approval_origin_from_string("MCP") == ApprovalOrigin::kUnrecognised); // case-sensitive
+    CHECK(approval_origin_from_string("nonsense") == ApprovalOrigin::kUnrecognised);
+    CHECK(declares_non_mcp_surface(ApprovalOrigin::kUnrecognised));
+    CHECK(!declares_non_mcp_surface(ApprovalOrigin::kUnspecified));
 }
 
 TEST_CASE("ApprovalManager: migration v5 leaves pre-existing rows with no declared origin",
@@ -865,6 +872,89 @@ TEST_CASE("ApprovalManager: a store failure during the recheck is not reported a
 
     // And the same read through get_checked directly.
     CHECK(!mgr.get_checked(*id).has_value());
+}
+
+TEST_CASE("ApprovalManager: a store failure on the TWO-argument path is not reported as spent",
+          "[approval_manager][approval]") {
+    // #2442 made the row read unconditional, so a read failure became reachable
+    // on the two-argument overload for the first time. The case above covers the
+    // three-argument path only; this is the same property on the other one.
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+    REQUIRE(sqlite3_exec(tdb.db, "DROP TABLE approvals", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    auto flat = mgr.consume_ticket(*id, "operator1");
+    REQUIRE(!flat.has_value());
+    // The flat overload discards the kind, so the string is all a caller has.
+    // The property that matters is the negative: it must NOT read as spent, or
+    // an operator is told to discard a live human-approved capability. (A
+    // dropped table fails at prepare, not at step, so the text is "prepare
+    // failed" rather than get_checked's "read failed" — both are kStoreError.)
+    CHECK(flat.error().find("not consumable") == std::string::npos);
+    CHECK(flat.error().find("already used") == std::string::npos);
+    CHECK(flat.error().find("failed") != std::string::npos);
+
+    // And the kind is right on the overload that exposes it.
+    auto typed = mgr.consume_ticket(*id, "operator1", {});
+    REQUIRE(!typed.has_value());
+    CHECK(typed.error().kind == ConsumeFailure::kStoreError);
+}
+
+TEST_CASE("ApprovalManager: an unrecognised origin column value is refused, not exempted",
+          "[approval_manager][approval][security]") {
+    // The decode used to fold anything unknown into kUnspecified. #2442 made
+    // kUnspecified the value that GRANTS redemption, so that fold would have made
+    // the composite fail OPEN even though the predicate fails closed.
+    CHECK(approval_origin_from_string("") == ApprovalOrigin::kUnspecified);
+    CHECK(approval_origin_from_string("mcp") == ApprovalOrigin::kMcp);
+    CHECK(approval_origin_from_string("MCP") == ApprovalOrigin::kUnrecognised); // case-sensitive
+    CHECK(approval_origin_from_string("nonsense") == ApprovalOrigin::kUnrecognised);
+    CHECK(declares_non_mcp_surface(ApprovalOrigin::kUnrecognised));
+
+    // End to end: a row written by a newer binary, read back by this one.
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+    REQUIRE(sqlite3_exec(tdb.db, "UPDATE approvals SET origin = 'future_surface'", nullptr, nullptr,
+                         nullptr) == SQLITE_OK);
+
+    auto denied = mgr.consume_ticket(*id, "operator1", {});
+    REQUIRE(!denied.has_value());
+    CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin);
+    CHECK(mgr.get(*id)->consumed_at == 0);
+}
+
+TEST_CASE("ApprovalManager: find_pending skips a ticket the recall would refuse",
+          "[approval_manager][approval][security]") {
+    // The MCP mint's dedup must not hand back a foreign-origin ticket, or an
+    // admin spends an approval on something that can never redeem.
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto rest = mgr.submit("mcp.quarantine_device", "operator1", "{\"agent_id\":\"a1\"}", "",
+                           ApprovalOrigin::kInstruction);
+    REQUIRE(rest.has_value());
+    // Same (definition_id, submitted_by, scope) tuple the MCP mint would look up.
+    CHECK(!mgr.find_pending("mcp.quarantine_device", "operator1", "{\"agent_id\":\"a1\"}")
+               .has_value());
+
+    // A newer eligible ticket behind it IS found — the scan takes the newest
+    // eligible row rather than letting a foreign one at the front hide it.
+    auto mcp = mgr.submit("mcp.quarantine_device", "operator1", "{\"agent_id\":\"a1\"}", "",
+                          ApprovalOrigin::kMcp);
+    REQUIRE(mcp.has_value());
+    auto found = mgr.find_pending("mcp.quarantine_device", "operator1", "{\"agent_id\":\"a1\"}");
+    REQUIRE(found.has_value());
+    CHECK(found->id == *mcp);
 }
 
 TEST_CASE("ApprovalManager: migration v6 applies to an existing v5 store",

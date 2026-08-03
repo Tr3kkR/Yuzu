@@ -205,17 +205,34 @@ definition authored under that prefix could line up with an MCP tool's canonical
 ticket raised on one surface being redeemable on another.
 
 What that gains an attacker is the **human approval**, not a new permission. An administrator
-who approved what the queue presented as an instruction execution would have unknowingly
-authorised an MCP tool invocation. The schema check, the tier gate and per-handler RBAC all
-still applied, but each constrains the attacker's own principal and would have been satisfied
-regardless, so none of them is an additional hurdle the forgery had to clear. What kept it
-narrow is that it required a definition to already exist under the prefix.
+reviewing that ticket in the approvals queue sees a ticket id, a submitter and a scope
+expression — nothing that names the tool or the surface — so they would have been authorising
+an MCP tool invocation with no way to tell. The schema check, the tier gate and per-handler
+RBAC all still applied, but each constrains the attacker's own principal and would have been
+satisfied regardless, so none of them is an additional hurdle the forgery had to clear. What
+kept it narrow is that it required a definition to already exist under the prefix, with an
+approval mode other than `auto`, and a scope expression byte-equal to the tool's canonical
+arguments.
 
 The forgery is closed at the point of redemption: every approval now records the surface that
-minted it, and the MCP recall refuses a ticket minted by any other surface. That refusal reads
-identically to an ordinary spent-ticket response, so the recall cannot be used to probe which
-definition ids exist. Reserving the prefix at authoring time, below, is forward-only hygiene on
-top of that — it is not the thing that stops the forgery, and nothing you have to rename.
+minted it, and the MCP recall refuses a ticket whose **recorded** surface is something other
+than MCP. That refusal reads identically to an ordinary spent-ticket response, so the recall
+cannot be used to probe which definition ids exist. Reserving the prefix at authoring time,
+below, is forward-only hygiene on top of that — it is not the thing that stops the forgery, and
+nothing you have to rename.
+
+**One exemption, and what bounds it.** A ticket with *no* recorded surface reads as
+*surface unknown* rather than *surface wrong*, and is still redeemable. That covers every
+approval row created before this upgrade — the column is added with an empty default and is
+deliberately not back-filled with a surface the migration cannot know — and, until its own
+follow-up lands, every ticket the MCP gate mints itself, which is why refusing them would break
+the live MCP flow. No new blank-surface row can be created by a surface that declares itself.
+
+Carried-across rows clear on the existing 7-day approval expiry, but note that sweep is **lazy**:
+it runs when an approval is submitted and at no other time, so a queue that receives no new
+submissions does not age anything out. The window is bounded by 7 days *and* a subsequent
+submission, not by 7 days alone. To close it immediately, reject any outstanding pending or
+approved tickets at upgrade time (`GET /api/approvals`, then `POST /api/approvals/{id}/reject`).
 
 **What changes.** Creating a definition whose id starts `mcp.` is refused with a 400 on every
 authoring route that accepts an explicit id — `POST /api/instructions`, `POST
@@ -252,14 +269,32 @@ from the dashboard's YAML editor (that path validates the id on every save, not 
 create).
 
 **Renaming is optional.** Nothing stops working, so this is housekeeping you can do when it
-suits you, not an upgrade step. If you do rename one: create the replacement under a new id,
-carry `approval_mode` across explicitly (it defaults to `auto` when omitted, which drops the
-approval gate), re-point anything that calls it, and only then delete the original — deleting a
-definition does not re-point the schedules that reference it. **If the definition carries a
-schedule, leave it alone for now**: a schedule cannot be moved between definitions, and
-rebuilding one from what `GET /api/schedules` returns is not possible — that route does not
-expose `scope_expression`, `requires_approval` or `interval_minutes`, and guessing them turns a
-group-scoped, approval-gated job into an ungated fleet-wide one (#2742).
+suits you, not an upgrade step.
+
+Before deciding, find out which of the affected definitions carry a schedule — that is what
+splits the two cases, and the REST route cannot answer it:
+
+```bash
+sqlite3 /var/lib/yuzu/instructions.db \
+  "SELECT definition_id, id, name FROM instruction_schedules WHERE definition_id GLOB 'mcp.*';"
+```
+
+**No schedule** — safe to rename. Create the replacement under a new id, carry `approval_mode`
+across explicitly (it defaults to `auto` when omitted, which drops the approval gate), re-point
+anything that calls it, and only then delete the original. Deleting a definition does not
+re-point the schedules that reference it, and an orphaned schedule keeps firing: every
+occurrence logs `instruction.schedule_fired / failure / definition_unknown` and increments
+`yuzu_schedule_fire_failures_total`, while the schedule still shows as enabled.
+
+**One or more schedules — leave it alone for now.** A schedule cannot be moved between
+definitions, and rebuilding one is not possible from what the API exposes: `GET /api/schedules`
+returns neither `scope_expression` nor `requires_approval` nor `interval_minutes`. Those values
+*are* readable by querying `instruction_schedules` directly, so a rebuild is mechanically
+possible — but no procedure is published for it, deliberately: recreating a schedule moves its
+firing time silently and irreversibly (#2746), and a `weekly` or `monthly` one cannot be held to
+its calendar day at all. Getting `scope_expression` or `requires_approval` wrong turns a
+group-scoped, approval-gated job into an ungated fleet-wide one, and both default to the
+permissive value when omitted (#2742).
 
 ### vNEXT — behind a reverse proxy, declare your external origin or CSRF-gated dashboard actions keep failing (#2537)
 

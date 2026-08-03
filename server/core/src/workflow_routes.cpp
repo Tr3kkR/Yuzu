@@ -1545,10 +1545,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
 
             if (needs_approval) {
-                // Declaring the origin (#2442) is what bars this path from
-                // minting into the reserved `mcp.` ticket namespace: def_id is
+                // Declaring the origin (#2442) is what makes this path's tickets
+                // REFUSABLE at the MCP recall. It does NOT bar the mint, and must
+                // not: refusing here failed closed on pre-existing operator
+                // content the store cannot tell apart from an attack. def_id is
                 // caller-influenced and scope_expr is caller-supplied verbatim,
-                // and the MCP recall matches on exactly that pair.
+                // and the MCP recall matches on exactly that pair — which is why
+                // the ticket has to carry its surface. See
+                // ApprovalManager::consume_ticket.
                 auto result = approval_manager->submit(def_id, session->username, scope_expr, "",
                                                        ApprovalOrigin::kInstruction);
                 if (!result) {

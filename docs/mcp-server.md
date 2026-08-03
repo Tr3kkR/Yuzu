@@ -75,7 +75,12 @@ JSON-RPC error responses from the denial paths (read-only mode, tier policy, app
 > **re-calls the same tool** passing the returned `approval_id` as an argument;
 > the server verifies the approval is (a) approved, (b) for this exact tool
 > (`definition_id`), (c) for these exact arguments (canonical-args match,
-> `approval_id` excluded from the comparison), and (d) not yet consumed, then
+> `approval_id` excluded from the comparison), (d) not yet consumed, and (e)
+> **minted by the MCP surface, or by a mint predating the origin column** — a
+> ticket recorded as raised by the REST instruction gate or the scheduler is
+> refused (#2442), *indistinguishably from a consumed one*, so the recall cannot
+> be used to enumerate approval ids. If a ticket you know to be fresh reports as
+> used, the server log carries the real reason. It then
 > **atomically consumes it** (one-time; a replay of a consumed ticket, or a
 > concurrent second recall, is rejected — the mutating op runs at most once) and
 > lets the call through to the handler. A recall against a still-**pending**

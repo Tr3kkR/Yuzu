@@ -54,6 +54,13 @@ const char* to_string(ApprovalOrigin origin) {
         return "schedule";
     case ApprovalOrigin::kMcp:
         return "mcp";
+    case ApprovalOrigin::kUnrecognised:
+        // Never written: this value only ever comes OUT of
+        // approval_origin_from_string for column text this build does not know.
+        // Round-tripping it as "" would relabel an unknown surface as an
+        // undeclared one, which is the exemption — so it keeps its own text and
+        // stays refused if it is ever stored.
+        return "unrecognised";
     case ApprovalOrigin::kUnspecified:
         break;
     }
@@ -67,10 +74,17 @@ ApprovalOrigin approval_origin_from_string(std::string_view text) {
         return ApprovalOrigin::kSchedule;
     if (text == "mcp")
         return ApprovalOrigin::kMcp;
-    // Empty (pre-v5 row or an undeclared mint) and any unrecognised value both
-    // read as "no declared origin" — an unknown string must never be silently
-    // promoted into a surface that grants something.
-    return ApprovalOrigin::kUnspecified;
+    // The empty string is "no declared origin": a pre-v5 row, or a mint that did
+    // not declare itself. It maps to kUnspecified, which #2442 EXEMPTS from the
+    // redemption guard — see declares_non_mcp_surface.
+    if (text.empty())
+        return ApprovalOrigin::kUnspecified;
+    // Anything else is a value this build does not know — written by a newer
+    // binary and read back after a rollback, say. It must NOT collapse into
+    // kUnspecified: that is now the value that GRANTS redemption, so folding an
+    // unknown into it would make the composite parse-then-decide fail OPEN even
+    // though the predicate itself fails closed. kUnrecognised is refused.
+    return ApprovalOrigin::kUnrecognised;
 }
 
 namespace {
@@ -451,10 +465,24 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
 
     std::lock_guard lock(mtx_);
 
+    // #2442: this is the MCP mint's dedup, and it must not hand back a ticket the
+    // MCP recall will then refuse. Without the origin filter below, a ticket
+    // minted through the REST instruction gate for the same (definition_id,
+    // submitter, scope) is returned here, an admin approves it, and the recall
+    // rejects it — burning a human approval on a ticket that could never have
+    // worked.
+    //
+    // Filtered in C++ with `declares_non_mcp_surface`, NOT with an `origin IN
+    // (...)` clause in the SQL: the SQL literal would be a second hand-written
+    // copy of the rule, free to drift from the predicate the recall actually
+    // applies. That is the whole reason the predicate exists. The cost is that
+    // the scan takes the newest ELIGIBLE row rather than trusting `LIMIT 1`, so
+    // a foreign ticket in front of a valid one no longer hides it. Bounded
+    // because the tuple is narrow and the global pending cap is 1000.
     std::string sql = std::string("SELECT ") + kSelectAllCols +
                       " FROM approvals WHERE definition_id = ? AND submitted_by = ? "
                       "AND scope_expression = ? AND status = 'pending' "
-                      "ORDER BY submitted_at DESC LIMIT 1";
+                      "ORDER BY submitted_at DESC LIMIT 64";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
         return std::nullopt;
@@ -464,8 +492,13 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
     sqlite3_bind_text(stmt, 3, scope_expression.c_str(), -1, SQLITE_TRANSIENT);
 
     std::optional<Approval> out;
-    if (sqlite3_step(stmt) == SQLITE_ROW)
-        out = row_to_approval(stmt);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        auto row = row_to_approval(stmt);
+        if (declares_non_mcp_surface(row.origin))
+            continue; // the recall would refuse this one — see above
+        out = std::move(row);
+        break;
+    }
 
     sqlite3_finalize(stmt);
     return out;
@@ -480,8 +513,15 @@ std::expected<void, std::string> ApprovalManager::consume_ticket(const std::stri
     auto r = consume_ticket(id, consumed_by, {});
     if (r)
         return {};
-    // The two-argument overload is the pre-#2443 contract: one flat string, and
-    // the same strings as before so its callers keep reporting identically.
+    // The two-argument overload is the pre-#2443 contract: one flat string, the
+    // kind discarded. It has NO production caller — the MCP recall moved to the
+    // three-argument form for #2442 so it can branch its audit detail on the
+    // kind. Kept for tests and for a caller that genuinely does not care.
+    //
+    // Its string set is no longer what it was: #2442 made the row read
+    // unconditional, so `get_checked`'s "read failed: <sqlite errmsg>" is
+    // reachable here where it previously could not be. A caller that pattern-
+    // matches these strings — none does — would need updating.
     return std::unexpected(r.error().message);
 }
 
@@ -528,10 +568,13 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     // event whatever the ticket's status, and letting a spent forgery report as
     // an ordinary replay would lose it. The distinction is carried by the KIND
     // and by the warn line — the operator-facing MESSAGE is deliberately the
-    // same string kNotConsumable uses, so a remote caller cannot use the recall
-    // to learn which ids exist or which surface minted them. That divergence
-    // between kind and message is intentional and is the only place in this
-    // function where the two disagree.
+    // same string kNotConsumable uses, so that **a refused foreign ticket is
+    // indistinguishable from a spent one**. That is the property this function
+    // owns and all it claims: the recall leaks more than that upstream of here
+    // (mcp_server.cpp separates absent from mismatched, and echoes "rejected"
+    // and "expired" verbatim), and a comment here cannot speak for a caller this
+    // function does not own. The divergence between kind and message is
+    // intentional and is the only place in this function where the two disagree.
     //
     // The ticket is left UNTOUCHED either way — refusing a forgery must never
     // burn a real operator's approval.

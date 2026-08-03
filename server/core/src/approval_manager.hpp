@@ -1,6 +1,5 @@
 #pragma once
 
-
 #include <sqlite3.h>
 
 #include <cstdint>
@@ -36,6 +35,13 @@ enum class ApprovalOrigin {
     /// The MCP approval-ticket gate (mcp_server.cpp). Not yet passed by that
     /// caller — see kUnspecified.
     kMcp,
+    /// Column text this build does not recognise — written by a newer binary and
+    /// read back after a rollback, say. NEVER written by this build. It exists so
+    /// that decoding an unknown value cannot land on kUnspecified, which #2442
+    /// exempts from the redemption guard: a DENY predicate whose decode folds
+    /// unknown into the allow value fails open however carefully the predicate
+    /// itself is written.
+    kUnrecognised,
 };
 
 /// Column text for `origin`. `kUnspecified` stores the empty string, which is
@@ -59,16 +65,47 @@ ApprovalOrigin approval_origin_from_string(std::string_view text);
 /// its id as `"mcp." + tool_name`, which nothing forces it to keep doing.
 ///
 /// `kUnspecified` is ALLOWED, and that is the loose end. It has to be: the MCP
-/// mint itself still records `kUnspecified` (see the enum above), and migration
-/// v5 back-fills pre-existing rows to it. So a ticket minted by ANY surface
-/// before v5 ran is still redeemable here. Those rows age out on the 7-day
-/// approval TTL, and the exemption closes when the MCP mint declares `kMcp` and
-/// this allow-set narrows from two values to one — the same unfreeze that the
-/// `kUnspecified` comment above already waits on. Until then the guard is
-/// complete for every mint made after v5 by a surface that declares itself,
-/// which is both non-MCP surfaces.
+/// mint itself still records `kUnspecified` (see the enum above), and rows
+/// predating migration v5 carry `''`, which decodes to it — the migration adds
+/// the column with `DEFAULT ''` and deliberately does NOT back-fill a surface it
+/// cannot know. So a ticket minted by ANY surface before v5 ran is still
+/// redeemable here.
+///
+/// Those rows age out on the 7-day approval expiry, but note that sweep is
+/// LAZY — it runs inside `submit()` and nowhere else, so an approval queue that
+/// receives no new mint does not age anything out. The residual is bounded by
+/// 7 days AND a subsequent submission, not by 7 days alone.
+///
+/// The exemption closes when the MCP mint declares `kMcp` and this allow-set
+/// narrows from two values to one — the same unfreeze that the `kUnspecified`
+/// comment above waits on. That narrowing must land AFTER a documented drain:
+/// at the instant it ships, every `''` row becomes unredeemable, including
+/// legitimate already-approved MCP tickets, which is the same stranding this
+/// change exists to remove. Until then the guard is complete for every mint made
+/// after v5 by a surface that declares itself, which is both non-MCP surfaces.
+///
+/// EXTENDING THIS: the shape for a second redeeming surface is
+/// `may_redeem(ticket_origin, redeeming_surface)` — widen this function, do not
+/// add a sibling. ADR-0031/0032/0033 contemplate engines and a separate
+/// presentation binary redeeming core-minted grants, and a parallel
+/// `declares_non_gateway_surface` would be a fork of a single-chokepoint rule.
+/// Written as an ALLOW-LIST switch rather than `!= kMcp && != kUnspecified`, and
+/// deliberately with no `default:`. Adding a fifth ApprovalOrigin then fails the
+/// build HERE, at the security gate, instead of silently inheriting whichever
+/// side of the inequality it happens to land on. The trailing `return true` is
+/// unreachable today and denies, which is the correct direction for the one
+/// value a future compiler could reach: a bit pattern outside the enumerators.
 [[nodiscard]] constexpr bool declares_non_mcp_surface(ApprovalOrigin origin) {
-    return origin != ApprovalOrigin::kMcp && origin != ApprovalOrigin::kUnspecified;
+    switch (origin) {
+    case ApprovalOrigin::kMcp:
+    case ApprovalOrigin::kUnspecified:
+        return false;
+    case ApprovalOrigin::kInstruction:
+    case ApprovalOrigin::kSchedule:
+    case ApprovalOrigin::kUnrecognised:
+        return true;
+    }
+    return true;
 }
 
 struct Approval {
@@ -115,15 +152,28 @@ struct ApprovalQuery {
 /// kNotConsumable means the one-time capability is spent. Distinguishing them by
 /// parsing the message string would be a fragile seam, so the kind is typed.
 ///
-/// OBLIGATION ON THE FIRST CALLER of the three-argument overload: today the MCP
-/// recall maps every consume failure onto one message — "approval already used
-/// (one-time ticket)", remediating "submit a new request without approval_id".
-/// That is correct only while the two-argument overload is the sole caller.
-/// Wired as-is to a precondition, it would tell the operator to discard a ticket
-/// this code deliberately left recallable — re-entering the very burn class
-/// #2443 exists to close. Map the kinds, and audit a kPrecondition denial: a
-/// refusal to honour a human-approved capability currently leaves nothing but a
-/// log line.
+/// OBLIGATION ON EVERY CALLER — half discharged, and the remaining half is
+/// named here so it is not rediscovered by a reviewer a third time.
+///
+/// The MCP recall answers ONE response body for every failure kind, and that is
+/// deliberate: it is what stops the recall being an oracle for which approval
+/// ids exist. The AUDIT DETAIL is the opposite case, and it is now branched on
+/// the kind (`mcp_server.cpp`, the `switch` on `ConsumeFailure`) — before #2442
+/// every failure was recorded as "already used", which for a foreign-origin
+/// refusal asserted a ticket state the approvals row contradicts.
+///
+/// STILL OWED: the client-facing REMEDIATION is unconditional — "submit a new
+/// request without approval_id to obtain a fresh approval ticket". That is
+/// correct for kNotConsumable and kForeignOrigin, and WRONG for kPrecondition
+/// and kStoreError: both leave the ticket recallable, and telling the operator
+/// to discard a live human-approved capability is the burn class #2443 exists to
+/// close. It cannot be fixed by varying the text per kind without reopening the
+/// oracle, so it needs a deliberate design decision — probably a retryable
+/// signal that does not name why. Whoever wires the first real precondition owns
+/// this.
+///
+/// A kPrecondition or kForeignOrigin denial still emits no audit ROW of its own,
+/// only the caller's `denied` row plus a server log line.
 enum class ConsumeFailure {
     kPrecondition,  ///< precondition denied — ticket UNTOUCHED, still recallable
     kNotConsumable, ///< absent / not approved / already consumed (the CAS lost)

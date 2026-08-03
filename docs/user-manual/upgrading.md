@@ -18,6 +18,21 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## Behaviour change: the `mcp.` definition-id prefix is reserved, and approvals are bound to their minting surface (#2442)
+
+**Who this affects.** Anyone whose instruction definitions include an id beginning `mcp.`. No shipped or bundled content uses that prefix, so a deployment running only Yuzu-supplied content needs no action. Find affected content before upgrading — query the database rather than `GET /api/v1/definitions`, which caps at 100 results and can report a false all-clear:
+
+```bash
+sqlite3 /var/lib/yuzu/instructions.db \
+  "SELECT id FROM instruction_definitions WHERE id GLOB 'mcp.*';"
+```
+
+**What changes.** Creating or importing a definition under that prefix is refused with a 400, and such a definition is skipped at boot auto-import. Separately, every approval ticket now records the surface that raised it, and the MCP approval recall refuses a ticket raised anywhere else — closing a case where an approval an administrator granted for an instruction execution could be redeemed as an MCP tool invocation instead.
+
+**A definition that already exists under the prefix keeps working, and needs no action.** It still executes, its schedules still fire, and its approval gate is unchanged. What does stop: the dashboard's YAML editor validates a declared id on *every* save, so such a definition can no longer be edited there if its document declares `metadata.id`, and re-importing an export of it fails. Renaming is optional housekeeping — and if the definition carries a schedule, leave it alone for now (#2742, #2746).
+
+Full detail — the detection queries, the rename procedure for the safe case, and the bounded exemption covering approval rows created before the upgrade — is in `docs/user-manual/server-admin.md` under "the `mcp.` instruction-definition id prefix is reserved".
+
 ## Behaviour change: `mcp.bridge.*` audit rows can now carry `result=failure` (#2487 / #2506)
 
 Audit rows for the MCP progress bridge (`mcp.bridge.done_reap`, `session_dead`, `arming_reaped`, `pin_acked`, `forced_expire`) were previously stamped `result=success` unconditionally, regardless of what actually happened. They now report the real outcome: `result=failure` when a background teardown could not release one of the resources it owns, or when the terminal-frame publish ladder poisoned the session, threw, or was never reached. The `detail` field names which, and no longer asserts a delivery or a poisoning that did not occur.
