@@ -5673,6 +5673,11 @@ than the store here: `POST /api/instructions/yaml` validates a declared id on
 every save, so an existing `mcp.`-prefixed definition cannot be edited through
 it unless its document omits `metadata.id`.
 
+This reservation is forward-only hygiene, not the control that stops the
+cross-surface redemption described above — that is enforced when a ticket is
+redeemed, by binding it to the surface that minted it. See the `#2442` upgrade
+note in `docs/user-manual/server-admin.md`.
+
 **Response (409):** Returned when an explicit `id` is supplied that already
 exists in the store. Body is
 `{"error": "instruction definition '<id>' already exists"}`.

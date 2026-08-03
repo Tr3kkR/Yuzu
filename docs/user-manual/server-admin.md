@@ -200,11 +200,22 @@ shipped or bundled content uses that prefix, so a deployment running only Yuzu-s
 is unaffected and needs no action.
 
 **Why.** `mcp.<tool>` names an MCP approval ticket. The MCP recall matches a ticket on its
-definition id and scope expression and does not bind the submitter, so a definition authored
-under that prefix could line up with an MCP tool's canonical arguments — a ticket raised on one
-surface being redeemable on another. Consuming it still required the schema check, the tier
-gate, per-handler RBAC and a human approval, so this closes a namespace confusion rather than an
-open escalation.
+definition id and scope expression and does not bind the submitter or the minting surface, so a
+definition authored under that prefix could line up with an MCP tool's canonical arguments — a
+ticket raised on one surface being redeemable on another.
+
+What that gains an attacker is the **human approval**, not a new permission. An administrator
+who approved what the queue presented as an instruction execution would have unknowingly
+authorised an MCP tool invocation. The schema check, the tier gate and per-handler RBAC all
+still applied, but each constrains the attacker's own principal and would have been satisfied
+regardless, so none of them is an additional hurdle the forgery had to clear. What kept it
+narrow is that it required a definition to already exist under the prefix.
+
+The forgery is closed at the point of redemption: every approval now records the surface that
+minted it, and the MCP recall refuses a ticket minted by any other surface. That refusal reads
+identically to an ordinary spent-ticket response, so the recall cannot be used to probe which
+definition ids exist. Reserving the prefix at authoring time, below, is forward-only hygiene on
+top of that — it is not the thing that stops the forgery, and nothing you have to rename.
 
 **What changes.** Creating a definition whose id starts `mcp.` is refused with a 400 on every
 authoring route that accepts an explicit id — `POST /api/instructions`, `POST
@@ -238,8 +249,17 @@ sqlite3 /var/lib/yuzu/instructions.db \
 Any id listed keeps executing after the upgrade and can still be edited through
 `PUT /api/instructions/{id}`, but re-importing an export of it will fail, and so will saving it
 from the dashboard's YAML editor (that path validates the id on every save, not only on
-create). Rename those definitions before upgrading — create a replacement under a different id
-and delete the original.
+create).
+
+**Renaming is optional.** Nothing stops working, so this is housekeeping you can do when it
+suits you, not an upgrade step. If you do rename one: create the replacement under a new id,
+carry `approval_mode` across explicitly (it defaults to `auto` when omitted, which drops the
+approval gate), re-point anything that calls it, and only then delete the original — deleting a
+definition does not re-point the schedules that reference it. **If the definition carries a
+schedule, leave it alone for now**: a schedule cannot be moved between definitions, and
+rebuilding one from what `GET /api/schedules` returns is not possible — that route does not
+expose `scope_expression`, `requires_approval` or `interval_minutes`, and guessing them turns a
+group-scoped, approval-gated job into an ungated fleet-wide one (#2742).
 
 ### vNEXT — behind a reverse proxy, declare your external origin or CSRF-gated dashboard actions keep failing (#2537)
 
