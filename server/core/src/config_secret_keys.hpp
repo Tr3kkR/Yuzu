@@ -27,6 +27,11 @@ bool is_secret_config_key(std::string_view key);
 /// is a C++26 addition (P2591), not available in the C++23 baseline this project
 /// builds against. A `string_view` here would fail to compile on every supported
 /// compiler.
+/// DO NOT respell this to a common word. `is_redaction_placeholder()` refuses any
+/// value CONTAINING this token, which is safe only because `<redacted>` is implausible
+/// as a substring of a real credential (`<` and `>` are outside the alphabet of every
+/// mainstream IdP secret). Changing it to "REDACTED" or "hidden" would silently turn a
+/// near-zero-false-positive guard into a broad refusal of legitimate credentials.
 inline constexpr const char* kRedactedPlaceholder = "<redacted>";
 
 /// True if `value` is the redaction placeholder, ignoring surrounding whitespace.

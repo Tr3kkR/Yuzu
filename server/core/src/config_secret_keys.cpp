@@ -33,7 +33,12 @@ bool is_redaction_placeholder(std::string_view value) {
     //    reviewer correctly pointed out is not a code-point set: a pasted U+FEFF or
     //    U+200B is multi-byte UTF-8 and survived it.
     // 2. Then refuse anything that CONTAINS the placeholder at all. That is the
-    //    catch-all rule 1 cannot give: no trim charset is exhaustive against every
+    //    catch-all rule 1 cannot give. NOTE: rule 2 currently SUBSUMES rule 1 entirely -
+    //    every byte of "<redacted>" is above 0x20, so trimming C0 can neither create nor
+    //    destroy an occurrence, and the function is today equivalent to a bare
+    //    `find(...) != npos`. Rule 1 is retained so that narrowing rule 2 later cannot
+    //    silently re-open the whitespace hole; it is not currently load-bearing, and
+    //    "improving" it changes nothing. No trim charset is exhaustive against every
     //    invisible code point someone can paste. A genuine client secret containing
     //    the literal "<redacted>" is implausible; if one exists, rotate it at the IdP.
     const auto keep = [](unsigned char c) { return c > 0x20; };

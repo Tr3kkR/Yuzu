@@ -183,9 +183,10 @@ TEST_CASE("Settings OIDC: a real secret is persisted and reported saved",
     CHECK(res->body.find("NOT saved") == std::string::npos);
 }
 
-TEST_CASE("Settings OIDC: a degraded store reports NOT SAVED instead of success",
+TEST_CASE("Settings OIDC: a NULL store reports NOT SAVED instead of success",
           "[settings][oidc][secret]") {
-    // The regression this pins: the persist block was guarded on is_open() with no
+    // NULL store only - see the KNOWN GAP in this file's header. The regression this
+    // pins: the persist block was guarded on is_open() with no
     // else, so a degraded store skipped the failure branch and still rendered the
     // success toast -- the same false-success the guard exists to remove.
     OidcHarness h{/*open_store=*/false};

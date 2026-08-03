@@ -3203,8 +3203,13 @@ the route's `>= 0` pre-check and is then rejected by the store's own `> 0` check
 **bare** shape with a different message: `{ "error": "value must be a positive integer" }`.
 
 **Error (400) - the redaction placeholder submitted as a secret.** `GET /api/config` omits a
-secret's value and the startup log prints `<redacted>` in its place; that literal is refused as a
-value for a secret-valued key, so copying it back cannot destroy the stored credential. Bare shape:
+secret's value and the startup log prints `<redacted>` in its place. Any value **containing** that
+literal is refused for a secret-valued key, ignoring surrounding whitespace and control bytes, so
+copying it back cannot destroy the stored credential. The rule is deliberately broad: a paste can
+carry an invisible code point (a BOM, a zero-width space) that no trim list catches exhaustively,
+and the two failure directions are not symmetric - refusing an implausible secret costs an error
+message, while accepting a padded placeholder silently destroys a live credential. If your real
+client secret contains `<redacted>`, rotate it at the IdP to a value that does not. Bare shape:
 
 ```json
 { "error": "value is the redaction placeholder, not a credential; send the real secret, or omit the key to leave it unchanged" }
