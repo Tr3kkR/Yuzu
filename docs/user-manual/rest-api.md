@@ -3192,7 +3192,9 @@ is a bare `error` string with no envelope:
 { "error": "key 'foo' is not a configurable runtime setting" }
 ```
 
-**Error (400) - bad value for an integer key**, which uses the A4 envelope:
+**Error (400) - bad value for an integer key**, which uses a nested error body. Note this is **not**
+the A4 envelope: `/api/config` is a legacy non-`/api/v1` route, and the body carries neither
+`correlation_id` nor `retry_after_ms`.
 
 ```json
 {

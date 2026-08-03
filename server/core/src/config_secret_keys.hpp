@@ -25,8 +25,8 @@ bool is_secret_config_key(std::string_view key);
 /// Deliberately `const char*` rather than `std::string_view`: it is concatenated
 /// with `std::string` at several call sites, and `std::string + std::string_view`
 /// is a C++26 addition (P2591), not available in the C++23 baseline this project
-/// builds against. A `string_view` here would fail to compile on every supported
-/// compiler.
+/// builds against. The declaration itself would compile fine as a `string_view`;
+/// it is those call sites that would not.
 /// DO NOT respell this to a common word. `is_redaction_placeholder()` refuses any
 /// value CONTAINING this token, which is safe only because `<redacted>` is implausible
 /// as a substring of a real credential (`<` and `>` are outside the alphabet of every
