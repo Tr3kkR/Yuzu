@@ -12,12 +12,19 @@
   400 on every authoring route that accepts an explicit id (`POST /api/instructions`,
   `/api/instructions/yaml`, `/api/instructions/import`), and such a definition is skipped at boot
   auto-import. Product-pack install is unaffected — it never carries a declared id through. No
-  shipped content uses the prefix. A definition that already exists under the prefix and is
-  **approval-gated stops executing**: the mint declares an origin, the reservation refuses it, and
-  the execute fails closed (nothing is bypassed, but the definition stops working). An
-  `approval_mode: auto` one keeps running and can still be saved through `PUT`, though the
-  dashboard's YAML editor refuses it on every save. Rename affected definitions before upgrading —
-  see the upgrade note in `docs/user-manual/server-admin.md` for the queries that find them.
+  shipped content uses the prefix.
+
+  A definition that already exists under the prefix and is **approval-gated also stops running**,
+  on the REST execute route, the dashboard and the scheduler: the mint declares an origin, the
+  reservation refuses it, and the run fails closed with a 400 naming the prefix. A run is
+  approval-gated if the definition's `approval_mode` is not `auto` OR the schedule carries its own
+  `requires_approval`, so an `auto` definition on a gated schedule is affected too. **The scheduled
+  case fails silently and permanently** — occurrences are dropped rather than retried while the
+  schedule still shows as enabled and advertises a next run it can never make, and nothing
+  self-corrects. MCP is unaffected (`execute_instruction` takes a plugin and action, not a
+  definition id). Rename affected definitions before upgrading — `docs/user-manual/server-admin.md`
+  carries the queries that find them and the order to rename in, which matters because deleting a
+  definition does not re-point the schedules that reference it.
 
   The minting surface is recorded with each approval; rows predating the column are left unlabelled
   rather than assigned a surface they may not have come from, and the MCP mint itself is unlabelled

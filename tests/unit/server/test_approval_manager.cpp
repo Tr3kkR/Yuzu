@@ -407,11 +407,13 @@ TEST_CASE("ApprovalManager: a declared non-MCP origin cannot mint into the mcp. 
     auto forged = mgr.submit("mcp.quarantine_device", "attacker", "{\"agent_id\":\"a1\"}", "",
                              ApprovalOrigin::kInstruction);
     REQUIRE(!forged.has_value());
-    // EXACT equality, not a substring: WorkflowRoutes distinguishes this
-    // deterministic policy refusal from a store failure by comparing the error
-    // against kReservedDefinitionIdError, and answers 400 rather than 500 on a
-    // match. If this message ever stops being exactly that constant, the route
-    // silently falls back to an opaque 500 and nothing else would notice.
+    // EXACT equality, not a substring. This message is the ONE operator-facing
+    // denial for the reserved namespace: the authoring routes, the YAML
+    // validator and the execute route all surface this same text, and
+    // docs/user-manual/audit-log.md documents its leading token as SIEM-keyable.
+    // A substring match would let the shared constant drift out from under all
+    // of them and still pass. (No status code depends on this string — the
+    // execute route decides with the shared predicate, not the message.)
     CHECK(forged.error() == std::string(kReservedDefinitionIdError));
 
     auto from_schedule = mgr.submit("mcp.delete_tag", "attacker", "{}", "sched-1",

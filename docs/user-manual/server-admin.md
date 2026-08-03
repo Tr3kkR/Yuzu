@@ -215,20 +215,28 @@ never carries a declared id through at all: the store assigns one, so a pack's o
 or not, has never been honoured.
 
 **What ALSO breaks, and this is the one to plan around.** A legacy `mcp.`-prefixed definition
-that is **approval-gated cannot execute after this upgrade**. Executing it mints an approval
-ticket, that mint declares the instruction origin, and the reservation refuses it — so the
-execute request fails. This covers `approval_mode: always`, `role-gated` for any caller who is
-not an admin, and any unrecognised mode (which fails closed to requiring approval). Scheduled
-fires of such a definition are skipped occurrence by occurrence, counted in
-`yuzu_schedule_fire_failures_total` and audited as `instruction.schedule_fired` /
-`approval_submit_failed`. Note what that looks like from the dashboard: the schedule stays
-enabled and keeps advertising a next run it can never make, and each occurrence is dropped
-rather than retried. Nothing self-corrects, so a scheduled `mcp.`-prefixed definition is the
-case to rename first.
+that is **approval-gated stops running through the REST execute route, the dashboard, and the
+scheduler**. Executing it mints an approval ticket, that mint declares the instruction origin,
+and the reservation refuses it. Two independent things make a run approval-gated, and you have
+to check both:
+
+- the **definition's** `approval_mode` — `always`, `role-gated` for any caller who is not an
+  admin, or any unrecognised mode (which fails closed to requiring approval); or
+- the **schedule's** own `requires_approval` flag, which applies even when the definition is
+  `auto`. A scheduled run is gated if *either* is set.
 
 It fails closed — nothing is bypassed, and no approval is granted that should not be — but the
-definition stops working rather than degrading. Only `approval_mode: auto`, or an admin
-bypassing `role-gated`, keeps running.
+definition stops working rather than degrading.
+
+The scheduled case is the one to fix first, because it fails silently and permanently.
+Occurrences are dropped rather than retried, counted in `yuzu_schedule_fire_failures_total` and
+audited as `instruction.schedule_fired` / `approval_submit_failed` — but from the dashboard the
+schedule stays enabled and keeps advertising a next run it can never make, and nothing
+self-corrects. There is no alert rule shipped for that counter today.
+
+(MCP is not affected: `execute_instruction` takes a plugin and action rather than a definition
+id, so it never mints under a definition's namespace. This is a REST, dashboard and scheduler
+change.)
 
 **What does NOT change.** The store applies the rule at creation only, so a definition that
 already carries such an id can still be saved through `PUT /api/instructions/{id}` — an update
@@ -245,26 +253,45 @@ false all-clear. `GLOB` rather than `LIKE` because SQLite's `LIKE` is case-insen
 the reservation is not — `MCP.foo` is a different id everywhere else in the system and is
 not reserved.
 
-```bash
-sqlite3 /var/lib/yuzu/instructions.db \
-  "SELECT id FROM instruction_definitions WHERE id GLOB 'mcp.*';"
-```
-
-For each id listed, check its `approval_mode`:
+Run both queries. The first finds definitions that stop executing interactively; the second
+finds schedules that stop firing, **including one whose definition is `auto` but whose schedule
+carries its own `requires_approval`** — that case passes the first query and would otherwise
+look clean.
 
 ```bash
+# 1. definitions that can no longer be executed interactively
 sqlite3 /var/lib/yuzu/instructions.db \
-  "SELECT id, approval_mode FROM instruction_definitions WHERE id GLOB 'mcp.*';"
+  "SELECT id, approval_mode FROM instruction_definitions
+    WHERE id GLOB 'mcp.*' AND approval_mode <> 'auto';"
+
+# 2. schedules that will silently stop firing
+sqlite3 /var/lib/yuzu/instructions.db \
+  "SELECT s.id, s.name, s.definition_id FROM schedules s
+     JOIN instruction_definitions d ON d.id = s.definition_id
+    WHERE d.id GLOB 'mcp.*'
+      AND (s.requires_approval = 1 OR d.approval_mode <> 'auto');"
 ```
 
-Anything other than `auto` stops executing after the upgrade — rename those first. An `auto`
-one keeps running and can still be edited through `PUT /api/instructions/{id}`, but re-importing
-an export of it will fail, and so will saving it from the dashboard's YAML editor (that path
-validates the id on every save, not only on create).
+A definition that appears in neither query keeps running, and can still be edited through
+`PUT /api/instructions/{id}` — but re-importing an export of it will fail, and so will saving
+it from the dashboard's YAML editor (that path validates the id on every save, not only on
+create). Renaming it is still the durable fix.
 
-To rename: create a replacement under a different id and delete the original. The replacement
-is an ordinary create, so it is subject to the same reservation — pick an id outside the `mcp.`
-namespace.
+**To rename, in this order.** Deleting a definition does not update the schedules that point at
+it — there is no referential guard — so a rename done in the wrong order swaps one silent
+failure for another: the schedule then fails with `definition_unknown`, and still shows enabled
+with a next run it never makes.
+
+1. Create the replacement under an id outside the `mcp.` namespace. This is an ordinary create,
+   so the reservation applies to the new id too.
+2. Re-point every schedule found by query 2 at the new definition id, and confirm each one's
+   next run actually dispatches.
+3. Re-point anything else that references the old id by name — saved searches, automation
+   calling `POST /api/instructions/{id}/execute`, product packs you re-install.
+4. Only then delete the original.
+
+Execution history keeps referencing the old id after the delete; that is expected and only
+affects how past runs are labelled.
 
 ### vNEXT — behind a reverse proxy, declare your external origin or CSRF-gated dashboard actions keep failing (#2537)
 

@@ -5666,12 +5666,22 @@ route that accepts an explicit id refuses it — this one, `POST
 auto-import skips such a definition. Product-pack install is unaffected: it
 never carries a declared id through, so the store always assigns one.
 
-The store applies this at **create time**, so an id that predates the rule stays
-executable and can still be saved through `PUT /api/instructions/{id}`, because
-an update cannot originate an id. Note the dashboard's YAML editor is stricter
-than the store here: `POST /api/instructions/yaml` validates a declared id on
-every save, so an existing `mcp.`-prefixed definition cannot be edited through
-it unless its document omits `metadata.id`.
+The store applies this at **create time**, so an id that predates the rule can
+still be saved through `PUT /api/instructions/{id}`, because an update cannot
+originate an id. It does NOT keep running: executing an approval-gated
+definition mints an approval ticket, and that mint is refused, so
+`POST /api/instructions/{id}/execute` answers **400** with the reserved-prefix
+message and a `remediation`. That covers `approval_mode: always`, `role-gated`
+for a non-admin, any unrecognised mode, and — for scheduled runs — a schedule
+carrying its own `requires_approval` even when the definition is `auto`. Only a
+fully `auto` run keeps working. See the upgrade note in
+`docs/user-manual/server-admin.md` for the queries that find affected content
+and the order to rename it in.
+
+Note also that the dashboard's YAML editor is stricter than the store here:
+`POST /api/instructions/yaml` validates a declared id on every save, so an
+existing `mcp.`-prefixed definition cannot be edited through it unless its
+document omits `metadata.id`.
 
 **Response (409):** Returned when an explicit `id` is supplied that already
 exists in the store. Body is
