@@ -75,6 +75,12 @@ fs::path find_registry_plugin() {
     // Meson launches tests with CWD=build root; agents/ sits alongside tests/.
     candidates.emplace_back(fs::path{"agents"} / "plugins" / "registry" / lib_name);
     candidates.emplace_back(fs::path{".."} / "agents" / "plugins" / "registry" / lib_name);
+    // A manual invocation from the source root (e.g. running the .exe
+    // directly instead of through `meson test`) has CWD=source root, not
+    // build root -- cover the conventional Windows build dir name (this
+    // whole TU is Windows-only, so build-linux/build-macos never apply).
+    candidates.emplace_back(fs::path{"build-windows"} / "agents" / "plugins" / "registry" /
+                            lib_name);
 
     for (const auto& p : candidates) {
         std::error_code ec;
