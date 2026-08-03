@@ -228,11 +228,30 @@ deliberately not back-filled with a surface the migration cannot know — and, u
 follow-up lands, every ticket the MCP gate mints itself, which is why refusing them would break
 the live MCP flow. No new blank-surface row can be created by a surface that declares itself.
 
-Carried-across rows clear on the existing 7-day approval expiry, but note that sweep is **lazy**:
-it runs when an approval is submitted and at no other time, so a queue that receives no new
-submissions does not age anything out. The window is bounded by 7 days *and* a subsequent
-submission, not by 7 days alone. To close it immediately, reject any outstanding pending or
-approved tickets at upgrade time (`GET /api/approvals`, then `POST /api/approvals/{id}/reject`).
+Carried-across rows clear on the existing 7-day approval expiry, but that sweep is **lazy**: it
+runs when an approval is submitted and at no other time, so a queue receiving no new submissions
+ages nothing out. It also sits *after* the 1000-pending cap check, so a queue saturated with
+pending approvals never reaches it at all. The window is bounded by 7 days *and* a subsequent
+successful submission — not by 7 days alone.
+
+**Closing it immediately needs the database.** The redeemable population is exactly
+`status = 'approved' AND consumed_at = 0`, and there is no API that can retire those: the
+approve/reject routes refuse any ticket that is not still `pending`
+(`400 approval already reviewed`), and the dashboard renders no control for them. Rejecting the
+pending ones achieves nothing — a pending ticket is not redeemable in the first place. If you
+need the window shut before the sweep runs:
+
+```bash
+# Stop the server first. Retires every approved-but-unredeemed ticket that
+# carries no recorded surface — the exempt population, and only that.
+sqlite3 /var/lib/yuzu/instructions.db \
+  "UPDATE approvals SET status = 'expired'
+    WHERE status = 'approved' AND consumed_at = 0 AND origin = '';"
+```
+
+This revokes real capabilities an administrator granted: anyone holding one of those
+`approval_id`s will have to request approval again. Do it only if you have reason to think an
+`mcp.`-prefixed definition was raised through the instruction gate before the upgrade.
 
 **What changes.** Creating a definition whose id starts `mcp.` is refused with a 400 on every
 authoring route that accepts an explicit id — `POST /api/instructions`, `POST
@@ -276,7 +295,7 @@ splits the two cases, and the REST route cannot answer it:
 
 ```bash
 sqlite3 /var/lib/yuzu/instructions.db \
-  "SELECT definition_id, id, name FROM instruction_schedules WHERE definition_id GLOB 'mcp.*';"
+  "SELECT definition_id, id, name FROM schedules WHERE definition_id GLOB 'mcp.*';"
 ```
 
 **No schedule** — safe to rename. Create the replacement under a new id, carry `approval_mode`
@@ -289,7 +308,7 @@ occurrence logs `instruction.schedule_fired / failure / definition_unknown` and 
 **One or more schedules — leave it alone for now.** A schedule cannot be moved between
 definitions, and rebuilding one is not possible from what the API exposes: `GET /api/schedules`
 returns neither `scope_expression` nor `requires_approval` nor `interval_minutes`. Those values
-*are* readable by querying `instruction_schedules` directly, so a rebuild is mechanically
+*are* readable by querying `schedules` directly, so a rebuild is mechanically
 possible — but no procedure is published for it, deliberately: recreating a schedule moves its
 firing time silently and irreversibly (#2746), and a `weekly` or `monthly` one cannot be held to
 its calendar day at all. Getting `scope_expression` or `requires_approval` wrong turns a

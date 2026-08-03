@@ -947,11 +947,21 @@ TEST_CASE("ApprovalManager: find_pending skips a ticket the recall would refuse"
     CHECK(!mgr.find_pending("mcp.quarantine_device", "operator1", "{\"agent_id\":\"a1\"}")
                .has_value());
 
-    // A newer eligible ticket behind it IS found — the scan takes the newest
-    // eligible row rather than letting a foreign one at the front hide it.
+    // An eligible ticket BEHIND the foreign one is still found — the scan takes
+    // the newest ELIGIBLE row rather than letting a foreign one at the front
+    // hide it. Both submits land in the same wall-clock second, so
+    // `ORDER BY submitted_at DESC` would tie and the assertion would hold
+    // whether or not the loop ever skipped: push the eligible row explicitly
+    // OLDER so it can only be reached by skipping past the foreign one.
     auto mcp = mgr.submit("mcp.quarantine_device", "operator1", "{\"agent_id\":\"a1\"}", "",
                           ApprovalOrigin::kMcp);
     REQUIRE(mcp.has_value());
+    REQUIRE(sqlite3_exec(tdb.db,
+                         ("UPDATE approvals SET submitted_at = submitted_at - 60 WHERE id = '" +
+                          *mcp + "'")
+                             .c_str(),
+                         nullptr, nullptr, nullptr) == SQLITE_OK);
+
     auto found = mgr.find_pending("mcp.quarantine_device", "operator1", "{\"agent_id\":\"a1\"}");
     REQUIRE(found.has_value());
     CHECK(found->id == *mcp);

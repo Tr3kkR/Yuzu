@@ -765,12 +765,16 @@ proposes.
    an agentic worker cannot approve its own request.
 6. Once approved, the AI assistant **re-calls the same tool with the same
    arguments plus the `approval_id`**. The server validates (approved, matching
-   tool + arguments, not yet consumed, and raised through MCP rather than
-   through the REST instruction gate or the scheduler — #2442) and **atomically
-   consumes** the ticket (one-time — a replay, a mismatched tool/args, or a
-   ticket raised on another surface all return `-32003` `PermissionDenied`, and
+   tool + arguments, not yet consumed, and **not recorded as raised by the REST
+   instruction gate or the scheduler** — #2442) and **atomically consumes** the
+   ticket (one-time — a replay, a mismatched tool/args, or a ticket recorded as
+   raised on one of those surfaces all return `-32003` `PermissionDenied`, and
    deliberately all return the *same* message so the recall cannot be used to
    enumerate approval ids), then executes.
+
+   That last check is a denial rather than a permission, deliberately: a ticket
+   carrying no recorded surface is still accepted, which today includes every
+   ticket MCP itself mints as well as any approval predating the field.
 
 ### What requires approval
 

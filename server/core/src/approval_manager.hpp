@@ -71,10 +71,14 @@ ApprovalOrigin approval_origin_from_string(std::string_view text);
 /// cannot know. So a ticket minted by ANY surface before v5 ran is still
 /// redeemable here.
 ///
-/// Those rows age out on the 7-day approval expiry, but note that sweep is
-/// LAZY — it runs inside `submit()` and nowhere else, so an approval queue that
-/// receives no new mint does not age anything out. The residual is bounded by
-/// 7 days AND a subsequent submission, not by 7 days alone.
+/// Those rows age out on the 7-day approval expiry, but that sweep is LAZY — it
+/// runs inside `submit()` and nowhere else, so an approval queue receiving no new
+/// mint ages nothing out. It also sits AFTER the pending-cap check in `submit`,
+/// so a queue saturated at the cap never reaches it either, and approved-
+/// unconsumed rows do not count toward that cap and so cannot drain it. The
+/// residual is bounded by 7 days AND a subsequent SUCCESSFUL submission, not by
+/// 7 days alone. There is no API that retires an approved-unconsumed ticket —
+/// approve/reject both refuse a non-pending row.
 ///
 /// The exemption closes when the MCP mint declares `kMcp` and this allow-set
 /// narrows from two values to one — the same unfreeze that the `kUnspecified`
