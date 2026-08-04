@@ -1052,7 +1052,7 @@ in a tight loop — the cap is protecting the worker pool that also serves your 
 before it could be delivered on the stream (the buffered-result population hit its cap).
 The real result was never lost - only its *streamed* copy was dropped.
 
-**Fix**: Resume the session's GET channel with `Last-Event-ID` — that replays the ring, including the pinned final, and is the path that works when the stream died before any frame reached you (so you never learned an `execution_id`). If you do have one, fetch the result durably with the supplied `execution_id`
+**Fix**: Fetch the result durably with the `execution_id` this very frame carries (`get_execution_status` / `query_responses`). Do NOT re-resume the GET channel: this error IS the answer to a resume, and per the Cause above only the *streamed* copy was dropped - re-attaching cannot conjure a final the server already force-expired. (GET + `Last-Event-ID` resume is the right first move for a *different* case — a stream that died before any frame reached you, so you never learned an `execution_id` at all.)
 (`get_execution_status` / `query_responses`). The parked-result path this arises
 from is live: it activates whenever a streamed POST is parked without having
 delivered its final (the client disconnected, the response cap elapsed, or the
