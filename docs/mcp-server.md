@@ -91,13 +91,10 @@ JSON-RPC error responses from the denial paths (read-only mode, tier policy, app
 > declares its own surface, which must not happen until outstanding blank-origin
 > tickets have drained or it strands legitimate approved ones.
 >
-> There is no check on **who** presents the ticket. The list (a)–(e) is complete:
-> `submitted_by` is not compared against the recalling session, so a valid
-> `approval_id` is redeemable by any principal that also passes the tier gate and
-> the tool's own RBAC — the approval is bound to the request, not to the
-> requester. `GET /api/approvals` returns ids in full to any `Approval:Read`
-> holder, so treat an `approval_id` as a secret in transit and at rest. Tracked as
-> #2442 (binding the submitter) and #1803 (the read exposure). It then
+> There is no check on **who** presents the ticket — the list (a)–(e) is
+> complete. Treat an `approval_id` as a secret in transit and at rest. The
+> residual and what bounds it are described once, in the `#2442` upgrade note in
+> `docs/user-manual/server-admin.md`; tracked as #2442 and #1803. It then
 > **atomically consumes it** (one-time; a replay of a consumed ticket, or a
 > concurrent second recall, is rejected — the mutating op runs at most once) and
 > lets the call through to the handler. A recall against a still-**pending**

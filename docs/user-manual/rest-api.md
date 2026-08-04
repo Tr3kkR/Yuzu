@@ -5675,11 +5675,9 @@ it unless its document omits `metadata.id`.
 
 This reservation is forward-only hygiene, not the control that stops the
 cross-surface redemption described above — that is enforced when a ticket is
-redeemed, by binding it to the surface that minted it. That check binds the
-surface but **not the submitter**, so a valid `approval_id` stays redeemable by
-any principal that also holds the target tool's own permissions — and this route's
-list sibling returns approval ids in full to any `Approval:Read` holder (#2442,
-#1803). See the `#2442` upgrade note in `docs/user-manual/server-admin.md`.
+redeemed, by binding it to the surface that minted it. That check does not bind
+the submitter; the residual and what bounds it are described once, in the `#2442`
+upgrade note in `docs/user-manual/server-admin.md` (#2442, #1803).
 
 **Response (409):** Returned when an explicit `id` is supplied that already
 exists in the store. Body is

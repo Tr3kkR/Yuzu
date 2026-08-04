@@ -274,58 +274,39 @@ that cannot be executed safely from the information available to the operator do
 an operator manual, and one that also writes no audit row is worse than the exposure it closes.
 
 **Do not reconstruct that statement yourself.** The predicate above describes the redeemable set,
-not a safe target set: every ticket the MCP gate mints is *also* blank-origin, so an `UPDATE`
-narrowed only on `origin = ''` revokes live MCP approvals as well, and re-running it periodically
-livelocks the MCP flow entirely — mint, human approves, statement expires it, recall reports it
-expired, worker mints again. That is the defect that took four revisions to stop reintroducing.
+not a safe target set. Every ticket the MCP gate mints is *also* blank-origin and *also*
+`mcp.`-prefixed, so neither `origin = ''` nor `definition_id GLOB 'mcp.*'` separates a
+carried-across ticket from a live one — narrowing on either revokes live MCP approvals, and
+re-running the statement periodically livelocks the MCP flow entirely: mint, human approves,
+statement expires it, recall reports it expired, worker mints again. That is the defect that took
+four revisions to stop reintroducing.
 
-**The window is not unguarded.** A ticket is single-use and is spent on first redemption; an
-approved-but-unconsumed ticket carries its own 7-day TTL from the review timestamp; every
-redemption attempt other than a recall against a still-`pending` ticket is audited under
-`mcp.<tool>`, including the successful one (see [Audit log](audit-log.md)); and
-`yuzu_mcp_approval_denied_total{reason="foreign_origin"}` counts exactly the cross-surface attempt
-this control refuses — alert on it. If your threat model needs the population narrowed further,
-remove `Approval:Read` from the seeded Viewer role with a custom role, since that route discloses
-approval ids in full (#1803).
+**Are you affected?** In almost every deployment, no: the exemption covers tickets minted before
+the upgrade, and on a deployment running only shipped content there are no `mcp.`-prefixed
+definitions for a carried-across ticket to have been raised against. To check, query the database
+rather than the API — `GET /api/approvals` does not return `consumed_at`, consumption does not
+change `status`, and the route returns only the newest 100 rows while carried-across tickets are
+the oldest (#2759):
 
-**What to do.** In almost every deployment the answer is nothing: the exemption covers tickets
-minted before the upgrade, and on a deployment running only shipped content there are no
-`mcp.`-prefixed definitions for a carried-across ticket to have been raised against. If you have
-specific reason to believe an `mcp.`-prefixed definition was raised through the instruction gate
-before the upgrade, treat it as an incident:
+```bash
+sqlite3 /var/lib/yuzu/instructions.db \
+  "SELECT id, definition_id, submitted_by, submitted_at, reviewed_by, consumed_at, consumed_by
+     FROM approvals
+    WHERE status = 'approved' AND origin = '' AND definition_id GLOB 'mcp.*';"
+```
 
-1. **Size it.** Query the database, not the API. `GET /api/approvals` returns `origin` but **not**
-   `consumed_at`, and consumption does not change `status` — so on that route a spent ticket and a
-   live one are indistinguishable. It also returns only the newest 100 rows
-   (`ORDER BY submitted_at DESC LIMIT 100`, no pagination), and carried-across rows are the
-   *oldest*, so they sort off the end first. Both limits trace to #2759 — consumption not
-   restatusing the row, and the 100-row bound on the query behind this route.
+Read-only. A row with `consumed_at = 0` is still redeemable; a non-zero value is one that has
+already been redeemed, and `consumed_by` names the principal that did it. The query cannot
+separate a ticket carried across the upgrade from one the MCP gate minted afterwards — that
+distinction is not recoverable from the data, which is the same limitation that made the withdrawn
+procedure unsafe — so treat the redeemable count as an upper bound.
 
-   ```bash
-   sqlite3 /var/lib/yuzu/instructions.db \
-     "SELECT id, definition_id, submitted_by, submitted_at, reviewed_by
-        FROM approvals
-       WHERE status = 'approved' AND consumed_at = 0 AND origin = ''
-         AND definition_id GLOB 'mcp.*';"
-   ```
-
-   This is read-only. It over-reports rather than under-reports: it cannot separate a ticket
-   carried across the upgrade from one the MCP gate minted afterwards, which is the same
-   limitation that made the withdrawn procedure unsafe. Treat the result as an upper bound.
-
-2. **Check whether any of them was redeemed.** Search the audit log for
-   `consumed approval_id=<id>` against the ids from step 1. A hit means a gated tool executed on
-   that approval, and this is a security incident rather than a maintenance task.
-
-3. **Contain without waiting for #2761.** `--mcp-read-only` restricts MCP to read-only tools
-   (no write or execute), and `--mcp-disable` rejects `/mcp/v1/` entirely; either stops a
-   redeemable ticket being spent, and both are also togglable from Settings without a restart.
-   Narrowing
-   the RBAC of the submitting principal, or of the affected tool, has the same effect and is
-   finer-grained.
-
-4. **Do not make a direct database change** without support involvement — see the withdrawal
-   above for why.
+**If you are affected**, contain by restricting MCP: `--mcp-read-only` (no write or execute tools)
+or `--mcp-disable` (rejects `/mcp/v1/`), both also settable via `YUZU_MCP_READ_ONLY` /
+`YUZU_MCP_DISABLE`. Use the flag or the environment variable rather than the Settings toggle: the
+toggle takes effect immediately but is held in memory only, so it is lost on the next restart.
+Then follow #2761, the audited operation that would let a targeted revocation be published
+safely.
 
 Bulk-revoking granted approvals is a gap, not a design. Doing it properly means an
 `Approval:Revoke` operation that emits its own audit row with the acting principal and the
