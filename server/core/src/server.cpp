@@ -31,6 +31,16 @@
 #include "kek_routes.hpp"
 #include "key_provider.hpp"
 #include "scim_routes.hpp"
+// PR1.5c/1.6c (p14): ADR-0031 operator surface — server wiring for p5's
+// plugin-config/secret/kill-switch store + REST routes and p6's upload-grant
+// store + REST routes. http_route_sink.hpp is the HttplibRouteSink adapter
+// their free-function registrars take (they do not expose an httplib::Server&
+// overload the way KekRoutes does).
+#include "http_route_sink.hpp"
+#include "plugin_config_routes.hpp"
+#include "plugin_config_store.hpp"
+#include "upload_grant_store.hpp"
+#include "file_retrieval_routes.hpp"
 #include "x509_ca.hpp"
 #include "compliance_eval.hpp"
 #include "custom_properties_store.hpp"
@@ -2370,6 +2380,80 @@ public:
                 spdlog::error("[PG] Refusing to start: SCIM store migration/open failed "
                               "(database reachable but the scim_store schema could not be "
                               "created/opened)");
+                startup_failed_ = true;
+            }
+        }
+
+        // PR1.5c/1.6c (p14) — PluginConfigStore + UploadGrantStore (ADR-0031
+        // operator surface: p5/p6 built the stores + routes; this package
+        // wires them). Same fail-CLOSED construction posture as every other
+        // born-on-PG store (ADR-0012 §1): a reachable database whose schema
+        // can't migrate/open is a deploy error, not a serve-degraded state.
+        //
+        // PluginConfigStore's SecretCodec (ADR-3005/ADR-0010 per-store
+        // model, mirrors AuthDB's construction sequence exactly, see the
+        // AuthDB block above): construct the codec first (ctor only), THEN
+        // PluginConfigStore's own constructor registers its ONE secret
+        // column (plugin_config_store.secrets.sealed_value) immediately
+        // after its schema migration, THEN SecretCodec::init() runs on a
+        // pinned lease so the just-registered column is validated. Reuses
+        // auth_key_provider_ (constructed above; guaranteed non-null
+        // whenever this guard is reached — if pg_pool_ were null or startup
+        // already failed, both guards would be false identically) rather
+        // than minting a second FileKeyProvider over the identical keys
+        // directory: the KEK material is genuinely install-wide (one KEK
+        // per database, ADR-0010 §2 / secret_codec.cpp), so one KeyProvider
+        // instance backing two independent SecretCodec instances is the
+        // correct shape, not a shortcut.
+        //
+        // ARBITER FLEET DIRECTIVE (p5 adjudication, #2568/#2580): this
+        // dedicated instance is also enrolled into the live KEK
+        // rotate/rewrap/status surface below (kek_ops_), alongside
+        // auth_secret_codec_ — see kek_enrolled_codecs(). Closes the
+        // residual gap p5 recorded in docs/adr/3005-plugin-config-store.md:
+        // a plugin secret no longer stays pinned to whatever KEK version was
+        // active when it was written once this package lands.
+        if (pg_pool_ && !startup_failed_) {
+            plugin_config_secret_codec_ = std::make_unique<pg::SecretCodec>(*auth_key_provider_);
+            plugin_config_store_ =
+                std::make_unique<PluginConfigStore>(*pg_pool_, *plugin_config_secret_codec_);
+            if (!plugin_config_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: plugin config store migration/open "
+                              "failed");
+                startup_failed_ = true;
+            } else {
+                // Substrate-level boot init (ADR-0010 §2) — MUST run before
+                // any encrypt/decrypt through plugin_config_secret_codec_.
+                // PluginConfigStore above is the only registrant on this
+                // codec instance; init() is where its column is verified.
+                auto lease = pg_pool_->acquire();
+                if (!lease) {
+                    spdlog::error("[PG] Refusing to start: could not acquire a connection to run "
+                                  "SecretCodec::init() for plugin_config_store ({})",
+                                  pg_pool_->last_error());
+                    startup_failed_ = true;
+                } else {
+                    auto init_res = plugin_config_secret_codec_->init(lease.get());
+                    lease.reset();
+                    if (!init_res) {
+                        spdlog::error(
+                            "[PG] Refusing to start: plugin_config_store SecretCodec::init() "
+                            "failed — {}: {}",
+                            pg::SecretCodec::to_string(init_res.error().kind),
+                            init_res.error().message);
+                        startup_failed_ = true;
+                    }
+                }
+            }
+        }
+
+        // UploadGrantStore (PR1.6a/c) — no secret codec of its own: grant
+        // and session credentials are stored as SHA-256 digests, never a
+        // sealed SecretCodec blob (upload_grant_store.hpp file header).
+        if (pg_pool_ && !startup_failed_) {
+            upload_grant_store_ = std::make_unique<UploadGrantStore>(*pg_pool_);
+            if (!upload_grant_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: upload grant store migration/open failed");
                 startup_failed_ = true;
             }
         }
@@ -5362,6 +5446,22 @@ public:
         if (auth_secret_codec_)
             auth_secret_codec_->set_audit_hook({});
         auth_secret_codec_.reset();
+        // PR1.5c/1.6c (p14) — plugin_config_store_ borrows
+        // plugin_config_secret_codec_, which borrows the SAME
+        // auth_key_provider_ auth_secret_codec_ above borrows — so both
+        // stores/codecs must be gone before auth_key_provider_.reset()
+        // below (docs/postgres-store-playbook.md:112 destruct-before-pool,
+        // applied transitively to the shared key provider too). No audit
+        // hook to clear: PluginConfigStore's SecretCodec is never wired to
+        // audit_store_ (its own audit trail runs through
+        // plugin_config_routes.cpp's rest_audit.hpp calls, not the codec's
+        // ADR-0010 audit hook).
+        plugin_config_store_.reset();
+        plugin_config_secret_codec_.reset();
+        // UploadGrantStore borrows pg_pool_ only (no codec) — drop before
+        // the pool. Every HTTP handler holding the raw pointer is quiesced
+        // by the drains above.
+        upload_grant_store_.reset();
         auth_key_provider_.reset();
         pg_pool_.reset();
     }
@@ -12395,6 +12495,35 @@ private:
             .audit_store = audit_store_.get(),
             .metrics = &metrics_,
             .dispatch_fn = command_dispatch_fn,
+            // D7/PLAN-003 (p14) — re-verify the arming principal's CURRENT
+            // authority for this plugin.action before every fire (both the
+            // auto and approval-gated arms — schedule_runner.hpp's fire()
+            // doc comment). p4 left this fail-closed and unset; wired here
+            // against the SAME classification seam build_classified_command
+            // consults on every other dispatch (capability_registry_,
+            // PR1.9c) so a schedule's required (securable, operation) can
+            // never drift from what a live dispatch of the same
+            // plugin.action would require. Fail-closed on every unresolved
+            // input: an unclassified/ambiguous plugin.action (ADR-0033 §2 —
+            // "a missing or unparseable classification means the capability
+            // does not exist"), a missing RBAC store, or a store error all
+            // deny the fire — a schedule must never dispatch under
+            // authority the server cannot presently confirm. RBAC
+            // legacy-open (rbac_enforcement_in_effect() false) admits,
+            // matching every other authz call site's posture.
+            .arming_check = [this](const std::string& principal, const std::string& plugin,
+                                   const std::string& action) -> bool {
+                const auto classified = capability_registry_.classify(plugin, action);
+                if (!classified)
+                    return false;
+                if (!rbac_store_ || !rbac_store_->is_open())
+                    return false;
+                if (!rbac_enforcement_in_effect(rbac_store_.get()))
+                    return true;
+                return rbac_store_->check_permission(
+                    principal, std::string(classified->securable),
+                    std::string(yuzu::server::authz::to_string(classified->operation)));
+            },
         });
         schedule_tick_thread_ = std::thread([this]() {
             spdlog::info("Schedule runner thread started (cadence=30s)");
@@ -13929,6 +14058,54 @@ private:
                     return result;
                 }
                 result.new_version = *rotated_version;
+
+                // #2568/#2580 (p14) — MINT ONCE (above, auth_secret_codec_
+                // only), then bring every OTHER enrolled codec onto the
+                // freshly-minted version under this SAME secrets_kek_op
+                // lock hold: resync its in-memory active_version_ via
+                // init() (a no-mutation re-verify against the kek_meta row
+                // rotate_kek just committed — see kek_enrolled_codecs()'s
+                // doc comment), then rewrap_all() its own registered
+                // columns onto it. This is NOT a second rotate_kek() call
+                // — calling rotate_kek() again per codec would mint N
+                // independent KEK versions and leave the codecs on
+                // divergent generations, exactly the bug this loop exists
+                // to prevent. A failure here means the mint committed but a
+                // secondary codec's rows did not follow it — the SAME
+                // half-committed shape as rotate_kek's own internal
+                // rewrap_all() failing, so it is classified identically
+                // (HalfCommitted) and resumed the identical way: POST
+                // /secrets/kek/rewrap, never a retried /rotate.
+                for (auto* codec : kek_enrolled_codecs()) {
+                    if (codec == auth_secret_codec_.get())
+                        continue; // already minted + self-rewrapped above
+                    auto init_res = codec->init(lease.get());
+                    if (!init_res) {
+                        spdlog::critical(
+                            "KEK rotate: minted v{} on auth_secret_codec_ but a secondary "
+                            "codec's init() resync failed ({}: {}) — the mint COMMITTED; "
+                            "resume with /rewrap, do NOT retry /rotate",
+                            *rotated_version, pg::SecretCodec::to_string(init_res.error().kind),
+                            init_res.error().message);
+                        result.failure = KekOpResult::Failure::HalfCommitted;
+                        record_kek_op_outcome("rotate",
+                                              detail::kek_op_outcome_label(result.failure));
+                        return result;
+                    }
+                    auto rewrapped = codec->rewrap_all(lease.get());
+                    if (!rewrapped) {
+                        spdlog::critical(
+                            "KEK rotate: minted v{} on auth_secret_codec_ but a secondary "
+                            "codec's rewrap_all() failed ({}) — the mint COMMITTED; resume "
+                            "with /rewrap, do NOT retry /rotate",
+                            *rotated_version, rewrapped.error().internal_message);
+                        result.failure = KekOpResult::Failure::HalfCommitted;
+                        record_kek_op_outcome("rotate",
+                                              detail::kek_op_outcome_label(result.failure));
+                        return result;
+                    }
+                }
+
                 // rotate_kek() runs its own internal rewrap_all() as part of
                 // minting (secret_codec.cpp ~824-838) but DISCARDS that call's
                 // row count, returning only the new version. Rather than
@@ -13938,10 +14115,11 @@ private:
                 // `rotation_complete` instead. That is the signal an operator
                 // actually needs (the ADR-0010 §3 completion signal), and it is
                 // one we can produce truthfully: reaching here means
-                // rotate_kek's internal rewrap_all() returned success, so no
-                // row is left on a superseded version. An operator who wants a
-                // count can call /rewrap, which reports a real one (0 when
-                // there is genuinely nothing left to do).
+                // rotate_kek's internal rewrap_all() returned success (and every
+                // enrolled secondary codec's own rewrap_all() above too), so no
+                // row on ANY enrolled codec is left on a superseded version. An
+                // operator who wants a count can call /rewrap, which reports a
+                // real one (0 when there is genuinely nothing left to do).
                 result.rotation_complete = true;
                 record_kek_op_outcome("rotate", detail::kek_op_outcome_label(result.failure));
                 return result;
@@ -14000,7 +14178,46 @@ private:
                     record_kek_op_outcome("rewrap", detail::kek_op_outcome_label(result.failure));
                     return result;
                 }
-                result.rows_rewrapped = *rewrapped;
+                std::size_t total_rewrapped = *rewrapped;
+
+                // #2568/#2580 (p14) — resume every OTHER enrolled codec too,
+                // under this SAME lock hold. init() first (a no-mutation
+                // resync of THIS instance's active_version_ from the shared
+                // kek_meta table — necessary because a PRIOR /rotate call
+                // may have minted a version this process's copy of the
+                // secondary codec never learned about; see
+                // kek_enrolled_codecs()'s doc comment), then rewrap_all().
+                // Idempotent like the primary above: rows already on the
+                // active version are simply skipped, so calling this
+                // repeatedly with nothing left to do is a normal 0-row
+                // outcome, never an error.
+                for (auto* codec : kek_enrolled_codecs()) {
+                    if (codec == auth_secret_codec_.get())
+                        continue; // already rewrapped above
+                    auto init_res = codec->init(lease.get());
+                    if (!init_res) {
+                        spdlog::error("KEK rewrap: a secondary codec's init() resync failed: {}: {}",
+                                     pg::SecretCodec::to_string(init_res.error().kind),
+                                     init_res.error().message);
+                        result.failure = KekOpResult::Failure::Internal;
+                        record_kek_op_outcome("rewrap", detail::kek_op_outcome_label(result.failure));
+                        return result;
+                    }
+                    auto secondary_rewrapped = codec->rewrap_all(lease.get());
+                    if (!secondary_rewrapped) {
+                        spdlog::error("KEK rewrap: a secondary codec's rewrap_all() failed: {}",
+                                     secondary_rewrapped.error().internal_message);
+                        result.failure =
+                            (secondary_rewrapped.error().kind ==
+                             pg::SecretCodec::LifecycleError::Kind::query_canceled)
+                                ? KekOpResult::Failure::QueryCanceled
+                                : KekOpResult::Failure::Internal;
+                        record_kek_op_outcome("rewrap", detail::kek_op_outcome_label(result.failure));
+                        return result;
+                    }
+                    total_rewrapped += *secondary_rewrapped;
+                }
+                result.rows_rewrapped = total_rewrapped;
                 record_kek_op_outcome("rewrap", detail::kek_op_outcome_label(result.failure));
                 return result;
             };
@@ -14045,32 +14262,63 @@ private:
                 // STILL never takes `secrets_kek_op` itself; the lock-holder
                 // observation below only ever OBSERVES via pg_locks.
                 result.active_version = auth_secret_codec_->active_kek_version();
-                auto oldest = auth_secret_codec_->oldest_kek_version_in_use(lease.get());
-                if (!oldest) {
-                    spdlog::error("KEK status: oldest_kek_version_in_use failed: {}",
-                                 oldest.error().internal_message);
-                    result.failure =
-                        (oldest.error().kind == pg::SecretCodec::LifecycleError::Kind::query_canceled)
-                            ? KekOpResult::Failure::QueryCanceled
-                            : KekOpResult::Failure::Internal;
-                    record_kek_op_outcome("status", detail::kek_op_outcome_label(result.failure));
-                    return result;
+
+                // #2568/#2580 (p14) — oldest_in_use must reflect EVERY
+                // enrolled codec's own registered columns, not just
+                // auth_secret_codec_'s: each codec's
+                // oldest_kek_version_in_use() scan only ever sees the
+                // secret columns THAT instance registered (columns_ is
+                // per-instance, SecretCodec::register_secret_column), so a
+                // plugin-config secret stuck on an old KEK version would be
+                // invisible to this field if only the primary codec were
+                // consulted here. Combine as the MIN across every codec
+                // that has secret rows at all (nullopt = "no secret rows on
+                // this codec", excluded from the min; the combined result
+                // is nullopt only when EVERY enrolled codec has none). A
+                // query failure on ANY codec is still a hard failure — same
+                // posture as the pre-generalisation single-codec original —
+                // a status response must never silently omit one codec's
+                // contribution to the fleet-wide oldest-in-use signal.
+                std::optional<std::uint32_t> combined_oldest;
+                bool any_anomaly = false;
+                for (auto* codec : kek_enrolled_codecs()) {
+                    auto oldest_result = codec->oldest_kek_version_in_use(lease.get());
+                    if (!oldest_result) {
+                        spdlog::error("KEK status: oldest_kek_version_in_use failed: {}",
+                                     oldest_result.error().internal_message);
+                        result.failure = (oldest_result.error().kind ==
+                                          pg::SecretCodec::LifecycleError::Kind::query_canceled)
+                                             ? KekOpResult::Failure::QueryCanceled
+                                             : KekOpResult::Failure::Internal;
+                        record_kek_op_outcome("status", detail::kek_op_outcome_label(result.failure));
+                        return result;
+                    }
+                    const std::optional<std::uint32_t>& codec_oldest = *oldest_result;
+                    if (!codec_oldest.has_value())
+                        continue; // this codec has no secret rows at all
+                    // Completion is `== active_version`, NOT `>=` (gov
+                    // unhappy-path UP-6). A row whose header references a
+                    // version HIGHER than the active one is an anomaly — a
+                    // restore against a newer keys dir, or a blob from
+                    // another install — and `>=` would report that state as
+                    // "complete", the worst possible false comfort: it says
+                    // "every secret is on the current key" about rows whose
+                    // key is not even registered here.
+                    if (*codec_oldest > result.active_version) {
+                        spdlog::error(
+                            "KEK status: oldest referenced version v{} EXCEEDS the active "
+                            "version v{} — a secret row references a KEK this install has "
+                            "not registered (restore skew?); reporting NOT complete",
+                            *codec_oldest, result.active_version);
+                        any_anomaly = true;
+                    }
+                    if (!combined_oldest.has_value() || *codec_oldest < *combined_oldest)
+                        combined_oldest = *codec_oldest;
                 }
-                result.oldest_in_use = *oldest;
-                // Completion is `== active_version`, NOT `>=` (gov unhappy-path
-                // UP-6). A row whose header references a version HIGHER than the
-                // active one is an anomaly — a restore against a newer keys dir,
-                // or a blob from another install — and `>=` would report that
-                // state as "complete", which is the worst possible false
-                // comfort: it says "every secret is on the current key" about
-                // rows whose key is not even registered here.
+                result.oldest_in_use = combined_oldest;
                 if (!result.oldest_in_use.has_value()) {
-                    result.rotation_complete = true; // no secret rows at all
-                } else if (*result.oldest_in_use > result.active_version) {
-                    spdlog::error("KEK status: oldest referenced version v{} EXCEEDS the active "
-                                  "version v{} — a secret row references a KEK this install has "
-                                  "not registered (restore skew?); reporting NOT complete",
-                                  *result.oldest_in_use, result.active_version);
+                    result.rotation_complete = true; // no secret rows at all, on ANY enrolled codec
+                } else if (any_anomaly) {
                     result.rotation_complete = false;
                 } else {
                     result.rotation_complete = (*result.oldest_in_use == result.active_version);
@@ -14134,6 +14382,73 @@ private:
                 return result;
             };
             kek_routes_->register_routes(*web_server_, perm_fn, audit_fn, kek_ops);
+        }
+
+        // PR1.5c/1.6c (p14) — ADR-0031 operator surface REST registration:
+        // p5's /api/v1/plugin-config/* and p6's /api/v1/upload-grants* +
+        // /api/v1/uploads* (mint/list/revoke are operator routes; the five
+        // /api/v1/uploads/* routes are the agent-authenticated chunked-
+        // receive protocol — see file_retrieval_routes.hpp's file header
+        // for the two-trust-domain split). Both registrars take an
+        // HttpRouteSink& (neither offers an httplib::Server& overload the
+        // way KekRoutes does above), so wrap web_server_ once and pass the
+        // same sink to both — the idiom http_route_sink.hpp's file header
+        // documents.
+        {
+            HttplibRouteSink operator_surface_sink{*web_server_};
+
+            plugin_config::register_plugin_config_routes(
+                operator_surface_sink,
+                plugin_config::Deps{
+                    .store = plugin_config_store_.get(),
+                    .rbac_store = rbac_store_.get(),
+                    .mgmt_store = mgmt_group_store_.get(),
+                    .auth_fn = auth_fn,
+                    .perm_fn = perm_fn,
+                    .audit_fn = audit_fn,
+                });
+
+            register_file_retrieval_routes(
+                operator_surface_sink,
+                yuzu::server::Deps{
+                    .auth_fn = auth_fn,
+                    .perm_fn = perm_fn,
+                    // ADR-0017 admit-then-filter list gate
+                    // (RbacStore::authorize_list_read) for GET
+                    // /api/v1/upload-grants — decoupled from RbacStore/
+                    // ManagementGroupStore at the file_retrieval_routes.hpp
+                    // boundary (its file header), wired here the same way
+                    // visible_set_fn above wires the analogous DEX seam.
+                    // Fail-closed (kDenyAll default) when rbac_store_ is
+                    // unset or closed.
+                    .list_read_fn =
+                        [this](const std::string& username) -> UploadGrantListAuthorization {
+                        UploadGrantListAuthorization out;
+                        if (!rbac_store_ || !rbac_store_->is_open())
+                            return out;
+                        auto authz = rbac_store_->authorize_list_read(
+                            username, "UploadGrant", "Read", mgmt_group_store_.get());
+                        switch (authz.decision) {
+                        case ListReadDecision::AdmitAll:
+                            out.decision = UploadGrantListDecision::kAdmitAll;
+                            break;
+                        case ListReadDecision::AdmitScoped:
+                            out.decision = UploadGrantListDecision::kAdmitScoped;
+                            out.visible_agents = std::move(authz.visible_agents);
+                            break;
+                        case ListReadDecision::DenyAll:
+                            break; // out already kDenyAll (default)
+                        }
+                        return out;
+                    },
+                    .audit_fn = audit_fn,
+                    .store = upload_grant_store_.get(),
+                    .blob_root = cfg_.db_dir() / "upload-blobs",
+                    .tls_enabled = cfg_.https_enabled,
+                    // now_fn left unset — production default reads
+                    // system_clock::now() (Deps::ClockFn doc comment,
+                    // file_retrieval_routes.hpp); only tests pin it.
+                });
         }
 
         // -- SCIM v2 provisioning (/scim/v2/*) — enterprise IdP auto-(de)provisioning --
@@ -14635,6 +14950,40 @@ private:
             // was null while the REST twins worked fine — two surfaces
             // disagreeing about whether the same capability exists (ADR-1005 A1).
             mcp_server_->set_kek_ops(kek_ops_); // same seam instance as the REST twins
+            // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
+            // wired UNCONDITIONALLY exactly like kek_ops above (never
+            // gated behind an unrelated conditional — see the KEK comment
+            // immediately above for why that matters: two surfaces
+            // disagreeing about whether the same capability exists is an
+            // ADR-1005 A1 violation).
+            mcp_server_->set_plugin_config_store(plugin_config_store_.get());
+            mcp_server_->set_upload_grant_ops(
+                upload_grant_store_.get(),
+                // SAME logic as the REST list_read_fn wired at the
+                // /api/v1/upload-grants registration site above — not the
+                // same std::function instance, but the identical
+                // RbacStore::authorize_list_read call with the identical
+                // (securable, operation), so the two surfaces cannot
+                // observe a different admit decision for the same caller.
+                [this](const std::string& username) -> UploadGrantListAuthorization {
+                    UploadGrantListAuthorization out;
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return out;
+                    auto authz = rbac_store_->authorize_list_read(username, "UploadGrant", "Read",
+                                                                  mgmt_group_store_.get());
+                    switch (authz.decision) {
+                    case ListReadDecision::AdmitAll:
+                        out.decision = UploadGrantListDecision::kAdmitAll;
+                        break;
+                    case ListReadDecision::AdmitScoped:
+                        out.decision = UploadGrantListDecision::kAdmitScoped;
+                        out.visible_agents = std::move(authz.visible_agents);
+                        break;
+                    case ListReadDecision::DenyAll:
+                        break; // out already kDenyAll (default)
+                    }
+                    return out;
+                });
             if (engine_principal_store_) {
                 mcp_server_->set_engine_principal_store(engine_principal_store_.get());
                 mcp_server_->set_engine_credential_store(api_token_store_.get());
@@ -15373,6 +15722,38 @@ private:
         ++kek_op_outcome_counts_[{std::string(op), std::string(outcome)}];
     }
 
+    // #2568/#2580 (p14, ARBITER FLEET DIRECTIVE from p5's adjudication) —
+    // every `SecretCodec` instance enrolled in the live KEK
+    // rotate/rewrap/status surface, GENERALISED from a single hard-coded
+    // `auth_secret_codec_` member so a future third consumer needs only an
+    // addition to this list, never another round of kek_ops lambda surgery.
+    // `auth_secret_codec_` is ALWAYS first — the kek_ops.rotate seam treats
+    // index 0 as the sole MINTING codec (see its doc comment): every other
+    // entry is brought onto the freshly-minted version by `init()` (a
+    // no-mutation re-verify/refresh of that instance's own
+    // `active_version_`/`key_refs_` from the shared `secrets.kek_meta`
+    // table — safe to call repeatedly post-boot, see SecretCodec::init's
+    // n>0 path) followed by `rewrap_all()`, NEVER by an independent
+    // `rotate_kek()` call, which would mint a second, spurious KEK version
+    // (the divergent-generations bug this generalisation exists to avoid).
+    // Every codec here shares the SAME underlying `secrets.kek_meta` table
+    // and KEK material (one KEK per database, ADR-0010 §2) — only each
+    // instance's in-memory `active_version_`/`key_refs_`/registered-column
+    // set is per-instance, which is exactly what makes the resync step
+    // necessary. Entries are skipped (not asserted) when null so a codec
+    // that failed to construct — impossible in production once startup
+    // succeeds, since a failed construction sets `startup_failed_` and the
+    // server never reaches request-serving — cannot crash a live request;
+    // defensive, matching every other raw-pointer null-check in this file.
+    [[nodiscard]] std::vector<pg::SecretCodec*> kek_enrolled_codecs() const {
+        std::vector<pg::SecretCodec*> out;
+        if (auth_secret_codec_)
+            out.push_back(auth_secret_codec_.get());
+        if (plugin_config_secret_codec_)
+            out.push_back(plugin_config_secret_codec_.get());
+        return out;
+    }
+
     // ── Postgres-backed AuthDB (ADR-0006 substrate migration) + its
     // dependency chain ──────────────────────────────────────────────────
     // Declared in this EXACT order — FileKeyProvider → SecretCodec → AuthDB
@@ -15398,6 +15779,26 @@ private:
     std::unique_ptr<ScimStore> scim_store_;
     std::unique_ptr<ScimRoutes> scim_routes_;
     std::unique_ptr<DiscoverRoutes> discover_routes_; // A2: /api/v1/discover/* (Issue 17.1)
+
+    // PR1.5c/1.6c (p14) — the ADR-0031 operator-surface stores. Declared in
+    // this EXACT order — plugin_config_secret_codec_ -> plugin_config_store_
+    // -> upload_grant_store_ — same reverse-declaration-destruction reasoning
+    // as the AuthDB chain above: plugin_config_store_ borrows
+    // plugin_config_secret_codec_ by reference (ADR-0010 per-store codec
+    // model, same shape as AuthDB(pg::PgPool&, pg::SecretCodec&)), so it must
+    // destruct BEFORE the codec it borrows — true here because it is
+    // declared AFTER the codec. Both borrow pg_pool_ (declared far above,
+    // near metrics_) by reference too, so both must destruct before it —
+    // true here since every member below this point destructs before
+    // pg_pool_ does (docs/postgres-store-playbook.md:112 — "declare the
+    // store so it destructs before the pool"). upload_grant_store_ borrows
+    // only pg_pool_ (no codec of its own — UploadGrantStore never seals a
+    // secret column, see upload_grant_store.hpp), so its position relative
+    // to the codec/plugin_config_store_ pair is unconstrained; declared last
+    // here purely to group the whole p14 surface together.
+    std::unique_ptr<pg::SecretCodec> plugin_config_secret_codec_;
+    std::unique_ptr<PluginConfigStore> plugin_config_store_;
+    std::unique_ptr<UploadGrantStore> upload_grant_store_;
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     std::unique_ptr<FleetTopologyStore> fleet_topology_store_;

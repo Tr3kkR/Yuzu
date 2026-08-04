@@ -56,16 +56,23 @@ fleet-wide codec. The construction sequence, matching `AuthDB`'s worked example 
 3. The server calls `secret_codec.init(conn)` right after the `PluginConfigStore` constructor
    returns.
 
-**KEK-rotation-surface enrolment (#2568/#2580) — registered, not yet wired live.**
-`register_secret_column` makes `plugin_config_store.secrets.sealed_value` *eligible* for
-`rotate`/`rewrap`, but the **live** `kek_routes.hpp` / `server.cpp` rotate/rewrap endpoints today
-call those operations on `auth_secret_codec_` specifically (the codec `AuthDB` owns), not on an
-arbitrary registered codec — there is no fleet-of-codecs loop for those endpoints to walk. This
-package's own `SecretCodec` instance is therefore registered and ready, but an operator's live
-`/rotate` or `/rewrap` request does **not yet** re-wrap this column, because `server.cpp` is
-outside this package's owned files (boundary discipline — this is a new-files-only package). See
-"Open items" below: wiring this store's codec into the live rotate/rewrap call path is the
-constructing/wiring PR's job, alongside the rest of this store's `server.cpp` wiring.
+**KEK-rotation-surface enrolment (#2568/#2580) — CLOSED by the constructing/wiring package
+(PR1.5c/1.6c, p14).** `register_secret_column` made `plugin_config_store.secrets.sealed_value`
+*eligible* for `rotate`/`rewrap`; p14 finished the job by constructing this store's dedicated
+`SecretCodec` (`plugin_config_secret_codec_`, `server.cpp`, declared after `pg_pool_` and
+`auth_key_provider_` per the destruction-order rule below) and enrolling it into the live
+`kek_ops_.{rotate,rewrap,status}` surface alongside `auth_secret_codec_`. `server.cpp`
+generalized those three seams from a single hard-coded `auth_secret_codec_` member to a
+`kek_enrolled_codecs()` list (`ServerImpl::kek_enrolled_codecs()`) so a future third consumer
+needs only an addition to that list. The multi-codec rotate mints the new KEK version **once**
+(via `auth_secret_codec_->rotate_kek()` only) and then brings every other enrolled codec onto it
+under the SAME `secrets_kek_op` advisory lock hold — each secondary codec's `init()` resyncs its
+in-memory `active_version_` from the shared `secrets.kek_meta` table (a no-mutation re-verify,
+safe to call repeatedly post-boot), then `rewrap_all()` re-wraps that codec's own registered
+columns. This is deliberately NOT N independent `rotate_kek()` calls, which would mint N
+divergent KEK versions — see `ServerImpl::kek_enrolled_codecs()`'s doc comment (server.cpp) for
+the full contract. An operator's `/rotate` or `/rewrap` request (REST or MCP) now re-wraps
+`plugin_config_store.secrets.sealed_value` too.
 
 `set_secret` encrypts under a **fresh DEK per write** (never DEK reuse — a secret update mints a
 new sealed blob from scratch). The SecretId AAD `row_pk` is the deterministic `scope_key`
@@ -181,17 +188,11 @@ exact same rows as before; the REST surface is the one caller that now reads it.
 
 ## Open items — deliberately NOT closed by this package
 
-**This store's `SecretCodec` is not yet wired into the live KEK rotate/rewrap endpoints.**
-`PluginConfigStore`'s constructor registers `plugin_config_store.secrets.sealed_value` on its own
-codec instance (ADR-0010 per-store model), which is necessary but not sufficient for "an
-operator's `/rotate` or `/rewrap` call re-wraps this column too" to be actually true: the live
-endpoints in `kek_routes.hpp`/`server.cpp` call `rotate_kek`/`rewrap_all` on `auth_secret_codec_`
-specifically. Making this store's column part of the live rotation surface needs either that
-codec instance to be looped in by the wiring/constructing PR (calling the same lifecycle
-operations on it alongside `auth_secret_codec_`), or a generalization of the KEK endpoints to walk
-a registry of codecs — both are `server.cpp`/`kek_routes.hpp` changes outside this package's
-owned, new-files-only scope. Until that lands, a plugin secret stays wrapped under whatever KEK
-version was active when it was written, indefinitely.
+**KEK-rotation-surface enrolment — CLOSED, see "KEK-rotation-surface enrolment" above.** p14
+(PR1.5c/1.6c) constructed this store's dedicated `SecretCodec` in `server.cpp` and enrolled it
+into the generalized `kek_ops_.{rotate,rewrap,status}` seam
+(`ServerImpl::kek_enrolled_codecs()`) alongside `auth_secret_codec_`. No residual gap remains on
+this item.
 
 **Agent-side secret delivery does not exist.** `yuzu_ctx_get_secret`
 (`agents/core/src/agent.cpp:463`) is a hard-coded `nullptr` stub. This package is **server-side

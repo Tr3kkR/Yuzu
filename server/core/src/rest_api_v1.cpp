@@ -996,7 +996,56 @@ const std::string& openapi_spec() {
     },
     "/access-reviews/{id}/close": {
       "post": {"summary": "Close an open review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Does not require every attestation to be decided first — a campaign closed with pending rows still outstanding is itself evidence, not something this route silently forces to completion. Self-audited as access_review.closed.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{closed: true}"}, "403": {"description": "Requires AccessReview:Attest"}, "404": {"description": "No campaign with that id, or already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
-    }
+    })json"
+        // Fresh literal split (MSVC C2026 ~16 KB per-literal cap) — PR1.5c/1.6c
+        // (p14) ADR-0031 operator surface: plugin config/secret/kill-switch
+        // (p5) and upload-grant + agent chunked-receive (p6) paths. The
+        // upload-grant mint/list/revoke routes are operator-facing (MCP
+        // twins exist); the /uploads* session routes authenticate on a
+        // grant/session bearer credential (X-Yuzu-Upload-Grant /
+        // X-Yuzu-Upload-Session), never an operator session, and are part
+        // of the HTTP contract despite having no MCP twin (spec item 2/3).
+        R"json(,
+    "/plugin-config": {
+      "get": {"summary": "List plugin config rows", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Read, routed through the ADR-0017 admit-then-filter list gate. AdmitAll (global grant, or RBAC loaded-and-disabled) serves the list; a management-group-CONFINED grant is denied (403), not silently narrowed — this resource is plugin/key configuration, not agent-scoped data, so there is no principled per-agent filter to apply.", "parameters": [{"name": "plugin", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 64}, "description": "Exact plugin filter; omit for every plugin"}], "responses": {"200": {"description": "{data: [{plugin, key, value, updated_at_ms, updated_by}], meta:{api_version, truncated}}"}, "403": {"description": "Requires PluginConfig:Read (or a management-group-confined grant, refused here by design)"}, "503": {"description": "Plugin config store or authorization store unavailable"}}}
+    },
+    "/plugin-config/{plugin}/{key}": {
+      "get": {"summary": "Get one plugin config value", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Read.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "key", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{plugin, key, value, updated_at_ms, updated_by}"}, "400": {"description": "Invalid plugin/key grammar"}, "404": {"description": "No such row"}, "503": {"description": "Plugin config store unavailable"}}},
+      "put": {"summary": "Upsert one plugin config value", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Write. Audited (plugin_config.set) before the mutation is attempted.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "key", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["value"], "properties": {"value": {"type": "string", "maxLength": 8192}}}}}}, "responses": {"200": {"description": "{plugin, key, value, updated_at_ms, updated_by}"}, "400": {"description": "Invalid plugin/key/value grammar, or NUL byte in value"}, "503": {"description": "Plugin config store unavailable, or the pre-mutation audit row could not be persisted"}}},
+      "delete": {"summary": "Delete one plugin config value", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Delete. Audited (plugin_config.delete). A double-delete/retry answers 404 with no audit row (existence pre-checked via GET first).", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "key", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{deleted: true}"}, "404": {"description": "No such row"}, "503": {"description": "Plugin config store unavailable, or the pre-mutation audit row could not be persisted"}}}
+    },
+    "/plugin-config/{plugin}/{key}/secret": {
+      "put": {"summary": "Seal a plugin secret value", "tags": ["Plugin Config"], "description": "Requires PluginSecret:Write. Write-only: the response is metadata ONLY (plugin, key, updated_at_ms, updated_by) — no method on this surface, anywhere, returns a secret's plaintext, so there is deliberately no GET/list route for secrets. Each write mints a fresh DEK; the audit detail is structurally redacted (never carries the value). Audited (plugin_secret.set) before the mutation is attempted.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "key", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["value"], "properties": {"value": {"type": "string", "minLength": 1, "maxLength": 65536}}}}}}, "responses": {"200": {"description": "{plugin, key, updated_at_ms, updated_by} — no value field, ever"}, "400": {"description": "Invalid plugin/key/value grammar"}, "503": {"description": "Plugin config store, or secret encryption, unavailable — or the pre-mutation audit row could not be persisted"}}},
+      "delete": {"summary": "Delete a sealed plugin secret", "tags": ["Plugin Config"], "description": "Requires PluginSecret:Delete. Audited (plugin_secret.delete) before the mutation is attempted — no existence pre-check exists on this write-only plane, so a delete of an already-absent key still records the attempt.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "key", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{deleted: true}"}, "400": {"description": "Invalid plugin/key grammar"}, "503": {"description": "Plugin config store unavailable, or the pre-mutation audit row could not be persisted"}}}
+    },
+    "/plugin-config/{plugin}/kill-switch": {
+      "get": {"summary": "Read a plugin or plugin-action kill-switch's display state", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Read. NOT the dispatch-gating decision (PluginConfigStore::action_allowed fails closed on any store error, which this display accessor deliberately does not) — this is the inspection view. Absence of a prior flip reads as enabled=true.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "action", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Action name for an action-level switch; omit for the whole-plugin switch"}], "responses": {"200": {"description": "{plugin, action, enabled, reason, set_by, updated_at_ms}"}, "400": {"description": "Invalid plugin/action grammar"}, "503": {"description": "Plugin config store unavailable"}}},
+      "put": {"summary": "Flip a plugin or plugin-action kill switch", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Write. Every dispatch-gating caller that consults this switch fails CLOSED on any store error, so this is a reliable emergency stop for the named plugin/action. Audited (plugin_config.kill_switch.set) before the mutation is attempted.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "action", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Action name for an action-level switch; omit for the whole-plugin switch"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["enabled"], "properties": {"enabled": {"type": "boolean"}, "reason": {"type": "string", "maxLength": 512}}}}}}, "responses": {"200": {"description": "{plugin, action, enabled, reason, set_by, updated_at_ms}"}, "400": {"description": "Invalid plugin/action/reason grammar, or missing/non-boolean enabled"}, "503": {"description": "Plugin config store unavailable, or the pre-mutation audit row could not be persisted"}}}
+    },
+    "/upload-grants": {
+      "post": {"summary": "Mint a one-time upload-grant credential", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Write. Authorises ONE agent to push ONE file back to the server (CC-06 authenticated chunked-receive protocol, docs/adr/3004-artifact-blob-storage.md). grant_secret is returned EXACTLY ONCE in this response — only its digest is persisted. destination_key is SERVER-DERIVED from retention_class + the freshly-minted grant_id only; source_path is stored as informational metadata and never influences it.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}, "source_path": {"type": "string", "description": "Informational only; never used to derive the destination key"}, "expected_sha256": {"type": "string"}, "retention_class": {"type": "string", "enum": ["standard", "extended", "transient"], "default": "standard"}, "declared_max_size": {"type": "integer"}, "ttl_secs": {"type": "integer"}}}}}}, "responses": {"201": {"description": "{grant_id, grant_secret, expires_at, destination_key}"}, "400": {"description": "Invalid input (empty agent_id, non-positive declared_max_size, unrecognized retention_class)"}, "503": {"description": "Upload grant store unavailable, or a CSPRNG/digest failure"}}},
+      "get": {"summary": "List upload grants", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Read, routed through the ADR-0017 admit-then-filter list gate: AdmitAll lists every grant; a management-group-confined grant lists only grants for agents in the caller's visible set. No client-selected agent_id filter exists on this surface — the frozen protocol forbids one on every path. Never returns a grant secret or its hash.", "responses": {"200": {"description": "{data: [{grant_id, agent_id, source_path, declared_max_size, expected_sha256, retention_class, destination_key, state, minted_by, created_at, expires_at}]}"}, "403": {"description": "No grant anywhere for UploadGrant:Read"}, "503": {"description": "Upload grant store unavailable"}}}
+    },
+    "/upload-grants/{grant_id}": {
+      "delete": {"summary": "Revoke an upload grant", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Delete. Closes the grant's one-time redemption window; has NO effect on a grant already redeemed into a session — an in-flight or completed upload is untouched.", "parameters": [{"name": "grant_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"204": {"description": "Revoked"}, "404": {"description": "No such grant, or it was already redeemed/revoked"}, "503": {"description": "Upload grant store unavailable"}}}
+    },
+    "/uploads": {
+      "post": {"summary": "Open an upload session by redeeming a grant credential", "tags": ["Upload Grants"], "description": "AGENT-AUTHENTICATED, not an operator route — authenticates via the X-Yuzu-Upload-Grant header (the raw grant_secret from mint), never a session cookie/token/AuthFn. One-time redemption: a grant that has already been redeemed, revoked, or expired is refused. No MCP twin exists for this route (ADR-0031/A5) — MCP tools authenticate as an operator, and this credential is agent-scoped, not operator-scoped.", "parameters": [{"name": "X-Yuzu-Upload-Grant", "in": "header", "required": true, "schema": {"type": "string"}, "description": "<grant_id>.<grant_secret>"}], "responses": {"200": {"description": "{upload_id, session_secret, chunk_max_bytes, offset:0, expires_at}"}, "400": {"description": "TLS required (when the deployment runs HTTP), or a malformed credential"}, "404": {"description": "Grant unknown, already redeemed, revoked, or expired"}, "503": {"description": "Upload grant store unavailable"}}}
+    },
+    "/uploads/{upload_id}/chunk": {
+      "put": {"summary": "Write one chunk of an open upload", "tags": ["Upload Grants"], "description": "AGENT-AUTHENTICATED via X-Yuzu-Upload-Session: <upload_id>.<session_secret> (from the session-open response), never an operator session. Bytes are written to disk BEFORE the recorded offset advances (write-then-CAS). Not individually audited (the per-chunk volume would be noise, not signal) — the session-open and commit/cancel rows bracket the upload's lifecycle. No MCP twin (ADR-0031/A5) — see POST /uploads.", "parameters": [{"name": "upload_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "X-Yuzu-Upload-Session", "in": "header", "required": true, "schema": {"type": "string"}}, {"name": "Content-Range", "in": "header", "required": true, "schema": {"type": "string"}, "description": "bytes <start>-<end>/<total>, per the frozen protocol"}], "responses": {"200": {"description": "{offset}"}, "400": {"description": "Malformed Content-Range, or an out-of-order/overlapping chunk"}, "404": {"description": "Session unknown or credential mismatch"}, "409": {"description": "The CAS on recorded offset missed (a concurrent chunk already advanced it)"}, "410": {"description": "Session expired or already terminal; size_exceeded forces termination the same way"}, "503": {"description": "Upload grant store unavailable, or a disk write failure"}}}
+    },
+    "/uploads/{upload_id}": {
+      "get": {"summary": "Read an open or terminal upload session's status", "tags": ["Upload Grants"], "description": "AGENT-AUTHENTICATED via X-Yuzu-Upload-Session, never an operator session. No MCP twin (ADR-0031/A5) — see POST /uploads.", "parameters": [{"name": "upload_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "X-Yuzu-Upload-Session", "in": "header", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{upload_id, state, offset, declared_max_size, expires_at}"}, "404": {"description": "Session unknown or credential mismatch"}, "503": {"description": "Upload grant store unavailable"}}},
+      "delete": {"summary": "Cancel an open upload session", "tags": ["Upload Grants"], "description": "AGENT-AUTHENTICATED via X-Yuzu-Upload-Session, never an operator session. Terminal, non-success: discards the partial blob. No MCP twin (ADR-0031/A5) — see POST /uploads.", "parameters": [{"name": "upload_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "X-Yuzu-Upload-Session", "in": "header", "required": true, "schema": {"type": "string"}}], "responses": {"204": {"description": "Cancelled"}, "404": {"description": "Session unknown or credential mismatch"}, "409": {"description": "Session already terminal"}, "503": {"description": "Upload grant store unavailable"}}}
+    },
+    "/uploads/{upload_id}/commit": {
+      "post": {"summary": "Commit a completed upload", "tags": ["Upload Grants"], "description": "AGENT-AUTHENTICATED via X-Yuzu-Upload-Session, never an operator session. Terminal success: verifies the received size/hash, writes the completed_uploads durability record, and transitions the session in ONE transaction. No MCP twin (ADR-0031/A5) — see POST /uploads.", "parameters": [{"name": "upload_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "X-Yuzu-Upload-Session", "in": "header", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"sha256": {"type": "string"}}}}}}, "responses": {"200": {"description": "{committed: true, destination_key, size, sha256}"}, "400": {"description": "Size/hash mismatch against the declared/expected values"}, "404": {"description": "Session unknown or credential mismatch"}, "409": {"description": "Session already terminal (concurrent commit/cancel)"}, "503": {"description": "Upload grant store unavailable"}}}
+    })json"
+        // Split again (MSVC C2026 16,380-byte cap); concatenated at compile
+        // time, so the emitted OpenAPI JSON is byte-identical to the unsplit
+        // form.
+        R"json(
   }
 })json";
     return spec;
@@ -7568,40 +7617,17 @@ void RestApiV1::register_routes(
              });
 
     // ── File Retrieval (capability 10.13) ────────────────────────────────
-    // Receives files uploaded by the content_dist plugin's upload_file action.
-    sink.Post("/api/v1/file-retrieval",
-              [auth_fn, perm_fn, audit_fn](const httplib::Request& req, httplib::Response& res) {
-                  if (!perm_fn(req, res, "FileRetrieval", "Write"))
-                      return;
-
-                  // Extract form fields from the request body (JSON)
-                  auto body = nlohmann::json::parse(req.body, nullptr, false);
-                  if (body.is_discarded() || !body.contains("agent_id")) {
-                      res.status = 400;
-                      res.set_content(detail::a4_error(res, "invalid request body"), "application/json");
-                      return;
-                  }
-                  auto agent_id = body.value("agent_id", "");
-                  auto original_path = body.value("original_path", "");
-                  auto sha256 = body.value("sha256", "");
-                  auto file_size = body.value("size", int64_t{0});
-
-                  // Store the uploaded file (implementation: write to a configurable
-                  // retrieval directory, keyed by agent_id and timestamp)
-                  spdlog::info("FileRetrieval: received {} bytes from agent={}, path={}", file_size,
-                               agent_id, original_path);
-
-                  audit_fn(req, "file_retrieval.upload", "success", "FileRetrieval", agent_id,
-                           "path=" + original_path + ", size=" + std::to_string(file_size));
-
-                  auto data = JObj()
-                                  .add("status", "received")
-                                  .add("bytes", file_size)
-                                  .add("agent_id", agent_id)
-                                  .add("sha256", sha256)
-                                  .str();
-                  res.set_content(ok_json(data), "application/json");
-              });
+    // The legacy POST /api/v1/file-retrieval handler that lived here was
+    // REMOVED (PR1.5c/1.6c, p14): it trusted a body-supplied `agent_id`
+    // (unauthenticated-as-that-agent metadata-only "upload"), stored
+    // nothing, and had no relationship to the actual bytes an agent might
+    // send. `register_file_retrieval_routes` (file_retrieval_routes.cpp,
+    // wired in server.cpp) replaces it with the authenticated one-time
+    // upload-grant + chunked-receive protocol
+    // (docs/adr/3004-artifact-blob-storage.md) — the operator mint/list/
+    // revoke routes live at /api/v1/upload-grants*, the agent-authenticated
+    // session routes at /api/v1/uploads*. Exactly one handler serves file
+    // retrieval now.
 
     // ── Guardian / Guaranteed State (/api/v1/guaranteed-state) ────────────
     // PR 2 of the Guardian Windows-first rollout. Endpoints follow design

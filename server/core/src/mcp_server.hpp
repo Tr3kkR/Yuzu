@@ -16,6 +16,12 @@
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
 #include "kek_routes.hpp" // KekOps / KekOpResult (#2395 track C): reused, not redefined
+// ADR-0031 operator surface (PR1.5c/1.6c, p14): reuses
+// UploadGrantListAuthorization/UploadGrantListDecision verbatim (not
+// redefined) so the REST list-admit gate (GET /api/v1/upload-grants) and its
+// MCP twin (list_upload_grants) cannot drift — same reuse discipline as
+// kek_routes.hpp above.
+#include "file_retrieval_routes.hpp"
 #include "management_group_store.hpp"
 #include "mcp_session.hpp"
 #include "mcp_stream.hpp" // GET SSE channel: StreamRevalidateFn, handle_get_tail (2f PR 2)
@@ -54,6 +60,12 @@ class EnginePrincipalStore;
 // directory_sync.hpp. AuthDB is already forward-declared via <yuzu/server/auth.hpp>.
 class AccessReviewStore;
 class DirectorySync;
+// ADR-0031 operator surface (PR1.5c, p14) — backs the plugin config/secret/
+// kill-switch MCP twins. Forward-declared (pointer-only in the setter
+// below); the .cpp includes plugin_config_store.hpp for the definition.
+// UploadGrantStore itself is NOT forward-declared here — it arrives fully
+// defined via file_retrieval_routes.hpp's own include above.
+class PluginConfigStore;
 }
 
 namespace yuzu::server::detail {
@@ -288,6 +300,35 @@ public:
     /// to KekRoutes::register_routes.
     void set_kek_ops(KekOps ops) { kek_ops_ = std::move(ops); }
 
+    /// ADR-0031 operator surface (PR1.5c) — plugin config/secret/kill-switch
+    /// store, backing get/set/delete_plugin_config, set/delete_plugin_secret,
+    /// get/set_plugin_kill_switch. Same setter idiom as
+    /// set_engine_principal_store above (the handler's `[=]` lambda captures
+    /// `this`, so the injection is a live read on the next request). Unset
+    /// (`nullptr`, the default) ⇒ every one of those tools answers
+    /// "unavailable" rather than crashing or silently no-op'ing.
+    void set_plugin_config_store(PluginConfigStore* store) { plugin_config_store_ = store; }
+
+    /// ADR-0031 operator surface (PR1.6c) — upload-grant store + the
+    /// ADR-0017 list-admit resolver for list_upload_grants, backing
+    /// mint/list/revoke_upload_grant. `list_read_fn` is the SAME shape as
+    /// `yuzu::server::Deps::ListReadFn` (file_retrieval_routes.hpp) reused
+    /// verbatim, not redefined, so the REST GET /api/v1/upload-grants list
+    /// gate and this MCP twin cannot drift — server.cpp wires both from the
+    /// identical `RbacStore::authorize_list_read` call. Unset store ⇒ every
+    /// upload-grant tool answers "unavailable"; unset (default-constructed)
+    /// `list_read_fn` fails CLOSED (kDenyAll), matching the REST twin's own
+    /// unwired default (file_retrieval_routes.hpp's Deps doc comment) — NOT
+    /// the fail-open-when-unwired contract ResponseScopeFn/InventoryScopeFn
+    /// above use, because this is the sole admit decision for the route, not
+    /// a defense-in-depth filter over an already-gated read.
+    using UploadGrantListReadFn =
+        std::function<UploadGrantListAuthorization(const std::string& username)>;
+    void set_upload_grant_ops(UploadGrantStore* store, UploadGrantListReadFn list_read_fn) {
+        upload_grant_store_ = store;
+        upload_grant_list_read_fn_ = std::move(list_read_fn);
+    }
+
     /// Republish-CRL callback (PR4 B-2): mirrors `CaRoutes::PublishCrlFn` so the
     /// MCP `revoke_certificate` tool republishes the CRL after a revoke exactly as
     /// the REST `/api/v1/ca/revoke` handler does. Returns the new CRL DER, or
@@ -467,6 +508,13 @@ private:
     // KEK rotation seam (#2395 track C) - see set_kek_ops above. Default-
     // constructed (all three std::functions empty) until server.cpp wires it.
     KekOps kek_ops_;
+    // ADR-0031 operator surface (PR1.5c/1.6c, p14) - see set_plugin_config_store
+    // / set_upload_grant_ops above. Nullable; every backed tool checks before
+    // use and answers a clean "unavailable" error, matching
+    // engine_principal_store_'s contract above.
+    PluginConfigStore* plugin_config_store_{nullptr};
+    UploadGrantStore* upload_grant_store_{nullptr};
+    UploadGrantListReadFn upload_grant_list_read_fn_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here
