@@ -94,6 +94,17 @@ TEST_CASE("parse_content_range accepts a single-byte final chunk", "[server][upl
     CHECK(content_range_length(*cr) == 1);
 }
 
+// A whole small file sent as one chunk. `end` is an inclusive byte INDEX, so
+// the final byte of an N-byte entity is index N-1 — this is the common case for
+// any upload under chunk_max_bytes, not an edge case.
+TEST_CASE("parse_content_range accepts a whole entity in one chunk", "[server][upload]") {
+    auto cr = parse_content_range("bytes 0-999/1000");
+    REQUIRE(cr.has_value());
+    CHECK(cr->start == 0);
+    CHECK(cr->end == 999);
+    CHECK(content_range_length(*cr) == 1000);
+}
+
 TEST_CASE("parse_content_range rejects malformed headers", "[server][upload]") {
     CHECK_FALSE(parse_content_range("").has_value());
     CHECK_FALSE(parse_content_range("bytes 0-99").has_value());          // no total
@@ -102,8 +113,7 @@ TEST_CASE("parse_content_range rejects malformed headers", "[server][upload]") {
     CHECK_FALSE(parse_content_range("bytes 0-/1000").has_value());       // no end
     CHECK_FALSE(parse_content_range("bytes 0-99/").has_value());         // no total
     CHECK_FALSE(parse_content_range("bytes 10-5/1000").has_value());     // end < start
-    CHECK_FALSE(parse_content_range("bytes 0-999/1000").has_value());    // end == total (must be < total)
-    CHECK_FALSE(parse_content_range("bytes 0-1000/1000").has_value());   // end >= total
+    CHECK_FALSE(parse_content_range("bytes 0-1000/1000").has_value());   // end == total (last valid index is total-1)
     CHECK_FALSE(parse_content_range("bytes 0-99/0").has_value());        // total <= 0
     CHECK_FALSE(parse_content_range("bytes a-99/1000").has_value());     // non-numeric
     CHECK_FALSE(parse_content_range("bytes 0-99/-5").has_value());       // negative total
