@@ -1967,9 +1967,19 @@ std::string probe_tool_path(const std::vector<std::string>& candidates) {
     for (const auto& c : candidates) {
         if (!detail::is_absolute_path(c))
             continue;
+        // K2/CDX-P2-003: the header promises "exists AND is executable" on
+        // both platforms (the POSIX twin checks X_OK). "Executable" on this
+        // backend means run_bounded_subprocess could actually spawn it:
+        // never a banned .bat/.cmd/.com (the same build_launch_spec policy
+        // the spawn path enforces -- a candidate the runner would refuse to
+        // exec must not be probed as usable), and a real executable image
+        // (GetBinaryTypeW -- which also rejects directories, non-PE files
+        // and nonexistent paths, subsuming the old attribute check).
+        if (detail::is_banned_windows_extension(c))
+            continue;
         std::wstring wc = utf8_to_wide(c);
-        DWORD attrs = GetFileAttributesW(wc.c_str());
-        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0)
+        DWORD binary_type = 0;
+        if (GetBinaryTypeW(wc.c_str(), &binary_type) != 0)
             return c;
     }
     return {};

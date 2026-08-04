@@ -328,7 +328,10 @@ YUZU_EXPORT bool subprocess_cancel_requested();
  * ADR-3002 ("tool path probing"): returns the first candidate that is an
  * absolute path (same contract as run_bounded_subprocess's argv[0]) AND
  * exists AND is executable, or an empty string if none match. Useful when a
- * tool's location varies (e.g. `ip` differs across distros).
+ * tool's location varies (e.g. `ip` differs across distros). "Executable"
+ * is judged per backend as "this runner could spawn it": POSIX = regular
+ * file + access(X_OK); Windows = not a spawn-banned .bat/.cmd/.com and a
+ * real executable image (GetBinaryTypeW), K2/CDX-P2-003.
  *
  * Honestly noted (ADR-3002): this is a stat-then-exec probe, so it is still
  * a filesystem TOCTOU if an attacker can replace the probed binary between

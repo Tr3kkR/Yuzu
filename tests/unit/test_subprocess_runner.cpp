@@ -1094,6 +1094,23 @@ TEST_CASE("probe_tool_path returns the first existing, absolute, executable cand
     CHECK(probe_tool_path({"relative/path", "/bin/sh"}) == "/bin/sh"); // relative candidates skipped
 }
 
+// K2/CDX-P2-003: the "is executable" half of the header contract, previously
+// untested on any platform -- an existing regular file with no execute bit
+// must be skipped, not returned.
+TEST_CASE("probe_tool_path skips an existing but non-executable regular file",
+          "[subprocess][probe]") {
+    yuzu::test::TempDir dir("yuzu_test_probe_");
+    std::filesystem::create_directories(dir.path);
+    const std::string plain = (dir.path / "not-executable").string();
+    {
+        const int fd = ::open(plain.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        REQUIRE(fd >= 0);
+        ::close(fd);
+    }
+    CHECK(probe_tool_path({plain, "/bin/sh"}) == "/bin/sh");
+    CHECK(probe_tool_path({plain}).empty());
+}
+
 // ---------------------------------------------------------------------------
 // B1: the pure build_launch_spec()/LaunchSpec core, exercised WITHOUT
 // spawning a real process (CLAUDE.md test discipline) -- the bounded
@@ -1154,9 +1171,13 @@ TEST_CASE("the Spawner interface is independently injectable/testable without sp
 // backend that fails to kill its child fails loudly instead of hanging CI.
 // ---------------------------------------------------------------------------
 
+#include "test_helpers.hpp"
+
 #include <yuzu/agent/subprocess_runner.hpp>
 
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -1284,6 +1305,34 @@ TEST_CASE("run_bounded_subprocess (Windows) honours a pre-armed per-invocation C
     CHECK(result.timed_out);
     CHECK(result.termination_reason == TerminationReason::cancelled);
     CHECK(elapsed < 15s);
+}
+
+// K2/CDX-P2-003: the Windows "is executable" half of probe_tool_path's
+// header contract -- previously the backend only checked exists-and-not-a-
+// directory, so an existing .txt, a directory sibling, or a spawn-banned
+// .bat all probed as "usable" and were returned to callers the runner would
+// then refuse (or worse, be unable) to exec.
+TEST_CASE("probe_tool_path (Windows) honours the executable half of its contract",
+          "[subprocess][probe][windows]") {
+    // A real PE binary is returned; a directory is not executable.
+    CHECK(probe_tool_path({kCmdExe}) == kCmdExe);
+    CHECK(probe_tool_path({"C:\\Windows"}).empty());
+
+    yuzu::test::TempDir dir("yuzu_test_probe_");
+    std::filesystem::create_directories(dir.path);
+
+    // An existing non-PE file is skipped (GetBinaryTypeW rejects it).
+    const std::string plain = (dir.path / "notabinary.txt").string();
+    { std::ofstream out(plain); out << "just text\n"; }
+    CHECK(probe_tool_path({plain, kCmdExe}) == kCmdExe);
+
+    // A spawn-banned .bat/.cmd/.com is skipped even when it EXISTS -- the
+    // same build_launch_spec ban the spawn path enforces (CVE-2024-24576),
+    // so the probe never vouches for a candidate the runner refuses to exec.
+    const std::string banned = (dir.path / "existing.bat").string();
+    { std::ofstream out(banned); out << "@echo off\r\n"; }
+    CHECK(probe_tool_path({banned, kCmdExe}) == kCmdExe);
+    CHECK(probe_tool_path({banned}).empty());
 }
 
 #endif // _WIN32
