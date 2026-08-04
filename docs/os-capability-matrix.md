@@ -167,6 +167,12 @@ section above, but does not yet populate its own `action_descriptors`). Every
 plugin the CI gate currently tracks therefore shows up as undeclared below —
 expected, and exactly what the ratchet baseline reflects today.
 
+**Rung legend** (the table's Rung column below): 1 = native OS interface
+(zero processes, best) · 2 = argv runner · 3 = governed shell (two-plus
+processes, worst) — rung states *how* a leg acquires its capability per
+docs/adr/3002-acquisition-ladder.md, never how mature or hardened the
+implementation is.
+
 <!-- BEGIN GENERATED: capmatrix-gen (#2204) — do not hand-edit; regenerate with
      tools/capmatrix-gen, verified by scripts/ci/check-capability-matrix.sh -->
 | Plugin | Action | OS | Support | Rung | Mechanism | Fallback |
