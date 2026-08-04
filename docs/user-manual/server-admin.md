@@ -256,9 +256,12 @@ withdrawn. Four successive attempts to publish a safe version each shipped a def
 destroyed or stranded live approvals, and the last review round established that the failure was
 structural rather than a matter of tightening predicates: the statement needs to distinguish
 tickets carried across the upgrade from tickets minted after it, the only available discriminator
-is the submission timestamp, and the timestamp of the upgrade itself cannot be recovered from the
-data — the MCP gate does not record its own surface, so no query can see the population the bound
-is meant to protect. A procedure that cannot be executed safely from the information available to
+is the submission timestamp, and the upgrade instant is not recoverable from the approvals table.
+The only column that could date the upgrade is `origin`, and of the three code paths that mint an
+approval only two record one — the scheduler and the REST instruction gate. The MCP gate
+deliberately records none until its own follow-up lands, so a query anchored on the first
+declared-origin row dates the first *scheduled or REST* approval after the upgrade, which can be
+arbitrarily later, and never sees the MCP population the bound exists to protect. A procedure that cannot be executed safely from the information available to
 the operator does not belong in an operator manual, and one that also writes no audit row is worse
 than the exposure it closes.
 
