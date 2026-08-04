@@ -785,7 +785,7 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 ### 18.5 OIDC / SSO Integration :white_check_mark: `T2`
 
-`OidcProvider` (575 LOC): PKCE authorization code flow, OpenID Connect discovery, JWT validation (iss, aud, nonce, exp), Entra ID group claim parsing, group-to-role mapping (`--oidc-admin-group`), token exchange via platform HTTP (WinHTTP/httplib). Login page SSO button active. Runtime-configurable via Settings UI (`POST /api/settings/oidc`) — admin can enter issuer, client_id, client_secret, redirect_uri, and admin_group from the dashboard without server restart. "Test Connection" button validates OIDC discovery endpoint. TLS cert verification configurable (`--oidc-skip-tls-verify`).
+`OidcProvider` (575 LOC): PKCE authorization code flow, OpenID Connect discovery, JWT validation (iss, aud, nonce, exp), Entra ID group claim parsing, group-to-role mapping (`--oidc-admin-group`), token exchange via platform HTTP (WinHTTP/httplib). Login page SSO button active. Runtime-configurable via Settings UI (`POST /api/settings/oidc`) — admin can enter issuer, client_id, client_secret, redirect_uri, and admin_group from the dashboard without server restart - though the swap is process-local and a restart reverts to the CLI/env values. "Test Connection" button validates OIDC discovery endpoint. TLS cert verification configurable (`--oidc-skip-tls-verify`).
 
 ### 18.6 Active Directory / Entra Integration :white_check_mark: `T2`
 
@@ -921,7 +921,7 @@ Kubernetes-style health probes: `/livez` (always 200) and `/readyz` (checks stor
 
 ### 22.4 Platform Configuration (TTLs, Limits) :white_check_mark: `T2`
 
-`RuntimeConfigStore` (219 LOC). Persistent runtime configuration overrides in SQLite. Allow-listed safe keys only (no secrets). Set/get/remove with `updated_by` attribution. Changes take effect without restart. REST API for configuration CRUD. Startup defaults overridden by stored values.
+`RuntimeConfigStore`. Persistent runtime configuration overrides in SQLite. Allow-listed keys only, **including one credential** (`oidc_client_secret`, plaintext at rest until ADR-0010 envelope encryption reaches this store) - `is_secret_key` gates every emitter (startup log, `GET /api/config`, the `config.update` audit detail, and the `PUT` response echo) so the value is not returned or logged; pre-existing audit rows are redacted when read. Set/get/remove with `updated_by` attribution. **Only some keys take effect without a restart**: the three retention keys are stored-only until a restart, DEX-alert keys until a restart or a Settings-UI save, OIDC keys apply ONLY via a Settings-UI save (a restart does not apply them), and `auto_approve_enabled` is never read back from this store - see `docs/user-manual/rest-api.md` "Runtime Configuration". REST API for configuration CRUD. Startup defaults overridden by stored values.
 
 ### 22.5 Gateway / Scale-Out Architecture :white_check_mark: `T2`
 
