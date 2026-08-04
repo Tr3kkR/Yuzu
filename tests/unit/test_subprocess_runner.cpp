@@ -642,6 +642,82 @@ TEST_CASE("run_bounded_subprocess never leaks a fd opened by a racing thread (TO
     CHECK_FALSE(any_leak);
 }
 
+namespace {
+// Closes std fd `target` for the duration of a scope (saving it aside above
+// the stdio range), restoring it on destruction. Models a daemonized parent
+// that runs with a standard descriptor genuinely CLOSED -- not redirected --
+// which is exactly the state where pipe()/open() start handing out fds 0-2.
+class ClosedStdFd {
+public:
+    explicit ClosedStdFd(int target) : target_(target), saved_(::dup(target)) {
+        REQUIRE(saved_ >= 3); // 0/1/2 all open here, so the copy lands above them
+        ::close(target_);
+    }
+    ~ClosedStdFd() {
+        ::dup2(saved_, target_);
+        ::close(saved_);
+    }
+    ClosedStdFd(const ClosedStdFd&) = delete;
+    ClosedStdFd& operator=(const ClosedStdFd&) = delete;
+
+private:
+    int target_;
+    int saved_;
+};
+} // namespace
+
+// CDX-P1-001/K3 (review blocker): pipe() returns the two lowest free
+// descriptors, so with a std fd closed in the parent a capture-pipe end lands
+// ON that fd; the child's dup2-then-close-by-number stdio wiring then destroys
+// the capture (or its own /dev/null wiring) and the runner returns a
+// successful-looking EMPTY result -- tool_ran=true, exit 0, output "".
+TEST_CASE("run_bounded_subprocess captures stdout with parent fd 1 closed",
+          "[subprocess][fd][macos][linux]") {
+    // The closed window covers ONLY the runner call: Catch2's reporter writes
+    // to stdout, so an assertion made while fd 1 is closed loses its output.
+    SubprocessResult r = [] {
+        ClosedStdFd closed(STDOUT_FILENO);
+        return run_bounded_subprocess({"/usr/bin/printf", "hello\n"},
+                                      SubprocessOptions{.deadline = 5000ms});
+    }();
+    CHECK(r.tool_ran);
+    CHECK(r.exit_code == 0);
+    CHECK(r.termination_reason == TerminationReason::exited);
+    CHECK(r.output == "hello\n");
+}
+
+TEST_CASE("run_bounded_subprocess wires child stdin to /dev/null with parent fd 0 closed",
+          "[subprocess][fd][macos][linux]") {
+    // The child-side open("/dev/null") can itself land on the closed fd 0, at
+    // which point the unconditional close-by-number undoes the stdin wiring:
+    // the ADR-3002 stdio policy promises /dev/null (immediate EOF), never a
+    // closed descriptor (EBADF).
+    SubprocessResult r = [] {
+        ClosedStdFd closed(STDIN_FILENO);
+        return run_bounded_subprocess(
+            {"/bin/sh", "-c", "if [ -r /dev/fd/0 ]; then printf R; else printf X; fi"},
+            SubprocessOptions{.deadline = 5000ms});
+    }();
+    CHECK(r.tool_ran);
+    CHECK(r.exit_code == 0);
+    CHECK(r.output == "R");
+}
+
+TEST_CASE("run_bounded_subprocess wires child stderr to /dev/null with parent fd 2 closed",
+          "[subprocess][fd][macos][linux]") {
+    // merge_stderr=false path: stderr must be /dev/null (writable), not the
+    // closed fd the parent happened to have.
+    SubprocessResult r = [] {
+        ClosedStdFd closed(STDERR_FILENO);
+        return run_bounded_subprocess(
+            {"/bin/sh", "-c", "if [ -w /dev/fd/2 ]; then printf W; else printf X; fi"},
+            SubprocessOptions{.deadline = 5000ms});
+    }();
+    CHECK(r.tool_ran);
+    CHECK(r.exit_code == 0);
+    CHECK(r.output == "W");
+}
+
 // ---------------------------------------------------------------------------
 // ADR-3002 runner-contract gaps + best-practice addendum (A1-A6, B1-B6).
 // ---------------------------------------------------------------------------

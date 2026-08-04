@@ -366,6 +366,27 @@ int dup2_retry(int oldfd, int newfd) {
     return rc;
 }
 
+// CDX-P1-001/K3: make a freshly created pipe end safe to use around the
+// child's stdio wiring. pipe() returns the two LOWEST free descriptors, so a
+// parent running with a standard fd closed (a daemonized service that closed
+// 0/1/2 before re-opening, or a crashed-away stdio) gets a pipe end ON fd
+// 0/1/2 -- the child's dup2-to-stdio + close-by-number sequence then silently
+// destroys the capture wiring. Move any such end above the stdio range with
+// F_DUPFD_CLOEXEC (atomic CLOEXEC, returns the lowest free fd >= 3); an end
+// already >= 3 just gets CLOEXEC set in place, exactly as before. Fail closed
+// on either fcntl -- CLOEXEC on every pipe end is load-bearing (it is what
+// keeps the pipe from leaking into whatever the child execs into).
+[[nodiscard]] bool secure_pipe_end(UniqueFd& fd) {
+    if (fd.get() < 3) {
+        const int raised = fcntl(fd.get(), F_DUPFD_CLOEXEC, 3);
+        if (raised == -1)
+            return false;
+        fd.reset(raised); // closes the low original
+        return true;
+    }
+    return fcntl(fd.get(), F_SETFD, FD_CLOEXEC) != -1;
+}
+
 // A true upper bound on any live fd NUMBER, computed in the PARENT (getrlimit /
 // sysctl / fopen are not async-signal-safe, so they must never run post-fork).
 // Used as the exclusive ceiling for the child's [3, ceiling) close-on-exec sweep.
@@ -618,13 +639,12 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         return result;
     UniqueFd read_fd(raw_pipe[0]);
     UniqueFd write_fd(raw_pipe[1]);
-    // Fail closed: CLOEXEC on both ends is load-bearing (it's what keeps
-    // the pipe from leaking into whatever the child execs into), so a
-    // failed fcntl here is treated the same as a failed pipe() above rather
-    // than silently continuing with a leaky descriptor. RAII closes both
-    // ends on this early return.
-    if (fcntl(read_fd.get(), F_SETFD, FD_CLOEXEC) == -1 ||
-        fcntl(write_fd.get(), F_SETFD, FD_CLOEXEC) == -1)
+    // secure_pipe_end: CLOEXEC both ends AND lift either end off fds 0-2 if
+    // the parent is running with a standard fd closed (CDX-P1-001/K3 -- see
+    // the helper). Fail closed: a failed fcntl here is treated the same as a
+    // failed pipe() above rather than silently continuing with a leaky or
+    // stdio-colliding descriptor. RAII closes both ends on this early return.
+    if (!secure_pipe_end(read_fd) || !secure_pipe_end(write_fd))
         return result;
 
     // PLAN-11: a second, CLOEXEC pipe used only to detect an exec()
@@ -640,8 +660,7 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         return result; // read_fd/write_fd close themselves
     UniqueFd err_read_fd(err_raw_pipe[0]);
     UniqueFd err_write_fd(err_raw_pipe[1]);
-    if (fcntl(err_read_fd.get(), F_SETFD, FD_CLOEXEC) == -1 ||
-        fcntl(err_write_fd.get(), F_SETFD, FD_CLOEXEC) == -1)
+    if (!secure_pipe_end(err_read_fd) || !secure_pipe_end(err_write_fd))
         return result; // fail closed, same reasoning as the pipe above
 
     // Ceiling for the child's inherited-fd sweep, computed HERE in the parent
@@ -783,7 +802,11 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
                 report_setup_failure_and_exit(err_write_fd.get(), errno);
             if (dup2_retry(devnull, STDERR_FILENO) == -1)
                 report_setup_failure_and_exit(err_write_fd.get(), errno);
-            close(devnull);
+            // CDX-P1-001/K3: with the parent's fd 2 closed, open() itself can
+            // return STDERR_FILENO -- the dup2 above was then a no-op and an
+            // unconditional close would undo the wiring it just did.
+            if (devnull != STDERR_FILENO)
+                close(devnull);
         }
 
         // ADR-3002 stdio policy: stdin -> /dev/null. CDX-006: also load-bearing
@@ -796,7 +819,10 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
                 report_setup_failure_and_exit(err_write_fd.get(), errno);
             if (dup2_retry(devnull_in, STDIN_FILENO) == -1)
                 report_setup_failure_and_exit(err_write_fd.get(), errno);
-            close(devnull_in);
+            // Same self-collision guard as the stderr /dev/null above: with
+            // the parent's fd 0 closed, open() can return STDIN_FILENO itself.
+            if (devnull_in != STDIN_FILENO)
+                close(devnull_in);
         }
 
         close(read_fd.get());
