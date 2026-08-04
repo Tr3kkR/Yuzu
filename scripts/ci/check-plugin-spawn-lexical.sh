@@ -103,13 +103,29 @@ while [ $# -gt 0 ]; do
 done
 if [ -z "$BASE_REF" ]; then BASE_REF="origin/dev"; fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "check-plugin-spawn-lexical: python3 is required (already a hard build dependency, see" >&2
-  echo "CLAUDE.md's PyYAML note) but was not found on PATH." >&2
+# Resolve a WORKING interpreter, not merely one whose name is on PATH:
+# `command -v python3` reports success on Windows even when the only thing
+# answering to that name is the default python3.exe App Execution Alias
+# stub, which prints a Microsoft-Store-redirect message and exits non-zero
+# instead of running any code. The Windows CI runner's provisioned, self-
+# tested toolchain guarantees `python` (deploy/windows/README.md's
+# toolchain-manifest.json, docs/windows-build.md's toolchain table) --
+# `python3` was never part of that contract, so prefer it where it genuinely
+# works but fall back rather than hard-requiring it.
+PYTHON_BIN=""
+for _candidate in python3 python; do
+  if command -v "$_candidate" >/dev/null 2>&1 && "$_candidate" -c "" >/dev/null 2>&1; then
+    PYTHON_BIN="$_candidate"
+    break
+  fi
+done
+if [ -z "$PYTHON_BIN" ]; then
+  echo "check-plugin-spawn-lexical: no working python interpreter found (tried python3, python --" >&2
+  echo "python3 already a hard build dependency, see CLAUDE.md's PyYAML note)." >&2
   exit 2
 fi
 
-python3 - "$REPO_ROOT" "$SELFTEST" "$BASE_REF" <<'PYEOF'
+"$PYTHON_BIN" - "$REPO_ROOT" "$SELFTEST" "$BASE_REF" <<'PYEOF'
 import bisect
 import collections
 import os
