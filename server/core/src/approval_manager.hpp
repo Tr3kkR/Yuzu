@@ -311,6 +311,14 @@ public:
     /// which uses this.
     std::expected<std::optional<Approval>, std::string> get_checked(const std::string& id) const;
 
+    /// How many same-tuple pending rows `find_pending` scans before truncating.
+    /// PUBLIC because the safety of that truncation depends on a caller-side
+    /// constant: any per-submitter pending cap MUST be strictly below this, or an
+    /// eligible row can hide behind foreign-origin rows and the dedup miss
+    /// reopens silently. `mcp_server.cpp` static_asserts its cap against this;
+    /// a new mint surface with its own cap must do the same.
+    static constexpr int kFindPendingScanLimit = 64;
+
     /// Newest PENDING approval matching (definition_id, submitted_by,
     /// scope_expression), or nullopt. The MCP approval-ticket mint dedup key
     /// (#289 / governance UP-1): reusing an extant pending ticket makes the mint
@@ -346,9 +354,15 @@ public:
     /// `consumed_by` records WHO recalled the ticket (PR #1796 H3/N2, SOC-2
     /// CC7.2) — the caller passes the authenticated principal; it is stored in
     /// the same CAS UPDATE so the who and the when can never disagree.
-    std::expected<void, std::string> consume_ticket(const std::string& id,
-                                                    const std::string& consumed_by);
-
+    ///
+    /// There is deliberately no overload that returns a bare string. The
+    /// pre-#2443 two-argument form did, and it discarded `ConsumeFailure`; a
+    /// caller reaching for it could not tell a cross-surface forgery from an
+    /// ordinary replay, which is the distinction #2442 and #2443 exist to draw.
+    /// It had no production caller and was removed rather than deprecated, so a
+    /// future caller cannot pick the lossy one by accident. Pass `{}` for no
+    /// precondition.
+    ///
     /// consume_ticket with a pre-consume recheck (#2443). A ticket can sit
     /// approved-but-unconsumed for up to the 7-day TTL, so the state its effect
     /// assumes may have moved on (the canonical case: an engine-key rotation the

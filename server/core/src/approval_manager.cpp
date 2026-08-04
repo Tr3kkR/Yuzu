@@ -517,15 +517,18 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
     // implies at least 64 pending for that submitter, and the tuple pins
     // `submitted_by`.
     //
-    // The invariant is therefore `LIMIT` > `kMcpSubmitterPendingCap`, and
-    // nothing couples the two numbers: they live in different translation units
-    // with no shared constant and no assert. Raise the cap above 64 and the
-    // dedup miss reopens silently, because foreign rows come from REST and the
-    // scheduler, which never consult that cap.
+    // The invariant is therefore `kFindPendingScanLimit` >
+    // `kMcpSubmitterPendingCap`. Those used to be unrelated literals in different
+    // translation units, so raising the cap above 64 reopened the dedup miss
+    // silently — foreign rows come from REST and the scheduler, which never
+    // consult that cap. The limit is now a public constant on this class and
+    // `mcp_server.cpp` static_asserts its cap against it, so that change fails
+    // the build instead.
     std::string sql = std::string("SELECT ") + kSelectAllCols +
                       " FROM approvals WHERE definition_id = ? AND submitted_by = ? "
                       "AND scope_expression = ? AND status = 'pending' "
-                      "ORDER BY submitted_at DESC LIMIT 64";
+                      "ORDER BY submitted_at DESC LIMIT " +
+                      std::to_string(kFindPendingScanLimit);
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
         return std::nullopt;
@@ -550,23 +553,6 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
 // ---------------------------------------------------------------------------
 // Consume (#289 — one-time MCP approval ticket)
 // ---------------------------------------------------------------------------
-
-std::expected<void, std::string> ApprovalManager::consume_ticket(const std::string& id,
-                                                                 const std::string& consumed_by) {
-    auto r = consume_ticket(id, consumed_by, {});
-    if (r)
-        return {};
-    // The two-argument overload is the pre-#2443 contract: one flat string, the
-    // kind discarded. It has NO production caller — the MCP recall moved to the
-    // three-argument form for #2442 so it can branch its audit detail on the
-    // kind. Kept for tests and for a caller that genuinely does not care.
-    //
-    // Its string set is no longer what it was: #2442 made the row read
-    // unconditional, so `get_checked`'s "read failed: <sqlite errmsg>" is
-    // reachable here where it previously could not be. A caller that pattern-
-    // matches these strings — none does — would need updating.
-    return std::unexpected(r.error().message);
-}
 
 std::expected<void, ConsumeError>
 ApprovalManager::consume_ticket(const std::string& id, const std::string& consumed_by,

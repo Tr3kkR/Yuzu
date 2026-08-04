@@ -345,7 +345,7 @@ TEST_CASE("ApprovalManager: consume_ticket stamps consumed_by with the recalling
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
 
-    auto consumed = mgr.consume_ticket(*id, "operator1");
+    auto consumed = mgr.consume_ticket(*id, "operator1", {});
     REQUIRE(consumed.has_value());
 
     auto row = mgr.get(*id);
@@ -365,7 +365,7 @@ TEST_CASE("ApprovalManager: consume_ticket without a principal fails closed",
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
     // An unattributable consumption would be a CC7.2 evidence hole.
-    auto consumed = mgr.consume_ticket(*id, "");
+    auto consumed = mgr.consume_ticket(*id, "", {});
     CHECK(!consumed.has_value());
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
@@ -381,9 +381,9 @@ TEST_CASE("ApprovalManager: consume_ticket replay is rejected and keeps the orig
     auto id = mgr.submit("mcp.quarantine_device", "operator1", "{}", "", ApprovalOrigin::kUnspecified);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*id, "operator1").has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
 
-    auto replay = mgr.consume_ticket(*id, "operator2");
+    auto replay = mgr.consume_ticket(*id, "operator2", {});
     CHECK(!replay.has_value());
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
@@ -413,7 +413,7 @@ TEST_CASE("ApprovalManager: a ticket minted by a declared non-MCP surface cannot
     REQUIRE(mgr.approve(*forged, "admin1", "").has_value());
 
     // The redemption is where it dies. This is the MCP recall's call shape.
-    auto redeemed = mgr.consume_ticket(*forged, "attacker");
+    auto redeemed = mgr.consume_ticket(*forged, "attacker", {});
     REQUIRE(!redeemed.has_value());
 
     // And the ticket is UNTOUCHED — a refused forgery must not burn it.
@@ -428,7 +428,7 @@ TEST_CASE("ApprovalManager: a ticket minted by a declared non-MCP surface cannot
                             ApprovalOrigin::kSchedule);
     REQUIRE(sched.has_value());
     REQUIRE(mgr.approve(*sched, "admin1", "").has_value());
-    CHECK(!mgr.consume_ticket(*sched, "attacker").has_value());
+    CHECK(!mgr.consume_ticket(*sched, "attacker", {}).has_value());
     CHECK(mgr.get(*sched)->consumed_at == 0);
 }
 
@@ -455,7 +455,7 @@ TEST_CASE("ApprovalManager: the redemption refusal is a distinct kind but not a 
     auto spent = mgr.submit("inventory.audit", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(spent.has_value());
     REQUIRE(mgr.approve(*spent, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*spent, "operator1").has_value()); // first use succeeds
+    REQUIRE(mgr.consume_ticket(*spent, "operator1", {}).has_value()); // first use succeeds
     auto replay = mgr.consume_ticket(*spent, "operator1", {});    // second does not
     REQUIRE(!replay.has_value());
     CHECK(replay.error().kind == ConsumeFailure::kNotConsumable);
@@ -474,7 +474,7 @@ TEST_CASE("ApprovalManager: an MCP-minted ticket under the reserved prefix still
                                ApprovalOrigin::kMcp);
     REQUIRE(declared.has_value());
     REQUIRE(mgr.approve(*declared, "admin1", "").has_value());
-    CHECK(mgr.consume_ticket(*declared, "operator1").has_value());
+    CHECK(mgr.consume_ticket(*declared, "operator1", {}).has_value());
     CHECK(mgr.get(*declared)->consumed_at != 0);
 
     // And the undeclared mint — which is what the frozen MCP gate actually does
@@ -482,7 +482,7 @@ TEST_CASE("ApprovalManager: an MCP-minted ticket under the reserved prefix still
     auto undeclared = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kUnspecified);
     REQUIRE(undeclared.has_value());
     REQUIRE(mgr.approve(*undeclared, "admin1", "").has_value());
-    CHECK(mgr.consume_ticket(*undeclared, "operator1").has_value());
+    CHECK(mgr.consume_ticket(*undeclared, "operator1", {}).has_value());
 }
 
 TEST_CASE("ApprovalManager: an ordinary non-MCP ticket is refused at redemption too",
@@ -706,7 +706,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kUnspecified);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*id, "operator1").has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
 
     bool ran = false;
     auto replay = mgr.consume_ticket(*id, "operator2",
@@ -798,7 +798,7 @@ TEST_CASE("ApprovalManager: the CAS still wins when the row is consumed during t
     auto outer =
         mgr.consume_ticket(*id, "operator1",
                            [&mgr, &id](const Approval&) -> std::expected<void, std::string> {
-                               (void)mgr.consume_ticket(*id, "operator2");
+                               (void)mgr.consume_ticket(*id, "operator2", {});
                                return {};
                            });
     REQUIRE(!outer.has_value());
@@ -874,11 +874,17 @@ TEST_CASE("ApprovalManager: a store failure during the recheck is not reported a
     CHECK(!mgr.get_checked(*id).has_value());
 }
 
-TEST_CASE("ApprovalManager: a store failure on the TWO-argument path is not reported as spent",
+TEST_CASE("ApprovalManager: a store failure is not reported as spent in the message either",
           "[approval_manager][approval]") {
-    // #2442 made the row read unconditional, so a read failure became reachable
-    // on the two-argument overload for the first time. The case above covers the
-    // three-argument path only; this is the same property on the other one.
+    // The case above pins the KIND on a store failure. This pins the MESSAGE,
+    // which is what reaches a human in a log or an error body. Both matter: the
+    // kind drives the branch, the message drives what an operator believes.
+    //
+    // This used to test a two-argument overload that returned the message alone
+    // and discarded the kind. That overload was removed (adversarial review,
+    // K3/CDX-P2-003) because a future caller picking it would have lost the
+    // cross-surface distinction #2442 added. The property it protected is kept
+    // here against the typed error.
     TestDb tdb;
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
@@ -888,21 +894,18 @@ TEST_CASE("ApprovalManager: a store failure on the TWO-argument path is not repo
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
     REQUIRE(sqlite3_exec(tdb.db, "DROP TABLE approvals", nullptr, nullptr, nullptr) == SQLITE_OK);
 
-    auto flat = mgr.consume_ticket(*id, "operator1");
+    auto flat = mgr.consume_ticket(*id, "operator1", {});
     REQUIRE(!flat.has_value());
-    // The flat overload discards the kind, so the string is all a caller has.
     // The property that matters is the negative: it must NOT read as spent, or
     // an operator is told to discard a live human-approved capability. (A
     // dropped table fails at prepare, not at step, so the text is "prepare
     // failed" rather than get_checked's "read failed" — both are kStoreError.)
-    CHECK(flat.error().find("not consumable") == std::string::npos);
-    CHECK(flat.error().find("already used") == std::string::npos);
-    CHECK(flat.error().find("failed") != std::string::npos);
+    CHECK(flat.error().message.find("not consumable") == std::string::npos);
+    CHECK(flat.error().message.find("already used") == std::string::npos);
+    CHECK(flat.error().message.find("failed") != std::string::npos);
 
-    // And the kind is right on the overload that exposes it.
-    auto typed = mgr.consume_ticket(*id, "operator1", {});
-    REQUIRE(!typed.has_value());
-    CHECK(typed.error().kind == ConsumeFailure::kStoreError);
+    // And the kind agrees with the message.
+    CHECK(flat.error().kind == ConsumeFailure::kStoreError);
 }
 
 TEST_CASE("ApprovalManager: an unrecognised origin column value is refused, not exempted",
@@ -1192,7 +1195,7 @@ TEST_CASE("ApprovalManager: approved-but-unconsumed tickets expire 7 days after 
     CHECK(row->status == "expired"); // the leaked capability token is dead
 
     // An expired ticket is no longer consumable.
-    auto consumed = mgr.consume_ticket(*id, "operator1");
+    auto consumed = mgr.consume_ticket(*id, "operator1", {});
     CHECK(!consumed.has_value());
 }
 
@@ -1205,7 +1208,7 @@ TEST_CASE("ApprovalManager: consumed tickets are history, never expired",
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kUnspecified);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*id, "operator1").has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
     backdate(tdb.db, *id, "reviewed_at", k8Days);
 
     REQUIRE(mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kUnspecified).has_value()); // triggers the sweep
