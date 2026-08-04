@@ -520,6 +520,10 @@ public:
         metrics_.describe("yuzu_mcp_streams_cap",
                           "Effective concurrent MCP SSE stream cap after the worker-pool clamp",
                           "gauge");
+        metrics_.describe("yuzu_mcp_streamed_post_enabled",
+                          "1 if SSE-on-POST is enabled (--mcp-enable-streamed-post), else 0. "
+                          "Ships 0: #2739 and #2740 are open against that surface",
+                          "gauge");
         metrics_.describe("yuzu_mcp_stream_closes_total", "MCP SSE streams closed, by reason",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_frames_dropped_total",
@@ -873,7 +877,7 @@ public:
                             "credential_revoked", "auth_unavailable", "internal_error",
                             // 2f PR 3b streamed-POST close reasons — producers land in C6c/C7;
                             // pre-seeded here so the closed label set is complete from C4.
-                            "cancelled", "cap_expired", "completed"}) {
+                            "cancelled", "cap_expired", "record_gone", "completed"}) {
             metrics_.counter("yuzu_mcp_stream_closes_total", {{"reason", reason}});
         }
         metrics_.counter("yuzu_mcp_stream_replay_ring_evictions_total");
@@ -7114,10 +7118,25 @@ private:
         // its sibling above, from the same post-clamp number.
         metrics_.gauge("yuzu_mcp_streams_cap").set(static_cast<double>(effective_streams));
         metrics_.gauge("yuzu_http_worker_pool_size").set(static_cast<double>(pool_max));
+        // A dormant, security-relevant toggle nobody can confirm is dormant is an
+        // operability gap. --max-sse-streams already surfaces its resolved value as a
+        // gauge; this does the same, so an operator can answer "is streamed POST live
+        // on this box" from /metrics rather than from ps.
+        metrics_.gauge("yuzu_mcp_streamed_post_enabled")
+            .set(cfg_.mcp_streamed_post_enable ? 1.0 : 0.0);
+        spdlog::info("MCP streamed POST (SSE-on-POST): {}{}",
+                     cfg_.mcp_streamed_post_enable ? "ENABLED" : "disabled (default)",
+                     cfg_.mcp_streamed_post_enable
+                         ? " - #2739 (response cap not enforced on a busy execution) and "
+                           "#2740 (an undelivered final holds a session streamed slot) are "
+                           "open against it; size shutdown grace against your longest "
+                           "execution, not the 120s cap"
+                         : " - enable with --mcp-enable-streamed-post");
         spdlog::info("HTTP worker pool: {} threads, sized for {} concurrent held-open responses "
                      "(plain-REST reserve {}). EVERY streaming surface leases from one budget: "
-                     "GET /mcp/v1/, GET /api/v1/events, the dashboard executions drawer, and the "
-                     "legacy /events stream. Watch yuzu_http_held_open_responses / "
+                     "GET /mcp/v1/, MCP streamed POST, GET /api/v1/events, the dashboard "
+                     "executions drawer, and the legacy /events stream. Watch "
+                     "yuzu_http_held_open_responses / "
                      "yuzu_http_held_open_capacity; the ceiling is thread-count (ADR-0034).",
                      pool_max, effective_streams, detail::kPlainRestReserveDefault);
 

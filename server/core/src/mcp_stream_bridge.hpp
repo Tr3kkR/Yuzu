@@ -497,6 +497,10 @@ public:
         /// The response cap elapsed with no terminal to deliver. The pump closes
         /// with kCapExpired; the execution continues server-side.
         bool cap_settled = false;
+        /// The bridge can no longer serve this key — record erased or bridge
+        /// shutting down. Distinct from an idle tick: there will be no next frame,
+        /// so the pump must close rather than heartbeat.
+        bool record_gone = false;
     };
 
     /// Bind the streamed-POST wake channel to a kStreaming record, returning its

@@ -127,6 +127,9 @@ const char* close_remediation(McpStreamClose reason) {
     case McpStreamClose::kCapExpired:
         return "the streamed-response time cap elapsed — the execution continues server-side; "
                "fetch the result by execution_id, or reconnect via GET to resume";
+    case McpStreamClose::kRecordGone:
+        return "this response could not continue — fetch the result by execution_id, or "
+               "reconnect via GET to resume";
     case McpStreamClose::kCompleted:
         // kCompleted never produces a close FRAME (the final is written then EOF); this exists
         // only so the audit/metric label set is exhaustive. No client action is warranted.
@@ -193,6 +196,8 @@ const char* to_string(McpStreamClose reason) {
         return "cancelled";
     case McpStreamClose::kCapExpired:
         return "cap_expired";
+    case McpStreamClose::kRecordGone:
+        return "record_gone";
     case McpStreamClose::kCompleted:
         return "completed";
     }
@@ -1469,6 +1474,13 @@ bool McpPostPump::pump_once_impl(const WriteFn& write) {
     McpStreamBridge::PostBatch batch;
     if (take_batch_) {
         batch = take_batch_(cap_expired);
+    }
+
+    // The bridge is the only side that can tell "nothing yet" from "nothing ever" -
+    // this pump holds just a batch and a clock, and both look identical on an idle
+    // tick. Check before draining: a gone record carries no frames to drain anyway.
+    if (batch.record_gone) {
+        return finish(write, McpStreamClose::kRecordGone);
     }
 
     for (const auto& frame : batch.progress) {

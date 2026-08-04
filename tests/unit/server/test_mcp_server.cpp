@@ -9487,6 +9487,21 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
 // so progress-before-final, on_final_written and EOF are covered by the pump's own
 // tests in test_mcp_stream_bridge.cpp, NOT from here. Stated rather than implied,
 // because a test named "streamed happy path" reads like end-to-end proof.
+TEST_CASE("Config's shipped default for streamed POST is OFF", "[mcp][2f][3b][config]") {
+    // The dormancy test below pins the HARNESS field it is given, not Config's own
+    // default — flipping the production default alone, without also flipping the
+    // harness line, would leave that test green regardless.
+    //
+    // NOT a static_assert. `Config` (yuzu/server/server.hpp) holds
+    // `std::filesystem::path` members, so it is not a literal type and cannot
+    // appear in a constant expression.
+    //
+    // RESIDUAL, deliberately not closed here: nothing in this file exercises
+    // server.cpp's own `&cfg_.mcp_streamed_post_enable` wiring. Closing that needs
+    // a live ServerImpl, which is not a unit test; tracked as a follow-up.
+    REQUIRE_FALSE(yuzu::server::Config{}.mcp_streamed_post_enable);
+}
+
 TEST_CASE("streamed POST ships DORMANT: the default is off and a stream is not opened",
           "[mcp][integration][execute][bridge][2f][3b]") {
     // The shipped default. 3b's machinery is complete, but #2739 (the 120 s response

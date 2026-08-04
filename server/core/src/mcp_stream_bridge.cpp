@@ -837,8 +837,13 @@ bool McpStreamBridge::on_final_written(const std::string& key) {
         }
     }
     std::lock_guard<std::mutex> rlk(rec->mu);
-    if (rec->phase.load(std::memory_order_acquire) != Phase::kStreaming) {
-        return false;  // only a live streamed wire can have written a final
+    // kRingOnly is accepted alongside kStreaming: the sweep's stale-arm backstop
+    // can flip a record kStreaming -> kRingOnly while its pump still holds a final
+    // to write. Rejecting a final here after that flip leaks the pin of a result
+    // that reached the client.
+    const auto ph = rec->phase.load(std::memory_order_acquire);
+    if (ph != Phase::kStreaming && ph != Phase::kRingOnly) {
+        return false;  // no wire could have written a final in any other phase
     }
     rec->final_written = true;
     // UNPIN RULE (a), the streamed-POST half: "the final was written on the POST
@@ -903,10 +908,16 @@ McpStreamBridge::PostBatch McpStreamBridge::take_post_batch(const std::string& k
     {
         std::lock_guard<std::mutex> lk(bridge_mu_);
         if (shutdown_started_) {
-            return out;  // shutdown owns teardown; the pump sees an empty tick
+            // Shutdown owns teardown, but the pump must be told there is nothing
+            // left to wait for.
+            out.record_gone = true;
+            return out;
         }
         rec = find_locked(key);
         if (!rec) {
+            // Erased under us — swept, reaped, or torn down. Nothing will ever
+            // arrive for this key again.
+            out.record_gone = true;
             return out;
         }
     }

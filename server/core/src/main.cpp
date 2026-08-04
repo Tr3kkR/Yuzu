@@ -457,7 +457,8 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_MCP_ALLOWED_ORIGINS");
     app.add_option("--max-sse-streams", cfg.max_sse_streams,
                    "Concurrent held-open SSE responses this server is sized for, across ALL "
-                   "streaming surfaces (MCP GET, /api/v1/events, dashboard, legacy /events). "
+                   "streaming surfaces (MCP GET, MCP streamed POST, /api/v1/events, dashboard, "
+                   "legacy /events). "
                    "The HTTP worker pool is derived from this: a stream costs one blocked "
                    "thread (no CPU; resident cost is a fraction of a virtual, platform-dependent stack reservation and is not yet measured). 0 = default (128). See ADR-0034.")
         ->check(CLI::Range(std::size_t{0}, std::size_t{4096}))

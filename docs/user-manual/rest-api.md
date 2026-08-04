@@ -6165,10 +6165,10 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 | 503 | The per-execution event bus is not configured (test harness opt-out, or a configuration path that omits the bus). Returned at request time so the operator does not silently freeze waiting on a missing publisher. |
 
 This stream holds an HTTP worker thread for as long as the drawer stays open, so it leases
-from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, `GET /api/v1/events`, and the
-legacy `/events` stream (ADR-0034). That means enough open drawers — or enough traffic on any
-of the other three surfaces — can cause a *new* drawer to be refused with `429`. A live stream
-is never evicted to make room.
+from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, MCP streamed POST,
+`GET /api/v1/events`, and the legacy `/events` stream (ADR-0034). That means enough open
+drawers — or enough traffic on any of the other surfaces — can cause a *new* drawer to be
+refused with `429`. A live stream is never evicted to make room.
 
 **Audit:** every successful subscribe emits one `execution.live_subscribe` audit event (`target_type=Execution, target_id={id}, result=success`). Per-session-per-execution dedup is **not** currently implemented (#700) — operators on the SOC 2 evidence chain receive a row per reconnect; the forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`.
 
@@ -6268,7 +6268,7 @@ The `type` field is the canonical taxonomy: `agent-transition`, `execution-progr
 
 This endpoint holds an HTTP worker thread open for the life of the subscription, so it
 leases from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, the dashboard
-executions drawer, and the legacy `/events` stream (ADR-0034). A cap hit rejects the
+executions drawer, MCP streamed POST, and the legacy `/events` stream (ADR-0034). A cap hit rejects the
 *new* stream with `429` — a live stream is never evicted to make room.
 
 A4 envelope shape:

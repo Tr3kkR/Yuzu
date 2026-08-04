@@ -2434,6 +2434,29 @@ TEST_CASE("McpPostPump: revocation and session death close the response (C7)",
     }
 }
 
+TEST_CASE("McpPostPump: record_gone closes the response instead of heartbeating (C7)",
+          "[mcp][bridge][2f]") {
+    // The pump's own half of the fix, tested against a fake take_batch with no
+    // live bridge behind it — the seam TakeBatchFn exists for. Before this check
+    // existed, a record_gone batch fell through to the unconditional heartbeat at
+    // the bottom of pump_once_impl and looped forever. Mutation check: deleting
+    // the `if (batch.record_gone)` block in mcp_stream.cpp leaves this red — the
+    // pump keeps the response open and writes a heartbeat instead of closing.
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto take = [](bool /*cap*/) {
+        mcp::McpStreamBridge::PostBatch out;
+        out.record_gone = true;
+        return out;
+    };
+    mcp::McpPostPump pump(sink, take, {}, {}, {}, fast_post_cfg(), {}, nullptr, "cid-7",
+                          "exec-gone");
+    PostWire wire;
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(wire.contains("record_gone"));
+    CHECK_FALSE(wire.contains("cap_expired"));
+    CHECK_FALSE(wire.contains("heartbeat"));
+}
+
 TEST_CASE("McpPostPump: the wait is bounded by the next credential check, not a fresh tick "
           "(CH-22)",
           "[mcp][bridge][2f][ch22]") {
@@ -2689,9 +2712,55 @@ TEST_CASE("bridge streamed-POST close is allocation-free and keyed (C6c)",
         auto ph = fx.bridge->phase_for(s.id, json(1));
         CHECK((!ph.has_value() || ph == Bridge::Phase::kDone));  // kDone, or already reaped
     }
-    SECTION("on_final_written only accepts a live streamed record") {
+    SECTION("a parked record still credits a final its pump actually wrote") {
+        // The sweep's stale-arm backstop can flip kStreaming -> kRingOnly while
+        // the pump is mid-tick; on_final_written must still accept the final that
+        // pump goes on to write, or the session's pin leaks.
         REQUIRE(fx.bridge->on_post_closed_keyed(*key));  // -> kRingOnly
-        CHECK_FALSE(fx.bridge->on_final_written(*key));
+        CHECK(fx.bridge->on_final_written(*key));
+    }
+}
+
+TEST_CASE("on_final_written rejects a phase that never held a streamed wire (C6c)",
+          "[mcp][bridge][2f]") {
+    // The invariant that survives widening on_final_written to accept kRingOnly:
+    // a record armed GET-only was never a streamed wire, so a final for it is
+    // rejected. Mutation check: deleting the phase check entirely leaves this
+    // green too unless this test exists — it is the coverage commit 97fd6379's
+    // duplicate SECTION (same file, both asserting accept) claimed to have and
+    // did not.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-getonly"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly) ==
+            Bridge::ArmOutcome::kArmed);
+    auto key = fx.bridge->record_key(s.id, json(1));
+    REQUIRE(key.has_value());
+    CHECK_FALSE(fx.bridge->on_final_written(*key));
+}
+
+TEST_CASE("take_post_batch reports record_gone, not a silent empty tick (C6c)",
+          "[mcp][bridge][2f]") {
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-rg"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto key = fx.bridge->record_key(s.id, json(1));
+    REQUIRE(key.has_value());
+
+    SECTION("an unknown key reports record_gone") {
+        auto batch = fx.bridge->take_post_batch("no-such-key", /*cap_expired=*/false);
+        CHECK(batch.record_gone);
+        CHECK_FALSE(batch.cap_settled);
+    }
+    SECTION("a key that existed before shutdown() reports record_gone") {
+        fx.bridge->shutdown();
+        auto batch = fx.bridge->take_post_batch(*key, /*cap_expired=*/false);
+        CHECK(batch.record_gone);
+        CHECK_FALSE(batch.cap_settled);
     }
 }
 

@@ -177,12 +177,13 @@ enum class McpStreamClose {
     kCredentialRevoked,  ///< re-validation said the credential is definitively gone
     kAuthUnavailable,    ///< re-validation was indeterminate past the grace window
     kInternalError,      ///< the pump caught an exception — OUR fault, not the client's
-    // The next three are produced ONLY by the streamed-POST surface (2f PR 3b); the GET pump
+    // The next four are produced ONLY by the streamed-POST surface (2f PR 3b); the GET pump
     // never emits them. Declared here so to_string / close_remediation / the metric seed cover
     // the whole closed reason set from C4. Their producers are LIVE as of 3b: the
-    // POST pump emits all three.
+    // POST pump emits all four.
     kCancelled,          ///< the client sent notifications/cancelled; the execution continues
     kCapExpired,         ///< the streamed-POST response time cap elapsed; the execution continues
+    kRecordGone,         ///< the bridge can no longer serve this key (erased, or shutting down)
     kCompleted,          ///< the final was delivered then EOF — no close frame is written for this
 };
 const char* to_string(McpStreamClose reason);

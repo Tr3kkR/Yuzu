@@ -31,9 +31,10 @@ namespace yuzu::server::detail {
 /// execution plan Decision 15(h); chaos CH-6).
 ///
 /// This is a real reserve, not an aspiration: EVERY surface that holds a response open
-/// leases from the one budget below — MCP's GET channel, `GET /api/v1/events`, the
-/// dashboard executions drawer, and the legacy `/events` stream. A surface that held a
-/// worker without a lease would make the arithmetic here a fiction.
+/// leases from the one budget below — MCP's GET channel, MCP streamed POST, `GET
+/// /api/v1/events`, the dashboard executions drawer, and the legacy `/events` stream.
+/// A surface that held a worker without a lease would make the arithmetic here a
+/// fiction.
 inline constexpr std::size_t kPlainRestReserveDefault = 8;
 
 /// Workers a single permitted stream can pin at once. A stream is normally one provider on
@@ -94,9 +95,10 @@ inline constexpr std::size_t kMaxHttpWorkerThreads = 2048;
 /// `kPlainRestReserveDefault` — so `derive_stream_budget(8, 8, N)` computed `(8-8)/2 == 0`
 /// and the floor sat inside its own dead zone: any `--http-worker-threads` in [1,9] clamped
 /// the budget to 0, and a 0 cap rejects unconditionally (`total_ >= global_cap` is
-/// `0 >= 0`). That silently 429'd EVERY streaming surface server-wide — MCP GET,
-/// /api/v1/events, the dashboard drawer and legacy /events — from behind a knob that reads
-/// like a tuning parameter, which is the exact failure this constant exists to prevent.
+/// `0 >= 0`). That silently 429'd EVERY streaming surface server-wide as they stood at
+/// the time — MCP GET, /api/v1/events, the dashboard drawer and legacy /events — from
+/// behind a knob that reads like a tuning parameter, which is the exact failure this
+/// constant exists to prevent.
 inline constexpr std::size_t kMinHttpWorkerThreads =
     derive_worker_pool(1, kPlainRestReserveDefault);
 
