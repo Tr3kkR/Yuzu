@@ -60,6 +60,7 @@ contract_test_exe = executable(
     'unit/contracts/test_b2_use_case.cpp',
     'unit/contracts/test_b3_platform.cpp',
     'unit/contracts/test_transport_auth_slot.cpp',
+    'unit/contracts/test_use_case_types.cpp',
   ),
   dependencies: [yuzu_adr31_contracts_dep, catch2_dep],
 )
