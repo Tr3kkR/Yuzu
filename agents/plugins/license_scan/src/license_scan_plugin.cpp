@@ -74,6 +74,45 @@ int do_surfaces(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// ── ABI4 capability declarations (#2204) ─────────────────────────────────
+//
+// One row per entry in actions() below, same names/order. Both actions call
+// the SAME collect_surfaces() -> run_platform_surfaces() (licensing_probes.cpp
+// dispatches by #if defined(_WIN32)/__linux__/__APPLE__), so both share
+// identical legs:
+//   - Windows (licensing_win.cpp run_platform_surfaces): SLP via the WMI
+//     enumerator, registry ProbeSpec rows, and per-user hive/file probes —
+//     every one a native, in-process Win32/COM call (rung 1).
+//   - Linux (licensing_linux.cpp run_platform_surfaces): pkg_metadata
+//     (rpm/dpkg-query) and entitlement_certs (openssl x509) both go through
+//     run_command_rc(), a real popen()/`/bin/sh -c` shell-out (rung 3) —
+//     genuinely wired and exercised, so SUPPORTED, not CONSTRAINED.
+//   - macOS (licensing_macos.cpp run_platform_surfaces): pure filesystem
+//     glob + in-house XML-plist string parsing, no exec at all (rung 1). The
+//     header's own doc comment records the real limitation: a BINARY
+//     (bplist00) Info.plist is not parsed and falls back to the bundle name
+//     with an empty version — CONSTRAINED, not SUPPORTED.
+namespace {
+
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        "list",
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(rpm/dpkg-query/openssl)", nullptr},
+        {YUZU_SUPPORT_CONSTRAINED, 1, "filesystem_probe(glob+plist)",
+         "binary (bplist00) Info.plist files are not parsed; falls back to the bundle "
+         "name with an empty version"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "wmi+win32_registry", nullptr},
+    },
+    {
+        "surfaces",
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(rpm/dpkg-query/openssl)", nullptr},
+        {YUZU_SUPPORT_CONSTRAINED, 1, "filesystem_probe(glob+plist)",
+         "binary (bplist00) Info.plist files are not parsed; falls back to the bundle "
+         "name with an empty version"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "wmi+win32_registry", nullptr},
+    },
+};
+
 } // namespace
 
 class LicenseScanPlugin final : public yuzu::Plugin {
@@ -87,6 +126,14 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"list", "surfaces", nullptr};
         return acts;
+    }
+
+    [[nodiscard]] const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    [[nodiscard]] size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
