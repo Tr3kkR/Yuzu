@@ -690,8 +690,14 @@ if build_server
     # YUZU_TEST_ENABLE_PG exposes the PostgresTestDb fixture in
     # test_helpers.hpp — only the server suite links libpq, so the guard
     # keeps the agent/tar suites (which share the header) libpq-free.
+    # /bigobj: yuzu_server_core_lib already carries it; this target did not, and it
+    # links test_mcp_server.cpp (10k+ lines, 263 TEST_CASEs) plus
+    # test_mcp_stream_bridge.cpp. Catch2 emits per-TEST_CASE COMDAT sections and
+    # MSVC's C1128 limit is a hard 65,279 - so the gap is a build-time cliff on one
+    # platform only, with no runtime component. Free on every other compiler.
     cpp_args: https_cpp_args + test_partial_init_args +
-              ['-DCPPHTTPLIB_LISTEN_BACKLOG=128', '-DYUZU_TEST_ENABLE_PG'],
+              ['-DCPPHTTPLIB_LISTEN_BACKLOG=128', '-DYUZU_TEST_ENABLE_PG'] +
+              (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
     # Server unit tests #include <openssl/...> directly (e.g.
     # test_plugin_signing_helpers.cpp). yuzu_server_core_dep does not
     # propagate the OpenSSL include path, so declare it explicitly here

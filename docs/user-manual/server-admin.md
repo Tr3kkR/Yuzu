@@ -76,8 +76,9 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
 | `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
 | `--mcp-no-streaming` | off | Disable the MCP **Streamable HTTP** transport (ADR-1005 Decision 15): no `Mcp-Session-Id` minting, `GET`/`DELETE /mcp/v1/` return `405`, and only plain JSON-RPC POST is served. The spec-required `202` status on notification POSTs still applies. Use where a buffering reverse proxy interferes with streaming. Env: `YUZU_MCP_NO_STREAMING`. |
+| `--mcp-enable-streamed-post` | off | Enable **SSE-on-POST** (streamed POST) for `execute_instruction` callers that supply a `progressToken`. **Ships OFF.** The transport machinery is complete and reviewed, but two bounds defects are open against it: #2739 (the 120 s response cap does not fire while progress keeps arriving, so a response can stay open for the whole execution) and #2740 (a committed-but-undelivered final holds one of the session's four streamed slots, and four dropped connections lock that session out of streaming until it is deleted, restarted, resumed past, or left idle). Both are fixed in the follow-up PR, which turns this on by default. Enabling it today is supported but you own the two defects — size shutdown grace against your longest execution, not against the cap. Distinct from `--mcp-no-streaming`, which disables the whole transport including the session lifecycle and GET channel. |
 | `--mcp-allowed-origin` | *(none)* | **Repeatable.** An allowed `Origin` header value (`scheme://host:port`, exact match) for `/mcp/v1/` DNS-rebinding defence. An **absent** `Origin` is always allowed (the endpoint requires a credential); an **empty allowlist rejects any *present* Origin** (secure default) — browser-based MCP clients must be listed explicitly, non-browser clients need no configuration. Env: `YUZU_MCP_ALLOWED_ORIGINS`. |
-| `--max-sse-streams` | `128` | **Concurrent held-open SSE responses this server is sized for, across EVERY streaming surface** — `GET /mcp/v1/`, `GET /api/v1/events`, the dashboard executions drawer, and the legacy `/events` stream. The HTTP worker pool is derived *from* this number: cpp-httplib is thread-per-connection, so each held-open response pins one worker for its whole life. That thread burns no CPU, and its resident cost is a fraction of a stack reservation that is virtual and platform-dependent (8 MB on Linux/glibc, 1 MB on Windows, 512 KB for macOS secondary threads). The resident fraction itself is **not yet measured** on our platforms (ADR-0034), so treat the default as a starting point rather than a sizing guarantee until a per-platform baseline exists. Utilisation is `yuzu_http_held_open_responses / yuzu_http_held_open_capacity`. The ceiling is thread-count; see ADR-0034. Env: `YUZU_MAX_SSE_STREAMS`. |
+| `--max-sse-streams` | `128` | **Concurrent held-open SSE responses this server is sized for, across EVERY streaming surface** — `GET /mcp/v1/`, MCP streamed POST, `GET /api/v1/events`, the dashboard executions drawer, and the legacy `/events` stream. The HTTP worker pool is derived *from* this number: cpp-httplib is thread-per-connection, so each held-open response pins one worker for its whole life. That thread burns no CPU, and its resident cost is a fraction of a stack reservation that is virtual and platform-dependent (8 MB on Linux/glibc, 1 MB on Windows, 512 KB for macOS secondary threads). The resident fraction itself is **not yet measured** on our platforms (ADR-0034), so treat the default as a starting point rather than a sizing guarantee until a per-platform baseline exists. Utilisation is `yuzu_http_held_open_responses / yuzu_http_held_open_capacity`. The ceiling is thread-count; see ADR-0034. Env: `YUZU_MAX_SSE_STREAMS`. |
 | `--mcp-max-streams-per-principal` | `4` | Max concurrent MCP SSE streams for one principal. An **anti-monopoly policy, not a capacity limit** — capacity is `--max-sse-streams`. Stops a single agentic token taking the channel; does not ration the fleet. Env: `YUZU_MCP_MAX_STREAMS_PER_PRINCIPAL`. |
 | `--http-worker-threads` | `0` (derive) | Pin the shared HTTP worker pool by hand. `0` derives it from `--max-sse-streams`, which is what you want. If you set it, the stream target is clamped to what your pool can actually carry (the startup log reports the effective figure). Env: `YUZU_HTTP_WORKER_THREADS`. |
 | `--viz-disable` | off | Disable the fleet visualization feature. When set, the REST endpoints (`GET /api/v1/viz/fleet/topology`, `GET /fragments/viz/fleet/topology`, and the per-host drill-down routes) **and** the page shells (`GET /viz/fleet`, `GET /viz/host/<id>`) all return `503`. Tier-before-permission ordering: the kill switch takes effect even for callers who would otherwise fail RBAC. Two pieces of durable evidence that the switch took effect: the startup log line `[VIZ] viz endpoint disabled by configuration`, and a `server.viz_disabled` audit event (`target_type = FleetTopology`) written to the audit store at boot — so an auditor can confirm the disabled state from the audit trail even on a deployment with no viz traffic. Env: `YUZU_VIZ_DISABLE`. |
@@ -616,6 +617,38 @@ After upgrading, refusals are counted by
 on every single refusal, because a rule that pages on one malformed request gets silenced. Use the
 audit rows, not the alert, to find individual offenders.
 
+### vNEXT — `POST /mcp/v1/` can now hold its response open as an SSE stream (2f PR 3b)
+
+A `tools/call` for `execute_instruction` that carries `_meta.progressToken` **and**
+an SSE-capable `Accept` now receives its progress on the POST response itself
+rather than on the session's GET stream. Opt-in and per request: a call that sends
+neither, or only one of the two, behaves exactly as before and is byte-identical on
+the wire. Plain POST clients (mcp-remote, Claude Desktop) are unaffected.
+
+Three operator-visible consequences:
+
+- **Sizing.** A streamed POST holds an HTTP worker for up to its response cap
+  (120 s) — **but see #2739: that bound is not enforced on a busy execution, so size
+  against the execution's own duration until the follow-up PR lands.** Streamed POST
+  ships OFF by default for this reason (`--mcp-enable-streamed-post`). It leases from the same held-open budget as the GET channel, so total
+  concurrency is unchanged — but `TimeoutStopSec` and any container termination
+  grace period must be sized against your longest expected execution while #2739 is
+  open, not against the cap. (Once the follow-up PR lands and the cap is enforced,
+  120 s becomes the true bound and 30 s — which suited GET alone — is the figure to
+  move away from.) Under-sizing SIGKILLs mid-drain and silently drops in-flight
+  streams on deploy.
+- **Per-principal ceiling.** `--mcp-max-streams-per-principal` governs the GET
+  channel. The streamed-POST allowance is a separate, fixed 4 per session (twinned
+  to the replay ring's pin slots), so the real per-principal held-open ceiling is
+  `--mcp-max-streams-per-principal + 4`. Lowering the flag to contain a noisy
+  principal does not reduce its streamed-POST concurrency.
+- **Reverse proxies.** The response sets `X-Accel-Buffering: no`, which only nginx
+  honours. Envoy, HAProxy, ALB and Cloudflare need their own no-buffering opt-out,
+  or the stream is buffered and dead clients are not detected.
+
+`--mcp-no-streaming` remains the kill switch and now also degrades the streamed
+POST arm back to plain JSON, not just GET/DELETE.
+
 ### vNEXT — MCP stream revalidation rides the tick, and the pin-drift alert moves to a new counter
 
 Two operator-visible changes to held-open MCP `GET` SSE streams. Neither changes a
@@ -856,7 +889,7 @@ Track 2f PR 2, plus ADR-0034. Three things change for an operator:
 
 1. **`GET /mcp/v1/` no longer returns `405`.** It is the MCP session's server→client SSE channel (heartbeats, `Last-Event-ID` resume). Nothing publishes onto it yet — `notifications/progress` arrives in the next rung — so a client that never issues a GET is unaffected. Behind a reverse proxy, note these are held-open responses: the server sets `X-Accel-Buffering: no` (nginx honours it); Envoy, HAProxy, ALB and Cloudflare need their own no-buffering opt-out.
 
-2. **Every held-open SSE response now leases from one shared budget** — MCP's GET channel, `GET /api/v1/events`, the dashboard executions drawer, and the legacy `/events` stream. cpp-httplib is thread-per-connection, so each of those pins a worker for its entire life; previously only MCP was counted, which meant the plain-REST reserve was arithmetic rather than a guarantee. A cap hit returns `429` with `Retry-After`; a live stream is never evicted. **This closes a starvation path that existed before MCP streaming shipped at all**: enough dashboard tabs could exhaust the pool and stall plain REST.
+2. **Every held-open SSE response now leases from one shared budget** — MCP's GET channel, MCP streamed POST, `GET /api/v1/events`, the dashboard executions drawer, and the legacy `/events` stream. cpp-httplib is thread-per-connection, so each of those pins a worker for its entire life; previously only MCP was counted, which meant the plain-REST reserve was arithmetic rather than a guarantee. A cap hit returns `429` with `Retry-After`; a live stream is never evicted. **This closes a starvation path that existed before MCP streaming shipped at all**: enough dashboard tabs could exhaust the pool and stall plain REST.
 
 3. **The worker pool is derived from `--max-sse-streams` (default 128), not the other way round.** The old default sized itself from httplib's accidental 32-thread pool and yielded 12 streams — on a platform designed for hundreds of agentic clients. A blocked thread burns no CPU; its resident cost is a fraction of a virtual, platform-dependent stack reservation and has not yet been measured (ADR-0034), so the pool is sized for the workload you declare rather than off a per-thread constant. Watch `yuzu_http_held_open_responses / yuzu_http_held_open_capacity`; the ceiling is thread-count, and the durable fix (moving long-lived connections off the thread-per-connection server) is recorded in ADR-0034.
 
