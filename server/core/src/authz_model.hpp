@@ -291,7 +291,7 @@ struct CapabilitySeed {
 }
 
 /// A small, representative seed catalogue — NOT a full mirror of
-/// `RbacStore`'s 21 securables × 7 operations. It exists so PR1.9 has real
+/// `RbacStore`'s 25 securables × 7 operations. It exists so PR1.9 has real
 /// rows to migrate and so this header's own tests exercise `is_valid`, not
 /// to be the registry itself (that is explicitly out of scope here). Covers
 /// an ordinary CRUD securable (`Response:Read`), a Tag write (mirrors
@@ -301,7 +301,21 @@ struct CapabilitySeed {
 /// securable with its `Attest` narrow op (Periodic Access Reviews, SOC 2
 /// CC6.2), deliberately outside every CRUD loop, exactly as seeded in
 /// `rbac_store.cpp`.
-inline constexpr std::array<CapabilitySeed, 5> kSeedCatalogue{{
+///
+/// PR1.9a (peer finding PLAN-001) adds three more rows for the three
+/// securables that same PR appends to `rbac_store.cpp`'s `seed_defaults()`
+/// `types[]` — `PluginConfig`, `PluginSecret`, `UploadGrant` — reusing only
+/// EXISTING `Operation` enumerators, per that PR's explicit "no new
+/// Operation" constraint: `PluginConfig:Write` (a plugin kill-switch flip),
+/// `PluginSecret:Write` (setting/rotating a plugin secret value — `Delete`
+/// removes it, `Read` reveals whether one is set, both role-gated the same
+/// way in `rbac_store.cpp`, only `Write` illustrated here), and
+/// `UploadGrant:Write` (minting an upload grant; `Delete` revokes one). None
+/// of the three needs a `FileRetrieval`-shaped op of its own — actual file
+/// retrieval after a grant is minted stays under the existing
+/// `FileRetrieval` securable, so `UploadGrant` only ever governs the
+/// grant's own lifecycle.
+inline constexpr std::array<CapabilitySeed, 8> kSeedCatalogue{{
     {"Response", Operation::Read, RiskTier::Low, "listResponses", "device_operational",
      "response.list"},
     {"Tag", Operation::Write, RiskTier::Medium, "setTag", "device_operational", "tag.set"},
@@ -311,6 +325,12 @@ inline constexpr std::array<CapabilitySeed, 5> kSeedCatalogue{{
      "device_operational", "guardian.push"},
     {"AccessReview", Operation::Attest, RiskTier::Medium, "attestAccessReview",
      "grant_evidence", "access_review.attested"},
+    {"PluginConfig", Operation::Write, RiskTier::Medium, "setPluginConfig",
+     "device_operational", "plugin_config.write"},
+    {"PluginSecret", Operation::Write, RiskTier::High, "setPluginSecret", "secret_material",
+     "plugin_secret.write"},
+    {"UploadGrant", Operation::Write, RiskTier::Medium, "mintUploadGrant", "device_operational",
+     "upload_grant.mint"},
 }};
 
 // ── #1788: the shared per-device visibility primitive ───────────────────

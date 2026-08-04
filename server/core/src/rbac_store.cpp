@@ -324,7 +324,19 @@ void RbacStore::seed_defaults() {
                            // Licences view in-server, but it is not built; the compliance
                            // sub-views are the SAM UCE module's.) Seeding it here
                            // also grants Administrator full CRUD via the loop below.
-                           "SoftwareLicensing"};
+                           "SoftwareLicensing",
+                           // PR1.9a (peer finding PLAN-001): the capability-classification
+                           // MODEL in authz_model.hpp declared these three securables'
+                           // CapabilitySeed rows, but that header does not seed `rbac.db` —
+                           // this store does. A securable absent from `types[]` cannot
+                           // receive a default grant, so leaving these three out would
+                           // deny even Administrator on an RBAC-enabled install. Seeded
+                           // here so the CRUD loop below grants Administrator full CRUD on
+                           // each; role-specific PlatformEngineer/Operator grants follow
+                           // further down.
+                           "PluginConfig",   // plugin kill-switch config (PluginConfig:Write)
+                           "PluginSecret",   // plugin secret material — never Operator-readable
+                           "UploadGrant"};   // upload-grant mint/revoke lifecycle
     for (auto* t : types) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(db_,
@@ -618,6 +630,50 @@ void RbacStore::seed_defaults() {
             sqlite3_finalize(s);
         }
     }
+
+    // PR1.9a (peer finding PLAN-001): PluginConfig / PluginSecret /
+    // UploadGrant role grants. Administrator already gets full CRUD on all
+    // three via the `types[]`/`crud_ops` loop above (seeding them into
+    // `types[]` is what makes that loop reach them) — these are the
+    // additional, narrower role grants those three surfaces need.
+    //
+    // PlatformEngineer: Read/Write/Delete on all three — they own plugin
+    // configuration (including kill-switch flips) and secret material, and
+    // mint/revoke upload grants for the plugins they manage. No Execute or
+    // Approve — none of the three has an executable or approval workflow.
+    {
+        const char* pe_plugin_types[] = {"PluginConfig", "PluginSecret", "UploadGrant"};
+        const char* pe_plugin_ops[] = {"Read", "Write", "Delete"};
+        for (auto* t : pe_plugin_types) {
+            for (auto* o : pe_plugin_ops) {
+                sqlite3_stmt* s = nullptr;
+                sqlite3_prepare_v2(
+                    db_,
+                    "INSERT OR IGNORE INTO role_permissions VALUES ('PlatformEngineer', ?, ?, "
+                    "'allow');",
+                    -1, &s, nullptr);
+                sqlite3_bind_text(s, 1, t, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(s, 2, o, -1, SQLITE_TRANSIENT);
+                sqlite3_step(s);
+                sqlite3_finalize(s);
+            }
+        }
+    }
+    // Operator: Read on PluginConfig and UploadGrant only — an operator can
+    // see current plugin config and outstanding upload grants for
+    // day-to-day triage, but never PluginSecret (secret material stays
+    // PlatformEngineer/Administrator-only) and never Write/Delete on any of
+    // the three (config and grant lifecycle stay privileged operations).
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'PluginConfig', 'Read', "
+        "'allow');",
+        nullptr, nullptr, nullptr);
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Operator', 'UploadGrant', 'Read', "
+        "'allow');",
+        nullptr, nullptr, nullptr);
 
     // ApiTokenManager: read + write + delete on ApiToken
     const char* atm_ops[] = {"Read", "Write", "Delete"};

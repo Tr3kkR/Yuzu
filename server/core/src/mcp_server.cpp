@@ -1403,13 +1403,19 @@ constexpr std::string_view kRbacOps[] = {"Read",    "Write", "Execute", "Delete"
 // type and requires_approval() exact-matches type strings, so e.g.
 // {"quarantine_device", {"Securty", "Execute"}} would silently skip its
 // approval rule (governance UP-6).
+//
+// PR1.9a adds PluginConfig, PluginSecret and UploadGrant here because rbac_store.cpp's `types[]`
+// seeds them for the new plugin/upload securables, and letting this mirror drift would fail the
+// seeded-catalogues binding test in test_rbac_store.cpp or, for a typo'd entry, silently fail open
+// exactly as above.
 constexpr std::string_view kRbacSecurables[] = {
     "Infrastructure", "UserManagement",     "InstructionDefinition", "InstructionSet",
     "Execution",      "Schedule",           "Approval",              "Tag",
     "AuditLog",       "Response",           "ManagementGroup",       "ApiToken",
     "Security",       "Policy",             "DeviceToken",           "SoftwareDeployment",
     "License",        "FileRetrieval",      "GuaranteedState",       "Inventory",
-    "AccessReview",   "SoftwareLicensing"};
+    "AccessReview",   "SoftwareLicensing",  "PluginConfig",          "PluginSecret",
+    "UploadGrant"};
 
 // Borrowed (name, input_schema_json) row for the registration validator's
 // 4th sequence (#2405). Views are valid only for the duration of the call.

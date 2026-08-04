@@ -1387,7 +1387,8 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
 // array is caught even when the rbac_store suite is filtered out.
 TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mcp][2g]") {
     CHECK(rbac_ops_for_test().size() == 7);
-    CHECK(rbac_securables_for_test().size() == 22);
+    // 22 + 3 PR1.9a additions (PluginConfig, PluginSecret, UploadGrant).
+    CHECK(rbac_securables_for_test().size() == 25);
 }
 
 TEST_CASE("MCP 2383: three-way dispatch classifier — knownness decides first", "[mcp][2g]") {
