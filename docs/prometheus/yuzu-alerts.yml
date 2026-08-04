@@ -118,19 +118,16 @@ groups:
           summary: "Cross-surface MCP approval redemption attempt ({{ $labels.tool }}) (#2442)"
           description: >-
             yuzu_mcp_approval_forgery_total{tool="{{ $labels.tool }}"} moved — an
-            approval ticket declaring a non-MCP minting surface was presented to
-            the MCP approval recall and refused. The ticket is left untouched, so
-            no approval was consumed. For the principal and the ticket id, read
-            the paired audit row: action mcp.{{ $labels.tool }}, result denied,
-            detail of the form "approval <id> refused: minted by a non-MCP
-            surface (#2442)". That detail is one constant for every non-MCP
-            origin, so it does not say which surface minted the ticket. Two
-            surfaces do: the server log line "ApprovalManager: refused recall of
-            ticket <redacted> minted by <origin>", and the origin field on GET
-            /api/approvals. increase() rather than a bare > 0 because the
-            registry is in-memory and every series resets on restart. See
-            docs/user-manual/metrics.md "MCP approval-gate metrics" for how to
-            read the origin value.
+            APPROVED approval ticket declaring a non-MCP minting surface was
+            refused at redemption by the MCP approval recall. The ticket is left
+            untouched, so no approval was consumed. For the principal and the
+            ticket id, read the paired audit row: action mcp.{{ $labels.tool }},
+            result denied. That row does not identify WHICH surface minted the
+            ticket; two other surfaces carry the origin. increase() rather than a
+            bare > 0 because the registry is in-memory and every series resets on
+            restart. See docs/user-manual/metrics.md "MCP approval-gate metrics",
+            which is the single home for the audit detail's wording, the two
+            surfaces that carry the origin, and how to read them.
           runbook_url: "https://docs.yuzu.io/runbooks/mcp-approval-forgery"
       - alert: YuzuOnBehalfAssertionRejected
         expr: |

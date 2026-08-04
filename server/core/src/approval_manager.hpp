@@ -387,7 +387,8 @@ public:
     /// stay correct when it does. The CAS remains the sole one-time-consumption
     /// guard, so a concurrent recall still loses exactly as before.
     ///
-    /// An empty `precondition` behaves exactly like the two-argument overload.
+    /// An empty `precondition` skips the recheck: the order above collapses to
+    /// match the row → reject a non-consumable one → CAS.
     std::expected<void, ConsumeError> consume_ticket(const std::string& id,
                                                      const std::string& consumed_by,
                                                      const ConsumePrecondition& precondition);

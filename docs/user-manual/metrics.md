@@ -165,7 +165,7 @@ not independent events, so summing across the two families double-counts.
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `yuzu_mcp_approval_denied_total` | counter | `tool`, `reason="foreign_origin"\|"store_error"\|"not_consumable"` | The operator/dashboard breakdown of approval-recall denials. `not_consumable` is an ordinary replay of a spent ticket and is expected in normal use; `store_error` is a transient approvals-store read failure that leaves the ticket **untouched** and valid; `foreign_origin` is the cross-surface refusal below. `#2443`'s pre-consume recheck would also count as `not_consumable` if it were reachable — the sole production caller passes no precondition callback today. So this series is replay in practice, with one other reachable cause: the compare-and-set also declines a row that a concurrent lazy expiry sweep has just moved out of `approved`. |
-| `yuzu_mcp_approval_forgery_total` | counter | `tool`, `event="security"` | The SIEM tap for the same `foreign_origin` event: an **approved** ticket declaring a non-MCP minting surface, refused at redemption by the MCP recall. Carries `event="security"` because SIEMs filter on that label ([observability-conventions.md](../observability-conventions.md)); the paired audit row `mcp.<tool>` / `denied` with detail `refused: minted by a non-MCP surface (#2442)` is the forensic evidence. **This is the family to alert on.** It counts refusals at redemption, NOT every cross-surface presentation: a foreign-origin ticket that is still pending, or was rejected or expired, is turned away by an earlier status check that never reaches the origin guard, so probing with a leaked non-approved approval id leaves this counter flat (#2779). See **Triaging an increase** below. |
+| `yuzu_mcp_approval_forgery_total` | counter | `tool`, `event="security"` | The SIEM tap for the same `foreign_origin` event: an **approved** ticket declaring a non-MCP minting surface, refused at redemption by the MCP recall. Carries `event="security"` because SIEMs filter on that label ([observability-conventions.md](../observability-conventions.md)); the paired audit row `mcp.<tool>` / `denied` with detail `refused: minted by a non-MCP surface (#2442)` is the forensic evidence. **This is the family to alert on.** It counts refusals at redemption, NOT every cross-surface presentation: **two** earlier checks turn a ticket away before the origin guard is reached, and neither increments anything. First, the recall rejects any ticket whose `definition_id` or scope expression does not match the call — which applies whatever the ticket's status, so an **approved** foreign-origin ticket aimed at a different tool or different arguments also leaves the counter flat, and that is the branch an attacker enumerating leaked ids hits first. Second, a ticket still pending, or rejected or expired, is turned away by the status check. So probing with a leaked approval id leaves this counter flat in every case except an exact tool-and-argument match on an approved ticket (#2779). Note also that the first check reads the store with `get()` rather than `get_checked()`, so a transient store-read failure is audited as `approval_id does not match this request` — a read failure and a genuine mismatch are indistinguishable in that audit row. See **Triaging an increase** below. |
 
 **Alert on an increase, not on a value.** The registry is in-memory, so every
 series returns to zero on restart — an instantaneous `> 0` rule resolves silently
@@ -192,9 +192,11 @@ constant for all three. Two surfaces do name the origin:
   truncated to its first 8 characters, so match it against the first 8 of the full id
   in the audit row's `detail`.
 - `GET /api/approvals`, which returns an `origin` field per ticket. It needs
-  `Approval:Read`, takes no id filter, and returns only the 100 most recently
-  submitted approvals — so it is exact when the refusal is recent and useless once
-  the ticket has aged past that window.
+  `Approval:Read` and takes no id filter, so you cannot fetch one ticket directly.
+  It does take `status` and `submitted_by`, and both are applied in the query's
+  `WHERE` clause ahead of its `LIMIT 100` — so a filtered read still reaches a
+  ticket far older than the hundredth most recent approval overall. An unfiltered
+  read is the one that goes stale quickly on a busy queue.
 
 The refused ticket is left untouched, so it is still readable by either route.
 

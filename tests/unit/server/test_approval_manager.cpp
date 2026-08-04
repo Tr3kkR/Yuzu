@@ -741,7 +741,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
     CHECK(!ran);
 }
 
-TEST_CASE("ApprovalManager: an empty precondition consumes exactly like the two-argument overload",
+TEST_CASE("ApprovalManager: an empty precondition consumes without running a recheck",
           "[approval_manager][approval]") {
     TestDb tdb;
     ApprovalManager mgr(tdb.db);
@@ -757,7 +757,7 @@ TEST_CASE("ApprovalManager: an empty precondition consumes exactly like the two-
     CHECK(row->consumed_by == "operator1");
 }
 
-TEST_CASE("ApprovalManager: a missing principal fails closed on the recheck overload too",
+TEST_CASE("ApprovalManager: a missing principal fails closed on the recheck path too",
           "[approval_manager][approval]") {
     TestDb tdb;
     ApprovalManager mgr(tdb.db);
@@ -876,9 +876,13 @@ TEST_CASE("ApprovalManager: a store failure during the recheck is not reported a
 
 TEST_CASE("ApprovalManager: a store failure is not reported as spent in the message either",
           "[approval_manager][approval]") {
-    // The case above pins the KIND on a store failure. This pins the MESSAGE,
-    // which is what reaches a human in a log or an error body. Both matter: the
-    // kind drives the branch, the message drives what an operator believes.
+    // The case above pins the KIND on a store failure. This pins the MESSAGE.
+    // The kind is what drives the branch: the only production caller, the MCP
+    // recall at mcp_server.cpp:3267, reads `.kind` four times and `.message`
+    // never. The message is pinned anyway because it is the field a future
+    // caller would surface to a human, and a store failure described as a spent
+    // ticket is the wrong thing to tell them — but do not read this test as
+    // evidence that anything reads it today.
     //
     // This used to test a two-argument overload that returned the message alone
     // and discarded the kind. That overload was removed (adversarial review,
