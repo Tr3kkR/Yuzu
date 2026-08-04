@@ -260,6 +260,15 @@ and no API retires it: the approve/reject routes refuse any ticket that is not s
 still `pending`. Rejecting the pending tickets achieves nothing, because a pending ticket is not
 redeemable in the first place.
 
+The claim is checkable rather than asserted. `ApprovalManager`'s only public mutators are
+`approve`, `reject`, `consume_ticket` and the submit path; the first two both route through
+`set_review_status`, which returns `approval already reviewed` unless the stored status is
+`pending`, and `consume_ticket` redeems a ticket rather than retiring it. The complete set of
+approval endpoints is `GET /api/approvals`, `GET /api/approvals/pending/count`, and the
+`POST /api/approvals/{id}/approve` and `/reject` pair — note the last two are registered as
+raw-string regex patterns, so a literal search for `"/api/approvals` will not find them and will
+appear to confirm this paragraph for the wrong reason.
+
 Earlier revisions of this note carried a direct `UPDATE` against `instructions.db`. It has been
 withdrawn. Four successive attempts to publish a safe version each shipped a defect that
 destroyed or stranded live approvals, and the last review round established that the failure was
