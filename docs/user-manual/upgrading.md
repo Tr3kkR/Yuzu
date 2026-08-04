@@ -18,6 +18,76 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## ⚠️ Security: rotate `oidc_client_secret` if it was ever set on this install
+
+**Every release up to and including v0.13.0** emitted the OIDC client secret in the clear to three
+places, and this upgrade closes all three:
+
+- the **server log**, written verbatim by the startup override pass on **every boot**;
+- `GET /api/config`, a route gated only on `Infrastructure:Read`;
+- the `config.update` **audit detail** written by `PUT /api/config/:key`, which is durably retained and
+  readable by every role seeded `AuditLog:Read` - the seeded `Operator` role among them.
+
+**Breaking for automation:** closing the second path changed a response shape.
+`GET /api/config` now reports `"is_set": true|false` for a secret-valued key instead of `value`, so a
+client reading `value` for `oidc_client_secret` gets nothing where it previously got the credential.
+Full shape and the reason it is not a placeholder:
+[`rest-api.md`](rest-api.md#get-apiconfig).
+
+Because the log path fired on every boot, **historical logs** — and anything that ingested them, such
+as journald, a Docker log driver, or a SIEM — may still hold the secret in plaintext. Purge or restrict
+those as your retention policy allows.
+
+Audit rows written before the upgrade are now redacted when read, so the value stops being disclosed
+through that path too. The rows themselves are deliberately left intact: an audit row is compliance
+evidence, and rewriting history to conceal a mistake is a worse posture than declining to disclose it.
+**So the plaintext remains at rest** in those rows, and a direct database read or a restored backup
+still shows it. Do not assume a fixed expiry: `audit_retention_days` defaults to 365, but each prune
+pass is capped, and the retention guard deliberately declines a pass after a clock anomaly or a long
+outage, so rows can outlive the nominal figure. The secret also remains stored in plaintext
+in runtime-config; this fix closes disclosure paths and does not encrypt it at rest (see
+`security-hardening.md`, "Current encryption posture").
+
+**Who this affects:** any install where `oidc_client_secret` was ever set through **Settings -> OIDC**
+or `PUT /api/config/oidc_client_secret` on an affected release. All three paths above read from
+runtime-config, so a secret supplied **only** via `--oidc-client-secret` or `YUZU_OIDC_CLIENT_SECRET`,
+and never written through Settings or the API, was not disclosed by *those three paths*.
+
+**That is not the same as "not disclosed".** A secret passed as `--oidc-client-secret` sits in the
+process command line, world-readable through `ps` or `/proc/<pid>/cmdline`, and it is typically also in
+a systemd unit, a Compose file, or shell history. If you cannot rule those out, rotate anyway.
+`YUZU_OIDC_CLIENT_SECRET` is better against other local users — `/proc/<pid>/environ` is owner-only,
+unlike `cmdline` — but it is *not* better if the value is written into a Compose file or unit, since
+`docker inspect` exposes it to anyone in the `docker` group. Prefer a secrets manager that injects the
+environment variable at runtime.
+
+**Before you begin, check you have a local account you can sign in with** — and on
+`--auth-mode=sso-only`, that it is the configured break-glass account, MFA-enrolled and armable.
+Rotating breaks SSO until Yuzu is re-pointed, and the way back in needs an account that already exists:
+break-glass *names* one rather than creating it. On an install with none, the only fallback
+[`auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md) documents is destructive.
+
+**What to do: rotate the client secret at your IdP, and delete the old one.** The upgrade closes the
+disclosure paths but **does not change the stored value** — anything that already read it still holds a
+working credential, and only the IdP can invalidate it. Most IdPs let you *add* a second client secret
+without removing the first; adding one is not a rotation, because the disclosed secret keeps working
+until it is deleted.
+
+Deletion does not reach what the secret already bought: access tokens minted with it are signed JWTs
+that stay valid until they expire, and IdP sessions can outlast them. Treat revoking those as part of
+the same job. Yuzu's own sessions are separate — the IdP cannot reach them — and are held in memory for
+at most 8 hours; they end on a restart, or per operator via
+`DELETE /api/v1/sessions?username=<name>` (admin, `UserManagement:Write`). **Neither reaches API
+tokens**: one minted under a session that used the disclosed secret survives every step above. List
+them with `GET /api/v1/tokens` and revoke with `DELETE /api/v1/tokens/{id}`.
+
+Re-pointing Yuzu at the new secret is a configuration task rather than a remediation one: once
+everything above is dealt with, SSO failing until you update it is an outage, not a continuing
+disclosure. It is also configuration-specific and easy to get subtly wrong, so it is being written up as
+a reviewed runbook rather than summarised here. Until that lands, see
+[`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to
+configure OIDC.
+
 ## Behaviour change: the `mcp.` definition-id prefix is reserved, and approvals are bound to their minting surface (#2442)
 
 **Who this affects.** Anyone whose instruction definitions include an id beginning `mcp.`. No shipped or bundled content uses that prefix, so a deployment running only Yuzu-supplied content needs no action. Find affected content before upgrading — query the database rather than `GET /api/v1/definitions`, which caps at 100 results and can report a false all-clear:
@@ -1451,9 +1521,9 @@ Manual remediation until the auto-migration in issue #485 lands. **Run each step
 
 Safe on fresh installs (no matching rows). If you are upgrading **from** a v0.11.x release directly **to** v0.12.0 or later, skip this entire sub-section — your RBAC database never carried the stale grants.
 
-**Retention changes take effect on restart, not on runtime PUT.** BL-2 wired `--guardian-event-retention-days` (default 30) through `RuntimeConfigStore` + `PUT /api/v1/config/guardian_event_retention_days`, matching the existing `response_retention_days` and `audit_retention_days` pattern. However, all three retention-bearing stores (`AuditStore`, `ResponseStore`, `GuaranteedStateStore`) capture their retention value at construction time and never re-read it — the runtime PUT mutates `cfg_` and `RuntimeConfigStore` but the running reaper continues using the startup value. An operator who PUTs a new retention value sees `200 {"applied": true}` but the store behaviour does not change until the next server restart. This is a systemic limitation shared across all three stores, not a Guardian-specific bug; it is tracked as issue #483.
+**Retention changes take effect on restart, not on runtime PUT.** BL-2 wired `--guardian-event-retention-days` (default 30) through `RuntimeConfigStore` + `PUT /api/config/guardian_event_retention_days`, matching the existing `response_retention_days` and `audit_retention_days` pattern. However, all three retention-bearing stores (`AuditStore`, `ResponseStore`, `GuaranteedStateStore`) capture their retention value at construction time and never re-read it — the runtime PUT mutates `cfg_` and `RuntimeConfigStore` but the running reaper continues using the startup value. An operator who PUTs a new retention value sees `200 {"applied": true}` but the store behaviour does not change until the next server restart. This is a systemic limitation shared across all three stores, not a Guardian-specific bug; it is tracked as issue #483.
 
-**Runtime config PUT now rejects non-numeric and negative integer values with HTTP 400.** Hardening round 4 (UP-R5) added `std::from_chars` validation to `PUT /api/v1/config/<key>` for `heartbeat_timeout`, `response_retention_days`, `audit_retention_days`, and `guardian_event_retention_days`. The previous handler silently wrote invalid strings to `RuntimeConfigStore` and swallowed the `stoi` error, leaving `cfg_` unchanged. If your automation relied on setting retention to a **negative** value (e.g., `"-1"`) to disable retention — which the store then treated as "never reap" via the `<= 0` sentinel — that automation will now receive `400 {"error":{"code":400,"message":"value must be a non-negative integer"}}`. Use `"0"` instead; it preserves the same disable-retention semantic and passes validation. Automation that previously set non-numeric strings (anything other than a base-10 integer) was silently a no-op before this release — the 400 now surfaces the configuration error that had been hidden.
+**Runtime config PUT now rejects non-numeric and negative integer values with HTTP 400.** Hardening round 4 (UP-R5) added `std::from_chars` validation to `PUT /api/config/<key>` for `heartbeat_timeout`, `response_retention_days`, `audit_retention_days`, and `guardian_event_retention_days`. The previous handler silently wrote invalid strings to `RuntimeConfigStore` and swallowed the `stoi` error, leaving `cfg_` unchanged. If your automation relied on setting retention to a **negative** value (e.g., `"-1"`) to disable retention — which the store then treated as "never reap" via the `<= 0` sentinel — that automation will now receive `400 {"error":{"code":400,"message":"value must be a non-negative integer"}}`. Use `"0"` instead **only for `guardian_event_retention_days`**, where it preserves the disable-retention semantic and passes validation. For `heartbeat_timeout`, `response_retention_days` and `audit_retention_days` the store applies its own `> 0` check *after* the route's, so `"0"` is also rejected - with a different, bare-shaped body, `{"error":"value must be a positive integer"}`. There is no supported way to disable retention for those three through this endpoint. Automation that previously set non-numeric strings (anything other than a base-10 integer) was silently a no-op before this release — the 400 now surfaces the configuration error that had been hidden.
 
 ### v0.12.0 — A3 UX ladder (#620, #622, #624)
 

@@ -235,10 +235,15 @@ agent_test_exe = executable(
     'unit/agent/test_msi_macos.cpp',          # C-1.21: pkgutil --pkg-info parser (P8)
     'unit/agent/test_bitlocker_macos.cpp',    # A-1.16: diskutil apfs list parser (P8)
     'unit/test_subprocess_runner.cpp',        # #2273: agent-core bounded subprocess runner (POSIX deadline/reap)
+    'unit/test_subprocess_launch_spec.cpp',   # PR1.2: host-agnostic pure launch-spec tests (run on Windows too)
     'unit/test_capability_descriptor.cpp',    # PR1.1: ABI4 descriptor + plugin->host result seam + declared-vs-observable honesty
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
     'unit/test_users_macos_last.cpp',         # qe-M1: pure `last -y` timestamp/weekday parsers
+    'unit/test_user_profile_model.cpp',       # PR1.7: pure ProfileList/HKU model (runs on every host)
+    'unit/test_registry_local_dispatcher.cpp', # PR1.7 remediation fix #3: real registry.dll driven
+                                                # end to end via LocalDispatcher (Windows-only; a no-op
+                                                # TU elsewhere via the file's own #ifdef _WIN32 guard)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -432,6 +437,7 @@ if build_server
       'unit/server/test_auth_db_pg.cpp',
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_cidr_match.cpp',
+      'unit/server/test_runtime_config_secret_redaction.cpp',
       'unit/server/test_nvd.cpp',
       'unit/server/test_cpe_identity_resolver.cpp',
       'unit/server/test_update_registry.cpp',
@@ -483,6 +489,7 @@ if build_server
       'unit/server/test_management_group_store.cpp',
       'unit/server/test_dashboard_tar_retention.cpp',
       'unit/server/test_dashboard_tar_fragments.cpp',
+      'unit/server/test_dashboard_results_columns.cpp', # PR1.7 remediation: resolve_render_columns/render_results
       'unit/server/test_route_sink_harness.cpp',
       'unit/server/test_rest_tar_purge.cpp',
       'unit/server/test_api_token_store.cpp',
@@ -593,6 +600,7 @@ if build_server
       'unit/server/test_insecure_tls_gate.cpp',
       'unit/server/test_settings_routes_users.cpp',
       'unit/server/test_settings_routes_dex_alerts.cpp',
+      'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
@@ -828,6 +836,21 @@ test('flake-retry selftest',
   timeout: 30,
 )
 
+# PR1.2 (ADR-3002 Decision-10a): pure-logic selftest of the lexical spawn gate —
+# a seeded raw-spawn fixture must fail and the sanctioned-runner allowlist case
+# must pass. Wired here so the gate's own matcher is enforced on every platform
+# with bash, mirroring the flake-retry selftest above. Guarded so Windows (no
+# bash) skips cleanly rather than erroring at configure.
+_bash_test = find_program('bash', required: false)
+if _bash_test.found()
+  test('plugin-spawn lexical gate selftest',
+    _bash_test,
+    args: [files('../scripts/ci/check-plugin-spawn-lexical.sh'), '--selftest'],
+    suite: 'docs',
+    timeout: 60,
+  )
+endif
+
 # QE-INFO / build-ci B3: tests/shell/test_capability_matrix_gate.sh (PR1.1
 # finding F10 — see the abi4_declared_fixture_plugin comment near the top of
 # this file) was wired ONLY as a separate post-build step in ci.yml, never as
@@ -859,7 +882,6 @@ test('flake-retry selftest',
 # the build_examples-only guard reproduced the same false-red class this PR
 # fixed under `-Dbuild_agent=false -Dbuild_tests=true`, since capmatrix-gen
 # lives under `if build_agent`).
-_bash_test = find_program('bash', required: false)
 if _bash_test.found() and meson.can_run_host_binaries() and build_agent and build_examples
   test('capability matrix gate shell tests (#2204 F10)',
     _bash_test,

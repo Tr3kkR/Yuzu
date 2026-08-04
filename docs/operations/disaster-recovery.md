@@ -66,6 +66,14 @@ systemctl start yuzu-server
 curl http://localhost:8080/livez
 ```
 
+> **Restoring a backup taken before the OIDC-secret redaction fix?** Rotate the OIDC client
+> secret. Earlier versions recorded it in the clear in the server log, `GET /api/config` and the
+> `config.update` audit detail. The current server no longer discloses it - including for audit
+> rows written before the fix, which are redacted when read - but **a restored backup still
+> contains the plaintext bytes on disk**, and anything that read it while it was exposed still
+> holds a working credential. See
+> [Security hardening -> OIDC](../user-manual/security-hardening.md#oidc-hardening).
+
 ## Recovery Time
 
 | Scenario | Data at Risk | Recovery Time |

@@ -3051,7 +3051,10 @@ Per-policy compliance detail with per-agent statuses.
 
 ### Runtime Configuration
 
-Runtime configuration endpoints allow reading and updating server settings without a restart. Only a predefined set of keys can be changed at runtime.
+Runtime configuration endpoints read and update a predefined set of server settings. Every accepted
+write is persisted immediately; **whether it also takes effect immediately depends on the key** - see
+[When a change takes effect](#when-a-change-takes-effect). In particular, writing an OIDC key through
+this API does **not** re-initialise the running OIDC provider.
 
 #### `GET /api/config`
 
@@ -3059,20 +3062,42 @@ Returns current configuration values and any active runtime overrides.
 
 **Permission:** `Infrastructure:Read`
 
-**Response:**
+> **Secret values are never returned.** For an override whose key holds a credential
+> (today: `oidc_client_secret`) the `value` field is **omitted entirely** and replaced
+> by `"is_set": true|false`. It is not a placeholder string: a placeholder is a legal
+> value, so a config-as-code or backup-restore client that read this and wrote it back
+> would silently overwrite the real secret. `updated_by` and `updated_at` are still
+> returned. `PUT /api/config/oidc_client_secret` sets it, and its 200 response omits
+> the value too.
+
+**Error (503) - runtime config store unavailable.** If the store is closed or failed to open, this
+returns 503 rather than an empty `overrides`, so a degraded store is never read as "nothing is
+configured". That distinction matters here specifically: this route no longer returns a secret's
+value, so key presence and `is_set` are the only way to answer "is the OIDC secret set on this
+server?" - the question [Security hardening](security-hardening.md#oidc-hardening) sends operators to
+before deciding whether to rotate.
+
+```json
+{ "error": { "code": 503, "message": "runtime configuration store unavailable" }, "meta": { "api_version": "v1" } }
+```
+
+**Response** (shape corrected - the handler returns `config`, `overrides` and
+`allowed_keys`, not a `data`/`meta` envelope):
 
 ```json
 {
-  "data": {
-    "heartbeat_timeout": 120,
-    "response_retention_days": 90,
-    "audit_retention_days": 365,
-    "auto_approve_enabled": false,
-    "log_level": "info"
+  "config": { "heartbeat_timeout": 120, "log_level": "info" },
+  "overrides": {
+    "log_level":          { "value": "debug", "updated_by": "admin", "updated_at": 1754150400 },
+    "oidc_client_secret": { "is_set": true,   "updated_by": "admin", "updated_at": 1754150400 }
   },
-  "meta": { "api_version": "v1" }
+  "allowed_keys": ["heartbeat_timeout", "log_level", "oidc_client_secret"]
 }
 ```
+
+`allowed_keys` above is abridged for readability; the real response lists every key in the
+[allowed-keys table](#put-apiconfigkey). `config` reports effective values and `overrides` only the
+keys with a stored override, so a key can appear in `config` without appearing in `overrides`.
 
 ---
 
@@ -3082,15 +3107,72 @@ Update a single runtime configuration value. The key must be one of the allowed 
 
 **Permission:** `Infrastructure:Write`
 
-**Allowed keys:**
+**Allowed keys** (the full set; source of truth is `kAllowedKeys` in
+`server/core/src/runtime_config_store.cpp`):
 
-| Key | Type | Description |
-|---|---|---|
-| `heartbeat_timeout` | integer | Seconds before an agent is considered offline |
-| `response_retention_days` | integer | Days to retain command response data |
-| `audit_retention_days` | integer | Days to retain audit log entries |
-| `auto_approve_enabled` | boolean | Whether auto-approve rules are active |
-| `log_level` | string | Server log verbosity (`trace`, `debug`, `info`, `warn`, `error`) |
+| Key | Type | Takes effect | Description |
+|---|---|---|---|
+| `heartbeat_timeout` | integer | immediately | Seconds before an agent is considered offline |
+| `response_retention_days` | integer | **stored only, applied at next restart** | Days to retain command response data |
+| `audit_retention_days` | integer | **stored only, applied at next restart** | Days to retain audit log entries |
+| `guardian_event_retention_days` | integer | **stored only, applied at next restart** | Days to retain guaranteed-state events |
+| `log_level` | string | immediately | Server log verbosity (`trace`, `debug`, `info`, `warn`, `error`) |
+| `auto_approve_enabled` | boolean | **never - see note** | Accepted and stored, but no consumer reads it back |
+| `plugin_signing_required` | boolean | **records intent only - see note** | Server-side record of the Settings "Require signed plugins" toggle |
+| `oidc_issuer` | string | **see note** | OIDC issuer URL |
+| `oidc_client_id` | string | **see note** | OIDC client ID |
+| `oidc_client_secret` | string | **see note** | OIDC client secret (write-only through this API) |
+| `oidc_redirect_uri` | string | **see note** | OIDC redirect URI |
+| `oidc_admin_group` | string | **see note** | OIDC admin group ID |
+| `oidc_skip_tls_verify` | boolean | **see note** | Skip TLS verification to the IdP (test only) |
+| `dex_alert_routing` | string (JSON array) | **persisted only - see note** | Routed DEX observation types |
+| `dex_blast_min_devices` | integer | **persisted only - see note** | Blast-radius alert threshold (clamped on apply) |
+| `dex_blast_window_seconds` | integer | **persisted only - see note** | Blast-radius window |
+| `dex_blast_cooldown_seconds` | integer | **persisted only - see note** | Blast-radius cooldown |
+| `dex_cohort_export_key` | string | **persisted only - see note** | Cohort export tag key; `""` disables export |
+
+##### When a change takes effect
+
+Persisting a value and applying it are separate steps, and this endpoint only does the first for
+most keys:
+
+- **immediately** - only two keys. `heartbeat_timeout` is assigned into the live server config and
+  re-read on every stale-session sweep; `log_level` is applied by `RuntimeConfigStore::set()` itself
+  via `spdlog::set_level`.
+- **stored only, applied at next restart** - `response_retention_days`, `audit_retention_days`,
+  `guardian_event_retention_days`. The handler updates the in-memory config, so `GET /api/config`
+  and the Settings page immediately report the NEW value - but each store captured its retention
+  window when it was constructed and exposes no setter, so the store still enforcing retention keeps
+  the old value until the server restarts. **The API reports the stored value, not the value being
+  enforced.** Restart after changing a retention window.
+- **records intent only** - `plugin_signing_required` is read in exactly two places, both of which
+  render the Settings status badge. **No server or agent code consumes it to require signatures**,
+  and it is not carried in any proto field, so it never reaches an agent. Agent-side enforcement is
+  the agent's own `--plugin-require-signature` flag paired with an operator-distributed
+  `--plugin-trust-bundle`. Setting this key records the operator's intent and changes what Settings
+  displays; **it does not harden anything by itself**.
+- **persisted only, applied at next boot or next DEX-alerts Settings save** - `dex_alert_routing`,
+  `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`,
+  `dex_cohort_export_key`. The live consumers (`DexAlertRouter`, the blast-radius detector, the
+  cohort-gauge export key) are **cached in memory** and refreshed only by `apply_dex_alert_config()`,
+  which runs at server startup and from the Settings -> DEX alerts save handler - never from this
+  endpoint. A `PUT` through this API is inert on the running server until one of those two happens.
+  To change DEX alerting and have it apply at once, use Settings -> DEX alerts.
+- **never** - `auto_approve_enabled` is accepted by the allow-list and written to the store, but no
+  code reads it back from there. `GET /api/config` reports `auto_approve_enabled` **derived from
+  whether any auto-approve rule exists**, not from the stored value, so a `PUT` of this key can
+  appear to have no effect - because it has none. Manage auto-approve through its own rules API.
+- **OIDC keys (see note)** - persisted only, and **a restart does not apply them either.** The
+  `OidcProvider` is constructed early in server startup (`server.cpp:1894`) from CLI/environment
+  configuration, whereas the stored runtime-config overrides are not read until much later in the
+  same startup (`server.cpp:3466`); nothing rebuilds the provider afterwards. So a value written
+  through this API never reaches the live provider, on this boot or any later one.
+  **Only Settings -> OIDC (`POST /api/settings/oidc`) applies OIDC settings**, because that handler
+  constructs a new provider and swaps it in - but that swap is **process-local**. The startup path
+  DOES read these keys out of the store, just too late to matter - the provider is already built and
+  nothing rebuilds it - so a restart runs on whatever the command line or environment supplies. To
+  change OIDC durably, update that value as well as saving through Settings. This matters most for a credential rotation: a `PUT` of
+  `oidc_client_secret` returns `"applied": true` meaning *persisted and accepted*, never *in use*.
 
 **Request body:**
 
@@ -3100,23 +3182,81 @@ Update a single runtime configuration value. The key must be one of the allowed 
 }
 ```
 
-**Response:**
+**Response** (flat, not a `data`/`meta` envelope). `applied` means *persisted and accepted* - see
+[When a change takes effect](#when-a-change-takes-effect) for whether the running server is using it
+yet:
+
+```json
+{ "key": "heartbeat_timeout", "value": 180, "applied": true }
+```
+
+For a secret-valued key the response **omits `value`**, for the same reason `GET /api/config` does:
+
+```json
+{ "key": "oidc_client_secret", "applied": true }
+```
+
+**Removing a stored secret.** Send an empty value — `{"value": ""}` — and `GET /api/config` then
+reports `"is_set": false` for that key. Two things to know before relying on this. It clears only the
+stored **override**: an empty stored value is skipped at startup, so if `--oidc-client-secret` or
+`YUZU_OIDC_CLIENT_SECRET` is still set, that value takes effect again on the next restart. And like
+every write to this route, it does **not** reach the running OIDC provider — the process keeps using
+whatever secret it started with until it restarts. Clearing the Settings → OIDC form field does *not*
+remove the secret either: a blank field there means "leave the stored value unchanged".
+
+**After clearing, do not save the Settings → OIDC form with the secret field blank.** That form falls
+back to the secret the process is currently holding, rebuilds the live provider with it, and — because
+the field was blank — does not write **the secret** back to the store (the form's other OIDC fields are
+persisted as normal). The result is the previously loaded secret live in the running process while
+`GET /api/config` still reports `"is_set": false`. If you have cleared the secret and need to change
+another OIDC field, restart first so the process is not holding the old value.
+
+> **Two different error sources, two different shapes.** The shared authorization gate in front of
+> this route **does** emit the A4 envelope: a `401`, a `403` permission denial, or a `503`
+> authorization-store failure carries `correlation_id` (echoed on `X-Correlation-Id`) like any other
+> gated route. The bodies **the handler itself** emits do not — `/api/config` is a legacy
+> non-`/api/v1` route, and its own errors are either a bare `error` string or a nested
+> `{"error":{"code","message"},"meta":{"api_version"}}` object with no `correlation_id` and no
+> `retry_after_ms`. Besides those shown below, the handler emits nested bodies for `400` "missing
+> 'value' in request body", `400` "invalid JSON body", and a `503` when the runtime-config store is
+> unavailable (`GET` says "runtime configuration store unavailable", `PUT` says "runtime config store
+> unavailable"). Note `503` is emitted by **both** sources, so status alone does not tell you which
+> shape you have: test for `error.correlation_id` rather than assuming it, on every status.
+
+**Error (400) - key not configurable.** This one is a bare `error` string with no envelope:
+
+```json
+{ "error": "key 'foo' is not a configurable runtime setting" }
+```
+
+**Error (400) - bad value for an integer key**, which uses a nested error body:
 
 ```json
 {
-  "data": { "updated": true, "key": "heartbeat_timeout", "value": 180 },
+  "error": { "code": 400, "message": "value must be a non-negative integer" },
   "meta": { "api_version": "v1" }
 }
 ```
 
-**Error (400) -- invalid key:**
+A value of `0` for `heartbeat_timeout`, `response_retention_days` or `audit_retention_days` passes
+the route's `>= 0` pre-check and is then rejected by the store's own `> 0` check, so it returns the
+**bare** shape with a different message: `{ "error": "value must be a positive integer" }`.
+
+**Error (400) - the redaction placeholder submitted as a secret.** `GET /api/config` omits a
+secret's value and the startup log prints `<redacted>` in its place. Any value **containing** that
+literal is refused for a secret-valued key, ignoring surrounding whitespace and control bytes, so
+copying it back cannot destroy the stored credential. The rule is deliberately broad: a paste can
+carry an invisible code point (a BOM, a zero-width space) that no trim list catches exhaustively,
+and the two failure directions are not symmetric - refusing an implausible secret costs an error
+message, while accepting a padded placeholder silently destroys a live credential. If your real
+client secret contains `<redacted>`, rotate it at the IdP to a value that does not. Bare shape:
 
 ```json
-{
-  "error": "unknown config key 'foo'; allowed: heartbeat_timeout, response_retention_days, audit_retention_days, auto_approve_enabled, log_level",
-  "meta": { "api_version": "v1" }
-}
+{ "error": "value is the redaction placeholder, not a credential; send the real secret, or omit the key to leave it unchanged" }
 ```
+
+**Audit:** a successful write emits `config.update` / `RuntimeConfig` with `target_id` = the key.
+See [Audit log](audit-log.md) for the `detail` contract, which differs for secret-valued keys.
 
 ---
 
@@ -5290,7 +5430,7 @@ The one device list behind every network-quality drill: worst devices by a metri
 | `skip_tls_verify` | string | No | `"true"` to disable TLS cert verification for OIDC endpoints (insecure, dev only) |
 
 - **Response:** Re-rendered Settings fragment (HTMX). Returns toast notification on success.
-- **Effect:** Immediately reinitializes the OIDC provider with the new configuration. No server restart required.
+- **Effect:** Immediately reinitializes the OIDC provider with the new configuration - in THIS process only. The swap is NOT durable: the provider is rebuilt at the next startup from the command-line/environment value, not from the stored runtime config, so a restart reverts to that value. Rotating a credential durably requires updating `--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET` as well - see [When a change takes effect](#when-a-change-takes-effect).
 
 **`POST /api/settings/oidc/test`** — Test OIDC discovery connectivity.
 

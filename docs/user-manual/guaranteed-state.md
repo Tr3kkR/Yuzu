@@ -327,7 +327,7 @@ Each row carries a human `detected_value` sentence plus a structured **`detail_j
 
 ## Retention
 
-Guardian events are pruned on a rolling window. The default is 30 days. Override with `--guardian-event-retention-days` at server start (or set `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`), or via `PUT /api/v1/config/guardian_event_retention_days` at runtime. See the [Retention Settings](server-admin.md#retention-settings) table in the server administration guide.
+Guardian events are pruned on a rolling window. The default is 30 days. Override with `--guardian-event-retention-days` at server start (or set `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`), or via `PUT /api/config/guardian_event_retention_days` at runtime. See the [Retention Settings](server-admin.md#retention-settings) table in the server administration guide. **The change is enforced only after the next restart**: the running store captures its retention window at construction and never re-reads it, so a `PUT` returns `"applied": true` while the reaper keeps using the startup value (#483). See [REST API -> When a change takes effect](rest-api.md#when-a-change-takes-effect).
 
 ## Reconnect replay traffic (durable lifecycle journal)
 
