@@ -438,3 +438,119 @@ TEST_CASE("ScheduleEngine: stop is safe to call", "[schedule_engine]") {
     engine.stop(); // should not crash
     REQUIRE(true);
 }
+
+// ── PR1.5a: typed schedule parameters ───────────────────────────────────────
+
+TEST_CASE("ScheduleEngine: a schedule created with no parameters defaults to the canonical "
+          "empty object",
+          "[schedule_engine][params]") {
+    TestDb tdb;
+    ScheduleEngine engine(tdb.db);
+    engine.create_tables();
+
+    auto result = engine.create_schedule(make_schedule("def-1", "interval"));
+    REQUIRE(result.has_value());
+
+    auto all = engine.query_schedules();
+    REQUIRE(all.size() == 1);
+    CHECK(all[0].parameter_values == "{}");
+}
+
+TEST_CASE("ScheduleEngine: create_schedule stores the canonical (sorted-key) form regardless "
+          "of the caller's key order",
+          "[schedule_engine][params]") {
+    TestDb tdb;
+    ScheduleEngine engine(tdb.db);
+    engine.create_tables();
+
+    auto sched = make_schedule("def-1", "interval", "Params");
+    sched.parameter_values = R"({"zeta":"1","alpha":"2"})";
+    auto result = engine.create_schedule(sched);
+    REQUIRE(result.has_value());
+
+    auto all = engine.query_schedules();
+    REQUIRE(all.size() == 1);
+    CHECK(all[0].parameter_values == R"({"alpha":"2","zeta":"1"})");
+}
+
+TEST_CASE("ScheduleEngine: create_schedule rejects invalid parameters and creates no row",
+          "[schedule_engine][params]") {
+    TestDb tdb;
+    ScheduleEngine engine(tdb.db);
+    engine.create_tables();
+
+    auto sched = make_schedule("def-1", "interval");
+    sched.parameter_values = R"({"nested":{"a":1}})"; // non-scalar value
+    auto result = engine.create_schedule(sched);
+    CHECK_FALSE(result.has_value());
+    CHECK(engine.query_schedules().empty());
+}
+
+// Migration test on an existing-row fixture (acceptance criteria): a row
+// written under the pre-PR1.5a schema (no parameter_values column at all)
+// must back-fill to the canonical empty object when the schema migrates —
+// not merely default correctly for a fresh INSERT.
+TEST_CASE("ScheduleEngine: migrating a pre-existing (v1) row back-fills parameter_values to "
+          "the canonical empty object",
+          "[schedule_engine][params][migration]") {
+    TestDb tdb;
+
+    // The ORIGINAL table shape, created directly (bypassing MigrationRunner
+    // entirely, so schema_meta has no record of this store — exactly the
+    // shape of a database that predates this migration's existence).
+    const char* v1_sql = R"(
+        CREATE TABLE schedules (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            definition_id TEXT NOT NULL,
+            frequency_type TEXT NOT NULL DEFAULT 'once',
+            interval_minutes INTEGER NOT NULL DEFAULT 60,
+            time_of_day TEXT NOT NULL DEFAULT '00:00',
+            day_of_week INTEGER NOT NULL DEFAULT 0,
+            day_of_month INTEGER NOT NULL DEFAULT 1,
+            scope_expression TEXT NOT NULL DEFAULT '',
+            requires_approval INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            next_execution_at INTEGER NOT NULL DEFAULT 0,
+            last_executed_at INTEGER NOT NULL DEFAULT 0,
+            execution_count INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT 0
+        );
+    )";
+    char* err = nullptr;
+    REQUIRE(sqlite3_exec(tdb.db, v1_sql, nullptr, nullptr, &err) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(tdb.db,
+                        "INSERT INTO schedules (id, name, definition_id, frequency_type, "
+                        "created_by) VALUES ('legacy-1', 'Legacy', 'def-legacy', 'once', "
+                        "'admin')",
+                        nullptr, nullptr, &err) == SQLITE_OK);
+
+    ScheduleEngine engine(tdb.db);
+    engine.create_tables(); // v1 CREATE TABLE IF NOT EXISTS no-ops; v2 ALTER COLUMN applies
+
+    auto all = engine.query_schedules();
+    bool found = false;
+    for (const auto& s : all) {
+        if (s.id == "legacy-1") {
+            found = true;
+            CHECK(s.parameter_values == "{}");
+        }
+    }
+    REQUIRE(found);
+
+    // The migrated row still fires — evaluate_due/advance_schedule read the
+    // new column via the same SELECT list as every other row.
+    REQUIRE(sqlite3_exec(tdb.db,
+                        "UPDATE schedules SET next_execution_at = 1 WHERE id = 'legacy-1'",
+                        nullptr, nullptr, &err) == SQLITE_OK);
+    auto due = engine.evaluate_due();
+    bool due_found = false;
+    for (const auto& s : due) {
+        if (s.id == "legacy-1") {
+            due_found = true;
+            CHECK(s.parameter_values == "{}");
+        }
+    }
+    CHECK(due_found);
+}

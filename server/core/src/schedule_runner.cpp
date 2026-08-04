@@ -7,6 +7,7 @@
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "schedule_engine.hpp"
+#include "schedule_params_parsers.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -72,6 +73,26 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
         audit(s, "instruction.schedule_fired", "failure",
               std::string(def ? "definition_disabled" : "definition_unknown") +
                   " schedule_id=" + s.id);
+        d_.schedule_engine->advance_schedule(s.id);
+        return;
+    }
+
+    // D7 (PLAN-003): re-verify the arming principal BEFORE the
+    // approval/direct branch below, so BOTH arms are covered — a check
+    // placed only inside fire_with_approval would let every
+    // approval_mode == "auto" schedule dispatch under stale authority.
+    // Fail-closed: an unset callback (p14 not wired yet, or a deliberate
+    // lockdown) denies the fire exactly like an explicit `false`. Always
+    // advance so a permanently-denied schedule cannot spin retrying every
+    // tick forever.
+    if (!d_.arming_check || !d_.arming_check(s.created_by, def->plugin, def->action)) {
+        count("yuzu_schedule_arming_denied_total");
+        spdlog::warn("schedule_runner: schedule '{}' (id={}) arming check denied — "
+                     "principal='{}' target={}.{}",
+                     s.name, s.id, s.created_by, def->plugin, def->action);
+        audit(s, "instruction.schedule_fired", "denied",
+              "arming_check_denied schedule_id=" + s.id + " principal=" + s.created_by +
+                  " plugin=" + def->plugin + " action=" + def->action);
         d_.schedule_engine->advance_schedule(s.id);
         return;
     }
@@ -187,7 +208,13 @@ int ScheduleRunner::dispatch_tracked(const InstructionSchedule& s, const std::st
         exec.definition_id = s.definition_id;
         exec.status = "running";
         exec.scope_expression = s.scope_expression;
-        exec.parameter_values = "{}";
+        // PR1.5a: the schedule's own canonical parameters, not a hardcoded
+        // "{}" — create_schedule() guarantees s.parameter_values is always a
+        // validated canonical blob (never truly empty), but a schedule row
+        // constructed off the persistence path (a test, a future direct
+        // caller) is defended against here too.
+        exec.parameter_values =
+            s.parameter_values.empty() ? std::string(kEmptyScheduleParams) : s.parameter_values;
         exec.dispatched_by = s.created_by;
         if (auto created = d_.execution_tracker->create_execution(exec); created.has_value())
             exec_id = *created;
@@ -216,10 +243,10 @@ int ScheduleRunner::dispatch_tracked(const InstructionSchedule& s, const std::st
     const std::string dispatch_scope = s.scope_expression.empty()
                                            ? std::string(yuzu::server::kBroadcastScope)
                                            : s.scope_expression;
+    auto parameters = schedule_params_to_map(s.parameter_values);
     try {
-        std::tie(command_id, sent) = d_.dispatch_fn(plugin, action, /*agent_ids=*/{},
-                                                    dispatch_scope,
-                                                    /*parameters=*/{}, exec_id);
+        std::tie(command_id, sent) =
+            d_.dispatch_fn(plugin, action, /*agent_ids=*/{}, dispatch_scope, parameters, exec_id);
     } catch (const std::exception& e) {
         count("yuzu_schedule_fire_failures_total");
         spdlog::error("schedule_runner: dispatch failed for schedule '{}' (id={}): {}", s.name,
