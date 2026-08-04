@@ -1245,11 +1245,22 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
 
 Quarantine isolates a device from receiving commands or participating in normal operations. Quarantined devices remain connected but are blocked from instruction execution.
 
+> **Scoped per-target authorization (#1788).** All three routes below authorize
+> per-device, matching the MCP `quarantine_device` tool: a management-group-confined
+> operator holding `Security:Execute`/`Security:Read` only through a group can
+> act on and see devices inside their own group(s), and is refused (`403`) for
+> devices outside them. A global grant (or an unfiltered/legacy-RBAC-disabled
+> deployment) still reaches every device, unchanged. If the per-target scope
+> gate is ever left unconfigured, every request on these routes fails **closed**
+> with a `500` rather than silently widening to a fleet-wide check.
+
 #### `GET /api/v1/quarantine`
 
-List all currently quarantined devices.
+List currently quarantined devices visible to the caller — admit-then-filter:
+a device outside the caller's management-group scope is omitted from the
+list entirely, not merely hidden from write access.
 
-**Permission:** `Security:Read`
+**Permission:** `Security:Read`, scoped per-device
 
 **Response:**
 
@@ -1276,7 +1287,7 @@ List all currently quarantined devices.
 
 Quarantine a device.
 
-**Permission:** `Security:Execute`
+**Permission:** `Security:Execute`, scoped per-device (see the note above)
 
 > **Supervised MCP tokens are approval-gated here too.** A bearer token minted
 > with `mcp_tier: "supervised"` gets `403` on this route (and on the `DELETE`
@@ -1315,7 +1326,7 @@ Quarantine a device.
 
 Release a device from quarantine.
 
-**Permission:** `Security:Execute`
+**Permission:** `Security:Execute`, scoped per-device (see the note above)
 
 **Response:**
 
@@ -3830,6 +3841,40 @@ the server row cap or 8 MiB aggregate payload cap, the route returns **503**
 persisting a silently-incomplete set — a fleet-targeting set is never silently
 narrowed.
 
+#### `POST /api/v1/result-sets/from-tar-query`<br>`POST /api/v1/result-sets/from-instruction-result`<br>`POST /api/v1/result-sets/{id}/re-eval`
+
+The three **asynchronous** result-set producers. Unlike `from-inventory-query`,
+which answers from server-side inventory, these **dispatch a command to agents**
+and materialise the set once the responses land — so they are operator dispatch
+surfaces, not reads. `from-tar-query` runs SQL on TAR agents; `from-instruction-result`
+runs an `InstructionDefinition` and filters responders by `matcher`; `{id}/re-eval`
+re-runs a set's own source query and creates a **sibling** (same parent, new id).
+
+**Permission:** `Execution:Execute`, **confined per device**
+
+> **Per-device confinement (#1788).** These routes admit on a global
+> `Execution:Execute` grant and then reach the fleet by scope (`parent_id`) or
+> `__all__` broadcast, so the caller's derived visible set is their only
+> per-device authorization. A service-scoped token reaches only agents tagged
+> with its own service; devices outside the caller's reach are dropped from the
+> send set rather than refused individually. A global administrator or a
+> JIT-elevated session keeps full-fleet reach — that is their actual authority.
+
+**Targeting:** omit `parent_id` to dispatch to `__all__` deliberately. A
+**supplied** `parent_id` that is empty, non-string, or `null` is refused with
+`400 RESULT_SET_BAD_PARENT` rather than silently widening to the fleet.
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent; or missing `sql` / `instruction_id` |
+| 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
+| 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
+| 500 | `RESULT_SET_GATE_UNCONFIGURED` — the server's dispatch-visibility gate is not wired. Fails **closed**: nothing is dispatched, and the refusal is audited. An operator seeing this has a server misconfiguration, not an authorization problem |
+| 503 | `RESULT_SET_NO_AGENTS` — no agents were reached in the target scope. Deliberately indistinguishable from "every resolved target was outside your reach": a distinct status would disclose devices the caller may not see |
+| 503 | `RESULT_SET_DISPATCH_UNAVAILABLE` / `RESULT_SET_DISPATCH_FAILED` — dispatch not wired, or the dispatch itself raised |
+
 #### `GET /api/v1/inventory/{plugin}/{agent_id}`
 
 Get inventory data for a specific plugin and agent.
@@ -4252,7 +4297,7 @@ The server expands the bundle into N ordinary plugin commands, each dispatched u
 
 Dispatch a bundle. Returns the correlation id immediately; poll `GET /api/v1/bundles/{id}` for the collated result.
 
-**Permission:** `Execution:Execute`
+**Permission:** `Execution:Execute`, scoped per-device (management-group-confined operators are admitted for devices in their own group(s)). The caller's derived visibility is also enforced a second time at dispatch (#1788, defense-in-depth) — a target outside it is treated as unreached (`result=no_agents`, `state=dispatch_failed` on collate) rather than reaching the device.
 
 **Request body:**
 
@@ -5749,7 +5794,24 @@ uniqueness against existing definitions.
 **Response (200):** `{"id": "<id>"}` for the newly-created definition.
 
 **Response (400):** Validation error (missing required field, invalid
-`approval_mode`, malformed JSON). Body is `{"error": "<reason>"}`.
+`approval_mode`, malformed JSON, or an `id` under the reserved `mcp.` prefix).
+Body is `{"error": "<reason>"}`.
+
+The `mcp.` definition-id prefix is **reserved** (#2442): it names MCP approval
+tickets, and the MCP recall matches a ticket on its definition id and scope
+expression without binding the submitter, so a definition authored under that
+prefix could line up with an MCP tool's canonical arguments. Every authoring
+route that accepts an explicit id refuses it — this one, `POST
+/api/instructions/yaml`, and `POST /api/instructions/import` — and boot-time
+auto-import skips such a definition. Product-pack install is unaffected: it
+never carries a declared id through, so the store always assigns one.
+
+The store applies this at **create time**, so an id that predates the rule stays
+executable and can still be saved through `PUT /api/instructions/{id}`, because
+an update cannot originate an id. Note the dashboard's YAML editor is stricter
+than the store here: `POST /api/instructions/yaml` validates a declared id on
+every save, so an existing `mcp.`-prefixed definition cannot be edited through
+it unless its document omits `metadata.id`.
 
 **Response (409):** Returned when an explicit `id` is supplied that already
 exists in the store. Body is

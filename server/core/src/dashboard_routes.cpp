@@ -163,14 +163,15 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                                        detail::EventBus* event_bus,
                                        AgentsJsonFn agents_json_fn,
                                        DispatchFn dispatch_fn,
+                                       ExecVisibleFn exec_visible_fn,
                                        ResolveFn resolve_fn,
                                        yuzu::MetricsRegistry* metrics,
                                        InstructionStore* instruction_store) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     response_store, mgmt_group_store, registry, tag_store, event_bus,
-                    std::move(agents_json_fn), std::move(dispatch_fn), std::move(resolve_fn),
-                    metrics, instruction_store);
+                    std::move(agents_json_fn), std::move(dispatch_fn), std::move(exec_visible_fn),
+                    std::move(resolve_fn), metrics, instruction_store);
 }
 
 void DashboardRoutes::register_routes(HttpRouteSink& sink,
@@ -181,6 +182,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                        detail::EventBus* event_bus,
                                        AgentsJsonFn agents_json_fn,
                                        DispatchFn dispatch_fn,
+                                       ExecVisibleFn exec_visible_fn,
                                        ResolveFn resolve_fn,
                                        yuzu::MetricsRegistry* metrics,
                                        InstructionStore* instruction_store) {
@@ -194,6 +196,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     event_bus_ = event_bus;
     agents_json_fn_ = std::move(agents_json_fn);
     dispatch_fn_ = std::move(dispatch_fn);
+    exec_visible_fn_ = std::move(exec_visible_fn);
     resolve_fn_ = std::move(resolve_fn);
     metrics_ = metrics;
     instruction_store_ = instruction_store;
@@ -560,7 +563,21 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  if (!perm_fn_(req, res, "Execution", "Execute")) return;
 
                  auto instruction = extract_form_value(req.body, "instruction");
-                 auto scope = extract_form_value(req.body, "scope");
+
+                 // CDX-P1-01: read the DECODED param first (httplib percent-decodes
+                 // both keys and values when it parses an
+                 // application/x-www-form-urlencoded body into req.params), falling
+                 // back to the raw-body helper only for a non-form Content-Type
+                 // httplib does not parse into req.params (UP-10). A raw-byte scan
+                 // alone (the prior form of this line) cannot see a percent-encoded
+                 // field NAME — e.g. `sc%6fpe=` decodes to `scope` in req.params but
+                 // never matches the literal `scope=` needle `extract_form_value`
+                 // scans for — so encoding the key name reopened exactly the
+                 // supplied-vs-omitted collapse CDX-R8-01 closed. Mirrors
+                 // tar-execute's identical fix below.
+                 auto scope = req.get_param_value("scope");
+                 if (scope.empty())
+                     scope = extract_form_value(req.body, "scope");
 
                  if (instruction.empty()) {
                      res.set_content(
@@ -676,18 +693,45 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                  }
 
-                 // Resolve scope → agent_ids or scope expression
+                 // Resolve scope → agent_ids or scope expression.
+                 //
+                 // CDX-R8-01: a SUPPLIED `scope=` that resolves to nothing is an
+                 // ERROR, not a fleet broadcast — `extract_form_value` returns ""
+                 // for an absent key and an empty one alike, so the two must be
+                 // told apart HERE or they collapse into the same request
+                 // (dispatch_target_shape.hpp:14-16). `__all__` is passed THROUGH
+                 // as a named broadcast rather than stripped to empty+empty, so
+                 // the fleet is reached by NAME, never inferred from emptiness.
                  std::vector<std::string> agent_ids;
                  std::string scope_expr;
                  if (!scope.empty() && scope.starts_with("group:")) {
                      scope_expr = scope;
                  } else if (!scope.empty() && scope != yuzu::server::kBroadcastScope) {
                      agent_ids.push_back(scope);
+                 } else if (scope == yuzu::server::kBroadcastScope) {
+                     scope_expr = std::string(yuzu::server::kBroadcastScope);
+                 } else if (req.has_param("scope") || form_value_supplied(req.body, "scope")) {
+                     res.set_content(
+                         "<span id=\"result-context\" hx-swap-oob=\"true\""
+                         " style=\"font-size:0.75rem;color:#f85149\">"
+                         "No target selected. Choose agents, or pick All agents "
+                         "to reach the fleet.</span>",
+                         "text/html; charset=utf-8");
+                     return;
                  }
-                 // scope == "__all__" or empty → broadcast (empty agent_ids + empty scope)
+                 // scope omitted entirely → the legacy UI contract: the whole fleet
+                 // (still narrowed to the operator's visible set by the seam).
 
-                 // Dispatch with inline CLI parameters
-                 auto [command_id, sent] = dispatch_fn_(plugin, action, agent_ids, scope_expr, inline_params);
+                 // Dispatch with inline CLI parameters. CDX-R7-02: narrow to the
+                 // operator's Execution:Execute visible set via the shared
+                 // dispatch_confined seam (same confinement as /api/command +
+                 // MCP). An UNWIRED derivation fails CLOSED (present-empty set →
+                 // reaches nobody), never nullopt/unfiltered.
+                 yuzu::server::authz::VisibleSet exec_visible =
+                     exec_visible_fn_ ? exec_visible_fn_(req)
+                                      : yuzu::server::authz::deny_all();
+                 auto [command_id, sent] =
+                     dispatch_fn_(plugin, action, agent_ids, scope_expr, inline_params, exec_visible);
                  if (sent == 0) {
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
@@ -836,18 +880,48 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                  }
 
+                 // CDX-R8-01, the TAR sibling of the execute route above: tell a
+                 // SUPPLIED-but-empty `scope=` apart from an omitted one, and pass
+                 // `__all__` through by NAME instead of stripping it to empty+empty.
+                 //
+                 // UP-10: req.has_param()/get_param_value() only see the query
+                 // string or a body httplib parsed into req.params — which happens
+                 // ONLY for an `application/x-www-form-urlencoded` Content-Type. A
+                 // non-form POST leaves a body-supplied `scope=` invisible to both,
+                 // so the refusal below was silently skippable by sending any other
+                 // Content-Type. Fall back to reading the raw body directly (the
+                 // same form_value_supplied/extract_form_value the execute route
+                 // above uses), which is Content-Type-independent.
                  auto scope = req.get_param_value("scope");
+                 if (scope.empty())
+                     scope = extract_form_value(req.body, "scope");
                  std::vector<std::string> agent_ids;
                  std::string scope_expr;
                  if (!scope.empty() && scope.starts_with("group:")) {
                      scope_expr = scope;
                  } else if (!scope.empty() && scope != yuzu::server::kBroadcastScope) {
                      agent_ids.push_back(scope);
+                 } else if (scope == yuzu::server::kBroadcastScope) {
+                     scope_expr = std::string(yuzu::server::kBroadcastScope);
+                 } else if (req.has_param("scope") || form_value_supplied(req.body, "scope")) {
+                     res.set_content(
+                         "<span id=\"result-context\" hx-swap-oob=\"true\""
+                         " style=\"font-size:0.75rem;color:#f85149\">"
+                         "No target selected. Choose agents, or pick All agents "
+                         "to reach the fleet.</span>",
+                         "text/html; charset=utf-8");
+                     return;
                  }
 
                  std::unordered_map<std::string, std::string> params;
                  params["sql"] = sql;
-                 auto [command_id, sent] = dispatch_fn_("tar", "sql", agent_ids, scope_expr, params);
+                 // CDX-R7-02: same confinement as /api/dashboard/execute — narrow
+                 // to the operator's visible set, fail CLOSED if unwired.
+                 yuzu::server::authz::VisibleSet exec_visible =
+                     exec_visible_fn_ ? exec_visible_fn_(req)
+                                      : yuzu::server::authz::deny_all();
+                 auto [command_id, sent] =
+                     dispatch_fn_("tar", "sql", agent_ids, scope_expr, params, exec_visible);
 
                  if (sent == 0) {
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
@@ -1047,8 +1121,17 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  }
 
                  std::unordered_map<std::string, std::string> params;
+                 // CDX-R7-02: this TAR scan already narrows `agent_ids` by
+                 // management-group (username) visibility above; ALSO narrow to
+                 // the caller's Execution:Execute visible set via the shared
+                 // dispatch_confined seam, so a service-scoped token cannot scan
+                 // an out-of-service device its username visibility would admit.
+                 // Fail CLOSED (present-empty) if the derivation is unwired.
+                 yuzu::server::authz::VisibleSet exec_visible =
+                     exec_visible_fn_ ? exec_visible_fn_(req)
+                                      : yuzu::server::authz::deny_all();
                  auto [command_id, sent] = dispatch_fn_(
-                     "tar", "status", agent_ids, /*scope_expr=*/"", params);
+                     "tar", "status", agent_ids, /*scope_expr=*/"", params, exec_visible);
 
                  {
                      std::lock_guard<std::mutex> lk(tar_scan_mu_);
@@ -1251,9 +1334,17 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  std::unordered_map<std::string, std::string> params;
                  params[std::format("{}_enabled", source)] = "true";
+                 // CDX-R7-02: reaches a single visibility-gated device_id — ALSO
+                 // narrow to the caller's Execution:Execute visible set (the Ids
+                 // arm of dispatch_confined drops an out-of-scope device_id), so
+                 // a service-scoped token cannot re-enable capture on a device
+                 // outside its service. Fail CLOSED if the derivation is unwired.
+                 yuzu::server::authz::VisibleSet exec_visible =
+                     exec_visible_fn_ ? exec_visible_fn_(req)
+                                      : yuzu::server::authz::deny_all();
                  auto [command_id, sent] = dispatch_fn_(
                      "tar", "configure", {device_id}, /*scope_expr=*/"",
-                     params);
+                     params, exec_visible);
 
                  if (sent == 0) {
                      audit_fn_(req, "tar.source.reenable", "failure",
@@ -1409,8 +1500,18 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  std::unordered_map<std::string, std::string> params;
                  params["source"] = source;
+                 // CDX-R7-02: purge_source is DESTRUCTIVE (drops a device's TAR
+                 // data), so narrowing to the caller's Execution:Execute visible
+                 // set matters most here — a service-scoped token must not purge
+                 // a device outside its service even if username visibility would
+                 // admit it. The Ids arm of dispatch_confined drops an
+                 // out-of-scope device_id; fail CLOSED if the derivation is unwired.
+                 yuzu::server::authz::VisibleSet exec_visible =
+                     exec_visible_fn_ ? exec_visible_fn_(req)
+                                      : yuzu::server::authz::deny_all();
                  auto [command_id, sent] =
-                     dispatch_fn_("tar", "purge_source", {device_id}, /*scope_expr=*/"", params);
+                     dispatch_fn_("tar", "purge_source", {device_id}, /*scope_expr=*/"", params,
+                                  exec_visible);
 
                  if (sent == 0) {
                      audit_fn_(req, "tar.source.purge", "failure", "command", "",

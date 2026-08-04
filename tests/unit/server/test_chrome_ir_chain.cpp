@@ -136,7 +136,8 @@ struct ChromeIrHarness {
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& params,
-                   const std::string& exec_id) -> std::pair<std::string, int> {
+                   const std::string& exec_id,
+                   const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
             calls.push_back({plugin, action, scope_expr, agent_ids, params, exec_id});
             return {"cmd-" + std::to_string(calls.size()), dispatch_sent};
         };
@@ -150,7 +151,25 @@ struct ChromeIrHarness {
                             /*product_pack_store=*/nullptr, /*sw_deploy_store=*/nullptr,
                             /*device_token_store=*/nullptr, /*license_store=*/nullptr,
                             /*guaranteed_state_store=*/nullptr, &metrics, /*session_revoke_fn=*/{},
-                            /*execution_event_bus=*/nullptr, store.get(), dispatch_fn);
+                            /*execution_event_bus=*/nullptr, store.get(), dispatch_fn,
+                            /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{},
+                            /*net_perf_fn=*/{}, /*lockout_clear_fn=*/{},
+                            /*baseline_store=*/nullptr, /*scoped_perm_fn=*/{},
+                            /*software_inventory_store=*/nullptr, /*inventory_scope_fn=*/{},
+                            /*response_scope_fn=*/{}, /*app_perf_providers=*/{},
+                            /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
+                            /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
+                            /*stream_budget=*/nullptr,
+                            // #1788: the async result-set producers now REFUSE
+                            // (audited 500) when the visibility derivation is
+                            // unwired — it is their only per-device gate. This
+                            // file exercises the lineage/audit/GC chain, not
+                            // confinement, so wire a derivation that ANSWERS
+                            // "unfiltered" (nullopt) rather than leaving it
+                            // empty, which is a missing gate and not a synonym.
+                            [](const auth::Session&) -> yuzu::server::authz::VisibleSet {
+                                return std::nullopt;
+                            });
     }
 
     nlohmann::json post(const std::string& path, const std::string& body, int& status) {

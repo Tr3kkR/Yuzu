@@ -647,6 +647,29 @@ inline std::string extract_form_value(const std::string& body, const std::string
     return url_decode(raw);
 }
 
+/// Was `key` PRESENT in the URL-encoded form body at all — even with an empty
+/// value?
+///
+/// `extract_form_value` CANNOT answer this: it returns `""` for an absent key
+/// and for a supplied-but-empty `key=` alike. That erasure is precisely the
+/// defect `dispatch_target_shape.hpp` names — "an OMITTED targeting argument
+/// means the whole fleet; a SUPPLIED one that resolves to nothing is an ERROR.
+/// The two are not the same request and must never collapse into each other" —
+/// in its form-encoded spelling, the twin of `extract_json_string_array`'s
+/// erasure on the JSON routes.
+///
+/// Matches only at a key boundary (start of body or just after `&`), so a
+/// `myscope=` field is never mistaken for `scope=`.
+inline bool form_value_supplied(const std::string& body, const std::string& key) {
+    const auto needle = key + "=";
+    for (std::string::size_type pos = body.find(needle); pos != std::string::npos;
+         pos = body.find(needle, pos + 1)) {
+        if (pos == 0 || body[pos - 1] == '&')
+            return true;
+    }
+    return false;
+}
+
 /// Extract plugin name from a command_id string (format: "plugin-timestamp").
 inline std::string extract_plugin(const std::string& command_id) {
     auto dash = command_id.find('-');
