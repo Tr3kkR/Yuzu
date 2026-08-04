@@ -82,8 +82,7 @@ static int param_int(const httplib::Request& req, const char* name, int def) {
 }
 
 // -- Helper: column index by name (case-insensitive, excl. Agent col) ---------
-static int col_index_for_name(const std::string& plugin, const std::string& name) {
-    auto& cols = columns_for_plugin(plugin);
+static int col_index_for_name(const std::vector<std::string>& cols, const std::string& name) {
     // cols[0] is "Agent" — field indices are 0-based starting after Agent
     for (size_t i = 1; i < cols.size(); ++i) {
         auto& c = cols[i];
@@ -322,9 +321,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                         // honoured by REST consumers but not auto-applied
                         // by the dashboard for now.
                         if (!filters_explicit) {
+                            auto render_cols = resolve_render_columns(plugin, definition_id);
                             for (const auto& tf : resolved.filters) {
                                 if (tf.op != "equals") continue;
-                                int col_idx = col_index_for_name(plugin, tf.column);
+                                int col_idx = col_index_for_name(render_cols, tf.column);
                                 if (col_idx < 0) continue;
                                 FacetFilter f;
                                 f.col_idx = col_idx;
@@ -661,9 +661,20 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  }
 
                  // Issue #587: reverse-lookup an InstructionDefinition that
-                 // matches (plugin, action) AND has a spec.visualization.
-                 // When found, propagate the definition_id through the
-                 // result-render flow so the chart deck renders inline.
+                 // matches (plugin, action) AND either has a
+                 // spec.visualization OR a non-empty result_schema. When
+                 // found, propagate the definition_id through the
+                 // result-render flow so the chart deck renders inline
+                 // (visualization match) and/or render_results resolves
+                 // per-action columns via resolve_render_columns
+                 // (result_schema match, PR1.7 remediation) instead of
+                 // falling back to columns_for_plugin's fixed per-plugin
+                 // schema — the fix for actions like registry's
+                 // list_profiles, whose column shape columns_for_plugin
+                 // does not know at all. A result_schema-only match still
+                 // resolves an empty chart deck (VisualizationEngine::count
+                 // is 0 without a visualization_spec), so this is a no-op
+                 // for every definition that doesn't also declare charts.
                  //
                  // Closes governance CP-1 / sec-F1 / ER-NEW-2: gate the
                  // reverse-lookup on `InstructionDefinition:Read` so a
@@ -686,7 +697,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      q.limit = 50;
                      for (const auto& d : instruction_store_->query_definitions(q)) {
                          if (d.action != action) continue;
-                         if (!VisualizationEngine::has_visualization(d.visualization_spec))
+                         if (!VisualizationEngine::has_visualization(d.visualization_spec) &&
+                             d.result_schema.empty())
                              continue;
                          def_id = d.id;
                          break;
@@ -741,8 +753,13 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      return;
                  }
 
-                 // Success: return OOB swaps for the results area
-                 auto& col_names = columns_for_plugin(plugin);
+                 // Success: return OOB swaps for the results area. Uses the
+                 // same schema-aware resolution as render_results (PR1.7
+                 // remediation) so a schema-only action's initial thead
+                 // matches what the 2s-later chart-deck-host refresh
+                 // renders, instead of flashing columns_for_plugin's
+                 // fallback shape first.
+                 auto col_names = resolve_render_columns(plugin, def_id);
 
                  std::string html;
                  html.reserve(4096);
@@ -1583,6 +1600,27 @@ std::vector<FacetFilter> DashboardRoutes::parse_filters(const httplib::Request& 
 }
 
 // ---------------------------------------------------------------------------
+// resolve_render_columns
+// ---------------------------------------------------------------------------
+
+std::vector<std::string> DashboardRoutes::resolve_render_columns(
+    const std::string& plugin, const std::string& definition_id) const {
+    if (!definition_id.empty() && instruction_store_ && instruction_store_->is_open()) {
+        if (auto def = instruction_store_->get_definition(definition_id);
+            def && !def->result_schema.empty()) {
+            ResponseTemplatesEngine engine;
+            auto tmpl = engine.synthesise_default(def->result_schema, plugin);
+            if (!tmpl.columns.empty()) {
+                std::vector<std::string> cols{"Agent"};
+                cols.insert(cols.end(), tmpl.columns.begin(), tmpl.columns.end());
+                return cols;
+            }
+        }
+    }
+    return columns_for_plugin(plugin);
+}
+
+// ---------------------------------------------------------------------------
 // render_results
 // ---------------------------------------------------------------------------
 
@@ -1601,7 +1639,7 @@ std::string DashboardRoutes::render_results(
                "Response store not available.</td></tr></tbody>";
     }
 
-    auto& col_names = columns_for_plugin(plugin);
+    auto col_names = resolve_render_columns(plugin, definition_id);
 
     // Issue #254 (Phase 8.2): when a template specified a visible-column
     // subset, build the set of plugin column indices to render. Index 0
@@ -1692,7 +1730,7 @@ std::string DashboardRoutes::render_results(
     // Phase 3: sort
     int sort_idx = -1; // -1 = sort by agent name
     if (sort_col != "agent") {
-        sort_idx = col_index_for_name(plugin, sort_col);
+        sort_idx = col_index_for_name(col_names, sort_col);
     }
     bool ascending = (sort_dir == "asc");
 
