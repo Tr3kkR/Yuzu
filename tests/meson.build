@@ -516,6 +516,11 @@ if build_server
       # kept OFF the production link line so the private cached path has no
       # public trampoline in server_core.
       'unit/server/engine_liveness_test_access.cpp',
+      # PR1.9c: same #2367 pattern for ClassifiedCommandTestAccess::make — the
+      # ONLY definition, deliberately off the production link line so a
+      # production caller that tries to forge a ClassifiedCommand (bypassing
+      # classification and authorization) fails to LINK rather than compiling.
+      'unit/server/classified_command_test_access.cpp',
       'unit/server/test_rest_engine_principal_roles.cpp',
       'unit/server/test_mcp_engine_principal_roles.cpp',
       'unit/server/test_engine_principal_lifecycle.cpp',
@@ -523,6 +528,8 @@ if build_server
       'unit/server/test_rotation_confirm_state.cpp',
       'unit/server/test_access_review_model.cpp',
       'unit/server/test_access_review_store.cpp',
+      'unit/server/test_dispatch_chokepoint.cpp',
+      'unit/server/test_capability_catalogue.cpp',
       'unit/server/test_command_capability.cpp',
       'unit/server/test_dex_obs_table.cpp',
       'unit/server/test_schedule_params.cpp',
@@ -824,6 +831,16 @@ test('changelog order',
   args: [files('test_changelog_order.py')],
   suite: 'docs',
   timeout: 10,
+)
+
+# PR1.9 data-gate: every plugin action has exactly one capability-catalogue row
+# across the five fragment headers, and no fragment claims an action no plugin
+# declares. Hermetic — parses sources, builds nothing.
+test('capability catalogue completeness',
+  _python3_test,
+  args: [files('test_capability_catalogue_complete.py')],
+  suite: 'docs',
+  timeout: 30,
 )
 
 # Tracker close-automation regression corpus (ADR-3001 A1 §11-§12): the frozen
