@@ -118,11 +118,12 @@ inline constexpr std::int64_t kMcpHandoverRetryAfterMs = 5000;
 
 /// `retry_after_ms` for a streamed-POST admission denial. Deliberately NOT the GET
 /// figure above: a GET slot frees when a dead peer is detected (one tick plus a
-/// write failure), but a streamed-POST slot is held until the WORK finishes or the
-/// response cap elapses. Advising 5 s there has a conforming client burn ~24 full
-/// auth + rate-limit + routing passes before a slot could possibly free - retry
-/// amplification on exactly the surface agentic workers hammer. A quarter of the
-/// cap is a floor that can actually be true.
+/// write failure), but a streamed-POST slot is held until the WORK finishes or cap
+/// settlement completes (#2739: the cap, then one drain pass, then the settle
+/// pass - not the bare cap instant). Advising 5 s there has a conforming client
+/// burn ~24 full auth + rate-limit + routing passes before a slot could possibly
+/// free - retry amplification on exactly the surface agentic workers hammer. A
+/// quarter of the cap is a floor that can actually be true.
 inline constexpr std::int64_t kMcpStreamedPostRetryAfterMs = 30000;
 
 /// Ring / sink frames are the shared `detail::SseEvent` (whose `id` field carries

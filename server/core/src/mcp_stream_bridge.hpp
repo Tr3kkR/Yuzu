@@ -831,6 +831,21 @@ private:
         /// that closes with this set is DONE (the client has its answer); one that
         /// closes without it parks for GET resume.
         bool final_written = false;
+        /// #2739: the one post-cap-expiry progress drain RAN (set when a
+        /// cap-expired take_post_batch extracts a progress batch - before the
+        /// publish loop, so a mid-pass throw leaves it set and the record still
+        /// settles). Once set, the next cap-expired pass with no pending terminal
+        /// arbitrates the cap instead of starting another progress batch, bounding
+        /// the response at cap + at most two pump ticks + one mailbox drain. A
+        /// pending terminal bypasses the suppression entirely: the terminal pass
+        /// drains intervening progress with it (progress-before-final ordering),
+        /// so nothing latched is stranded when the record settles kDone. Frames
+        /// latched after the drain pass are NOT lost on the cap path - the record
+        /// parks kRingOnly and the projector flushes them to the ring for GET
+        /// resume. Guarded by `mu`; read only on the pump (`out != nullptr`) path;
+        /// never cleared (no kRingOnly -> kStreaming edge exists, so the flag is
+        /// dead after park).
+        bool cap_progress_drained = false;
 
         // C5: record-local, listener-writable observability. Flushed by the
         // projector / teardown through the noexcept obs guard - the listener

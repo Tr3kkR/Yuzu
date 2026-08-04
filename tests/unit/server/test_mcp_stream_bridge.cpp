@@ -2824,6 +2824,78 @@ TEST_CASE("bridge take_post_batch - a terminal beats an expired cap (C7)",
     }
 }
 
+TEST_CASE("bridge take_post_batch - an expired cap settles one drain pass later, "
+          "never at execution pace (#2739)",
+          "[mcp][bridge][2f]") {
+    // Before this fix, cap arbitration was reached only on a pass with neither
+    // progress nor terminal pending - so a mailbox that refilled every tick held
+    // the response open for the WHOLE execution, and every operator statement
+    // derived from the 120 s cap was wrong. The contract that killed the naive
+    // fix still holds: the drain pass DELIVERS latched work and stays open; only
+    // the pass after it settles.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-drain"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto key = fx.bridge->record_key(s.id, json(1));
+    REQUIRE(key.has_value());
+
+    SECTION("continuous progress cannot hold the response open past the drain pass") {
+        // publish() fans out to the bridge listener synchronously (under
+        // Channel::mu), so every take below sees exactly the mailbox its
+        // preceding publish latched - no polling needed on this path.
+        fx.bus.publish("exec-drain", "execution-progress", prog(1, 5));
+        auto drain = fx.bridge->take_post_batch(*key, /*cap_expired=*/true);
+        REQUIRE(drain.progress.size() == 1);  // latched work is DELIVERED (C7)...
+        CHECK_FALSE(drain.cap_settled);       // ...and this pass stays open to do it
+        // The execution keeps producing - the exact shape that used to keep the
+        // response open indefinitely.
+        fx.bus.publish("exec-drain", "execution-progress", prog(2, 5));
+        auto settle = fx.bridge->take_post_batch(*key, /*cap_expired=*/true);
+        CHECK(settle.cap_settled);       // one drain pass, then the cap wins
+        CHECK(settle.progress.empty());  // held back on the cap path...
+        // ...and NOT lost: the record parks and the projector flushes the held
+        // frame to the ring, so a GET resume still replays it.
+        REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+        REQUIRE(poll_until([&] {
+            return count_method(ring_frames(*s.stream, "alice"), "notifications/progress") == 2;
+        }));
+    }
+
+    SECTION("a terminal latched after the drain pass bypasses the suppression - "
+            "held progress rides the same pass, ahead of the final") {
+        fx.bus.publish("exec-drain", "execution-progress", prog(1, 5));
+        auto drain = fx.bridge->take_post_batch(*key, /*cap_expired=*/true);
+        REQUIRE(drain.progress.size() == 1);
+        fx.bus.publish("exec-drain", "execution-progress", prog(2, 5));
+        fx.bus.publish("exec-drain", "execution-completed", kCompleted);
+        auto fin = fx.bridge->take_post_batch(*key, /*cap_expired=*/true);
+        REQUIRE(fin.final_frame.has_value());
+        CHECK_FALSE(fin.cap_settled);  // a real result is never masked as a cap close
+        // The intervening frame is delivered on the terminal pass rather than
+        // stranded in a record about to settle kDone; the pump writes progress
+        // first and the final last, preserving progress-before-final ordering.
+        REQUIRE(fin.progress.size() == 1);
+        CHECK(fin.progress[0].find("notifications/progress") != std::string::npos);
+    }
+
+    SECTION("the drain pass pokes the bound sink - the settle pass needs no "
+            "further event or tick to wake") {
+        auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+        REQUIRE(fx.bridge->bind_post_sink(s.id, json(1), sink).has_value());
+        fx.bus.publish("exec-drain", "execution-progress", prog(1, 5));
+        // Let the projector's own wake-forwarding poke for this publish land
+        // first, then shed it so the assertion isolates the drain pass's poke.
+        REQUIRE(poll_until([&] { return sink->poked.load(std::memory_order_acquire); }));
+        sink->poked.store(false, std::memory_order_release);
+        auto drain = fx.bridge->take_post_batch(*key, /*cap_expired=*/true);
+        REQUIRE(drain.progress.size() == 1);
+        CHECK(sink->poked.load(std::memory_order_acquire));
+    }
+}
+
 TEST_CASE("bridge bind_post_sink - gates on kStreaming and hands off latched work (C7)",
           "[mcp][bridge][2f]") {
     Fx fx;

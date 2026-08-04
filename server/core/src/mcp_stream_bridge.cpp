@@ -962,9 +962,12 @@ McpStreamBridge::PostBatch McpStreamBridge::take_post_batch(const std::string& k
 }
 
 bool McpStreamBridge::has_pending_work_locked(const BridgeRecord& rec) {
-    // The SAME predicate project_record uses to decide there is a batch worth
-    // claiming. Factored so the bind handshake and the projector's wake-forwarding
-    // cannot disagree with the consumer about what "pending" means.
+    // "Latched work worth waking the pump for". This was the SAME predicate
+    // project_record uses to decide there is a batch worth claiming until #2739
+    // made the pump path context-dependent (cap_expired + cap_progress_drained);
+    // the divergence is deliberate - a mailbox deliberately held back by the cap
+    // drain must STILL count as pending here, because that wake is what lets the
+    // settle pass run immediately instead of a tick later.
     const bool progress = rec.mb_count > 0 && !rec.pressure_requested;
     const bool terminal = rec.terminal_accepted &&
                           !rec.terminal_projected.load(std::memory_order_acquire) &&
@@ -1108,10 +1111,20 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
         }
         // E1: while a pressure sweep is waiting on this record, no NEW progress
         // batch may start - only an already-latched terminal settles.
-        const bool want_progress = rec->mb_count > 0 && !rec->pressure_requested;
         const bool want_terminal = rec->terminal_accepted &&
                                    !rec->terminal_projected.load(std::memory_order_acquire) &&
                                    rec->terminal_slot.has_value();
+        // #2739: once the one post-expiry drain pass has run, a cap-expired pump
+        // pass starts no further progress batch - otherwise a mailbox that refills
+        // every tick keeps the response open for the whole execution. A pending
+        // terminal bypasses the suppression: that pass ends the response anyway,
+        // and it must carry the intervening progress ahead of the final
+        // (progress-before-final ordering) rather than strand it in a record about
+        // to settle kDone.
+        const bool settling_cap =
+            out != nullptr && cap_expired && rec->cap_progress_drained && !want_terminal;
+        const bool want_progress =
+            rec->mb_count > 0 && !rec->pressure_requested && !settling_cap;
         if (!want_progress && !want_terminal) {
             // CAP ARBITRATION, decided INSIDE the record lock alongside the
             // terminal check rather than by the pump beforehand: a terminal that
@@ -1134,6 +1147,17 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
             batch_n = rec->mb_count;
             rec->mb_head = 0;
             rec->mb_count = 0;
+            if (out != nullptr && cap_expired) {
+                // #2739: this IS the drain pass. Marked before the publish loop
+                // (see the field comment for why a mid-pass throw must leave it
+                // set), and the sink is poked NOW so the settle pass rides an
+                // immediate wake instead of sleeping out a full pump tick when
+                // the execution happens to go quiet at cap expiry. Sink-mu under
+                // rec-mu is the sanctioned lock order (bind_post_sink does the
+                // same); a failed poke just falls back to the next tick.
+                rec->cap_progress_drained = true;
+                poke_post_sink(rec->post_sink);
+            }
         }
         if (want_terminal) {
             term = std::move(rec->terminal_slot);
