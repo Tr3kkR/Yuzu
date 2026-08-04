@@ -271,8 +271,13 @@ The surfaces that reach those mutators are `GET /api/approvals`,
 `GET /api/approvals/pending/count`, the `POST /api/approvals/{id}/approve` and `/reject` pair,
 the read-only versioned `GET /api/v1/approvals/{id}`, and three MCP tools —
 `list_pending_approvals` (`Approval:Read`), `approve_request` and `reject_request`
-(`Approval:Write`). The MCP write pair calls the same `approve`/`reject` path and inherits the
-same pending-only refusal.
+(`Approval:Approve`, and they additionally require the **supervised** tier). The MCP review pair
+calls the same `approve`/`reject` path and inherits the same pending-only refusal.
+
+Note that `Approval:Approve` is a distinct RBAC operation and is **not** implied by
+`Approval:Write`; an access review keyed on `Approval:Write` under-counts who can approve. The
+`Approval:Write` entry those two tools carry elsewhere in the source is the tier-policy row, not
+the permission gate.
 
 **Re-derive that list before relying on it; do not trust the sentence above to be complete.**
 Three successive reviews of this paragraph each found it missing an entry, and each time the

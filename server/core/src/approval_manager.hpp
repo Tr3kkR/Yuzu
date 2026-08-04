@@ -312,16 +312,20 @@ public:
     std::expected<std::optional<Approval>, std::string> get_checked(const std::string& id) const;
 
     /// True when `submitted_by` was at or above the per-principal pending cap AT
-    /// THE MOMENT OF THE CHECK. Not an invariant: the count, this check and
-    /// `submit()` each take `mtx_` separately, so concurrent mints can each
-    /// observe a count below the cap and all proceed. It bounds a sustained
-    /// flood, it does not guarantee a ceiling.
+    /// THE MOMENT OF THE CHECK. Not an invariant: the count and `submit()` take
+    /// `mtx_` in separate acquisitions, so concurrent mints can each observe a
+    /// count below the cap and all proceed. It bounds a sustained flood, it does
+    /// not guarantee a ceiling.
     ///
-    /// This is the ONLY per-principal cap predicate. The cap and the scan window
-    /// it must stay below are both private (see below) and related there by a
-    /// static_assert, and the count it is measured against is private too — so a
-    /// caller cannot express a divergent cap without adding a public counter
-    /// first, and a new mint surface cannot forget to relate the two.
+    /// This is the ONLY per-principal cap predicate, and the cap and the scan
+    /// window it must stay below are private (see below) and related there by a
+    /// static_assert, so those two cannot silently drift apart.
+    ///
+    /// That is the whole of the guarantee. It does NOT make a divergent cap
+    /// impossible: the public `query()` takes `status` and `submitted_by`, so
+    /// any caller can count pending rows itself and compare against a number of
+    /// its own. Privacy removes the obvious route, not every route — a new mint
+    /// surface asking its own question is caught by review, not by the compiler.
     bool submitter_pending_cap_reached(const std::string& submitted_by) const;
 
     /// Newest PENDING approval matching (definition_id, submitted_by,
