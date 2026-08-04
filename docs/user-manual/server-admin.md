@@ -223,7 +223,8 @@ nothing you have to rename.
 
 **What the recall still does not bind: the submitter.** It compares the definition id, the scope
 expression and now the minting surface — not who obtained the approval. Anyone holding a valid
-`approval_id`, plus the RBAC the tool itself requires, can redeem it, whoever it was granted to.
+`approval_id`, who also passes the tier gate and holds the RBAC the tool itself requires, can
+redeem it, whoever it was granted to.
 That matters because the id is not hard to come by: `GET /api/approvals` returns approval ids in
 full to any holder of `Approval:Read`, which the seeded **Viewer** role has, and the audit row for
 a redemption attempt carries the id in full as well. So the surface binding closes the cross-surface
@@ -295,16 +296,32 @@ sqlite3 /var/lib/yuzu/instructions.db \
     WHERE status = 'approved' AND origin = '' AND definition_id GLOB 'mcp.*';"
 ```
 
-Read-only. A row with `consumed_at = 0` is still redeemable; a non-zero value is one that has
-already been redeemed, and `consumed_by` names the principal that did it. The query cannot
-separate a ticket carried across the upgrade from one the MCP gate minted afterwards — that
-distinction is not recoverable from the data, which is the same limitation that made the withdrawn
-procedure unsafe — so treat the redeemable count as an upper bound.
+Read-only. A row with `consumed_at = 0` is still redeemable, and because a ticket is spent by the
+first redemption that succeeds, each such row is worth at most one gated tool invocation — so the
+count of them is the upper bound on what an attacker could still do. **A row with a non-zero
+`consumed_at` is different in kind: it has already been redeemed, `consumed_by` names the principal
+that did it, and that is a security incident rather than a maintenance task.** Containment does
+nothing about a redemption that has already happened; investigate what that tool call did.
+
+Two limits on the query. It cannot separate a ticket carried across the upgrade from one the MCP
+gate minted afterwards — that distinction is not recoverable from the data, which is the same
+limitation that made the withdrawn procedure unsafe. And it selects `status = 'approved'` only, so
+it says nothing about a **pending** carried-across ticket: an admin approving one later turns it
+into a live residual, and an empty result here is not a clearance for that case.
+
+> **If you took guidance from an earlier revision of this note, re-check it.** A previous version
+> listed compensating controls that were wrong: it offered
+> `yuzu_mcp_approval_denied_total{reason="foreign_origin"}` as the alert for this residual, when
+> that counter cannot fire for it; and it advised removing `Approval:Read` from the Viewer role,
+> which is re-inserted at every server start. An alert or a role edit made on that basis is not
+> doing what it appears to.
 
 **If you are affected**, contain by restricting MCP: `--mcp-read-only` (no write or execute tools)
 or `--mcp-disable` (rejects `/mcp/v1/`), both also settable via `YUZU_MCP_READ_ONLY` /
-`YUZU_MCP_DISABLE`. Use the flag or the environment variable rather than the Settings toggle: the
-toggle takes effect immediately but is held in memory only, so it is lost on the next restart.
+`YUZU_MCP_DISABLE`. The two forms trade off against each other and neither is both: the Settings
+toggle applies immediately but is held in memory only, so it is lost on the next restart; the flag
+and the environment variable are read at process start, so they are durable but need a restart to
+take effect. To contain now *and* stay contained, use the toggle and set the flag.
 Then follow #2761, the audited operation that would let a targeted revocation be published
 safely.
 

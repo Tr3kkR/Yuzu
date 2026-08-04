@@ -5900,6 +5900,8 @@ fire — an operator can always disable a schedule to stop it even without
 
 Fetch a single approval by id. This is the **A4 `status_url` target**: when an operation is denied with an approval-required envelope, a worker polls this endpoint for the current status rather than re-issuing the gated request. Requires `Approval:Read`. Read-only — it never mutates the approval lifecycle.
 
+> **Treat an `approval_id` as bearer-sensitive.** Presenting one is what redeems the approval, and the redemption check does not bind it to the principal it was granted to — so do not log it, echo it into a response, or pass it through a channel you would not send a token through. The residual and what bounds it are described once, in the `#2442` upgrade note in [Server Administration](server-admin.md) (#2442, #1803).
+
 **Response (200):** the standard v1 envelope wrapping an `Approval` object:
 
 ```json
