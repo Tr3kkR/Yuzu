@@ -34,7 +34,9 @@
   the registry resets on restart, so alert on `increase(...)` rather than a bare `> 0`.
   `docs/prometheus/yuzu-alerts.yml` carries a `YuzuMcpApprovalForgeryAttempt` rule to copy; that
   file states in its own header that nothing in the repo wires it up. An increase is not
-  attack-only: the same branch refuses an origin string the build does not recognise. The audit
+  attack-only: the same branch refuses an origin string the build does not recognise. It also does
+  not count every cross-surface presentation — only refusals at redemption, so a foreign-origin
+  ticket presented while still pending or after rejection leaves it flat (#2779). The audit
   detail is one constant for every non-MCP origin, so it does not say which surface minted the
   ticket — see the user manual's "Triaging an increase" for the two surfaces that do. Neither
   counter fires for the unlabelled carried-across tickets described below — those are exempt from

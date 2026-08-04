@@ -519,8 +519,8 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
     //
     // The invariant is therefore `kFindPendingScanLimit` >
     // `kMcpSubmitterPendingCap`. Those used to be unrelated literals in different
-    // translation units, so raising the cap above 64 reopened the dedup miss
-    // silently — foreign rows come from REST and the scheduler, which never
+    // translation units, so raising the cap above 64 WOULD HAVE reopened the dedup
+    // miss silently — foreign rows come from REST and the scheduler, which never
     // consult that cap. The limit is now a public constant on this class and
     // `mcp_server.cpp` static_asserts its cap against it, so that change fails
     // the build instead.
