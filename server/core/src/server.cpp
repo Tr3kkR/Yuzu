@@ -514,10 +514,18 @@ public:
         metrics_.describe("yuzu_mcp_streams_active",
                           "MCP GET SSE streams currently held open (each pins one HTTP worker)",
                           "gauge");
+        // Deliberately a SEPARATE series from the GET gauge above rather than a
+        // label on it: the two have different lifetimes (a GET channel is
+        // open-ended, a streamed POST is bounded by its response cap) and
+        // different owners, so summing them would hide which kind is saturating.
+        metrics_.describe("yuzu_mcp_post_streams_active",
+                          "MCP streamed-POST (SSE-on-POST) responses currently held open (each "
+                          "pins one HTTP worker)",
+                          "gauge");
         metrics_.describe("yuzu_http_held_open_responses",
                           "SSE responses held open right now across ALL surfaces (MCP GET, "
-                          "/api/v1/events, dashboard drawer, legacy /events) — each pins one "
-                          "HTTP worker thread",
+                          "MCP streamed POST, /api/v1/events, dashboard drawer, legacy /events) — "
+                          "each pins one HTTP worker thread",
                           "gauge");
         metrics_.describe("yuzu_http_held_open_capacity",
                           "Held-open responses this server is sized for (--max-sse-streams, "
@@ -533,6 +541,10 @@ public:
         // tell them why.
         metrics_.describe("yuzu_mcp_streams_cap",
                           "Effective concurrent MCP SSE stream cap after the worker-pool clamp",
+                          "gauge");
+        metrics_.describe("yuzu_mcp_streamed_post_enabled",
+                          "1 if SSE-on-POST is enabled (--mcp-enable-streamed-post), else 0. "
+                          "Ships 0: #2739 and #2740 are open against that surface",
                           "gauge");
         metrics_.describe("yuzu_mcp_stream_closes_total", "MCP SSE streams closed, by reason",
                           "counter");
@@ -550,9 +562,26 @@ public:
                           "cursor falls behind gets a 404 and must re-initialize",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_rejects_total",
-                          "MCP GET SSE stream attach denials by reason", "counter");
+                          // Covers the GET attach denials AND the streamed-POST
+                          // ADMISSION denials (post_* reasons). It does NOT cover
+                          // every streamed-POST refusal: a bridge-level reserve
+                          // reject is counted by the bridge's own
+                          // yuzu_mcp_bridge_reject_total. Two families, split by who
+                          // refused, not by surface.
+                          "MCP SSE stream denials by reason — GET attach denials plus "
+                          "streamed-POST admission denials",
+                          "counter");
         metrics_.describe("yuzu_mcp_initialize_protocol_total",
                           "MCP initialize handshakes by negotiated protocol revision", "counter");
+        metrics_.describe("yuzu_mcp_cancel_notifications_total",
+                          "notifications/cancelled received, by outcome: `detached` - a live "
+                          "streamed response was ended by this cancel; `accepted` - intent "
+                          "recorded before the request armed, for arm()/abandon() to arbitrate; "
+                          "`noop` - nothing to cancel. A high noop rate means clients are "
+                          "cancelling requests that already finished, addressing the wrong "
+                          "session, or retrying a cancel that already landed. A cancel NEVER "
+                          "stops the execution - it detaches the response only",
+                          "counter");
         metrics_.describe("yuzu_mcp_stream_publish_failures_total",
                           "publish() exception-boundary catches — a producer's frame "
                           "construction failed before commit (#2366); the frame was never "
@@ -601,6 +630,49 @@ public:
                           "Progress-bridge projector wake cycles. An event-driven liveness signal: "
                           "records_active > 0 with a flat rate here means the projector is wedged",
                           "counter");
+        metrics_.describe("yuzu_mcp_bridge_projection_degraded_total",
+                          "Progress-bridge projections whose claim had to be released WITHOUT the "
+                          "record lock, so the settle bookkeeping could not run normally (#2528). "
+                          "Needs a genuinely broken platform mutex, so ANY nonzero value is a "
+                          "signal, not a rate: the record is still reclaimable, but a terminal "
+                          "payload mid-retry is lost and answered by the fallback final",
+                          "counter");
+        metrics_.describe("yuzu_mcp_stream_attach_audit_failures_total",
+                          "Streamed-POST attach audits the sink REJECTED (returned false rather "
+                          "than throwing). The stream is live and correct; its evidence is not. "
+                          "Installing the content provider seals the response headers, so unlike "
+                          "the GET channel there is no Sec-Audit-Failed to set and this counter "
+                          "is the only signal. Any non-zero value is an audit-coverage gap",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_pin_slots_reject_total",
+                          "Streamed admissions refused for want of a session slot, by which half "
+                          "of the admission sum held them: held=\"charges\" means at least one "
+                          "charge was outstanding; held=\"pins\" means finals already committed "
+                          "whose pins were not yet released. After the rule-(a) unpin a "
+                          "pins refusal should not PERSIST, so a sustained rate there is the "
+                          "wedged-session signature - the case where the 429's own remediation "
+                          "(\"wait for one to finish\") is untrue because they already did. A "
+                          "single pins sample is NOT a wedge: the charge-to-pin handover happens "
+                          "at terminal projection but the unpin only once the final reaches the "
+                          "wire, so every healthy session passes through that shape during the "
+                          "flush window - which is why its alert carries a load-bearing `for`. "
+                          "And \"charges\" is not purely benign: it is emitted whenever ANY "
+                          "charge is outstanding, so a PARTIAL wedge is bucketed there unseen",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_charge_release_deferred_total",
+                          "Streamed admission charges that could not be released at their natural "
+                          "release point and are RETAINED on the record until its teardown "
+                          "reclaims them (#2529). Needs a genuinely broken platform mutex, so ANY "
+                          "nonzero value is a signal, not a rate. The record and the ledger still "
+                          "agree, so this is a deferred release, never a stranded slot",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_streaming_backstop_total",
+                          "Streamed-POST records the sweep had to park because they were still "
+                          "kStreaming with a dead session or long past the cap. The pump's own "
+                          "releaser is what normally ends that phase, so any nonzero value means "
+                          "a close was swallowed or never delivered - without this backstop the "
+                          "record would leak for the life of the process",
+                          "counter");
         metrics_.describe("yuzu_mcp_bridge_teardown_incomplete_total",
                           "Progress-bridge teardown steps that could not complete on the "
                           "maintenance thread, by reason. DEFENCE IN DEPTH, not the live "
@@ -611,6 +683,43 @@ public:
                           "retried and what it still owns is held until the process restarts; a "
                           "retained record also pins that session's whole stream state, its "
                           "replay ring and any pinned finals. Alert on > 0",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_forced_expire_total",
+                          "Parked progress-bridge records force-expired by the ring-only "
+                          "pressure escape hatch, by the disposition the visitor DECIDED "
+                          "(#2489). Counted at the decision, before the teardown publishes, so "
+                          "this is an attempted disposition and not proof of delivery - a frame "
+                          "build, the publish ladder or the poison step can still fail "
+                          "afterwards, which is what yuzu_mcp_stream_terminal_publish_failures_"
+                          "total and yuzu_mcp_bridge_teardown_incomplete_total report. A claim "
+                          "that loses a shutdown race is reaped by shutdown() and is NOT "
+                          "counted here (the shutdown-silent convention in "
+                          "docs/observability-conventions.md). \"none\": a real final was "
+                          "already pinned, so the client loses nothing. \"fallback_final\": a "
+                          "terminal DID happen but its payload is gone - either aged out of the "
+                          "bus buffer, or lost to a degraded projection claim (#2528, see "
+                          "yuzu_mcp_bridge_projection_degraded_total) - so a success-shaped "
+                          "final pointing at execution_id is published instead. "
+                          "\"synthesize_unavailable\": the bus verdict was that the execution "
+                          "never reached a terminal, so -32014 is published. Movement means the "
+                          "cap is doing its job; the previous only signal here was a FAILURE "
+                          "counter, so a fleet quietly degrading every client to the fallback "
+                          "and one synthesizing -32014 looked identical. Alert on a rising "
+                          "synthesize_unavailable rate; for fallback_final check the "
+                          "projection-degraded counter first, and only then treat it as a "
+                          "bus-buffer sizing question",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_pressure_budget_exhausted_total",
+                          "Ring-only pressure passes that stopped on their per-invocation "
+                          "victim budget with the cap STILL exceeded (#2489 review). The budget "
+                          "is the number of parked records the pass saw when it started, and it "
+                          "exists because a deferred victim now advances the pass instead of "
+                          "ending it - without it, records parking as fast as they are expired "
+                          "would keep one maintenance tick working indefinitely and delay the "
+                          "session GC that shares that thread. Not an error and not a loss: the "
+                          "remaining victims are expired on the next tick. A sustained rate "
+                          "means arrivals are keeping pace with expiries - look at "
+                          "yuzu_mcp_bridge_records_active and the streamed-POST admission rate",
                           "counter");
         metrics_.describe("yuzu_mcp_maintenance_tick_failures_total",
                           "MCP maintenance ticks that threw and were contained, by tick "
@@ -640,17 +749,36 @@ public:
                           "going unprotected); the displaced final becomes evictable from the "
                           "replay ring, still recoverable by execution_id. Alert on > 0",
                           "counter");
+        metrics_.describe("yuzu_mcp_stream_final_credit_failed_total",
+                          "A streamed-POST final was written to the wire (the client has it), but "
+                          "the bridge's own credit step threw before it could run, so the "
+                          "session's pin is retained rather than released. The close is still "
+                          "reported to the client as completed, since that is what they received; "
+                          "this counter fires ONLY on a thrown failure of that step - a credit step "
+                          "that fails to run without throwing is a distinct, uncovered failure "
+                          "shape. Needs a genuinely broken platform mutex, so any nonzero value is "
+                          "a signal about the host, not a rate to tune. Alert on > 0",
+                          "counter");
         metrics_.gauge("yuzu_mcp_sessions_active").set(0);
         metrics_.counter("yuzu_mcp_sessions_opened_total");
         metrics_.gauge("yuzu_mcp_streams_active").set(0);
+        metrics_.gauge("yuzu_mcp_post_streams_active").set(0);
         metrics_.gauge("yuzu_mcp_streams_handover_pending").set(0);
         metrics_.gauge("yuzu_mcp_bridge_records_active").set(0);
         metrics_.counter("yuzu_mcp_bridge_listener_failures_total");
         metrics_.counter("yuzu_mcp_bridge_mailbox_drops_total");
         metrics_.counter("yuzu_mcp_bridge_projector_cycles_total");
+        metrics_.counter("yuzu_mcp_bridge_projection_degraded_total");
+        metrics_.counter("yuzu_mcp_stream_attach_audit_failures_total");
+        for (auto held : {"charges", "pins"}) {
+            metrics_.counter("yuzu_mcp_bridge_pin_slots_reject_total", {{"held", held}});
+        }
+        metrics_.counter("yuzu_mcp_bridge_charge_release_deferred_total");
+        metrics_.counter("yuzu_mcp_bridge_streaming_backstop_total");
         metrics_.counter("yuzu_mcp_stream_terminal_publish_failures_total");
         metrics_.counter("yuzu_mcp_stream_final_unpinned_total");
         metrics_.counter("yuzu_mcp_stream_pin_displaced_total");
+        metrics_.counter("yuzu_mcp_stream_final_credit_failed_total");
         // Pre-seed the CLOSED reason label sets to 0 so absent() alerting is
         // meaningful on a healthy/idle server (observability-conventions; the
         // reason literals mirror the bridge's reject/degrade taxonomies).
@@ -658,8 +786,10 @@ public:
                             "global_cap", "pin_slots"}) {
             metrics_.counter("yuzu_mcp_bridge_reject_total", {{"reason", reason}});
         }
-        for (auto reason : {"reserve_rejected", "reserve_threw", "no_execution_row",
-                            "subscribe_failed", "arm_threw"}) {
+        // Derived from the bridge's own CLOSED list so a new degrade reason cannot
+        // be emitted without this seed following it - the streamed-POST rung added
+        // six and seeded none, which left valid series absent on a healthy server.
+        for (auto reason : mcp::McpStreamBridge::kDegradeReasons) {
             metrics_.counter("yuzu_mcp_bridge_degrade_total", {{"reason", reason}});
         }
         // #2487: CLOSED reason set, derived from the bridge's own stage table so a
@@ -667,6 +797,16 @@ public:
         for (auto stage : mcp::McpStreamBridge::kTeardownStageNames) {
             metrics_.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"reason", stage}});
         }
+        // sre-N1 (#2489): CLOSED set, derived from TeardownFinal the same way, so a
+        // fourth disposition cannot ship without this seed following it. Seeding
+        // matters more here than elsewhere: an idle server force-expires nothing,
+        // and an absent series reads as "never happened" exactly where the
+        // operator needs "has not happened YET".
+        for (auto disposition : mcp::McpStreamBridge::kForcedExpireDispositions) {
+            metrics_.counter("yuzu_mcp_bridge_forced_expire_total",
+                             {{"disposition", disposition}});
+        }
+        metrics_.counter("yuzu_mcp_bridge_pressure_budget_exhausted_total");
         for (auto tick : {"bridge_sweep", "session_gc"}) {
             metrics_.counter("yuzu_mcp_maintenance_tick_failures_total", {{"tick", tick}});
         }
@@ -770,13 +910,27 @@ public:
                             "credential_revoked", "auth_unavailable", "internal_error",
                             // 2f PR 3b streamed-POST close reasons — producers land in C6c/C7;
                             // pre-seeded here so the closed label set is complete from C4.
-                            "cancelled", "cap_expired", "completed"}) {
+                            "cancelled", "cap_expired", "record_gone", "completed"}) {
             metrics_.counter("yuzu_mcp_stream_closes_total", {{"reason", reason}});
         }
         metrics_.counter("yuzu_mcp_stream_replay_ring_evictions_total");
+        // Derived from the bridge's own CLOSED list, beside the enum - a
+        // hand-written copy here is what let `detached` ship unseeded.
+        for (auto outcome : mcp::McpStreamBridge::kCancelOutcomeLabels) {
+            metrics_.counter("yuzu_mcp_cancel_notifications_total", {{"outcome", outcome}});
+        }
         for (auto reason : {"missing_session_header", "unknown_session", "not_acceptable",
                             "per_principal_stream_cap", "global_stream_cap",
-                            "stream_handover_pending", "replay_window_exceeded", "origin"}) {
+                            "stream_handover_pending", "replay_window_exceeded", "origin",
+                            }) {
+            metrics_.counter("yuzu_mcp_stream_rejects_total", {{"reason", reason}});
+        }
+        // 2f PR 3b streamed-POST admission denials, derived from the bridge's own
+        // closed list so the emit sites and this seed cannot drift. Prefixed `post_`
+        // because they answer a DIFFERENT question from the GET labels above: which
+        // admission gate refused a streamed tool call, not which attach check
+        // refused a channel.
+        for (auto reason : mcp::McpStreamBridge::kPostRejectReasons) {
             metrics_.counter("yuzu_mcp_stream_rejects_total", {{"reason", reason}});
         }
         // Pre-seed both supported MCP protocol revisions to 0 so a
@@ -7256,10 +7410,25 @@ private:
         // its sibling above, from the same post-clamp number.
         metrics_.gauge("yuzu_mcp_streams_cap").set(static_cast<double>(effective_streams));
         metrics_.gauge("yuzu_http_worker_pool_size").set(static_cast<double>(pool_max));
+        // A dormant, security-relevant toggle nobody can confirm is dormant is an
+        // operability gap. --max-sse-streams already surfaces its resolved value as a
+        // gauge; this does the same, so an operator can answer "is streamed POST live
+        // on this box" from /metrics rather than from ps.
+        metrics_.gauge("yuzu_mcp_streamed_post_enabled")
+            .set(cfg_.mcp_streamed_post_enable ? 1.0 : 0.0);
+        spdlog::info("MCP streamed POST (SSE-on-POST): {}{}",
+                     cfg_.mcp_streamed_post_enable ? "ENABLED" : "disabled (default)",
+                     cfg_.mcp_streamed_post_enable
+                         ? " - #2739 (response cap not enforced on a busy execution) and "
+                           "#2740 (an undelivered final holds a session streamed slot) are "
+                           "open against it; size shutdown grace against your longest "
+                           "execution, not the 120s cap"
+                         : " - enable with --mcp-enable-streamed-post");
         spdlog::info("HTTP worker pool: {} threads, sized for {} concurrent held-open responses "
                      "(plain-REST reserve {}). EVERY streaming surface leases from one budget: "
-                     "GET /mcp/v1/, GET /api/v1/events, the dashboard executions drawer, and the "
-                     "legacy /events stream. Watch yuzu_http_held_open_responses / "
+                     "GET /mcp/v1/, MCP streamed POST, GET /api/v1/events, the dashboard "
+                     "executions drawer, and the legacy /events stream. Watch "
+                     "yuzu_http_held_open_responses / "
                      "yuzu_http_held_open_capacity; the ceiling is thread-count (ADR-0034).",
                      pool_max, effective_streams, detail::kPlainRestReserveDefault);
 
@@ -14928,13 +15097,19 @@ private:
                     execution_event_bus_.get(), mcp_sessions_.get(), &metrics_,
                     [this](const std::string& action, const std::string& execution_id,
                            const std::string& detail,
-                           mcp::McpStreamBridge::AuditResult result) {
+                           mcp::McpStreamBridge::AuditResult result,
+                           const std::string& actor) {
                         if (audit_store_ && audit_store_->is_open()) {
                             AuditEvent ev;
                             ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
                                                std::chrono::system_clock::now().time_since_epoch())
                                                .count();
-                            ev.principal = "system";
+                            // EMPTY actor = the bridge's own background work (sweep/projector).
+                            // A non-empty one is an authenticated client whose action
+                            // produced this row - stamping those "system" would make a
+                            // client-driven cancel indistinguishable from housekeeping
+                            // and defeat Decision 15(j) non-repudiation.
+                            ev.principal = actor.empty() ? std::string("system") : actor;
                             ev.action = action;
                             ev.target_type = "Execution";
                             ev.target_id = execution_id;
@@ -15124,7 +15299,8 @@ private:
                 // MCP Streamable HTTP transport (ADR-1005 Decision 15, 2f): the
                 // session registry, the --mcp-no-streaming kill switch (by live
                 // pointer into cfg_), and the Origin allowlist.
-                mcp_sessions_.get(), &cfg_.mcp_streaming_disable, cfg_.mcp_allowed_origins,
+                mcp_sessions_.get(), &cfg_.mcp_streaming_disable, &cfg_.mcp_streamed_post_enable,
+                cfg_.mcp_allowed_origins,
                 // ADR-0024: the SLE discovery store backs the query_software_licenses
                 // MCP twin of GET /api/v1/sle/agents/{id} (machine-scope facts; the
                 // per-user user_ref PII stays on the audited REST drill).

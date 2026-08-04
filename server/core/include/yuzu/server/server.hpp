@@ -321,6 +321,14 @@ struct Config {
     bool mcp_read_only{false}; // Restrict MCP to read-only tools only
     // MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f)
     bool mcp_streaming_disable{false}; // --mcp-no-streaming: no sessions, GET/DELETE → 405
+    /// SSE-on-POST (streamed POST, 2f PR 3b). Ships OFF: the machinery is complete and
+    /// reviewed, but two bounds defects are open against it (#2739 - the response cap
+    /// does not fire on a busy execution; #2740 - an undelivered final holds a session
+    /// streamed slot). Both are fixed in the follow-up PR, which flips this default.
+    /// Same shape as Spark's `prefer_spark_`: land the machinery dormant, cut over
+    /// where the invariants actually hold. NOT --mcp-no-streaming, which disables the
+    /// whole transport (sessions + GET/DELETE) including rungs already shipped.
+    bool mcp_streamed_post_enable{false}; // --mcp-enable-streamed-post
     /// Allowed Origin header values for /mcp/v1/ (scheme+host+port, exact match).
     /// Empty ⇒ any PRESENT Origin is rejected (secure default; absent Origin is
     /// allowed because the endpoint requires a credential). Wired via the
@@ -333,8 +341,9 @@ struct Config {
     /// deliberately BELOW the per-principal session cap (8) — a session is a cheap
     /// cursor, a held-open worker is not.
     /// Concurrent held-open SSE responses this server is sized for, across EVERY streaming
-    /// surface (MCP GET, /api/v1/events, the dashboard executions drawer, the legacy /events
-    /// stream). The worker pool is derived FROM this — not the other way round (ADR-0034):
+    /// surface (MCP GET, MCP streamed POST, /api/v1/events, the dashboard executions
+    /// drawer, the legacy /events stream). The worker pool is derived FROM this — not
+    /// the other way round (ADR-0034):
     /// a stream costs a blocked thread, which is cheap, so the operator declares the workload
     /// and the pool is sized to honour it. 0 = the default (128).
     std::size_t max_sse_streams{0};
