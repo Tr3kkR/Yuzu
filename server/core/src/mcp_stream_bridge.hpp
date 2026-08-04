@@ -646,7 +646,7 @@ public:
     /// proves the prebuilt string is non-empty for a record parked before arm).
     void inject_projection_build_fault_for_test(int times = 1);
     /// The NEXT `times` FALLBACK copies throw as well. Armed together with the
-    /// build fault this is the double allocation failure - the only path that
+    /// build fault this is the double allocation failure - the path that
     /// leaves the terminal extracted but never published, and therefore the only
     /// path whose recovery is the guard's restore. Pairs with
     /// inject_claim_lock_fault_for_test to reach #2528's payload-lost arm.

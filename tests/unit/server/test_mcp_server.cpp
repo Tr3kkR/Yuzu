@@ -750,6 +750,12 @@ struct McpTestServer {
     /// present Origin). Default nullptr/{} = streaming OFF ⇒ pre-2f behaviour.
     yuzu::server::mcp::McpSessionRegistry* session_registry_for_test{nullptr};
     bool streaming_disabled_{false};
+    /// Streamed POST ships OFF in production while #2739/#2740 are open (see
+    /// Config::mcp_streamed_post_enable). The harness turns it ON so the streamed
+    /// tests exercise the streamed path - without this every one of them would
+    /// silently take the plain path and pass while proving nothing. A test that
+    /// wants the shipped default sets this false explicitly.
+    bool streamed_post_enabled_{true};
     std::vector<std::string> allowed_origins_for_test{};
 
     /// 2f PR 2 (GET SSE channel): the shared held-open-stream budget and the
@@ -965,6 +971,7 @@ private:
             /*scoped_perm_fn=*/scoped_perm_fn_for_test,
             /*sessions=*/session_registry_for_test,
             /*mcp_streaming_disabled=*/&streaming_disabled_,
+            /*mcp_streamed_post_enabled=*/&streamed_post_enabled_,
             /*allowed_origins=*/allowed_origins_for_test,
             /*software_licensing_store=*/software_licensing_store_for_test,
             // Spelled out only because the streamed-POST params after them are
@@ -9480,6 +9487,81 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
 // so progress-before-final, on_final_written and EOF are covered by the pump's own
 // tests in test_mcp_stream_bridge.cpp, NOT from here. Stated rather than implied,
 // because a test named "streamed happy path" reads like end-to-end proof.
+TEST_CASE("streamed POST ships DORMANT: the default is off and a stream is not opened",
+          "[mcp][integration][execute][bridge][2f][3b]") {
+    // The shipped default. 3b's machinery is complete, but #2739 (the 120 s response
+    // cap does not fire on a busy execution) and #2740 (an undelivered final holds a
+    // session streamed slot) are open against it, and four operator surfaces document
+    // a bound the implementation does not honour. So it lands off, exactly as Spark
+    // landed behind prefer_spark_ = false, and the follow-up PR flips it.
+    //
+    // This test exists because an unpinned default is how dormancy silently ends: the
+    // harness sets streamed_post_enabled_ = true for every OTHER streamed test, so
+    // nothing else in this file would notice the production default changing.
+    namespace smcp = yuzu::server::mcp;
+
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    struct Guard {
+        sqlite3* h;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+        }
+    } guard{db};
+
+    yuzu::server::ExecutionTracker tracker(db);
+    tracker.create_tables();
+    yuzu::server::ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+    yuzu::MetricsRegistry metrics;
+    smcp::McpSessionRegistry sessions{smcp::McpSessionRegistry::Config{}, {}, &metrics};
+    smcp::McpStreamBridge bridge{&bus, &sessions, &metrics};
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{.global_cap = 8}};
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.session_registry_for_test = &sessions;
+    ts.metrics_for_test = &metrics;
+    ts.stream_budget_for_test = &budget;
+    // THE POINT: take the shipped default rather than the harness's opt-in.
+    ts.streamed_post_enabled_ = false;
+
+    auto minted = sessions.mint("test-user");
+    REQUIRE(minted.ok);
+    const auto sid = minted.session_id;
+
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&,
+                        const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd-dormant", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+    ts.mcp.set_stream_bridge(&bridge);
+
+    const std::string body =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":770,"params":{"name":"execute_instruction",)"
+        R"("arguments":{"plugin":"os_info","action":"version"},)"
+        R"("_meta":{"progressToken":"tok-dormant"}}})";
+    auto res = ts.call_raw("POST", body,
+                           {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
+    REQUIRE(res);
+
+    // The command still runs and still answers - dormant is a PLAIN response, not a
+    // refusal. A client asking to stream simply does not get a stream.
+    CHECK(res->status == 200);
+    CHECK(dispatched);
+    CHECK(res->get_header_value("Content-Type").find("text/event-stream") == std::string::npos);
+    auto parsed = nlohmann::json::parse(res->body);
+    CHECK(parsed.contains("result"));
+    // And no streamed admission was taken against the shared budget.
+    CHECK(budget.active_for(smcp::sse_bus::SseSurface::kMcpPost, "test-user") == 0);
+}
+
 TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
           "[mcp][integration][execute][bridge][2f][3b]") {
     namespace smcp = yuzu::server::mcp;

@@ -596,8 +596,10 @@ static const ToolDef kTools[] = {
      "Accept and this POST answers immediately in JSON while the frames go to the session's GET "
      "SSE stream. Streaming refusals are answered, not silent: 429 (stream/session cap, "
      "Retry-After), 409 (this request id is already in flight), 404 (session expired). If a "
-     "stream ends early, recover with the execution_id - NEVER re-send this call, which would "
-     "run the action a second time. Progress is always BEST-EFFORT: even after supplying a "
+     "stream ends early there are TWO recovery paths and you may need the first: resume the "
+     "session's GET channel with Last-Event-ID, which replays the ring including the final "
+     "and works even if you never received a frame; or fetch by execution_id if you already "
+     "have one. NEVER re-send this call, which would run the action a second time. Progress is always BEST-EFFORT: even after supplying a "
      "token you MUST still be prepared to poll (a reservation can silently degrade under load "
      "and zero progress frames is indistinguishable from 'nothing has happened yet'). "
      "FALLBACK when not streaming: poll query_responses with the "
@@ -2155,6 +2157,7 @@ McpServer::HandlerFn McpServer::build_handler(
     QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
     yuzu::server::detail::AgentRegistry* agent_registry, ScopedPermFn scoped_perm_fn,
     McpSessionRegistry* sessions, const bool* mcp_streaming_disabled,
+    const bool* mcp_streamed_post_enabled,
     std::vector<std::string> allowed_origins, SoftwareLicensingStore* software_licensing_store,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, ExecVisibleFn exec_visible_fn,
@@ -2181,6 +2184,8 @@ McpServer::HandlerFn McpServer::build_handler(
     // the stale copy a [=] capture of a const bool& alias produces.
     McpSessionRegistry* const mcp_sessions = sessions;
     const bool* const p_streaming_off = mcp_streaming_disabled;
+    // Same live-pointer discipline: captured by pointer, never by a stale alias.
+    const bool* const p_streamed_post_on = mcp_streamed_post_enabled;
     const std::vector<std::string> mcp_allowed_origins = std::move(allowed_origins);
 
     // Live-query bundle orchestrator (ADR-0011) — backs execute_bundle /
@@ -5906,8 +5911,25 @@ McpServer::HandlerFn McpServer::build_handler(
                 // The three wiring deps are part of eligibility, not assertions: a
                 // build_handler caller that omits any of them (every pre-3b test)
                 // gets today's plain path rather than a stream it cannot service.
+                // 3b ships DORMANT. The machinery below is complete and reviewed, but
+                // two bounds defects are open against it - #2739 (the 120 s response
+                // cap does not fire on a busy execution; the arbitration is in
+                // mcp_stream_bridge.cpp's project_record, gated on !want_progress &&
+                // !want_terminal) and #2740 (an undelivered final holds one of the
+                // session's four streamed slots; the admission sum is in
+                // McpStreamBridge::reserve). Shipping it
+                // on by default would put a documented bound on four operator surfaces
+                // that the implementation does not honour. The follow-up PR carries
+                // both fixes, hardened over five governance rounds, and flips this.
+                //
+                // nullptr reads as OFF, so every caller that does not opt in - incl.
+                // every pre-3b test - gets the plain path, matching the wiring-deps
+                // rule above rather than adding a second convention.
+                const bool streamed_post_enabled =
+                    p_streamed_post_on != nullptr && *p_streamed_post_on;
                 const bool streamed_mode =
-                    bridge_eligible && stream_budget != nullptr && mcp_sessions != nullptr &&
+                    bridge_eligible && streamed_post_enabled && stream_budget != nullptr &&
+                    mcp_sessions != nullptr &&
                     mcp::transport::accept_wants_sse(req.get_header_value("Accept"));
                 if (bridge_eligible) {
                     // The session id was validated (principal-bound) at handler
@@ -9625,6 +9647,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 yuzu::server::detail::AgentRegistry* agent_registry,
                                 ScopedPermFn scoped_perm_fn, McpSessionRegistry* sessions,
                                 const bool* mcp_streaming_disabled,
+                                const bool* mcp_streamed_post_enabled,
                                 std::vector<std::string> allowed_origins,
                                 SoftwareLicensingStore* software_licensing_store,
                                 EnginePrincipalStore* engine_principal_store,
@@ -9657,7 +9680,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            std::move(inventory_scope_fn), metrics,
                            std::move(app_perf_providers), quarantine_store,
                            std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
-                           sessions, mcp_streaming_disabled, std::move(allowed_origins),
+                           sessions, mcp_streaming_disabled, mcp_streamed_post_enabled,
+                           std::move(allowed_origins),
                            software_licensing_store, engine_principal_store, access_review_store,
                            auth_db, directory_sync, std::move(exec_visible_fn),
                            // 2f PR 3b: the streamed-POST arm leases from the SAME

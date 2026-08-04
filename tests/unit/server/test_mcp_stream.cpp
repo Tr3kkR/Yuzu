@@ -651,7 +651,8 @@ TEST_CASE("McpStreamPump: pass one owes no store round trip - the ctor seeds the
     // attach has just authenticated this request end to end, so pass one owes neither
     // store round trip. One pass, no wall-clock dependence, and it reddens the moment
     // the seed goes. The frozen clock is what makes it exact - `now` never advances, so
-    // the ONLY thing that can put the gate in the future is the ctor's seed.
+    // nothing else can put the gate in the future: the two writers of `gate_` are the
+    // ctor's seed and the per-tick advance, and the frozen clock pins the latter.
     auto state = std::make_shared<mcp::McpStreamState>();
     auto attached = state->attach_and_replay(0, nullptr, "alice");
     REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);

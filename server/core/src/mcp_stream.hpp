@@ -370,7 +370,14 @@ public:
     /// on > 0). In that state the slots degrade as an LRU: the OLDEST pin yields to the
     /// newest, because the newest terminal is the one a client is likeliest still waiting to
     /// resume while the oldest has almost certainly been consumed. The displaced final stays
-    /// committed and delivered - it merely loses its eviction exemption.
+    /// committed and remains in the ring until ordinary eviction reaches it - it loses its
+    /// eviction EXEMPTION, nothing more.
+    ///
+    /// NOT "delivered". These frames are ring-only; nothing delivers one except a resume,
+    /// so "almost certainly been consumed" is a likelihood, not a fact. Saying otherwise
+    /// matters because the sweep cannot tell a displaced pin from a cursor-acknowledged
+    /// one and records both as terminal_delivered - a wrong audit fact rather than a
+    /// wrong comment. That gap is fixed in the follow-up PR (a tri-state pin status).
     ///
     /// The pin is released by unpin() (final written on the POST wire), by attach_and_replay
     /// when a cursor proves consumption (Last-Event-ID >= its id), by displacement as above,
@@ -723,7 +730,9 @@ private:
 ///    WAKE CHANNEL: the projector pokes it, and the pump then asks the bridge
 ///    what to write. Nothing ever enqueues onto that queue.
 ///  - It has a response CAP. The GET channel is open-ended; a POST response is
-///    a request/response exchange, so it is bounded and the execution continues
+///    a request/response exchange, so it is MEANT to be bounded (#2739: the cap does
+///    not fire while progress keeps arriving - the reason streamed POST ships off by
+///    default) and the execution continues
 ///    server-side past the close. That needs a clock of its own, because
 ///    RevalidateGrace privately owns the one injected into it.
 ///  - It NEVER closes the session's stream state. The GET pump owns that stream;

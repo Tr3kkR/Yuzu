@@ -2883,7 +2883,8 @@ TEST_CASE("bridge #2528 - a ClaimGuard lock failure still releases the claim",
         return count_method(ring_frames(*s.stream, "alice"), "notifications/progress") == 1;
     }));
     // The claim was taken for that batch and its guard hit the injected lock
-    // failure, so the degraded release is the only thing that can free it.
+    // failure, so the degraded release is what frees it - ~ClaimGuard is the other
+    // releaser and it is precisely the one the injected failure disabled.
     REQUIRE(poll_until(
         [&] { return fx.reg.counter("yuzu_mcp_bridge_projection_degraded_total").value() == 1.0; }));
 
@@ -3317,8 +3318,9 @@ TEST_CASE("CH-16: progress reaches the wire on publication, not on the tick",
     // that the BRIDGE has work, the projector's wake-forwarding and bind_post_sink's
     // handshake are both dead code and progress arrives on a fixed tick grid.
     //
-    // A deliberately huge tick makes that unambiguous: if the only thing that can
-    // wake this pump is the timeout, the test waits 30s and fails. It also explains
+    // A deliberately huge tick makes that unambiguous: if the timeout is what wakes
+    // this pump - rather than the bus notify under test - the test waits 30s and
+    // fails. It also explains
     // why C7's mutant 8 survived - removing the sink-mutex acquisition from an inert
     // function changes nothing, and that was mistaken for a timing subtlety.
     Fx fx;

@@ -447,6 +447,10 @@ int main(int argc, char* argv[]) {
                  "Disable MCP Streamable HTTP (sessions, GET/DELETE channels); plain "
                  "JSON-RPC POST only")
         ->envname("YUZU_MCP_NO_STREAMING");
+    app.add_flag("--mcp-enable-streamed-post", cfg.mcp_streamed_post_enable,
+                 "Enable SSE-on-POST for execute_instruction callers that send a "
+                 "progressToken (OFF by default: #2739/#2740 are open against it)")
+        ->envname("YUZU_MCP_ENABLE_STREAMED_POST");
     app.add_option("--mcp-allowed-origin", cfg.mcp_allowed_origins,
                    "Allowed Origin header value for /mcp/v1/ (scheme+host+port, exact match; "
                    "repeatable). Empty rejects any present Origin (absent is always allowed).")
