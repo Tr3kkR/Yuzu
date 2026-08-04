@@ -128,8 +128,8 @@ const char* close_remediation(McpStreamClose reason) {
         return "the streamed-response time cap elapsed — the execution continues server-side; "
                "fetch the result by execution_id, or reconnect via GET to resume";
     case McpStreamClose::kRecordGone:
-        return "this response could not continue — fetch the result by execution_id, or "
-               "reconnect via GET to resume";
+        return "this response could not continue — the execution continues server-side; "
+               "fetch the result by execution_id, or reconnect via GET to resume";
     case McpStreamClose::kCompleted:
         // kCompleted never produces a close FRAME (the final is written then EOF); this exists
         // only so the audit/metric label set is exhaustive. No client action is warranted.
