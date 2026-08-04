@@ -562,6 +562,30 @@ int do_set_start_mode_macos(yuzu::CommandContext& ctx, std::string_view name,
 
 #endif
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// windows: EnumServicesStatusExW/QueryServiceConfigW/ChangeServiceConfigW --
+// native Win32 Service Control Manager API throughout, rung 1.
+// linux: systemctl (list-units / enable|disable|mask) via
+// run_bounded_subprocess({"/bin/sh", "-c", cmd}, ...) -- rung 3.
+// macos: launchctl (list, print-disabled, enable|disable) via the same
+// runner path -- rung 3; the macOS startup_type leg specifically is the
+// bulk `launchctl print-disabled system` parse in services_macos_launchd.hpp.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"list",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "systemctl", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "launchctl", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "win32_service_api", nullptr}},
+    {"running",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "systemctl", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "launchctl", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "win32_service_api", nullptr}},
+    {"set_start_mode",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "systemctl", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "launchctl", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "win32_service_api", nullptr}},
+};
+
 } // namespace
 
 class ServicesPlugin final : public yuzu::Plugin {
@@ -575,6 +599,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"list", "running", "set_start_mode", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
