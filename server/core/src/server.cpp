@@ -9232,7 +9232,7 @@ private:
                 if (classified_for_gate &&
                     classified_for_gate->dispatch_class == yuzu::server::DispatchClass::Destructive) {
                     const auto& cap = *classified_for_gate;
-                    if (!require_permission(req, res, cap.securable,
+                    if (!require_permission(req, res, std::string(cap.securable),
                                             std::string(yuzu::server::authz::to_string(cap.operation))))
                         return;
                     // Destructive dispatch must be explicitly targeted + in scope.

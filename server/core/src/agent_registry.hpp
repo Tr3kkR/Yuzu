@@ -87,10 +87,16 @@ enum class DispatchDenialReason : uint8_t {
 };
 
 /// A refused dispatch. `securable`/`operation` are populated only once
-/// classification itself succeeded — `Unclassified`/`Ambiguous`/
-/// `AnonymousOperator` carry no resolved securable, there is nothing to name
-/// yet (a caller logging/auditing a denial must branch on `reason` before
-/// trusting `securable`).
+/// classification itself succeeded — `Unclassified`/`Ambiguous` carry no
+/// resolved securable, there is nothing to name yet (a caller
+/// logging/auditing a denial must branch on `reason` before trusting
+/// `securable`). `AnonymousOperator` and `Forbidden` are raised AFTER
+/// classification resolved, so both DO name the securable the caller failed
+/// to satisfy — that is what makes the audit line actionable.
+///
+/// `securable` owns its characters rather than viewing `CommandCapability`'s
+/// static storage: a denial is the exceptional path, and the consumers
+/// concatenate it into operator-facing messages.
 struct DispatchDenial {
     DispatchDenialReason reason;
     std::string securable;
@@ -146,7 +152,8 @@ classify_and_authorize_dispatch(
     // caller", only of "no matching role_permissions row".
     if (caller.principal.empty())
         return std::unexpected(
-            DispatchDenial{DispatchDenialReason::AnonymousOperator, cap.securable, cap.operation});
+            DispatchDenial{DispatchDenialReason::AnonymousOperator, std::string(cap.securable),
+                           cap.operation});
 
     // A `system_reserved` row is dispatchable ONLY under a system caller
     // (PLAN item 2) — never caller-attributable, so an operator is refused
@@ -155,11 +162,13 @@ classify_and_authorize_dispatch(
     // operator grant would be a category error, not a stricter check.
     if (cap.system_reserved)
         return std::unexpected(
-            DispatchDenial{DispatchDenialReason::Forbidden, cap.securable, cap.operation});
+            DispatchDenial{DispatchDenialReason::Forbidden, std::string(cap.securable),
+                           cap.operation});
 
     if (!has_permission(caller.principal, cap.securable, cap.operation))
         return std::unexpected(
-            DispatchDenial{DispatchDenialReason::Forbidden, cap.securable, cap.operation});
+            DispatchDenial{DispatchDenialReason::Forbidden, std::string(cap.securable),
+                           cap.operation});
 
     return cap;
 }
