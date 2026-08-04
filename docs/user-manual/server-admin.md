@@ -238,17 +238,25 @@ follow-up lands, every ticket the MCP gate mints itself, which is why refusing t
 the live MCP flow. No new blank-surface row can be created by a surface that declares itself.
 
 Carried-across rows clear on the existing 7-day approval expiry, but that sweep is **lazy**: it
-runs when an approval is submitted and at no other time, so a queue receiving no new submissions
-ages nothing out. The window is therefore bounded by 7 days *and* a subsequent successful
-submission — not by 7 days alone. (The sweep runs *before* the pending-queue cap check, so a
-saturated queue still drains; see the ordering comment in `approval_manager.cpp`, which is the
-source of truth for it.)
+runs inside `submit()` and at no other time. Two different clocks apply — a *pending* ticket
+expires 7 days after it was submitted, an *approved-but-unconsumed* one 7 days after it was
+**reviewed** — and neither fires until some later submission drives the sweep. Any submission
+does: it runs ahead of the pending-queue cap check, so even a mint that the cap then refuses
+still drains the table first.
+
+**On a server that receives no further submissions, nothing expires and the window is
+indefinite.** That is the case to plan for, not the 7 days.
+
+> **Run every `sqlite3` command in this section as the `yuzu` service user, not as root.** They
+> are read-only in SQL, but not on the filesystem: opening a WAL database creates `-wal` and
+> `-shm` sidecars owned by the invoking user, and root-owned sidecars stop the service opening
+> `instructions.db` on its next boot.
 
 **There is no supported way to close the window early, and this manual deliberately no longer
 publishes one.** The redeemable population is exactly `status = 'approved' AND consumed_at = 0`,
 and no API retires it: the approve/reject routes refuse any ticket that is not still `pending`
-(`400 approval already reviewed`), and the dashboard renders no control for one that is already
-reviewed. Rejecting the pending tickets achieves nothing, because a pending ticket is not
+(`400 approval already reviewed`), and the dashboard renders a control only for a row that is
+still `pending`. Rejecting the pending tickets achieves nothing, because a pending ticket is not
 redeemable in the first place.
 
 Earlier revisions of this note carried a direct `UPDATE` against `instructions.db`. It has been
@@ -261,17 +269,63 @@ The only column that could date the upgrade is `origin`, and of the three code p
 approval only two record one — the scheduler and the REST instruction gate. The MCP gate
 deliberately records none until its own follow-up lands, so a query anchored on the first
 declared-origin row dates the first *scheduled or REST* approval after the upgrade, which can be
-arbitrarily later, and never sees the MCP population the bound exists to protect. A procedure that cannot be executed safely from the information available to
-the operator does not belong in an operator manual, and one that also writes no audit row is worse
-than the exposure it closes.
+arbitrarily later, and never sees the MCP population the bound exists to protect. A procedure
+that cannot be executed safely from the information available to the operator does not belong in
+an operator manual, and one that also writes no audit row is worse than the exposure it closes.
 
-**What to do instead.** In almost every deployment the answer is nothing: the exemption covers
-tickets minted before the upgrade, it expires on its own within 7 days of the next submission, and
-on a deployment running only shipped content there are no `mcp.`-prefixed definitions for a
-carried-across ticket to have been raised against. If you have specific reason to believe an
-`mcp.`-prefixed definition was raised through the instruction gate before the upgrade, treat it as
-an incident rather than a maintenance task: the approvals are visible through `GET /api/approvals`,
-and the appropriate response depends on what was approved and by whom.
+**Do not reconstruct that statement yourself.** The predicate above describes the redeemable set,
+not a safe target set: every ticket the MCP gate mints is *also* blank-origin, so an `UPDATE`
+narrowed only on `origin = ''` revokes live MCP approvals as well, and re-running it periodically
+livelocks the MCP flow entirely — mint, human approves, statement expires it, recall reports it
+expired, worker mints again. That is the defect that took four revisions to stop reintroducing.
+
+**The window is not unguarded.** A ticket is single-use and is spent on first redemption; an
+approved-but-unconsumed ticket carries its own 7-day TTL from the review timestamp; every
+redemption attempt other than a recall against a still-`pending` ticket is audited under
+`mcp.<tool>`, including the successful one (see [Audit log](audit-log.md)); and
+`yuzu_mcp_approval_denied_total{reason="foreign_origin"}` counts exactly the cross-surface attempt
+this control refuses — alert on it. If your threat model needs the population narrowed further,
+remove `Approval:Read` from the seeded Viewer role with a custom role, since that route discloses
+approval ids in full (#1803).
+
+**What to do.** In almost every deployment the answer is nothing: the exemption covers tickets
+minted before the upgrade, and on a deployment running only shipped content there are no
+`mcp.`-prefixed definitions for a carried-across ticket to have been raised against. If you have
+specific reason to believe an `mcp.`-prefixed definition was raised through the instruction gate
+before the upgrade, treat it as an incident:
+
+1. **Size it.** Query the database, not the API. `GET /api/approvals` returns `origin` but **not**
+   `consumed_at`, and consumption does not change `status` — so on that route a spent ticket and a
+   live one are indistinguishable. It also returns only the newest 100 rows
+   (`ORDER BY submitted_at DESC LIMIT 100`, no pagination), and carried-across rows are the
+   *oldest*, so they sort off the end first. Both limits trace to #2759 — consumption not
+   restatusing the row, and the 100-row bound on the query behind this route.
+
+   ```bash
+   sqlite3 /var/lib/yuzu/instructions.db \
+     "SELECT id, definition_id, submitted_by, submitted_at, reviewed_by
+        FROM approvals
+       WHERE status = 'approved' AND consumed_at = 0 AND origin = ''
+         AND definition_id GLOB 'mcp.*';"
+   ```
+
+   This is read-only. It over-reports rather than under-reports: it cannot separate a ticket
+   carried across the upgrade from one the MCP gate minted afterwards, which is the same
+   limitation that made the withdrawn procedure unsafe. Treat the result as an upper bound.
+
+2. **Check whether any of them was redeemed.** Search the audit log for
+   `consumed approval_id=<id>` against the ids from step 1. A hit means a gated tool executed on
+   that approval, and this is a security incident rather than a maintenance task.
+
+3. **Contain without waiting for #2761.** `--mcp-read-only` restricts MCP to read-only tools
+   (no write or execute), and `--mcp-disable` rejects `/mcp/v1/` entirely; either stops a
+   redeemable ticket being spent, and both are also togglable from Settings without a restart.
+   Narrowing
+   the RBAC of the submitting principal, or of the affected tool, has the same effect and is
+   finer-grained.
+
+4. **Do not make a direct database change** without support involvement — see the withdrawal
+   above for why.
 
 Bulk-revoking granted approvals is a gap, not a design. Doing it properly means an
 `Approval:Revoke` operation that emits its own audit row with the acting principal and the

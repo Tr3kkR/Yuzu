@@ -1,5 +1,6 @@
 - **Breaking — an approval ticket can no longer be redeemed on a surface other than the one that
-  minted it, and the `mcp.` instruction-definition id prefix is reserved for new definitions.** Approvals are one
+  minted it *where that surface is recorded*, and the `mcp.` instruction-definition id prefix is
+  reserved for new definitions.** Approvals are one
   shared store with three mint paths, and the MCP approval recall matches a ticket on its definition
   id and scope expression without binding the submitter or the minting surface — so an approval
   raised through the REST instruction gate, where both of those fields are caller-influenced, could
