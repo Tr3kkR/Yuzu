@@ -41,6 +41,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -860,20 +861,23 @@ TEST_CASE("exec_verify (B6) accepts a correctly-sized target and execs it via th
     // symlink swap between the caller's stat and this open() is exactly the
     // TOCTOU it exists to close), so it fails closed with ELOOP if argv[0]
     // itself is a symlink -- observed for real on a CI runner where
-    // /bin/echo IS one (deterministic on that host, not a flake). A system
-    // path's symlink-ness varies by distro/runner and isn't this test's
-    // concern; make a throwaway REGULAR-file copy so the test exercises the
-    // documented happy path (a genuine regular file) regardless of host
-    // layout. std::filesystem::copy_file follows symlinks by default, so the
-    // copy is a plain file even when the source isn't.
-    //
-    // The copy keeps argv[0]'s basename ("echo"): on that same runner /bin/echo
-    // resolves to a single-binary coreutils build that dispatches its behaviour
-    // by looking at basename(argv[0]) -- a copy under an unrelated name execs
-    // fine (spawn_errno=0) but the multiplexer doesn't recognise itself and
-    // exits 1, which a differently-named copy would misreport as an exec_verify
-    // failure when the exec actually succeeded.
-    std::filesystem::path tmp_dir = yuzu::test::unique_temp_path("yuzu_test_b6_echo_");
+    // /bin/echo IS one (deterministic on that host, not a flake). A same-
+    // basename copy of /bin/echo fixed the ELOOP but still failed with
+    // exit_code=1 despite a successful exec (spawn_errno=0) -- some other
+    // runner-specific property of that binary (write() denied by a MAC
+    // policy on the temp-dir copy is one candidate: coreutils' echo checks
+    // write()'s return and exits 1 on failure). A script fixture doesn't
+    // work either: this fd-based execveat(fd, "", ..., AT_EMPTY_PATH) opens
+    // argv[0] O_CLOEXEC, so by the time binfmt_script's interpreter hop
+    // tries to re-open the script (shells read their script argument as a
+    // file, they don't inherit its already-open fd), that fd is long closed
+    // and the re-open 404s -- fundamentally incompatible with this
+    // exec primitive, not merely a runner quirk. So: copy /bin/true instead
+    // (same basename-preserving copy as the /bin/echo attempt) -- its ONLY
+    // syscall is exit(0), no write() to trip a permissions-based theory,
+    // and it's still a real regular-file ELF target exercising the exact
+    // same open+fstat+size-check+execveat path this test verifies.
+    std::filesystem::path tmp_dir = yuzu::test::unique_temp_path("yuzu_test_b6_true_");
     REQUIRE(std::filesystem::create_directory(tmp_dir));
     struct Cleanup {
         std::filesystem::path p;
@@ -883,8 +887,8 @@ TEST_CASE("exec_verify (B6) accepts a correctly-sized target and execs it via th
         }
     } cleanup{tmp_dir};
 
-    std::filesystem::path exe_copy = tmp_dir / "echo";
-    std::filesystem::copy_file("/bin/echo", exe_copy);
+    std::filesystem::path exe_copy = tmp_dir / "true";
+    std::filesystem::copy_file("/bin/true", exe_copy);
     REQUIRE(::chmod(exe_copy.c_str(), 0755) == 0);
     struct stat st{};
     REQUIRE(::stat(exe_copy.c_str(), &st) == 0);
@@ -892,14 +896,23 @@ TEST_CASE("exec_verify (B6) accepts a correctly-sized target and execs it via th
     opts.exec_verify.enabled = true;
     opts.exec_verify.require_root_owned = false; // test binaries aren't root-owned in CI
     opts.exec_verify.expected_size = static_cast<std::uint64_t>(st.st_size);
-    SubprocessResult r = run_bounded_subprocess({exe_copy.string(), "hi"}, opts);
+    SubprocessResult r = run_bounded_subprocess({exe_copy.string()}, opts);
     // Diagnostic only, printed by Catch2 solely on a failing CHECK below:
     // names the exact reason toctou_verified_exec's child branch gave up
-    // (report_setup_failure_and_exit's errno), so a CI failure on an
-    // unfamiliar runner environment (e.g. a syscall filter blocking
-    // execveat) is diagnosable from the log instead of a bare
-    // "tool_ran == false".
-    INFO("spawn_errno=" << r.spawn_errno << " (" << std::strerror(r.spawn_errno) << ")");
+    // (report_setup_failure_and_exit's errno) and echoes back any captured
+    // output, so a CI failure on an unfamiliar runner environment is
+    // diagnosable from the log instead of a bare "tool_ran == false".
+    INFO("spawn_errno=" << r.spawn_errno << " (" << std::strerror(r.spawn_errno) << "), "
+                         << r.lines.size() << " captured line(s):"
+                         << [&] {
+                                std::string joined;
+                                for (const auto& line : r.lines) {
+                                    joined += " [";
+                                    joined += line;
+                                    joined += ']';
+                                }
+                                return joined;
+                            }());
     CHECK(r.tool_ran);
     CHECK(r.exit_code == 0);
 }
