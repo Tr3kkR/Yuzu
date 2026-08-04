@@ -331,7 +331,7 @@ DESCRIPTOR_TEST("content_dist", "content_dist", 5, "stage", "execute_staged", "l
 DESCRIPTOR_TEST("interaction", "interaction", 5, "notify", "message_box", "input", "survey", "set_dnd")
 DESCRIPTOR_TEST("agent_logging", "agent_logging", 2, "get_log", "get_key_files")
 DESCRIPTOR_TEST("storage", "storage", 5, "set", "get", "delete", "list", "clear")
-DESCRIPTOR_TEST("registry", "registry", 8, "get_value", "set_value", "delete_value", "delete_key", "key_exists", "enumerate_keys", "enumerate_values", "get_user_value")
+DESCRIPTOR_TEST("registry", "registry", 9, "get_value", "set_value", "delete_value", "delete_key", "key_exists", "enumerate_keys", "enumerate_values", "get_user_value", "list_profiles")
 DESCRIPTOR_TEST("wmi", "wmi", 2, "query", "get_instance")
 DESCRIPTOR_TEST("rdp_control", "rdp_control", 2, "set_state", "status")
 DESCRIPTOR_TEST("disk_space", "disk_space", 1, "free")

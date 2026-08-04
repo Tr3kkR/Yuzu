@@ -239,6 +239,10 @@ agent_test_exe = executable(
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
     'unit/test_users_macos_last.cpp',         # qe-M1: pure `last -y` timestamp/weekday parsers
+    'unit/test_user_profile_model.cpp',       # PR1.7: pure ProfileList/HKU model (runs on every host)
+    'unit/test_registry_local_dispatcher.cpp', # PR1.7 remediation fix #3: real registry.dll driven
+                                                # end to end via LocalDispatcher (Windows-only; a no-op
+                                                # TU elsewhere via the file's own #ifdef _WIN32 guard)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -483,6 +487,7 @@ if build_server
       'unit/server/test_management_group_store.cpp',
       'unit/server/test_dashboard_tar_retention.cpp',
       'unit/server/test_dashboard_tar_fragments.cpp',
+      'unit/server/test_dashboard_results_columns.cpp', # PR1.7 remediation: resolve_render_columns/render_results
       'unit/server/test_route_sink_harness.cpp',
       'unit/server/test_rest_tar_purge.cpp',
       'unit/server/test_api_token_store.cpp',
