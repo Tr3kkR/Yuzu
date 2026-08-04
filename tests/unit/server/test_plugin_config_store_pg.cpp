@@ -295,7 +295,7 @@ TEST_CASE("A set secret decrypts under the deterministic scope_key AAD — the r
         REQUIRE(pk.has_value());
         const std::string scope_key = yuzu::server::plugin_config::canonical_plugin_key(*pk);
         auto dec = w.codec.decrypt(
-            pg::SecretCodec::SecretId{"plugin_config_store", "secrets", "sealed_value", scope_key},
+            SecretCodec::SecretId{"plugin_config_store", "secrets", "sealed_value", scope_key},
             std::span<const std::uint8_t>{raw, len});
         REQUIRE(dec.has_value());
         return std::string(reinterpret_cast<const char*>(dec->data()), dec->size());
