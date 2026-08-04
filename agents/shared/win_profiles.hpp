@@ -231,7 +231,10 @@ enum class HiveAccessStatus {
 // and set (never cleared) if the offline mount's RegUnLoadKeyW fails on the
 // way out -- read it AFTER this call returns. The caller must surface a set
 // flag rather than drop it: a failed unload leaves a system-wide mount that
-// survives process death and locks the profile's NTUSER.DAT until reboot.
+// survives process death and locks the profile's NTUSER.DAT until it is
+// unloaded or the host reboots (see win_reg_handle.hpp's ScopedUserHive
+// doc comment for the common transient-holder case reboot isn't actually
+// required for).
 template <typename Fn>
 HiveAccessStatus with_user_hive(const std::string& sid, const std::string& profile_path_utf8,
                                 Fn&& fn, bool* unload_failed = nullptr) {

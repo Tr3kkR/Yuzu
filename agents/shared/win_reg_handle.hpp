@@ -80,9 +80,13 @@ private:
 // a profile's NTUSER.DAT) under HKEY_USERS, unloaded on destruction.
 //
 // A leaked mount is SYSTEM-WIDE, survives process death, and locks the
-// source file until reboot: installed_apps_plugin.cpp:165-166,
-// licensing_win.cpp:70-104, and tar_mapdrive_collector.cpp each independently
-// hit and documented exactly this failure mode. with_root() is the only
+// source file until it is unloaded or the host reboots -- most commonly a
+// transient third-party handle (Search Indexer, AV, System Restore) into the
+// mounted branch, recoverable without reboot once that holder releases; a
+// genuinely stuck holder is the rarer case reboot actually resolves:
+// installed_apps_plugin.cpp:165-166, licensing_win.cpp:70-104, and
+// tar_mapdrive_collector.cpp each independently hit and documented exactly
+// this failure mode. with_root() is the only
 // sanctioned way to read the mounted hive through this type: it hands the
 // caller a borrowed HKEY for the duration of one callback and closes that
 // handle before returning, so a handle into the mount cannot accidentally

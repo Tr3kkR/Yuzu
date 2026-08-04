@@ -404,8 +404,13 @@ private:
 
         // Surface a failed offline-mount unload on EVERY exit path from here
         // on -- not just the success path below. A leaked mount is
-        // system-wide and locks the profile's NTUSER.DAT until reboot, and
-        // it is exactly the failure mode installed_apps_plugin.cpp/
+        // system-wide and locks the profile's NTUSER.DAT until it is
+        // unloaded or the host reboots -- most commonly a transient
+        // ERROR_ACCESS_DENIED from a third party (Search Indexer, AV,
+        // System Restore) briefly holding a handle into the newly-mounted
+        // branch, recoverable without reboot once that holder releases; a
+        // genuinely stuck holder is the rarer case reboot actually resolves.
+        // It is exactly the failure mode installed_apps_plugin.cpp/
         // licensing_win.cpp/tar_mapdrive_collector.cpp each independently
         // hit. unload_failed can be true even on HiveAccessStatus::
         // mount_failed (RegLoadKeyW itself can succeed while the subsequent
@@ -413,7 +418,10 @@ private:
         // before the switch below, not only after a full-success read.
         if (unload_failed) {
             ctx.write_output(std::format(
-                "warning|hive_unload_failed: offline mount for sid '{}' may remain loaded",
+                "warning|hive_unload_failed: HKU\\YUZU_HIVE_{} for sid '{}' may remain "
+                "mounted; retry `reg unload HKU\\YUZU_HIVE_{}` once any process holding "
+                "the branch (Search Indexer, AV, System Restore) releases it",
+                sanitize_field(resolved_sid), sanitize_field(resolved_sid),
                 sanitize_field(resolved_sid)));
         }
 

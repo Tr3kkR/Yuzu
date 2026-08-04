@@ -778,7 +778,7 @@ Plugins for Windows-specific system management: registry operations and WMI quer
 | `key_exists` | Check whether a registry key exists. Parameters: `hive`, `key`. Returns boolean. |
 | `enumerate_keys` | List all subkeys under a registry key. Parameters: `hive`, `key`. |
 | `enumerate_values` | List all value names and types under a registry key. Parameters: `hive`, `key`. |
-| `get_user_value` | Read a registry value from a specific user's hive. Resolves the profile via ProfileList (by `username` or an explicit `sid`), then reads the live `HKEY_USERS\<SID>` hive if the user is logged in, or loads that profile's NTUSER.DAT via `RegLoadKey` as a fallback. Requires `SE_RESTORE_NAME` and `SE_BACKUP_NAME` privileges for the offline-hive fallback only. Parameters: `username` or `sid` (one required), `key`, `name` (optional). |
+| `get_user_value` | Read a registry value from a specific user's hive. Resolves the profile via ProfileList (by `username` or an explicit `sid`), then reads the live `HKEY_USERS\<SID>` hive if the user is logged in, or loads that profile's NTUSER.DAT via `RegLoadKey` as a fallback. Requires `SE_RESTORE_NAME` and `SE_BACKUP_NAME` privileges for the offline-hive fallback only. Parameters: `username` or `sid` (one required), `key`, `name` (optional). Known limitation: two concurrent reads against the same logged-out user's hive can collide on the offline mount — the second surfaces an honest `error|failed to load hive`, self-resolving on retry. |
 | `list_profiles` | Enumerate local user profiles: SID, resolved profile name, profile path, and whether the profile's hive is currently loaded under `HKEY_USERS`. System profiles (LocalSystem, LocalService, NetworkService) are excluded. No parameters. |
 
 ### wmi
