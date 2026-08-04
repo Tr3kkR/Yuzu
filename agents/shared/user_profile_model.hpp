@@ -197,14 +197,21 @@ struct ProfileInfo {
     return out;
 }
 
-/// Renders one profile as `profile|<sid>|<name>|<path>|<state>`, with every
-/// field sanitised and empty fields rendered as "-".
+/// Renders one profile as `<sid>|<name>|<path>|<state>`, with every field
+/// sanitised and empty fields rendered as "-". No leading discriminator tag
+/// (PR1.7 remediation, Gate 4 happy-path finding): list_profiles has exactly
+/// one row shape, and the dashboard's split_fields (result_parsing.hpp) has
+/// no per-plugin entry for "registry" so it falls to the generic
+/// split-on-all-pipes path -- every other multi-column plugin (procfetch,
+/// netstat, sockwho, vuln_scan) emits raw pipe-joined field values with no
+/// self-describing prefix for exactly this reason. A leading "profile|" tag
+/// was an extra field split_fields didn't know to skip, shifting every real
+/// column one position right of its header.
 [[nodiscard]] inline std::string render_profile_row(const ProfileInfo& info) {
     auto field = [](std::string_view v) -> std::string {
         return v.empty() ? std::string{"-"} : sanitize_field(v);
     };
-    std::string out = "profile|";
-    out += field(info.sid);
+    std::string out = field(info.sid);
     out += '|';
     out += field(info.profile_name);
     out += '|';

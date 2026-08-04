@@ -84,15 +84,27 @@ InstructionDefinition make_list_profiles_definition() {
     return def;
 }
 
+constexpr const char* kAliceSid = "S-1-5-21-1-2-3-1001";
+
 StoredResponse mk_list_profiles_response(const std::string& command_id) {
     StoredResponse r;
     r.instruction_id = command_id; // render_results queries the store by this
     r.agent_id = "agent-1";
     r.received_at_ms = 1000;
     r.status = 0;
-    // render_profile_row's real wire shape (user_profile_model.hpp).
-    r.output = "profile|S-1-5-21-1-2-3-1001|alice|C:\\Users\\alice|loaded";
+    // render_profile_row's real wire shape (user_profile_model.hpp): raw
+    // pipe-joined fields, no leading discriminator tag.
+    r.output = std::string{kAliceSid} + "|alice|C:\\Users\\alice|loaded";
     return r;
+}
+
+std::size_t count_occurrences(const std::string& hay, std::string_view needle) {
+    std::size_t n = 0, pos = 0;
+    while ((pos = hay.find(needle, pos)) != std::string::npos) {
+        ++n;
+        pos += needle.size();
+    }
+    return n;
 }
 
 } // namespace
@@ -121,11 +133,25 @@ TEST_CASE("render_results: a schema-only definition (no visualization) resolves 
     CHECK(contains(html, "hive_state"));
     CHECK_FALSE(contains(html, ">Output<"));
 
-    // Data: the row's real field values are NOT suppressed -- this is the
-    // actual pre-fix bug (is_visible() matched template columns against the
-    // 2-entry fallback and hid every profile field).
-    CHECK(contains(html, "alice"));
-    CHECK(contains(html, "loaded"));
+    // Data: every real field value renders in its OWN correctly-formed
+    // <td>, not shifted into the wrong column. A substring-containment
+    // check alone (contains(html, "alice")) would pass even if the row
+    // were column-shifted -- this pins the exact cell markup instead
+    // (Gate 4 happy-path finding: a since-removed leading tag on
+    // render_profile_row's wire format shifted every field one column
+    // right, and a weaker version of this test did not catch it).
+    CHECK(contains(html, "<td title=\"" + std::string{kAliceSid} + "\">" +
+                             kAliceSid + "</td>"));
+    CHECK(contains(html, "<td title=\"alice\">alice</td>"));
+    CHECK(contains(html, "<td title=\"loaded\">loaded</td>"));
+    // "profile" must never appear as a rendered cell value now that the
+    // tag is gone.
+    CHECK_FALSE(contains(html, "<td title=\"profile\">profile</td>"));
+
+    // Column count: Agent + 4 real fields == 5 <td> in the primary row, plus
+    // 1 more for the detail-drawer row's own single colspan <td> wrapper
+    // (its contents use <div>, but the wrapper itself is a <td>).
+    CHECK(count_occurrences(html, "<td ") == 6);
 }
 
 TEST_CASE("render_results: no definition_id falls back to columns_for_plugin "

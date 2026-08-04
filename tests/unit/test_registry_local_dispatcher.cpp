@@ -135,8 +135,13 @@ std::optional<std::string> current_user_sid() {
 }
 
 // Parses LocalDispatcher's newline-joined capture into
-// render_profile_row's `profile|sid|name|path|state` lines and returns the
-// row whose sid matches, if any.
+// render_profile_row's `sid|name|path|state` lines (no leading discriminator
+// tag -- PR1.7 remediation, Gate 4 happy-path finding: a plugin row emits
+// raw pipe-joined fields, matching every other multi-column plugin) and
+// returns the row whose sid matches, if any. Non-data lines (list_profiles
+// can also emit a `warning|profile_list_truncated...` line) are skipped by
+// requiring exactly 4 fields AND that the first one isn't a known sentinel
+// prefix.
 struct ProfileRow {
     std::string sid, name, path, state;
 };
@@ -144,10 +149,10 @@ std::optional<ProfileRow> find_profile_row(const std::string& captured, const st
     std::istringstream iss(captured);
     std::string line;
     while (std::getline(iss, line)) {
-        if (!line.starts_with("profile|"))
+        if (line.starts_with("warning|") || line.starts_with("error|"))
             continue;
         std::vector<std::string> fields;
-        size_t pos = 8; // skip "profile|"
+        size_t pos = 0;
         while (pos <= line.size()) {
             auto p = line.find('|', pos);
             if (p == std::string::npos) {

@@ -243,12 +243,12 @@ TEST_CASE("sanitize_field: ordinary text passes through unchanged", "[profiles]"
 
 TEST_CASE("render_profile_row: ordinary profile", "[profiles]") {
     ProfileInfo info{std::string{kAliceSid}, "alice", "C:\\Users\\alice", HiveState::loaded};
-    CHECK(render_profile_row(info) == "profile|" + std::string{kAliceSid} + "|alice|C:\\Users\\alice|loaded");
+    CHECK(render_profile_row(info) == std::string{kAliceSid} + "|alice|C:\\Users\\alice|loaded");
 }
 
 TEST_CASE("render_profile_row: empty fields render as '-'", "[profiles]") {
     ProfileInfo info{std::string{kAliceSid}, "", "", HiveState::not_loaded};
-    CHECK(render_profile_row(info) == "profile|" + std::string{kAliceSid} + "|-|-|not_loaded");
+    CHECK(render_profile_row(info) == std::string{kAliceSid} + "|-|-|not_loaded");
 }
 
 TEST_CASE("render_profile_row: a value containing '|' cannot forge a column", "[profiles]") {
@@ -259,7 +259,7 @@ TEST_CASE("render_profile_row: a value containing '|' cannot forge a column", "[
     ProfileInfo info{std::string{kAliceSid}, "ali|ce", "C:\\Users\\a|b", HiveState::loaded};
     auto row = render_profile_row(info);
     CHECK(row.find("ali|ce") == std::string::npos);
-    CHECK(row == "profile|" + std::string{kAliceSid} + "|ali_ce|C:\\Users\\a_b|loaded");
+    CHECK(row == std::string{kAliceSid} + "|ali_ce|C:\\Users\\a_b|loaded");
 }
 
 TEST_CASE("render_profile_row: exhaustive over every HiveState", "[profiles]") {
