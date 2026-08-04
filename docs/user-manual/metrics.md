@@ -150,6 +150,32 @@ both leave rows undeleted, so an audit table that never shrinks looks identical
 either way. Only the pair distinguishes "the guard is protecting the table" from
 "cleanup is broken".
 
+## MCP approval-gate metrics
+
+Outcomes of the supervised-tier approval gate on an MCP tool call (#2442). Label
+sets are CLOSED and pre-seeded at boot over `approval_gated_tool_names()`, so
+`absent()` alerting stays meaningful and a series that is present-and-flat means
+"no such event", not "not wired".
+
+Both counters fire on the **same** cross-surface refusal, one-to-one — they are
+not independent events, so summing across the two families double-counts.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `yuzu_mcp_approval_denied_total` | counter | `tool`, `reason="foreign_origin"\|"store_error"\|"not_consumable"` | The operator/dashboard breakdown of approval-recall denials. `not_consumable` is an ordinary replay of a spent ticket and is expected in normal use; `store_error` is a transient approvals-store read failure that leaves the ticket **untouched** and valid; `foreign_origin` is the cross-surface refusal below. `#2443`'s pre-consume recheck currently also counts as `not_consumable`. |
+| `yuzu_mcp_approval_forgery_total` | counter | `tool`, `event="security"` | The SIEM tap for the same `foreign_origin` event: an approval minted by the REST instruction gate or the scheduler, presented to the MCP recall. Carries `event="security"` because SIEMs filter on that label ([observability-conventions.md](../observability-conventions.md)); the paired audit row `mcp.<tool>` / `denied` with detail `refused: minted by a non-MCP surface (#2442)` is the forensic evidence. **This is the family to alert on.** |
+
+**Alert on an increase, not on a value.** The registry is in-memory, so every
+series returns to zero on restart — an instantaneous `> 0` rule resolves silently
+across a bounce. Use `increase(yuzu_mcp_approval_forgery_total[24h]) > 0`. The
+durable record of the same event is the audit row, which is best-effort: the write
+is unchecked and MCP has no `Sec-Audit-Failed` channel, so neither signal alone is
+a complete record.
+
+Note the counters do **not** fire for the unlabelled carried-across tickets
+described in [server-admin.md](server-admin.md)'s `#2442` upgrade note — those are
+exempt from the origin check by design and so take no denial branch at all.
+
 ## MCP progress-bridge metrics
 
 The MCP Streamable-HTTP progress bridge projects live `notifications/progress` onto a

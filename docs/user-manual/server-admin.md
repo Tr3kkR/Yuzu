@@ -312,7 +312,8 @@ into a live residual, and an empty result here is not a clearance for that case.
 > **If you took guidance from an earlier revision of this note, re-check it.** A previous version
 > listed compensating controls that were wrong: it offered
 > `yuzu_mcp_approval_denied_total{reason="foreign_origin"}` as the alert for this residual, when
-> that counter cannot fire for it; and it advised removing `Approval:Read` from the Viewer role,
+> neither that counter nor `yuzu_mcp_approval_forgery_total` can fire for it — a carried-across
+> ticket is exempt from the origin check by design, so it takes no denial branch at all; and it advised removing `Approval:Read` from the Viewer role,
 > which is re-inserted at every server start. An alert or a role edit made on that basis is not
 > doing what it appears to.
 
