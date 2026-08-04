@@ -191,7 +191,10 @@ constant for all three. Two surfaces do name the origin:
   <origin>`, at `warn` (emitted at the default `--log-level info`). The id is
   truncated to its first 8 characters, so match it against the first 8 of the full id
   in the audit row's `detail`.
-- `GET /api/approvals`, which returns an `origin` field per ticket. It needs
+- `GET /api/approvals`, which returns an `origin` field per ticket. **This is a REST-only
+  triage path.** The MCP twin `list_pending_approvals` reads the same store and accepts the
+  same `status` filter, but its projection omits `origin`, so an operator confined to MCP
+  cannot complete this triage and must use the REST route or the log line below. It needs
   `Approval:Read` and takes no id filter, so you cannot fetch one ticket directly.
   It does take `status` and `submitted_by`, and both are applied in the query's
   `WHERE` clause ahead of its `LIMIT 100` — so a filtered read still reaches a

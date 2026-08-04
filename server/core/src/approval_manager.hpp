@@ -311,12 +311,17 @@ public:
     /// which uses this.
     std::expected<std::optional<Approval>, std::string> get_checked(const std::string& id) const;
 
-    /// True when `submitted_by` already holds the maximum PENDING approvals a
-    /// single principal may hold. Ask this rather than comparing
-    /// `pending_count_for` against a cap of your own: the cap and the scan
-    /// window it must stay below are both private to this class (see below) and
-    /// related there by a static_assert, so a caller cannot hold a divergent
-    /// number and a new mint surface cannot forget to relate the two.
+    /// True when `submitted_by` was at or above the per-principal pending cap AT
+    /// THE MOMENT OF THE CHECK. Not an invariant: the count, this check and
+    /// `submit()` each take `mtx_` separately, so concurrent mints can each
+    /// observe a count below the cap and all proceed. It bounds a sustained
+    /// flood, it does not guarantee a ceiling.
+    ///
+    /// This is the ONLY per-principal cap predicate. The cap and the scan window
+    /// it must stay below are both private (see below) and related there by a
+    /// static_assert, and the count it is measured against is private too — so a
+    /// caller cannot express a divergent cap without adding a public counter
+    /// first, and a new mint surface cannot forget to relate the two.
     bool submitter_pending_cap_reached(const std::string& submitted_by) const;
 
     /// Newest PENDING approval matching (definition_id, submitted_by,
@@ -328,12 +333,6 @@ public:
                                          const std::string& scope_expression) const;
 
     int pending_count() const;
-
-    /// Count of PENDING approvals submitted by one principal. Backs the MCP
-    /// mint's per-submitter sub-cap (governance sec8-MEDIUM-1): dedup alone does
-    /// not stop an adaptive flood (a nonce key defeats the args-hash), so the
-    /// mint bounds any single supervised token's share of the GLOBAL cap.
-    int pending_count_for(const std::string& submitted_by) const;
 
     std::expected<void, std::string> approve(const std::string& id, const std::string& reviewer,
                                              const std::string& comment);
@@ -394,6 +393,16 @@ public:
                                                      const ConsumePrecondition& precondition);
 
 private:
+    /// Count of PENDING approvals submitted by one principal. Backs the
+    /// per-submitter sub-cap (governance sec8-MEDIUM-1): dedup alone does not
+    /// stop an adaptive flood (a nonce key defeats the args-hash), so a mint
+    /// surface that asks bounds any single supervised token's share of the
+    /// GLOBAL cap. PRIVATE so the only way to express the cap is
+    /// `submitter_pending_cap_reached`, which measures it against the one
+    /// constant; a public counter is how a caller would reintroduce a divergent
+    /// cap of its own.
+    int pending_count_for(const std::string& submitted_by) const;
+
     /// How many same-tuple pending rows `find_pending` scans before truncating.
     /// An eligible row past this position IS hidden, which is only harmless
     /// while no principal can accumulate that many pending rows.

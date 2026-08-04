@@ -260,20 +260,28 @@ and no API retires it: the approve/reject routes refuse any ticket that is not s
 still `pending`. Rejecting the pending tickets achieves nothing, because a pending ticket is not
 redeemable in the first place.
 
-The claim is checkable rather than asserted. `ApprovalManager`'s only public mutators are
-`approve`, `reject`, `consume_ticket` and the submit path; the first two both route through
-`set_review_status`, which returns `approval already reviewed` unless the stored status is
-`pending`, and `consume_ticket` redeems a ticket rather than retiring it. The operator-reachable
-surfaces are `GET /api/approvals`, `GET /api/approvals/pending/count`, the
-`POST /api/approvals/{id}/approve` and `/reject` pair, the read-only versioned
-`GET /api/v1/approvals/{id}`, and the `approve_request` / `reject_request` MCP tools — the last
-two call the same `approve`/`reject` path and inherit the same pending-only refusal.
+The claim is checkable rather than asserted. `ApprovalManager` exposes four mutators, and each
+one is accounted for: `approve` and `reject` both route through `set_review_status`, which
+returns `approval already reviewed` unless the stored status is `pending`; `consume_ticket`
+redeems a ticket rather than retiring it; and `submit` carries the lazy expiry sweep, which is
+the only thing in the tree that retires an approved-unconsumed row — at the 7-day boundary
+described above, never on demand.
 
-Two traps in checking that list, both of which caught a reviewer of this very paragraph: the
-approve/reject routes are registered as raw-string regex patterns, so a literal search for
-`"/api/approvals` misses them; and searching `server.cpp` alone misses both the versioned route
-and the MCP tools, which live in `rest_api_v1.cpp` and `mcp_server.cpp`. An enumeration drawn
-from one file will look like it confirms this paragraph, for the wrong reason.
+The surfaces that reach those mutators are `GET /api/approvals`,
+`GET /api/approvals/pending/count`, the `POST /api/approvals/{id}/approve` and `/reject` pair,
+the read-only versioned `GET /api/v1/approvals/{id}`, and three MCP tools —
+`list_pending_approvals` (`Approval:Read`), `approve_request` and `reject_request`
+(`Approval:Write`). The MCP write pair calls the same `approve`/`reject` path and inherits the
+same pending-only refusal.
+
+**Re-derive that list before relying on it; do not trust the sentence above to be complete.**
+Three successive reviews of this paragraph each found it missing an entry, and each time the
+list looked complete to whoever wrote it. The traps compound: the approve/reject routes are
+registered as raw-string regex patterns, so a literal search for `"/api/approvals` misses them;
+searching `server.cpp` alone misses the versioned route in `rest_api_v1.cpp` and every MCP tool
+in `mcp_server.cpp`; and the MCP tools are best enumerated from the securable table
+(`{"Approval", ...}` entries) rather than by name. What does not change with the enumeration is
+the conclusion: no surface in it retires an approved-unconsumed ticket on demand.
 
 Earlier revisions of this note carried a direct `UPDATE` against `instructions.db`. It has been
 withdrawn. Four successive attempts to publish a safe version each shipped a defect that

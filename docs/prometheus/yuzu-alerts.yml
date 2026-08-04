@@ -122,7 +122,9 @@ groups:
             refused at redemption by the MCP approval recall. The ticket is left
             untouched, so no approval was consumed. For the principal and the
             ticket id, read the paired audit row: action mcp.{{ $labels.tool }},
-            result denied. That row does not identify WHICH surface minted the
+            result denied, detail "refused: minted by a non-MCP surface (#2442)"
+            — that token is the grep key, and result=denied alone matches many
+            other refusals. The row does not identify WHICH surface minted the
             ticket; two other surfaces carry the origin. increase() rather than a
             bare > 0 because the registry is in-memory and every series resets on
             restart. See docs/user-manual/metrics.md "MCP approval-gate metrics",

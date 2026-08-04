@@ -741,7 +741,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
     CHECK(!ran);
 }
 
-TEST_CASE("ApprovalManager: an empty precondition consumes without running a recheck",
+TEST_CASE("ApprovalManager: an empty precondition consumes with no precondition supplied",
           "[approval_manager][approval]") {
     TestDb tdb;
     ApprovalManager mgr(tdb.db);
