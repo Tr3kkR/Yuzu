@@ -463,8 +463,6 @@ void output_summary(yuzu::CommandContext& ctx, const std::vector<Finding>& findi
 //   - macOS: get_installed_apps shells out via popen (system_profiler,
 //     optionally brew); run_macos_checks is almost entirely popen
 //     (spctl/fdesetup/csrutil/socketfilterfw/systemsetup/defaults) — rung 3.
-namespace {
-
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         "scan",

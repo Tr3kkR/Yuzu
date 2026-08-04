@@ -411,8 +411,6 @@ std::vector<std::string> load_stabilization_exclusions(yuzu::tar::TarDatabase& d
 //     effective_network_capture_method). Native on every OS; macOS's poll
 //     (proc_pidfdinfo) carries the same TOCTOU caveat the schema table
 //     records for that leg (tar "tcp" row 2) — CONSTRAINED there.
-namespace {
-
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         "status",

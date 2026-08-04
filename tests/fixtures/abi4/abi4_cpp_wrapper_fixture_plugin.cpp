@@ -6,7 +6,8 @@
  * Unlike tests/fixtures/abi4/abi4_declared_fixture_plugin.cpp (which
  * hand-rolls the C YuzuPluginDescriptor directly), this fixture is written
  * through the yuzu::Plugin + YUZU_PLUGIN_EXPORT path every real Yuzu plugin
- * uses (see agents/plugins/*/src/*.cpp). Before the seam, YUZU_PLUGIN_EXPORT's
+ * uses (see any plugin source under agents/plugins/). Before the seam,
+ * YUZU_PLUGIN_EXPORT's
  * generated descriptor never wired action_descriptors/action_descriptor_count
  * at all — so no C++-wrapper plugin could declare an ABI4 capability leg no
  * matter what it overrode, which is exactly why every one of the 49 shipped

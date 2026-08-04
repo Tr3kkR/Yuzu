@@ -92,8 +92,6 @@ int do_surfaces(yuzu::CommandContext& ctx) {
 //     header's own doc comment records the real limitation: a BINARY
 //     (bplist00) Info.plist is not parsed and falls back to the bundle name
 //     with an empty version — CONSTRAINED, not SUPPORTED.
-namespace {
-
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         "list",
