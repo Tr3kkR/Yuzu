@@ -1244,3 +1244,126 @@ TEST_CASE("KEK op lock: the guard leaves nothing held on the connection it relea
     CHECK(try_lock_kek_op(observer.get()) == KekOpLockAttempt::kAcquired);
     KekOpLockGuard cleanup{observer.get()};
 }
+
+// ── Multi-codec rotation (PR1.5c/PR1.6c) ────────────────────────────────────
+//
+// The server now owns MORE THAN ONE SecretCodec: `auth_secret_codec_` (AuthDB's
+// TOTP secrets) and `plugin_config_secret_codec_` (PluginConfigStore's sealed
+// values), both enrolled in the live `kek_ops.{rotate,rewrap,status}` surface.
+//
+// The failure this pins is silent and expensive: `rotate_kek()` MINTS a new KEK
+// version, so calling it once per codec would mint N versions and strand each
+// codec on a different generation. The production loop therefore mints ONCE (on
+// the primary) and brings every other codec onto that same version with
+// `init()` (a non-minting resync) followed by `rewrap_all()`, all under a SINGLE
+// `secrets_kek_op` lock hold. This test reproduces that sequence at the
+// SecretCodec level and asserts the properties that make it correct.
+TEST_CASE("SecretCodec: a second codec joins a rotation without minting a second KEK",
+          "[pg][secrets][multicodec]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    PgConn conn = connect(db.dsn());
+    create_test_table(conn.get());
+
+    // A second store/table standing in for the second consumer.
+    REQUIRE(PgResult{PQexec(conn.get(), "CREATE SCHEMA IF NOT EXISTS tstore2")}.ok());
+    REQUIRE(PgResult{PQexec(conn.get(), "CREATE TABLE IF NOT EXISTS tstore2.things ("
+                                        "  id     BIGINT PRIMARY KEY,"
+                                        "  secret BYTEA)")}
+                .ok());
+    auto upsert2 = [&](std::int64_t pk, std::span<const std::uint8_t> blob) {
+        const std::string pk_str = std::to_string(pk);
+        const char* values[] = {pk_str.c_str(), reinterpret_cast<const char*>(blob.data())};
+        const int lengths[] = {0, static_cast<int>(blob.size())};
+        const int formats[] = {0, 1};
+        REQUIRE(PgResult{PQexecParams(conn.get(),
+                                      "INSERT INTO tstore2.things (id, secret)"
+                                      " VALUES ($1::bigint, $2)"
+                                      " ON CONFLICT (id) DO UPDATE SET secret = EXCLUDED.secret",
+                                      2, nullptr, values, lengths, formats, 0)}
+                    .ok());
+    };
+    auto fetch2 = [&](std::int64_t pk) {
+        const std::string pk_str = std::to_string(pk);
+        const char* values[] = {pk_str.c_str()};
+        PgResult res{PQexecParams(conn.get(),
+                                  "SELECT secret FROM tstore2.things WHERE id = $1::bigint", 1,
+                                  nullptr, values, nullptr, nullptr, 1)};
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        const auto* p = reinterpret_cast<const std::uint8_t*>(PQgetvalue(res.get(), 0, 0));
+        return std::vector<std::uint8_t>{p, p + PQgetlength(res.get(), 0, 0)};
+    };
+
+    const SecretCodec::SecretId id_a = test_id(1);
+    const SecretCodec::SecretId id_b{"tstore2", "things", "secret",
+                                     SecretCodec::encode_bigint_pk(1)};
+
+    // Both codecs boot against the same database and land on v1.
+    SecretCodec codec_a(provider);
+    REQUIRE(codec_a.register_secret_column({"tstore", "things", "secret", "id"}));
+    REQUIRE(codec_a.init(conn.get()).has_value());
+
+    SecretCodec codec_b(provider);
+    REQUIRE(codec_b.register_secret_column({"tstore2", "things", "secret", "id"}));
+    REQUIRE(codec_b.init(conn.get()).has_value());
+
+    REQUIRE(codec_a.active_kek_version() == 1);
+    REQUIRE(codec_b.active_kek_version() == 1);
+
+    const auto plain_a = bytes_of("auth-totp-seed");
+    const auto plain_b = bytes_of("plugin-config-sealed-value");
+    auto blob_a = codec_a.encrypt(id_a, plain_a);
+    auto blob_b = codec_b.encrypt(id_b, plain_b);
+    REQUIRE(blob_a.has_value());
+    REQUIRE(blob_b.has_value());
+    upsert_secret(conn.get(), 1, *blob_a);
+    upsert2(1, *blob_b);
+    REQUIRE(blob_kek_version(*blob_a) == 1);
+    REQUIRE(blob_kek_version(*blob_b) == 1);
+
+    auto live_versions = [&] {
+        PgResult res{PQexec(conn.get(), "SELECT count(*) FROM secrets.kek_meta"
+                                        " WHERE retired_at IS NULL")};
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        return std::string{PQgetvalue(res.get(), 0, 0)};
+    };
+    REQUIRE(live_versions() == "1");
+
+    // THE PRODUCTION SEQUENCE: mint once on A...
+    auto rotated = codec_a.rotate_kek(conn.get());
+    INFO((rotated ? std::string{} : rotated.error().internal_message));
+    REQUIRE(rotated.has_value());
+    REQUIRE(*rotated == 2);
+
+    // ...then bring B onto that SAME version — init() resyncs without minting.
+    REQUIRE(codec_b.init(conn.get()).has_value());
+    REQUIRE(codec_b.active_kek_version() == 2);
+    REQUIRE(codec_b.rewrap_all(conn.get()).has_value());
+
+    // EXACTLY ONE new version exists. If the loop had called rotate_kek() per
+    // codec this would be 3, and the two codecs would sit on 2 and 3.
+    REQUIRE(live_versions() == "2");
+    REQUIRE(codec_a.active_kek_version() == codec_b.active_kek_version());
+
+    // Both codecs' stored rows moved onto v2, and both still decrypt.
+    REQUIRE(blob_kek_version(fetch_secret(conn.get(), 1)) == 2);
+    REQUIRE(blob_kek_version(fetch2(1)) == 2);
+
+    auto back_a = codec_a.decrypt(id_a, fetch_secret(conn.get(), 1));
+    REQUIRE(back_a.has_value());
+    REQUIRE(back_a->size() == plain_a.size());
+    REQUIRE(std::equal(plain_a.begin(), plain_a.end(), back_a->data()));
+
+    auto back_b = codec_b.decrypt(id_b, fetch2(1));
+    REQUIRE(back_b.has_value());
+    REQUIRE(back_b->size() == plain_b.size());
+    REQUIRE(std::equal(plain_b.begin(), plain_b.end(), back_b->data()));
+
+    // A codec is NEVER responsible for a sibling's columns: A's rewrap scan
+    // must not have touched tstore2, and vice versa. Proven by registration
+    // being per-instance — a cross-registration would be a duplicate.
+    REQUIRE(codec_a.registered_columns().size() == 1);
+    REQUIRE(codec_b.registered_columns().size() == 1);
+}

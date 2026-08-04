@@ -74,6 +74,15 @@ divergent KEK versions — see `ServerImpl::kek_enrolled_codecs()`'s doc comment
 the full contract. An operator's `/rotate` or `/rewrap` request (REST or MCP) now re-wraps
 `plugin_config_store.secrets.sealed_value` too.
 
+That sequence is pinned at the `SecretCodec` level by
+`tests/unit/server/test_secret_codec.cpp`'s `[pg][secrets][multicodec]` case: two codecs over one
+database, each with its own registered column, rotate on the first, and assert that **exactly one**
+new live `kek_meta` version exists, that both codecs report the same `active_kek_version()`, that
+both stores' rows carry the new version, and that both still decrypt. It is mutation-proven rather
+than assumed green — omitting the second codec's `rewrap_all()` fails it with the second store's
+rows still on the old generation (`1 == 2`), which is precisely the silent stranding this design
+exists to prevent.
+
 `set_secret` encrypts under a **fresh DEK per write** (never DEK reuse — a secret update mints a
 new sealed blob from scratch). The SecretId AAD `row_pk` is the deterministic `scope_key`
 (`<plugin>.<key>`, via `plugin_config_parsers.hpp::canonical_plugin_key`) — a TEXT identity
