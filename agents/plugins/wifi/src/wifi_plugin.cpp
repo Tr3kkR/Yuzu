@@ -503,6 +503,43 @@ int do_connected(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// Windows is native WLAN API throughout (rung 1). Linux routes nmcli/iw
+// through the bounded subprocess runner, but run_command (above) hands the
+// command line to `/bin/sh -c` rather than an argv array — a governed
+// shell payload, ADR-3002 rung 3 — with a raw-text iw/iwlist fallback when
+// nmcli is absent. macOS's list_networks scan path has no
+// working leg today — the `airport` private binary was removed in macOS 14
+// (Sonoma) and the system_profiler fallback needs Location Services
+// authorisation it may not have, so this is UNSUPPORTED, never a fabricated
+// SUPPORTED claim (the honest "wifi|info|..." sentinel emitted when neither
+// produces output). macOS connected instead ships via CoreWLAN
+// (wifi_corewlan.mm), a native framework — rung 1 — though Location
+// Services (macOS 14+) can withhold the SSID/BSSID from a background
+// daemon.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "list_networks",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 3, "nmcli via governed shell runner",
+         "falls back to a raw, unstructured iw/iwlist text dump when nmcli is unavailable"},
+        /* .macos_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "WlanGetAvailableNetworkList", nullptr},
+    },
+    {
+        /* .action      = */ "connected",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 3, "nmcli via governed shell runner",
+         "falls back to a raw iwconfig text blob (ESSID/Signal only) when nmcli reports no SSID"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 1, "CoreWLAN",
+         "Location Services (macOS 14+) may withhold SSID/BSSID from a background daemon"},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "WlanQueryInterface", nullptr},
+    },
+};
+
 } // namespace
 
 class WifiPlugin final : public yuzu::Plugin {
@@ -516,6 +553,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"list_networks", "connected", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

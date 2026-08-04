@@ -642,6 +642,46 @@ std::vector<std::string> macos_get_whitelist() {
 
 #endif // __APPLE__
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// Every leg on every platform shells out via a raw popen()/_popen()
+// (run_command/run_command_rc above — never the bounded subprocess
+// runner): netsh on Windows, sudo-prefixed iptables on Linux, a
+// sudo-prefixed pfctl ruleset load on macOS. That is rung 3 throughout —
+// a shell/interpreter payload, whether or not it is sudo-governed, is
+// never rung 1 or 2 (sudo changes the privilege boundary, not the
+// acquisition mechanism). quarantine is the endpoint's most disruptive
+// action here — it blocks essentially all traffic except the whitelist —
+// so it is classified Destructive; unquarantine is its genuine, tested
+// undo (exercised end-to-end by scripts/test/instructions_quarantine_survivor.py,
+// which specifically verifies the box is NOT left locked out).
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "quarantine",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "sudo iptables via popen", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "sudo pfctl via popen", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 3, "netsh via popen", nullptr},
+    },
+    {
+        /* .action      = */ "unquarantine",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "sudo iptables via popen", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "sudo pfctl via popen", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 3, "netsh via popen", nullptr},
+    },
+    {
+        /* .action      = */ "status",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "sudo iptables via popen", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "sudo pfctl via popen", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 3, "netsh via popen", nullptr},
+    },
+    {
+        /* .action      = */ "whitelist",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "sudo iptables via popen", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "sudo pfctl via popen", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 3, "netsh via popen", nullptr},
+    },
+};
+
 } // namespace
 
 // ── Plugin class ─────────────────────────────────────────────────────────────
@@ -657,6 +697,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"quarantine", "unquarantine", "status", "whitelist", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
