@@ -239,127 +239,41 @@ the live MCP flow. No new blank-surface row can be created by a surface that dec
 
 Carried-across rows clear on the existing 7-day approval expiry, but that sweep is **lazy**: it
 runs when an approval is submitted and at no other time, so a queue receiving no new submissions
-ages nothing out. It also sits *after* the 1000-pending cap check, so a queue saturated with
-pending approvals never reaches it at all. The window is bounded by 7 days *and* a subsequent
-successful submission — not by 7 days alone.
+ages nothing out. The window is therefore bounded by 7 days *and* a subsequent successful
+submission — not by 7 days alone. (The sweep runs *before* the pending-queue cap check, so a
+saturated queue still drains; see the ordering comment in `approval_manager.cpp`, which is the
+source of truth for it.)
 
-**Closing it immediately needs the database.** The redeemable population is exactly
-`status = 'approved' AND consumed_at = 0`, and there is no API that can retire those: the
-approve/reject routes refuse any ticket that is not still `pending`
-(`400 approval already reviewed`), and the dashboard renders no control for them. Rejecting the
-pending ones achieves nothing — a pending ticket is not redeemable in the first place. If you
-need the window shut before the sweep runs:
+**There is no supported way to close the window early, and this manual deliberately no longer
+publishes one.** The redeemable population is exactly `status = 'approved' AND consumed_at = 0`,
+and no API retires it: the approve/reject routes refuse any ticket that is not still `pending`
+(`400 approval already reviewed`), and the dashboard renders no control for one that is already
+reviewed. Rejecting the pending tickets achieves nothing, because a pending ticket is not
+redeemable in the first place.
 
-Run every command below **as the `yuzu` service user**, not as root — a `sqlite3` session
-interrupted as root leaves root-owned `-wal`/`-shm` files that the service cannot open on its next
-boot.
+Earlier revisions of this note carried a direct `UPDATE` against `instructions.db`. It has been
+withdrawn. Four successive attempts to publish a safe version each shipped a defect that
+destroyed or stranded live approvals, and the last review round established that the failure was
+structural rather than a matter of tightening predicates: the statement needs to distinguish
+tickets carried across the upgrade from tickets minted after it, the only available discriminator
+is the submission timestamp, and the timestamp of the upgrade itself cannot be recovered from the
+data — the MCP gate does not record its own surface, so no query can see the population the bound
+is meant to protect. A procedure that cannot be executed safely from the information available to
+the operator does not belong in an operator manual, and one that also writes no audit row is worse
+than the exposure it closes.
 
-**Step 1 — establish the cutoff.** Only the submission timestamp separates the carried-across rows
-from the ones your running system depends on: both carry a blank surface. Ideally record
-`date +%s` *before* you first start the upgraded binary. If you are reading this afterwards — the
-common case — recover it instead, since the first row carrying a declared surface can only have
-been written by the upgraded server:
+**What to do instead.** In almost every deployment the answer is nothing: the exemption covers
+tickets minted before the upgrade, it expires on its own within 7 days of the next submission, and
+on a deployment running only shipped content there are no `mcp.`-prefixed definitions for a
+carried-across ticket to have been raised against. If you have specific reason to believe an
+`mcp.`-prefixed definition was raised through the instruction gate before the upgrade, treat it as
+an incident rather than a maintenance task: the approvals are visible through `GET /api/approvals`,
+and the appropriate response depends on what was approved and by whom.
 
-```bash
-sqlite3 /var/lib/yuzu/instructions.db \
-  "SELECT MIN(submitted_at) FROM approvals WHERE origin != '';"
-```
-
-If that returns empty, no declared-origin ticket has been minted yet, so no blank-origin row
-post-dates the upgrade and any cutoff at or after the upgrade works.
-
-**Step 2 — size the population, and capture it.** Do not assume it is small: the REST instruction
-gate never redeems its own approvals, so on a long-lived install these rows accumulate for the life
-of the deployment.
-
-```bash
-sqlite3 /var/lib/yuzu/instructions.db \
-  "SELECT COUNT(*) FROM approvals
-    WHERE status = 'approved' AND consumed_at = 0 AND origin = ''
-      AND definition_id GLOB 'mcp.*'
-      AND submitted_at < <cutoff from step 1>;"
-```
-
-**Capturing the rows themselves is mandatory, not optional.** Step 5 writes no audit row (see the
-note below it), so this output is the only record of which capabilities were revoked and whose they
-were. Take it *immediately* before step 5, with the identical `WHERE` clause, and file it with the
-change record:
-
-```bash
-sqlite3 -header -csv /var/lib/yuzu/instructions.db \
-  "SELECT id, definition_id, submitted_by, submitted_at, reviewed_by, reviewed_at
-     FROM approvals
-    WHERE status = 'approved' AND consumed_at = 0 AND origin = ''
-      AND definition_id GLOB 'mcp.*'
-      AND submitted_at < <cutoff from step 1>;" \
-  > approvals-revoked-$(date +%Y%m%dT%H%M%S).csv
-```
-
-`submitted_by` and `reviewed_by` are the two fields that make the record answerable afterwards:
-they name who loses a capability and which administrator originally granted it. Treat the file as
-sensitive — the `id` column is the approval id, which is a bearer capability for any ticket the
-statement does not in fact retire.
-
-**Step 3 — stop the server**, and confirm it is stopped before continuing.
-
-**Step 4 — take a real backup.** `instructions.db` runs in WAL mode, so a plain `cp` copies the
-main file and silently omits any committed transactions still in `instructions.db-wal` — which is
-exactly what a prior unclean shutdown leaves behind. Use SQLite's own backup, which is WAL-aware:
-
-```bash
-sqlite3 /var/lib/yuzu/instructions.db ".backup /var/lib/yuzu/instructions.db.pre-2442"
-```
-
-**This backup is not scoped to approvals.** `instructions.db` also holds instruction definitions,
-schedules, and execution-tracking state. Restoring it rolls those back too, so treat it as a
-whole-database restore point and not an approvals undo:
-
-```bash
-# To restore: stop the server, remove any stale WAL alongside the live file,
-# then put the backup back. Do NOT copy over a database that still has a -wal.
-rm -f /var/lib/yuzu/instructions.db-wal /var/lib/yuzu/instructions.db-shm
-cp /var/lib/yuzu/instructions.db.pre-2442 /var/lib/yuzu/instructions.db
-```
-
-**Step 5 — retire the tickets.**
-
-```bash
-sqlite3 /var/lib/yuzu/instructions.db \
-  "UPDATE approvals SET status = 'expired'
-    WHERE status = 'approved' AND consumed_at = 0 AND origin = ''
-      AND definition_id GLOB 'mcp.*'
-      AND submitted_at < <cutoff from step 1>;"
-```
-
-**Both extra predicates are load-bearing — do not drop either.**
-
-`definition_id GLOB 'mcp.*'` narrows this to the tickets that could actually be forged. The MCP
-recall only ever looks up `mcp.<tool_name>`, so a blank-surface ticket for any other definition can
-never be redeemed there — it is inert. Without this predicate the statement also expires two
-populations that are not at risk: REST-gate approvals, which are never redeemed at all and simply
-accumulate, and **scheduler approvals, which are live** — expiring one holds that scheduled run
-pending a fresh human approval. On a deployment running only shipped content the correctly narrowed
-count is zero, and that is the honest number.
-
-**The `submitted_at` bound is load-bearing — do not drop it.** A blank surface means *not
-recorded*, and the MCP gate does not record its own surface yet, so **every currently-approved
-MCP ticket also carries `origin = ''`**. Without the time bound this statement revokes those too,
-and re-running it periodically livelocks MCP approvals entirely: mint, human approves, statement
-expires it, recall reports it expired, worker mints again.
-
-Even bounded, this revokes capabilities an administrator granted — anyone holding one of those
-`approval_id`s must request approval again — and because it is a direct database write rather than
-a server operation, the transition writes **no audit row**. In the audit trail the result is
-indistinguishable from the automatic 7-day expiry: same terminal status, no principal, no reason.
-That is why the step 2 capture is mandatory. Attach the CSV to your change record, and record the
-operator and the reason there, because nothing in the product will do it for you. Do it only if you
-have reason to think an `mcp.`-prefixed definition was raised through the instruction gate before
-the upgrade.
-
-Bulk-revoking granted approvals by hand is a gap, not a design: there is no audited server-side
-route for it. Doing this properly means an `Approval:Revoke` operation that emits its own audit row
-with the acting principal and the selection it applied — which would also let this whole SQL section
-be deleted. Tracked as #2761; until it exists, the change record is the evidence.
+Bulk-revoking granted approvals is a gap, not a design. Doing it properly means an
+`Approval:Revoke` operation that emits its own audit row with the acting principal and the
+selection it applied — tracked as #2761, which is also what would let a procedure like this be
+published safely.
 
 **What changes.** Creating a definition whose id starts `mcp.` is refused with a 400 on every
 authoring route that accepts an explicit id — `POST /api/instructions`, `POST
