@@ -2609,7 +2609,8 @@ TEST_CASE("McpPostPump: a throwing credit step still closes kCompleted, not inte
     auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
     auto take = [](bool /*cap*/) {
         mcp::McpStreamBridge::PostBatch out;
-        out.final_frame = R"({"jsonrpc":"2.0","id":1,"result":{"status":"completed"}})";
+        out.final_frame = mcp::McpStreamBridge::PostBatch::PostFrame{
+            R"({"jsonrpc":"2.0","id":1,"result":{"status":"completed"}})", 0};
         return out;
     };
     auto throwing_credit = [] { throw std::runtime_error("lock acquisition failed"); };
@@ -2634,7 +2635,8 @@ TEST_CASE("McpPostPump: the credit step's own success path is unaffected by the 
     auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
     auto take = [](bool /*cap*/) {
         mcp::McpStreamBridge::PostBatch out;
-        out.final_frame = R"({"jsonrpc":"2.0","id":1,"result":{"status":"completed"}})";
+        out.final_frame = mcp::McpStreamBridge::PostBatch::PostFrame{
+            R"({"jsonrpc":"2.0","id":1,"result":{"status":"completed"}})", 0};
         return out;
     };
     bool credited = false;
@@ -2759,7 +2761,7 @@ TEST_CASE("bridge take_post_batch - ring-commits and hands the same frames to th
         // The projector must NOT drain a kStreaming record - it is pump-owned.
         auto batch = poll_batch(*fx.bridge, *key);
         REQUIRE(batch.progress.size() == 1);
-        CHECK(batch.progress[0].find("notifications/progress") != std::string::npos);
+        CHECK(batch.progress[0].data.find("notifications/progress") != std::string::npos);
         CHECK_FALSE(batch.final_frame.has_value());
         // ...and the same frame is replayable.
         CHECK(count_method(ring_frames(*s.stream, "alice"), "notifications/progress") == 1);
@@ -2771,7 +2773,7 @@ TEST_CASE("bridge take_post_batch - ring-commits and hands the same frames to th
             batch = fx.bridge->take_post_batch(*key, /*cap_expired=*/false);
             return batch.final_frame.has_value();
         }));
-        auto j = json::parse(*batch.final_frame, nullptr, /*allow_exceptions=*/false);
+        auto j = json::parse(batch.final_frame->data, nullptr, /*allow_exceptions=*/false);
         REQUIRE(j.is_object());
         CHECK(j["result"]["status"] == "completed");
         CHECK(j["result"]["execution_id"] == "exec-tb");
@@ -2819,7 +2821,7 @@ TEST_CASE("bridge take_post_batch - a terminal beats an expired cap (C7)",
             return batch.final_frame.has_value();
         }));
         CHECK_FALSE(batch.cap_settled);  // NOT a cap close - deliver the result
-        auto j = json::parse(*batch.final_frame, nullptr, /*allow_exceptions=*/false);
+        auto j = json::parse(batch.final_frame->data, nullptr, /*allow_exceptions=*/false);
         CHECK(j["result"]["status"] == "completed");
     }
 }
@@ -2878,7 +2880,7 @@ TEST_CASE("bridge take_post_batch - an expired cap settles one drain pass later,
         // stranded in a record about to settle kDone; the pump writes progress
         // first and the final last, preserving progress-before-final ordering.
         REQUIRE(fin.progress.size() == 1);
-        CHECK(fin.progress[0].find("notifications/progress") != std::string::npos);
+        CHECK(fin.progress[0].data.find("notifications/progress") != std::string::npos);
     }
 
     SECTION("the drain pass pokes the bound sink - the settle pass needs no "
@@ -2894,6 +2896,56 @@ TEST_CASE("bridge take_post_batch - an expired cap settles one drain pass later,
         REQUIRE(drain.progress.size() == 1);
         CHECK(sink->poked.load(std::memory_order_acquire));
     }
+}
+
+TEST_CASE("McpPostPump: wire frames carry the replay-ring event id (#2785)",
+          "[mcp][bridge][2f]") {
+    // The replay ring commits every streamed-POST frame under a real,
+    // monotonically-increasing event id - but until this fix the pump wrote
+    // every frame with the 2-arg SseEvent (id 0, "no id"), so a client that
+    // only ever saw the POST connection had no id to hand back as
+    // `Last-Event-ID` and the documented resume contract was unreachable from
+    // this surface. Asserted against the WIRE TEXT and the ring only, so this
+    // test compiles unchanged on the unfixed tree - where it fails.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-wireid"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); }, {}, {}, {},
+        fast_post_cfg(), {}, nullptr, "cid-wireid", "exec-wireid");
+
+    PostWire wire;
+    fx.bus.publish("exec-wireid", "execution-progress", prog(1, 3));
+    REQUIRE(poll_until([&] {
+        return pump.pump_once(wire.writer()) && wire.contains("notifications/progress");
+    }));
+    fx.bus.publish("exec-wireid", "execution-completed", kCompleted);
+    REQUIRE(poll_until([&] { return !pump.pump_once(wire.writer()); }));
+    REQUIRE(wire.contains(R"("status":"completed")"));
+
+    // Every ring-committed progress/result frame's id must appear as an SSE
+    // `id:` line on the POST wire - the ring id is the only resume cursor a
+    // POST-only client can ever learn. (Heartbeats carry none by design.)
+    auto frames = ring_frames(*s.stream, "alice");
+    std::size_t matched = 0;
+    for (const auto& f : frames) {
+        auto j = json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+        const bool relevant = j.is_object() && (j.value("method", "") == "notifications/progress" ||
+                                                j.contains("result"));
+        if (!relevant) {
+            continue;
+        }
+        REQUIRE(f.id != 0);
+        CHECK(wire.contains("id: " + std::to_string(f.id) + "\n"));
+        ++matched;
+    }
+    CHECK(matched >= 2);  // at least the one progress frame and the final
 }
 
 TEST_CASE("bridge bind_post_sink - gates on kStreaming and hands off latched work (C7)",

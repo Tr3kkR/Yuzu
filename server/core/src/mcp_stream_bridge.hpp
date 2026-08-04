@@ -495,8 +495,19 @@ public:
     /// have ALREADY been committed to the session ring (for GET resume) by the
     /// time this returns - the ring is the durable copy, this is the live one.
     struct PostBatch {
-        std::vector<std::string> progress;       ///< write in order, oldest first
-        std::optional<std::string> final_frame;  ///< write LAST, then EOF
+        /// One wire frame plus the replay-ring event id it was committed under
+        /// (#2785). The id rides the SSE `id:` line so a client that only ever
+        /// saw the POST connection can hand it back as `Last-Event-ID` on a GET
+        /// resume - without it the documented resume contract is unreachable
+        /// from this surface. 0 = no ring counterpart (a poisoned or pinless
+        /// final); format_sse omits the `id:` line for 0 rather than minting a
+        /// cursor that would resume onto nothing.
+        struct PostFrame {
+            std::string data;
+            std::uint64_t event_id = 0;
+        };
+        std::vector<PostFrame> progress;        ///< write in order, oldest first
+        std::optional<PostFrame> final_frame;   ///< write LAST, then EOF
         /// Another claimant held the projection claim; nothing was taken and
         /// nothing is owed. The pump retries on its next tick.
         bool deferred = false;

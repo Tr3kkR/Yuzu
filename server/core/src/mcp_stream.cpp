@@ -1500,7 +1500,11 @@ bool McpPostPump::pump_once_impl(const WriteFn& write) {
     }
 
     for (const auto& frame : batch.progress) {
-        if (!write_all(write, sse_bus::format_sse(sse_bus::SseEvent{"message", frame}))) {
+        // #2785: the replay-ring event id rides the SSE `id:` line (3-arg
+        // SseEvent; format_sse omits the line for 0) so a POST-only client can
+        // build a `Last-Event-ID` resume cursor from the frames it actually saw.
+        if (!write_all(write, sse_bus::format_sse(
+                                  sse_bus::SseEvent{"message", frame.data, frame.event_id}))) {
             return finish(write, McpStreamClose::kClientGone);
         }
     }
@@ -1509,8 +1513,9 @@ bool McpPostPump::pump_once_impl(const WriteFn& write) {
         // The final goes LAST and is followed by EOF - the spec's
         // progress-before-response ordering, which the 3a GET-after-response
         // shape could not provide.
-        if (!write_all(write, sse_bus::format_sse(
-                                  sse_bus::SseEvent{"message", *batch.final_frame}))) {
+        if (!write_all(write,
+                       sse_bus::format_sse(sse_bus::SseEvent{"message", batch.final_frame->data,
+                                                             batch.final_frame->event_id}))) {
             return finish(write, McpStreamClose::kClientGone);
         }
         if (on_final_written_) {

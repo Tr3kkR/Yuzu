@@ -1323,7 +1323,7 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
                     // can never fill - and the watermark above deliberately did
                     // not advance for it either.
                     try {
-                        out->progress.push_back(std::move(frame));
+                        out->progress.push_back(PostBatch::PostFrame{std::move(frame), id});
                     } catch (...) {  // NOLINT(bugprone-empty-catch)
                         // The ring copy is durable; losing the live copy costs
                         // this client a frame it can still fetch by resume.
@@ -1382,9 +1382,17 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
         // clears and the pump retries - nothing has been committed or delivered
         // twice. Doing it after the publish would risk a ring commit the pump
         // never learns about.
-        out->final_frame = frame;
+        out->final_frame = PostBatch::PostFrame{frame, 0};
     }
     const auto fid = publish_terminal_ladder(rec, std::move(frame)).id;
+    if (out != nullptr && out->final_frame.has_value()) {
+        // #2785: the ring id exists only now, after the ladder committed the
+        // frame - stamped in place rather than moving the copy below the
+        // publish, which would re-open the restore-safety hole the comment
+        // above closes. Stays 0 on a poisoned/pinless settle: that final has no
+        // ring counterpart to resume from, so the wire honestly carries no id.
+        out->final_frame->event_id = fid;
+    }
     // Settle IMMEDIATELY after the commit/poison decision (C4): no later
     // bookkeeping failure may restore + republish.
     guard.terminal_settled = true;
