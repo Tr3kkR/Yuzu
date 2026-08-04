@@ -12516,6 +12516,22 @@ private:
                 const auto classified = capability_registry_.classify(plugin, action);
                 if (!classified)
                     return false;
+                // BR-003 (branch review): a schedule is OPERATOR-authored but
+                // fires through `command_dispatch_fn`, which dispatches as
+                // `DispatchCaller{.system = true}`. The chokepoint's
+                // system_reserved guard (agent_registry.hpp) only refuses
+                // NON-system callers, so without this check a schedule is a
+                // confused deputy: an operator who may not dispatch
+                // `tar.fleet_snapshot` directly could schedule it — the
+                // definition ships operator-referencable
+                // (content/definitions/tar.yaml, `crossplatform.tar.fleet_snapshot`)
+                // — and the fire would reach the fleet under system authority.
+                // Refuse here, where the operator's provenance is still known;
+                // the reserved rows are server-initiated by construction
+                // (server.cpp issues them itself) and have no legitimate
+                // schedule caller.
+                if (classified->system_reserved)
+                    return false;
                 if (!rbac_store_ || !rbac_store_->is_open())
                     return false;
                 if (!rbac_enforcement_in_effect(rbac_store_.get()))

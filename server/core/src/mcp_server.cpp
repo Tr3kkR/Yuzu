@@ -7536,6 +7536,32 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // BR-005 (branch review): AUDIT BEFORE MUTATING and refuse the
+                // mutation if the row will not persist — the posture this
+                // feature's own REST twin takes via `audit_or_503`
+                // (plugin_config_routes.cpp). p14's contract for a twin is the
+                // SAME audit envelope as its REST sibling, "never weaker", and
+                // mutate-then-report-`audit_persisted:false` IS weaker: with a
+                // degraded audit backend the change commits, the caller sees
+                // success, and no evidence row exists precisely when evidence
+                // matters. The residual gap REST already accepts and documents
+                // — a pre-audited row can rarely describe a mutation that then
+                // fails on a lease timeout or a concurrent-delete race — is
+                // narrow and infrastructure-shaped, not routine.
+                //
+                // Scope: the FIVE plugin-config/secret/kill-switch mutations
+                // this PR introduces. The ~20 pre-existing MCP write tools keep
+                // their mutate-then-disclose posture; changing those is a
+                // separate, separately-reviewed decision.
+                if (!audit_fn(req, "plugin_config.set", "success", "PluginConfig",
+                              plugin + "." + key, "len=" + std::to_string(value.size()))) {
+                    res.set_content(
+                        a4_error(503, "the audit record could not be persisted; the configuration "
+                                      "was NOT changed — retry once the audit store recovers"),
+                        "application/json");
+                    mcp_audit("error");
+                    return;
+                }
                 auto result = plugin_config_store_->set_config(plugin, key, value, session->username);
                 if (!result) {
                     const auto info = plugin_config_error_info(result.error());
@@ -7546,17 +7572,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                const bool audit_ok =
-                    audit_fn(req, "plugin_config.set", "success", "PluginConfig", plugin + "." + key,
-                            "len=" + std::to_string(value.size()));
                 JObj payload;
                 payload.add("plugin", result->plugin)
                     .add("key", result->key)
                     .add("value", result->value)
                     .add("updated_at_ms", result->updated_at_ms)
                     .add("updated_by", result->updated_by);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -7587,6 +7608,17 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // BR-005: audit before mutating, refuse on failure — see
+                // set_plugin_config above for the full rationale.
+                if (!audit_fn(req, "plugin_config.delete", "success", "PluginConfig",
+                              plugin + "." + key, "deleted")) {
+                    res.set_content(
+                        a4_error(503, "the audit record could not be persisted; the configuration "
+                                      "was NOT deleted — retry once the audit store recovers"),
+                        "application/json");
+                    mcp_audit("error");
+                    return;
+                }
                 auto result = plugin_config_store_->delete_config(plugin, key);
                 if (!result) {
                     const auto info = plugin_config_error_info(result.error());
@@ -7597,12 +7629,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                const bool audit_ok = audit_fn(req, "plugin_config.delete", "success", "PluginConfig",
-                                              plugin + "." + key, "deleted");
                 JObj payload;
                 payload.add("deleted", true);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -7639,6 +7667,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 // no parameter through which `value` could reach the audit
                 // detail.
                 const std::string detail_str = plugin_config::redact_secret_for_audit(*pk);
+                // BR-005: audit before mutating, refuse on failure — see
+                // set_plugin_config above. `detail_str` is already redacted.
+                if (!audit_fn(req, "plugin_secret.set", "success", "PluginSecret",
+                              plugin + "." + key, detail_str)) {
+                    res.set_content(
+                        a4_error(503, "the audit record could not be persisted; the secret was NOT "
+                                      "changed — retry once the audit store recovers"),
+                        "application/json");
+                    mcp_audit("error");
+                    return;
+                }
                 auto result = plugin_config_store_->set_secret(plugin, key, value, session->username);
                 if (!result) {
                     const auto info = plugin_config_error_info(result.error());
@@ -7649,15 +7688,11 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                const bool audit_ok = audit_fn(req, "plugin_secret.set", "success", "PluginSecret",
-                                              plugin + "." + key, detail_str);
                 JObj payload;
                 payload.add("plugin", result->plugin)
                     .add("key", result->key)
                     .add("updated_at_ms", result->updated_at_ms)
                     .add("updated_by", result->updated_by);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -7688,6 +7723,17 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // BR-005: audit before mutating, refuse on failure — see
+                // set_plugin_config above.
+                if (!audit_fn(req, "plugin_secret.delete", "success", "PluginSecret",
+                              plugin + "." + key, "deleted")) {
+                    res.set_content(
+                        a4_error(503, "the audit record could not be persisted; the secret was NOT "
+                                      "deleted — retry once the audit store recovers"),
+                        "application/json");
+                    mcp_audit("error");
+                    return;
+                }
                 auto result = plugin_config_store_->delete_secret(plugin, key);
                 if (!result) {
                     const auto info = plugin_config_error_info(result.error());
@@ -7698,12 +7744,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                const bool audit_ok = audit_fn(req, "plugin_secret.delete", "success", "PluginSecret",
-                                              plugin + "." + key, "deleted");
                 JObj payload;
                 payload.add("deleted", true);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -7783,6 +7825,21 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // BR-005: audit before mutating, refuse on failure — see
+                // set_plugin_config above. A kill-switch flip is the most
+                // consequential of the five: it disables a capability
+                // fleet-wide, which is exactly what an incident review needs
+                // evidence of and cannot reconstruct afterwards.
+                const std::string target_id = action.empty() ? plugin : plugin + "." + action;
+                if (!audit_fn(req, "plugin_config.kill_switch.set", "success", "PluginConfig",
+                              target_id, std::string("enabled=") + (enabled ? "true" : "false"))) {
+                    res.set_content(
+                        a4_error(503, "the audit record could not be persisted; the kill switch was "
+                                      "NOT changed — retry once the audit store recovers"),
+                        "application/json");
+                    mcp_audit("error");
+                    return;
+                }
                 auto result = plugin_config_store_->set_kill_switch(plugin, action, enabled, reason,
                                                                     session->username);
                 if (!result) {
@@ -7794,10 +7851,6 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                const std::string target_id = action.empty() ? plugin : plugin + "." + action;
-                const bool audit_ok =
-                    audit_fn(req, "plugin_config.kill_switch.set", "success", "PluginConfig",
-                            target_id, std::string("enabled=") + (enabled ? "true" : "false"));
                 JObj payload;
                 payload.add("plugin", result->plugin)
                     .add("action", result->action)
@@ -7805,8 +7858,6 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("reason", result->reason)
                     .add("set_by", result->set_by)
                     .add("updated_at_ms", result->updated_at_ms);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
