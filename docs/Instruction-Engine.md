@@ -14,7 +14,7 @@
 - **Phase 1** data infrastructure complete — `ResponseStore` (SQLite, TTL-based cleanup, query with filtering/pagination, **aggregation engine** with GROUP BY + COUNT/SUM/AVG/MIN/MAX), `AuditStore` (structured events with principal/action/target/result), `TagStore` (agent-synced and server-set tags, validation), `ScopeEngine` (494 LOC recursive-descent parser, 9 operators, AND/OR/NOT combinators, wildcard LIKE, case-insensitive matching), **data export** (CSV/JSON export with RFC 4180 compliance, generic JSON-to-CSV conversion). All in `server/core/src/`.
 - **Phase 2** implemented — `InstructionStore` (full CRUD with YAML source storage, parameter/result schema fields, JSON import/export, InstructionSet CRUD with cascade delete), `ExecutionTracker` (create/query/get executions, per-agent status tracking with UPSERT, aggregate count refresh, auto-status transitions, rerun with failed-only targeting, cancel), `ApprovalManager` (submit/approve/reject with ownership validation — reviewer != submitter, pending count), `ScheduleEngine` (CRUD with frequency validation, evaluate_due for firing, advance_schedule with per-type next-execution computation). All methods backed by SQLite with WAL mode.
 - **30 plugins** across `agents/plugins/`: 24 cross-platform, 4 Windows-only (`bitlocker`, `msi_packages`, `sccm`, `windows_updates`), 2 test/debug (`chargen`, `example`).
-- **Plugin ABI** v1 stable: `YuzuPluginDescriptor` with `abi_version`, `name`, `version`, `description`, `actions[]`, `init`, `shutdown`, `execute`.
+- **Plugin ABI** at v4 (`YUZU_PLUGIN_ABI_VERSION`), minimum supported v1 (`YUZU_PLUGIN_ABI_VERSION_MIN`): `YuzuPluginDescriptor` with `abi_version`, `name`, `version`, `description`, `actions[]`, `init`, `shutdown`, `execute`, plus the ABI4 per-OS `YuzuActionDescriptor` capability-matrix fields (append-only; see `sdk/README.md`'s ABI compatibility table and §14.3 below).
 - **Wire protocol**: gRPC/Protobuf — `CommandRequest` (plugin + action + parameters + expires_at), `CommandResponse` (status enum: RUNNING/SUCCESS/FAILURE/TIMEOUT/REJECTED, streaming output).
 - **Scope DSL grammar**: `expr → or_expr → and_expr → not_expr → primary → condition`. Operators: `==`, `!=`, `LIKE`, `<`, `>`, `<=`, `>=`, `IN`, `CONTAINS`. Max nesting depth 10.
 - **Dashboard** — HTMX-based instruction management page (`instruction_ui.cpp`) with tabs for Definitions, Executions, Schedules, Approvals. All load fragments via `hx-get`.
@@ -1056,13 +1056,12 @@ This is already the current behavior — the instruction engine formalizes it.
 
 ### 14.3 Plugin ABI Evolution
 
-The plugin ABI (`plugin.h`) uses a single `abi_version` field (currently `YUZU_PLUGIN_ABI_VERSION = 1`).
+The plugin ABI (`plugin.h`) uses a single `abi_version` field, currently `YUZU_PLUGIN_ABI_VERSION = 4` with a minimum supported version `YUZU_PLUGIN_ABI_VERSION_MIN = 1` (ABI4 landed the per-OS `YuzuActionDescriptor` capability-matrix fields for #2204). See `sdk/README.md`'s ABI compatibility table for what each version added and whether it required a rebuild.
 
 **Rules:**
-- `YuzuPluginDescriptor` can only grow by appending new fields after `execute`
-- ABI version 1 plugins work with any agent that supports version 1
-- When ABI version 2 arrives, agents check `abi_version_range` (a new field) to determine compatibility
-- Plugins are never broken by agent upgrades — the agent checks `abi_version` at load time
+- `YuzuPluginDescriptor` can only grow by appending new fields after the previous version's last field — never reordered or repurposed
+- A plugin's `abi_version` must fall inside the closed range `[YUZU_PLUGIN_ABI_VERSION_MIN, YUZU_PLUGIN_ABI_VERSION]`; the agent rejects it at load time otherwise (`plugin_loader.cpp`) — this covers both an older plugin the host has since dropped support for, and a newer plugin declaring an `abi_version` the host doesn't understand yet
+- Plugins are never broken by agent upgrades within the supported range — the agent checks `abi_version` at load time, before the plugin's `yuzu_plugin_descriptor()` return value is otherwise trusted
 
 ### 14.4 Mixed-Version Fleet
 

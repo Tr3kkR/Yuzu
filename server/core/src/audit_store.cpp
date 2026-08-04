@@ -1,5 +1,9 @@
 #include "audit_store.hpp"
 #include "migration_runner.hpp"
+// A zero-dependency leaf holding the secret-key predicate + placeholder. Deliberately
+// NOT runtime_config_store.hpp: the evidence store has no business depending on a
+// domain store (or, transitively, on nlohmann) to answer "is this key a credential".
+#include "config_secret_keys.hpp"
 #include "sqlite_raii.hpp"
 
 #include <spdlog/spdlog.h>
@@ -113,6 +117,9 @@ void AuditStore::create_tables() {
         // both mean "there is durable state and we could not use it", which the
         // first pass must report rather than treat as a clean slate.
         loaded_meta_unusable_ = (r.error() != MetaReadError::Absent);
+        // No usable reading of ANY kind, however it went missing: this process
+        // has no comparison point until a pass actually reaches a verdict.
+        bootstrap_pending_ = true;
         if (r.error() == MetaReadError::Malformed)
             spdlog::error("AuditStore: the stored retention clock reading is not an integer; "
                           "treating it as a clock anomaly and re-anchoring on the next pass");
@@ -431,7 +438,10 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_
         e.action = col_text(4);
         e.target_type = col_text(5);
         e.target_id = col_text(6);
-        e.detail = col_text(7);
+        // Sanitised at the single point where a stored row becomes a value a caller
+        // can hold, so every reader is covered by
+        // construction rather than by each reader remembering to call it.
+        e.detail = sanitized_detail(e.target_type, e.target_id, col_text(7));
         e.source_ip = col_text(8);
         e.user_agent = col_text(9);
         e.session_id = col_text(10);
@@ -456,6 +466,36 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_
         }
     }
     return results;
+}
+
+std::string AuditStore::sanitized_detail(std::string_view target_type, std::string_view target_id,
+                                         std::string detail) {
+    // Keyed on the TARGET (a runtime-config row naming a secret key), not on one
+    // writer's action string. `config.update` is the only such writer today, but
+    // keying on it would leave a future writer -- a settings handler recording the
+    // same key under its own verb -- outside the rule, and nothing would fail.
+    // Still narrow: a blanket "redact anything that looks secret" across every audit
+    // detail would gut the evidence value of the log, which is what this store is for.
+    if (target_type != "RuntimeConfig" || !is_secret_config_key(target_id))
+        return detail;
+    if (detail.empty())
+        return detail;
+
+    // ONLY the exact shape today's writer emits -- a detail that STARTS `value=` --
+    // keeps its `value=` label. Anything else is replaced wholesale.
+    //
+    // An earlier revision preserved `detail.substr(0, pos)` for a `value=` found at
+    // ANY offset, to keep a future writer's surrounding context. Two reviewers
+    // independently rejected that, and both were right: a writer that placed the
+    // credential BEFORE a `value=` token would have had it preserved verbatim, and
+    // the comment promising that context is kept held only for one token ordering
+    // that nothing enforces. No writer of either shape exists today, so this gives
+    // up nothing real and removes a trap that fires the moment someone trusts the
+    // comment. If a future writer needs context to survive, give `detail` structure
+    // (named JSON fields) rather than adding a second string-surgery rule.
+    if (detail.rfind("value=", 0) == 0)
+        return "value=" + std::string(kRedactedPlaceholder);
+    return std::string(kRedactedPlaceholder);
 }
 
 std::size_t AuditStore::total_count() const {
@@ -551,6 +591,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         None,
         ProbeFailed,
         DeclineFirstPass,
+        DeclineNoAnchor,
         DeclineWipe,
         DeclineStep,
         DeclineImplausible,
@@ -757,13 +798,20 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             emit_window = kAuditMinBigStepSec;
             emit_full_wipe = would_wipe;
 
-            // `cleanup_once` is the ONLY caller of `classify`; the rule lives in its
-            // own header so it can be pinned exhaustively (all 16 inputs) without a
-            // database, not because anything else consumes it.
+            // The rule lives in its own header so it can be pinned exhaustively (all
+            // 32 inputs) without a database. It has a SECOND consumer --
+            // `ResultSetStore::gc_sweep` (#2496) -- so a change here is a change
+            // there: check that site before touching the fact set or the enum.
+            // (This comment used to claim `cleanup_once` was the only caller, which
+            // is how #2579's enum insertion nearly missed the other one.)
             const audit_retention::Facts facts{.has_expired = *has_expired,
                                                .would_wipe = would_wipe,
                                                .big_step = big_step,
-                                               .prev_unusable = prev_unusable};
+                                               .prev_unusable = prev_unusable,
+                                               // NOT `!prev_pass_now`: the anchor is rewritten
+                                               // before the probes, so deriving it there lets a
+                                               // verdict-less pass disarm the trigger (#2579).
+                                               .no_anchor = bootstrap_pending_};
             const audit_retention::Anomaly a = audit_retention::classify(facts);
             // Consumed HERE, unconditionally, at exactly one site: this pass has
             // folded it into the verdict. The durable row was re-anchored above,
@@ -771,6 +819,9 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             // clear sites is what produced both the cleared-too-early and the
             // cleared-too-late defects.
             loaded_meta_unusable_ = false;
+            // Same site, same reason: this pass reached a verdict, so the
+            // bootstrap question has now been ANSWERED rather than skipped.
+            bootstrap_pending_ = false;
 
             // ONE rule for the whole guard: report an anomaly when it is not the
             // one already being reported, and stand down when it is gone. This
@@ -793,7 +844,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             // unless the clock actually moved again.
             //
             // Deduplication compares the whole FACT SET, not the classified
-            // enum. `classify` collapses four facts onto one value, so an enum
+            // enum. `classify` collapses five facts onto one value, so an enum
             // comparison cannot see a new condition arriving underneath a
             // reported one: a `Wipe` appearing under a standing `BadState`
             // classifies as `BadState` both times, matches, and is silently
@@ -804,7 +855,16 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                                   (a == audit_retention::Anomaly::BadState && clock_event);
             if (a != audit_retention::Anomaly::None &&
                 (is_event || !last_reported_ || *last_reported_ != facts)) {
-                clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
+                // Two counters, because they make two different claims. Only the
+                // bootstrap decline can say "nothing can be ruled out yet"; every
+                // other trigger here is asserting something positive about the
+                // clock or the stored state (#2579). The dedup and decline
+                // behaviour below is identical either way -- this chooses the
+                // signal, not the verdict.
+                if (a == audit_retention::Anomaly::NoAnchor)
+                    bootstrap_declines_.fetch_add(1, std::memory_order_relaxed);
+                else
+                    clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
                 // NOT unobservable for `Step`, which an earlier comment here
                 // claimed. Being event-exempt means this write cannot cause
                 // SUPPRESSION -- that is all that proof established. It does
@@ -824,6 +884,9 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                     break;
                 case audit_retention::Anomaly::Wipe:
                     emit = prev_pass_now ? Emit::DeclineWipe : Emit::DeclineFirstPass;
+                    break;
+                case audit_retention::Anomaly::NoAnchor:
+                    emit = Emit::DeclineNoAnchor;
                     break;
                 case audit_retention::Anomaly::None:
                     break; // unreachable: guarded above
@@ -902,6 +965,14 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                      "EVERY datable audit row; declining once so a clock anomaly cannot delete "
                      "the audit trail wholesale. (There is no previous reading to compare "
                      "against, so nothing can be said about the clock yet.)");
+        break;
+    case Emit::DeclineNoAnchor:
+        spdlog::warn("AuditStore: there is no stored clock reading to compare against and rows "
+                     "are already expired; declining this pass once, so a clock that was ALREADY "
+                     "wrong before the first guarded pass cannot delete them unremarked. Nothing "
+                     "here says the clock IS wrong -- only that nothing can yet rule it out. The "
+                     "reading is anchored now, so the next pass proceeds normally: if this "
+                     "server's time may be wrong, correct it before then (#2579)");
         break;
     case Emit::DeclineWipe:
         spdlog::warn("AuditStore: this retention pass would expire EVERY datable audit row; "

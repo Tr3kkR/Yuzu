@@ -10,6 +10,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <type_traits>
 
 #include "../../../server/core/src/mcp_session.hpp"
@@ -463,8 +464,18 @@ TEST_CASE("McpStreamState: a cap hit rejects the attach and leaves the ring inta
 
 // ── Pump: heartbeats, revocation, grace window (CH-4) ───────────────────────
 
-TEST_CASE("McpStreamPump: a healthy tick emits queued frames then a heartbeat",
+TEST_CASE("McpStreamPump: a pass that delivers frames sends no redundant heartbeat",
           "[mcp][stream]") {
+    // CONTRACT CHANGE. This pass used to emit a heartbeat alongside the frames. The
+    // heartbeat exists only to stop an intermediary idling a QUIET connection out, and a
+    // pass that just delivered real frames has already proved the connection live - so the
+    // extra frame was filler.
+    //
+    // It became worth removing when re-validation moved onto the tick: every pass used to
+    // pay a contended global-registry acquisition, which accidentally rate-limited this
+    // loop to roughly one pass per tick. Without that throttle a continuously-published
+    // stream re-enters bounded only by the socket write, so an unconditional heartbeat
+    // would multiply wire frames on exactly the busiest streams.
     auto state = std::make_shared<mcp::McpStreamState>();
     state->publish("message", R"({"ok":true})");
     auto attached = state->attach_and_replay(0, nullptr, "alice");
@@ -480,9 +491,188 @@ TEST_CASE("McpStreamPump: a healthy tick emits queued frames then a heartbeat",
     CHECK(wire.contains("id: 1\n"));
     CHECK(wire.contains("event: message\n"));
     CHECK(wire.contains(R"(data: {"ok":true})"));
-    // …and the heartbeat deliberately does not (resuming onto a heartbeat's id
-    // would skip real frames).
+    // …and no heartbeat rides along with it.
+    CHECK_FALSE(wire.contains("event: heartbeat\n"));
+}
+
+TEST_CASE("McpStreamPump: an idle pass still sends the anti-idle heartbeat", "[mcp][stream]") {
+    // The other half of the contract above: with nothing to deliver, the heartbeat is the
+    // only thing keeping an intermediary from idling the connection out, so it must still
+    // go. It deliberately carries no id - resuming onto a heartbeat's id would skip real
+    // frames.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    mcp::McpStreamPump pump{attached.sink, state, attached.generation,
+                            [] { return mcp::StreamRevalidate::kValid; }, [] { return true; },
+                            fast_cfg()};
+    FakeWire wire;
+    CHECK(pump.pump_once(wire.writer()));
+
     CHECK(wire.contains("event: heartbeat\n"));
+    CHECK_FALSE(wire.contains("id: "));
+}
+
+TEST_CASE("McpStreamPump: credential revalidation is once per TICK, not once per wake",
+          "[mcp][stream][tickgate]") {
+    // THE DEFECT. The comment at the revalidate site has always read "Credential
+    // re-validation, once per tick". It was not. The pump's wait predicate wakes on every
+    // PUBLISHED FRAME (a producer notifies under the sink mutex), so a busy stream ran a
+    // full auth-store round trip AND a session-registry `validate_and_touch` per frame.
+    // `validate_and_touch` walks every session under one global registry mutex, so the cost
+    // is O(sessions) per frame, fleet-wide, on the surface agentic workers hammer hardest.
+    //
+    // The tick is the contract (Decision 15(c)/(i), CH-4). The DRAIN must still run on
+    // every wake - that is what makes progress feel immediate - but the two store round
+    // trips belong on the tick, which is what the comment already promised.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    int revalidations = 0;
+    int liveness_checks = 0;
+    auto now = std::chrono::steady_clock::now();
+    mcp::McpStreamPump::Config cfg{};
+    cfg.tick = std::chrono::seconds(30); // long: a second check can only come from the gate
+    mcp::McpStreamPump pump{attached.sink,
+                            state,
+                            attached.generation,
+                            [&] {
+                                ++revalidations;
+                                return mcp::StreamRevalidate::kValid;
+                            },
+                            [&] {
+                                ++liveness_checks;
+                                return true;
+                            },
+                            cfg,
+                            [&] { return now; }};
+    FakeWire wire;
+
+    // Five wakes well inside one tick. Each publish makes the predicate true on arrival,
+    // so the pump never actually sleeps - exactly the busy-stream shape.
+    for (int i = 0; i < 5; ++i) {
+        state->publish("message", "frame-" + std::to_string(i));
+        REQUIRE(pump.pump_once(wire.writer()));
+    }
+    CHECK(revalidations == 0); // pre-fix: 5
+    CHECK(liveness_checks == 0);
+    for (int i = 0; i < 5; ++i) { // ...while every frame still went out immediately
+        CHECK(wire.contains("frame-" + std::to_string(i)));
+    }
+
+    // Cross the boundary and the check fires - the bound is a tick, not a suppression.
+    now += cfg.tick;
+    state->publish("message", "past-the-boundary");
+    REQUIRE(pump.pump_once(wire.writer()));
+    CHECK(revalidations == 1);
+    CHECK(liveness_checks == 1);
+}
+
+TEST_CASE("McpStreamPump: the first pass does not re-validate - next_check_ is seeded, not epoch",
+          "[mcp][stream][tickgate]") {
+    // A default-constructed time_point is the steady_clock EPOCH, so an unseeded
+    // `next_check_` makes the check due on the very FIRST pass: a redundant auth round trip
+    // immediately after attach already authenticated the request, and - worse - a zero wait
+    // budget, turning pass one into an instant no-op. That exact defect shipped on an
+    // earlier attempt at this fix and silently invalidated the test certifying the wake
+    // path, so it gets its own assertion rather than being caught incidentally.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    int revalidations = 0;
+    const auto frozen = std::chrono::steady_clock::now();
+    mcp::McpStreamPump::Config cfg{};
+    cfg.tick = std::chrono::milliseconds(10);
+    mcp::McpStreamPump pump{attached.sink,
+                            state,
+                            attached.generation,
+                            [&] {
+                                ++revalidations;
+                                return mcp::StreamRevalidate::kValid;
+                            },
+                            [] { return true; },
+                            cfg,
+                            [&] { return frozen; }};
+    FakeWire wire;
+    REQUIRE(pump.pump_once(wire.writer()));
+    CHECK(revalidations == 0); // pre-fix (epoch default): 1
+}
+
+TEST_CASE("McpStreamPump: a sub-millisecond remainder waits rather than spinning",
+          "[mcp][stream][tickgate]") {
+    // `ceil`, not `duration_cast`. Flooring a remainder under 1ms to a zero budget makes
+    // wait_for return immediately; the pass then falls through to the heartbeat write and
+    // the caller re-enters, spinning frames at the client until real time crosses the
+    // boundary. A zero-budget wait_for is NOT free - it is a real futex syscall.
+    //
+    // Asserted as a LOWER bound AMPLIFIED over many passes: a single-call floor would be
+    // defeated by a loaded runner inflating the buggy path past the threshold, which is how
+    // a sibling assertion was found to be unfalsifiable. 100 passes are ~100ms when the wait
+    // is honoured and a few ms when it is floored, so load would have to inflate the buggy
+    // path more than tenfold to cross the 50ms floor and produce a false pass (margin
+    // widened from 20 passes / 10ms after two external reviewers judged that thin on a
+    // saturated CI box).
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    auto now = std::chrono::steady_clock::now();
+    const auto base = now;
+    mcp::McpStreamPump::Config cfg{};
+    cfg.tick = std::chrono::seconds(5);
+    mcp::McpStreamPump pump{attached.sink,      state, attached.generation,
+                            {},                 [] { return true; }, cfg,
+                            [&] { return now; }};
+    FakeWire wire;
+
+    // 500us short of the check: ceil rounds the budget up to 1ms, floor would make it 0.
+    now = base + cfg.tick - std::chrono::microseconds(500);
+    const auto started = std::chrono::steady_clock::now();
+    for (int i = 0; i < 100; ++i) {
+        REQUIRE(pump.pump_once(wire.writer()));
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(elapsed >= std::chrono::milliseconds(50)); // ~100ms honoured; a few ms floored
+}
+
+TEST_CASE("McpStreamPump: the wait is bounded by the next check, so the tick cannot stretch",
+          "[mcp][stream][tickgate]") {
+    // The trap that this exact fix fell into once already, on the abandoned branch: gating
+    // the checks on a deadline while still waiting a FRESH FULL TICK from each wake. A wake
+    // arriving just before the boundary then pushed the next check out to nearly TWO ticks,
+    // silently doubling the revocation bound the gate was supposed to preserve.
+    //
+    // Counter-intuitively, frequent wakes are harmless - each re-tests the gate. The bad
+    // case is ONE wake just before the boundary followed by silence, which is what a stream
+    // that emits a burst and then goes quiet does.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    auto now = std::chrono::steady_clock::now();
+    const auto base = now;
+    mcp::McpStreamPump::Config cfg{};
+    cfg.tick = std::chrono::seconds(5); // deliberately long, so the two cases diverge hugely
+    mcp::McpStreamPump pump{attached.sink,      state, attached.generation,
+                            {},                 [] { return true; }, cfg,
+                            [&] { return now; }};
+    FakeWire wire;
+
+    // The ring is empty and nothing has been published, so this pass genuinely sleeps -
+    // no drain pass is needed first. (An earlier version added one on the theory that
+    // `attach_and_replay` leaves replay state queued. It does not: with cursor 0 on an
+    // empty ring it enqueues nothing, so that pass just blocked for a real 5s tick and
+    // added 5 seconds to every run of the suite for no coverage.)
+    //
+    // Freeze 50ms short of the check: the pump must wake FOR it, not restart a full tick.
+    now = base + cfg.tick - std::chrono::milliseconds(50);
+    const auto started = std::chrono::steady_clock::now();
+    REQUIRE(pump.pump_once(wire.writer()));
+    const auto waited = std::chrono::steady_clock::now() - started;
+    CHECK(waited < std::chrono::milliseconds(1500)); // correct ~50ms; unclamped ~5s
 }
 
 TEST_CASE("McpStreamPump/CH-4: a revoked credential kills the stream within one tick",
@@ -711,6 +901,10 @@ TEST_CASE("McpStreamPump/#2367: an authoritative re-confirmation does reset the 
     clock_now += std::chrono::milliseconds(900); // budget nearly spent on cached answers
     CHECK(pump.pump_once(wire.writer()));
 
+    // Cross a tick boundary first: re-validation is once per TICK, so a second pass at the
+    // SAME instant correctly does not ask the store again. Without this the re-confirmation
+    // below never happens and the budget is never reset.
+    clock_now += fast_cfg().tick;
     verdict = mcp::StreamRevalidate::kValid; // the store was actually asked
     CHECK(pump.pump_once(wire.writer()));
 
@@ -1375,6 +1569,73 @@ TEST_CASE("McpStreamState: a pinned final survives a full ring wrap (CH-2, Decis
     CHECK(attached.sink->sse->queue.front().data == "FINAL");
 }
 
+TEST_CASE("McpStreamState: pin slots are a bounded LRU, not first-come-permanent",
+          "[mcp][stream][pins]") {
+    // WHAT THIS PINS. Exhausting the four pin slots means admission accounting has already
+    // drifted - `publish_final` runs only for a kRingOnly record, and the bridge admits
+    // streamed records against `pinned_count() + unpinned` with the array sized to exactly
+    // that cap. So this is the DEGRADED path, not an ordinary one.
+    //
+    // The old fallback sacrificed the wrong frame: it committed the NEWEST terminal
+    // unpinned. A pin exists so a terminal survives a ring wrap and a late resume can
+    // recover it (Decision 15(f)) - worth most for the newest result, least for the oldest,
+    // which by then has almost certainly been consumed. Leaving the newest evictable meant
+    // the request most likely still waiting for its answer was the one left unprotected.
+    //
+    // The slots now degrade as an LRU: oldest yields to newest.
+    mcp::McpStreamState state{/*ring_cap=*/64};
+    std::vector<std::uint64_t> ids;
+    for (int i = 0; i < 6; ++i) {
+        ids.push_back(state.publish_final("message", "FINAL-" + std::to_string(i)));
+    }
+    REQUIRE(ids.size() == 6);
+
+    // Still exactly four slots - this is a bound, not a leak.
+    CHECK(state.pinned_count() == 4);
+    // The two OLDEST yielded...
+    CHECK_FALSE(state.is_pinned(ids[0]));
+    CHECK_FALSE(state.is_pinned(ids[1]));
+    // ...so that the four most recent are the ones a resume can still recover.
+    CHECK(state.is_pinned(ids[2]));
+    CHECK(state.is_pinned(ids[3]));
+    CHECK(state.is_pinned(ids[4]));
+    CHECK(state.is_pinned(ids[5]));
+}
+
+TEST_CASE("McpStreamState: the newest terminal survives a wrap even past the slot count",
+          "[mcp][stream][pins]") {
+    // The consequence that actually reaches a client once the slots have been exhausted.
+    // Pre-fix the 5th and later terminals were evictable, so a late resume could lose the
+    // very result it asked for while the session's FIRST four - long since consumed -
+    // stayed protected.
+    mcp::McpStreamState state{/*ring_cap=*/5};
+    std::vector<std::uint64_t> ids;
+    for (int i = 0; i < 6; ++i) {
+        ids.push_back(state.publish_final("message", "FINAL-" + std::to_string(i)));
+    }
+    for (int i = 0; i < 20; ++i) {
+        state.publish("message", "flood-" + std::to_string(i)); // wraps the 5-frame ring 4x
+    }
+    CHECK(state.is_pinned(ids[5])); // the newest terminal is still recoverable
+
+    auto attached = state.attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+    std::lock_guard<std::mutex> lk(attached.sink->sse->mu);
+    REQUIRE(!attached.sink->sse->queue.empty());
+
+    // NOT `queue.front()`: replay is oldest-first, and the oldest SURVIVING frame is now
+    // the oldest still-pinned terminal (FINAL-2), not the newest. What matters is which
+    // terminals a late resume can still be served.
+    const auto has = [&](std::string_view want) {
+        return std::any_of(attached.sink->sse->queue.begin(), attached.sink->sse->queue.end(),
+                           [&](const auto& ev) { return ev.data == want; });
+    };
+    CHECK(has("FINAL-5")); // the newest terminal survived the wrap
+    CHECK(has("FINAL-2")); // ...as did the rest of the retained window
+    CHECK_FALSE(has("FINAL-0")); // displaced, then evicted by the flood - the bounded cost
+    CHECK_FALSE(has("FINAL-1"));
+}
+
 TEST_CASE("McpStreamState: publish_ring_only commits to the ring but not the live sink",
           "[mcp][stream]") {
     // A streamed POST's frames ride the POST stream; publishing them onto a concurrent live
@@ -1471,23 +1732,135 @@ TEST_CASE("McpStreamState: a pre-commit publish_final failure writes no pin and 
     CHECK(state.next_event_id() == 1);                  // no id consumed
 }
 
-TEST_CASE("McpStreamState: a final past the pin bound commits unpinned rather than lose it",
-          "[mcp][stream]") {
-    // The pin array is sized to the per-session streamed-request cap; the bridge enforces the
-    // same cap at admission, so this is defence-in-depth. If it is ever hit, the final is kept
-    // (committed, evictable) rather than dropped, and the drift is counted.
+TEST_CASE("McpStreamState: a final past the pin bound displaces the OLDEST pin",
+          "[mcp][stream][pins]") {
+    // REPLACES an earlier test that asserted the overflow final commits UNPINNED. Its
+    // premise - that reaching this state means admission accounting drifted - is CORRECT and
+    // is preserved here; what it got wrong was which frame to sacrifice. Committing the
+    // newest terminal unprotected leaves the request most likely still waiting for its
+    // answer as the evictable one, while the oldest pin, almost certainly consumed already,
+    // keeps its exemption. The slots now degrade as an LRU, and the drift is still reported
+    // (via `pin_displaced_total`, which is alertable) rather than silently absorbed.
     yuzu::MetricsRegistry reg;
     mcp::McpStreamState state{mcp::kMcpRingCapDefault, &reg};
+    std::vector<std::uint64_t> ids;
     for (std::size_t i = 0; i < mcp::kMaxStreamedPostsPerSession; ++i) {
-        REQUIRE(state.publish_final("message", "final") != 0);
+        ids.push_back(state.publish_final("message", "final"));
+        REQUIRE(ids.back() != 0);
     }
     CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession); // slots full
 
     const auto overflow_id = state.publish_final("message", "one-too-many");
-    REQUIRE(overflow_id != 0);                 // committed - never lost
-    CHECK_FALSE(state.is_pinned(overflow_id)); // but not pinned
+    REQUIRE(overflow_id != 0);            // committed - never lost
+    CHECK(state.is_pinned(overflow_id));  // AND protected, which is the point
+    CHECK_FALSE(state.is_pinned(ids[0])); // the oldest yielded its slot
+    CHECK(state.is_pinned(ids[1]));       // the rest of the window is untouched
+    CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession); // still a bound
+
+    // The displacement is ordinary and is counted as such; the old counter stays at zero
+    // because committing a final unprotected is no longer reachable.
+    CHECK(reg.counter("yuzu_mcp_stream_pin_displaced_total").value() == 1.0);
+    CHECK(reg.counter("yuzu_mcp_stream_final_unpinned_total").value() == 0.0);
+}
+
+TEST_CASE("McpStreamState: unpin of a displaced id no-ops - it cannot release the usurper",
+          "[mcp][stream][pins]") {
+    // The bridge holds the DISPLACED request's id until its POST wire settles, and its
+    // normal teardown still calls unpin(displaced_id). unpin matches by ID VALUE across
+    // the slots - never by index - so the stale release must find nothing: the slot that
+    // held the displaced id now protects the newer terminal, and releasing THAT pin on a
+    // stale handle would strip the exemption from exactly the frame the LRU chose to keep.
+    mcp::McpStreamState state;
+    std::vector<std::uint64_t> ids;
+    for (std::size_t i = 0; i < mcp::kMaxStreamedPostsPerSession; ++i) {
+        ids.push_back(state.publish_final("message", "final"));
+    }
+    const auto overflow_id = state.publish_final("message", "one-too-many");
+    REQUIRE_FALSE(state.is_pinned(ids[0])); // displaced by the overflow
+
+    state.unpin(ids[0]); // the stale release the bridge will eventually issue
+    CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession); // nothing released
+    CHECK(state.is_pinned(overflow_id));                             // the usurper kept its slot
+    CHECK(state.is_pinned(ids[1]));
+
+    state.unpin(overflow_id); // a REAL release still works after the stale one no-op'd
+    CHECK_FALSE(state.is_pinned(overflow_id));
+    CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession - 1);
+}
+
+TEST_CASE("McpStreamState/CH-5: a post-commit fault during displacement loses only the count",
+          "[mcp][stream][pins]") {
+    // Compound of the displacement path with the #2366 post-commit containment: the
+    // observability block throws AFTER the frame committed and the older pin was already
+    // destroyed. The containment must hold displacement-shaped state coherent - committed
+    // id returned, usurper pinned, bound intact - with ONLY the drift count lost, and the
+    // loss must not latch: the next displacement, with the registry healthy again, counts.
+    yuzu::MetricsRegistry reg;
+    mcp::McpStreamState state{mcp::kMcpRingCapDefault, &reg};
+    std::vector<std::uint64_t> ids;
+    for (std::size_t i = 0; i < mcp::kMaxStreamedPostsPerSession; ++i) {
+        ids.push_back(state.publish_final("message", "final"));
+    }
+
+    state.inject_publish_fault_for_test(
+        mcp::McpStreamState::PublishFault::kPostCommitObservability);
+    const auto first_overflow = state.publish_final("message", "displaces-under-fault");
+    REQUIRE(first_overflow != 0);          // committed - the fault must not un-commit it
+    CHECK(state.is_pinned(first_overflow)); // displacement itself completed under mu_
+    CHECK_FALSE(state.is_pinned(ids[0]));
     CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession);
-    CHECK(reg.counter("yuzu_mcp_stream_final_unpinned_total").value() == 1.0);
+    // The drift count is the documented casualty (sec-L1: observability must not
+    // un-commit, so the increment dies with the throw).
+    CHECK(reg.counter("yuzu_mcp_stream_pin_displaced_total").value() == 0.0);
+
+    // The loss does not latch: a healthy registry counts the next displacement.
+    const auto second_overflow = state.publish_final("message", "displaces-counted");
+    REQUIRE(second_overflow != 0);
+    CHECK_FALSE(state.is_pinned(ids[1])); // next-oldest yielded this time
+    CHECK(reg.counter("yuzu_mcp_stream_pin_displaced_total").value() == 1.0);
+}
+
+TEST_CASE("McpStreamPump/CH-4: the first pass after a long write stall runs the revalidation",
+          "[mcp][stream][ch4][tickgate]") {
+    // A saturated socket parks the pump inside write_all for up to the 30s write timeout -
+    // passes simply do not happen while it blocks. The tick gate must not turn that stall
+    // into a revalidation hole: the FIRST pass once writes resume finds next_check_ long
+    // overdue and runs the check BEFORE the drain delivers anything, so a credential
+    // revoked during the stall closes the stream ahead of any further frames.
+    auto state = std::make_shared<mcp::McpStreamState>();
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    auto now = std::chrono::steady_clock::now();
+    auto verdict = mcp::StreamRevalidate::kValid;
+    mcp::McpStreamPump::Config cfg{};
+    cfg.tick = std::chrono::seconds(3);
+    mcp::McpStreamPump pump{attached.sink,
+                            state,
+                            attached.generation,
+                            [&] { return verdict; },
+                            [] { return true; },
+                            cfg,
+                            [&] { return now; }};
+    FakeWire wire;
+
+    // A healthy delivering pass first, so the stall starts from the busy-stream shape.
+    state->publish("message", "before-the-stall");
+    REQUIRE(pump.pump_once(wire.writer()));
+    REQUIRE(wire.contains("before-the-stall"));
+
+    // The stall: no passes while the clock crosses several tick boundaries, and the
+    // credential is revoked mid-stall. Frames queue up behind the blocked write.
+    now += cfg.tick * 10; // well past next_check_ - a 30s write timeout is 10 ticks
+    verdict = mcp::StreamRevalidate::kRevoked;
+    state->publish("message", "queued-during-stall");
+
+    // The resumed pass must close revoked WITHOUT delivering what queued during the stall:
+    // the gate runs before the drain, and an overdue check fires on the first opportunity.
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(attached.sink->close_reason.load() == mcp::McpStreamClose::kCredentialRevoked);
+    CHECK(wire.contains(R"("reason":"credential_revoked")"));
+    CHECK_FALSE(wire.contains("queued-during-stall"));
 }
 
 TEST_CASE("McpStreamPump: a parked pump is woken by the producer's drop, not the tick (#2382)",

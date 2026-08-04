@@ -178,6 +178,37 @@ groups:
             failure poisons that session's stream). Results remain durably
             fetchable by execution_id, but the streaming surface is degraded;
             this is an allocation-pressure or stream-state signal worth paging.
+      - alert: YuzuMcpStreamPinDisplaced
+        expr: |
+          rate(yuzu_mcp_stream_pin_displaced_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP replay-ring pin slots exhausted (admission accounting drift)"
+          description: >-
+            yuzu_mcp_stream_pin_displaced_total is moving - a session filled every
+            replay-ring pin slot, which the bridge's admission cap should make
+            unreachable, so admission accounting has drifted. The server degraded
+            gracefully (the oldest pinned terminal yielded its eviction exemption
+            to the newest; the displaced final stays committed and remains
+            fetchable by execution_id). No restart needed - this is a diagnostic
+            signal, not an outage: file a bug with the session's stream metrics.
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement"
+      - alert: YuzuMcpStreamFinalUnpinned
+        expr: |
+          rate(yuzu_mcp_stream_final_unpinned_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP terminal committed with no pin at all (defence-in-depth tripped)"
+          description: >-
+            yuzu_mcp_stream_final_unpinned_total is moving. This is structurally
+            unreachable while the pin array is non-empty (a full slot set displaces
+            its oldest pin instead), so a non-zero value means the pin array was
+            resized to zero or the displacement path was bypassed. The affected
+            terminal is evictable from the replay ring but remains fetchable by
+            execution_id. File a bug; no restart needed.
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement"
       - alert: YuzuMcpBridgeTeardownIncomplete
         expr: |
           sum by (reason) (yuzu_mcp_bridge_teardown_incomplete_total) > 0
@@ -675,6 +706,27 @@ groups:
       # clock moved in a way that WOULD have wiped audit evidence -- an
       # unattended host whose time sync is broken is one guard away from losing
       # its SOC 2 trail.
+      # yuzu_server_audit_retention_bootstrap_declines_total (#2579) is NOT
+      # folded into the rule below, and that is deliberate rather than an
+      # oversight. It has its own rule further down
+      # (YuzuAuditRetentionAnchorNotSurviving) keyed on the value CLIMBING; what
+      # is deliberately unalerted is a SINGLE decline. That counter
+      # marks a pass declined for having NO stored clock reading while rows were
+      # already expired - it asserts only that nothing can yet RULE OUT a wrong
+      # clock, never that the clock moved, so folding it into the rule below
+      # would make this alert's own description untrue and fire it on every
+      # server carrying a backlog through the schema-v3 upgrade. Expect 0 or 1
+      # per database, so a SINGLE decline is not alerted: that is the ordinary
+      # schema-v3 upgrade of a server carrying a backlog.
+      #
+      # A value that keeps CLIMBING is a different thing and IS alerted, below.
+      # An earlier draft of this comment claimed the persist-failure counter
+      # already covered it; that was false and is worth stating so nobody
+      # restores it. The anchor can be destroyed OUT OF BAND - a restore from a
+      # pre-v3 backup, a replica rehydrated from a template, a disk-level
+      # rollback - and in every one of those `store_meta` SUCCEEDS each pass, so
+      # `..._retention_persist_failed_total` stays flat at zero while the anchor
+      # never survives.
       - alert: YuzuAuditRetentionClockAnomaly
         expr: |
           increase(yuzu_server_audit_clock_anomaly_skips_total[1h]) > 0
@@ -793,6 +845,32 @@ groups:
       # The durable clock reading is what makes anomaly detection survive a
       # restart. If it cannot be written, that half of the guard silently
       # degrades to nothing on the next boot.
+      # The climbing case the comment above describes. Threshold follows the
+      # contract, not a guess: the bootstrap decline is expected AT MOST ONCE per
+      # database, so more than one inside a day means the stored reading is not
+      # surviving between passes and the guard is re-bootstrapping instead of
+      # comparing. Deliberately NOT keyed on > 0, which would fire on every
+      # legitimate schema-v3 upgrade.
+      - alert: YuzuAuditRetentionAnchorNotSurviving
+        expr: |
+          increase(yuzu_server_audit_retention_bootstrap_declines_total[24h]) > 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit retention keeps re-bootstrapping - the stored clock reading is not surviving"
+          description: >-
+            The retention guard has declined more than once in a day for having NO stored
+            clock reading. Expect this AT MOST once per database, on the upgrade that adds
+            the reading. Repeating means the anchor is being lost between passes, so the
+            restart-surviving half of the clock guard is not working and each pass starts
+            blind. Nothing has been deleted by these passes. Check
+            yuzu_server_audit_retention_persist_failed_total first - if it is FLAT, the row
+            is being destroyed outside the server (a restore from a pre-v3 backup, a replica
+            rehydrated from a template, a disk-level rollback), which that counter cannot
+            see. Runbook: docs/ops-runbooks/audit-store-clock-guard.md.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/audit-store-clock-guard.md"
+
       - alert: YuzuAuditRetentionStateNotPersisting
         expr: |
           increase(yuzu_server_audit_retention_persist_failed_total[1h]) > 0
@@ -994,6 +1072,56 @@ groups:
             <CVE>") reads as degraded, NOT "installed nowhere" — do not trust a
             zero-result inventory answer while this fires.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuMgmtGroupReadDegraded
+        # A CONFINEMENT-feeding management-group hierarchy read (ancestors /
+        # descendants / agent-groups, ADR-0042) degraded, so the caller failed
+        # closed to DenyAll. This is the confinement substrate itself faulting,
+        # not the fleet shrinking: a fired alert means SCOPED operators see
+        # reduced/empty lists, NOT that groups were deleted. Same dashboard-
+        # invisibility as YuzuInventoryReadDegraded — /readyz stays green under
+        # pure pool saturation, so only the store-specific counter moves.
+        # reason = store_not_open | pool_acquire_timeout | query_error.
+        expr: |
+          sum(rate(yuzu_server_mgmt_group_read_degrade_total[5m])) by (reason) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Management-group confinement reads degrading ({{ $labels.reason }})"
+          description: >-
+            yuzu_server_mgmt_group_read_degrade_total{reason="{{ $labels.reason }}"}
+            is non-zero: a confinement-feeding hierarchy read degraded and the
+            caller failed closed to DenyAll. This is a confinement-substrate
+            degrade — scoped operators now see REDUCED or EMPTY lists, it does
+            NOT mean management groups shrank or devices left the fleet.
+            pool_acquire_timeout/query_error correlate with yuzu_pg_* saturation
+            or outage; store_not_open means the store failed to open at boot. Do
+            not read a scoped operator's short/empty list as authoritative while
+            this fires.
+          runbook_url: "https://docs.yuzu.io/runbooks/management-groups"
+      - alert: YuzuMgmtGroupBackfillFailing
+        # The one-time SQLite->Postgres confinement backfill (ADR-0042) reported
+        # a failed outcome. The server fails closed at boot on a backfill failure
+        # (write error, or an over-deep/cyclic legacy tree) and retries next
+        # start, so a failed sample means the server refused to come up with a
+        # partial/empty confinement hierarchy — an operator must repair or move
+        # aside the legacy management-groups.db before it will boot.
+        expr: |
+          sum(rate(yuzu_server_mgmt_group_backfill_total{result="failed"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Management-group confinement backfill failed (server refused to boot)"
+          description: >-
+            yuzu_server_mgmt_group_backfill_total{result="failed"} advanced: the
+            one-time confinement backfill could not complete (Postgres write
+            error, or an over-deep/cyclic legacy management-groups.db). The server
+            fails closed at boot rather than come up with partial confinement and
+            retries on the next start — repair the legacy tree (flatten below 10
+            levels / break the cycle) or move management-groups.db aside, then
+            restart.
+          runbook_url: "https://docs.yuzu.io/runbooks/management-groups"
       - alert: YuzuInventoryIngestSlow
         # Leading indicator for ingest transaction-hold saturation: full-payload
         # ingests taking >10s. Distinct from the yuzu_pg_acquire_* family, which

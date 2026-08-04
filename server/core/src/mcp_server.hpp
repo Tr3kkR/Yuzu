@@ -5,6 +5,7 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "authz_model.hpp" // #1788: VisibleSet — MCP dispatch confinement (in_scope/filter_to_scope)
 #include "ca_store.hpp"
 #include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
@@ -204,7 +205,20 @@ public:
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,
-        const std::string& execution_id)>;
+        const std::string& execution_id,
+        // #1788: the caller's Execution:Execute visible set (nullopt == unfiltered).
+        // Every dispatch arm intersects against it, mirroring /api/command.
+        const yuzu::server::authz::VisibleSet& exec_visible)>;
+
+    /// #1788: derives the per-request Execution:Execute visible set the DispatchFn
+    /// intersects against. Injected because the handler has the session but the
+    /// dispatch lambda (server.cpp) does not. When this std::function is UNSET,
+    /// the execute_instruction / execute_bundle handlers substitute a PRESENT-EMPTY
+    /// VisibleSet (deny-all), NOT nullopt — an unwired derivation fails CLOSED
+    /// (ADR-0033 §1: a missing applicable filter denies; CDX-R6-02). A caller that
+    /// genuinely wants full-fleet dispatch must wire a callback returning
+    /// std::nullopt; production wires server.cpp's derive_exec_visible.
+    using ExecVisibleFn = std::function<yuzu::server::authz::VisibleSet(const auth::Session&)>;
 
     /// Owner-FK existence check for engine-principal create/transfer-owner
     /// (design doc `docs/auth-engine-principals-design.md` §3.1:
@@ -336,7 +350,14 @@ public:
                             // optional deps; access_review_store == nullptr leaves the
                             // whole access-review tool family answering "unavailable".
                             AccessReviewStore* access_review_store = nullptr,
-                            AuthDB* auth_db = nullptr, DirectorySync* directory_sync = nullptr);
+                            AuthDB* auth_db = nullptr, DirectorySync* directory_sync = nullptr,
+                            // #1788: derives the per-request Execution:Execute visible
+                            // set for the execute_instruction / execute_bundle dispatch
+                            // confinement. Trailing optional, but UNSET fails CLOSED —
+                            // the handlers substitute a present-empty (deny-all) VisibleSet,
+                            // not unfiltered (CDX-R6-02); a test seam wanting full fleet
+                            // wires a callback returning std::nullopt.
+                            ExecVisibleFn exec_visible_fn = {});
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -414,7 +435,10 @@ public:
                              kMcpStreamsPerPrincipalDefault,
                          // Explicit-principal audit sink for mcp.stream.close (see
                          // StreamPrincipalAuditFn). Empty falls back to the generic sink.
-                         StreamPrincipalAuditFn principal_audit_fn = {});
+                         StreamPrincipalAuditFn principal_audit_fn = {},
+                         // #1788: per-request Execution:Execute visible-set deriver,
+                         // forwarded to build_handler for MCP dispatch confinement.
+                         ExecVisibleFn exec_visible_fn = {});
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──

@@ -5,6 +5,15 @@ provides a tamper-evident trail suitable for compliance reporting, incident
 investigation, and forwarding to external SIEM platforms such as Splunk or
 Elastic.
 
+> **Fixed (#2579), and it affected upgrades only.** A retention pass that began
+> with NO stored clock reading declined nothing on its own account, so a host
+> whose clock was ALREADY skewed forward when it first ran the guard could delete
+> expired rows unremarked. Such a pass now declines once, warns, and anchors the
+> reading; the next pass proceeds normally. A correct clock was never at risk, and
+> a fresh install with nothing expired does not decline. If you ran an affected
+> version with a wrong clock, rows deleted then are not recoverable without a
+> backup taken before it. Detail under [Limits](#the-retention-clock-guard).
+
 > **Known issue in v0.9.0 (advisory YZA-2026-001):** audit rows for requests
 > authenticated via `Authorization: Bearer` or `X-Yuzu-Token` (every MCP tool
 > call and every REST automation using an API token) had an empty `principal`
@@ -105,7 +114,7 @@ required.
 | `instruction.execute` | Instruction | An instruction is dispatched to one or more agents |
 | `instruction.approve` | Instruction | An instruction pending approval is approved |
 | `instruction.deny` | Instruction | An instruction pending approval is denied |
-| `instruction.import` | InstructionDefinition | An InstructionDefinition JSON envelope was submitted via `POST /api/instructions/import`. On `result=success`: `target_id` is the new definition's id; `detail` is empty. On `result=denied`: `target_id` is empty (no id assigned on rejection); `detail` carries the store-returned error string, which begins with a stable SIEM-keyable token — known tokens are `duplicate_id` (409 conflict), `signature verification failed for instruction — content may have been tampered with` (#1073 / W7.4), `instruction-import is unsigned and signature enforcement is enabled` (#1073), `instruction-import has incomplete signing metadata` (#1073), `instruction-import has signing field of wrong JSON type` (#1073 R1), `signature length invalid` / `publicKey length invalid` (#1073 R1 DoS amplification guard), `instruction-import has signature + publicKey but no yaml_source` (#1073). Permission gate: `InstructionDefinition:Write`. SOC 2 CC6.7: every import attempt is logged regardless of outcome; if the audit-store write itself fails, the response carries the `Sec-Audit-Failed: true` header AND an `audit_emitted=false` field in the JSON body (PR #883 evidence-chain pattern). |
+| `instruction.import` | InstructionDefinition | An InstructionDefinition JSON envelope was submitted via `POST /api/instructions/import`. On `result=success`: `target_id` is the new definition's id; `detail` is empty. On `result=denied`: `target_id` is empty (no id assigned on rejection); `detail` carries the store-returned error string, which begins with a stable SIEM-keyable token — known tokens are `duplicate_id` (409 conflict), `signature verification failed for instruction — content may have been tampered with` (#1073 / W7.4), `instruction-import is unsigned and signature enforcement is enabled` (#1073), `instruction-import has incomplete signing metadata` (#1073), `instruction-import has signing field of wrong JSON type` (#1073 R1), `signature length invalid` / `publicKey length invalid` (#1073 R1 DoS amplification guard), `instruction-import has signature + publicKey but no yaml_source` (#1073), `definition id may not use the reserved 'mcp.' prefix` (#2442 — the `mcp.` definition-id namespace belongs to MCP approval tickets; note this one is reached AFTER signature verification, so a signed pack is verified first and then refused on the id). Permission gate: `InstructionDefinition:Write`. SOC 2 CC6.7: every import attempt is logged regardless of outcome; if the audit-store write itself fails, the response carries the `Sec-Audit-Failed: true` header AND an `audit_emitted=false` field in the JSON body (PR #883 evidence-chain pattern). |
 | `enrollment.approve` | Agent | A pending agent enrollment is approved |
 | `enrollment.deny` | Agent | A pending agent enrollment is denied |
 | `enrollment.token_create` | EnrollmentToken | An enrollment token is generated |
@@ -180,6 +189,7 @@ required.
 | `inventory.device.software` | Inventory | An operator opened **one device's installed software** (`/inventory` Devices tab → device click). Machine-scope software data, **set-and-proceed** (HTML fragment renders even if the audit row can't persist). `target_id` is `agent=<id>`; `result=success` carries `rows=<n>`, a store degrade emits `result=failure`. Gated **per device** on `Inventory:Read` for that device's management group (`scoped_perm_fn` — the tier + management-group chokepoint), so an operator only reads a device in their scope. |
 | `inventory.devices` | Inventory | An operator opened the `/inventory` **Devices** tab — the device roster (hostnames + agent_ids + OS + online/last-seen), **plus the device-CI columns** (serial, model, CPU cores/threads, RAM) joined onto each row from `DeviceInventoryStore`. Because serial is a device-persistent identifier (GDPR personal data per ADR-0016), this verb is emitted via the **behavioural-PII audit tier** (`Sec-Audit-Failed` header on a persist failure) rather than the lighter machine-scope tier the other `inventory.*` list verbs use. The CI join is confinement-preserving relative to whatever roster the route renders (it only ever looks up an agent ID already present in that roster, so an out-of-scope device's CI is never attached or disclosed — regression-tested); **the roster itself gates on the global `Inventory:Read`, and per-operator management-group confinement of that roster is designed for, not yet verified effective** (ADR-0017 — the same inert-list-scoping class as the `inventory.software.query` Find verb above), not a per-device gate. `target_id` is `fleet`; `result=success` carries `devices=<n> (incl. CI columns: serial/model/cpu/ram)`; `result=failure` carries `devices=<n> (CI store degraded; roster rendered without CI columns)` when the CI-enrichment join degrades on a populated roster, or `devices=0 (device roster or CI store unavailable)` when the rendered roster is empty AND the CI-enrichment join degrades — reachable either from a legitimately empty visible fleet coinciding with a CI-store hiccup, or (practically unreachable, since ADR-0012 fails the server closed at boot) the roster provider itself being down — either way the roster still renders whatever it has, only the audit-fidelity signal changes. Set-and-proceed: the HTML fragment still renders on an audit-persist failure. (Distinct from `inventory.device.software`/`inventory.device.ci`, the per-device drill verbs, which are per-device scoped + audited.) |
 | `inventory.device.ci` | Inventory | An operator opened **one device's CI record** (`/inventory` Devices tab → device click → CI panel: manufacturer, model, serial, system UUID, domain/OU, BIOS, CPU, memory, MAC addresses, NIC count, OS name/version/build, architecture, first/last-synced). Device-persistent identifiers (GDPR personal data per ADR-0016), so this uses the **behavioural-PII audit tier** — same as `dex.device.view`/`tar.dns.read`/`tar.arp.read` — rather than the lighter tier `inventory.device.software` (installed-software content, not a device-persistent identifier) uses. `target_id` is `agent=<id>`; `result=success` carries `detail=found` (a CI record exists) or `detail=absent` (the device hasn't completed its first `device_ci` sync yet — NOT a failure); `result=failure` carries `detail=store degraded` (the store itself could not be read). Gated **per device** on `Inventory:Read` for that device's management group (`scoped_perm_fn`), so an operator only reads a device in their scope. |
+| `config.update` | RuntimeConfig | An operator wrote a runtime-config key via `PUT /api/config/:key` (`Infrastructure:Write`). `target_id` is the key name. For an ordinary key `detail` carries `value=<the new value>` verbatim, so this row is the change-management evidence for what a setting was changed to and by whom. **For a secret-valued key (today `oidc_client_secret`) `detail` never carries the real value** - the write path records `value=<redacted>`, and `AuditStore::query()` additionally redacts the `detail` of any *pre-existing* `config.update` row naming a secret key **on read**, so rows written before that fix shipped no longer disclose the plaintext through `GET /api/v1/audit`, the legacy `GET /api/audit`, or the MCP `query_audit_log` tool (every reader shares the one read path). The stored row on disk is left unchanged - an audit row is evidence, so this redacts what a caller *sees* rather than rewriting history. If you set `oidc_client_secret` before that fix, rotate it: the value was disclosed while it was being recorded in the clear. **Rotating durably takes more than one step, and rotating through Settings alone breaks the next restart** — see [`upgrading.md`](upgrading.md) ("Security: rotate `oidc_client_secret` if it was ever set on this install") for what to remediate, and [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to configure it. The note below about Settings is about where the audit evidence lands, not how to rotate. Note this verb covers the generic config API only; a change made through Settings emits its own verb instead (`settings.dex_alerts.*`, `plugin_signing.require.changed`, and for OIDC `oidc.configure` on `target_type="OidcConfig"` with the ISSUER as `target_id`). **Consequence for rotation evidence:** a Settings-driven OIDC secret rotation is audited as `oidc.configure` and does NOT name `oidc_client_secret` anywhere, so a query for `config.update` + `target_id=oidc_client_secret` finds only rotations done through the generic API. Since Settings is the only path that applies an OIDC change to the running server, expect key-level rotation evidence to be absent for the path operators are told to use. |
 | `settings.dex_alerts.cohort_export` | RuntimeConfig | An admin set or cleared the cohort metrics export tag key via Settings → DEX alerts. `target_id` is `dex_cohort_export_key`; `detail` carries `export_key=<key>` or `export disabled`. The runtime-config store keeps no history, so this row is the change-management evidence for what cohort labels were exported when. |
 | `tar.status.scan` | Infrastructure | An operator clicked **Scan fleet** on the TAR dashboard page (`/tar`). A `tar.status` command was dispatched to the operator's visible-agent set. `detail` carries the count of agents the dispatch reached (e.g. `dispatched to 47 agent(s) in scope`). One row per Scan button press; no row on page-load Refresh. |
 | `tar.source.reenable` | Infrastructure | An operator clicked **Re-enable** on a row of the TAR retention-paused list and a `tar.configure` command with `<source>_enabled=true` was dispatched to a single device. `detail` carries `device=<id> source=<process|tcp|service|user>` on success. Failures emit `result=failure` with `detail` set to the real reason (`scope_violation source=<src>` for out-of-scope device IDs, `agent_not_connected source=<src>` for connected-but-zero-sent dispatches) so SIEM rules can distinguish a forged-form attempt from a transient connectivity issue — even though the HTTP response body is identical (`Agent not reachable.` 404) for both, to deny enumeration. |
@@ -490,6 +500,42 @@ fix --- not hand-deletion.
 - Detection is best-effort; the cap is the half that always applies. It bounds any
   allowed wipe to 25,000 rows per pass unconditionally, whether or not a detector
   fired --- an instantaneous wipe becomes a paced one plus an operator signal.
+- **A pass that begins with NO stored reading declines, once (#2579).** An
+  ABSENT reading is the ordinary fresh-install case and says nothing about the
+  clock; an unusable one is a separate, stronger signal and still reports as
+  corruption. But an absent reading together with rows ALREADY EXPIRED leaves the
+  pass nothing that could rule out a clock which was wrong before the guard ever
+  ran, so it holds back rather than delete. It declines once, warns, and anchors
+  the reading; the next pass has a comparison point and proceeds, paced by the cap
+  as always. With nothing expired there is nothing to hold back and no decline
+  happens, so a fresh install is unaffected. The same one-off decline recurs
+  wherever the reading goes missing again: after a failed anchor persist plus a
+  restart, or after restoring a pre-v3 snapshot. The rule itself is stated once,
+  above; this bullet deliberately does not restate it.
+- **Its signal is separate on purpose.** The decline raises
+  `yuzu_server_audit_retention_bootstrap_declines_total`, NOT
+  `yuzu_server_audit_clock_anomaly_skips_total`. The latter drives an alert
+  meaning "the clock moved in a way that would have wiped audit evidence", and
+  this decline claims nothing of the sort --- only that nothing can yet rule it
+  out. Expect 0 or 1 per database. A value that keeps climbing means the anchor is
+  not surviving, which `YuzuAuditRetentionAnchorNotSurviving` alerts on. Read
+  `yuzu_server_audit_retention_persist_failed_total` beside it, but do not treat
+  that counter as equivalent coverage: when the reading is destroyed OUT OF BAND
+  (a restore from a pre-v3 backup, a rehydrated replica, a disk rollback) the
+  write succeeds every pass and it stays flat at zero.
+- **Before the fix**, such a pass deleted up to the cap with no decline and no
+  clock-anomaly counter, and kept deleting rows stamped before the skew until that
+  cohort was exhausted --- only those lose time, since a row written under the skew
+  is stamped from the same wall clock the cutoff is read from and keeps its full
+  window, so a forward step of `S` on a window of `W` works through the pre-skew
+  rows and stops about `W - S` later. There is no reliable retrospective test for
+  whether a given database was affected, and the obvious checks do not
+  discriminate: a surviving-row floor near the configured cutoff is what a healthy
+  oldest-first reaper looks like; `MIN(timestamp)` is pinned indefinitely by any
+  row stamped `ttl_expires_at = 0`, which deletion never touches; and a cutoff
+  computed on the affected host moves with the skew. Rows deleted then are not
+  recoverable without a backup predating the pass. Upgrade guidance:
+  [upgrading.md § Retention clock guards](upgrading.md#retention-clock-guards-2360-server-audit-store-2361-tar-agent-warehouse).
 - Changing `--audit-retention-days` does not re-date existing rows.
   `ttl_expires_at` is stamped once at INSERT and never rewritten, so a reduction
   expires nothing retroactively and reclaims no disk.
@@ -523,8 +569,9 @@ directly. Do not collapse the first two:
 | `yuzu_server_audit_cleanup_failed_total` | A pass did not fully do its job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. **One site fires after a SUCCESSFUL delete** (the post-delete backlog probe), so read this as "retention is not fully healthy", not "nothing was deleted". |
 | `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
+| `yuzu_server_audit_retention_bootstrap_declines_total` | A pass declined because it had NO stored clock reading while rows were already expired (#2579); nothing was deleted. Counted apart from the clock-anomaly series on purpose - it claims only that nothing can yet rule out a wrong clock, not that the clock moved, so it must not fire an alert that says otherwise. Expect 0 or 1 per database; a climbing value means the anchor is not surviving, so read it with `..._retention_persist_failed_total`. |
 | `yuzu_server_audit_retention_persist_failed_total` | The durable clock reading could not be written. Detection will not survive a restart while this is rising. |
-| `yuzu_server_audit_retention_passes_total` | Passes **attempted**, including declined and failed ones. The one signal that catches a reaper which is not running at all - in that state the other five counters here stay flat at 0, which looks exactly like a quiet, healthy store. Alert on it NOT increasing. |
+| `yuzu_server_audit_retention_passes_total` | Passes **attempted**, including declined and failed ones. The one signal that catches a reaper which is not running at all - in that state the other six counters here stay flat at 0, which looks exactly like a quiet, healthy store. Alert on it NOT increasing. |
 | `yuzu_server_audit_retention_last_pass_unixtime` | When the most recent pass with a USABLE clock reading ran; `0` if none has in this process. A pass refused for an implausible `now` counts as a pass but does not stamp this gauge, and a restart resets it to `0` for up to one cleanup interval even though the durable reading survives. |
 
 The first two both leave rows undeleted, so an audit table that never shrinks

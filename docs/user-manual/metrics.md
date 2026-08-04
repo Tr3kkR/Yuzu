@@ -135,8 +135,9 @@ documented in `docs/user-manual/audit-log.md`.
 | `yuzu_server_audit_cleanup_failed_total` | counter | Retention passes that did not fully do their job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. **One of the seven sites fires after a SUCCESSFUL delete** (the post-delete backlog probe), so this means "retention is not fully healthy", not "nothing was deleted". |
 | `yuzu_server_audit_retention_cap_reached_total` | counter | Passes that hit the per-pass delete cap, leaving a backlog. Sustained growth means expiry is outrunning the drain. This is the failure the cap itself introduces; neither counter above moves in that state. |
 | `yuzu_server_audit_rows_deleted_total` | counter | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
+| `yuzu_server_audit_retention_bootstrap_declines_total` | counter | Retention passes **declined** because the pass began with no usable stored clock reading while rows were already expired (#2579). Nothing was deleted. Deliberately NOT folded into `..._clock_anomaly_skips_total`: that series' alert means "the clock moved in a way that would have wiped audit evidence", whereas this decline asserts only that nothing can yet rule that out - a weaker claim and a different incident. Expect 0 or 1 per database: the declining pass also anchors the reading, so the next pass proceeds. A value that keeps climbing means the anchor is not surviving - read it alongside `..._retention_persist_failed_total`. A SINGLE decline is deliberately unalerted - that is the ordinary schema-v3 upgrade - but a climbing value fires `YuzuAuditRetentionAnchorNotSurviving` (`increase(...[24h]) > 1`). It is deliberately not folded into `YuzuAuditRetentionClockAnomaly`, whose meaning is that the clock MOVED. See [the retention clock guard](audit-log.md#the-retention-clock-guard). |
 | `yuzu_server_audit_retention_persist_failed_total` | counter | Failures to persist the retention clock reading. Sustained non-zero means clock-anomaly detection will not survive a restart. |
-| `yuzu_server_audit_retention_passes_total` | counter | Retention passes **attempted**, including declined and failed ones. Alert on this NOT increasing: the other five retention counters are silence-means-healthy, so a cleanup thread that never runs leaves them flat at 0 - identical to a quiet, healthy store, while `audit.db` grows without bound. |
+| `yuzu_server_audit_retention_passes_total` | counter | Retention passes **attempted**, including declined and failed ones. Alert on this NOT increasing: the other six retention counters are silence-means-healthy, so a cleanup thread that never runs leaves them flat at 0 - identical to a quiet, healthy store, while `audit.db` grows without bound. |
 | `yuzu_server_audit_retention_last_pass_unixtime` | gauge | Wall-clock reading of the most recent pass; `0` if none has run in this process. Read WITH the counter above: stale here while that RISES means the reaper is alive but refusing an implausible clock -- a different fault from stopped. |
 
 **Alert on absence, not just on rising counters.** Four of the five retention alert
@@ -166,7 +167,8 @@ session's `GET` stream when `execute_instruction` is called with a `_meta.progre
 | `yuzu_mcp_bridge_teardown_incomplete_total{reason}` | counter | Progress-bridge teardown steps that could not complete on the maintenance thread, by closed-set `reason`. **This is defence in depth, not the live out-of-memory signal** - all three steps are find/erase and node operations that allocate nothing, so only a mutex failure can reach them on the current code; for allocation pressure watch `yuzu_mcp_stream_terminal_publish_failures_total` instead. It exists because the day an allocating call is added to any of those steps, this becomes the signal that matters. The sweep's claim is one-way, so a record that fails here is never retried; what stays retained until the process restarts depends on the reason. `unsubscribe` - the record, its streamed admission charge, and (on the pin-ack and session-death paths) its event-bus subscription, which also blocks that execution's bus channel and replay buffer from being collected; on the memory-pressure path the subscription was already removed atomically with the claim. `release_charge` - one per-session admission slot, with the record itself still erased. `erase` - the record and one global record slot, after the subscription and charge were settled. A retained record also pins that session's whole stream state, its replay ring and any pinned finals, past session gc. Client results remain durably fetchable by `execution_id` in every case. Alert on `> 0`; the only remediation is a process restart - see `docs/ops-runbooks/mcp-bridge-teardown-recovery.md`. |
 | `yuzu_mcp_maintenance_tick_failures_total{tick}` | counter | MCP maintenance ticks that threw and were contained, by closed-set `tick` (`bridge_sweep` / `session_gc`). The tick is skipped, not retried. `bridge_sweep` - pin-ack, session-death and memory-pressure teardown are all stalled while this grows, so bridge records and their pins accumulate. `session_gc` - expired sessions keep their streams and pinned finals until a tick succeeds. The two are guarded separately so a failure in one cannot suppress the other. Alert on a nonzero rate over a window, NOT on the raw counter - a skipped tick is retried next cycle, so unlike `teardown_incomplete` this condition is self-healing and its alert must clear. |
 | `yuzu_mcp_stream_terminal_publish_failures_total` | counter | Terminal-frame publish failures seen by the bridge's `publish_final → fallback → poison` ladder. Non-zero means a client-visible result could not be delivered on the stream (recoverable by `execution_id`). Alert-worthy. |
-| `yuzu_mcp_stream_final_unpinned_total` | counter | Committed terminal frames that found no free pin slot and were published **unpinned** (a real terminal is committed rather than lost to preserve a pin). Not expected: the bridge caps streamed records per session at the pin count, so any non-zero value means that admission accounting was violated and the affected final is evictable from the replay ring - still recoverable by `execution_id`. Alert on `> 0`. |
+| `yuzu_mcp_stream_final_unpinned_total` | counter | Committed terminal frames that found no free pin slot and were published **unpinned** (a real terminal is committed rather than lost to preserve a pin). **Structurally unreachable** while the pin array is non-empty: a full slot set now displaces its oldest pin rather than committing the *newest* final unprotected. Kept as defence in depth - a non-zero value means the array was resized to zero or the displacement path was bypassed. Alert on `> 0`. **Upgrade note:** the drift reading this counter used to carry ("admission accounting was violated") now belongs to `yuzu_mcp_stream_pin_displaced_total`; alert on both. |
+| `yuzu_mcp_stream_pin_displaced_total` | counter | An older pinned terminal yielded its eviction-exemption slot to a newer one. **Not expected:** `publish_final` runs only for a `kRingOnly` record, the bridge admits streamed records against `pinned_count() + unpinned`, and the pin array is sized to exactly that cap - so a full slot set means **admission accounting has drifted**. The displacement is the graceful degradation, not a licence: the oldest terminal (likeliest already consumed) yields instead of the newest going unprotected, which is the wrong one to sacrifice since it is the request most likely still waiting. The displaced final becomes evictable from the replay ring, still recoverable by `execution_id`. Alert on `> 0`. |
 
 All reason-label sets are closed (every value is a static literal seeded to 0 at boot),
 so `absent()`/`rate()` alerting is meaningful on a healthy server.
@@ -938,13 +940,15 @@ account for the deliberately-disabled case, not just the stuck case.
 
 ## Management group metrics
 
-The server exposes two gauges for management group telemetry. These are
-refreshed on every `/metrics` scrape.
+The server exposes two gauges plus two counters for management group telemetry.
+The gauges are refreshed on every `/metrics` scrape; the counters are cumulative.
 
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_management_groups_total` | gauge | Total number of management groups (including the root "All Devices" group) |
 | `yuzu_server_group_members_total` | gauge | Total membership records across all management groups |
+| `yuzu_server_mgmt_group_read_degrade_total{reason}` | counter | A **confinement-feeding** hierarchy read (ancestors/descendants/agent-groups) degraded instead of returning a result, so the caller failed closed to **DenyAll**. `reason` ∈ `store_not_open` (store failed to open at boot), `pool_acquire_timeout` (no Postgres connection available in time — correlates with `yuzu_pg_acquire_*` saturation), `query_error` (the recursive-CTE query failed). **A non-zero rate means scoped operators see reduced/empty lists** because the confinement substrate (`management_group_store`, ADR-0042) is degraded — it does **not** mean groups shrank. This is the deny-set fail-**open** hazard now closed (a degraded read denies rather than silently under-restricting). |
+| `yuzu_server_mgmt_group_backfill_total{result}` | counter | Outcome of the one-time SQLite→Postgres confinement backfill at boot (ADR-0042). `result` ∈ `completed` (legacy `management-groups.db` found and backfilled, then moved aside), `fresh` (no legacy DB — a clean install, nothing to migrate), `failed` (backfill could not complete — write error, unreadable/over-deep/cyclic legacy tree; the server **fails closed at boot** and retries on next start). Emitted once per boot; a `failed` sample is the signal that the server refused to come up. |
 
 **Example output:**
 
@@ -969,6 +973,15 @@ yuzu_server_group_members_total / yuzu_server_management_groups_total
 
 # Alert if no management groups exist (store may be down)
 yuzu_server_management_groups_total == 0
+
+# Confinement reads degrading → scoped operators see reduced/empty lists (DenyAll).
+# A degrade denies confinement reads fleet-wide — treat any non-zero rate as a
+# confidentiality/availability signal, not a fleet-size change. (Shipped as the
+# YuzuMgmtGroupReadDegraded alert.)
+sum(rate(yuzu_server_mgmt_group_read_degrade_total[5m])) by (reason) > 0
+
+# One-time confinement backfill failed → server refused to boot (ADR-0042).
+sum(rate(yuzu_server_mgmt_group_backfill_total{result="failed"}[15m])) > 0
 ```
 
 ## Useful PromQL queries

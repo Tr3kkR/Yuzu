@@ -436,6 +436,19 @@ if get_option('build_fuzzers')
   subdir('tests/fuzz')
 endif
 
+# ── Capability-matrix generator (PR1.1 / #2204; IT-2) ────────────────────────
+# Placed AFTER the build_fuzzers endif — OUTSIDE that conditional (PLAN-04: an
+# insert right after subdir('tests/fuzz') would bury it inside the fuzzer gate
+# and normal CI would never build it). Guarded on build_agent (the tool
+# dlopens the built plugin shared objects to read their ABI4 descriptors) AND
+# build_examples (build-ci B1: with no agents/plugins/*/ subdirs configured
+# there is nothing for the generator to inspect — building it anyway would
+# leave scripts/ci/check-capability-matrix.sh looking for plugin artifacts
+# that were never going to exist).
+if build_agent and build_examples
+  subdir('tools/capmatrix-gen')
+endif
+
 # ── Erlang Gateway (optional — requires rebar3 + Erlang/OTP) ─────────────
 _rebar3 = find_program('rebar3', required: false)
 if _rebar3.found()

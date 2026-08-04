@@ -1,5 +1,15 @@
 # Yuzu — Claude Code Guide
 
+## Active workstreams (temporary — 2026-07-29 → ~2026-08-05)
+
+Four parallel streams are running across three machines. **Read `docs/workstreams.md` and the
+`STREAM.md` at your worktree root before starting work.** Work belongs to exactly one stream:
+`ci` (CI/test revamp) · `adr17` (list-read confinement) · `adr31` (decomposition) ·
+`pg` (SQLite → Postgres). If a task is outside all four, say so and ask rather than starting it.
+
+Shulgi's Windows and WSL2 halves are one shared box and a live runner host — **take the semaphore
+(`~/yz/bin/shulgi-lock`) before any build or test there, and release it when done.**
+
 ## What is Yuzu?
 
 Yuzu is an agentic enterprise endpoint management platform — a single control plane where agentic colleagues query, command, scan, patch, and enforce policy compliance on Windows/Linux/macOS fleets in real time; an open-source alternative to commercial endpoint platforms, built in C++23.
@@ -231,7 +241,7 @@ The `frontend-design` plugin is **marketing / sales / demo surfaces only** — i
 
 ### Issue tracker, triage labels, domain docs
 
-Issues follow `docs/agents/issue-standard.md`: dedupe before filing; automation never closes `security`/`do-not-close` issues. Commands: `docs/agents/issue-tracker.md`; labels: `docs/agents/triage-labels.md`. Domain docs: `CONTEXT.md`, ADRs in `docs/adr/` (`docs/agents/domain.md`).
+Issues follow `docs/agents/issue-standard.md`: dedupe before filing; automation never closes `security`/`do-not-close` issues. Commands: `docs/agents/issue-tracker.md`; labels: `docs/agents/triage-labels.md`. Domain docs: `CONTEXT.md`, ADRs in `docs/adr/` (`docs/agents/domain.md`). ADR numbers are **author-namespaced** and `0016`/`0031` each host two accepted ADRs — cite those by filename, never number alone: `docs/adr/README.md`.
 
 ## CLAUDE.md updates
 

@@ -12,7 +12,11 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
 | File | Role |
 |---|---|
 | `Provision-Windows-Runner.ps1` | Installs the pinned toolchain, sets machine env (incl. the gateway + shared-cache contracts), emits `toolchain-manifest.json`. |
-| `Assert-Toolchain.ps1` | Runner self-test: verifies the manifest, contract env, and every per-agent PostgreSQL binary/service/health check. Run at provision time **and** as a registration/preflight gate. |
+| `toolchain-contract.json` | Reviewable schema for host pins/probes and the separate job-scoped vcpkg baseline. Provisioning parameters must match it. |
+| `Toolchain-Contract.psm1` | Fail-closed schema/pin/probe adapter shared by the assertion and its hermetic tests. |
+| `Assert-Toolchain.ps1` | Runner self-test: verifies the manifest schema and live versions, contract env, and every per-agent PostgreSQL binary/service/health check. Run at provision time **and** as a registration/preflight gate. |
+| `Assert-VcpkgCheckout.ps1` | Job self-test: after `lukka/run-vcpkg`, verifies the workspace checkout HEAD, clean tracked tree, and executable release against the checkout metadata before CI installs ports. |
+| `Test-ToolchainContract.ps1` | Hermetic schema/version regression tests, also registered in Meson's `docs` suite when `pwsh` exists. Safe anywhere; reads no service or registry state. |
 | `Test-ProvisionLogic.ps1` | Regression tests for the provisioning script's decision logic (maintenance gate, `-D` handling, `ImagePath` rewrite). Safe anywhere — no elevation, no machine state. Run after editing `Provision-Windows-Runner.ps1`. |
 | `Start-PinnedRunner.ps1` | Supervises one runner, hard-pinned to one Threadripper CCD (L3 domain); shares the vcpkg binary cache and selects that runner's persistent telemetry DB. |
 
@@ -24,7 +28,28 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
    pwsh -File deploy\windows\Provision-Windows-Runner.ps1
    ```
    Re-runnable; pins live in the `param()` block (bump deliberately). Open a new
-   shell afterwards so machine PATH/env take effect.
+   shell afterwards so machine PATH/env take effect. The matching values in
+   `toolchain-contract.json` are the reviewed contract; a command-line version
+   override that differs from that file fails before the first provisioning
+   step. Change both in the same review when deliberately bumping a pin.
+
+   Host pin bumps use a two-phase compatibility window so review CI never
+   depends on reprovisioning from unmerged code:
+
+   1. Change the target in `pins` and list both old and new values in the
+      matching `accepted_host_pins` entry. Merge while old and new hosts pass.
+   2. Drain and reprovision the runners from the merged target, then remove the
+      old accepted value in a follow-up review.
+
+   Provisioning accepts only the target value; the compatibility list affects
+   validation during the rollout, not what a newly provisioned host installs.
+
+   The schema introduction has one separately bounded bridge for manifests
+   emitted by the immediately preceding provisioner: a missing `schema` is
+   accepted through **2026-08-14 23:59:59 UTC**, but every v1 pin, path, and
+   live-version probe still runs. Drain and reprovision every Windows runner
+   from merged code before that deadline. Unknown explicit schemas and a
+   missing manifest always fail.
 
    **On an existing shared box, stop all four runners first.** Provisioning
    restarts shared PostgreSQL services and rewrites machine PATH/env under
@@ -61,6 +86,11 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
    including on a box that is busy:
    ```powershell
    pwsh -File deploy\windows\Test-ProvisionLogic.ps1
+   ```
+
+   If you edited the manifest, its assertion, or any pinned version, also run:
+   ```powershell
+   pwsh -NoProfile -File deploy\windows\Test-ToolchainContract.ps1
    ```
 
 2. **Self-test** (must pass before registering):
@@ -179,6 +209,7 @@ verified by `Assert-Toolchain.ps1`:
 
 ```json
 {
+  "schema": "yuzu/windows-toolchain/v1",
   "generated": "2026-06-20T13:00:00Z",
   "host": "WEETAM",
   "runner_count": 4,
@@ -204,9 +235,33 @@ verified by `Assert-Toolchain.ps1`:
       "pg_isready": "D:\\ci\\pgbin\\agent-0\\bin\\pg_isready.exe" },
     "..."
   ],
-  "tools": [ { "name": "vcpkg", "path": "C:\\vcpkg\\vcpkg.exe", "version": "...", "required": true }, ... ]
+  "tools": [ { "name": "python", "path": "C:\\Python314\\python.exe", "version": "...", "required": true }, ... ]
 }
 ```
 
 The manifest is host-generated (like a lockfile) and not committed; this README
 documents its shape so the self-test and any tooling agree on the contract.
+The committed `toolchain-contract.json` is the version-policy source of truth.
+`Assert-Toolchain.ps1` accepts a missing schema only during the dated rollout
+bridge above, rejects an unknown explicit schema, rejects a host pin outside
+its committed `accepted_host_pins` list, then executes version probes
+for Python, Meson, Erlang OTP, rebar3, and PostgreSQL. It also proves the
+effective `python`, `meson`, and `git` commands resolve to the recorded host
+executables. Every executable probe has a 10-second deadline. A launch error,
+timeout, unparseable output, or mismatch is a failure.
+
+vcpkg has a different lifetime: Windows CI checks it out under
+`$GITHUB_WORKSPACE\vcpkg`, so the host's `C:\vcpkg` clone is not evidence about
+the tool a job executes. The effective baseline therefore lives under
+`job_pins`. The retained `pins.vcpkg_baseline` in older and current host
+manifests is informational and ignored for job validation. After `lukka/run-vcpkg`,
+`Assert-VcpkgCheckout.ps1` checks the effective checkout HEAD, tracked-tree
+cleanliness, and that `vcpkg.exe` reports the release tag in the checkout's
+tracked `scripts/vcpkg-tool-metadata.txt`. (The executable's own commit is not
+the ports repository baseline.) A
+baseline PR can consequently validate itself without reprovisioning the host.
+
+Ninja, CMake, Git, ccache, MSVC, and MSYS2 bash are currently observed but
+unversioned: the host assertion checks their required paths (and Git's effective
+command path), not a reviewed version. Add a pin plus executable probe before
+claiming version enforcement for any of them.
