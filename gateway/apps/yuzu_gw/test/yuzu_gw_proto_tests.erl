@@ -133,6 +133,17 @@ encode_command_request_preserves_payload_test() ->
     Encoded = yuzu_gw_proto:encode_command_request(Input),
     ?assertEqual(Payload, maps:get(payload, Encoded)).
 
+%% PR1.9b / CC-03: the normaliser must preserve `dispatch_tag` (field 9) the
+%% same way it preserves `payload` (field 8) above — same rationale, same
+%% not-on-the-forward-path caveat, same "must never become a silent strip
+%% point" requirement.
+encode_command_request_preserves_dispatch_tag_test() ->
+    Tag = <<"v1|dest|irrev|deadbeefcafef00d">>,
+    Input = #{plugin => <<"services">>, action => <<"remove">>,
+              command_id => <<"c1">>, dispatch_tag => Tag},
+    Encoded = yuzu_gw_proto:encode_command_request(Input),
+    ?assertEqual(Tag, maps:get(dispatch_tag, Encoded)).
+
 encode_command_response_fills_defaults_test() ->
     Input = #{command_id => <<"c1">>, status => 'SUCCESS'},
     Encoded = yuzu_gw_proto:encode_command_response(Input),

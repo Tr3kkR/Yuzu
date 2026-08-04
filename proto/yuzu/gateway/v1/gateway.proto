@@ -69,6 +69,21 @@ message StreamStatusNotification {
   string peer_addr = 4;
   // Gateway node handling this agent.
   string gateway_node = 5;
+
+  // CC-03 wire-capability handshake: literals this gateway build supports on
+  // the wire, sent with every CONNECTED notification (the first message the
+  // gateway emits upstream when an agent's Subscribe stream establishes —
+  // see yuzu_gw_agent:init/1 -> yuzu_gw_upstream:notify_stream_status/4 in
+  // gateway/apps/yuzu_gw/src/). The dispatch chokepoint checks for the
+  // literal "command_dispatch_tag_v1": its presence means this gateway's
+  // vendored agent.proto carries CommandRequest.dispatch_tag = 9 (see
+  // proto/yuzu/agent/v1/agent.proto) and forwards it untouched, so the
+  // server may safely route dispatch-tagged commands to agents behind this
+  // gateway. Absence — an old gateway build, agent proto drift, or this
+  // field missing from a gateway mirror (gateway/priv/proto/gateway.proto,
+  // gateway/priv/proto/yuzu/gateway/v1/gateway.proto) — means the server
+  // must refuse to route tagged CommandRequests through this gateway.
+  repeated string wire_capabilities = 6;
 }
 
 message StreamStatusAck {
