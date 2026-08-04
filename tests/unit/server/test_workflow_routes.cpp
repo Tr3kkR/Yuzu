@@ -127,11 +127,17 @@ struct ExecHarness {
     /// into the dispatch stub (the confinement the production dispatch_confined
     /// seam then applies). Mirrors test_mcp_server.cpp's last_dispatch_exec_visible.
     yuzu::server::authz::VisibleSet last_dispatch_exec_visible;
-    /// K-R7-02: the reassignable per-request exec-visible derivation. Default
-    /// returns nullopt (UNFILTERED) so every pre-existing workflow test keeps the
+    /// PLAN-006: the full DispatchCaller (identity + exec_visible) the execute
+    /// handler threaded into the dispatch stub, so a test can assert the
+    /// principal half independently of last_dispatch_exec_visible above.
+    yuzu::server::DispatchCaller last_dispatch_caller;
+    /// K-R7-02 / PLAN-006: the reassignable per-request DispatchCaller
+    /// derivation. Default returns a DispatchCaller whose exec_visible is
+    /// nullopt (UNFILTERED) so every pre-existing workflow test keeps the
     /// full-fleet path; a confinement test overrides it with a specific set.
-    WorkflowRoutes::ExecVisibleFn exec_visible_fn{
-        [](const httplib::Request&) { return yuzu::server::authz::VisibleSet{}; }};
+    WorkflowRoutes::CallerFn caller_fn{[](const httplib::Request&) -> yuzu::server::DispatchCaller {
+        return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::VisibleSet{}};
+    }};
     WorkflowRoutes routes;
 
     /// Per-process monotonic counter for execution IDs. Replaces the prior
@@ -145,7 +151,7 @@ struct ExecHarness {
     /// bus so SSE-handler 503-on-no-bus tests can exercise the path where
     /// the route is registered but the underlying bus is intentionally
     /// not wired (governance qe-S1).
-    /// `wire_exec_visible = false` registers with an EMPTY ExecVisibleFn so the
+    /// `wire_exec_visible = false` registers with an EMPTY CallerFn so the
     /// production execute handler's own fail-closed branch (unwired → present-
     /// empty deny-all) is exercised (K-R7-02).
     bool wire_exec_visible{true};
@@ -228,15 +234,17 @@ struct ExecHarness {
                                    const std::string& scope_expr,
                                    const std::unordered_map<std::string, std::string>&,
                                    const std::string& execution_id,
-                                   const yuzu::server::authz::VisibleSet& exec_visible)
+                                   const yuzu::server::DispatchCaller& caller)
             -> std::pair<std::string, int> {
             last_dispatch_execution_id = execution_id;
             // #2500: capture what the sink was actually asked to target.
             ++dispatch_calls;
             last_dispatch_agent_ids = agent_ids;
             last_dispatch_scope = scope_expr;
-            // K-R7-02: capture the confinement threaded into dispatch.
-            last_dispatch_exec_visible = exec_visible;
+            // K-R7-02 / PLAN-006: capture the confinement + identity threaded
+            // into dispatch.
+            last_dispatch_exec_visible = caller.exec_visible;
+            last_dispatch_caller = caller;
             return {dispatch_cmd_override, dispatch_sent_override};
         };
 
@@ -252,12 +260,13 @@ struct ExecHarness {
         wf_deps.execution_tracker = tracker.get();
         wf_deps.instruction_store = instructions.get();
         wf_deps.command_dispatch_fn = cmd_dispatch;
-        // K-R7-02: wire the exec-visible derivation (or leave it EMPTY so the
-        // handler's own fail-closed path runs). The wired form delegates to the
-        // reassignable member so a test can override it after construction.
+        // K-R7-02 / PLAN-006: wire the DispatchCaller derivation (or leave it
+        // EMPTY so the handler's own fail-closed path runs). The wired form
+        // delegates to the reassignable member so a test can override it after
+        // construction.
         if (wire_exec_visible) {
-            wf_deps.exec_visible_fn = [this](const httplib::Request& req) {
-                return exec_visible_fn ? exec_visible_fn(req) : yuzu::server::authz::VisibleSet{};
+            wf_deps.caller_fn = [this](const httplib::Request& req) -> yuzu::server::DispatchCaller {
+                return caller_fn ? caller_fn(req) : yuzu::server::DispatchCaller{};
             };
         }
         wf_deps.response_store = responses.get();
@@ -1690,8 +1699,9 @@ TEST_CASE("K-R7-02 — instruction execute threads the caller's exec_visible int
     h.dispatch_cmd_override = "cmd-x";
     h.dispatch_sent_override = 1;
     // Service-scoped confinement: the caller can see only agent-A.
-    h.exec_visible_fn = [](const httplib::Request&) {
-        return yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+    h.caller_fn = [](const httplib::Request&) -> yuzu::server::DispatchCaller {
+        return yuzu::server::DispatchCaller{
+            .exec_visible = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}}};
     };
     // Target agent-B (an id-list arm), OUTSIDE the caller's visible set.
     auto res = h.sink.Post("/api/instructions/def-CONF1/execute", R"({"agent_ids":["agent-B"]})");
@@ -1712,8 +1722,9 @@ TEST_CASE("K-R7-02 — instruction execute broadcast still carries the caller's 
     h.make_def("def-CONF3", "conf3");
     h.dispatch_cmd_override = "cmd-z";
     h.dispatch_sent_override = 1;
-    h.exec_visible_fn = [](const httplib::Request&) {
-        return yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+    h.caller_fn = [](const httplib::Request&) -> yuzu::server::DispatchCaller {
+        return yuzu::server::DispatchCaller{
+            .exec_visible = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}}};
     };
     // Omitted target → the handler names __all__ (broadcast). Even that composes
     // with the visible set.
@@ -1728,7 +1739,7 @@ TEST_CASE("K-R7-02 — instruction execute broadcast still carries the caller's 
 
 TEST_CASE("K-R7-02 — instruction execute FAILS CLOSED when the exec-visible derivation is unwired",
           "[workflow][executions][execute][scope][security]") {
-    // Genuinely UNWIRED ExecVisibleFn: the production handler must hand dispatch
+    // Genuinely UNWIRED CallerFn: the production handler must hand dispatch
     // a PRESENT EMPTY visible set (deny all), never nullopt (unfiltered).
     ExecHarness h(/*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/false);
     h.make_def("def-CONF2", "conf2");
@@ -1740,6 +1751,42 @@ TEST_CASE("K-R7-02 — instruction execute FAILS CLOSED when the exec-visible de
     CHECK(h.dispatch_calls == 1);
     REQUIRE(h.last_dispatch_exec_visible.has_value()); // PRESENT (deny), not nullopt
     CHECK(h.last_dispatch_exec_visible->empty());       // EMPTY → production sink reaches no one
+}
+
+// PLAN-006: the sibling of the confinement handoff test above, asserting the
+// IDENTITY half of DispatchCaller — a wired CallerFn's principal must reach
+// the dispatch seam, not just its exec_visible.
+TEST_CASE("PLAN-006 — instruction execute threads the caller's principal into dispatch",
+          "[workflow][executions][execute][scope]") {
+    ExecHarness h;
+    h.make_def("def-CONF4", "conf4");
+    h.dispatch_cmd_override = "cmd-p";
+    h.dispatch_sent_override = 1;
+    h.caller_fn = [](const httplib::Request&) -> yuzu::server::DispatchCaller {
+        return yuzu::server::DispatchCaller{.principal = "wf-operator", .principal_role = "admin"};
+    };
+    auto res = h.sink.Post("/api/instructions/def-CONF4/execute", R"({"agent_ids":["agent-A"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.dispatch_calls == 1);
+    CHECK(h.last_dispatch_caller.principal == "wf-operator");
+    CHECK(h.last_dispatch_caller.principal_role == "admin");
+    CHECK_FALSE(h.last_dispatch_caller.system);
+}
+
+TEST_CASE("PLAN-006 — instruction execute FAILS CLOSED on an empty principal when unwired",
+          "[workflow][executions][execute][scope][security]") {
+    // Genuinely UNWIRED CallerFn: the production handler must hand dispatch an
+    // EMPTY principal alongside a present-empty exec_visible.
+    ExecHarness h(/*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/false);
+    h.make_def("def-CONF5", "conf5");
+    h.dispatch_cmd_override = "cmd-pfc";
+    h.dispatch_sent_override = 1;
+    auto res = h.sink.Post("/api/instructions/def-CONF5/execute", R"({"agent_ids":["agent-A"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.dispatch_calls == 1);
+    CHECK(h.last_dispatch_caller.principal.empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1762,8 +1809,9 @@ TEST_CASE("CDX-FV-03 — workflow execute threads the caller's exec_visible into
     h.dispatch_cmd_override = "cmd-wf1";
     h.dispatch_sent_override = 1;
     // Service-scoped confinement: the caller can see only agent-A.
-    h.exec_visible_fn = [](const httplib::Request&) {
-        return yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+    h.caller_fn = [](const httplib::Request&) -> yuzu::server::DispatchCaller {
+        return yuzu::server::DispatchCaller{
+            .exec_visible = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}}};
     };
 
     // Target agent-B — an id-list arm OUTSIDE the caller's visible set. The
@@ -1781,7 +1829,7 @@ TEST_CASE("CDX-FV-03 — workflow execute threads the caller's exec_visible into
 
 TEST_CASE("CDX-FV-03 — workflow execute FAILS CLOSED when the exec-visible derivation is unwired",
           "[workflow][executions][execute][scope][security]") {
-    // Genuinely UNWIRED ExecVisibleFn. ADR-0033 §1: the handler must hand step
+    // Genuinely UNWIRED CallerFn. ADR-0033 §1: the handler must hand step
     // dispatch a PRESENT EMPTY visible set (deny all), never nullopt — nullopt
     // means UNFILTERED at the shared seam, i.e. the whole fleet.
     ExecHarness h(/*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/false,

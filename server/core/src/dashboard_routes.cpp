@@ -162,14 +162,14 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                                        detail::EventBus* event_bus,
                                        AgentsJsonFn agents_json_fn,
                                        DispatchFn dispatch_fn,
-                                       ExecVisibleFn exec_visible_fn,
+                                       CallerFn caller_fn,
                                        ResolveFn resolve_fn,
                                        yuzu::MetricsRegistry* metrics,
                                        InstructionStore* instruction_store) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     response_store, mgmt_group_store, registry, tag_store, event_bus,
-                    std::move(agents_json_fn), std::move(dispatch_fn), std::move(exec_visible_fn),
+                    std::move(agents_json_fn), std::move(dispatch_fn), std::move(caller_fn),
                     std::move(resolve_fn), metrics, instruction_store);
 }
 
@@ -181,7 +181,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                        detail::EventBus* event_bus,
                                        AgentsJsonFn agents_json_fn,
                                        DispatchFn dispatch_fn,
-                                       ExecVisibleFn exec_visible_fn,
+                                       CallerFn caller_fn,
                                        ResolveFn resolve_fn,
                                        yuzu::MetricsRegistry* metrics,
                                        InstructionStore* instruction_store) {
@@ -195,7 +195,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     event_bus_ = event_bus;
     agents_json_fn_ = std::move(agents_json_fn);
     dispatch_fn_ = std::move(dispatch_fn);
-    exec_visible_fn_ = std::move(exec_visible_fn);
+    caller_fn_ = std::move(caller_fn);
     resolve_fn_ = std::move(resolve_fn);
     metrics_ = metrics;
     instruction_store_ = instruction_store;
@@ -739,11 +739,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // dispatch_confined seam (same confinement as /api/command +
                  // MCP). An UNWIRED derivation fails CLOSED (present-empty set →
                  // reaches nobody), never nullopt/unfiltered.
-                 yuzu::server::authz::VisibleSet exec_visible =
-                     exec_visible_fn_ ? exec_visible_fn_(req)
-                                      : yuzu::server::authz::deny_all();
+                 yuzu::server::DispatchCaller caller =
+                     caller_fn_ ? caller_fn_(req)
+                               : yuzu::server::DispatchCaller{
+                                     .exec_visible = yuzu::server::authz::deny_all()};
                  auto [command_id, sent] =
-                     dispatch_fn_(plugin, action, agent_ids, scope_expr, inline_params, exec_visible);
+                     dispatch_fn_(plugin, action, agent_ids, scope_expr, inline_params, caller);
                  if (sent == 0) {
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
@@ -934,11 +935,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  params["sql"] = sql;
                  // CDX-R7-02: same confinement as /api/dashboard/execute — narrow
                  // to the operator's visible set, fail CLOSED if unwired.
-                 yuzu::server::authz::VisibleSet exec_visible =
-                     exec_visible_fn_ ? exec_visible_fn_(req)
-                                      : yuzu::server::authz::deny_all();
+                 yuzu::server::DispatchCaller caller =
+                     caller_fn_ ? caller_fn_(req)
+                               : yuzu::server::DispatchCaller{
+                                     .exec_visible = yuzu::server::authz::deny_all()};
                  auto [command_id, sent] =
-                     dispatch_fn_("tar", "sql", agent_ids, scope_expr, params, exec_visible);
+                     dispatch_fn_("tar", "sql", agent_ids, scope_expr, params, caller);
 
                  if (sent == 0) {
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
@@ -1144,11 +1146,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // dispatch_confined seam, so a service-scoped token cannot scan
                  // an out-of-service device its username visibility would admit.
                  // Fail CLOSED (present-empty) if the derivation is unwired.
-                 yuzu::server::authz::VisibleSet exec_visible =
-                     exec_visible_fn_ ? exec_visible_fn_(req)
-                                      : yuzu::server::authz::deny_all();
+                 yuzu::server::DispatchCaller caller =
+                     caller_fn_ ? caller_fn_(req)
+                               : yuzu::server::DispatchCaller{
+                                     .exec_visible = yuzu::server::authz::deny_all()};
                  auto [command_id, sent] = dispatch_fn_(
-                     "tar", "status", agent_ids, /*scope_expr=*/"", params, exec_visible);
+                     "tar", "status", agent_ids, /*scope_expr=*/"", params, caller);
 
                  {
                      std::lock_guard<std::mutex> lk(tar_scan_mu_);
@@ -1356,12 +1359,13 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // arm of dispatch_confined drops an out-of-scope device_id), so
                  // a service-scoped token cannot re-enable capture on a device
                  // outside its service. Fail CLOSED if the derivation is unwired.
-                 yuzu::server::authz::VisibleSet exec_visible =
-                     exec_visible_fn_ ? exec_visible_fn_(req)
-                                      : yuzu::server::authz::deny_all();
+                 yuzu::server::DispatchCaller caller =
+                     caller_fn_ ? caller_fn_(req)
+                               : yuzu::server::DispatchCaller{
+                                     .exec_visible = yuzu::server::authz::deny_all()};
                  auto [command_id, sent] = dispatch_fn_(
                      "tar", "configure", {device_id}, /*scope_expr=*/"",
-                     params, exec_visible);
+                     params, caller);
 
                  if (sent == 0) {
                      audit_fn_(req, "tar.source.reenable", "failure",
@@ -1523,12 +1527,13 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // a device outside its service even if username visibility would
                  // admit it. The Ids arm of dispatch_confined drops an
                  // out-of-scope device_id; fail CLOSED if the derivation is unwired.
-                 yuzu::server::authz::VisibleSet exec_visible =
-                     exec_visible_fn_ ? exec_visible_fn_(req)
-                                      : yuzu::server::authz::deny_all();
+                 yuzu::server::DispatchCaller caller =
+                     caller_fn_ ? caller_fn_(req)
+                               : yuzu::server::DispatchCaller{
+                                     .exec_visible = yuzu::server::authz::deny_all()};
                  auto [command_id, sent] =
                      dispatch_fn_("tar", "purge_source", {device_id}, /*scope_expr=*/"", params,
-                                  exec_visible);
+                                  caller);
 
                  if (sent == 0) {
                      audit_fn_(req, "tar.source.purge", "failure", "command", "",

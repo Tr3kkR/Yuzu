@@ -89,6 +89,7 @@
 #include "scope_yaml.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_confined
 #include "dispatch_target_shape.hpp" // check_targeting_shape / targeting_supplied (#2500)
 #include "authz_model.hpp" // #1788: per-arm visibility intersection (in_scope/filter_to_scope)
 #include "dispatch_confined_arms.hpp" // the ONE per-arm intersection, shared with /api/command
@@ -6296,6 +6297,21 @@ private:
         return yuzu::server::authz::compose_exec_visible(facts);
     }
 
+    /// PLAN-006: wraps `derive_exec_visible` with the caller's IDENTITY, so a
+    /// dispatch surface with a live Session can hand `dispatch_confined` a
+    /// principal to work with, not only a visibility filter. Pure plumbing —
+    /// composes `derive_exec_visible` verbatim and adds no new decision.
+    /// `principal_role` mirrors the `role` audited on scope-evaluation rows
+    /// (see `dispatch_confined`'s own `principal_role` param below).
+    yuzu::server::DispatchCaller derive_dispatch_caller(const auth::Session& sess) {
+        return yuzu::server::DispatchCaller{
+            .principal = sess.username,
+            .principal_role = auth::role_to_string(sess.role),
+            .exec_visible = derive_exec_visible(sess),
+            .system = false,
+        };
+    }
+
     /// A-3: the `ConfinedDispatchSink` literal both `dispatch_confined` and
     /// `/api/command` built by hand — byte-identical apart from the local
     /// name (`sink` vs `confined_sink`) — is the same sink because the two
@@ -6332,31 +6348,42 @@ private:
     /// empty selection into a deliberate fleet broadcast (dashboard + MCP —
     /// `true`). This is the seam #1714/#1715's core chokepoint will EXTEND, not
     /// a per-route copy to be forked.
-    /// `principal_role` (C5): carried alongside `principal` on the
-    /// scope-evaluation audit rows this seam emits. Defaulted so the four
-    /// existing callers (all wired through Deps/DispatchFn shapes owned by
-    /// other files — dashboard_routes.hpp, mcp_server.hpp, PolicyEvaluator —
-    /// this wave does not touch) keep compiling unchanged and keep emitting
-    /// role="" exactly as before; a caller updated in a later wave to thread
-    /// its live session's role through can now do so without a second seam.
+    /// `caller.principal_role` (C5): carried alongside `caller.principal` on
+    /// the scope-evaluation audit rows this seam emits.
     ///
-    /// CDX-P1-03/K-3 (adv-fix11): attempted widening McpServer::DispatchFn by
-    /// one param for exactly this — the session is already in scope at both
-    /// MCP call sites (execute_instruction, quarantine_device) via
-    /// ExecVisibleFn. Reverted: the typedef is reused verbatim by 18+ fake
-    /// DispatchFn lambdas in test_mcp_server.cpp alone (each would need
-    /// updating for a signature-only change), plus BundleOrchestrator::
-    /// DispatchFn (execute_bundle) is a SEPARATE, REST-shared typedef with no
-    /// role concept on its REST side — disproportionate blast radius for an
+    /// PLAN-006 (verified; supersedes CDX-P1-03/K-3 below): the calculus that
+    /// declined this widening no longer holds once a principal is the actual
+    /// FEATURE a chokepoint wave needs, not merely audit completeness. The
+    /// widening happened: `DispatchCaller` (dispatch_caller.hpp) replaces the
+    /// bare `exec_visible`/`principal_role` pair on this signature AND on the
+    /// three DispatchFn/CommandDispatchFn typedefs that feed it
+    /// (McpServer::DispatchFn, DashboardRoutes::DispatchFn,
+    /// WorkflowRoutes::CommandDispatchFn); every fake dispatch lambda in
+    /// test_mcp_server.cpp / test_dashboard_tar_fragments.cpp /
+    /// test_workflow_routes.cpp was updated for the signature-only change.
+    /// `BundleOrchestrator::DispatchFn` (execute_bundle) is left as the
+    /// original CDX-P1-03/K-3 comment found it — a SEPARATE, REST-shared
+    /// typedef with no role concept on its REST side; mcp_server.cpp now
+    /// adapts the widened DispatchFn down to it at construction rather than
+    /// touch that shared type. `principal`/`principal_role` are empty for a
+    /// caller not yet wired to identify itself (present-empty `exec_visible`
+    /// still denies); `DispatchCaller::system` marks a genuine
+    /// background/system dispatcher (no Session at all) explicitly.
+    ///
+    /// Original CDX-P1-03/K-3 (adv-fix11) rationale, preserved for context: a
+    /// prior wave attempted widening McpServer::DispatchFn by one param for
+    /// exactly this — the session is already in scope at both MCP call sites
+    /// (execute_instruction, quarantine_device) via ExecVisibleFn — and
+    /// reverted, judging the blast radius (18+ fake DispatchFn lambdas plus
+    /// the BundleOrchestrator coupling above) disproportionate for an
     /// audit-completeness LOW both external reviewers graded non-blocking.
-    /// Still open for a future wave willing to touch those call sites.
     std::pair<std::string, int> dispatch_confined(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,
         const std::string& execution_id,
-        const yuzu::server::authz::VisibleSet& exec_visible,
-        bool broadcast_on_none, const std::string& principal_role = {}) {
+        const yuzu::server::DispatchCaller& caller,
+        bool broadcast_on_none) {
         // Normalize action to lowercase — agent plugins register actions in
         // lowercase and match case-sensitively (was implicit on the MCP path
         // via upstream lowercasing; a safe superset here).
@@ -6426,8 +6453,8 @@ private:
                    const std::string& cmd_id, const std::string& reason) {
                 audit_scope_evaluation_aborted(principal, role, cmd_id, reason);
             },
-            command_id, execution_id, principal_role, agent_ids, scope_expr, exec_visible,
-            broadcast_on_none, cmd);
+            command_id, execution_id, caller.principal_role, agent_ids, scope_expr,
+            caller.exec_visible, broadcast_on_none, cmd);
         (void)ignored_command_id; // always == command_id, minted above
 
         forward_gateway_pending();
@@ -11945,18 +11972,25 @@ private:
         // Shared command-dispatch closure — sends a CommandRequest to agents via
         // gRPC. Hoisted here (was inline in the WorkflowRoutes block) so the
         // PolicyEvaluator and WorkflowRoutes drive the EXACT same dispatch path.
+        //
+        // PLAN-006: this is a genuine background/system dispatcher — its ONLY
+        // production caller is PolicyEvaluator (a compliance-check tick with no
+        // Session in the loop) — so it constructs `DispatchCaller{.system =
+        // true}` explicitly rather than leaving `principal` merely empty by
+        // default: a background dispatch is a deliberate, greppable statement.
         auto command_dispatch_fn =
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& parameters,
                    const std::string& execution_id) -> std::pair<std::string, int> {
             // Background engines + legacy callers dispatch as SYSTEM (unfiltered):
-            // exec_visible = nullopt. Operator surfaces that must confine call the
-            // 7-param command_dispatch_confined_fn (below) instead. Both funnel
-            // through the ONE dispatch_confined seam. broadcast_on_none=false: an
-            // unnamed target here reaches nobody (#2500), never the fleet.
+            // exec_visible = nullopt (DispatchCaller's default). Operator surfaces
+            // that must confine call command_dispatch_confined_fn / the caller-typed
+            // sibling below instead. Both funnel through the ONE dispatch_confined
+            // seam. broadcast_on_none=false: an unnamed target here reaches nobody
+            // (#2500), never the fleet.
             return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
-                                     execution_id, /*exec_visible=*/std::nullopt,
+                                     execution_id, yuzu::server::DispatchCaller{.system = true},
                                      /*broadcast_on_none=*/false);
         };
 
@@ -11965,6 +11999,15 @@ private:
         // Execution:Execute visible set so dashboard + workflow dispatch narrow
         // to it, exactly as /api/command and MCP do. Same seam
         // (dispatch_confined), one extra parameter.
+        //
+        // PLAN-006: kept at its ORIGINAL bare-VisibleSet signature — unlike the
+        // three DispatchFn/CommandDispatchFn typedefs this wave widened
+        // (McpServer, DashboardRoutes, WorkflowRoutes) — because this exact
+        // closure is ALSO fed straight into `RestApiV1::CommandDispatchFn`
+        // below (rest_api_v1.hpp), a fourth, REST-owned typedef out of scope
+        // for this wave. `command_dispatch_caller_fn`, immediately below, is
+        // the sibling WorkflowRoutes now takes instead — same dispatch_confined
+        // seam, real caller identity threaded through.
         auto command_dispatch_confined_fn =
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
@@ -11973,7 +12016,25 @@ private:
                    const yuzu::server::authz::VisibleSet& exec_visible)
             -> std::pair<std::string, int> {
             return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
-                                     execution_id, exec_visible, /*broadcast_on_none=*/false);
+                                     execution_id,
+                                     yuzu::server::DispatchCaller{.exec_visible = exec_visible},
+                                     /*broadcast_on_none=*/false);
+        };
+
+        // PLAN-006: the CommandDispatchFn WorkflowRoutes now takes — same seam,
+        // same broadcast_on_none posture as command_dispatch_confined_fn above,
+        // but forwards the caller's identity (not just its visible set) through
+        // to dispatch_confined. Cannot simply widen command_dispatch_confined_fn
+        // in place: that closure's signature must stay VisibleSet-based to keep
+        // feeding RestApiV1::CommandDispatchFn (rest_api_v1.hpp, out of scope).
+        auto command_dispatch_caller_fn =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                   const std::unordered_map<std::string, std::string>& parameters,
+                   const std::string& execution_id,
+                   const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
+            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
+                                     execution_id, caller, /*broadcast_on_none=*/false);
         };
 
         // PolicyEvaluator — drives the compliance check -> verdict pipeline.
@@ -13230,24 +13291,25 @@ private:
             // DispatchFn — the dashboard execute surface, now routed through the
             // shared dispatch_confined seam exactly as /api/command and MCP are.
             //
-            // CDX-R7-02: carries the operator's Execution:Execute visible set
-            // (`exec_visible`, derived per-request by the ExecVisibleFn below)
-            // and narrows every arm to it — a management group / scope / id-list
-            // / broadcast is a targeting mechanism, never an authz exemption
-            // (#1788). execution_id is empty (dashboard is the legacy untracked
-            // UI path). broadcast_on_none=true preserves the legacy UI contract
-            // that an OMITTED `scope` means the whole fleet. It is NOT about
-            // `__all__`: dashboard_routes passes that through by name (the
-            // Broadcast arm), and refuses a supplied-but-empty `scope=`, so None
-            // reaches here only when no targeting argument was supplied at all.
+            // CDX-R7-02 / PLAN-006: carries the operator's identity + its
+            // Execution:Execute visible set (`caller`, derived per-request by
+            // the CallerFn below) and narrows every arm to it — a management
+            // group / scope / id-list / broadcast is a targeting mechanism,
+            // never an authz exemption (#1788). execution_id is empty (dashboard
+            // is the legacy untracked UI path). broadcast_on_none=true preserves
+            // the legacy UI contract that an OMITTED `scope` means the whole
+            // fleet. It is NOT about `__all__`: dashboard_routes passes that
+            // through by name (the Broadcast arm), and refuses a
+            // supplied-but-empty `scope=`, so None reaches here only when no
+            // targeting argument was supplied at all.
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& parameters,
-                   const yuzu::server::authz::VisibleSet& exec_visible)
+                   const yuzu::server::DispatchCaller& caller)
                 -> std::pair<std::string, int> {
                 auto [command_id, sent] = dispatch_confined(plugin, action, agent_ids, scope_expr,
                                                             parameters, /*execution_id=*/std::string{},
-                                                            exec_visible, /*broadcast_on_none=*/true);
+                                                            caller, /*broadcast_on_none=*/true);
 
                 if (sent > 0) {
                     // Publish RUNNING status + clear results via SSE.
@@ -13275,17 +13337,19 @@ private:
                 }
                 return {command_id, sent};
             },
-            // ExecVisibleFn — CDX-R7-02: resolve the caller's Execution:Execute
-            // visible set from the request. The dashboard execute handlers gate
-            // via perm_fn and hold no Session at the dispatch site, so resolve it
-            // here from a throwaway Response (never written back). A session that
-            // cannot be resolved yields a present-EMPTY set — fail CLOSED, deny
-            // all — never nullopt.
-            [this](const httplib::Request& req) -> yuzu::server::authz::VisibleSet {
+            // CallerFn — CDX-R7-02 / PLAN-006: resolve the caller's identity +
+            // Execution:Execute visible set from the request. The dashboard
+            // execute handlers gate via perm_fn and hold no Session at the
+            // dispatch site, so resolve it here from a throwaway Response
+            // (never written back). A session that cannot be resolved yields an
+            // empty principal alongside a present-EMPTY set — fail CLOSED on
+            // visibility, deny all — never nullopt.
+            [this](const httplib::Request& req) -> yuzu::server::DispatchCaller {
                 httplib::Response throwaway;
                 if (auto s = require_auth(req, throwaway))
-                    return derive_exec_visible(*s);
-                return std::unordered_set<std::string>{};
+                    return derive_dispatch_caller(*s);
+                return yuzu::server::DispatchCaller{
+                    .exec_visible = yuzu::server::authz::deny_all()};
             },
             // ResolveFn — resolve instruction text → (plugin, action)
             [this](const std::string& text) -> std::pair<std::string, std::string> {
@@ -13354,19 +13418,22 @@ private:
         wf_deps.product_pack_store = product_pack_store_.get();
         wf_deps.instruction_store = instruction_store_.get();
         wf_deps.policy_store = policy_store_.get();
-        // K-R7-02: workflow + instruction dispatch is an OPERATOR surface, so it
-        // routes through the CONFINED 7-param sibling (carries the caller's
-        // Execution:Execute visible set), not the system 6-param command_dispatch_fn.
-        // Both funnel through the ONE dispatch_confined seam.
-        wf_deps.command_dispatch_fn = command_dispatch_confined_fn;
-        wf_deps.exec_visible_fn =
-            [this](const httplib::Request& req) -> yuzu::server::authz::VisibleSet {
+        // K-R7-02 / PLAN-006: workflow + instruction dispatch is an OPERATOR
+        // surface, so it routes through the caller-carrying sibling (carries
+        // the caller's identity + Execution:Execute visible set), not the
+        // system command_dispatch_fn. Both funnel through the ONE
+        // dispatch_confined seam.
+        wf_deps.command_dispatch_fn = command_dispatch_caller_fn;
+        wf_deps.caller_fn =
+            [this](const httplib::Request& req) -> yuzu::server::DispatchCaller {
             // Resolve the session from a throwaway Response (never written back);
-            // an unresolved session yields a present-EMPTY set (fail CLOSED).
+            // an unresolved session yields an empty principal alongside a
+            // present-EMPTY set (fail CLOSED on visibility).
             httplib::Response throwaway;
             if (auto s = require_auth(req, throwaway))
-                return derive_exec_visible(*s);
-            return std::unordered_set<std::string>{};
+                return derive_dispatch_caller(*s);
+            return yuzu::server::DispatchCaller{
+                .exec_visible = yuzu::server::authz::deny_all()};
         };
         wf_deps.approval_manager = approval_manager_.get();
         wf_deps.response_store = response_store_.get();
@@ -14405,14 +14472,14 @@ private:
                        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                        const std::unordered_map<std::string, std::string>& parameters,
                        const std::string& execution_id,
-                       const yuzu::server::authz::VisibleSet& exec_visible)
+                       const yuzu::server::DispatchCaller& caller)
                     -> std::pair<std::string, int> {
                     // MCP normalises an omitted target to kBroadcastScope upstream
                     // (mcp_server.cpp), so broadcast_on_none=true states its
                     // deliberate broadcast-on-empty contract. Same seam as the
                     // shared closure and the dashboard — one confined arm logic.
                     auto r = dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
-                                               execution_id, exec_visible,
+                                               execution_id, caller,
                                                /*broadcast_on_none=*/true);
                     spdlog::info("MCP execute_instruction: {}:{} → {} agent(s)", plugin, action,
                                  r.second);
@@ -14537,11 +14604,12 @@ private:
                                                                  principal.role, target_type,
                                                                  target_id, detail, principal.cls);
                 },
-                // #1788: per-request Execution:Execute visible-set deriver, so the MCP
-                // execute_instruction / execute_bundle dispatch confines to the caller's
-                // visible device set — the SAME derivation /api/command uses.
-                [this](const auth::Session& s) -> yuzu::server::authz::VisibleSet {
-                    return derive_exec_visible(s);
+                // #1788 / PLAN-006: per-request DispatchCaller deriver, so the MCP
+                // execute_instruction / execute_bundle / quarantine_device dispatch
+                // confines to AND identifies the caller — the SAME derivation
+                // /api/command's visible-set half uses, now carrying identity too.
+                [this](const auth::Session& s) -> yuzu::server::DispatchCaller {
+                    return derive_dispatch_caller(s);
                 });
         }
 
