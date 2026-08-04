@@ -78,12 +78,12 @@ constexpr const char* kMetricFinalUnpinned = "yuzu_mcp_stream_final_unpinned_tot
 /// counter carries that reading (the LRU is the graceful degradation, not a licence).
 constexpr const char* kMetricPinDisplaced = "yuzu_mcp_stream_pin_displaced_total";
 /// The final was written to the wire (the client has it), but the bridge's own
-/// credit step (on_final_written) threw before it could run - so the session's
-/// pin is retained rather than released. Needs a genuinely broken platform mutex
-/// (the same modelled fault class as kMetricChargeReleaseDeferred), so any nonzero
-/// value is a signal about the host, not a rate to tune. The close is still
-/// reported to the client as kCompleted, since that is what they actually
-/// received; this counter is the only server-side signal the credit step failed.
+/// credit step (on_final_written, mcp_stream_bridge.cpp) threw before it could
+/// run - so the session's pin is retained rather than released. Needs a
+/// genuinely broken platform mutex, so any nonzero value is a signal about the
+/// host, not a rate to tune. The close is still reported to the client as
+/// kCompleted, since that is what they actually received; this counter is the
+/// only server-side signal the credit step failed.
 constexpr const char* kMetricFinalCreditFailed = "yuzu_mcp_stream_final_credit_failed_total";
 
 void count_reject(yuzu::MetricsRegistry* metrics, const char* reason) {
@@ -1512,9 +1512,9 @@ bool McpPostPump::pump_once_impl(const WriteFn& write) {
             return finish(write, McpStreamClose::kClientGone);
         }
         if (on_final_written_) {
-            // Contained: this call reaches into the bridge (lock acquisition, per
-            // the file's own modelled fault class) after the bytes are already on
-            // the wire. A throw here must not read back as an internal fault to
+            // Contained: this call reaches into the bridge (a lock acquisition
+            // that can throw) after the bytes are already on the wire. A throw
+            // here must not read back as an internal fault to
             // the client that just received a correct result - note the true
             // reason FIRST (finish's own note_close_reason is first-wins, so this
             // wins the race against pump_once's outer catch), then let the
