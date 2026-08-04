@@ -570,13 +570,13 @@ TEST_CASE("bridge pin-ack sweep - resume consumption frees streamed admission",
         REQUIRE(poll_until(
             [&, i] { return s.stream->pinned_count() == static_cast<std::size_t>(i); }));
     }
-    auto pin_reject1 = fx.bridge->reserve(s.id, "alice", json(5), json("t"), true);
-    // Null-guarded like the sibling at the C6a test: if the cap ever fails to
-    // bite, std::string(nullptr) is UB and kills the whole binary instead of
-    // failing this assertion cleanly.
-    CHECK(std::string(pin_reject1.reject_reason == nullptr ? ""
-                                                           : pin_reject1.reject_reason) ==
-          "pin_slots");
+    // No pre-resume reserve probe here any more. These four records are parked
+    // with COMMITTED, UNDELIVERED finals - exactly the state #2740's admission
+    // displacement now reclaims a slot from - so a fifth reserve at this point
+    // would succeed by unpinning one of them and perturb the very pin set this
+    // test is about. Lockout-versus-displacement is asserted in the #2740 case;
+    // what THIS test owns is that a resume ack frees admission on its own, which
+    // the displacement counter below pins.
 
     // Find the SMALLEST pinned id and consume exactly it via a resume cursor
     // (Last-Event-ID >= pinned_id is the consumption proof).
@@ -602,6 +602,11 @@ TEST_CASE("bridge pin-ack sweep - resume consumption frees streamed admission",
     CHECK_FALSE(fx.bridge->phase_for(s.id, json(1)).has_value());
     CHECK(fx.bridge->phase_for(s.id, json(2)).has_value());
     CHECK(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+    // ...and it was admitted by the ACK, not by #2740's displacement: with three
+    // pins against a cap of four the admission sum is already under water, so no
+    // pin was released to make room. Without this the assertion above would pass
+    // even if the resume path had stopped freeing anything at all.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value() == 0.0);
     CHECK(fx.audit_count("mcp.bridge.pin_acked") == 1);
     // #2487: teardown owns THREE things - the map entry, the streamed charge, and
     // the bus subscription. The two lines above cover the first two; without this
@@ -613,6 +618,151 @@ TEST_CASE("bridge pin-ack sweep - resume consumption frees streamed admission",
     CHECK(fx.bus.subscriber_count("exec-pin-2") == 1);  // siblings untouched
     CHECK(fx.bus.subscriber_count("exec-pin-3") == 1);
     CHECK(fx.bus.subscriber_count("exec-pin-4") == 1);
+}
+
+TEST_CASE("bridge admission - client-gone finals never lock a session out of streaming (#2740)",
+          "[mcp][bridge][2f]") {
+    // A streamed POST whose peer dies before the final is written leaves that
+    // final PINNED: the prompt release (on_final_written) is reached only after
+    // write_all succeeds, and the remaining routes - a GET resume acking past the
+    // pinned id, or session death - both need a channel a POST-only client does
+    // not have. Four such calls used to exhaust the session's four slots forever,
+    // answering 429 with "wait for one to finish" while nothing was in flight and
+    // every conforming 30s retry slid the session TTL so it never idled out.
+    //
+    // The helper builds exactly that state: park the record (peer gone), THEN let
+    // the terminal land, so the final is committed and pinned with no wire to
+    // take it.
+    Fx fx;
+    auto s = fx.make_session();
+    const auto park_with_undelivered_final = [&](int id) {
+        const std::string exec = "exec-gone-" + std::to_string(id);
+        // Retry a pin_slots reject rather than REQUIREing the first attempt: the
+        // admission sum transiently reads one settling record as two slots (the
+        // pin commits before the charge clears, both inside one projection
+        // claim), and reserve fails CLOSED on that reading by design. A real
+        // client does exactly this on its Retry-After. Without the retry this
+        // setup is flaky for a reason that has nothing to do with what the
+        // sections below assert.
+        REQUIRE(poll_until([&] { return fx.bridge->reserve(s.id, "alice", json(id),
+                                                           json("t"), true).ok; }));
+        REQUIRE(fx.bridge->subscribe(s.id, json(id), exec));
+        REQUIRE(fx.bridge->arm(s.id, json(id), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(id)));  // peer gone, no final written
+        fx.bus.publish(exec, "execution-completed", kCompleted, /*is_terminal=*/true);
+        // Settle before the next reserve, so each park contributes exactly one
+        // slot when the next one is admitted.
+        REQUIRE(poll_until([&] {
+            return s.stream->pinned_count() == static_cast<std::size_t>(id);
+        }));
+    };
+    const auto displaced_count = [&] {
+        return fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value();
+    };
+
+    SECTION("four client-gone calls leave a fifth admissible") {
+        for (int i = 1; i <= 4; ++i) {
+            park_with_undelivered_final(i);
+        }
+        // the helper already settled each park; nothing further to wait for
+        auto fifth = fx.bridge->reserve(s.id, "alice", json(5), json("t"), true);
+        CHECK(fifth.ok);
+        CHECK(displaced_count() == 1.0);
+        CHECK(fx.audit_count("mcp.bridge.pin_displaced_for_admission") == 1);
+        // The OLDEST parked record yields - its resume window is the one most
+        // likely already gone - and the result stays fetchable by execution_id.
+        CHECK(s.stream->pinned_count() == 3);
+        // The lockout is gone for good, not merely deferred by one: each further
+        // client-gone call displaces the next-oldest rather than refusing.
+        for (int i = 6; i <= 8; ++i) {
+            CHECK(fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok);
+        }
+    }
+
+    SECTION("a displaced final is unpinned, NOT erased - a resume can still collect it") {
+        for (int i = 1; i <= 4; ++i) {
+            park_with_undelivered_final(i);
+        }
+        REQUIRE(poll_until([&] { return s.stream->pinned_count() == 4; }));
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+        // Displacement removes the eviction EXEMPTION, nothing more: the frame is
+        // still in the ring, so a resume from before it still replays it. This is
+        // the whole reason displacement is acceptable rather than data loss.
+        CHECK(count_results(ring_frames(*s.stream, "alice")) == 4);
+    }
+
+    SECTION("live streamed calls are never displaced - the concurrency limit still bites") {
+        // Four records still kStreaming with their finals in flight: no pin here
+        // belongs to an abandoned response, so the fifth must be REFUSED, and the
+        // refusal must say so in terms that are true.
+        for (int i = 1; i <= 4; ++i) {
+            const std::string exec = "exec-live-" + std::to_string(i);
+            REQUIRE(fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok);
+            REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
+            REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
+                    Bridge::ArmOutcome::kArmed);
+        }
+        auto fifth = fx.bridge->reserve(s.id, "alice", json(5), json("t"), true);
+        CHECK_FALSE(fifth.ok);
+        CHECK(std::string(fifth.reject_reason == nullptr ? "" : fifth.reject_reason) ==
+              "pin_slots");
+        // Charges outstanding, so "wait for one to finish" is the true advice.
+        CHECK(fifth.pin_slots_held == Bridge::PinSlotsHeld::kCharges);
+        CHECK(displaced_count() == 0.0);
+    }
+
+    SECTION("a mixed set displaces only the parked pin and leaves a live one alone") {
+        for (int i = 1; i <= 3; ++i) {
+            park_with_undelivered_final(i);
+        }
+        REQUIRE(poll_until([&] { return s.stream->pinned_count() == 3; }));
+        // A fourth call that is genuinely LIVE: armed, streaming, no terminal yet,
+        // so it holds a charge rather than a pin. Three pins plus this one charge
+        // is the cap, which is what puts admission on the reject path at all.
+        const std::string live = "exec-live-4";
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(4), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(4), live));
+        REQUIRE(fx.bridge->arm(s.id, json(4), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+
+        // Capture the parked pins BEFORE admission so the survivor set is checked
+        // by id rather than by count.
+        std::vector<std::uint64_t> parked;
+        for (std::uint64_t id = 1; id < s.stream->next_event_id(); ++id) {
+            if (s.stream->is_pinned(id)) {
+                parked.push_back(id);
+            }
+        }
+        REQUIRE(parked.size() == 3);  // the live call holds a charge, not a pin
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+        CHECK(displaced_count() == 1.0);
+        CHECK_FALSE(s.stream->is_pinned(parked.front()));  // oldest parked displaced
+        CHECK(s.stream->is_pinned(parked[1]));             // the others untouched
+        CHECK(s.stream->is_pinned(parked[2]));
+        // The live call is not a candidate at any point: it is still streaming and
+        // its final has not been committed, let alone abandoned.
+        CHECK(fx.bridge->phase_for(s.id, json(4)) == Bridge::Phase::kStreaming);
+    }
+
+    SECTION("a late on_final_written for a displaced record is a no-op, and the sweep reaps it") {
+        for (int i = 1; i <= 4; ++i) {
+            park_with_undelivered_final(i);
+        }
+        auto victim_key = fx.bridge->record_key(s.id, json(1));
+        REQUIRE(victim_key.has_value());
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+
+        // A pump that comes back from the dead after its record was displaced must
+        // not resurrect anything: the unpin is id-targeted and the id is already
+        // released, so this is a no-op, and the record is then reapable by the
+        // sweep's pin-ack arm (final_published, pin gone) exactly as if a resume
+        // had acked it. This is what makes displacement self-cleaning.
+        CHECK(fx.bridge->on_final_written(*victim_key));
+        fx.bridge->sweep();
+        CHECK_FALSE(fx.bridge->phase_for(s.id, json(1)).has_value());
+        CHECK(fx.bridge->phase_for(s.id, json(2)).has_value());  // siblings untouched
+    }
 }
 
 TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final is never lost",

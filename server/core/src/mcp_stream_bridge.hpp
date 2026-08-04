@@ -408,12 +408,27 @@ public:
         return idx < kTeardownStageCount ? kTeardownStageNames[idx] : "unknown";
     }
 
+    /// What was actually holding this session's streamed slots when a `pin_slots`
+    /// reject was emitted (#2740). The refusal's remediation is chosen from this,
+    /// because ONE sentence cannot be true of both states: `kCharges` means calls
+    /// that reserved and have not settled a terminal (ordinarily in flight - the
+    /// text may say "wait"), `kPins` means every slot is a COMMITTED final that no
+    /// wire has taken delivery of, where waiting is exactly what will not help.
+    /// Never asserts a fault: a healthy session passes through `kPins` during the
+    /// terminal-to-wire flush window, which is why the text points at the metric
+    /// rather than declaring one (see `count_pin_slots_reject`).
+    enum class PinSlotsHeld : int { kNotApplicable, kCharges, kPins };
+
     struct ReserveResult {
         bool ok = false;
         /// Static literal iff !ok - doubles as the reject_total{reason} label:
         /// "disabled" | "shutdown" | "unknown_session" | "duplicate_request_id" |
         /// "global_cap" | "pin_slots".
         const char* reject_reason = nullptr;
+        /// Set only alongside `reject_reason == "pin_slots"`. Deliberately NOT a
+        /// new reject_reason value: that string is a CLOSED metric label set, and
+        /// splitting it would silently re-partition every existing dashboard.
+        PinSlotsHeld pin_slots_held = PinSlotsHeld::kNotApplicable;
     };
 
     /// `bus` nullable ⇒ bridge disabled: reserve() rejects "disabled", nothing
@@ -993,6 +1008,31 @@ private:
     /// holding the slots. Called at the reject site so it cannot drift from the
     /// expression admission actually evaluates.
     void count_pin_slots_reject(std::size_t pinned, std::size_t unpinned) noexcept;  ///< never called under bridge_mu_
+    /// #2740 displacement counter. Never called under bridge_mu_ (the registry has
+    /// its own mutex; the admission lock is the global one).
+    void count_pin_displaced_for_admission() noexcept;
+    /// #2740. Called from the admission path with `bridge_mu_` HELD, on the pass
+    /// that is about to refuse `pin_slots`: releases the pin of this session's
+    /// OLDEST parked record whose committed final no wire ever took delivery of,
+    /// so a new streamed call can be admitted in its place. Returns that record's
+    /// execution id and the released event id, or nullopt when no such record
+    /// exists (every slot is a live call, or the pins are ring-side orphans no
+    /// record references - see the reserve() call site for why an orphan is NOT
+    /// displaced ring-side).
+    ///
+    /// Deliberately under the SAME `bridge_mu_` hold as the admission decision:
+    /// releasing the lock to unpin and then re-admitting is a TOCTOU between two
+    /// concurrent reserves on one session, and every sweep claim path takes
+    /// `bridge_mu_` too, so holding it is also what fences a teardown from
+    /// claiming a candidate mid-scan. Lock order is the declared
+    /// `bridge_mu_ -> BridgeRecord::mu -> McpStreamState::mu_` (on_final_written's
+    /// order). Allocation-free apart from the returned id, and the metric/audit
+    /// for a displacement must be emitted by the CALLER after the lock releases.
+    struct DisplacedPin {
+        std::string execution_id;
+        std::uint64_t event_id = 0;
+    };
+    std::optional<DisplacedPin> displace_parked_pin_locked(const std::string& session_id);
     void flush_record_obs(BridgeRecord& rec) noexcept;
     void flush_core_obs() noexcept;
     /// `detail` is a string_view, NOT a `const std::string&`: every caller passes a

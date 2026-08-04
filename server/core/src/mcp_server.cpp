@@ -6025,12 +6025,38 @@ McpServer::HandlerFn McpServer::build_handler(
                                 return;
                             } else {
                                 // global_cap | pin_slots - capacity, retryable.
+                                //
+                                // #2740: the pin_slots remediation is chosen by what
+                                // was actually holding the slots, because ONE sentence
+                                // cannot be true of both states. "Wait for one to
+                                // finish" is sound advice while charges are
+                                // outstanding (calls that reserved and have not
+                                // settled a terminal), and was actively misleading
+                                // when every slot held a COMMITTED final no wire had
+                                // taken delivery of - waiting is exactly what does not
+                                // clear that, and a conforming client honouring
+                                // retry_after_ms slid the session TTL on every retry
+                                // so it never idled out either. Admission now displaces
+                                // the oldest such final rather than refusing, so this
+                                // arm is reached only when the remaining pins belong to
+                                // finals still being written, or to ring-side orphans
+                                // no record references - neither of which a wait fixes,
+                                // and both of which a fresh session does.
+                                const char* pin_remediation =
+                                    rr.pin_slots_held == McpStreamBridge::PinSlotsHeld::kPins
+                                        ? "this session's streamed slots are held by results "
+                                          "that have not reached a client rather than by live "
+                                          "calls, so waiting will not free one: resume on the "
+                                          "GET channel to collect them, or re-initialize for a "
+                                          "fresh session. A rate here is reported by "
+                                          "yuzu_mcp_bridge_pin_slots_reject_total{held=\"pins\"}"
+                                        : "this session already has the maximum streamed calls "
+                                          "in flight; wait for one to finish";
                                 streamed_reject(
                                     429, mcp::kMcpStreamCap, "Streamed request capacity reached",
                                     why == "pin_slots" ? "post_pin_slots" : "post_global_cap",
                                     why == "pin_slots"
-                                        ? "this session already has the maximum streamed calls in "
-                                          "flight; wait for one to finish"
+                                        ? pin_remediation
                                         : "retry shortly, or retry without an SSE Accept for a "
                                           "plain response",
                                     mcp::kMcpStreamedPostRetryAfterMs);
