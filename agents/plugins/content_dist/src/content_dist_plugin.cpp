@@ -6,22 +6,30 @@
  *   "execute_staged" — Execute a previously staged file.
  *   "list_staged"    — List files in the staging directory.
  *   "cleanup"        — Remove staged files older than N hours.
- *   "upload_file"    — Upload a local file to the Yuzu server.
+ *   "upload_file"    — Upload a local file to the Yuzu server via the
+ *                       one-time upload-grant + authenticated chunked
+ *                       receive protocol (PR1.6, CC-06).
  *
- * Security: uses cpp-httplib for downloads (no shell invocation).
+ * Security: uses cpp-httplib for downloads/uploads (no shell invocation).
  *           execute_staged uses CreateProcessW/fork+execvp (no shell interpretation).
  *           Args validated to block shell metacharacters.
  */
 
 #include <yuzu/plugin.hpp>
 
+#include "content_dist_upload_parsers.hpp"
+
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -48,6 +56,7 @@
 #include <httplib.h>
 
 namespace fs = std::filesystem;
+namespace up = yuzu::content_dist::upload;
 
 namespace {
 
@@ -67,44 +76,93 @@ fs::path staging_dir() {
     return dir;
 }
 
+// Incremental SHA-256: `update()` any number of times over buffers fed to it
+// in order, `finalize()` once at the end. Extracted out of what used to be a
+// single whole-stream `sha256_stream()` so `do_upload` (below) can feed it
+// the EXACT buffer just transmitted, immediately once the server has
+// acknowledged it — binding the committed digest to bytes actually sent
+// over the wire rather than a second, independent re-read of the file after
+// the fact (#P7-003: a second read pass cannot see a write that lands, via
+// another handle, in the gap between "chunk sent" and "file re-read").
+#ifdef _WIN32
+class IncrementalSha256 {
+public:
+    IncrementalSha256() {
+        BCryptOpenAlgorithmProvider(&alg_, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+        DWORD result_len = 0;
+        BCryptGetProperty(alg_, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_len_),
+                          sizeof(hash_len_), &result_len, 0);
+        BCryptCreateHash(alg_, &hash_, nullptr, 0, nullptr, 0, 0);
+    }
+    ~IncrementalSha256() {
+        if (hash_)
+            BCryptDestroyHash(hash_);
+        if (alg_)
+            BCryptCloseAlgorithmProvider(alg_, 0);
+    }
+    IncrementalSha256(const IncrementalSha256&) = delete;
+    IncrementalSha256& operator=(const IncrementalSha256&) = delete;
+
+    void update(const char* data, std::size_t len) {
+        BCryptHashData(hash_, reinterpret_cast<PUCHAR>(const_cast<char*>(data)),
+                       static_cast<ULONG>(len), 0);
+    }
+    std::string finalize() {
+        std::vector<UCHAR> digest(hash_len_);
+        BCryptFinishHash(hash_, digest.data(), hash_len_, 0);
+        std::string hex;
+        for (auto b : digest)
+            hex += std::format("{:02x}", b);
+        return hex;
+    }
+
+private:
+    BCRYPT_ALG_HANDLE alg_{nullptr};
+    BCRYPT_HASH_HANDLE hash_{nullptr};
+    DWORD hash_len_{0};
+};
+#else
+class IncrementalSha256 {
+public:
+    IncrementalSha256() : ctx_(EVP_MD_CTX_new()) { EVP_DigestInit_ex(ctx_, EVP_sha256(), nullptr); }
+    ~IncrementalSha256() {
+        if (ctx_)
+            EVP_MD_CTX_free(ctx_);
+    }
+    IncrementalSha256(const IncrementalSha256&) = delete;
+    IncrementalSha256& operator=(const IncrementalSha256&) = delete;
+
+    void update(const char* data, std::size_t len) { EVP_DigestUpdate(ctx_, data, len); }
+    std::string finalize() {
+        unsigned char digest[EVP_MAX_MD_SIZE];
+        unsigned int len = 0;
+        EVP_DigestFinal_ex(ctx_, digest, &len);
+        std::string hex;
+        for (unsigned i = 0; i < len; ++i)
+            hex += std::format("{:02x}", digest[i]);
+        return hex;
+    }
+
+private:
+    EVP_MD_CTX* ctx_;
+};
+#endif
+
+// SHA-256 over an already-open, positioned ifstream, reading from its
+// CURRENT position to EOF — never opens or closes the handle itself.
+std::string sha256_stream(std::ifstream& file) {
+    IncrementalSha256 hasher;
+    char buf[8192];
+    while (file.read(buf, sizeof(buf)) || file.gcount() > 0)
+        hasher.update(buf, static_cast<std::size_t>(file.gcount()));
+    return hasher.finalize();
+}
+
 std::string sha256_file(const fs::path& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file)
         return {};
-#ifdef _WIN32
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
-    DWORD hash_len = 0, result_len = 0;
-    BCryptGetProperty(alg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_len),
-                      sizeof(hash_len), &result_len, 0);
-    BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0);
-    char buf[8192];
-    while (file.read(buf, sizeof(buf)) || file.gcount() > 0)
-        BCryptHashData(hash, reinterpret_cast<PUCHAR>(buf), static_cast<ULONG>(file.gcount()), 0);
-    std::vector<UCHAR> digest(hash_len);
-    BCryptFinishHash(hash, digest.data(), hash_len, 0);
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(alg, 0);
-    std::string hex;
-    for (auto b : digest)
-        hex += std::format("{:02x}", b);
-    return hex;
-#else
-    auto* ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr);
-    char buf[8192];
-    while (file.read(buf, sizeof(buf)) || file.gcount() > 0)
-        EVP_DigestUpdate(ctx, buf, static_cast<size_t>(file.gcount()));
-    unsigned char digest[EVP_MAX_MD_SIZE];
-    unsigned int len = 0;
-    EVP_DigestFinal_ex(ctx, digest, &len);
-    EVP_MD_CTX_free(ctx);
-    std::string hex;
-    for (unsigned i = 0; i < len; ++i)
-        hex += std::format("{:02x}", digest[i]);
-    return hex;
-#endif
+    return sha256_stream(file);
 }
 
 bool is_safe_filename(std::string_view name) {
@@ -414,6 +472,63 @@ int safe_execute(const fs::path& exe_path, std::string_view args_str, std::strin
 
 #endif
 
+// ── ABI4 per-OS capability declaration (#2204) ──────────────────────────────
+//
+// `rung` is the ADR-3002 ACQUISITION rung (docs/adr/3002-acquisition-ladder.md:66-73):
+// 1 = native OS interface (zero subprocesses), 2 = argv via a runner (no
+// shell), 3 = shell/interpreter payload. One row per `actions()` entry,
+// same order, same names — capmatrix-gen hard-errors on any mismatch.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "stage",
+        // httplib download over a socket this plugin opens itself — zero
+        // subprocesses, rung 1 on every OS. HTTPS is a build-time REQUIRED
+        // OpenSSL dependency on Linux/macOS (content_dist/meson.build:
+        // `dependency('openssl', required: true, ...)`) but only
+        // best-effort on Windows (`required: false`) — CPPHTTPLIB_OPENSSL_SUPPORT
+        // is conditionally undefined there (see `download_file`'s #else
+        // branch above), so Windows is CONSTRAINED, not SUPPORTED.
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "httplib_tls", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "httplib_tls", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_CONSTRAINED, 1, "httplib_tls",
+         "requires OpenSSL to be found at build time; HTTPS unavailable if absent"},
+    },
+    {
+        /* .action      = */ "execute_staged",
+        // Spawns the staged binary directly from a pre-split argv —
+        // CreateProcessW on Windows, fork+execvp on POSIX — never a shell
+        // (see `safe_execute` above): rung 2 on every OS.
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 2, "fork_execvp", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 2, "fork_execvp", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 2, "createprocessw", nullptr},
+    },
+    {
+        /* .action      = */ "list_staged",
+        // std::filesystem directory iteration — in-process, rung 1.
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+    },
+    {
+        /* .action      = */ "cleanup",
+        // std::filesystem removal — in-process, rung 1.
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+    },
+    {
+        /* .action      = */ "upload_file",
+        // Same httplib-socket transport as `stage`, same Windows OpenSSL
+        // caveat.
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "httplib_tls", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "httplib_tls", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_CONSTRAINED, 1, "httplib_tls",
+         "requires OpenSSL to be found at build time; HTTPS unavailable if absent"},
+    },
+};
+
 } // namespace
 
 class ContentDistPlugin final : public yuzu::Plugin {
@@ -429,6 +544,14 @@ public:
         static const char* acts[] = {"stage",   "execute_staged", "list_staged",
                                      "cleanup", "upload_file",    nullptr};
         return acts;
+    }
+
+    [[nodiscard]] const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    [[nodiscard]] size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
@@ -595,22 +718,39 @@ private:
         return 0;
     }
 
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+    // Sends the grant/session credential's DELETE (cancel) so a
+    // server-side partial blob is discarded, then surfaces `error_msg`.
+    // Never itself an error — a cancel failure is not this command's
+    // failure to report, the upload's own failure already is. Only
+    // declared when SSLClient exists at all (see `do_upload`'s matching
+    // build guard below) — TLS is mandatory for this transport, so there
+    // is no non-SSL variant to guard against.
+    void abort_upload(httplib::SSLClient& client, const std::string& cancel_path,
+                      const std::string& session_header, yuzu::CommandContext& ctx,
+                      const std::string& error_msg) {
+        httplib::Headers cancel_headers = {{"X-Yuzu-Upload-Session", session_header}};
+        client.Delete(cancel_path, cancel_headers);
+        ctx.write_output(std::format("error|{}", error_msg));
+    }
+#endif
+
+    // ", reason=<name>" when present, empty otherwise — pulled out of the
+    // several error-message call sites below so none of them has to juggle
+    // a mixed string_view/const-char* ternary.
+    static std::string describe_reason(std::optional<up::Reason> reason) {
+        if (!reason)
+            return {};
+        return std::string{", reason="} + std::string{up::reason_string(*reason)};
+    }
+
     int do_upload(yuzu::CommandContext& ctx, yuzu::Params params) {
         auto path_str = params.get("path");
-        auto server_url = params.get("server_url");
-        if (path_str.empty()) {
-            ctx.write_output("error|missing required parameter: path");
-            return 1;
-        }
-
-        // If no server_url provided, try to derive from agent config
-        if (server_url.empty()) {
-            yuzu::PluginContext pctx{g_ctx};
-            server_url = pctx.get_config("agent.server_web_url");
-        }
-        if (server_url.empty()) {
+        auto grant_id = params.get("grant_id");
+        auto grant_secret = params.get("grant_secret");
+        if (path_str.empty() || grant_id.empty() || grant_secret.empty()) {
             ctx.write_output(
-                "error|missing server_url parameter and agent.server_web_url not configured");
+                "error|missing required parameters: path, grant_id, grant_secret");
             return 1;
         }
 
@@ -648,90 +788,345 @@ private:
             }
         }
 
-        auto file_size = fs::file_size(file_path, ec);
+        std::error_code size_ec;
+        const auto file_size = static_cast<std::int64_t>(fs::file_size(file_path, size_ec));
+        if (size_ec || file_size <= 0) {
+            ctx.write_output("error|failed to determine file size, or file is empty");
+            return 1;
+        }
+
         int max_mb = 100;
         auto max_str = params.get("max_size_mb", "100");
         try {
             max_mb = std::stoi(std::string{max_str});
         } catch (...) {}
-        if (file_size > static_cast<std::uintmax_t>(max_mb) * 1024 * 1024) {
+        if (static_cast<std::uintmax_t>(file_size) > static_cast<std::uintmax_t>(max_mb) * 1024 * 1024) {
             ctx.write_output(
                 std::format("error|file too large ({} bytes, max {} MB)", file_size, max_mb));
             return 1;
         }
 
-        // Compute SHA-256
-        auto hash = sha256_file(file_path);
-        if (hash.empty()) {
-            ctx.write_output("error|failed to compute file hash");
+        // The base URL comes ONLY from the agent's own configured server
+        // transport (agent.server_web_url) — this action no longer accepts
+        // an operator-supplied URL parameter at all (CC-06), and no request
+        // below ever carries a self-declared agent id: identity is entirely
+        // a server-side fact tied to the grant. TLS is mandatory —
+        // an explicit http:// value is a hard configuration error, never
+        // silently used or upgraded; a bare host (no scheme) defaults to
+        // https, matching this plugin's pre-existing bare-host convention.
+        yuzu::PluginContext pctx{g_ctx};
+        auto configured = pctx.get_config("agent.server_web_url");
+        if (configured.empty()) {
+            ctx.write_output(
+                "error|agent.server_web_url is not configured; cannot reach the upload endpoint");
+            return 1;
+        }
+        if (configured.starts_with("http://")) {
+            ctx.write_output("error|agent.server_web_url must not be http://; TLS is mandatory");
+            return 1;
+        }
+        std::string url_to_parse = configured.starts_with("https://")
+                                       ? std::string{configured}
+                                       : ("https://" + std::string{configured});
+        ParsedUrl base;
+        if (!parse_url(url_to_parse, base) || !base.is_https) {
+            ctx.write_output("error|agent.server_web_url is not a valid host or URL");
             return 1;
         }
 
-        // Read file contents
-        std::ifstream ifs(file_path, std::ios::binary);
-        if (!ifs) {
+#ifndef CPPHTTPLIB_OPENSSL_SUPPORT
+        ctx.write_output("error|HTTPS not supported in this build (OpenSSL not available)");
+        return 1;
+#else
+        httplib::SSLClient client(base.host, base.port);
+        client.set_connection_timeout(30);
+        client.set_read_timeout(300);
+        client.enable_server_certificate_verification(true);
+
+        // The destination is opened EXACTLY ONCE for this upload. Every
+        // chunk below reads its bytes via `seekg` on THIS SAME ifstream
+        // handle, and the commit hash is accumulated incrementally from the
+        // SAME buffer each chunk transmits, the moment the server
+        // acknowledges it — never by reopening the file or independently
+        // re-reading it through a second pass — so the committed digest
+        // can never describe different bytes than were actually streamed
+        // to the server (#P7-003).
+        std::ifstream file(file_path, std::ios::binary);
+        if (!file.is_open()) {
             ctx.write_output("error|failed to open file");
             return 1;
         }
-        std::string content((std::istreambuf_iterator<char>(ifs)),
-                            std::istreambuf_iterator<char>());
-        ifs.close();
 
-        // Parse server URL and POST the file
-        std::string url{server_url};
-        std::string scheme = "https";
-        std::string host = url;
+        // ── Session open ─────────────────────────────────────────────
+        const std::string grant_header = std::string{grant_id} + "." + std::string{grant_secret};
+        httplib::Headers open_headers = {{"X-Yuzu-Upload-Grant", grant_header}};
 
-        if (url.starts_with("https://")) {
-            host = url.substr(8);
-            scheme = "https";
-        } else if (url.starts_with("http://")) {
-            host = url.substr(7);
-            scheme = "http";
+        std::optional<up::SessionOpenResponse> session;
+        for (int attempt = 1;; ++attempt) {
+            auto open_res = client.Post("/api/v1/uploads", open_headers);
+            const int status = open_res ? open_res->status : 0;
+            if (open_res && status == 201) {
+                session = up::parse_session_open_response(open_res->body);
+                if (!session) {
+                    ctx.write_output("error|malformed session-open response from server");
+                    return 1;
+                }
+                break;
+            }
+            std::optional<up::Reason> reason;
+            if (open_res)
+                reason = up::parse_error_envelope(open_res->body).reason;
+            auto decision = up::decide_next_action(status, reason, attempt);
+            if (decision.action != up::UploadDecision::kRetry) {
+                ctx.write_output(std::format("error|failed to open upload session (HTTP {}{})",
+                                             status, describe_reason(reason)));
+                return 1;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(decision.backoff_ms));
         }
 
-        // Strip trailing slash
-        while (!host.empty() && host.back() == '/')
-            host.pop_back();
-
-        ctx.report_progress(10);
-
-        auto filename = file_path.filename().string();
-
-        httplib::UploadFormDataItems items = {
-            {"file", content, filename, "application/octet-stream"},
-            {"sha256", hash, "", "text/plain"},
-            {"original_path", std::string{path_str}, "", "text/plain"},
-        };
-
-        std::unique_ptr<httplib::Client> client;
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-        if (scheme == "https") {
-            client = std::make_unique<httplib::Client>(scheme + "://" + host);
-        } else
-#endif
-        {
-            client = std::make_unique<httplib::Client>("http://" + host);
+        if (session->chunk_max_bytes <= 0) {
+            ctx.write_output("error|server returned an invalid chunk_max_bytes");
+            return 1;
         }
-        client->set_connection_timeout(30);
-        client->set_read_timeout(300);
 
-        auto result = client->Post("/api/v1/file-retrieval", items);
+        const std::string session_header = session->upload_id + "." + session->session_secret;
+        const std::string chunk_path = "/api/v1/uploads/" + session->upload_id + "/chunk";
+        const std::string commit_path = "/api/v1/uploads/" + session->upload_id + "/commit";
+        const std::string cancel_path = "/api/v1/uploads/" + session->upload_id;
 
-        ctx.report_progress(90);
+        ctx.report_progress(5);
 
-        if (!result || result->status >= 400) {
-            auto status = result ? result->status : 0;
-            ctx.write_output(std::format("error|upload failed (HTTP {})", status));
+        // ── Chunk streaming ──────────────────────────────────────────
+        // The commit digest is built INCREMENTALLY from the exact buffer
+        // just transmitted, fed to `hasher` the moment the server
+        // acknowledges it (never from a later, independent re-read — see
+        // the RAII-handle comment above, #P7-003). The one unavoidable
+        // exception is a RESUMED session's already-uploaded prefix
+        // (`session->offset > 0`, accepted in an earlier process's run):
+        // those bytes were never in THIS process's memory, so they are
+        // read once, up front, via the SAME open handle everything else
+        // below uses.
+        IncrementalSha256 hasher;
+        if (session->offset > 0) {
+            file.clear();
+            file.seekg(0, std::ios::beg);
+            std::vector<char> prefix_buf(64 * 1024);
+            std::int64_t remaining = session->offset;
+            while (remaining > 0) {
+                const auto want = static_cast<std::streamsize>(
+                    std::min<std::int64_t>(remaining, static_cast<std::int64_t>(prefix_buf.size())));
+                file.read(prefix_buf.data(), want);
+                if (file.gcount() != want) {
+                    ctx.write_output("error|failed to read local file while hashing an "
+                                     "already-uploaded prefix");
+                    return 1;
+                }
+                hasher.update(prefix_buf.data(), static_cast<std::size_t>(want));
+                remaining -= want;
+            }
+        }
+
+        std::int64_t offset = session->offset;
+        std::int64_t last_progress_offset = -1;
+        int attempt = 1;
+        std::vector<char> buf;
+
+        while (offset < file_size) {
+            if (offset > last_progress_offset) {
+                last_progress_offset = offset;
+                attempt = 1;
+            }
+
+            auto spec = up::plan_next_chunk(offset, file_size, session->chunk_max_bytes);
+            if (!spec) {
+                abort_upload(client, cancel_path, session_header, ctx,
+                            "internal chunk-planning error");
+                return 1;
+            }
+            const auto chunk_len = spec->end - spec->start + 1;
+            buf.resize(static_cast<std::size_t>(chunk_len));
+            file.clear();
+            file.seekg(spec->start, std::ios::beg);
+            file.read(buf.data(), static_cast<std::streamsize>(chunk_len));
+            if (file.gcount() != static_cast<std::streamsize>(chunk_len)) {
+                abort_upload(client, cancel_path, session_header, ctx,
+                            "failed to read local file while streaming");
+                return 1;
+            }
+
+            httplib::Headers chunk_headers = {
+                {"X-Yuzu-Upload-Session", session_header},
+                {"Content-Range", std::format("bytes {}-{}/{}", spec->start, spec->end, spec->total)},
+            };
+            auto res = client.Put(chunk_path, chunk_headers, std::string(buf.data(), buf.size()),
+                                  "application/octet-stream");
+            const int status = res ? res->status : 0;
+
+            if (res && status == 200) {
+                auto ack = up::parse_chunk_ack_offset(res->body);
+                // The only valid ack is EXACTLY `spec->end + 1` — the agent
+                // already knows what a successful write of THIS chunk must
+                // produce, so a missing or disagreeing offset is a
+                // malformed/inconsistent response, not new state to adopt
+                // (#P7-004).
+                auto validated = up::validate_chunk_ack(ack, spec->end + 1, file_size);
+                if (!validated) {
+                    abort_upload(client, cancel_path, session_header, ctx,
+                                "server returned a missing or inconsistent chunk offset "
+                                "acknowledgement");
+                    return 1;
+                }
+                // Hash the SAME buffer just transmitted, now that the
+                // server has confirmed receipt of exactly this range.
+                hasher.update(buf.data(), buf.size());
+                offset = *validated;
+                ctx.report_progress(
+                    5 + static_cast<int>(offset * 90 / file_size)); // 5..95 while streaming
+                continue;
+            }
+
+            std::optional<up::Reason> reason;
+            if (res)
+                reason = up::parse_error_envelope(res->body).reason;
+            auto decision = up::decide_next_action(status, reason, attempt);
+            switch (decision.action) {
+            case up::UploadDecision::kResync: {
+                auto authoritative = res ? up::parse_error_envelope(res->body).offset
+                                         : std::nullopt;
+                auto resynced = authoritative
+                                    ? up::reconcile_resume_offset(*authoritative, file_size)
+                                    : std::nullopt;
+                if (!resynced) {
+                    abort_upload(client, cancel_path, session_header, ctx,
+                                "server reported offset_mismatch without a usable offset");
+                    return 1;
+                }
+                if (*resynced <= offset) {
+                    // No forward progress — without a bounded budget here a
+                    // server that keeps handing back a non-advancing
+                    // offset would drive an unbounded resend loop
+                    // (#P7-006). Reuses the SAME attempt/backoff budget as
+                    // an ordinary retry; a resync that DOES advance resets
+                    // it via the `offset > last_progress_offset` check at
+                    // the top of the loop, same as any other progress.
+                    if (up::attempts_exhausted(attempt)) {
+                        abort_upload(client, cancel_path, session_header, ctx,
+                                    "offset_mismatch resync made no forward progress after "
+                                    "repeated attempts");
+                        return 1;
+                    }
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(up::backoff_delay_ms(attempt)));
+                    ++attempt;
+                }
+                offset = *resynced;
+                continue;
+            }
+            case up::UploadDecision::kRetry:
+                ++attempt;
+                std::this_thread::sleep_for(std::chrono::milliseconds(decision.backoff_ms));
+                continue;
+            case up::UploadDecision::kAbort:
+                abort_upload(client, cancel_path, session_header, ctx,
+                            std::format("chunk upload failed (HTTP {}{})", status,
+                                        describe_reason(reason)));
+                return 1;
+            }
+        }
+
+        auto computed_hash = hasher.finalize();
+        if (computed_hash.empty()) {
+            abort_upload(client, cancel_path, session_header, ctx,
+                        "failed to compute upload hash");
+            return 1;
+        }
+
+        // ── Commit ───────────────────────────────────────────────────
+        // Bounded retry loop mirroring session-open's, driven by the SAME
+        // `decide_next_action` (#P7-002: a transient commit failure used to
+        // cancel the upload outright instead of honouring the retry
+        // policy). A `session_terminal` reason on commit specifically, or a
+        // pure connection-level/unreasoned failure once the retry budget is
+        // exhausted, is outcome-AMBIGUOUS: the server may already have
+        // committed THIS exact upload from an earlier attempt whose
+        // response never reached the agent (`file_retrieval_routes.cpp`'s
+        // commit handler races itself by design — a concurrent winner
+        // reports `session_terminal` to the loser). The status route
+        // answers 200 with the current state even for a terminal session,
+        // so that ambiguity is resolved there BEFORE declaring failure or
+        // sending a cancel that would otherwise be pointless or misleading.
+        httplib::Headers commit_headers = {{"X-Yuzu-Upload-Session", session_header}};
+        const std::string commit_body = "{\"sha256\":\"" + computed_hash + "\"}";
+
+        std::optional<up::CommitResponse> commit_result;
+        for (int commit_attempt = 1;; ++commit_attempt) {
+            auto commit_res =
+                client.Post(commit_path, commit_headers, commit_body, "application/json");
+            const int commit_status = commit_res ? commit_res->status : 0;
+            if (commit_res && commit_status == 200) {
+                commit_result = up::parse_commit_response(commit_res->body);
+                if (!commit_result) {
+                    ctx.write_output("error|malformed commit response from server");
+                    return 1;
+                }
+                break;
+            }
+
+            std::optional<up::Reason> reason;
+            if (commit_res)
+                reason = up::parse_error_envelope(commit_res->body).reason;
+            auto decision = up::decide_next_action(commit_status, reason, commit_attempt);
+
+            const bool ambiguous = reason == up::Reason::kSessionTerminal ||
+                                   (decision.action != up::UploadDecision::kRetry &&
+                                    up::is_transient_no_reason(commit_status, reason));
+            if (ambiguous) {
+                auto status_res = client.Get(
+                    cancel_path, httplib::Headers{{"X-Yuzu-Upload-Session", session_header}});
+                if (status_res && status_res->status == 200) {
+                    auto st = up::parse_status_response(status_res->body);
+                    if (st && st->state == "committed") {
+                        // Reported response values are our own locally
+                        // transmitted state — the server's commit ONLY
+                        // succeeds with the sha256 this exact run posted
+                        // (`upload_grant::verify_commit`), so these are the
+                        // values that committed, whichever attempt won.
+                        commit_result = up::CommitResponse{"committed", file_size, computed_hash};
+                        break;
+                    }
+                }
+            }
+
+            if (decision.action == up::UploadDecision::kRetry) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(decision.backoff_ms));
+                continue;
+            }
+
+            abort_upload(client, cancel_path, session_header, ctx,
+                        std::format("commit failed (HTTP {}{})", commit_status,
+                                    describe_reason(reason)));
+            return 1;
+        }
+
+        // The server's own reported size/hash must agree with what this
+        // run computed and transmitted — a 200 naming different metadata
+        // is a server-contract violation, not a result to trust (#P7-009).
+        if (!up::commit_matches(*commit_result, file_size, computed_hash)) {
+            ctx.write_output(std::format(
+                "error|commit response does not match the uploaded file (expected size={} "
+                "sha256={}, server reported size={} sha256={})",
+                file_size, computed_hash, commit_result->actual_size, commit_result->sha256));
             return 1;
         }
 
         ctx.report_progress(100);
         ctx.write_output("status|ok");
-        ctx.write_output(std::format("sha256|{}", hash));
-        ctx.write_output(std::format("size|{}", file_size));
-        ctx.write_output(std::format("filename|{}", filename));
+        ctx.write_output(std::format("sha256|{}", commit_result->sha256));
+        ctx.write_output(std::format("size|{}", commit_result->actual_size));
+        ctx.write_output(std::format("upload_id|{}", session->upload_id));
         return 0;
+#endif
     }
 
     int do_cleanup(yuzu::CommandContext& ctx, yuzu::Params params) {
