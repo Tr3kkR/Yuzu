@@ -138,6 +138,7 @@
 #include "webhook_routes.hpp"
 #include "workflow_routes.hpp"
 #include "runtime_config_store.hpp"
+#include "runtime_config_view.hpp"
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
 #include "instruction_db_pool.hpp"
@@ -6859,9 +6860,15 @@ private:
     void apply_runtime_config_overrides() {
         if (!runtime_config_store_ || !runtime_config_store_->is_open())
             return;
-        auto entries = runtime_config_store_->get_all();
+        // The ONE caller entitled to plaintext: it must apply the real secret.
+        auto entries = runtime_config_store_->get_all_with_secrets();
         for (const auto& e : entries) {
-            spdlog::info("Applying runtime config override: {} = {}", e.key, e.value);
+            // Never log a credential. This line wrote the OIDC client secret verbatim
+            // into yuzu-server.log on every boot once it had been set via Settings.
+            spdlog::info("Applying runtime config override: {} = {}", e.key,
+                         RuntimeConfigStore::is_secret_key(e.key)
+                             ? RuntimeConfigStore::redacted_placeholder()
+                             : e.value.c_str());
             if (e.key == "log_level") {
                 spdlog::set_level(spdlog::level::from_str(e.value));
             } else if (e.key == "heartbeat_timeout") {
@@ -6881,7 +6888,10 @@ private:
                     cfg_.guardian_event_retention_days = std::stoi(e.value);
                 } catch (...) {}
             }
-            // auto_approve_enabled is read dynamically, no startup action needed
+            // auto_approve_enabled is deliberately NOT applied here -- and nothing
+            // else reads it back from this store either. GET /api/config reports it
+            // derived from whether any auto-approve rule exists, so a stored value
+            // has no effect at all. See docs/user-manual/rest-api.md.
             // OIDC settings — runtime-configurable via Settings UI
             else if (e.key == "oidc_issuer" && !e.value.empty())
                 cfg_.oidc_issuer = e.value;
@@ -7946,8 +7956,13 @@ private:
                 // AND the underlying instr_db_pool_ explicitly, so a
                 // pool-open failure surfaces as /readyz=503 rather than a
                 // silent no-op on every response.
-                {"execution_tracker",
-                 execution_tracker_ != nullptr && instr_db_pool_ && instr_db_pool_->is_open()},
+                // gov B-1: ALSO probe schema_ok(). The store shares this pool,
+                // so a FAILED MIGRATION leaves the pool open and this row green
+                // while every execution-status write fails against a missing
+                // column — every execution wedged at `dispatched`, /readyz ready.
+                {"execution_tracker", execution_tracker_ != nullptr && instr_db_pool_ &&
+                                          instr_db_pool_->is_open() &&
+                                          execution_tracker_->schema_ok()},
                 // gov R3 HC-1: FleetTopologyStore became load-bearing for
                 // /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology.
                 // Pure in-memory store with no is_open(); pointer-not-null is
@@ -8192,16 +8207,26 @@ private:
             config_obj["log_level"] =
                 spdlog::level::to_string_view(spdlog::default_logger()->level()).data();
 
-            // Overrides from store
-            nlohmann::json overrides = nlohmann::json::object();
-            if (runtime_config_store_ && runtime_config_store_->is_open()) {
-                auto entries = runtime_config_store_->get_all();
-                for (const auto& e : entries) {
-                    overrides[e.key] = {{"value", e.value},
-                                        {"updated_by", e.updated_by},
-                                        {"updated_at", e.updated_at}};
-                }
+            // Overrides from store. The omission rule lives in
+            // build_overrides_json (runtime_config_view.hpp) so it is unit-testable -- this
+            // route is not TestRouteSink-registered, and it is one of the sites the
+            // secret leaked from twice.
+            // A degraded store must NOT read as "nothing is configured". This route no
+            // longer returns a secret's value, so the PRESENCE of the key and its
+            // `is_set` are the only way to answer "is the OIDC secret set here?" -- and
+            // security-hardening.md tells operators to answer exactly that before
+            // deciding whether to rotate a disclosed credential. Returning 200 with an
+            // empty `overrides` would answer "never set, nothing to rotate". The PUT twin
+            // below already 503s on this condition; this matches it.
+            if (!runtime_config_store_ || !runtime_config_store_->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"runtime configuration store unavailable"},)"
+                    R"("meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
             }
+            nlohmann::json overrides = build_overrides_json(runtime_config_store_->get_all());
 
             nlohmann::json allowed = nlohmann::json::array();
             for (const auto& k : RuntimeConfigStore::allowed_keys())
@@ -8299,11 +8324,21 @@ private:
             }
             // log_level is applied inside RuntimeConfigStore::set()
 
+            // NOT the raw value. An audit detail is durable, retained by policy, and
+            // readable by every role seeded AuditLog:Read (Operator among them) -- so
+            // writing a credential here is a worse sink than the log and the API this
+            // branch already fixed, and it is not rotatable away afterwards.
             (void)audit_log(req, "config.update", "success", "RuntimeConfig", key,
-                            "value=" + value);
+                            "value=" + (RuntimeConfigStore::is_secret_key(key)
+                                            ? std::string(RuntimeConfigStore::redacted_placeholder())
+                                            : value));
 
             res.set_content(
-                nlohmann::json({{"key", key}, {"value", value}, {"applied", true}}).dump(),
+                nlohmann::json(RuntimeConfigStore::is_secret_key(key)
+                                   ? nlohmann::json{{"key", key}, {"applied", true}}
+                                   : nlohmann::json{{"key", key}, {"value", value},
+                                                    {"applied", true}})
+                    .dump(),
                 "application/json");
         });
 
