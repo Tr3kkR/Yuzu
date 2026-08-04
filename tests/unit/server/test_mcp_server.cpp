@@ -9848,6 +9848,50 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
         CHECK(budget.active() == 0);
     }
 
+    SECTION("per-principal cap hit by CONCURRENT streams -> 429 naming "
+            "post_per_principal_cap (#2789)") {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        // The pin-slots sibling above closes every response before opening the
+        // next, so the budget always reads back down to 0 and only the ring's
+        // pin_slots arm is ever reached. HOLDING the responses is what makes the
+        // budget itself refuse: with kPerPrincipalMcpPost live streams for one
+        // principal, the fifth must be refused by the per-principal arm - not
+        // the global cap (8 in this fixture) and not pin_slots.
+        std::vector<std::unique_ptr<httplib::Response>> held;
+        for (int i = 0; i < static_cast<int>(smcp::sse_bus::kPerPrincipalMcpPost); ++i) {
+            auto ok = call_sse(exec_body(760 + i, /*with_token=*/true));
+            REQUIRE(ok->status == 200);
+            held.push_back(std::move(ok));
+        }
+        REQUIRE(budget.active_for(smcp::sse_bus::SseSurface::kMcpPost, "test-user") ==
+                smcp::sse_bus::kPerPrincipalMcpPost);
+        const auto rows_before = tracker.query_executions({}).size();
+
+        auto fifth = call_sse(exec_body(770, /*with_token=*/true));
+        REQUIRE(fifth->status == 429);
+        auto body = nlohmann::json::parse(fifth->body);
+        CHECK(body["id"] == 770);
+        CHECK(body["error"]["code"] == smcp::kMcpStreamCap);
+        // The DISTINCT reject reason - this is the arm nothing covered end-to-end.
+        CHECK(reject_count("post_per_principal_cap") == 1.0);
+        CHECK(reject_count("post_global_cap") == 0.0);
+        CHECK(reject_count("post_pin_slots") == 0.0);
+        // And its distinct remediation: the per-principal message tells the
+        // caller to finish THEIR calls, not to come back later.
+        const std::string remediation = body["error"]["data"]["remediation"];
+        CHECK(remediation.find("wait for one of your streamed calls to finish") !=
+              std::string::npos);
+        CHECK(body["error"]["data"]["retry_after_ms"] == smcp::kMcpStreamedPostRetryAfterMs);
+        CHECK(fifth->get_header_value("Retry-After") == "30");
+        // Refused at admission: reserve was never called, nothing dispatched.
+        CHECK(tracker.query_executions({}).size() == rows_before);
+        CHECK(audit_has("mcp.session.reject|failure"));
+        // Reject-not-evict: all four live streams keep their slots.
+        CHECK(budget.active_for(smcp::sse_bus::SseSurface::kMcpPost, "test-user") ==
+              smcp::sse_bus::kPerPrincipalMcpPost);
+    }
+
     SECTION("reserve THROWS -> degrade to plain, never 429 and never 500") {
         ts.start_with_dispatch(dispatch, "operator");
         ts.mcp.set_stream_bridge(&bridge);
