@@ -7052,14 +7052,26 @@ TEST_CASE("MCP 2442: a ticket minted by a declared non-MCP surface is refused, c
     CHECK(after->consumed_at == 0);
 
     // 2. The caller learns nothing: the message is byte-identical to the
-    //    spent-ticket string, so the recall is not an oracle.
+    //    spent-ticket string, so the recall is not an oracle. Substring checks
+    //    are NOT enough here: governance round 11 mutated this message to
+    //    "approval refused: cross-surface ticket" - a full disclosure - and the
+    //    old assertions stayed green. The handler builds its OWN constant
+    //    (mcp_server.cpp:3357), independent of ApprovalManager's, so the
+    //    byte-identity pinned at test_approval_manager.cpp:462 does not cover
+    //    the surface an attacker actually talks to. Pin it here, exactly.
     const std::string msg = body["error"].value("message", std::string{});
-    CHECK(msg.find("minted") == std::string::npos);
-    CHECK(msg.find("origin") == std::string::npos);
+    CHECK(msg == "approval already used (one-time ticket)");
 
-    // 3. The SERVER side is the opposite case and must NOT be blurred.
+    // 3. The SERVER side is the opposite case and must NOT be blurred - and
+    //    audit_log carries only "action|result", which is byte-identical on the
+    //    spent-ticket path. The discriminator lives in audit_details. Round 11
+    //    proved the point by deleting the kForeignOrigin `why` assignment: every
+    //    suite stayed green, because this assertion did not exist.
     REQUIRE(!h.ts.audit_log.empty());
     CHECK(h.ts.audit_log.back() == "mcp.delete_tag|denied");
+    REQUIRE(!h.ts.audit_details.empty());
+    CHECK(h.ts.audit_details.back().find("minted by a non-MCP surface") !=
+          std::string::npos);
 
     // 4. Both counters move, and the security family carries the labels
     //    server.cpp pre-seeds — {tool,event}, NOT {tool,reason}. A mismatch here
@@ -7071,6 +7083,48 @@ TEST_CASE("MCP 2442: a ticket minted by a declared non-MCP surface is refused, c
     CHECK(reg.counter("yuzu_mcp_approval_forgery_total",
                       {{"tool", "delete_tag"}, {"event", "security"}})
               .value() == 1.0);
+}
+
+// The other half of the counter contract, and the half round 11 found missing:
+// the security family must fire ONLY on a cross-surface attempt. Its describe()
+// says "any non-zero value is an attack or a mint/recall pairing bug", so an
+// ordinary spent-ticket double-click incrementing it would turn every replay
+// into a page. Proved necessary by mutation: hoisting the increment out of the
+// kForeignOrigin arm to fire unconditionally left the whole [mcp] tag green.
+TEST_CASE("MCP 2442: an ordinary spent-ticket replay does not touch the security counter",
+          "[mcp][integration][approval][security]") {
+    yuzu::MetricsRegistry reg;
+    SchemaGateHarness h("operator");
+    h.ts.metrics_for_test = &reg;
+    h.ts.start("operator");
+
+    // An MCP-origin ticket (kUnspecified is what the MCP gate mints today),
+    // approved and then redeemed once - the ordinary happy path.
+    auto seeded = h.appr->submit("mcp.delete_tag", "test-user",
+                                 R"({"agent_id":"agent-1","key":"role"})", "",
+                                 ApprovalOrigin::kUnspecified);
+    REQUIRE(seeded);
+    REQUIRE(h.appr->approve(*seeded, "reviewer-bob", ""));
+    const std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":443,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":")" +
+        *seeded + R"("}}})";
+    h.call(recall);                       // first call consumes it
+    auto replay = h.call(recall);         // second call is the replay
+
+    REQUIRE(replay.contains("error"));
+    // Same client-facing constant as the foreign-origin refusal - that identity
+    // IS the oracle resistance, asserted from both sides.
+    CHECK(replay["error"].value("message", std::string{}) ==
+          "approval already used (one-time ticket)");
+
+    // The ordinary-replay counter moved...
+    CHECK(reg.counter("yuzu_mcp_approval_denied_total",
+                      {{"tool", "delete_tag"}, {"reason", "not_consumable"}})
+              .value() == 1.0);
+    // ...and the SECURITY family did not.
+    CHECK(reg.counter("yuzu_mcp_approval_forgery_total",
+                      {{"tool", "delete_tag"}, {"event", "security"}})
+              .value() == 0.0);
 }
 
 TEST_CASE("MCP 2405: wrong-typed argument is rejected before the gate",
