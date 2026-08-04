@@ -240,6 +240,67 @@ TEST_CASE("run_bounded_subprocess: a natural nonzero exit survives the stop_afte
     CHECK(result.termination_reason == TerminationReason::exited);
 }
 
+// K1/CDX-P2-002 (review blocker): the deadline twin of K-5. A child that ran
+// to completion and exited ON ITS OWN must be reported `exited` with its real
+// exit code even when the deadline expires in the same poll iteration its
+// reap lands in. With the default soft_terminate_grace=0 no SIGTERM is ever
+// sent, so an observed WIFEXITED is unconditional proof the exit predates any
+// kill (see child_exited_normally's declaration comment) -- exactly the K-5
+// reasoning already applied to line_cap. The child's runtime deliberately
+// EXCEEDS the deadline: the runner's first wake after the deadline is then
+// the pipe-EOF/pidfd wake at the child's own exit, so the reap and the kill
+// decision land in the same iteration -- the exact race window. Runs where
+// the kill genuinely wins carry the -1 sentinel and are legitimately skipped
+// by the implication.
+TEST_CASE("a natural exit racing the deadline is reported exited, never deadline (K1)",
+          "[subprocess][deadline][macos][linux]") {
+    int natural_exits = 0;
+    for (int i = 0; i < 40; ++i) {
+        SubprocessResult r = run_bounded_subprocess({"/bin/sh", "-c", "sleep 0.005; exit 0"},
+                                                    SubprocessOptions{.deadline = 5ms});
+        if (r.exit_code == 0) { // WIFEXITED(0) observed => the exit was natural
+            ++natural_exits;
+            CHECK(r.termination_reason == TerminationReason::exited);
+            CHECK_FALSE(r.timed_out);
+        }
+    }
+#if defined(__linux__)
+    // Non-vacuity floor, Linux only: the pidfd wake makes the same-iteration
+    // window all but deterministic there (independently reproduced 500/500
+    // and 2000/2000 in review). On macOS the 10ms poll-timeout wake can beat
+    // a slow-starting /bin/sh and the kill then legitimately wins, so the
+    // floor would flake under load; the implication above still bites
+    // whenever the window is hit.
+    CHECK(natural_exits > 0);
+#else
+    (void)natural_exits;
+#endif
+}
+
+// The cancel arm shares the deadline arm's latch and resolution code; a
+// watcher thread races the cancel against the child's own natural exit (a
+// deliberate race driver, not a completion poll). No non-vacuity floor here:
+// thread scheduling decides how many iterations land in the window, and the
+// deadline twin above already pins the window as reachable.
+TEST_CASE("a natural exit racing a cancel is reported exited, never cancelled (K1 twin)",
+          "[subprocess][deadline][macos][linux]") {
+    for (int i = 0; i < 20; ++i) {
+        auto token = std::make_shared<CancellationToken>();
+        std::thread canceller([token] {
+            std::this_thread::sleep_for(6ms);
+            token->cancel();
+        });
+        SubprocessResult r =
+            run_bounded_subprocess({"/bin/sh", "-c", "sleep 0.005; exit 0"},
+                                   SubprocessOptions{.deadline = 5000ms, .cancel_token = token});
+        canceller.join();
+        if (r.exit_code == 0) {
+            CHECK(r.termination_reason == TerminationReason::exited);
+            CHECK_FALSE(r.timed_out);
+        }
+    }
+}
+
 TEST_CASE("run_bounded_subprocess: stop_after_max_lines cap-stop of a genuinely signal-killed child "
           "never fabricates exit_code 0 (ADR-3002 fixes the pre-existing success-sentinel)",
           "[subprocess][deadline][macos][linux]") {

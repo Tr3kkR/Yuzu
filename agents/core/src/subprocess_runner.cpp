@@ -937,9 +937,11 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     bool exec_confirmed_ok = false;
 
     // ADR-3002 termination-reason bookkeeping: at most one of these becomes
-    // true (all three guarded by `!killed` at the moment they'd be set), and
-    // together with exec_confirmed_ok/exec_failed/natural_signaled below
-    // they determine the final TerminationReason after the loop.
+    // true (all three guarded by `!killed` at the moment they'd be set; the
+    // deadline/cancel pair additionally by `!child_reaped`, the K-5 twin
+    // guard line_cap already had -- K1/CDX-P2-002), and together with
+    // exec_confirmed_ok/exec_failed/natural_signaled below they determine
+    // the final TerminationReason after the loop.
     bool killed_by_deadline = false;
     bool killed_by_cancel = false;
     bool killed_by_line_cap = false;
@@ -974,6 +976,14 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     // hard_kill_sent is set in the very same branch as killed, at the same
     // `now`, so this is a no-op for all current behaviour.
     bool soft_terminating = false;
+    // K1/CDX-P2-002: soft_terminating is CONSUMED (reset) when the grace
+    // escalates to the hard kill, so it cannot answer the only question the
+    // final reason resolution needs -- "was a catchable SIGTERM ever actually
+    // delivered?", the one case where a WIFEXITED status may legitimately be
+    // our kill's doing (a child that trapped SIGTERM and exited during the
+    // grace) rather than proof of a natural exit. Set alongside
+    // soft_terminating, never reset.
+    bool soft_term_sent = false;
     std::chrono::steady_clock::time_point soft_term_deadline{};
     bool hard_kill_sent = false;
     std::chrono::steady_clock::time_point hard_kill_time{};
@@ -1121,10 +1131,22 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
                         (opts.cancel_token && opts.cancel_token->cancelled()));
 
         if (deadline_hit || cancel_hit) {
-            result.timed_out = true;
+            // K1/CDX-P2-002 (the deadline/cancel twin of line_cap's K-5
+            // guard at its own kill decision below): credit the reason flags
+            // and timed_out only when the child was NOT already reaped --
+            // try_reap() at the top of THIS iteration confirming the child
+            // gone means the exit strictly predates this kill decision, so
+            // reporting deadline/cancelled would fabricate a kill that never
+            // happened. The kill escalation below still runs unconditionally:
+            // a descendant may have outlived the reaped leader and be holding
+            // the pipe open (CDX-002), and arming hard_kill_sent is what
+            // bounds the remaining drain.
+            if (!child_reaped) {
+                result.timed_out = true;
+                killed_by_deadline = deadline_hit;
+                killed_by_cancel = !deadline_hit && cancel_hit;
+            }
             killed = true;
-            killed_by_deadline = deadline_hit;
-            killed_by_cancel = !deadline_hit && cancel_hit;
             if (opts.soft_terminate_grace.count() > 0 && !child_reaped) {
                 // ADR-3002 soft-terminate grace: give a mutating tool a
                 // chance to finish an in-flight transaction before the hard
@@ -1134,6 +1156,7 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
                 // picks it up like any other exit.
                 soft_terminate_child_or_group(pid);
                 soft_terminating = true;
+                soft_term_sent = true; // sticky, unlike soft_terminating
                 soft_term_deadline = now + opts.soft_terminate_grace;
             } else if (child_reaped) {
                 // try_reap() just above already confirmed this PID is gone
@@ -1322,19 +1345,27 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     // normally (WIFEXITED observed) -- see its declaration comment for why a
     // genuine WIFEXITED always outranks a killed_by_line_cap that raced it
     // (our kill decision can latch true one loop iteration before try_reap()
-    // catches up to a child that already exited on its own). This does NOT
-    // extend to killed_by_cancel/killed_by_deadline: those can escalate via
-    // soft_terminate_grace's SIGTERM first, which a child may legitimately
-    // trap and voluntarily exit(0) from -- a WIFEXITED our own signal
-    // directly caused, unlike line_cap's SIGKILL-only path (never catchable,
-    // so WIFEXITED there is unconditional proof of a natural exit).
+    // catches up to a child that already exited on its own).
+    //
+    // K1/CDX-P2-002: the SAME override now applies to killed_by_cancel/
+    // killed_by_deadline, with one carve-out the line_cap path doesn't need:
+    // those two can escalate via soft_terminate_grace's SIGTERM first, which
+    // a child may legitimately trap and voluntarily exit(0) from -- a
+    // WIFEXITED our own signal directly caused. soft_term_sent records
+    // whether that catchable signal was ever actually delivered; when it was
+    // not (the default soft_terminate_grace=0 path is SIGKILL-only, exactly
+    // like line_cap), WIFEXITED is unconditional proof of a natural exit and
+    // deadline/cancelled would be a fabricated kill. timed_out is re-cleared
+    // on the override so callers keying on it (see SubprocessResult) never
+    // see "timed out" paired with the honest `exited`.
+    const bool natural_exit_overrides_kill = child_exited_normally && !soft_term_sent;
     if (exec_failed) {
         result.termination_reason = TerminationReason::spawn_error;
     } else if (killed_by_line_cap && !child_exited_normally) {
         result.termination_reason = TerminationReason::line_limit;
-    } else if (killed_by_cancel) {
+    } else if (killed_by_cancel && !natural_exit_overrides_kill) {
         result.termination_reason = TerminationReason::cancelled;
-    } else if (killed_by_deadline) {
+    } else if (killed_by_deadline && !natural_exit_overrides_kill) {
         result.termination_reason = TerminationReason::deadline;
     } else if (!result.tool_ran) {
         // exec never positively confirmed and we did not deliberately kill it
@@ -1345,6 +1376,8 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     } else {
         result.termination_reason = TerminationReason::exited;
     }
+    if ((killed_by_deadline || killed_by_cancel) && natural_exit_overrides_kill)
+        result.timed_out = false;
 
     return result;
 }
@@ -1749,10 +1782,20 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
                         (opts.cancel_token && opts.cancel_token->cancelled()));
 
         if (deadline_hit || cancel_hit) {
-            result.timed_out = true;
+            // K1/CDX-P2-002 twin of the killed_by_line_cap = !process_exited
+            // guard below: a process already observed exited at the top of
+            // THIS iteration completed strictly before this kill decision, so
+            // crediting deadline/cancelled (and timed_out) would fabricate a
+            // kill that never happened. The Job termination below still runs
+            // unconditionally -- a descendant may have outlived the leader
+            // and be holding the pipe open (BR-003), and arming
+            // hard_kill_sent bounds the remaining drain.
+            if (!process_exited) {
+                result.timed_out = true;
+                killed_by_deadline = deadline_hit;
+                killed_by_cancel = !deadline_hit && cancel_hit;
+            }
             killed = true;
-            killed_by_deadline = deadline_hit;
-            killed_by_cancel = !deadline_hit && cancel_hit;
             if (opts.soft_terminate_grace.count() > 0 && !process_exited &&
                 GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pi.dwProcessId)) {
                 // Windows twin of POSIX's SIGTERM soft-terminate: CTRL_BREAK
