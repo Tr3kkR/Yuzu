@@ -31,9 +31,15 @@
   `yuzu_mcp_approval_forgery_total{tool,event="security"}` — the SIEM-routed family, and the one to
   alert on — alongside `yuzu_mcp_approval_denied_total{tool,reason="foreign_origin"}`, and records an
   `mcp.<tool>` / `denied` audit row. Both are pre-seeded to zero for every approval-gated tool, and
-  the registry resets on restart, so alert on `increase(...)` rather than a bare `> 0`. Neither
-  counter fires for the unlabelled carried-across tickets described below — those are exempt from
-  the check, not refused by it.
+  the registry resets on restart, so alert on `increase(...)` rather than a bare `> 0`. Two rules
+  ship in `docs/prometheus/yuzu-alerts.yml` — `YuzuMcpApprovalForgeryAttempt` (warning) and
+  `YuzuMcpApprovalForgerySustained` (critical) — and are not applied automatically; re-copy that
+  file if you already deploy an older version of it. An increase is not attack-only: the same
+  branch refuses an origin string the build does not recognise, so a downgrade from a build that
+  writes a newer one also counts. The audit detail is one constant for every non-MCP origin and
+  cannot separate the two — triage on the `ApprovalManager: refused recall` server log line, which
+  names the origin. Neither counter fires for the unlabelled carried-across tickets described below
+  — those are exempt from the check, not refused by it.
 
   **What changes for operators:** creating or importing a definition whose id starts `mcp.` is
   refused with a 400 on every authoring route that accepts an explicit id (`POST /api/instructions`,

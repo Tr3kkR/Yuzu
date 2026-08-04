@@ -3317,13 +3317,16 @@ McpServer::HandlerFn McpServer::build_handler(
                         // never caller-derived, so the label set stays bounded.
                         if (consumed.error().kind == ConsumeFailure::kForeignOrigin) {
                             count_denial("yuzu_mcp_approval_denied_total", "foreign_origin");
-                            // The dedicated security family. server.cpp describes it
-                            // as "any non-zero value is an attack or a mint/recall
-                            // pairing bug" and pre-seeds it; this is the ONLY site
-                            // that makes that description true. The describe and the
-                            // pre-seed shipped without it, leaving a flat-zero series
-                            // that reads as healthy during the exact event it exists
-                            // to report. Pinned by the [security]-tagged #2442 test,
+                            // The dedicated security family, and the only site that
+                            // increments it. The describe and the pre-seed shipped
+                            // without this line, leaving a flat-zero series that
+                            // reads as healthy during the exact event it exists to
+                            // report. NOT every increment is an attack: kUnrecognised
+                            // reaches this same branch after a downgrade, and `why`
+                            // above is one constant for all non-MCP origins, so the
+                            // audit row cannot tell the two apart — only the
+                            // ApprovalManager log line names the origin.
+                            // Pinned by the [security]-tagged #2442 test,
                             // which is red if this line goes or its labels drift.
                             count_security_event("yuzu_mcp_approval_forgery_total");
                         } else if (consumed.error().kind == ConsumeFailure::kStoreError)

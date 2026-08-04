@@ -557,8 +557,12 @@ public:
         metrics_.describe("yuzu_mcp_approval_forgery_total",
                           "Cross-surface approval redemption attempts (#2442): a ticket minted "
                           "by the REST instruction gate or the scheduler, presented to the MCP "
-                          "recall. A legitimate client cannot produce this, so any non-zero "
-                          "value is an attack or a mint/recall pairing bug",
+                          "recall. Usually an attack or a mint/recall pairing bug — but the "
+                          "same branch refuses an origin string this build does not know, so "
+                          "a downgrade from a build that writes a newer one also lands here. "
+                          "The audit detail is identical for both; triage on the "
+                          "'ApprovalManager: refused recall' server log line, which names the "
+                          "origin. See docs/user-manual/metrics.md",
                           "counter");
         // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
         // degrade reason is a static literal inside the bridge, never derived

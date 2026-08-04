@@ -105,10 +105,9 @@ ApprovalOrigin approval_origin_from_string(std::string_view text);
 /// deliberately with no `default:`. Adding another ApprovalOrigin then fails the
 /// build HERE, at the security gate — and at `to_string`, which is the site that
 /// would otherwise fail OPEN, since an unhandled enumerator falls out to `""`
-/// and decodes straight back to the exempt `kUnspecified`. That guarantee is
-/// real rather than asserted: `meson.build` carries `-Werror=switch` (`/we4062`
-/// on MSVC) precisely so these two switches are enforced. The trailing
-/// `return true` is
+/// and decodes straight back to the exempt `kUnspecified`. What enforces that is
+/// the `error` pragma below, NOT a project-wide setting — see its own comment.
+/// The trailing `return true` is
 /// unreachable today and denies, which is the correct direction for the one
 /// value a future compiler could reach: a bit pattern outside the enumerators.
 // The `error` pragma is what turns the paragraph above from a claim into a fact:

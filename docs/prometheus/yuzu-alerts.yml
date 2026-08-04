@@ -116,19 +116,40 @@ groups:
           severity: warning
         annotations:
           summary: "Cross-surface MCP approval redemption attempt ({{ $labels.tool }}) (#2442)"
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-approval-forgery"
           description: >-
             yuzu_mcp_approval_forgery_total{tool="{{ $labels.tool }}"} moved — an
-            approval ticket minted by the REST instruction gate or the scheduler
-            was presented to the MCP approval recall and refused. The ticket is
-            left untouched, so no approval was consumed. Read the paired audit
-            row (action mcp.{{ $labels.tool }}, result denied, detail beginning
-            "refused: minted by a non-MCP surface") for the principal and the
-            ticket id. One benign cause exists: a rollback to an older server
-            binary refuses origin strings it does not recognise down the same
-            branch, so check the detail before treating this as an attack.
-            increase() rather than a bare > 0 because the registry is in-memory
-            and every series resets on restart. See
-            docs/user-manual/metrics.md "MCP approval-gate metrics".
+            approval ticket declaring a non-MCP minting surface was presented to
+            the MCP approval recall and refused. The ticket is left untouched, so
+            no approval was consumed. For the principal and the ticket id, read
+            the paired audit row: action mcp.{{ $labels.tool }}, result denied,
+            detail of the form "approval <id> refused: minted by a non-MCP
+            surface (#2442)" — note it does NOT begin with that token. That
+            detail is one constant for every non-MCP origin and CANNOT tell an
+            attack from the benign case, so do not triage on it. The
+            discriminator is the server log line "ApprovalManager: refused recall
+            of ticket <redacted> minted by <origin>": instruction or schedule is
+            a genuine cross-surface attempt; any other value means this build was
+            downgraded from one that writes a newer origin, which is benign and
+            unreachable on any released build today. increase() rather than a
+            bare > 0 because the registry is in-memory and every series resets on
+            restart. See docs/user-manual/metrics.md "MCP approval-gate metrics".
+      - alert: YuzuMcpApprovalForgerySustained
+        expr: |
+          rate(yuzu_mcp_approval_forgery_total{event="security"}[5m]) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sustained cross-surface MCP approval forgery ({{ $labels.tool }}) (#2442)"
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-approval-forgery"
+          description: >-
+            Cross-surface approval redemptions have been refused continuously for
+            10 minutes. The one benign cause — a downgrade reading rows whose
+            origin this build does not know — produces a bounded burst as those
+            rows are retried, not a sustained rate, so treat this as an active
+            attempt to redeem approvals across surfaces. Escalate; do not wait to
+            correlate the audit rows first.
       - alert: YuzuOnBehalfAssertionRejected
         expr: |
           increase(yuzu_onbehalf_rejected_total[1h]) > 0

@@ -164,15 +164,26 @@ not independent events, so summing across the two families double-counts.
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `yuzu_mcp_approval_denied_total` | counter | `tool`, `reason="foreign_origin"\|"store_error"\|"not_consumable"` | The operator/dashboard breakdown of approval-recall denials. `not_consumable` is an ordinary replay of a spent ticket and is expected in normal use; `store_error` is a transient approvals-store read failure that leaves the ticket **untouched** and valid; `foreign_origin` is the cross-surface refusal below. `#2443`'s pre-consume recheck would also count as `not_consumable` if it were reachable — the sole production caller passes no precondition callback today, so this series is pure replay. |
-| `yuzu_mcp_approval_forgery_total` | counter | `tool`, `event="security"` | The SIEM tap for the same `foreign_origin` event: an approval minted by the REST instruction gate or the scheduler, presented to the MCP recall. Carries `event="security"` because SIEMs filter on that label ([observability-conventions.md](../observability-conventions.md)); the paired audit row `mcp.<tool>` / `denied` with detail `refused: minted by a non-MCP surface (#2442)` is the forensic evidence. **This is the family to alert on.** One caveat on the describe() text's "a legitimate client cannot produce this": the same branch also refuses an origin string this build does not recognise (`kUnrecognised` — written by a newer binary and read back after a rollback), so a downgrade with newer-origin rows present increments this counter benignly. Check the audit detail before treating an increase as an attack. |
+| `yuzu_mcp_approval_denied_total` | counter | `tool`, `reason="foreign_origin"\|"store_error"\|"not_consumable"` | The operator/dashboard breakdown of approval-recall denials. `not_consumable` is an ordinary replay of a spent ticket and is expected in normal use; `store_error` is a transient approvals-store read failure that leaves the ticket **untouched** and valid; `foreign_origin` is the cross-surface refusal below. `#2443`'s pre-consume recheck would also count as `not_consumable` if it were reachable — the sole production caller passes no precondition callback today. So this series is replay in practice, with one other reachable cause: the compare-and-set also declines a row that a concurrent lazy expiry sweep has just moved out of `approved`. |
+| `yuzu_mcp_approval_forgery_total` | counter | `tool`, `event="security"` | The SIEM tap for the same `foreign_origin` event: an approval minted by the REST instruction gate or the scheduler, presented to the MCP recall. Carries `event="security"` because SIEMs filter on that label ([observability-conventions.md](../observability-conventions.md)); the paired audit row `mcp.<tool>` / `denied` with detail `refused: minted by a non-MCP surface (#2442)` is the forensic evidence. **This is the family to alert on.** It is not attack-only: the same branch refuses an origin string this build does not recognise (`kUnrecognised`), so downgrading to this build from one that writes a newer origin value also increments it, benignly. **The audit detail cannot tell the two apart** — `refused: minted by a non-MCP surface (#2442)` is one constant for every non-MCP origin. The discriminator is the server log line `ApprovalManager: refused recall of ticket <redacted> minted by <origin>`: `instruction`/`schedule` is a genuine cross-surface attempt, anything else is the downgrade case. No released build writes an origin outside `''`/`instruction`/`schedule`/`mcp`, so `kUnrecognised` is unreachable today; the branch exists so a value from a future build denies rather than admits. |
 
 **Alert on an increase, not on a value.** The registry is in-memory, so every
 series returns to zero on restart — an instantaneous `> 0` rule resolves silently
-across a bounce. Use `increase(yuzu_mcp_approval_forgery_total[24h]) > 0`. The
-durable record of the same event is the audit row, which is best-effort: the write
-is unchecked and MCP has no `Sec-Audit-Failed` channel, so neither signal alone is
-a complete record.
+across a bounce. `YuzuMcpApprovalForgeryAttempt` in
+[`docs/prometheus/yuzu-alerts.yml`](../prometheus/yuzu-alerts.yml) ships this rule —
+`increase(yuzu_mcp_approval_forgery_total{event="security"}[24h]) > 0` — and is not
+applied automatically; deploy it, and re-copy it on upgrade if you already run an
+older copy of that file. For a since-restart question rather than an alert, read the
+bare counter without `increase()`. The durable record of the same event is the audit
+row, which is best-effort: the write is unchecked and MCP has no `Sec-Audit-Failed`
+channel, so neither signal alone is a complete record.
+
+**Rollback removes this control and its signal together.** Downgrading the server
+below the release that introduced the origin guard removes the consume-side refusal
+*and* both counters, so the alert cannot fire and the absence looks like quiet. A
+downgrade window also stamps every new approval — REST and scheduler included — with
+a blank origin, and blank rows stay exempt from the check for the 7-day approval
+lifetime after you roll forward.
 
 Note the counters do **not** fire for the unlabelled carried-across tickets
 described in [server-admin.md](server-admin.md)'s `#2442` upgrade note — those are
