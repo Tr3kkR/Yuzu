@@ -102,14 +102,19 @@ private:
 };
 
 /// Wires a real (PG-backed) engine principal + a mintable engine API token, plus
-/// an in-memory AuditStore/AnalyticsEventStore/ManagementGroupStore so the audit
-/// flag and the never-AdmitScoped contract are both observable. Each test then
-/// constructs the AuthRoutes/RbacStore combination it wants to exercise via make().
+/// an in-memory AuditStore/AnalyticsEventStore so the audit flag and the
+/// never-AdmitScoped contract are both observable. Each test then constructs the
+/// AuthRoutes/RbacStore combination it wants to exercise via make().
 struct EngineListReadFixture {
     Config cfg{};
     auth::AuthManager auth_mgr{};
-    yuzu::test::ApiTokenStorePgShared api_tokens;
+    // Declaration order is load-bearing: `engine_store` MUST precede `api_tokens`.
+    // api_tokens holds the [&] referent-check lambda that dereferences engine_store
+    // (set_engine_referent_check below); members destruct in reverse declaration
+    // order, so api_tokens (and its lambda) must die BEFORE engine_store — i.e.
+    // engine_store declared first. (cpp-safety Gate-3.)
     EnginePrincipalStorePg engine_store;
+    yuzu::test::ApiTokenStorePgShared api_tokens;
     AuditStore audit{":memory:"};
     yuzu::test::TempDbFile an_db{"yuzu_test_rlr_engine_an-"};
     std::unique_ptr<AnalyticsEventStore> analytics;
@@ -247,10 +252,93 @@ TEST_CASE("require_list_read engine: fleet-wide grant -> AdmitAll, scope==nullop
     CHECK_FALSE(gate.scope.has_value());
     CHECK(fix.list_read_denials() == 0); // an admit writes no denial row
 
-    // Regression: an operation the grant does NOT cover is still denied — proves
-    // this isn't silently falling through to a fleet-wide legacy path.
+    // Regression: a Read securable the grant does NOT cover is still denied by the
+    // engine branch's check_permission — proves this isn't silently falling through
+    // to a fleet-wide legacy path. (A different READ securable, not a mutating op:
+    // the wrapper now fail-closes any non-Read at the entry Read-guard, so a "Write"
+    // here would exercise that guard rather than engine authz.)
     httplib::Response res2;
-    auto gate2 = fix.ar->require_list_read(req, res2, "Inventory", "Write");
+    auto gate2 = fix.ar->require_list_read(req, res2, "Response", "Read");
     CHECK_FALSE(gate2.admitted);
     CHECK(res2.status == 403);
+    CHECK(fix.list_read_denials() == 1); // the ungranted-Read denial stamped is_list_read
+}
+
+// ── quality-engineer Gate-3: the MCP-tier and service-scoped ladder branches were
+//    live production code but unexercised. These cover them with the same PG
+//    ApiTokenStore harness — a HUMAN token carrying an mcp_tier / scope_service
+//    synthesizes a session with those fields set (synthesize_token_session), with
+//    role defaulting to `user` (no AuthDB record needed). ───────────────────────
+
+TEST_CASE("require_list_read MCP-tier: an allowed tier falls through to the standard gate",
+          "[pg][auth_routes][list_read][mcp][rbac]") {
+    EngineListReadFixture fix;
+    // A human MCP token, tier=readonly. `readonly` allows every Read, so the tier
+    // check must NOT return early — it FALLS THROUGH to the standard admit-then-
+    // filter branch, which resolves alice's OWN RBAC (a missed `return` here would
+    // wrongly short-circuit or re-run the gate — the branch quality-engineer flagged).
+    auto raw = fix.api_tokens->create_token("mcp-tok", "alice", now_epoch() + 3600, "", "readonly",
+                                            "human");
+    REQUIRE(raw.has_value());
+    auto db = yuzu::test::TempDbFile{"yuzu_test_rlr_mcp-"};
+    RbacStore rbac(db.path);
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    REQUIRE(rbac.create_role({.name = "RespReader", .description = "d"}).has_value());
+    REQUIRE(rbac.set_permission({"RespReader", "Response", "Read", "allow"}).has_value());
+    REQUIRE(rbac.assign_role({"user", "alice", "RespReader"}).has_value()); // GLOBAL grant
+    fix.make(&rbac);
+
+    httplib::Request req;
+    req.headers.emplace("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+    auto gate = fix.ar->require_list_read(req, res, "Response", "Read");
+    CHECK(gate.admitted);                // fell through and resolved alice's grant
+    CHECK_FALSE(gate.scope.has_value()); // global grant -> AdmitAll unfiltered
+    CHECK(fix.list_read_denials() == 0);
+}
+
+TEST_CASE("require_list_read service-scoped: RBAC disabled -> 403 (scoped tokens require RBAC)",
+          "[pg][auth_routes][list_read][rbac]") {
+    EngineListReadFixture fix;
+    auto raw = fix.api_tokens->create_token("svc-tok", "alice", now_epoch() + 3600, "billing", "",
+                                            "human");
+    REQUIRE(raw.has_value());
+    auto db = yuzu::test::TempDbFile{"yuzu_test_rlr_svc_off-"};
+    RbacStore rbac(db.path);
+    REQUIRE(rbac.is_open());
+    REQUIRE_FALSE(rbac.is_rbac_enabled()); // a service-scoped token cannot be used with RBAC off
+    fix.make(&rbac);
+
+    httplib::Request req;
+    req.headers.emplace("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+    auto gate = fix.ar->require_list_read(req, res, "Response", "Read");
+    CHECK_FALSE(gate.admitted);
+    CHECK(res.status == 403);
+    CHECK(fix.list_read_denials() == 1);
+}
+
+TEST_CASE("require_list_read service-scoped: ITServiceOwner grant -> AdmitAll unfiltered",
+          "[pg][auth_routes][list_read][rbac]") {
+    EngineListReadFixture fix;
+    auto raw = fix.api_tokens->create_token("svc-tok", "alice", now_epoch() + 3600, "billing", "",
+                                            "human");
+    REQUIRE(raw.has_value());
+    auto db = yuzu::test::TempDbFile{"yuzu_test_rlr_svc_on-"};
+    RbacStore rbac(db.path);
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+    // ITServiceOwner is a seeded role; grant it the read explicitly so the test is
+    // independent of seed contents. A service-scoped token is fleet-wide by role.
+    REQUIRE(rbac.set_permission({"ITServiceOwner", "Response", "Read", "allow"}).has_value());
+    fix.make(&rbac);
+
+    httplib::Request req;
+    req.headers.emplace("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+    auto gate = fix.ar->require_list_read(req, res, "Response", "Read");
+    CHECK(gate.admitted);
+    CHECK_FALSE(gate.scope.has_value()); // ITServiceOwner is fleet-scoped -> unfiltered
+    CHECK(fix.list_read_denials() == 0);
 }

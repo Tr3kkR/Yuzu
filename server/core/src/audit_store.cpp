@@ -99,10 +99,14 @@ void AuditStore::create_tables() {
         // (AuditEvent::is_list_read). Same additive-ahead-of-PG-cutover posture as
         // principal_class (migration 2) — AuditStore's eventual PG migration must
         // carry this column + index forward. Existing rows default 0.
+        //
+        // The ALTER is O(1) metadata-only (constant default). Its supporting index
+        // is built OUTSIDE this transaction in ensure_list_read_index() — same
+        // reasoning as idx_audit_ttl_id: an O(N log N) build inside the fail-closed
+        // MigrationRunner path could take the SOC 2 audit trail offline on a
+        // transient temp-space shortfall at first post-upgrade boot.
         {4, R"(
             ALTER TABLE audit_events ADD COLUMN is_list_read INTEGER NOT NULL DEFAULT 0;
-            CREATE INDEX IF NOT EXISTS idx_audit_list_read
-                ON audit_events(is_list_read, timestamp);
         )"},
     };
     if (!MigrationRunner::run(db_.get(), "audit_store", kMigrations)) {
@@ -113,6 +117,7 @@ void AuditStore::create_tables() {
         return;
     }
     ensure_retention_index();
+    ensure_list_read_index();
     if (auto r = load_meta(kLastPassNowKey)) {
         last_pass_now_ = *r;
     } else {
@@ -182,6 +187,44 @@ void AuditStore::ensure_retention_index() {
         spdlog::info("AuditStore: built idx_audit_ttl_id in {} ms (one-time, first boot after "
                      "upgrade on an existing audit_events)",
                      ms);
+}
+
+void AuditStore::ensure_list_read_index() {
+    // ADR-0017 #2473: index the list-read authorization DENIAL rows so
+    // `WHERE is_list_read = 1 ORDER BY timestamp` (the access-review pull) does
+    // not full-scan audit_events. PARTIAL on `is_list_read = 1` for two reasons:
+    // (1) only deny_audit() ever sets the flag, so is_list_read=1 is a tiny
+    // subset — a full index would add a 6th b-tree to every (frequent) audit
+    // INSERT for rows it will never serve; the partial index costs ~0 insert
+    // maintenance on the common is_list_read=0 row. (2) Matching the query's own
+    // literal `= 1` term is what lets SQLite pick it (see query()'s builder,
+    // which emits a LITERAL `AND is_list_read = 1` for exactly this reason), so
+    // the predicate is load-bearing, not just a size optimisation.
+    //
+    // Built OUTSIDE MigrationRunner, best-effort, for the same reason as
+    // ensure_retention_index: a failed CREATE INDEX must NOT roll back the
+    // migration and close the evidence store over a performance artifact. On the
+    // rare is_list_read=1 subset the build is effectively instant, but the
+    // fail-open-to-full-scan posture is kept identical to the retention index.
+    if (!db_)
+        return;
+    const auto t0 = std::chrono::steady_clock::now();
+    SqliteErrMsg err;
+    const int rc = sqlite3_exec(db_.get(),
+                                "CREATE INDEX IF NOT EXISTS idx_audit_list_read "
+                                "ON audit_events(timestamp) WHERE is_list_read = 1;",
+                                nullptr, nullptr, err.addr());
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+            .count();
+    if (rc != SQLITE_OK) {
+        spdlog::error("AuditStore: could not create idx_audit_list_read ({}); list-read denial "
+                      "queries will scan audit_events",
+                      err.c_str());
+        return;
+    }
+    if (ms >= 1000)
+        spdlog::info("AuditStore: built idx_audit_list_read in {} ms (one-time)", ms);
 }
 
 std::expected<std::int64_t, AuditStore::MetaReadError>
@@ -364,8 +407,11 @@ std::vector<AuditEvent> AuditStore::query(const AuditQuery& q, std::size_t* out_
         int_binds.emplace_back(bind_idx++, q.until);
     }
     if (q.is_list_read.has_value()) {
-        sql += " AND is_list_read = ?";
-        int_binds.emplace_back(bind_idx++, *q.is_list_read ? 1 : 0);
+        // LITERAL term, not a bound `?`: SQLite cannot prove `? = 1` at plan time,
+        // so a bound parameter would never select the partial idx_audit_list_read
+        // (WHERE is_list_read = 1). The value is code-controlled (a bool → 0/1),
+        // never caller text, so there is no injection surface.
+        sql += *q.is_list_read ? " AND is_list_read = 1" : " AND is_list_read = 0";
     }
     // Prefix OR-group (e.g. auth./mfa./session. for the auth-log sample, #4).
     // Prefixes are code-controlled constants, not user input, so they carry no

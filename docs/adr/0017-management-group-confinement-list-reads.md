@@ -26,6 +26,14 @@ context-refs: #1634 (response-reader ruling), PR #1711 (per-row filter foundatio
 > wrappers (`require_list_read` etc.) land with their first caller in PR-B rather than uncalled here.
 > Ships alongside the decision-independent **#1717** fail-closed gate fix (`require_permission` /
 > `require_scoped_permission` gate on `rbac_enforcement_in_effect`).
+>
+> **Correction (PR-B, #2473, landed 2026-08-04):** the split ended up one hop finer than the sentence
+> above predicted — PR-B shipped `AuthRoutes::require_list_read` (the transport wrapper + the
+> `is_list_read` audit flag) **uncalled**, and the first live call site (response-list reads) is
+> deferred to **PR-C**. So the wrapper lands here without its first caller after all; the "no call site
+> is switched yet" state of PR-A simply extends through PR-B. Nothing is broken by the uncalled wrapper
+> (no route reaches the gate), and it ships with full unit coverage of the principal-kind ladder
+> (including the engine 503/403 default-deny and the `AdmitScoped`-empty zero-rows contract).
 
 ## Context
 

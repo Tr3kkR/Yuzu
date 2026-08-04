@@ -437,6 +437,11 @@ private:
     /// Build `idx_audit_ttl_id` best-effort, OUTSIDE the migration runner. See
     /// the definition for why it must not be a Migration entry.
     void ensure_retention_index();
+    /// Build the PARTIAL `idx_audit_list_read` (WHERE is_list_read = 1)
+    /// best-effort, OUTSIDE the migration runner (ADR-0017 #2473). Same
+    /// fail-open-to-full-scan rationale as ensure_retention_index — see its
+    /// definition.
+    void ensure_list_read_index();
     /// Why a durable reading could not be used. ABSENT and MALFORMED must stay
     /// DISTINGUISHABLE: absent is the ordinary fresh-install shape and says
     /// nothing about the clock, whereas a row that exists but is not an integer

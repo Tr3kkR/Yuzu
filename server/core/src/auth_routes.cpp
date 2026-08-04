@@ -936,19 +936,36 @@ AuthRoutes::ListReadGate AuthRoutes::require_list_read(const httplib::Request& r
     ListReadGate gate;
     const std::string perm = securable_type + ":" + operation;
 
-    // Every denial from this gate is a list-read authorization row. Per #2473 we
-    // do NOT mint a dedicated verb: we reuse the shared "auth.permission_required"
+    // Single denial helper (#2473): write the 4xx/5xx response FIRST, then the
+    // audit row, so a throwing audit write can never leave a wrong/unset status.
+    // We do NOT mint a dedicated verb: reuse the shared "auth.permission_required"
     // verb and stamp AuditEvent::is_list_read, so `WHERE is_list_read` pulls every
-    // list/fan-out authorization decision out of the log with an index.
-    auto deny_audit = [&](const std::string& detail) {
-        audit_log(req, "auth.permission_required", "denied", "", "", detail,
+    // list/fan-out authorization decision out of the log with an index. Returns
+    // the (un-admitted) gate so callers can `return deny(...)`.
+    auto deny = [&](int status, const std::string& client_msg,
+                    const std::string& audit_detail) -> ListReadGate& {
+        res.status = status;
+        res.set_content(
+            detail::a4_denial(res, status, client_msg, detail::A4ErrorOpts{.permission = perm}),
+            "application/json");
+        audit_log(req, "auth.permission_required", "denied", "", "", audit_detail,
                   /*is_list_read=*/true);
+        return gate; // admitted == false
     };
 
     auto session = require_auth(req, res);
     if (!session)
         return gate; // require_auth wrote 401
     gate.session = session;
+
+    // Read-class only (see the invariant above), enforced not just documented: a
+    // non-Read operation must fail CLOSED here rather than reach the RBAC-off
+    // legacy-open branch below, where it would be admitted unfiltered (a mutating
+    // op must never ride the list gate). No live caller passes non-Read today;
+    // this guards the PR-C wiring.
+    if (operation != "Read")
+        return deny(403, "list-read gate accepts Read operations only",
+                    "non-Read operation rejected: " + perm);
 
     // JIT admin elevation: full admin for the window → unfiltered (scope=nullopt).
     if (auth::is_elevated(*session)) {
@@ -962,25 +979,12 @@ AuthRoutes::ListReadGate AuthRoutes::require_list_read(const httplib::Request& r
     // AdmitAll (a real global grant) or DenyAll — never AdmitScoped. Same 503/403
     // shape as require_permission's engine branch.
     if (session->principal_kind == "engine") {
-        if (!rbac_store_ || !rbac_store_->is_open()) {
-            deny_audit(
-                      "engine principal denied: RBAC store unavailable");
-            res.status = 503;
-            res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
-                                              detail::A4ErrorOpts{.permission = perm}),
-                            "application/json");
-            return gate;
-        }
+        if (!rbac_store_ || !rbac_store_->is_open())
+            return deny(503, "authorization store unavailable",
+                        "engine principal denied: RBAC store unavailable");
         if (!rbac_store_->is_rbac_enabled() ||
-            !rbac_store_->check_permission(session->username, securable_type, operation)) {
-            deny_audit(
-                      "engine principal denied " + perm);
-            res.status = 403;
-            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
-                                              detail::A4ErrorOpts{.permission = perm}),
-                            "application/json");
-            return gate;
-        }
+            !rbac_store_->check_permission(session->username, securable_type, operation))
+            return deny(403, "permission denied: " + perm, "engine principal denied " + perm);
         gate.admitted = true; // fleet-wide grant → unfiltered
         return gate;
     }
@@ -990,15 +994,9 @@ AuthRoutes::ListReadGate AuthRoutes::require_list_read(const httplib::Request& r
     // via authorize_list_read (strictly tighter than require_permission's global
     // check for a list read). Reads are never approval-gated, so no ticket check.
     if (!session->mcp_tier.empty()) {
-        if (!mcp::tier_allows(session->mcp_tier, securable_type, operation)) {
-            deny_audit(
-                      "MCP token tier '" + session->mcp_tier + "' does not allow " + perm);
-            res.status = 403;
-            res.set_content(detail::a4_denial(res, 403, "MCP token tier does not allow " + perm,
-                                              detail::A4ErrorOpts{.permission = perm}),
-                            "application/json");
-            return gate;
-        }
+        if (!mcp::tier_allows(session->mcp_tier, securable_type, operation))
+            return deny(403, "MCP token tier does not allow " + perm,
+                        "MCP token tier '" + session->mcp_tier + "' does not allow " + perm);
     }
 
     // Service-scoped tokens: ITServiceOwner must grant the permission; scoped tokens
@@ -1014,27 +1012,14 @@ AuthRoutes::ListReadGate AuthRoutes::require_list_read(const httplib::Request& r
     // below. This introduces no NEW bypass — the wrapper is >= as tight as
     // require_permission for every principal kind, and tighter for confined humans.
     if (!session->token_scope_service.empty()) {
-        if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
-            deny_audit(
-                      "service-scoped token blocked: RBAC not enabled");
-            res.status = 403;
-            res.set_content(detail::a4_denial(res, 403,
-                                              "service-scoped tokens require RBAC to be enabled",
-                                              detail::A4ErrorOpts{.permission = perm}),
-                            "application/json");
-            return gate;
-        }
-        if (!rbac_store_->check_role_has_permission("ITServiceOwner", securable_type, operation)) {
-            deny_audit(
-                      "service-scoped token blocked: lacks ITServiceOwner permission");
-            res.status = 403;
-            res.set_content(detail::a4_denial(res, 403,
-                                              "service-scoped token does not grant " + perm +
-                                                  " (ITServiceOwner permission required)",
-                                              detail::A4ErrorOpts{.permission = perm}),
-                            "application/json");
-            return gate;
-        }
+        if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
+            return deny(403, "service-scoped tokens require RBAC to be enabled",
+                        "service-scoped token blocked: RBAC not enabled");
+        if (!rbac_store_->check_role_has_permission("ITServiceOwner", securable_type, operation))
+            return deny(403,
+                        "service-scoped token does not grant " + perm +
+                            " (ITServiceOwner permission required)",
+                        "service-scoped token blocked: lacks ITServiceOwner permission");
         gate.admitted = true; // ITServiceOwner is fleet-scoped by role → unfiltered
         return gate;
     }
@@ -1050,12 +1035,7 @@ AuthRoutes::ListReadGate AuthRoutes::require_list_read(const httplib::Request& r
                                                      mgmt_group_store_);
     switch (decision.decision) {
     case ListReadDecision::DenyAll:
-        deny_audit( "RBAC denied " + perm);
-        res.status = 403;
-        res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
-                                          detail::A4ErrorOpts{.permission = perm}),
-                        "application/json");
-        return gate; // admitted == false
+        return deny(403, "permission denied: " + perm, "RBAC denied " + perm);
     case ListReadDecision::AdmitAll:
         gate.admitted = true; // scope stays nullopt → unfiltered
         return gate;
