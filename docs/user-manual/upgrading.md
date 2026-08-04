@@ -28,15 +28,14 @@ places, and this upgrade closes all three:
 - the `config.update` **audit detail** written by `PUT /api/config/:key`, which is durably retained and
   readable by every role seeded `AuditLog:Read` - the seeded `Operator` role among them.
 
+**Breaking for automation:** closing the second path changed a response shape.
+`GET /api/config` now reports `"is_set": true|false` for a secret-valued key instead of `value`, so a
+client reading `value` for `oidc_client_secret` gets nothing where it previously got the credential.
+Full shape and the reason it is not a placeholder: [`rest-api.md`](rest-api.md).
+
 Because the log path fired on every boot, **historical logs** — and anything that ingested them, such
 as journald, a Docker log driver, or a SIEM — may still hold the secret in plaintext. Purge or restrict
 those as your retention policy allows.
-
-**Response-shape change for automation.** `GET /api/config` no longer returns a `value` field for a
-secret-valued key; it returns `"is_set": true|false` instead. A client that reads `value` for
-`oidc_client_secret` gets nothing where it previously got the credential. Deliberately not a placeholder
-string: a placeholder is itself a legal value, so a config-as-code client round-tripping one would
-overwrite the real secret. `updated_by` and `updated_at` are unchanged.
 
 Audit rows written before the upgrade are now redacted when read, so the value stops being disclosed
 through that path too. The rows themselves are deliberately left intact: an audit row is compliance

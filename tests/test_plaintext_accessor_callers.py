@@ -18,17 +18,27 @@ that extraction would otherwise be needed to catch, at the seam that does exist.
 
 WHAT IT ASSERTS
 ---------------
-The SET of production call sites, not a count. A count is defeated by a net-zero swap
--- delete one caller, add another -- which is the refactor this exists to catch.
+A MULTISET keyed on (file, normalised call text) -> how many times that exact call
+appears. Not a count, which a net-zero swap defeats; and not a set of FILES, which was
+the first version's defect: `server.cpp` is entitled for the startup pass, and both
+`/api/config` routes live in that same file, so a second plaintext read added inside
+either route handler was invisible. That was demonstrated by mutation in review, not
+reasoned about -- the test reported OK with three call sites where one of the three
+was an illegitimate read in the GET handler.
 
-COMMENT HANDLING, and why it is per-line
-----------------------------------------
-An earlier version of this file stripped `/* ... */` spans across the whole text first.
-MEASURED on `server/core/src/server.cpp`: that removed 518389 of 899392 characters,
-because a `/*` inside ordinary prose and inside a route glob opened spans that ran for
-tens of thousands of lines. The scan then covered 42% of the file and would have gone
-GREEN while blind to the rest. Comments are judged per line here for that reason; a
-whole-file span matcher on C++ needs a real lexer, and this is not one.
+WHAT IT DOES NOT COVER, stated so the guarantee is not read wider than it is
+-------------------------------------------------------------------------
+  * A wrapper. Once a method that itself calls an accessor is entitled, every caller
+    of THAT method is invisible here -- the scan matches accessor names as text.
+  * Indirect reach: `&RuntimeConfigStore::get_all_with_secrets` bound through
+    `std::function`/`std::bind` and invoked later. No line then contains both the name
+    and a call.
+  * Anything outside ROOTS, or any suffix outside the scanned set.
+It is a tripwire on the direct-call surface, not a proof that plaintext is unreachable.
+
+Comments are judged per line, never by whole-file `/* ... */` span matching, which
+false-positives on a `/*` inside prose or a route glob and can blank most of a large
+file. That needs a real lexer, and this is not one.
 """
 
 import re
@@ -37,18 +47,27 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-# Call sites permitted to read a secret in plaintext, each with why.
+# (file, normalised call line) -> (how many times it may appear, why it is entitled).
+# Keyed on the call text so an unrelated edit above does not move it, and counted so a
+# duplicate cannot hide behind an already-entitled twin.
 EXPECTED = {
-    "server/core/src/runtime_config_store.cpp": (
-        "get_all() calls it internally and then redacts -- this IS the redacting wrapper"
-    ),
-    "server/core/src/server.cpp": (
-        "apply_runtime_config_overrides(): the startup pass must apply the real secret. "
-        "It logs the placeholder, never the value."
-    ),
+    ("server/core/src/runtime_config_store.cpp",
+     "auto entries = get_all_with_secrets();"):
+        (1, "get_all() calls it and then redacts -- this IS the redacting wrapper"),
+    ("server/core/src/runtime_config_store.cpp",
+     "auto entry = get_with_secrets(key);"):
+        (2, "get_value_with_secrets() and get() both funnel through it internally"),
+    ("server/core/src/server.cpp",
+     "auto entries = runtime_config_store_->get_all_with_secrets();"):
+        (1, "apply_runtime_config_overrides(): the startup pass must apply the real "
+            "secret. It logs the placeholder, never the value."),
 }
 
-ACCESSORS = ("get_all_with_secrets", "get_value_with_secrets")
+# All three `_with_secrets` twins. runtime_config_store.hpp:40 states there are three
+# plain read accessors that redact; an earlier version of this file pinned two of the
+# three, so `get_with_secrets()` was an unguarded plaintext route past a test whose
+# headline claimed to pin them all.
+ACCESSORS = ("get_all_with_secrets", "get_value_with_secrets", "get_with_secrets")
 
 # Shipped source. Tests may read plaintext freely -- asserting on it is their job.
 ROOTS = ("server", "agents", "sdk")
@@ -72,8 +91,9 @@ def is_call(line: str, acc: str) -> bool:
     return True
 
 
-def call_sites() -> dict[str, list[int]]:
-    found: dict[str, list[int]] = {}
+def call_sites() -> dict[tuple[str, str], list[int]]:
+    """(file, normalised call line) -> the line numbers where it occurs."""
+    found: dict[tuple[str, str], list[int]] = {}
     for root in ROOTS:
         base = REPO / root
         if not base.is_dir():
@@ -86,8 +106,14 @@ def call_sites() -> dict[str, list[int]]:
             except OSError:
                 continue
             for n, line in enumerate(lines, 1):
-                if any(is_call(line, acc) for acc in ACCESSORS):
-                    found.setdefault(str(path.relative_to(REPO)), []).append(n)
+                if not any(is_call(line, acc) for acc in ACCESSORS):
+                    continue
+                # as_posix(), not str(): on Windows str() emits backslashes, so every
+                # site would miss its forward-slash key and land in BOTH the unexpected
+                # and the missing set -- bogus failures on every Windows run, and
+                # ci.yml runs the docs suite there with no --suite filter.
+                rel = path.relative_to(REPO).as_posix()
+                found.setdefault((rel, " ".join(line.split())), []).append(n)
     return found
 
 
@@ -104,25 +130,43 @@ def main() -> int:
         print("      is clean. Fix the scan before trusting a green run.")
         return 1
 
-    for rel in sorted(set(found) - set(EXPECTED)):
+    for key in sorted(set(found) - set(EXPECTED)):
         ok = False
-        lines = ", ".join(str(n) for n in found[rel])
-        print(f"FAIL: {rel}:{lines} reads a runtime-config secret in plaintext.")
+        rel, text = key
+        lines = ", ".join(str(n) for n in found[key])
+        print(f"FAIL: {rel}:{lines} reads a runtime-config secret in plaintext:")
+        print(f"        {text}")
         print("      Every disclosure this guards against was an emitter holding the")
         print("      plaintext. If the read is entitled, add it to EXPECTED with the")
         print("      reason. Do not delete the test.")
 
-    for rel in sorted(set(EXPECTED) - set(found)):
+    for key in sorted(set(EXPECTED) - set(found)):
         ok = False
-        print(f"FAIL: {rel} no longer calls a plaintext accessor.")
-        print(f"      It was permitted one because: {EXPECTED[rel]}")
-        print("      If the caller moved, move its entry with it -- a stale allowlist")
-        print("      silently re-permits whatever takes its place.")
+        rel, text = key
+        print(f"FAIL: {rel} no longer contains this entitled plaintext read:")
+        print(f"        {text}")
+        print(f"      It was permitted because: {EXPECTED[key][1]}")
+        print("      If the caller moved or was reworded, update its entry -- a stale")
+        print("      allowlist silently re-permits whatever takes its place.")
+
+    for key in sorted(set(found) & set(EXPECTED)):
+        want = EXPECTED[key][0]
+        got = len(found[key])
+        if got == want:
+            continue
+        ok = False
+        rel, text = key
+        lines = ", ".join(str(n) for n in found[key])
+        print(f"FAIL: {rel} has {got} copies of an entitled plaintext read, expected {want}:")
+        print(f"        {text}  (lines {lines})")
+        print("      A duplicate cannot ride along on an entitled twin. This is counted")
+        print("      per call site precisely because a file-level allowlist let a second")
+        print("      read inside the GET /api/config handler pass green.")
 
     if ok:
         sites = sum(len(v) for v in found.values())
-        print(f"plaintext-accessor callers: OK ({sites} call site(s) across "
-              f"{len(found)} file(s), all accounted for)")
+        print(f"plaintext-accessor callers: OK ({sites} call site(s), "
+              f"{len(found)} distinct, all accounted for)")
     return 0 if ok else 1
 
 
