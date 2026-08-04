@@ -221,6 +221,7 @@ Headers are `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `X-Acc
 |---|---|---|
 | `completed` | result delivered | nothing — you have the answer |
 | `cap_expired` | the response's time budget elapsed; **the execution continues** | fetch by `execution_id` |
+| `record_gone` | this response could not continue — the bridge record was reaped (session/pressure teardown) or the server is shutting down; **the execution continues** | fetch by `execution_id`, or reconnect via GET to resume |
 | `cancelled` | your `notifications/cancelled` detached the response; **the execution continues** | fetch by `execution_id` if you still want it |
 | `session_terminated` | the session ended | re-`initialize` |
 | `credential_revoked` | your credential stopped being valid | re-authenticate |

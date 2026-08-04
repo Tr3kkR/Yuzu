@@ -1090,7 +1090,15 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
             return;
         }
         if (ph != Phase::kArmedGetOnly && ph != Phase::kRingOnly && ph != Phase::kStreaming) {
-            return;  // kArming latches; kDone/kAborted dead
+            // kArming latches; kDone/kAborted dead. A sweep claim can reach this
+            // point (phase already flipped, record not yet erased) while a pump
+            // still holds this key: without record_gone, the pump reads an
+            // untouched default batch and heartbeats on a record nothing will
+            // ever update again.
+            if (out != nullptr) {
+                out->record_gone = true;
+            }
+            return;
         }
         if (rec->projection_in_flight.load(std::memory_order_acquire)) {
             if (out != nullptr) {

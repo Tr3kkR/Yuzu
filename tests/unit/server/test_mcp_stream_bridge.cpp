@@ -2764,6 +2764,36 @@ TEST_CASE("take_post_batch reports record_gone, not a silent empty tick (C6c)",
     }
 }
 
+TEST_CASE("take_post_batch reports record_gone for a record settled kDone but not yet reaped (C6c)",
+          "[mcp][bridge][2f]") {
+    // Gate 8 wave 2 (cpp-safety): on_post_closed_keyed's own kDone transition
+    // deliberately does NOT erase the record - "settle kDone and let sweep reap
+    // it" - so a record can sit in records_ with phase kDone for an arbitrary
+    // stretch before a later sweep pass claims and erases it. If a pump is still
+    // ticking on that key in that window (the sweep's stranded-kStreaming
+    // backstop having parked it earlier, or a slow releaser), take_post_batch
+    // still finds the record and hands it to project_record, whose own
+    // kArming/kDone/kAborted early return is the third record_gone gap the
+    // first two fixed sites in take_post_batch did not cover.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-settled"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto key = fx.bridge->record_key(s.id, json(1));
+    REQUIRE(key.has_value());
+
+    REQUIRE(fx.bridge->on_final_written(*key));
+    REQUIRE(fx.bridge->on_post_closed_keyed(*key));  // final_written -> kDone, not erased
+    REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kDone);
+
+    auto batch = fx.bridge->take_post_batch(*key, /*cap_expired=*/false);
+    CHECK(batch.record_gone);
+    CHECK_FALSE(batch.cap_settled);
+    CHECK_FALSE(batch.final_frame.has_value());
+}
+
 TEST_CASE("bridge sweep backstop PARKS a stranded kStreaming record, never reaps it (C6c)",
           "[mcp][bridge][2f]") {
     // No sweep pass claims kStreaming, so a record whose releaser never ran is
