@@ -399,13 +399,18 @@ private:
     /// while no principal can accumulate that many pending rows.
     static constexpr int kFindPendingScanLimit = 64;
 
-    /// The most PENDING approvals one principal may hold, enforced for every
-    /// mint surface through `submitter_pending_cap_reached`.
+    /// The most PENDING approvals one principal may hold on a mint surface that
+    /// ASKS. `submit()` does not enforce this, so it binds only a caller that
+    /// calls `submitter_pending_cap_reached` first — today that is the MCP mint
+    /// alone; the REST instruction gate and the scheduler mint uncapped, bounded
+    /// only by the global pending cap.
     static constexpr int kSubmitterPendingCap = 25;
 
     static_assert(kSubmitterPendingCap < kFindPendingScanLimit,
-                  "a per-submitter pending cap at or above the scan window lets an eligible "
-                  "row hide behind foreign-origin rows, reopening the #289 dedup miss");
+                  "a per-submitter pending cap at or above the scan window is not provably "
+                  "safe: it takes a full scan window of same-tuple rows AHEAD of an eligible "
+                  "one to hide it, so keep the cap strictly below and leave margin for the "
+                  "uncapped mint paths, or the #289 dedup miss reopens");
     static_assert(kFindPendingScanLimit > 0,
                   "LIMIT 0 makes find_pending return nullopt unconditionally (dedup silently "
                   "off); a negative limit means NO limit in SQLite (unbounded scan under mtx_)");

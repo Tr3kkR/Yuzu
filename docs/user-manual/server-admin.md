@@ -263,11 +263,17 @@ redeemable in the first place.
 The claim is checkable rather than asserted. `ApprovalManager`'s only public mutators are
 `approve`, `reject`, `consume_ticket` and the submit path; the first two both route through
 `set_review_status`, which returns `approval already reviewed` unless the stored status is
-`pending`, and `consume_ticket` redeems a ticket rather than retiring it. The complete set of
-approval endpoints is `GET /api/approvals`, `GET /api/approvals/pending/count`, and the
-`POST /api/approvals/{id}/approve` and `/reject` pair — note the last two are registered as
-raw-string regex patterns, so a literal search for `"/api/approvals` will not find them and will
-appear to confirm this paragraph for the wrong reason.
+`pending`, and `consume_ticket` redeems a ticket rather than retiring it. The operator-reachable
+surfaces are `GET /api/approvals`, `GET /api/approvals/pending/count`, the
+`POST /api/approvals/{id}/approve` and `/reject` pair, the read-only versioned
+`GET /api/v1/approvals/{id}`, and the `approve_request` / `reject_request` MCP tools — the last
+two call the same `approve`/`reject` path and inherit the same pending-only refusal.
+
+Two traps in checking that list, both of which caught a reviewer of this very paragraph: the
+approve/reject routes are registered as raw-string regex patterns, so a literal search for
+`"/api/approvals` misses them; and searching `server.cpp` alone misses both the versioned route
+and the MCP tools, which live in `rest_api_v1.cpp` and `mcp_server.cpp`. An enumeration drawn
+from one file will look like it confirms this paragraph, for the wrong reason.
 
 Earlier revisions of this note carried a direct `UPDATE` against `instructions.db`. It has been
 withdrawn. Four successive attempts to publish a safe version each shipped a defect that

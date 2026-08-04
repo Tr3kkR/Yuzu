@@ -11,13 +11,20 @@ one retrievable by a third party, not editable in place by the change author, an
 anchored to a version. Those rows cite `/tmp/advrev-2442/`, which satisfies none of the
 three.
 
-**The rows do not yet carry it.** Correcting them is blocked, not merely outstanding:
-they are stamped `recorded_at 2026-08-04T19:10:00Z` while the commit that introduced
-them, `85253af7`, has both author and committer date `2026-08-04T16:19:04Z`. Since
-`recorded_at` is the last-write-wins precedence key and a row is superseded rather than
-edited, a correction stamped honestly sorts before the row it corrects and never takes
-effect. The same block holds for the `source: "external-review"` value, which is off the
-enum at SKILL.md:1642.
+**The rows now carry it, after a delay worth recording.** They are stamped
+`recorded_at 2026-08-04T19:10:00Z`, while the commit that introduced them, `85253af7`,
+has both author and committer date `2026-08-04T16:19:04Z` — a row claiming to be written
+three hours after the commit containing it. Because `recorded_at` is the last-write-wins
+precedence key and a row is superseded rather than edited, a correction stamped honestly
+before 19:10Z would have sorted behind the row it corrects and never taken effect, so the
+correction waited rather than being back-dated into place. It landed in `beaa7aec`, whose
+rows are stamped `19:17:30Z`: all four now carry `source: "external-model"` — replacing a
+value off the enum at SKILL.md:1642 — and a `reporter_ref` into this directory.
+
+One row is deliberately still uncorrected: `adv2-reviewer-left-guard-disabled` keeps
+`source: "external-review"`, because its reporter was the orchestrator rather than an
+external model, and none of the three enum values describes an author-side self-finding.
+That is an open question for the operator, not an oversight.
 
 ## What was reviewed, and what has changed since
 
