@@ -438,6 +438,10 @@ int ApprovalManager::pending_count_for(const std::string& submitted_by) const {
     return count;
 }
 
+bool ApprovalManager::submitter_pending_cap_reached(const std::string& submitted_by) const {
+    return pending_count_for(submitted_by) >= kSubmitterPendingCap;
+}
+
 // ---------------------------------------------------------------------------
 // Get by id (#289 — MCP approval-ticket recall)
 // ---------------------------------------------------------------------------
@@ -508,22 +512,22 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
     // the scan takes the newest ELIGIBLE row rather than trusting `LIMIT 1`, so
     // a foreign ticket in front of a valid one does not hide it.
     //
-    // `LIMIT 64` does truncate: an eligible row past position 64 IS hidden. What
-    // makes that harmless is `kMcpSubmitterPendingCap` (25) in mcp_server.cpp —
-    // NOT the global 1000-pending cap. Note the ORDER: that check runs AFTER
-    // this call, on the nullopt path, not before it. So a truncated scan does
-    // not silently mint a duplicate; it falls through to the cap check, which
-    // denies with "too many pending approvals" — 64 same-tuple pending rows
-    // implies at least 64 pending for that submitter, and the tuple pins
+    // The `LIMIT` does truncate: an eligible row past the scan window IS hidden.
+    // What makes that harmless is `kSubmitterPendingCap` — NOT the global
+    // 1000-pending cap. Note the ORDER: that check runs AFTER this call, on the
+    // nullopt path, not before it. So a truncated scan does not silently mint a
+    // duplicate; it falls through to the cap check, which denies with "too many
+    // pending approvals" — a full scan window of same-tuple pending rows implies
+    // at least that many pending for that submitter, and the tuple pins
     // `submitted_by`.
     //
-    // The invariant is therefore `kFindPendingScanLimit` >
-    // `kMcpSubmitterPendingCap`. Those used to be unrelated literals in different
-    // translation units, so raising the cap above 64 WOULD HAVE reopened the dedup
-    // miss silently — foreign rows come from REST and the scheduler, which never
-    // consult that cap. The limit is now a public constant on this class and
-    // `mcp_server.cpp` static_asserts its cap against it, so that change fails
-    // the build instead.
+    // Both constants are private to this class and related by a static_assert in
+    // the header, so a cap raised to or above the scan window fails the build
+    // rather than reopening the dedup miss silently. Ordering alone is necessary
+    // but not sufficient: the margin between them also absorbs same-tuple pending
+    // rows from the other two mint paths — `workflow_routes.cpp` and
+    // `schedule_runner.cpp` call `submit()` without consulting any pending cap —
+    // so narrowing the gap to satisfy the assert is not the same as staying safe.
     std::string sql = std::string("SELECT ") + kSelectAllCols +
                       " FROM approvals WHERE definition_id = ? AND submitted_by = ? "
                       "AND scope_expression = ? AND status = 'pending' "

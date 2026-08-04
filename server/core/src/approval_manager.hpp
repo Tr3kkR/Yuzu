@@ -311,13 +311,13 @@ public:
     /// which uses this.
     std::expected<std::optional<Approval>, std::string> get_checked(const std::string& id) const;
 
-    /// How many same-tuple pending rows `find_pending` scans before truncating.
-    /// PUBLIC because the safety of that truncation depends on a caller-side
-    /// constant: any per-submitter pending cap MUST be strictly below this, or an
-    /// eligible row can hide behind foreign-origin rows and the dedup miss
-    /// reopens silently. `mcp_server.cpp` static_asserts its cap against this;
-    /// a new mint surface with its own cap must do the same.
-    static constexpr int kFindPendingScanLimit = 64;
+    /// True when `submitted_by` already holds the maximum PENDING approvals a
+    /// single principal may hold. Ask this rather than comparing
+    /// `pending_count_for` against a cap of your own: the cap and the scan
+    /// window it must stay below are both private to this class (see below) and
+    /// related there by a static_assert, so a caller cannot hold a divergent
+    /// number and a new mint surface cannot forget to relate the two.
+    bool submitter_pending_cap_reached(const std::string& submitted_by) const;
 
     /// Newest PENDING approval matching (definition_id, submitted_by,
     /// scope_expression), or nullopt. The MCP approval-ticket mint dedup key
@@ -393,6 +393,22 @@ public:
                                                      const ConsumePrecondition& precondition);
 
 private:
+    /// How many same-tuple pending rows `find_pending` scans before truncating.
+    /// An eligible row past this position IS hidden, which is only harmless
+    /// while no principal can accumulate that many pending rows.
+    static constexpr int kFindPendingScanLimit = 64;
+
+    /// The most PENDING approvals one principal may hold, enforced for every
+    /// mint surface through `submitter_pending_cap_reached`.
+    static constexpr int kSubmitterPendingCap = 25;
+
+    static_assert(kSubmitterPendingCap < kFindPendingScanLimit,
+                  "a per-submitter pending cap at or above the scan window lets an eligible "
+                  "row hide behind foreign-origin rows, reopening the #289 dedup miss");
+    static_assert(kFindPendingScanLimit > 0,
+                  "LIMIT 0 makes find_pending return nullopt unconditionally (dedup silently "
+                  "off); a negative limit means NO limit in SQLite (unbounded scan under mtx_)");
+
     std::expected<void, std::string> set_review_status(const std::string& id,
                                                        const std::string& status,
                                                        const std::string& reviewer,

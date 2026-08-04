@@ -3181,9 +3181,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         // key defeats the args-hash) would still fill the GLOBAL
                         // pending cap shared with the REST approval workflow. Bound
                         // any single principal's share far below that global cap.
-                        constexpr int kMcpSubmitterPendingCap = 25;
-                        if (approval_manager->pending_count_for(session->username) >=
-                            kMcpSubmitterPendingCap) {
+                        if (approval_manager->submitter_pending_cap_reached(session->username)) {
                             mcp_audit("denied", "per-submitter pending-approval cap reached");
                             res.set_content(
                                 a4_error(kTierDenied,
