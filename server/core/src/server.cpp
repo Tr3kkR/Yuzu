@@ -94,6 +94,16 @@
 #include "authz_model.hpp" // #1788: per-arm visibility intersection (in_scope/filter_to_scope)
 #include "dispatch_confined_arms.hpp" // the ONE per-arm intersection, shared with /api/command
 #include "dispatch_scope_ladder.hpp" // A-3/QE-2: the shared scope-resolution ladder + caller wiring
+#include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
+#include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
+// PR1.9c: the six capability spans build_classified_command's registry composes over — declared
+// by other packages (p1/p7/p10-p13), included (never authored) here at the composition site.
+#include "capability_decls/core_dispatch_capabilities.hpp"
+#include "capability_decls/plugin_action_catalogue_a.hpp"
+#include "capability_decls/plugin_action_catalogue_b.hpp"
+#include "capability_decls/plugin_action_catalogue_c.hpp"
+#include "capability_decls/plugin_action_catalogue_d.hpp"
+#include "capability_decls/plugin_action_catalogue_content_dist.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -2425,17 +2435,22 @@ public:
                 const auto command_id =
                     "tar-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
 
-                detail::pb::CommandRequest cmd;
-                cmd.set_command_id(command_id);
-                cmd.set_plugin("tar");
-                cmd.set_action("fleet_snapshot");
+                // PR1.9c: the ONE builder, under an explicit system caller —
+                // `tar.fleet_snapshot` is `system_reserved` (never a
+                // caller-attributable RBAC decision, capdecls::
+                // core_dispatch_capabilities.hpp).
+                auto classified = build_classified_command(
+                    yuzu::server::DispatchCaller{.system = true}, "tar", "fleet_snapshot",
+                    command_id);
+                if (!classified)
+                    return out; // denied/unclassified — already counted + logged
 
                 agent_service_.record_send_time(command_id);
 
                 std::unordered_set<std::string> dispatched;
                 dispatched.reserve(agent_ids.size());
                 for (const auto& aid : agent_ids) {
-                    if (registry_.send_to(aid, cmd))
+                    if (registry_.send_to(aid, *classified))
                         dispatched.insert(aid);
                 }
                 forward_gateway_pending();
@@ -2905,16 +2920,17 @@ public:
                             return member;
                         },
                         /*full_sync=*/true, current);
-                    ::yuzu::agent::v1::CommandRequest cmd;
                     // Unique per re-push (random suffix) so a same-generation reconcile
                     // can't collide with the agent's replay-dedup set (hp-F2/cons-S1).
-                    cmd.set_command_id(
+                    const auto command_id =
                         "__guard__-reconcile-" + std::to_string(current) + "-" +
-                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8)));
-                    cmd.set_plugin("__guard__");
-                    cmd.set_action("push_rules");
-                    cmd.set_payload(push.SerializeAsString());
-                    if (registry_.send_to(agent_id, cmd)) {
+                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+                    // PR1.9c: system caller — __guard__.push_rules is
+                    // `system_reserved` (capdecls::core_dispatch_capabilities.hpp).
+                    auto classified = build_classified_command(
+                        yuzu::server::DispatchCaller{.system = true}, "__guard__", "push_rules",
+                        command_id, /*parameters=*/{}, push.SerializeAsString());
+                    if (classified && registry_.send_to(agent_id, *classified)) {
                         forward_gateway_pending();
                         metrics_
                             .counter("yuzu_server_guardian_reconciles_total",
@@ -6312,13 +6328,132 @@ private:
         };
     }
 
+    /// PR1.9c: a stable string label for `DispatchArm`, fed into
+    /// `build_classified_command`'s `target_arm` (→ `compute_plan_hash`) so
+    /// two dispatches of the same `plugin.action` differing only in HOW
+    /// targets were selected (an explicit id list vs. a scope match that
+    /// happens to resolve to the same set) mint distinct plan identities.
+    /// Local to this translation unit, not the wire — never parsed back,
+    /// only hashed, so the exact spelling is a private implementation detail.
+    static std::string_view dispatch_arm_label(DispatchArm arm) {
+        switch (arm) {
+        case DispatchArm::Group: return "group";
+        case DispatchArm::Scope: return "scope";
+        case DispatchArm::Ids: return "ids";
+        case DispatchArm::Broadcast: return "broadcast";
+        case DispatchArm::None: return "none";
+        }
+        return "none";
+    }
+
+    /// PR1.9c (spec item 1): the ONE place a `detail::pb::CommandRequest` is
+    /// constructed — every former direct-construction site now calls this
+    /// instead. Classifies `plugin.action` via `capability_registry_`,
+    /// authorizes the result against `caller` (via
+    /// `classify_and_authorize_dispatch`, agent_registry.hpp — the pure,
+    /// independently-unit-tested decision this method wraps with the one live
+    /// dependency it needs: `rbac_store_`), and — ONLY on success — stamps
+    /// `dispatch_tag` and mints the `ClassifiedCommand` that alone can reach
+    /// `AgentRegistry::send_to`/`send_to_all`.
+    ///
+    /// `target_arm`/`execution_id` feed `compute_plan_hash` (via
+    /// `detail::compute_dispatch_tag`) so two dispatches that differ only in
+    /// HOW targets were selected, or which execution they belong to, mint
+    /// distinct plan identities; callers with no such concept (the system
+    /// dispatchers, the legacy sink) pass `{}` for both. `payload`/
+    /// `stagger_seconds`/`delay_seconds` are optional CommandRequest fields
+    /// only some call sites need — set post-classification, since a
+    /// classification/authorization DENIAL must never construct any part of
+    /// the wire command.
+    ///
+    /// Denial is reported, never thrown: every caller — background loops with
+    /// no `res` to answer on included — must handle
+    /// `std::unexpected` explicitly. Every denial is counted (one family,
+    /// `reason` label) and logged; no path returns a permissive default
+    /// (ADR-0033 §2).
+    std::expected<detail::ClassifiedCommand, detail::DispatchDenial> build_classified_command(
+        const yuzu::server::DispatchCaller& caller, const std::string& plugin,
+        const std::string& action, const std::string& command_id,
+        const std::unordered_map<std::string, std::string>& parameters = {},
+        const std::string& payload = {}, int stagger_seconds = 0, int delay_seconds = 0,
+        const std::string& target_arm = {}, const std::string& execution_id = {}) {
+        auto decision = yuzu::server::detail::classify_and_authorize_dispatch(
+            capability_registry_, caller, plugin, action,
+            [this](std::string_view principal, std::string_view securable,
+                   yuzu::server::authz::Operation op) {
+                // Mirrors every other dispatch-adjacent RBAC read in this file
+                // (e.g. derive_exec_visible's own `legacy_open` composition):
+                // a loaded-and-explicitly-disabled store is legacy-open, and
+                // legacy-open means "RBAC off, everyone may do everything" —
+                // the SAME bypass every other securable already grants here,
+                // not a new one minted for this chokepoint.
+                if (!rbac_enforcement_in_effect(rbac_store_.get()))
+                    return true;
+                return rbac_store_ != nullptr &&
+                       rbac_store_->check_permission(std::string(principal),
+                                                     std::string(securable),
+                                                     std::string(yuzu::server::authz::to_string(op)));
+            });
+
+        if (!decision) {
+            const auto& denial = decision.error();
+            std::string_view reason_label;
+            switch (denial.reason) {
+            case yuzu::server::detail::DispatchDenialReason::Unclassified:
+                reason_label = "unclassified";
+                break;
+            case yuzu::server::detail::DispatchDenialReason::Ambiguous:
+                reason_label = "ambiguous";
+                break;
+            case yuzu::server::detail::DispatchDenialReason::AnonymousOperator:
+                reason_label = "anonymous_operator";
+                break;
+            case yuzu::server::detail::DispatchDenialReason::Forbidden:
+                reason_label = "forbidden";
+                break;
+            }
+            metrics_
+                .counter("yuzu_server_dispatch_denied_total",
+                         {{"reason", std::string(reason_label)}})
+                .increment();
+            spdlog::warn(
+                "dispatch denied: {}:{} reason={} securable={} caller={}", plugin, action,
+                reason_label, denial.securable.empty() ? "(none)" : denial.securable,
+                caller.system ? std::string("system")
+                             : (caller.principal.empty() ? std::string("(anonymous)")
+                                                          : caller.principal));
+            return std::unexpected(denial);
+        }
+
+        const auto& cap = *decision;
+        detail::pb::CommandRequest cmd;
+        cmd.set_command_id(command_id);
+        cmd.set_plugin(plugin);
+        cmd.set_action(action);
+        for (const auto& [k, v] : parameters)
+            (*cmd.mutable_parameters())[k] = v;
+        if (!payload.empty())
+            cmd.set_payload(payload);
+        if (stagger_seconds > 0)
+            cmd.set_stagger_seconds(stagger_seconds);
+        if (delay_seconds > 0)
+            cmd.set_delay_seconds(delay_seconds);
+
+        const std::map<std::string, std::string> ordered_params(parameters.begin(),
+                                                                 parameters.end());
+        cmd.set_dispatch_tag(yuzu::server::detail::compute_dispatch_tag(
+            cap, plugin, action, ordered_params, target_arm, execution_id));
+
+        return detail::ClassifiedCommand(std::move(cmd));
+    }
+
     /// A-3: the `ConfinedDispatchSink` literal both `dispatch_confined` and
     /// `/api/command` built by hand — byte-identical apart from the local
     /// name (`sink` vs `confined_sink`) — is the same sink because the two
     /// callers dispatch through the SAME registry_. `cmd` is captured by
     /// reference: the returned sink must not outlive it.
     yuzu::server::ConfinedDispatchSink
-    make_confined_dispatch_sink(const detail::pb::CommandRequest& cmd) {
+    make_confined_dispatch_sink(const detail::ClassifiedCommand& cmd) {
         return yuzu::server::ConfinedDispatchSink{
             [this, &cmd](const std::string& aid) { return registry_.send_to(aid, cmd); },
             [this, &cmd] { return registry_.send_to_all(cmd); },
@@ -6394,26 +6529,35 @@ private:
         auto command_id =
             plugin + "-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
 
-        detail::pb::CommandRequest cmd;
-        cmd.set_command_id(command_id);
-        cmd.set_plugin(plugin);
-        cmd.set_action(norm_action);
-        for (const auto& [k, v] : parameters)
-            (*cmd.mutable_parameters())[k] = v;
+        // Same classifier as the /api/command handler (#2500): an explicit
+        // agent_ids list ALWAYS wins over a broadcast request; `__all__` is
+        // treated as "no scope expression", never a first-wins broadcast.
+        // Computed here (in addition to inside resolve_and_dispatch_confined,
+        // which is pure and cheap to call twice) for TWO reasons now: the
+        // None-arm observability below (specific to this seam, not something
+        // dispatch_confined_arms itself emits), AND — PR1.9c — to feed
+        // build_classified_command's plan-hash `target_arm` below.
+        const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+
+        // PR1.9c (spec item 1): the ONE builder. Classification/authorization
+        // gates BEFORE any targeting decision — a denial (unclassified,
+        // ambiguous, or `caller` not authorized for the resolved
+        // securable/operation) reaches nobody, exactly like the None-arm
+        // no-target case below. Already counted + logged by
+        // build_classified_command; nothing further to do here on refusal.
+        auto classified =
+            build_classified_command(caller, plugin, norm_action, command_id, parameters,
+                                     /*payload=*/{}, /*stagger_seconds=*/0, /*delay_seconds=*/0,
+                                     std::string(dispatch_arm_label(arm)), execution_id);
+        if (!classified)
+            return {command_id, 0};
+
         agent_service_.record_send_time(command_id);
         // PR 2 / UP2-4: register command_id -> execution_id BEFORE any RPC.
         if (!execution_id.empty()) {
             agent_service_.record_execution_id(command_id, execution_id);
         }
 
-        // Same classifier as the /api/command handler (#2500): an explicit
-        // agent_ids list ALWAYS wins over a broadcast request; `__all__` is
-        // treated as "no scope expression", never a first-wins broadcast.
-        // Computed here (in addition to inside resolve_and_dispatch_confined,
-        // which is pure and cheap to call twice) ONLY to decide the
-        // None-arm observability below, which is specific to this seam and
-        // not something dispatch_confined_arms itself emits.
-        const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
         if (arm == DispatchArm::None && !broadcast_on_none) {
             // Shared closure: NO TARGET NAMED AT ALL — reach NOBODY, not
             // everybody (#2500). COUNTED, not just logged: this branch is
@@ -6454,7 +6598,7 @@ private:
                 audit_scope_evaluation_aborted(principal, role, cmd_id, reason);
             },
             command_id, execution_id, caller.principal_role, agent_ids, scope_expr,
-            caller.exec_visible, broadcast_on_none, cmd);
+            caller.exec_visible, broadcast_on_none, *classified);
         (void)ignored_command_id; // always == command_id, minted above
 
         forward_gateway_pending();
@@ -6610,22 +6754,22 @@ private:
             return;
 
         // Build the sync command with all 4 structured category values
-        ::yuzu::agent::v1::CommandRequest cmd;
-        cmd.set_command_id("asset-tag-sync-" +
-                           std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                              std::chrono::system_clock::now().time_since_epoch())
-                                              .count()));
-        cmd.set_plugin("asset_tags");
-        cmd.set_action("sync");
-
-        auto* params = cmd.mutable_parameters();
+        std::unordered_map<std::string, std::string> parameters;
         for (auto cat_key : kCategoryKeys) {
             std::string key_str{cat_key};
-            auto val = tag_store_->get_tag(agent_id, key_str);
-            (*params)[key_str] = val;
+            parameters[key_str] = tag_store_->get_tag(agent_id, key_str);
         }
 
-        if (registry_.send_to(agent_id, cmd)) {
+        const auto command_id =
+            "asset-tag-sync-" +
+            std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count());
+        // PR1.9c: system caller — asset_tags.sync is `system_reserved`
+        // (capdecls::core_dispatch_capabilities.hpp).
+        auto classified = build_classified_command(yuzu::server::DispatchCaller{.system = true},
+                                                    "asset_tags", "sync", command_id, parameters);
+        if (classified && registry_.send_to(agent_id, *classified)) {
             spdlog::debug("Pushed asset tag sync to agent {}", agent_id);
             forward_gateway_pending();
         }
@@ -9046,6 +9190,19 @@ private:
             }
             const bool named_target = yuzu::server::targeting_supplied(body);
 
+            // Resolved ONCE for the whole handler (was resolved a second time,
+            // redundantly, inside the destructive-action block below, and a
+            // third time implicitly via derive_exec_visible's need for a
+            // Session — PR1.9c consolidates to the one call every other path
+            // in this file already treats as the rule: "require_auth writes an
+            // error response on failure, so calling it twice could emit two"
+            // (forward_legacy_command's own comment, same file). Placed AFTER
+            // require_permission(Execution,Execute) so a bare-unauthenticated
+            // caller was already turned away by that coarser gate first.
+            auto sess = require_auth(req, res);
+            if (!sess)
+                return; // require_auth already wrote the response
+
             // Per-action securable elevation + scope confinement for DESTRUCTIVE
             // generic-dispatch actions (governance HIGH #2). /api/command otherwise
             // base-gates only Execution:Execute and applies NO per-device visibility to
@@ -9059,18 +9216,24 @@ private:
             // purge via /api/command audits under the generic `command.dispatch` verb +
             // yuzu_commands_dispatched_total, not tar.source.purge / the domain metric —
             // domain-verb emission on this path is tracked in Tr3kkR/Yuzu#1787.)
+            //
+            // PR1.9c (spec item 4): PRESERVES this behaviour exactly for
+            // `tar.purge_source` — same securable (`Infrastructure`), same
+            // operation (`Delete`), same 400/404 shapes, same visible-agents
+            // confinement — but sources the securable/operation from
+            // `capability_registry_` instead of a hand-maintained one-row map,
+            // so it generalizes automatically to every OTHER row the registry
+            // classifies `Destructive` (e.g. `filesystem.delete_lines`,
+            // `registry.delete_key`) rather than silently exempting them from
+            // the same targeting-safety treatment `tar.purge_source` alone used
+            // to get.
             {
-                static const std::unordered_map<std::string,
-                                                std::pair<std::string, std::string>>
-                    kDestructiveActionSecurable = {
-                        {"tar.purge_source", {"Infrastructure", "Delete"}},
-                    };
-                std::string dkey = plugin + "." + action;
-                std::transform(dkey.begin(), dkey.end(), dkey.begin(),
-                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                if (auto it = kDestructiveActionSecurable.find(dkey);
-                    it != kDestructiveActionSecurable.end()) {
-                    if (!require_permission(req, res, it->second.first, it->second.second))
+                const auto classified_for_gate = capability_registry_.classify(plugin, action);
+                if (classified_for_gate &&
+                    classified_for_gate->dispatch_class == yuzu::server::DispatchClass::Destructive) {
+                    const auto& cap = *classified_for_gate;
+                    if (!require_permission(req, res, cap.securable,
+                                            std::string(yuzu::server::authz::to_string(cap.operation))))
                         return;
                     // Destructive dispatch must be explicitly targeted + in scope.
                     if (agent_ids.empty() || !extract_json_string(body, "scope").empty()) {
@@ -9085,10 +9248,8 @@ private:
                     // dashboard fragment). Out-of-scope ids are silently dropped.
                     std::vector<std::string> filtered;
                     if (mgmt_group_store_) {
-                        auto s = require_auth(req, res);
-                        if (!s) return;
                         // ADR-0042: nullopt (store degraded) → empty visible set → 404.
-                        auto vis = mgmt_group_store_->get_visible_agents(s->username);
+                        auto vis = mgmt_group_store_->get_visible_agents(sess->username);
                         std::unordered_set<std::string> visible;
                         if (vis)
                             visible.insert(vis->begin(), vis->end());
@@ -9132,11 +9293,11 @@ private:
             // emptied out below. Fail-closed: any store error narrows to
             // "nothing visible", never "everything" — never re-decides the
             // frozen #1715/INV-7 precedence those RbacStore calls already
-            // resolve, only composes on top of it.
-            auto sess = require_auth(req, res);
-            if (!sess)
-                return; // require_auth already wrote the response
-
+            // resolve, only composes on top of it. `sess` was already
+            // resolved once, above the destructive-action block (PR1.9c
+            // consolidation) — re-authenticating here would risk a second
+            // written response on failure for no benefit.
+            //
             // D3: the no-agent 503 short-circuit sits BEFORE deriving
             // exec_visible — that derivation runs an RBAC/tag-store lookup
             // that is wasted work on the (common, cheap-to-detect) no-agent
@@ -9149,39 +9310,74 @@ private:
                 return;
             }
 
-            yuzu::server::authz::VisibleSet exec_visible = derive_exec_visible(*sess);
+            // PLAN-006: the caller's IDENTITY, not merely their visibility
+            // filter — `caller.exec_visible` is byte-identical to the
+            // `exec_visible` this handler derived directly before PR1.9c
+            // (`derive_dispatch_caller` composes `derive_exec_visible`
+            // verbatim), kept as a reference alias so every arm-dispatch use
+            // of `exec_visible` below is unchanged.
+            const auto caller = derive_dispatch_caller(*sess);
+            const auto& exec_visible = caller.exec_visible;
 
             auto command_id =
                 plugin + "-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
 
-            detail::pb::CommandRequest cmd;
-            cmd.set_command_id(command_id);
-            cmd.set_plugin(plugin);
-            cmd.set_action(action);
+            // Parameters: pass-through key-value pairs to the agent plugin.
+            auto parameters = extract_json_string_map(body, "params");
 
-            // Parameters: pass-through key-value pairs to the agent plugin
-            {
-                auto params_map = extract_json_string_map(body, "params");
-                for (const auto& [k, v] : params_map) {
-                    (*cmd.mutable_parameters())[k] = v;
-                }
-            }
-
-            // Stagger/delay: prevent thundering herd on large-fleet dispatch
+            // Stagger/delay: prevent thundering herd on large-fleet dispatch.
             auto stagger = extract_json_int(body, "stagger", 0);
             auto delay = extract_json_int(body, "delay", 0);
-            if (stagger > 0)
-                cmd.set_stagger_seconds(stagger);
-            if (delay > 0)
-                cmd.set_delay_seconds(delay);
-
-            agent_service_.record_send_time(command_id);
 
             // Check for scope-based targeting. Reuses the parsed body like the
             // other post-auth reads; this site was missed when the rest were
             // converted and re-parsed the whole body to read a key the handler
-            // already had (governance).
+            // already had (governance). Computed here (moved up from just
+            // before the arm dispatch below) because PR1.9c's builder needs
+            // `arm` for its plan-hash `target_arm` before any dispatch
+            // decision is made.
             auto scope_expr = extract_json_string(body, "scope");
+            const auto arm = yuzu::server::classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+
+            // PR1.9c (spec item 1): the ONE builder — the only place a
+            // `detail::pb::CommandRequest` is constructed. A denial (unknown/
+            // ambiguous plugin.action, or `caller` not authorized for the
+            // resolved securable/operation) is answered here — unlike the
+            // background dispatch seams, this route has a `res` to write to.
+            // Already counted (`yuzu_server_dispatch_denied_total{reason=}`)
+            // and logged by build_classified_command; this block only shapes
+            // the HTTP response and the route-local audit row.
+            auto classified = build_classified_command(
+                caller, plugin, action, command_id, parameters, /*payload=*/{}, stagger, delay,
+                std::string(dispatch_arm_label(arm)), /*execution_id=*/{});
+            if (!classified) {
+                const auto& denial = classified.error();
+                const bool is_classification_error =
+                    denial.reason == yuzu::server::detail::DispatchDenialReason::Unclassified ||
+                    denial.reason == yuzu::server::detail::DispatchDenialReason::Ambiguous;
+                const int status = is_classification_error ? 400 : 403;
+                const std::string message =
+                    is_classification_error
+                        ? std::string{"unknown or ambiguous plugin.action"}
+                        : "permission denied: " + denial.securable + ":" +
+                              std::string(yuzu::server::authz::to_string(denial.operation));
+                const bool audit_ok =
+                    audit_log(req, "command.dispatch", "denied", "command", "",
+                             std::string("reason=dispatch_denied ") +
+                                 onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                 onbehalf::sanitize_for_log(action, 128));
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = status;
+                nlohmann::json err{{"error", {{"code", status}, {"message", message}}},
+                                   {"meta", {{"api_version", "v1"}}}};
+                if (audit_store_)
+                    err["audit_emitted"] = audit_ok;
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+
+            agent_service_.record_send_time(command_id);
 
             int sent = 0;
             // `__all__` is the PUBLISHED ground scope kind (/discover/scope-kinds,
@@ -9199,14 +9395,13 @@ private:
             // shaping — which is why it is not simply absorbed by that seam —
             // but the DECISION OF WHO IS REACHED is the shared one, so the two
             // can no longer drift.
-            const auto confined_sink = make_confined_dispatch_sink(cmd);
+            const auto confined_sink = make_confined_dispatch_sink(*classified);
             const auto dispatch_broadcast = [&]() -> int {
                 return yuzu::server::dispatch_confined_arms(
                     yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
                     /*broadcast_on_none=*/true, confined_sink);
             };
 
-            const auto arm = yuzu::server::classify_dispatch_arm(!agent_ids.empty(), scope_expr);
             if (arm == yuzu::server::DispatchArm::Group) {
                 // Group-based dispatch — resolve group members here, then let the
                 // shared seam intersect (#1788): a management group is a targeting
@@ -14259,19 +14454,20 @@ private:
                         [&](const std::string& expr) { return agent_in_scope(aid, expr); },
                         full_sync, generation);
 
-                    ::yuzu::agent::v1::CommandRequest cmd;
                     // Unique per push (random suffix) so two pushes in the same second
                     // can't collide on the agent's replay-dedup set (hp-F2/cons-S1).
-                    cmd.set_command_id(
+                    const auto push_command_id =
                         "__guard__-push-" + std::to_string(now_s) + "-" +
-                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8)));
-                    cmd.set_plugin("__guard__");
-                    cmd.set_action("push_rules");
+                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
                     // Binary serialized proto rides in the `payload` bytes field, not the
                     // `parameters` string map: proto3 string values must be valid UTF-8, and
                     // raw GuaranteedStatePush bytes are not. See agent.proto CommandRequest.payload.
-                    cmd.set_payload(push.SerializeAsString());
-                    if (registry_.send_to(aid, cmd)) {
+                    // PR1.9c: system caller — __guard__.push_rules is
+                    // `system_reserved` (capdecls::core_dispatch_capabilities.hpp).
+                    auto classified = build_classified_command(
+                        yuzu::server::DispatchCaller{.system = true}, "__guard__", "push_rules",
+                        push_command_id, /*parameters=*/{}, push.SerializeAsString());
+                    if (classified && registry_.send_to(aid, *classified)) {
                         ++sent;
                         metrics_
                             .counter("yuzu_server_guardian_pushes_dispatched_total",
@@ -14706,24 +14902,35 @@ private:
         auto command_id =
             plugin + "-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
 
-        detail::pb::CommandRequest cmd;
-        cmd.set_command_id(command_id);
-        cmd.set_plugin(plugin);
-        cmd.set_action(action);
-
-        agent_service_.record_send_time(command_id);
         // Resolve the session ONCE — require_auth writes an error response on
         // failure, so calling it twice could emit two. Fail CLOSED to a
-        // present-empty set (reaches nobody), never nullopt (unfiltered);
-        // the permission gate above has already admitted the caller, so this
-        // only bites if the session vanished between the two.
+        // present-empty visible set AND an empty principal, never nullopt
+        // (unfiltered); the permission gate above has already admitted the
+        // caller, so this only bites if the session vanished between the two.
         auto sess = require_auth(req, res);
-        const yuzu::server::authz::VisibleSet exec_visible =
-            sess ? derive_exec_visible(*sess)
-                 : yuzu::server::authz::deny_all();
+        const yuzu::server::DispatchCaller caller =
+            sess ? derive_dispatch_caller(*sess)
+                 : yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
+        const yuzu::server::authz::VisibleSet& exec_visible = caller.exec_visible;
+
+        // PR1.9c (spec item 1): the ONE builder. A vanished session denies
+        // here (empty principal, non-system caller) — reaching nobody exactly
+        // as the pre-existing deny_all() fallback did, just at the chokepoint
+        // rather than after resolving targets. Already counted + logged by
+        // build_classified_command.
+        auto classified = build_classified_command(caller, plugin, action, command_id);
+        if (!classified) {
+            res.status = 403;
+            res.set_content(
+                R"({"error":{"code":403,"message":"command denied"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+
+        agent_service_.record_send_time(command_id);
         const yuzu::server::ConfinedDispatchSink sink{
-            [&](const std::string& aid) { return registry_.send_to(aid, cmd); },
-            [&] { return registry_.send_to_all(cmd); },
+            [&](const std::string& aid) { return registry_.send_to(aid, *classified); },
+            [&] { return registry_.send_to_all(*classified); },
             [&] { return registry_.all_ids(); }};
         int sent = yuzu::server::dispatch_confined_arms(
             yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
@@ -14841,6 +15048,22 @@ private:
     auth::AuthManager& auth_mgr_;
     auth::AutoApproveEngine auto_approve_;
     yuzu::MetricsRegistry metrics_;
+    /// PR1.9c: the composed classification ruleset `build_classified_command`
+    /// consults on every dispatch — core (this package) plus the five
+    /// per-group plugin catalogues (p7/p10-p13). A STATIC ruleset, constructed
+    /// once: composing it is not itself a cached DECISION (ADR-0012 §4) —
+    /// `classify_and_authorize_dispatch` still re-classifies and re-authorizes
+    /// on every call; nothing about a dispatch OUTCOME is memoized here. No
+    /// dependency on any other member, so declaration order carries no
+    /// constraint.
+    yuzu::server::CommandCapabilityRegistry capability_registry_{
+        yuzu::server::capdecls::core_dispatch_capabilities(),
+        yuzu::server::capdecls::plugin_action_catalogue_a(),
+        yuzu::server::capdecls::plugin_action_catalogue_b(),
+        yuzu::server::capdecls::plugin_action_catalogue_c(),
+        yuzu::server::capdecls::plugin_action_catalogue_d(),
+        yuzu::server::capdecls::plugin_action_catalogue_content_dist(),
+    };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
     /// closed if the DSN is empty or unreachable), reset in stop() AFTER the

@@ -486,6 +486,7 @@ TEST_CASE("resolve_scope_targets: a degraded registry evaluation with no princip
 
 namespace {
 using yuzu::server::detail::AgentRegistry;
+using yuzu::server::detail::ClassifiedCommandTestAccess;
 using yuzu::server::detail::EventBus;
 namespace agent_pb = ::yuzu::agent::v1;
 
@@ -509,12 +510,28 @@ TEST_CASE("wire_and_dispatch_confined: the Ids arm intersects exec_visible again
         // and returns true with NO live gRPC stream needed — the observable
         // hook this test uses to see exactly who was targeted.
         registry.set_gateway_node(id, "test-gateway");
+        // p8/PR1.9c CC-03: send_to()'s routed-path check now refuses a
+        // dispatch-tagged command to a gateway session that hasn't advertised
+        // command_dispatch_tag_v1 — irrelevant to what THIS test binds (the
+        // exec_visible intersection), so advertise it for every fixture agent
+        // exactly as a real gateway's CONNECTED notification would.
+        registry.set_gateway_wire_capabilities(
+            id, {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
     }
 
     yuzu::agent::v1::CommandRequest cmd;
     cmd.set_command_id("wiring-test-cmd");
     cmd.set_plugin("os_info");
     cmd.set_action("version");
+    // p8/PR1.9c PLAN-011: send_to()'s defensive belt-and-braces check now
+    // refuses a command whose dispatch_tag doesn't decode — irrelevant to
+    // what THIS test binds, so stamp a well-formed one. Wrapped via the
+    // test-only door (`ClassifiedCommandTestAccess`) mirroring
+    // `EngineLivenessTestAccess`: `send_to`/`send_to_all` accept only a
+    // `ClassifiedCommand`, mintable in production ONLY by
+    // `ServerImpl::build_classified_command`.
+    cmd.set_dispatch_tag("v1|ro|none|0123456789abcdef0123456789abcdef");
+    auto classified = ClassifiedCommandTestAccess::make(cmd);
 
     // Confined to dev-A only; agent_ids names all three. If the intersection
     // is deleted (the exact K-1 mutation), all three get queued instead of
@@ -529,7 +546,7 @@ TEST_CASE("wire_and_dispatch_confined: the Ids arm intersects exec_visible again
         /*tag_store=*/nullptr, /*custom_properties_store=*/nullptr,
         /*execution_tracker=*/nullptr, noop_audit, noop_audit,
         /*command_id=*/"wiring-test-cmd", /*execution_id=*/"", /*principal_role=*/"",
-        agent_ids, /*scope_expr=*/"", exec_visible, /*broadcast_on_none=*/false, cmd);
+        agent_ids, /*scope_expr=*/"", exec_visible, /*broadcast_on_none=*/false, classified);
 
     CHECK(sent == 1);
     auto pending = registry.drain_gateway_pending();

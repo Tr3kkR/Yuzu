@@ -656,13 +656,33 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
     }
 
     switch (request->event()) {
-    case gw::StreamStatusNotification::CONNECTED:
+    case gw::StreamStatusNotification::CONNECTED: {
         registry_.set_gateway_node(agent_id, request->gateway_node());
-        spdlog::info("[gateway] Agent {} stream CONNECTED at gateway node '{}'", agent_id,
-                     request->gateway_node());
+        // PLAN item 5 (CC-03, peer finding PLAN-007): `wire_capabilities` was
+        // read off the wire and dropped on the floor here — p3's advertised
+        // capability set never reached the registry, so the dispatch
+        // chokepoint's routed-path gateway-capability check (agent_registry.cpp)
+        // had nothing to consult and every gateway session looked
+        // capability-less. Record the FULL set exactly as advertised; a
+        // reconnect (a fresh CONNECTED, which this branch always is —
+        // `wire_capabilities` is sent with EVERY CONNECTED notification, not
+        // only the first) REPLACES it via `set_gateway_wire_capabilities`,
+        // never merges.
+        std::vector<std::string> wire_capabilities(request->wire_capabilities().begin(),
+                                                    request->wire_capabilities().end());
+        registry_.set_gateway_wire_capabilities(agent_id, std::move(wire_capabilities));
+        spdlog::info("[gateway] Agent {} stream CONNECTED at gateway node '{}' ({} wire "
+                     "capabilit{})",
+                     agent_id, request->gateway_node(), request->wire_capabilities_size(),
+                     request->wire_capabilities_size() == 1 ? "y" : "ies");
         break;
+    }
 
     case gw::StreamStatusNotification::DISCONNECTED:
+        // `clear_stream_if_session` also clears the advertised-capability set
+        // (agent_registry.cpp) — a session whose stream is gone has nothing
+        // live to route a dispatch-tagged command through, so no separate
+        // clear call is needed here.
         registry_.clear_stream_if_session(agent_id, session_id);
         registry_.remove_agent_if_session(agent_id, session_id);
         {
