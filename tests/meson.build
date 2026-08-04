@@ -834,3 +834,15 @@ test('tsan-gdb-capture selftest',
   suite: 'docs',
   timeout: 30,
 )
+
+# Who may read a runtime-config secret in plaintext. The redaction rule is only as
+# good as the list of emitters holding the real value, and the two /api/config routes
+# are inline lambdas with no HttpRouteSink seam, so they cannot be asserted on through
+# TestRouteSink the way the sibling Settings OIDC route is. This pins the accessor
+# instead: a new caller of *_with_secrets() fails here rather than at review.
+test('plaintext accessor callers',
+  _python3_test,
+  args: [files('test_plaintext_accessor_callers.py')],
+  suite: 'docs',
+  timeout: 30,
+)

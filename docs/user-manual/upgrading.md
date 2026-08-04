@@ -32,6 +32,12 @@ Because the log path fired on every boot, **historical logs** — and anything t
 as journald, a Docker log driver, or a SIEM — may still hold the secret in plaintext. Purge or restrict
 those as your retention policy allows.
 
+**Response-shape change for automation.** `GET /api/config` no longer returns a `value` field for a
+secret-valued key; it returns `"is_set": true|false` instead. A client that reads `value` for
+`oidc_client_secret` gets nothing where it previously got the credential. Deliberately not a placeholder
+string: a placeholder is itself a legal value, so a config-as-code client round-tripping one would
+overwrite the real secret. `updated_by` and `updated_at` are unchanged.
+
 Audit rows written before the upgrade are now redacted when read, so the value stops being disclosed
 through that path too. The rows themselves are deliberately left intact: an audit row is compliance
 evidence, and rewriting history to conceal a mistake is a worse posture than declining to disclose it.
