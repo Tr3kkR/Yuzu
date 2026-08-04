@@ -82,8 +82,10 @@ constexpr const char* kMetricPinDisplaced = "yuzu_mcp_stream_pin_displaced_total
 /// run - so the session's pin is retained rather than released. Needs a
 /// genuinely broken platform mutex, so any nonzero value is a signal about the
 /// host, not a rate to tune. The close is still reported to the client as
-/// kCompleted, since that is what they actually received; this counter is the
-/// only server-side signal the credit step failed.
+/// kCompleted, since that is what they actually received. This counter fires
+/// ONLY on a THROWN failure of that call (the catch block below is its one
+/// increment site) - a credit step that fails to run without throwing is a
+/// distinct failure shape this counter says nothing about.
 constexpr const char* kMetricFinalCreditFailed = "yuzu_mcp_stream_final_credit_failed_total";
 
 void count_reject(yuzu::MetricsRegistry* metrics, const char* reason) {

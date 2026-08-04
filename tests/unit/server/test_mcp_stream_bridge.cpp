@@ -982,7 +982,7 @@ TEST_CASE("bridge pressure - a mark does not outlive the pressure that raised it
 
 TEST_CASE("bridge pressure - one sweep expires exactly down to the cap, no further "
           "(Doomgoose, PR #2781 review)",
-          "[mcp][bridge][2f]") {
+          "[mcp][bridge][2f][2489]") {
     // The single-scan-and-sort refactor removes the per-victim cap re-check the
     // previous rescan-per-victim shape had; this pins that the replacement (a
     // pass-local live count, decremented per teardown THIS pass commits) still
@@ -1038,6 +1038,81 @@ TEST_CASE("bridge pressure - one sweep expires exactly down to the cap, no furth
     // budget or candidates with the cap still exceeded - the exhausted counter
     // must NOT fire.
     CHECK(fx.reg.counter("yuzu_mcp_bridge_pressure_budget_exhausted_total").value() == 0.0);
+}
+
+TEST_CASE("bridge pressure - deferred victims consume visit budget without decrementing "
+          "live, so a defer-heavy pass still reports budget-exhausted "
+          "(quality-engineer + unhappy-path UP-3, wave 4)",
+          "[mcp][bridge][2f][2489]") {
+    // The down-to-cap test above (and the population-bound TSan test below) both use
+    // an all-claimable population, so `live` (decremented only by a teardown THIS
+    // pass commits) and `visit_budget` (decremented on every visit, claimed or
+    // deferred alike) move in lockstep and neither test can tell them apart - flagged
+    // independently by quality-engineer and unhappy-path's UP-3 in the same wave-4
+    // review. This one can, and specifically because all 3 defers are parked - and
+    // therefore visited - before either claim: a candidate that goes UNVISITED stays
+    // parked exactly like one that was visited and then deferred (nothing touches an
+    // unvisited candidate), so the two orderings are indistinguishable UNLESS a
+    // miscounted `live` causes the loop to exit before every candidate is reached -
+    // which can only strand a claim if the claims sit AFTER the point of that early
+    // exit. Mutation-verified (governance.d/2f-pr3b-dormant.e331oX.jsonl, W4-1): an
+    // unconditional extra `live` decrement per visit made this test fail exactly as
+    // predicted (record_count 4 instead of 3, the second claim left in kRingOnly,
+    // forced_expire{synthesize_unavailable} 1.0 instead of 2.0) before the mutation
+    // was reverted.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+    auto s1 = fx.make_session();
+    auto s2 = fx.make_session();
+
+    auto park_deferring = [&](Fx::Session& s, const std::string& exec, int slot) {
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(slot), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(slot), exec));
+        REQUIRE(fx.bridge->arm(s.id, json(slot), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(slot)));
+        fx.bus.publish(exec, "execution-progress",
+                       R"({"status":"succeeded","agents_success":1,"agents_failure":0})",
+                       /*is_terminal=*/true);
+    };
+    auto park_claimable = [&](Fx::Session& s, const std::string& exec, int slot) {
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(slot), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(slot), exec));
+        REQUIRE(fx.bridge->arm(s.id, json(slot), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(slot)));
+        // No publish: bus verdict is kNeverTerminal -> synthesize_unavailable, an
+        // unambiguous claim on first visit.
+    };
+    // Parked (and therefore visited, oldest-first) in this exact order: all 3
+    // defers, THEN both claims.
+    park_deferring(s1, "exec-def-1", 1);
+    park_deferring(s1, "exec-def-2", 2);
+    park_deferring(s2, "exec-def-3", 1);
+    park_claimable(s1, "exec-claim-1", 3);
+    park_claimable(s1, "exec-claim-2", 4);
+    // PERSISTENT: while it fires, none of the 3 deferring records' terminal copies
+    // ever latch, so none can be claimed however many sweeps run - the same
+    // self-validating fault this file uses for every other defer scenario.
+    fx.bridge->inject_visit_copy_fault_for_test(/*times=*/100);
+    REQUIRE(fx.bridge->record_count() == 5);
+
+    fx.bridge->sweep();
+
+    // Both claimable records reaped; all 3 deferring records survive - visited (and
+    // marked) but never claimed, exhausting visit_budget rather than satisfying live.
+    CHECK(fx.bridge->record_count() == 3);
+    CHECK(fx.bridge->phase_for(s1.id, json(1)) == Bridge::Phase::kRingOnly);
+    CHECK(fx.bridge->phase_for(s1.id, json(2)) == Bridge::Phase::kRingOnly);
+    CHECK(fx.bridge->phase_for(s2.id, json(1)) == Bridge::Phase::kRingOnly);
+    CHECK_FALSE(fx.bridge->phase_for(s1.id, json(3)).has_value());
+    CHECK_FALSE(fx.bridge->phase_for(s1.id, json(4)).has_value());
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_forced_expire_total",
+                         {{"disposition", "synthesize_unavailable"}})
+              .value() == 2.0);
+    // The hatch disengaged with the cap STILL exceeded (3 > 1) - budget/candidates
+    // exhausted on a population `live` alone would have under-reported as satisfied
+    // only once every defer resolves, which this fault deliberately never does.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_pressure_budget_exhausted_total").value() == 1.0);
 }
 
 TEST_CASE("bridge pressure - one sweep is bounded by the population it started with "

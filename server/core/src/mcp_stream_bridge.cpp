@@ -1623,6 +1623,7 @@ void McpStreamBridge::sweep() {
         if (shutdown_started_) {
             return;
         }
+        candidates.reserve(records_.size());
         for (const auto& [key, rec] : records_) {
             if (rec->phase.load(std::memory_order_acquire) != Phase::kRingOnly) {
                 continue;
