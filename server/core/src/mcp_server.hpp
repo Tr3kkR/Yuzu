@@ -332,6 +332,9 @@ public:
                             // stale [=]-over-const-bool& alias pattern.
                             McpSessionRegistry* sessions = nullptr,
                             const bool* mcp_streaming_disabled = nullptr,
+                            // 3b: SSE-on-POST gate. nullptr or false = plain path, which is the
+                            // shipped default while #2739/#2740 are open.
+                            const bool* mcp_streamed_post_enabled = nullptr,
                             std::vector<std::string> allowed_origins = {},
                             // ADR-0024: backs the query_software_licenses discovery read
                             // (the MCP twin of GET /api/v1/sle/agents/{id}).
@@ -357,7 +360,28 @@ public:
                             // the handlers substitute a present-empty (deny-all) VisibleSet,
                             // not unfiltered (CDX-R6-02); a test seam wanting full fleet
                             // wires a callback returning std::nullopt.
-                            ExecVisibleFn exec_visible_fn = {});
+                            ExecVisibleFn exec_visible_fn = {},
+                            // 2f PR 3b (streamed POST): the SAME shared held-open
+                            // budget the GET channel leases from - a streamed POST
+                            // pins an HTTP worker exactly as a GET SSE stream does,
+                            // so it must be admitted by the same arithmetic. All
+                            // three are trailing-defaulted for the test seams;
+                            // PRODUCTION MUST WIRE ALL THREE when streaming is on,
+                            // for the same reasons build_get_handler states: without
+                            // the budget there is no admission control on held-open
+                            // workers, without re-validation a revoked credential
+                            // keeps its stream, and without the principal sink the
+                            // close audit cannot name an actor whose credential may
+                            // already be gone. Absent any of them the POST simply
+                            // never streams - it answers plain JSON, byte-identical
+                            // to today, which is the correct degradation.
+                            //
+                            // ORDER: exec_visible_fn stays FIRST so #2689's positional
+                            // call sites are untouched by this branch; the streaming
+                            // trio is appended after it.
+                            yuzu::server::detail::StreamBudget* stream_budget = nullptr,
+                            StreamRevalidateFn revalidate_fn = {},
+                            StreamPrincipalAuditFn principal_audit_fn = {});
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -412,6 +436,9 @@ public:
                          // temporary that would dangle once build_handler captures its address.
                          McpSessionRegistry* sessions = nullptr,
                          const bool* mcp_streaming_disabled = nullptr,
+                            // 3b: SSE-on-POST gate. nullptr or false = plain path, which is the
+                            // shipped default while #2739/#2740 are open.
+                            const bool* mcp_streamed_post_enabled = nullptr,
                          std::vector<std::string> allowed_origins = {},
                          SoftwareLicensingStore* software_licensing_store = nullptr,
                          // PR 4.2 (design §4.1): engine-principal role-assignment MCP

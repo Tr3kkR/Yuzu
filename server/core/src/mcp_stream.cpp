@@ -37,6 +37,19 @@ static_assert(McpSessionRegistry::Config{}.ring_cap == kMcpRingCapDefault,
 // forward-declares McpStreamState), so the two literals are pinned together here.
 static_assert(McpSessionRegistry::Config{}.ring_bytes_cap == kMcpRingBytesCapDefault,
               "registry byte-cap default and stream byte-cap default must not drift");
+// The session TTL slide rides the TICK GATE (#2730). Before that it ran on every
+// wake, so the tick was irrelevant to it; now a live stream refreshes its session
+// once per tick, and a tick approaching the idle TTL would let the registry's idle
+// GC reclaim a session out from under a stream that is demonstrably alive. The
+// margin is deliberately generous rather than a bare `tick < idle_ttl`: a pass can
+// stall for up to the 30 s socket write timeout before it reaches the gate, so the
+// interval between slides is bounded by tick PLUS that stall, not by tick alone.
+// 100x puts the floor at 300 s against today's 1800 s vs 3000 ms. This is the
+// fourth cross-constant pair the file pins, and the one the tick gate created -
+// the other three predate it.
+static_assert(kMcpStreamTickDefault * 100 <= McpSessionRegistry::Config{}.idle_ttl,
+              "session idle_ttl must stay far above the stream tick (#2730) - the TTL slide "
+              "now runs once per tick, so a narrow margin lets idle GC reap a live stream");
 
 namespace {
 
@@ -64,6 +77,16 @@ constexpr const char* kMetricFinalUnpinned = "yuzu_mcp_stream_final_unpinned_tot
 /// sized to exactly that cap, so a full slot set means admission accounting has drifted. This
 /// counter carries that reading (the LRU is the graceful degradation, not a licence).
 constexpr const char* kMetricPinDisplaced = "yuzu_mcp_stream_pin_displaced_total";
+/// The final was written to the wire (the client has it), but the bridge's own
+/// credit step (on_final_written, mcp_stream_bridge.cpp) threw before it could
+/// run - so the session's pin is retained rather than released. Needs a
+/// genuinely broken platform mutex, so any nonzero value is a signal about the
+/// host, not a rate to tune. The close is still reported to the client as
+/// kCompleted, since that is what they actually received. This counter fires
+/// ONLY on a THROWN failure of that call (the catch block below is its one
+/// increment site) - a credit step that fails to run without throwing is a
+/// distinct failure shape this counter says nothing about.
+constexpr const char* kMetricFinalCreditFailed = "yuzu_mcp_stream_final_credit_failed_total";
 
 void count_reject(yuzu::MetricsRegistry* metrics, const char* reason) {
     if (metrics != nullptr) {
@@ -78,6 +101,12 @@ void count_reject(yuzu::MetricsRegistry* metrics, const char* reason) {
 void count_stream_close(yuzu::MetricsRegistry* metrics, McpStreamClose reason) {
     if (metrics != nullptr) {
         metrics->counter(kMetricStreamCloses, {{"reason", to_string(reason)}}).increment();
+    }
+}
+
+void count_final_credit_failed(yuzu::MetricsRegistry* metrics) {
+    if (metrics != nullptr) {
+        metrics->counter(kMetricFinalCreditFailed).increment();
     }
 }
 
@@ -113,6 +142,9 @@ const char* close_remediation(McpStreamClose reason) {
                "result by execution_id";
     case McpStreamClose::kCapExpired:
         return "the streamed-response time cap elapsed — the execution continues server-side; "
+               "fetch the result by execution_id, or reconnect via GET to resume";
+    case McpStreamClose::kRecordGone:
+        return "this response could not continue — the execution continues server-side; "
                "fetch the result by execution_id, or reconnect via GET to resume";
     case McpStreamClose::kCompleted:
         // kCompleted never produces a close FRAME (the final is written then EOF); this exists
@@ -180,6 +212,8 @@ const char* to_string(McpStreamClose reason) {
         return "cancelled";
     case McpStreamClose::kCapExpired:
         return "cap_expired";
+    case McpStreamClose::kRecordGone:
+        return "record_gone";
     case McpStreamClose::kCompleted:
         return "completed";
     }
@@ -1212,6 +1246,305 @@ bool McpStreamPump::pump_once_impl(const WriteFn& write) {
     if (wrote_frame) {
         return true;
     }
+    static constexpr std::string_view kHeartbeat = "event: heartbeat\ndata: \n\n";
+    if (!write_all(write, kHeartbeat)) {
+        return finish(write, McpStreamClose::kClientGone);
+    }
+    return true;
+}
+
+// ── McpPostPump ─────────────────────────────────────────────────────────────
+
+McpPostPump::McpPostPump(std::shared_ptr<sse_bus::SseSinkState> sink, TakeBatchFn take_batch,
+                         FinalWrittenFn on_final_written,
+                         std::function<StreamRevalidate()> revalidate,
+                         std::function<bool()> session_alive)
+    : McpPostPump(std::move(sink), std::move(take_batch), std::move(on_final_written),
+                  std::move(revalidate), std::move(session_alive), Config{}) {}
+
+McpPostPump::McpPostPump(std::shared_ptr<sse_bus::SseSinkState> sink, TakeBatchFn take_batch,
+                         FinalWrittenFn on_final_written,
+                         std::function<StreamRevalidate()> revalidate,
+                         std::function<bool()> session_alive, Config cfg, ClockFn clock,
+                         yuzu::MetricsRegistry* metrics, std::string correlation_id,
+                         std::string execution_id)
+    : sink_(std::move(sink)),
+      take_batch_(std::move(take_batch)),
+      on_final_written_(std::move(on_final_written)),
+      revalidate_(std::move(revalidate)),
+      session_alive_(std::move(session_alive)),
+      cfg_(cfg),
+      metrics_(metrics),
+      correlation_id_(std::move(correlation_id)),
+      execution_id_(std::move(execution_id)),
+      clock_(std::move(clock)),
+      grace_(RevalidateGrace::Config{cfg.revalidate_grace, cfg.revalidate_grace_jitter_max,
+                                     cfg.revalidate_max_staleness},
+             clock_) {
+    // The cap deadline is stamped at CONSTRUCTION, not on the first tick: the
+    // clock starts when the response is created, so a pump that never gets
+    // scheduled cannot silently extend its own budget.
+    deadline_ = (clock_ ? clock_() : std::chrono::steady_clock::now()) + cfg_.cap;
+}
+
+bool McpPostPump::finish(const WriteFn& write, McpStreamClose reason) {
+    // BEFORE the count, and before anything else that can throw: the releaser
+    // audits whatever this records, so a metric mutex failure here must not let
+    // the pump_once catch below overwrite the real reason with kInternalError.
+    // First-wins, because the first reason is the true cause; a later one is a
+    // consequence of it.
+    note_close_reason(reason);
+    // Backstop. The bridge already flips `closed` at the DECISION point for the
+    // endings it knows about (a final handed back, or a settled cap), which is what
+    // keeps a mid-tick cancel from claiming a detach it did not perform. This covers
+    // the endings the bridge never sees - revocation, session death, a dead peer, an
+    // internal fault - and is idempotent for the ones it does. Must stay AFTER the
+    // unlock above: on the kCancelled path the sink mutex is non-recursive.
+    mark_sink_closed();
+    count_stream_close(metrics_, reason);
+    // kCompleted EOFs after a real final: a close frame there would be a second,
+    // contradictory terminal on a stream that already answered. Same rule the GET
+    // pump applies, and the reason that arm was written before this producer
+    // existed.
+    if (reason != McpStreamClose::kCompleted) {
+        std::string extra;
+        try {
+            // The durable handle, so a client closed by cap/revocation/session
+            // death knows what to fetch. Values are escaped - make_stream_closed_
+            // frame takes a RAW fragment by contract.
+            if (!execution_id_.empty()) {
+                extra = R"(,"execution_id":)" + mcp::detail::json_quoted(execution_id_) +
+                        R"(,"partial":true)";
+            }
+            (void)write_all(write, sse_bus::format_sse(sse_bus::SseEvent{
+                                       "message",
+                                       make_stream_closed_frame(reason, correlation_id_, extra)}));
+        } catch (...) {  // NOLINT(bugprone-empty-catch)
+            // A close frame we could not build is not worth terminating over; the
+            // response ends either way and the result stays durably fetchable.
+        }
+    }
+    return false;
+}
+
+bool McpPostPump::pump_once(const WriteFn& write) {
+    // HARD noexcept boundary - httplib runs providers on a bare ThreadPool task,
+    // outside its routing try/catch, so an escaped throw is std::terminate
+    // (#2037's class). Mirrors McpStreamPump::pump_once, including the nested
+    // guard: the handler itself allocates.
+    try {
+        const bool keep_open = pump_once_impl(write);
+        if (!keep_open) {
+            mark_sink_closed();
+        }
+        return keep_open;
+    } catch (...) {
+        // Recorded FIRST, before the fallible metric/log calls - this is the one
+        // close path that never reaches finish(), so without it the releaser would
+        // read kNone, normalise to client_gone, and audit a disconnect for what was
+        // actually an internal failure. First-wins keeps a real earlier reason.
+        note_close_reason(McpStreamClose::kInternalError);
+        mark_sink_closed();
+        try {
+            count_stream_close(metrics_, McpStreamClose::kInternalError);
+            spdlog::warn("MCP streamed-POST pump: tick failed, closing the response");
+        } catch (...) {  // NOLINT(bugprone-empty-catch)
+        }
+        return false;
+    }
+}
+
+void McpPostPump::mark_sink_closed() noexcept {
+    // Publishes "this response is over" into the flag the BRIDGE reads, on EVERY
+    // path that ends the response - the normal finishes, and the catch above.
+    //
+    // Without it, `closed` tracked only "someone asked to cancel" rather than
+    // liveness, and the bridge's cancel interlock is that flag: in the window
+    // between this pump returning false and httplib running the releaser (which is
+    // what actually parks the record), a cancel would still find kStreaming, a
+    // bound sink and closed==false, win the exchange, and audit "detached the
+    // streamed response" for a response that had already ended as completed,
+    // cap_expired or client_disconnect. An audit row that overstates an outcome is
+    // worse than a missing one. Mirrors McpStreamState::close on the GET channel,
+    // which sets the same flag for the same reason.
+    //
+    // Under the sink mutex, like every other write to `closed` - the pump's own
+    // wait predicate reads it, and ownership of the mutex during the modification
+    // is what orders the two.
+    try {
+        {
+            std::lock_guard<std::mutex> lk(sink_->mu);
+            sink_->closed.store(true, std::memory_order_release);
+        }
+        sink_->cv.notify_all();
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
+        // pump_once is a hard noexcept boundary; a lock failure here costs a
+        // late cancel one possibly-inaccurate audit row, never the process.
+    }
+}
+
+void McpPostPump::note_close_reason(McpStreamClose reason) noexcept {
+    auto expected = McpStreamClose::kNone;
+    close_reason_.compare_exchange_strong(expected, reason, std::memory_order_acq_rel,
+                                          std::memory_order_relaxed);
+}
+
+McpStreamClose McpPostPump::close_reason() const noexcept {
+    return close_reason_.load(std::memory_order_acquire);
+}
+
+bool McpPostPump::pump_once_impl(const WriteFn& write) {
+    // Sampled BEFORE the wait, and used ONLY to size it. The gate below needs the
+    // post-wait instant and must re-sample: testing a pre-wait sample against
+    // `next_check_` would be false by construction after waiting for exactly that
+    // deadline, and the credential check would never fire at all.
+    const auto now_before_wait = clock_ ? clock_() : std::chrono::steady_clock::now();
+    {
+        std::unique_lock<std::mutex> lk(sink_->mu);
+        // The queue is NOT a source of frames here - the bridge is - but `closed`
+        // and the projector's poke both arrive through this mutex, so this is the
+        // wait. The timeout is also the backstop for a poke that raced the wait.
+        //
+        // Bounded by whichever comes FIRST: a full tick, or the instant the next
+        // credential check falls due. Waiting a fresh full tick from each WAKE is
+        // what a poke-driven pump must NOT do: a poke landing at
+        // `next_check_ - eps` wakes it, finds the check not yet due, and then
+        // waits another whole tick - pushing the re-check to ~2 ticks after the
+        // previous one and silently doubling the one-tick revocation bound that
+        // Decision 15(c) / CH-4 and the class comment above both promise.
+        // Counter-intuitively FREQUENT pokes are harmless (each wake re-tests the
+        // gate); the bad case is ONE poke just before the boundary then silence,
+        // which is precisely why a poke-driven test did not catch it.
+        // ceil, NOT duration_cast. duration_cast FLOORS, so a remainder under 1ms
+        // became a zero budget: the wait returned instantly, the post-wait sample
+        // was still short of `next_check_`, the pass fell through to the
+        // unconditional heartbeat write at the bottom, and httplib re-entered - a
+        // tight spin emitting heartbeat frames at the client until real time
+        // crossed the boundary. Bounded to under a millisecond, but it is a burst
+        // of wire traffic per affected tick on every streamed response, and this
+        // fleet's standing bar is to be kind to the network. Rounding UP can
+        // overshoot the check by at most 1ms, which the one-tick bound absorbs.
+        const auto until_check =
+            next_check_ > now_before_wait
+                ? std::chrono::ceil<std::chrono::milliseconds>(next_check_ - now_before_wait)
+                : std::chrono::milliseconds{0};
+        sink_->cv.wait_for(lk, std::min(cfg_.tick, until_check), [this] {
+            return sink_->closed.load() || sink_->poked.load(std::memory_order_acquire);
+        });
+        // Consumed under the same lock that set it, so a poke arriving during this
+        // tick is not lost - it simply wakes the next wait immediately.
+        sink_->poked.store(false, std::memory_order_release);
+        if (sink_->closed.load()) {
+            // UNLOCK FIRST. finish() writes the close frame to the socket, bounded
+            // only by the server's write timeout, and takes the metrics mutex on the
+            // way. Holding sink-mu across that stalls every other thread that needs
+            // this sink - and because the projector's poke takes sink-mu while
+            // holding rec-mu, and the sweep takes rec-mu while holding bridge_mu_,
+            // one peer that stops reading becomes a bridge-wide outage. Every link
+            // is in the sanctioned lock order, so TSan never sees a cycle.
+            //
+            // NOTHING that writes, allocates, or takes another mutex may run under
+            // sink_->mu. The GET pump has always obeyed this ("a stalled socket
+            // write must never block a publisher"); this one did not until now.
+            lk.unlock();
+            return finish(write, McpStreamClose::kCancelled);
+        }
+    }
+
+    // Credential re-validation and the session TTL touch are PER-TICK, not per wake.
+    // The poke now wakes this pump on every publication, and both of these are store
+    // round trips (the api-token cache and the session registry) - letting them ride
+    // the wake would scale auth load with the fleet's progress-frame rate instead of
+    // the 3s tick, which is the opposite of what #2367's caching exists to achieve.
+    // The DRAIN below still runs on every wake; that is the part that makes progress
+    // feel immediate.
+    const auto now_tp = clock_ ? clock_() : std::chrono::steady_clock::now();
+    const bool tick_due = now_tp >= next_check_;
+    if (tick_due) {
+        next_check_ = now_tp + cfg_.tick;
+    }
+    if (tick_due && revalidate_) {
+        switch (grace_.on_verdict(revalidate_())) {
+            case RevalidateGrace::Outcome::kCloseCredentialRevoked:
+                return finish(write, McpStreamClose::kCredentialRevoked);
+            case RevalidateGrace::Outcome::kCloseAuthUnavailable:
+                return finish(write, McpStreamClose::kAuthUnavailable);
+            case RevalidateGrace::Outcome::kContinue:
+                break;
+        }
+    }
+    // Also the TTL slide, exactly as on the GET channel.
+    if (tick_due && session_alive_ && !session_alive_()) {
+        return finish(write, McpStreamClose::kSessionTerminated);
+    }
+
+    // Reuses the post-wait sample above rather than taking a third: the cap and the
+    // credential gate are meant to read the same instant, and a fake clock that
+    // advances per call would otherwise consume the cap at twice the rate.
+    const bool cap_expired = now_tp >= deadline_;
+
+    // The cap is ARBITRATED BY THE BRIDGE, inside the projection claim: a terminal
+    // that latched in the same instant wins over an expired cap, because closing
+    // with kCapExpired while a real result sits latched would send the client
+    // polling for an answer the server is holding.
+    McpStreamBridge::PostBatch batch;
+    if (take_batch_) {
+        batch = take_batch_(cap_expired);
+    }
+
+    // The bridge is the only side that can tell "nothing yet" from "nothing ever" -
+    // this pump holds just a batch and a clock, and both look identical on an idle
+    // tick. Check before draining: a gone record carries no frames to drain anyway.
+    if (batch.record_gone) {
+        return finish(write, McpStreamClose::kRecordGone);
+    }
+
+    for (const auto& frame : batch.progress) {
+        if (!write_all(write, sse_bus::format_sse(sse_bus::SseEvent{"message", frame}))) {
+            return finish(write, McpStreamClose::kClientGone);
+        }
+    }
+
+    if (batch.final_frame.has_value()) {
+        // The final goes LAST and is followed by EOF - the spec's
+        // progress-before-response ordering, which the 3a GET-after-response
+        // shape could not provide.
+        if (!write_all(write, sse_bus::format_sse(
+                                  sse_bus::SseEvent{"message", *batch.final_frame}))) {
+            return finish(write, McpStreamClose::kClientGone);
+        }
+        if (on_final_written_) {
+            // Contained: this call reaches into the bridge (a lock acquisition
+            // that can throw) after the bytes are already on the wire. A throw here
+            // must not read back as an internal fault to the client that just
+            // received a correct result - note the true reason FIRST (finish's own
+            // note_close_reason is first-wins, so this wins the race against
+            // pump_once's outer catch), then let the log/counter run in their own
+            // nested guard so a fault in THEM cannot un-win it either.
+            try {
+                on_final_written_();  // before the close, so the record settles kDone
+            } catch (...) {
+                note_close_reason(McpStreamClose::kCompleted);
+                try {
+                    count_final_credit_failed(metrics_);
+                    spdlog::error("MCP streamed-POST [{}]: final delivered but the bridge "
+                                  "credit step threw - session pin not released this way",
+                                  correlation_id_);
+                } catch (...) {  // NOLINT(bugprone-empty-catch)
+                }
+            }
+        }
+        return finish(write, McpStreamClose::kCompleted);
+    }
+
+    if (batch.cap_settled) {
+        // ONLY the bridge may declare this. A frame-build or write failure above
+        // returns kClientGone; stamping kCapExpired for those would poison the
+        // closed-reason taxonomy and tell the client to retry on a schedule that
+        // has nothing to do with what happened.
+        return finish(write, McpStreamClose::kCapExpired);
+    }
+
     static constexpr std::string_view kHeartbeat = "event: heartbeat\ndata: \n\n";
     if (!write_all(write, kHeartbeat)) {
         return finish(write, McpStreamClose::kClientGone);
