@@ -86,23 +86,29 @@
 // window for a terminal to land in; closing that window IS #2409 (C5), so do not
 // re-split this into two steps.
 //
-// A DEFER advances to the next-oldest victim; it does not end the pass (UP-5,
-// #2489). The no-tight-re-visit property FA-4 wanted is carried by a monotonic
-// parked_seq floor instead, so an oldest victim that is perpetually mid-projection
-// costs itself its turn rather than denying relief to every newer victim. Because
-// advancing means the pass no longer stops on the first defer, it also carries a
-// VICTIM BUDGET captured at entry: a record parking mid-pass gets a higher
-// parked_seq and would otherwise be eligible, so a sustained park rate could keep
-// one maintenance tick working without end. Hitting the budget is counted, never
-// silent (yuzu_mcp_bridge_pressure_budget_exhausted_total).
+// A DEFER advances to the next candidate; it does not end the pass (UP-5,
+// #2489). The candidate list is built ONCE - a parked_seq-sorted scan taken at
+// entry - and iterated ONCE, so the no-tight-re-visit property FA-4 wanted is
+// carried structurally: there is no rescan to re-check it against, and no
+// separate floor to maintain (Doomgoose, PR #2781 review - the prior shape
+// rescanned the full record set, taking every record's own lock, once PER
+// VICTIM visited). A pass-local `live` count (the entry ring_only population)
+// is decremented only for a teardown THIS PASS itself commits, which is what
+// lets the pass stop as soon as the cap is satisfied rather than visiting
+// every candidate; a separate `visit_budget`, also captured at entry, bounds
+// how many candidates get visited even if none of them settle - a record
+// parking mid-pass gets a higher parked_seq and is simply not in the list, so
+// a sustained park rate cannot keep one maintenance tick working without end.
+// Hitting that budget with the cap still exceeded is counted, never silent
+// (yuzu_mcp_bridge_pressure_budget_exhausted_total).
 //
-// The marks that pass leaves behind are cleared in one place only - the exit where
-// the cap is back under water (UP-4, #2489) - because a mark on a merely-deferred
-// victim is still live work. Both the mark and the clear take bridge_mu_ before
-// the record lock, and the clear RE-TESTS the cap inside that hold: the cap
-// reading from the selection walk is one critical section old by then, and
-// clearing on it would strip a quiesce that a record parking in the gap had just
-// made live again.
+// The marks that pass leaves behind, and the budget-exhausted telemetry, are
+// both decided by a SINGLE fresh rescan at the very end of the pass - not
+// per-victim, and not from the entry-scan snapshot - so a record that parked
+// in the gap between entry and now is neither undercounted nor has its
+// quiesce mark wrongly cleared. Marks clear only when that fresh count is
+// back under the cap (UP-4, #2489); a mark on a merely-deferred victim is
+// still live work.
 //
 // Record state DOMINATES the bus verdict: a record that already holds a real final
 // (accepted AND projected) is torn down with nothing published; one with a latched

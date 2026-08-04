@@ -2594,7 +2594,7 @@ TEST_CASE("McpPostPump: record_gone closes the response instead of heartbeating 
 
 TEST_CASE("McpPostPump: a throwing credit step still closes kCompleted, not internal_error (C7)",
           "[mcp][bridge][2f]") {
-    // Doomgoose (Gate 8 wave 3 + review, PR #2781): on_final_written_() is called
+    // Doomgoose (PR #2781 review): on_final_written_() is called
     // with no exception containment right after write_all() of the final already
     // succeeded - so the client has a correct result by the time this runs. A
     // throw here (this codebase's own modelled fault class for a lock acquisition;

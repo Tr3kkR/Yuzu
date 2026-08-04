@@ -732,9 +732,10 @@ public:
                           "the bridge's own credit step threw before it could run, so the "
                           "session's pin is retained rather than released. The close is still "
                           "reported to the client as completed, since that is what they received; "
-                          "this is the only server-side signal the credit step failed. Needs a "
-                          "genuinely broken platform mutex, so any nonzero value is a signal about "
-                          "the host, not a rate to tune. Alert on > 0",
+                          "this counter fires ONLY on a thrown failure of that step - a credit step "
+                          "that fails to run without throwing is a distinct, uncovered failure "
+                          "shape. Needs a genuinely broken platform mutex, so any nonzero value is "
+                          "a signal about the host, not a rate to tune. Alert on > 0",
                           "counter");
         metrics_.gauge("yuzu_mcp_sessions_active").set(0);
         metrics_.counter("yuzu_mcp_sessions_opened_total");

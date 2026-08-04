@@ -1515,13 +1515,12 @@ bool McpPostPump::pump_once_impl(const WriteFn& write) {
         }
         if (on_final_written_) {
             // Contained: this call reaches into the bridge (a lock acquisition
-            // that can throw) after the bytes are already on the wire. A throw
-            // here must not read back as an internal fault to
-            // the client that just received a correct result - note the true
-            // reason FIRST (finish's own note_close_reason is first-wins, so this
-            // wins the race against pump_once's outer catch), then let the
-            // log/counter run in their own nested guard so a fault in THEM cannot
-            // un-win it either.
+            // that can throw) after the bytes are already on the wire. A throw here
+            // must not read back as an internal fault to the client that just
+            // received a correct result - note the true reason FIRST (finish's own
+            // note_close_reason is first-wins, so this wins the race against
+            // pump_once's outer catch), then let the log/counter run in their own
+            // nested guard so a fault in THEM cannot un-win it either.
             try {
                 on_final_written_();  // before the close, so the record settles kDone
             } catch (...) {
