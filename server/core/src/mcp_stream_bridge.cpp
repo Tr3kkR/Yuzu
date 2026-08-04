@@ -1595,127 +1595,79 @@ void McpStreamBridge::sweep() {
 
     // Pass 3: ring-only pressure (E1 two-stage, multi-victim, oldest-first).
     //
-    // UP-5 (#2489): a DEFER now ADVANCES to the next-oldest victim instead of
-    // ending the pass. FA-4's concern was re-visiting the SAME oldest victim in a
-    // tight cycle within one sweep - not visiting a different one - so the guard
-    // is a monotonic floor over `parked_seq` rather than an early return. That is
-    // a sound total order: `parked_seq` comes from `next_parked_seq_++` under
-    // bridge_mu_ on the only two transitions into kRingOnly, and both write it in
-    // the SAME record-lock hold as the phase CAS, so every kRingOnly record has a
-    // unique nonzero value by the time a sweep can read it. Each victim is
-    // therefore visited at most once per sweep and the loop still terminates,
-    // while an oldest victim caught perpetually mid-projection no longer denies
-    // relief to every newer victim behind it.
-    std::uint64_t victim_floor = 0;  // consider only victims with parked_seq >= this
-    bool wake_projector = false;     // a defer left a secured terminal to settle
-    // VICTIM BUDGET, captured at entry (#2489 review). The floor bounds this pass
-    // against the population it STARTED with, but not against arrivals: a record
-    // that parks mid-pass gets a higher parked_seq, so it lands ABOVE the floor and
-    // is eligible. Under sustained parking at the reap rate, `ring_only` never falls
-    // back under the cap and the pass would keep finding fresh victims - turning one
-    // maintenance tick into unbounded teardown + audit work and delaying the session
-    // GC that shares this thread, against the bounded-work property server.cpp's
-    // tick comment states. So the pass may visit at most the number of parked
-    // records it observed on its FIRST count. Relief that arrives late is the NEXT
-    // tick's job, which is the same answer the cap itself gives.
-    std::size_t visit_budget = 0;
-    bool budget_set = false;
-    for (;;) {
-        std::shared_ptr<BridgeRecord> oldest;
-        std::size_t ring_only = 0;
-        std::size_t marked = 0;
-        {
-            std::lock_guard<std::mutex> lk(bridge_mu_);
-            if (shutdown_started_) {
-                return;
-            }
-            for (const auto& [key, rec] : records_) {
-                if (rec->phase.load(std::memory_order_acquire) != Phase::kRingOnly) {
-                    continue;
-                }
-                // The CAP is measured over EVERY parked record; the floor narrows
-                // only the SELECTION. Counting just the unvisited ones would make
-                // pressure appear to ease as the pass walks its own victims, and
-                // the escape hatch would stop with the cap still exceeded.
-                ++ring_only;
-                std::lock_guard<std::mutex> rlk(rec->mu);
-                if (rec->pressure_requested) {
-                    ++marked;
-                }
-                if (rec->parked_seq < victim_floor) {
-                    continue;  // already visited this sweep (UP-5)
-                }
-                if (!oldest || rec->parked_seq < oldest->parked_seq) {
-                    oldest = rec;
-                }
-            }
-            if (!budget_set) {
-                visit_budget = ring_only;
-                budget_set = true;
-            }
-        }
-        if (ring_only <= cfg_.ring_only_pressure_cap || !oldest || visit_budget == 0) {
-            // UP-4 (#2489): `pressure_requested` is a request to QUIESCE a victim
-            // for a reap that is coming, and project_record gates `want_progress`
-            // on it - so a mark that outlives the pressure freezes progress on a
-            // record nothing is reaping any more, for the rest of what may be a
-            // long-running execution (the terminal still settles; `want_terminal`
-            // is ungated). Clear every mark HERE, where the escape hatch actually
-            // disengages, and ONLY here: a mark on a victim this pass merely
-            // deferred past is still live work, and clearing it would let the
-            // projector start the very batch the next visit needs quiesced.
-            //
-            // The cap is RE-TESTED inside the clearing hold, not carried in from
-            // the count above (#2489 review). Those are two different critical
-            // sections with a gap between them, and a record parking in that gap
-            // puts the bridge back over cap - clearing on the stale reading would
-            // then strip a live quiesce and hand the next visit a fresh projection
-            // to defer on, which is exactly the liveness hole this policy exists to
-            // avoid. Stage 1 marks under bridge_mu_ for the same reason, so a
-            // concurrent sweep cannot slip a mark past this hold either.
-            if (marked > 0) {
-                std::lock_guard<std::mutex> lk(bridge_mu_);
-                if (shutdown_started_) {
-                    return;
-                }
-                std::size_t still_parked = 0;
-                for (const auto& [key, rec] : records_) {
-                    if (rec->phase.load(std::memory_order_acquire) == Phase::kRingOnly) {
-                        ++still_parked;
-                    }
-                }
-                if (still_parked <= cfg_.ring_only_pressure_cap) {
-                    // A record cannot leave kRingOnly except by a teardown claim that
-                    // erases it, so this walk sees every mark that exists.
-                    for (const auto& [key, rec] : records_) {
-                        if (rec->phase.load(std::memory_order_acquire) != Phase::kRingOnly) {
-                            continue;
-                        }
-                        std::lock_guard<std::mutex> rlk(rec->mu);
-                        rec->pressure_requested = false;
-                    }
-                    wake_projector = true;  // progress may have been frozen mid-execution
-                }
-            }
-            if (visit_budget == 0 && ring_only > cfg_.ring_only_pressure_cap) {
-                // NOT a silent cap: the hatch stopped with the cap still exceeded, so
-                // say so. Sustained movement here means records are parking at least
-                // as fast as they are being expired.
-                count_pressure_budget_exhausted();
-            }
-            if (wake_projector) {
-                wake(*core_);
-            }
+    // UP-5 (#2489): each victim is visited AT MOST ONCE per sweep, so an oldest
+    // victim caught perpetually mid-projection cannot deny relief to every newer
+    // victim behind it. Originally enforced by a `parked_seq` monotonic floor
+    // re-checked on every rescan; a candidate list built ONCE and iterated ONCE
+    // (below) subsumes that property structurally - there is no rescan to
+    // re-check it against.
+    //
+    // Doomgoose (PR #2781 review) + Fable plan review: the previous shape
+    // rescanned the FULL `records_` map, taking every record's own lock, on
+    // EVERY victim visited - O(records x victims) mutex traffic (confirmed
+    // introduced by a4809554, not present on origin/dev), ungated by
+    // --mcp-enable-streamed-post since this pass already serves the pre-existing
+    // GET-only bridge. Fixed by scanning ONCE to build a parked_seq-sorted
+    // candidate list, then iterating it with per-visit re-validation instead of
+    // per-visit re-scanning.
+    bool wake_projector = false;  // a defer left a secured terminal to settle
+
+    // ONE scan: ring_only count, mark count, and the full candidate list, sorted
+    // oldest-first. Every kRingOnly record is a candidate - no floor to apply,
+    // since each is visited at most once by construction below.
+    std::size_t ring_only = 0;
+    std::size_t marked = 0;
+    std::vector<std::pair<std::uint64_t, std::shared_ptr<BridgeRecord>>> candidates;
+    {
+        std::lock_guard<std::mutex> lk(bridge_mu_);
+        if (shutdown_started_) {
             return;
         }
+        for (const auto& [key, rec] : records_) {
+            if (rec->phase.load(std::memory_order_acquire) != Phase::kRingOnly) {
+                continue;
+            }
+            ++ring_only;
+            std::lock_guard<std::mutex> rlk(rec->mu);
+            if (rec->pressure_requested) {
+                ++marked;
+            }
+            candidates.emplace_back(rec->parked_seq, rec);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+             [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    // VICTIM BUDGET, captured at entry (#2489 review), unchanged: the pass may
+    // visit at most the number of parked records it observed on its FIRST count.
+    // A record that parks mid-pass is not in `candidates` and is not visited this
+    // pass - relief that arrives late is the NEXT tick's job, which is the same
+    // answer the cap itself gives, and is now true by construction rather than by
+    // a floor comparison.
+    std::size_t visit_budget = ring_only;
+    // PASS-LOCAL LIVE COUNT (Doomgoose + Fable plan review): decremented only for
+    // teardowns THIS PASS commits, so the down-to-cap early exit - visit exactly
+    // enough victims to bring the population back under cap, never more - stays
+    // O(1) per visit instead of the O(records) rescan it replaces. The ONLY way
+    // this can diverge from a fresh recount is a teardown performed by something
+    // OTHER than this pass in the same window (a concurrent sweep, which does not
+    // happen in production - one maintenance thread - or shutdown(), which this
+    // loop already checks for on every lock re-entry and returns on). That
+    // residue is bounded by `visit_budget` either way.
+    std::size_t live = ring_only;
+
+    std::size_t idx = 0;
+    while (idx < candidates.size() && visit_budget > 0 && live > cfg_.ring_only_pressure_cap) {
+        auto oldest = candidates[idx].second;
+        ++idx;
         --visit_budget;
-        // Re-validate map identity before the visit (the victim was selected in a
-        // prior bridge_mu_ section; a concurrent teardown may have moved it), and
-        // mark it in the SAME hold - stage 1. The mark tells the projector to start
-        // no NEW progress batch (project_record gates on pressure_requested); ALL
+        // Re-validate map identity before the visit (the candidate was collected
+        // in the entry scan; a concurrent teardown may have moved it), and mark it
+        // in the SAME hold - stage 1. The mark tells the projector to start no NEW
+        // progress batch (project_record gates on pressure_requested); ALL
         // disposition logic lives in the atomic visit below, one source of truth
         // (CORE-2). Marking under bridge_mu_ -> mu rather than mu alone is what
-        // makes it mutually exclusive with the clearing walk above, and it also
+        // makes it mutually exclusive with the clearing walk below, and it also
         // stops us marking a record that has already been torn down.
         {
             std::lock_guard<std::mutex> lk(bridge_mu_);
@@ -1724,7 +1676,7 @@ void McpStreamBridge::sweep() {
             }
             auto it = records_.find(oldest->key);
             if (it == records_.end() || it->second != oldest) {
-                continue;  // torn down concurrently - recount
+                continue;  // torn down by something else - move to the next candidate
             }
             std::lock_guard<std::mutex> rlk(oldest->mu);
             oldest->pressure_requested = true;
@@ -1864,7 +1816,8 @@ void McpStreamBridge::sweep() {
             // that failure has its own family (teardown_incomplete).
             count_forced_expire(decision);
             teardown_claimed(oldest, decision, "mcp.bridge.forced_expire");
-            continue;  // recount
+            --live;  // a teardown THIS PASS committed - keeps the O(1) exit check honest
+            continue;
         }
         if (status == ExecutionEventBus::VisitStatus::kAbsentChannel ||
             status == ExecutionEventBus::VisitStatus::kInternalError) {
@@ -1911,18 +1864,73 @@ void McpStreamBridge::sweep() {
             if (guard_claim) {
                 count_forced_expire(guard_decision);  // sre-N1; kNone-only by construction
                 teardown_claimed(oldest, guard_decision, "mcp.bridge.forced_expire");
+                --live;  // a teardown THIS PASS committed
                 continue;
             }
         }
         // Deferred (not claimed, or a bus-less build). ADVANCE past this victim
-        // rather than ending the pass (UP-5, #2489): the monotonic floor is what
-        // carries FA-4's no-tight-re-visit property now, so a defer costs this
-        // victim its turn this sweep instead of costing every newer victim theirs.
-        // The projector is woken ONCE at the exit - a defer means work was left for
-        // it (a secured terminal to settle), and one wake covers every deferral.
+        // rather than ending the pass (UP-5, #2489): iterating the pre-sorted list
+        // once, never revisiting an entry, is what now carries FA-4's
+        // no-tight-re-visit property, so a defer costs this victim its turn this
+        // sweep instead of costing every newer victim theirs. The projector is
+        // woken ONCE at the exit - a defer means work was left for it (a secured
+        // terminal to settle), and one wake covers every deferral.
         wake_projector = true;
-        victim_floor = oldest->parked_seq + 1;
-        continue;
+    }
+
+    // FRESH final scan (Doomgoose + Fable plan review): both the mark-clearing
+    // gate and the budget-exhausted telemetry need the CURRENT picture, not the
+    // entry-scan snapshot the visiting loop above used - a record parking in the
+    // gap between entry and now must not be undercounted by either check, exactly
+    // the #2489 reasoning that already governed the single-scan version of this
+    // gate. This is the only rescan in the whole pass, and it runs once
+    // regardless of how many victims were visited above.
+    if (marked > 0 || ring_only > cfg_.ring_only_pressure_cap) {
+        std::lock_guard<std::mutex> lk(bridge_mu_);
+        if (shutdown_started_) {
+            return;
+        }
+        std::size_t still_parked = 0;
+        std::size_t still_marked = 0;
+        for (const auto& [key, rec] : records_) {
+            if (rec->phase.load(std::memory_order_acquire) != Phase::kRingOnly) {
+                continue;
+            }
+            ++still_parked;
+            std::lock_guard<std::mutex> rlk(rec->mu);
+            if (rec->pressure_requested) {
+                ++still_marked;
+            }
+        }
+        // UP-4 (#2489): `pressure_requested` is a request to QUIESCE a victim for a
+        // reap that is coming, and project_record gates `want_progress` on it - so
+        // a mark that outlives the pressure freezes progress on a record nothing
+        // is reaping any more, for the rest of what may be a long-running
+        // execution (the terminal still settles; `want_terminal` is ungated).
+        // Clear every mark HERE, where the escape hatch actually disengages, and
+        // ONLY here, gated on the FRESH still_parked so clearing never strips a
+        // live quiesce this same pass just placed.
+        if (still_marked > 0 && still_parked <= cfg_.ring_only_pressure_cap) {
+            for (const auto& [key, rec] : records_) {
+                if (rec->phase.load(std::memory_order_acquire) != Phase::kRingOnly) {
+                    continue;
+                }
+                std::lock_guard<std::mutex> rlk(rec->mu);
+                rec->pressure_requested = false;
+            }
+            wake_projector = true;  // progress may have been frozen mid-execution
+        }
+        if (still_parked > cfg_.ring_only_pressure_cap) {
+            // NOT a silent cap: the hatch disengaged with the cap still exceeded
+            // (whether from exhausting visit_budget, the candidate list, or
+            // finding live already satisfied while a concurrent arrival kept the
+            // fresh count high), so say so. Sustained movement here means records
+            // are parking at least as fast as they are being expired.
+            count_pressure_budget_exhausted();
+        }
+    }
+    if (wake_projector) {
+        wake(*core_);
     }
 }
 

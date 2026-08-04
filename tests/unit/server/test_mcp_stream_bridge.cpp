@@ -980,6 +980,66 @@ TEST_CASE("bridge pressure - a mark does not outlive the pressure that raised it
     }));
 }
 
+TEST_CASE("bridge pressure - one sweep expires exactly down to the cap, no further "
+          "(Doomgoose, PR #2781 review)",
+          "[mcp][bridge][2f]") {
+    // The single-scan-and-sort refactor removes the per-victim cap re-check the
+    // previous rescan-per-victim shape had; this pins that the replacement (a
+    // pass-local live count, decremented per teardown THIS pass commits) still
+    // stops at exactly the cap rather than draining every eligible candidate. No
+    // prior test caught this - the existing pressure tests all use cap 0 or 1,
+    // where "stop at the cap" and "reap everything eligible" are indistinguishable.
+    //
+    // 6 claimable (unambiguously reapable - no bus publish, so the verdict is
+    // kNeverTerminal -> synthesize_unavailable on first visit) records parked
+    // oldest-first across two sessions (streamed admission caps at 4 pin slots
+    // PER SESSION, so 6 in one session is not constructible). Cap 2: exactly 4
+    // must be reaped, 2 - the two parked LAST, since sweep visits oldest-first -
+    // must survive this single sweep.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 2}};
+    auto s1 = fx.make_session();
+    auto s2 = fx.make_session();
+    struct Victim {
+        Fx::Session* s;
+        nlohmann::json id;
+    };
+    const std::vector<Victim> victims = {
+        {&s1, json(1)}, {&s1, json(2)}, {&s1, json(3)},
+        {&s2, json(1)}, {&s2, json(2)}, {&s2, json(3)},
+    };
+    int n = 0;
+    for (const auto& v : victims) {
+        const std::string exec_id = "exec-cap-" + std::to_string(++n);
+        REQUIRE(fx.bridge->reserve(v.s->id, "alice", v.id, json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(v.s->id, v.id, exec_id));
+        REQUIRE(fx.bridge->arm(v.s->id, v.id, Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+    }
+    // Park in the SAME order as the reserve loop above, so parked_seq matches
+    // victims[] order exactly - the first four are the ones sweep must reap.
+    for (const auto& v : victims) {
+        REQUIRE(fx.bridge->on_post_closed(v.s->id, v.id));
+    }
+    REQUIRE(fx.bridge->record_count() == 6);
+
+    fx.bridge->sweep();
+
+    CHECK(fx.bridge->record_count() == 2);
+    CHECK_FALSE(fx.bridge->phase_for(s1.id, json(1)).has_value());  // reaped (1st parked)
+    CHECK_FALSE(fx.bridge->phase_for(s1.id, json(2)).has_value());  // reaped (2nd parked)
+    CHECK_FALSE(fx.bridge->phase_for(s1.id, json(3)).has_value());  // reaped (3rd parked)
+    CHECK_FALSE(fx.bridge->phase_for(s2.id, json(1)).has_value());  // reaped (4th parked)
+    CHECK(fx.bridge->phase_for(s2.id, json(2)) == Bridge::Phase::kRingOnly);  // survives (5th)
+    CHECK(fx.bridge->phase_for(s2.id, json(3)) == Bridge::Phase::kRingOnly);  // survives (6th)
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_forced_expire_total",
+                         {{"disposition", "synthesize_unavailable"}})
+              .value() == 4.0);
+    // The hatch stopped BECAUSE the cap was satisfied, not because it ran out of
+    // budget or candidates with the cap still exceeded - the exhausted counter
+    // must NOT fire.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_pressure_budget_exhausted_total").value() == 0.0);
+}
+
 TEST_CASE("bridge pressure - one sweep is bounded by the population it started with "
           "(#2489 review, TSan)",
           "[mcp][bridge][2f][2489]") {
@@ -2455,6 +2515,60 @@ TEST_CASE("McpPostPump: record_gone closes the response instead of heartbeating 
     CHECK(wire.contains("record_gone"));
     CHECK_FALSE(wire.contains("cap_expired"));
     CHECK_FALSE(wire.contains("heartbeat"));
+}
+
+TEST_CASE("McpPostPump: a throwing credit step still closes kCompleted, not internal_error (C7)",
+          "[mcp][bridge][2f]") {
+    // Doomgoose (Gate 8 wave 3 + review, PR #2781): on_final_written_() is called
+    // with no exception containment right after write_all() of the final already
+    // succeeded - so the client has a correct result by the time this runs. A
+    // throw here (this codebase's own modelled fault class for a lock acquisition;
+    // see mcp_stream_bridge.cpp's inject_claim_lock_fault_for_test) used to
+    // propagate to pump_once's outer catch, which stamped kInternalError - a
+    // misreport, since the client's own experience was success - while the
+    // bridge's credit step (final_written + unpin) never ran, silently retaining
+    // the session's pin. Fixed: the true reason is noted before the log/counter
+    // run (first-wins beats pump_once's catch), and a dedicated counter makes the
+    // failure operator-visible instead of folding into the generic fault metric.
+    yuzu::MetricsRegistry reg;
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto take = [](bool /*cap*/) {
+        mcp::McpStreamBridge::PostBatch out;
+        out.final_frame = R"({"jsonrpc":"2.0","id":1,"result":{"status":"completed"}})";
+        return out;
+    };
+    auto throwing_credit = [] { throw std::runtime_error("lock acquisition failed"); };
+    mcp::McpPostPump pump(sink, take, throwing_credit, {}, {}, fast_post_cfg(), {}, &reg,
+                          "cid-credit-throw", "exec-credit-throw");
+    PostWire wire;
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(pump.close_reason() == mcp::McpStreamClose::kCompleted);
+    CHECK(wire.contains(R"("status":"completed")"));  // the client got its real result
+    CHECK_FALSE(wire.contains("internal_error"));
+    CHECK_FALSE(wire.contains("notifications/yuzu.stream_closed"));  // kCompleted writes no close frame
+    CHECK(reg.counter("yuzu_mcp_stream_final_credit_failed_total").value() == 1.0);
+    CHECK(reg.counter("yuzu_mcp_stream_closes_total", {{"reason", "internal_error"}}).value() ==
+          0.0);
+    CHECK(reg.counter("yuzu_mcp_stream_closes_total", {{"reason", "completed"}}).value() == 1.0);
+}
+
+TEST_CASE("McpPostPump: the credit step's own success path is unaffected by the try/catch (C7)",
+          "[mcp][bridge][2f]") {
+    // The happy path must still unpin - the containment in the prior test must not
+    // swallow a SUCCESSFUL call too.
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto take = [](bool /*cap*/) {
+        mcp::McpStreamBridge::PostBatch out;
+        out.final_frame = R"({"jsonrpc":"2.0","id":1,"result":{"status":"completed"}})";
+        return out;
+    };
+    bool credited = false;
+    mcp::McpPostPump pump(sink, take, [&] { credited = true; }, {}, {}, fast_post_cfg(), {},
+                          nullptr, "cid-credit-ok", "exec-credit-ok");
+    PostWire wire;
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(credited);
+    CHECK(pump.close_reason() == mcp::McpStreamClose::kCompleted);
 }
 
 TEST_CASE("McpPostPump: the wait is bounded by the next credential check, not a fresh tick "

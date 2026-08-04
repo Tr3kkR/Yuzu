@@ -727,6 +727,15 @@ public:
                           "going unprotected); the displaced final becomes evictable from the "
                           "replay ring, still recoverable by execution_id. Alert on > 0",
                           "counter");
+        metrics_.describe("yuzu_mcp_stream_final_credit_failed_total",
+                          "A streamed-POST final was written to the wire (the client has it), but "
+                          "the bridge's own credit step threw before it could run, so the "
+                          "session's pin is retained rather than released. The close is still "
+                          "reported to the client as completed, since that is what they received; "
+                          "this is the only server-side signal the credit step failed. Needs a "
+                          "genuinely broken platform mutex, so any nonzero value is a signal about "
+                          "the host, not a rate to tune. Alert on > 0",
+                          "counter");
         metrics_.gauge("yuzu_mcp_sessions_active").set(0);
         metrics_.counter("yuzu_mcp_sessions_opened_total");
         metrics_.gauge("yuzu_mcp_streams_active").set(0);
@@ -746,6 +755,7 @@ public:
         metrics_.counter("yuzu_mcp_stream_terminal_publish_failures_total");
         metrics_.counter("yuzu_mcp_stream_final_unpinned_total");
         metrics_.counter("yuzu_mcp_stream_pin_displaced_total");
+        metrics_.counter("yuzu_mcp_stream_final_credit_failed_total");
         // Pre-seed the CLOSED reason label sets to 0 so absent() alerting is
         // meaningful on a healthy/idle server (observability-conventions; the
         // reason literals mirror the bridge's reject/degrade taxonomies).
