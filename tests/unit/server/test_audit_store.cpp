@@ -39,6 +39,111 @@ TEST_CASE("AuditStore: open in-memory", "[audit_store][db]") {
     REQUIRE(store.is_open());
 }
 
+TEST_CASE("AuditStore: a pre-existing config.update secret detail is redacted on READ",
+          "[audit_store][secret]") {
+    // The writer-side fix is prospective only. A row written BEFORE it holds the
+    // plaintext and is served verbatim by every reader (six query() call sites across
+    // REST v1, the legacy REST route, MCP and Settings), so an install that set the
+    // secret pre-upgrade and did not rotate still
+    // discloses a live credential to any AuditLog:Read holder -- seeded Operator
+    // among them. `log()` plants the row exactly as the old writer would have; the
+    // assertion is on what `query()` hands back.
+    AuditStore store(":memory:");
+
+    AuditEvent legacy;
+    legacy.principal = "admin";
+    legacy.action = "config.update";
+    legacy.target_type = "RuntimeConfig";
+    legacy.target_id = "oidc_client_secret";
+    legacy.detail = "value=s3cr3t-from-before-the-fix";
+    legacy.result = "success";
+    CHECK(store.log(legacy));
+
+    // A non-secret key on the SAME action keeps its detail: the redaction must not
+    // cost the evidence value of ordinary config auditing.
+    AuditEvent ordinary;
+    ordinary.principal = "admin";
+    ordinary.action = "config.update";
+    ordinary.target_type = "RuntimeConfig";
+    ordinary.target_id = "log_level";
+    ordinary.detail = "value=debug";
+    ordinary.result = "success";
+    CHECK(store.log(ordinary));
+
+    // A row on a DIFFERENT target type is untouched: the rule is the (RuntimeConfig,
+    // secret key) pair, not "anything mentioning a secret". oidc.configure records
+    // the issuer as its target and carries no value, so redacting it would cost
+    // evidence for nothing.
+    AuditEvent other;
+    other.principal = "admin";
+    other.action = "oidc.configure";
+    other.target_type = "OidcConfig";
+    other.target_id = "oidc_client_secret";
+    other.detail = "issuer=https://idp.example.com";
+    other.result = "success";
+    CHECK(store.log(other));
+
+    // A DIFFERENT WRITER recording the same key under its own verb IS covered --
+    // this is why the predicate keys on target_type, not on the action string. An
+    // earlier revision keyed on action == "config.update" and would have served this
+    // row's plaintext, with a green test pinning that gap shut.
+    AuditEvent future_writer;
+    future_writer.principal = "admin";
+    future_writer.action = "settings.oidc.secret_rotated";
+    future_writer.target_type = "RuntimeConfig";
+    future_writer.target_id = "oidc_client_secret";
+    future_writer.detail = "reason=rotation value=another-secret";
+    future_writer.result = "success";
+    CHECK(store.log(future_writer));
+
+    std::string secret_detail, ordinary_detail, other_detail;
+    for (const auto& e : store.query()) {
+        if (e.action == "config.update" && e.target_id == "oidc_client_secret")
+            secret_detail = e.detail;
+        if (e.target_id == "log_level")
+            ordinary_detail = e.detail;
+        if (e.action == "oidc.configure")
+            other_detail = e.detail;
+    }
+
+    std::string future_detail;
+    for (const auto& e : store.query()) {
+        if (e.action == "settings.oidc.secret_rotated")
+            future_detail = e.detail;
+    }
+
+    CHECK(secret_detail.find("s3cr3t-from-before-the-fix") == std::string::npos);
+    CHECK(secret_detail == "value=<redacted>");
+    CHECK(ordinary_detail == "value=debug");
+    CHECK(other_detail == "issuer=https://idp.example.com");
+    // Covered by target_type. Context is NOT preserved: a credential could equally
+    // have been written before the token, so any shape but a leading `value=` is
+    // dropped entirely.
+    CHECK(future_detail.find("another-secret") == std::string::npos);
+    // Wholesale: the detail does not START with `value=`, so we cannot tell which
+    // part is the credential and none of it is preserved.
+    CHECK(future_detail == "<redacted>");
+}
+
+TEST_CASE("AuditStore::sanitized_detail is idempotent and leaves an empty detail alone",
+          "[audit_store][secret]") {
+    // Rows written after the writer fix already hold the placeholder; applying the
+    // read-time rule again must not double-wrap or invent content.
+    CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_client_secret",
+                                       "value=<redacted>") == "value=<redacted>");
+    CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_client_secret", "").empty());
+    CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_issuer", "value=https://idp") ==
+          "value=https://idp");
+    // No leading `value=`: we cannot tell which part is the credential, so the whole
+    // detail goes. Fail safe, not fail open.
+    CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_client_secret", "raw-leak") ==
+          "<redacted>");
+    // The credential written BEFORE a value= token -- the case the old prefix-
+    // preserving rule leaked verbatim.
+    CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_client_secret",
+                                       "s3cr3t value=x") == "<redacted>");
+}
+
 TEST_CASE("AuditStore: log and retrieve", "[audit_store]") {
     AuditStore store(":memory:");
 

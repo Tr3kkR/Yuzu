@@ -941,7 +941,8 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | Definition ID | Action | Type | Platforms | Parameters | Result Columns |
 |---|---|---|---|---|---|
 | `windows.registry.get_value` | get_value | Q | W | hive:enum (req), key:string (req), name:string (req) | value:string, type:string |
-| `windows.registry.get_user_value` | get_user_value | Q | W | username:string (req), key:string (req), name:string | username:string, value:string, type:string |
+| `windows.registry.get_user_value` | get_user_value | Q | W | username:string, sid:string, key:string (req), name:string | username:string, value:string, type:string |
+| `windows.registry.list_profiles` | list_profiles | Q | W | (none) | sid:string, profile_name:string, profile_path:string, hive_state:string |
 | `windows.registry.set_value` | set_value | A | W | hive:enum (req), key:string (req), name:string (req), value:string (req), type:enum | status:string |
 | `windows.registry.delete_value` | delete_value | A | W | hive:enum (req), key:string (req), name:string (req) | status:string |
 | `windows.registry.delete_key` | delete_key | A | W | hive:enum (req), key:string (req) | status:string |

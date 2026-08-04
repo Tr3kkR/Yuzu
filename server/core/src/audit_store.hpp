@@ -178,6 +178,38 @@ public:
                                   std::size_t* out_pool_size = nullptr) const;
     std::size_t total_count() const;
 
+    /// The `detail` a reader should see for a row, given its target.
+    ///
+    /// Keyed on the TARGET -- a `RuntimeConfig` row naming a secret-valued key --
+    /// rather than on a writer's action string, so a future writer recording the same
+    /// key under a different verb is covered without anyone remembering to extend a
+    /// list. A detail that STARTS `value=` keeps that label and loses the value; ANY
+    /// other shape is replaced wholesale, because we cannot then tell which part is
+    /// the credential. Deliberately not "preserve everything before the first
+    /// `value=`" -- that preserved a credential written before the token, and made
+    /// the guarantee depend on an ordering nothing enforces.
+    ///
+    /// A `config.update` on a secret-valued key recorded `value=<the secret>` in
+    /// `detail` before that write path was fixed. Those rows are ALREADY on disk on
+    /// any install that set the secret before upgrading, and fixing the writer does
+    /// nothing for them: the readers serialise `detail` verbatim, so a seeded
+    /// Operator (`AuditLog:Read`) could still read a live credential out of history.
+    ///
+    /// Redaction is applied on READ rather than by rewriting the rows, deliberately.
+    /// An audit row is compliance evidence; editing history to hide a mistake is a
+    /// worse posture than declining to disclose it, and a DELETE/UPDATE sweep over
+    /// audit_events is exactly the kind of thing that must not become routine.
+    /// The plaintext therefore remains at rest (unchanged by this) and stops being
+    /// DISCLOSED. Operators who set the secret pre-upgrade should still rotate it.
+    ///
+    /// Idempotent: rows written after the writer fix already hold the placeholder.
+    /// `detail` is taken BY VALUE and moved through on the common pass-through path:
+    /// this runs per row on every audit read (up to kAuditSampleScanCap rows under
+    /// the reader lock), and a const-ref parameter forced a copy of every row's
+    /// detail whether or not it needed redacting.
+    static std::string sanitized_detail(std::string_view target_type, std::string_view target_id,
+                                        std::string detail);
+
     /// Cumulative audit-event write counts grouped by `result` value. Exposed for
     /// Prometheus scraping; reset at process start. Lock-free reads.
     uint64_t events_written(const std::string& result) const noexcept;
