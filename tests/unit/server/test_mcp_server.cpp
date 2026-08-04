@@ -7688,6 +7688,12 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         // KEK rotation (#2395 track C): both take zero arguments.
         {"rotate_kek", nlohmann::json::parse(R"({})")},
         {"rewrap_secrets", nlohmann::json::parse(R"({})")},
+        // Plugin config/secret + upload grants (PR1.5c/PR1.6c): the Delete-class
+        // operations gate on the supervised tier like every other destructive
+        // tool. `grant_id` must satisfy the schema's ^[a-f0-9]+$ pattern.
+        {"delete_plugin_config", nlohmann::json::parse(R"({"plugin":"p","key":"k"})")},
+        {"delete_plugin_secret", nlohmann::json::parse(R"({"plugin":"p","key":"k"})")},
+        {"revoke_upload_grant", nlohmann::json::parse(R"({"grant_id":"ab12"})")},
     };
 
     // Tether: the gated set derived from security rows + requires_approval()

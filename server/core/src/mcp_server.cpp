@@ -1240,7 +1240,11 @@ static const ToolDef kTools[] = {
      "a management-group-CONFINED grant lists only grants for agents in the caller's visible "
      "set; no grant anywhere is denied. No client-selected agent_id filter exists on this "
      "surface — the frozen protocol forbids one on every path. Requires UploadGrant:Read.",
-     R"j({"type":"object","properties":{}})",
+     // Takes NO arguments: the frozen protocol forbids a client-selected
+     // agent_id filter on every path, so confinement is derived server-side.
+     // `additionalProperties:false` is what makes that BOUNDED rather than
+     // free-form — a bare `properties:{}` would silently accept anything.
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
      R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object"}}},"required":["data"]})j"},
 
     {"revoke_upload_grant",
