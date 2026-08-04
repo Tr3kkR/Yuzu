@@ -7055,8 +7055,9 @@ TEST_CASE("MCP 2442: a ticket minted by a declared non-MCP surface is refused, c
     //    spent-ticket string, so the recall is not an oracle. Substring checks
     //    are NOT enough here: governance round 11 mutated this message to
     //    "approval refused: cross-surface ticket" - a full disclosure - and the
-    //    old assertions stayed green. The handler builds its OWN constant
-    //    (mcp_server.cpp:3357), independent of ApprovalManager's, so the
+    //    old assertions stayed green. The handler builds its OWN
+    //    "approval already used (one-time ticket)" constant, independent of
+    //    ApprovalManager's, so the
     //    byte-identity pinned at test_approval_manager.cpp:462 does not cover
     //    the surface an attacker actually talks to. Pin it here, exactly.
     const std::string msg = body["error"].value("message", std::string{});
@@ -7086,8 +7087,8 @@ TEST_CASE("MCP 2442: a ticket minted by a declared non-MCP surface is refused, c
 }
 
 // The other half of the counter contract, and the half round 11 found missing:
-// the security family must fire ONLY on a cross-surface attempt. Its describe()
-// says "any non-zero value is an attack or a mint/recall pairing bug", so an
+// the security family must fire ONLY on a cross-surface attempt, because it is
+// the family the shipped alert rule watches — so an
 // ordinary spent-ticket double-click incrementing it would turn every replay
 // into a page. Proved necessary by mutation: hoisting the increment out of the
 // kForeignOrigin arm to fire unconditionally left the whole [mcp] tag green.

@@ -3321,11 +3321,10 @@ McpServer::HandlerFn McpServer::build_handler(
                             // increments it. The describe and the pre-seed shipped
                             // without this line, leaving a flat-zero series that
                             // reads as healthy during the exact event it exists to
-                            // report. NOT every increment is an attack: kUnrecognised
-                            // reaches this same branch after a downgrade, and `why`
-                            // above is one constant for all non-MCP origins, so the
-                            // audit row cannot tell the two apart — only the
-                            // ApprovalManager log line names the origin.
+                            // report. NOT every increment is an attack: an origin
+                            // this build does not recognise reaches the same branch,
+                            // and `why` above is one constant for every non-MCP
+                            // origin, so this audit row does not record which one.
                             // Pinned by the [security]-tagged #2442 test,
                             // which is red if this line goes or its labels drift.
                             count_security_event("yuzu_mcp_approval_forgery_total");
