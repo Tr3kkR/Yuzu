@@ -603,7 +603,7 @@ gRPC streaming delivers output in real time.
 
 ### 12.7 Per-User Registry Operations :white_check_mark: `T2`
 
-`registry` plugin with `get_user_value` action. Loads NTUSER.DAT hive via `RegLoadKey` for offline users. Requires SE_RESTORE_NAME and SE_BACKUP_NAME privileges.
+`registry` plugin with `list_profiles` (enumerate local profiles: SID, resolved name, profile path, live hive-load state) and `get_user_value` (read a value from a resolved profile's hive) actions. Both resolve the target profile via `HKLM\...\ProfileList`; `get_user_value` reads the live `HKEY_USERS\<SID>` hive when the user is logged in, or loads that profile's NTUSER.DAT via `RegLoadKey` as a fallback (unloaded via RAII on every exit path). SE_RESTORE_NAME and SE_BACKUP_NAME privileges are required only for that offline fallback, which the agent account already holds — no new privilege grant; reading an already-loaded live hive needs no elevated privilege.
 
 ---
 
