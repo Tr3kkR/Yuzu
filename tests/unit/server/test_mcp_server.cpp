@@ -7014,6 +7014,65 @@ TEST_CASE("MCP 2405: approved ticket bound to schema-invalid args is rejected an
     CHECK(after->consumed_at == 0);     // the CAS never ran
 }
 
+// #2442 — the MCP recall must refuse a ticket minted by a DECLARED non-MCP
+// surface, and it must SAY SO on the two server-side channels while staying
+// opaque to the caller. External adversarial review (Codex/Kimi, 2026-08-04)
+// found the security counter described and pre-seeded with no increment site
+// anywhere: a flat-zero series that reads as healthy during the exact event it
+// exists to report. This test is the writer for that claim — it fails if the
+// increment is removed, if its labels drift from server.cpp's pre-seed, or if
+// the audit token is blurred back onto the generic "already used" string.
+TEST_CASE("MCP 2442: a ticket minted by a declared non-MCP surface is refused, counted and audited",
+          "[mcp][integration][approval][security]") {
+    yuzu::MetricsRegistry reg;
+    SchemaGateHarness h("operator");
+    h.ts.metrics_for_test = &reg;
+    h.ts.start("operator"); // restart with the registry wired
+
+    // A ticket the REST instruction gate raised — a DECLARED non-MCP origin —
+    // whose definition_id and canonical args line up with an MCP tool. This is
+    // the forgery shape #2442 exists to stop.
+    auto seeded = h.appr->submit("mcp.delete_tag", "test-user",
+                                 R"({"agent_id":"agent-1","key":"role"})", "",
+                                 ApprovalOrigin::kInstruction);
+    REQUIRE(seeded);
+    REQUIRE(h.appr->approve(*seeded, "reviewer-bob", ""));
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":442,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":")" +
+        *seeded + R"("}}})";
+    auto body = h.call(recall);
+
+    // 1. Refused, and the ticket is left UNTOUCHED — refusing a forgery must
+    //    never burn a real operator's approval.
+    REQUIRE(body.contains("error"));
+    auto after = h.appr->get(*seeded);
+    REQUIRE(after);
+    CHECK(after->status == "approved");
+    CHECK(after->consumed_at == 0);
+
+    // 2. The caller learns nothing: the message is byte-identical to the
+    //    spent-ticket string, so the recall is not an oracle.
+    const std::string msg = body["error"].value("message", std::string{});
+    CHECK(msg.find("minted") == std::string::npos);
+    CHECK(msg.find("origin") == std::string::npos);
+
+    // 3. The SERVER side is the opposite case and must NOT be blurred.
+    REQUIRE(!h.ts.audit_log.empty());
+    CHECK(h.ts.audit_log.back() == "mcp.delete_tag|denied");
+
+    // 4. Both counters move, and the security family carries the labels
+    //    server.cpp pre-seeds — {tool,event}, NOT {tool,reason}. A mismatch here
+    //    lands on an unseeded series and is exactly the defect this test exists
+    //    to pin.
+    CHECK(reg.counter("yuzu_mcp_approval_denied_total",
+                      {{"tool", "delete_tag"}, {"reason", "foreign_origin"}})
+              .value() == 1.0);
+    CHECK(reg.counter("yuzu_mcp_approval_forgery_total",
+                      {{"tool", "delete_tag"}, {"event", "security"}})
+              .value() == 1.0);
+}
+
 TEST_CASE("MCP 2405: wrong-typed argument is rejected before the gate",
           "[mcp][integration][approval][schema]") {
     SchemaGateHarness h("supervised");

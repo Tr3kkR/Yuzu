@@ -3063,6 +3063,22 @@ McpServer::HandlerFn McpServer::build_handler(
                         }
                     };
 
+                    // Sibling of count_denial for the SECURITY-EVENT family, which
+                    // carries `event="security"` instead of a `reason` — the SIEM
+                    // filters on `event` (observability-conventions.md). The label
+                    // set must match server.cpp's pre-seed EXACTLY: seeding
+                    // {tool,event} and incrementing anything else lands on a second,
+                    // never-seeded series, leaving the seeded one flat at zero and
+                    // an absent()-style alert armed forever.
+                    auto count_security_event = [metrics, &tool_name](const char* family) noexcept {
+                        if (metrics == nullptr) return;
+                        try {
+                            metrics->counter(family, {{"tool", tool_name}, {"event", "security"}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                        }
+                    };
+
                     // ── #2405: input-schema validation BEFORE any ticket work ──
                     // A schema-invalid call must neither MINT a ticket (an
                     // admin's approval would be wasted on args the handler
@@ -3299,9 +3315,18 @@ McpServer::HandlerFn McpServer::build_handler(
                         // counts, and the operator was left tailing logs for the
                         // only case that matters. `reason` is a fixed literal,
                         // never caller-derived, so the label set stays bounded.
-                        if (consumed.error().kind == ConsumeFailure::kForeignOrigin)
+                        if (consumed.error().kind == ConsumeFailure::kForeignOrigin) {
                             count_denial("yuzu_mcp_approval_denied_total", "foreign_origin");
-                        else if (consumed.error().kind == ConsumeFailure::kStoreError)
+                            // The dedicated security family. server.cpp describes it
+                            // as "any non-zero value is an attack or a mint/recall
+                            // pairing bug" and pre-seeds it; this is the ONLY site
+                            // that makes that description true. The describe and the
+                            // pre-seed shipped without it, leaving a flat-zero series
+                            // that reads as healthy during the exact event it exists
+                            // to report. Pinned by the [security]-tagged #2442 test,
+                            // which is red if this line goes or its labels drift.
+                            count_security_event("yuzu_mcp_approval_forgery_total");
+                        } else if (consumed.error().kind == ConsumeFailure::kStoreError)
                             count_denial("yuzu_mcp_approval_denied_total", "store_error");
                         else
                             count_denial("yuzu_mcp_approval_denied_total", "not_consumable");
