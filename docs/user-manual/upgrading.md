@@ -31,7 +31,8 @@ places, and this upgrade closes all three:
 **Breaking for automation:** closing the second path changed a response shape.
 `GET /api/config` now reports `"is_set": true|false` for a secret-valued key instead of `value`, so a
 client reading `value` for `oidc_client_secret` gets nothing where it previously got the credential.
-Full shape and the reason it is not a placeholder: [`rest-api.md`](rest-api.md).
+Full shape and the reason it is not a placeholder:
+[`rest-api.md`](rest-api.md#get-apiconfig).
 
 Because the log path fired on every boot, **historical logs** — and anything that ingested them, such
 as journald, a Docker log driver, or a SIEM — may still hold the secret in plaintext. Purge or restrict
