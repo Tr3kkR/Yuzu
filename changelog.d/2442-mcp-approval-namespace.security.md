@@ -29,7 +29,7 @@
 
   **Alerting.** A cross-surface redemption attempt increments
   `yuzu_mcp_approval_forgery_total{tool,event="security"}` — the SIEM-routed family, and the one to
-  alert on — alongside `yuzu_mcp_approval_denied_total{reason="foreign_origin"}`, and records an
+  alert on — alongside `yuzu_mcp_approval_denied_total{tool,reason="foreign_origin"}`, and records an
   `mcp.<tool>` / `denied` audit row. Both are pre-seeded to zero for every approval-gated tool, and
   the registry resets on restart, so alert on `increase(...)` rather than a bare `> 0`. Neither
   counter fires for the unlabelled carried-across tickets described below — those are exempt from

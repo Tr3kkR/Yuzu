@@ -155,15 +155,17 @@ either way. Only the pair distinguishes "the guard is protecting the table" from
 Outcomes of the supervised-tier approval gate on an MCP tool call (#2442). Label
 sets are CLOSED and pre-seeded at boot over `approval_gated_tool_names()`, so
 `absent()` alerting stays meaningful and a series that is present-and-flat means
-"no such event", not "not wired".
+"no such event", not "not wired" — except under `--mcp-disable` or `--mcp-read-only`,
+where the pre-seed still runs but the surface is off, so a flat zero means the
+tools are unreachable rather than unattacked.
 
 Both counters fire on the **same** cross-surface refusal, one-to-one — they are
 not independent events, so summing across the two families double-counts.
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `yuzu_mcp_approval_denied_total` | counter | `tool`, `reason="foreign_origin"\|"store_error"\|"not_consumable"` | The operator/dashboard breakdown of approval-recall denials. `not_consumable` is an ordinary replay of a spent ticket and is expected in normal use; `store_error` is a transient approvals-store read failure that leaves the ticket **untouched** and valid; `foreign_origin` is the cross-surface refusal below. `#2443`'s pre-consume recheck currently also counts as `not_consumable`. |
-| `yuzu_mcp_approval_forgery_total` | counter | `tool`, `event="security"` | The SIEM tap for the same `foreign_origin` event: an approval minted by the REST instruction gate or the scheduler, presented to the MCP recall. Carries `event="security"` because SIEMs filter on that label ([observability-conventions.md](../observability-conventions.md)); the paired audit row `mcp.<tool>` / `denied` with detail `refused: minted by a non-MCP surface (#2442)` is the forensic evidence. **This is the family to alert on.** |
+| `yuzu_mcp_approval_denied_total` | counter | `tool`, `reason="foreign_origin"\|"store_error"\|"not_consumable"` | The operator/dashboard breakdown of approval-recall denials. `not_consumable` is an ordinary replay of a spent ticket and is expected in normal use; `store_error` is a transient approvals-store read failure that leaves the ticket **untouched** and valid; `foreign_origin` is the cross-surface refusal below. `#2443`'s pre-consume recheck would also count as `not_consumable` if it were reachable — the sole production caller passes no precondition callback today, so this series is pure replay. |
+| `yuzu_mcp_approval_forgery_total` | counter | `tool`, `event="security"` | The SIEM tap for the same `foreign_origin` event: an approval minted by the REST instruction gate or the scheduler, presented to the MCP recall. Carries `event="security"` because SIEMs filter on that label ([observability-conventions.md](../observability-conventions.md)); the paired audit row `mcp.<tool>` / `denied` with detail `refused: minted by a non-MCP surface (#2442)` is the forensic evidence. **This is the family to alert on.** One caveat on the describe() text's "a legitimate client cannot produce this": the same branch also refuses an origin string this build does not recognise (`kUnrecognised` — written by a newer binary and read back after a rollback), so a downgrade with newer-origin rows present increments this counter benignly. Check the audit detail before treating an increase as an attack. |
 
 **Alert on an increase, not on a value.** The registry is in-memory, so every
 series returns to zero on restart — an instantaneous `> 0` rule resolves silently
