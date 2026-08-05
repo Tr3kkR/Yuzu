@@ -35,6 +35,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <httplib.h>
+#include <sqlite3.h>
 
 #include <algorithm>
 #include <chrono>
@@ -313,6 +314,83 @@ TEST_CASE("RbacStore::seed_defaults: EnginePrincipal is seeded with Administrato
 
     REQUIRE(fix.rbac_store.assign_role({"user", "linda", "Viewer"}).has_value());
     CHECK(fix.rbac_store.check_permission("linda", "EnginePrincipal", "Read"));
+}
+
+// ── 7b. The UPGRADE path — the claim the no-migration decision rests on ──
+//
+// #2376 deliberately ships NO schema migration for the new `EnginePrincipal`
+// securable. The whole justification is that `seed_defaults()` runs
+// unconditionally on every construction and its `types[]` / Administrator-CRUD
+// / `viewer_types[]` loops are all `INSERT OR IGNORE`, so an EXISTING
+// deployment picks the securable and its grants up on the next boot with no
+// migration at all — exactly how `AccessReview` and `SoftwareLicensing` were
+// introduced. (A migration is needed only where a change cannot be an
+// idempotent additive re-seed: `rbac_store.cpp`'s v4 DELETEs rows, which is
+// why that one had to be one.)
+//
+// The seeding test above only proves that on a FRESH store. That is not the
+// claim — the claim is about a database that already exists and predates the
+// securable. This reconstructs that database (open, then delete the
+// EnginePrincipal rows so the file looks pre-#2376 while its `schema_version`
+// stays where it was), reopens it, and asserts the next boot restores
+// everything. If someone later makes `seed_defaults()` conditional — a
+// run-once guard, a version gate — this fails, which is the point: it would
+// silently strand every upgraded deployment without the securable, and the
+// engine-principal routes would 403 for Administrator and Viewer alike.
+TEST_CASE("RbacStore: an EXISTING pre-#2376 database gains EnginePrincipal on the next boot, "
+          "with no migration — the no-migration decision's actual claim",
+          "[authz][floor]") {
+    yuzu::test::TempDbFile rbac_db_file{"yuzu_test_authz_floor_upgrade_"};
+
+    // Boot once so the file exists and is fully seeded/migrated, then strip the
+    // securable back out to simulate a database created before #2376.
+    {
+        RbacStore store{rbac_db_file.path};
+        REQUIRE(store.is_open());
+        auto types = store.list_securable_types();
+        REQUIRE(std::find(types.begin(), types.end(), "EnginePrincipal") != types.end());
+    }
+
+    // Strip the securable back out, and confirm the strip actually took — all
+    // through raw SQL with NO RbacStore open, because merely constructing one
+    // re-seeds and would restore the rows. An earlier draft of this test put a
+    // store construction between the strip and the assertion; that made the
+    // "upgrade boot" the third open and the test passed for the wrong reason.
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(rbac_db_file.path.c_str(), &raw) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(raw,
+                             "DELETE FROM role_permissions WHERE securable_type='EnginePrincipal';"
+                             "DELETE FROM securable_types WHERE name='EnginePrincipal';",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+
+        auto count_of = [&](const char* sql) {
+            sqlite3_stmt* s = nullptr;
+            REQUIRE(sqlite3_prepare_v2(raw, sql, -1, &s, nullptr) == SQLITE_OK);
+            REQUIRE(sqlite3_step(s) == SQLITE_ROW);
+            const int n = sqlite3_column_int(s, 0);
+            sqlite3_finalize(s);
+            return n;
+        };
+        REQUIRE(count_of("SELECT COUNT(*) FROM securable_types WHERE name='EnginePrincipal';") == 0);
+        REQUIRE(count_of(
+                    "SELECT COUNT(*) FROM role_permissions WHERE securable_type='EnginePrincipal';")
+                == 0);
+        sqlite3_close(raw);
+    }
+
+    // The upgrade boot — the FIRST store construction since the strip.
+    RbacStore upgraded{rbac_db_file.path};
+    REQUIRE(upgraded.is_open());
+
+    auto types = upgraded.list_securable_types();
+    CHECK(std::find(types.begin(), types.end(), "EnginePrincipal") != types.end());
+
+    REQUIRE(upgraded.assign_role({"user", "morag", "Administrator"}).has_value());
+    CHECK(upgraded.check_permission("morag", "EnginePrincipal", "Read"));
+
+    REQUIRE(upgraded.assign_role({"user", "niall", "Viewer"}).has_value());
+    CHECK(upgraded.check_permission("niall", "EnginePrincipal", "Read"));
 }
 
 // ── 8. Engine principal → still denied, behaviour unchanged by the floor ──
