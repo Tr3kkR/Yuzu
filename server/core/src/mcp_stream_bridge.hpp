@@ -1035,7 +1035,7 @@ private:
     /// #2740 / #2795: the reclaim's release returned WITHOUT throwing and without
     /// having cleared the slot - another route (a resume ack, or a final reaching the
     /// wire) got there first. The admission still stands, so the session can sit
-    /// transiently one call over its cap until the next `reserve` rejects.
+    /// transiently one call over its cap for the lifetime of the over-admitted call.
     ///
     /// This exists because that residual was otherwise INVISIBLE: the branch resets
     /// `displaced`, which suppresses the displacement counter, the audit row and the

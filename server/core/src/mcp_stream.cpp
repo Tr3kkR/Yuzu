@@ -74,9 +74,9 @@ constexpr const char* kMetricPublishFailures = "yuzu_mcp_stream_publish_failures
 // path was bypassed.
 constexpr const char* kMetricFinalUnpinned = "yuzu_mcp_stream_final_unpinned_total";
 /// An older pinned terminal yielded its eviction-exemption slot to a newer one.
-/// the bridge admits streamed records against `pinned_count() + unpinned`, and the pin array is
-/// sized to exactly that cap. What a full set MEANS since #2740 is defined once -
-/// see McpStreamState's "What a FULL PIN-SLOT SET means" block (mcp_stream.hpp) - and deliberately not restated here. This
+/// The bridge admits streamed records against `pinned_count() + unpinned` and the pin array
+/// is sized to exactly that cap. What a full set MEANS since #2740 is defined once -
+/// see McpStreamState's "What a FULL PIN-SLOT SET means" block in mcp_stream.hpp. This
 /// counter carries that reading (the LRU is the graceful degradation, not a licence).
 constexpr const char* kMetricPinDisplaced = "yuzu_mcp_stream_pin_displaced_total";
 /// The final was written to the wire (the client has it), but the bridge's own
@@ -340,7 +340,7 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
     std::uint64_t evicted = 0;
     bool oversized = false;
     bool sink_enqueue_failed = false;
-    bool pin_displaced = false; ///< an older pin yielded its slot (admission drift)
+    bool pin_displaced = false; ///< an older pin yielded its slot (corroborate, not a verdict)
     bool pin_unslotted = false; ///< no slot at all (only if the array is size 0)
     bool post_commit_obs_fault = false;  // test seam; tripped inside the post-commit try
     {

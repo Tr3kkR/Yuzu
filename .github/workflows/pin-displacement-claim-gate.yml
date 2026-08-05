@@ -1,0 +1,45 @@
+name: Pin-displacement claim gate
+
+# Drift gate for the "what causes a replay-ring pin displacement" claim, which is stated
+# independently on four operator-facing surfaces (the alert rule, the /metrics HELP string,
+# the user manual, and the derivation header) plus the runbook and changelog fragments.
+#
+# WHY A GATE AND NOT A CONVENTION. #2740 falsified the claim "a full pin-slot set means
+# admission accounting has drifted". Correcting it took thirteen governance rounds: the
+# claim exists as an independent paraphrase on every surface that mentions it, and each
+# round found and fixed a different subset. Round twelve designated one normative home and
+# had the others cite it; round thirteen still shipped two stale copies -- one in a customer
+# changelog, one in the /metrics HELP an on-call engineer reads with no repo access. Nine
+# reviewers were actively looking. The convention did not hold, so this is the instrument.
+#
+# WHAT IT CHECKS. Not the prose -- the lexical approach walls at exactly that boundary and
+# is parked for that reason. It checks the CAUSE SET: which counters each surface names as
+# explaining a displacement. That set is enumerable, it is what on-call acts on, and every
+# defect this exists to catch was a disagreement about its membership. See the script's own
+# header for the invariant and its derivation.
+#
+# Deliberately its OWN workflow, like plugin-spawn-gate.yml: it greps source text and needs
+# no build -- no meson, vcpkg or compiler setup -- so it neither belongs in ci.yml's
+# build-dependent fast path nor needs a paths: filter, because there is nothing expensive
+# to skip.
+
+on:
+  pull_request:
+  push:
+    branches: [dev, main]
+
+permissions:
+  contents: read
+
+jobs:
+  claim-set:
+    name: "Pin-displacement cause set"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the cause set agrees across every surface
+        run: bash scripts/ci/check-pin-displacement-claim-set.sh

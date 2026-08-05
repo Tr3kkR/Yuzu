@@ -10,7 +10,7 @@
   erased: it stays in the replay ring until ordinary eviction and remains
   fetchable by `execution_id`. Live calls are never displaced, so the per-session
   concurrency limit is intact by construction - with two bounded exceptions, each
-  leaving a session one call over its cap until the next admission rejects, and each
+  leaving a session one call over its cap for the lifetime of the over-admitted call, and each
   now separately countable: #2795, where the release loses a race to another route
   (`yuzu_mcp_bridge_pin_release_raced_total` - a client can reach this by racing its
   own resume against a new call); and #2805, where the release throws and is

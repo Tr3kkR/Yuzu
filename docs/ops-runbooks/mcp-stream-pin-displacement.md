@@ -11,7 +11,7 @@ these want from you is a judgement — whether a genuine accounting bug should b
 `YuzuMcpBridgePinReleaseFailed` is **different** and the line above does not apply to
 it: it needs a genuinely broken platform mutex, so any nonzero value is a signal about
 the HOST, not about MCP. Treat it as you would any other host-fault signal; the MCP-side
-consequence (a session one call over its cap until the next admission rejects) is the
+consequence (a session one call over its cap for the lifetime of the over-admitted call) is the
 minor half.
 
 ## What has happened
@@ -21,12 +21,7 @@ ring and **pinned** (exempt from ring eviction) so a client that reconnects late
 still resume it. `YuzuMcpStreamPinDisplaced` means a session's pin slots were all full
 and the oldest pin was displaced to make room.
 
-**What a full slot set means is defined in exactly one place:** the
-`What a FULL PIN-SLOT SET means` block on `McpStreamState` in
-`server/core/src/mcp_stream.hpp`. Read it there. It is deliberately not restated here,
-in the alert rules, in `/metrics` HELP, or in the user manual — it previously existed as a
-paraphrase in every file that mentioned it, and after #2740 falsified the claim,
-successive review rounds each found and fixed a different subset.
+The derivation lives in `server/core/src/mcp_stream.hpp`'s `What a FULL PIN-SLOT SET means` block. The statement below is this document's own self-contained summary — you may not have that file — so if the answer changes, change the derivation there first and then propagate to every operator surface, this one included.
 
 The short version, for triage only: a full slot set is a **signal to corroborate, not a
 verdict**. A *successful* #2740 reclaim cannot cause one — it releases a pin and adds a
@@ -62,14 +57,15 @@ one except a resume.
 
    | counter | what it means | explains how much? |
    |---|---|---|
-   | `yuzu_mcp_bridge_pin_release_raced_total` | the release lost a race (#2795) | one slot, per increment |
+   | `yuzu_mcp_bridge_pin_release_raced_total` | the release lost a race (#2795) | at most one slot, per increment |
    | `yuzu_mcp_bridge_pin_release_failed_total` | the release threw and was contained (#2805) | one slot, per increment |
+   | `yuzu_mcp_bridge_pin_displaced_for_admission_total` | a successful reclaim | **zero — NOT a cause. Do not rule out against it.** |
 
-   `yuzu_mcp_bridge_pin_displaced_for_admission_total` is deliberately **not** in this
-   table: a successful reclaim explains **zero** slots. It is ordinary, expected traffic
-   and counting it here would let routine client churn explain away real drift.
-   Displacement in excess of what the two counters above explain is the residue worth
-   filing.
+   The third row is listed precisely so you do not have to wonder why it is missing. A
+   successful reclaim releases a pin and adds a charge, so the session stays *at* cap and
+   nothing is displaced; it is ordinary, expected traffic, and counting it here would let
+   routine client churn explain away real drift. Displacement in excess of what the first
+   two rows explain is the residue worth filing.
 
 3. **File, unless the rule-out is clean and complete.** Title: "MCP streamed-POST
    admission accounting drift", attach the capture. The interesting question is how
@@ -85,8 +81,8 @@ one except a resume.
 
 An earlier revision told you to file unconditionally; the revision after that told you
 to dismiss whenever any reclaim counter had moved. Both were wrong, in opposite
-directions, and the second was worse — a reclaim explains one slot, so "a reclaim moved"
-does not explain an arbitrary amount of displacement.
+directions, and the second was worse — a successful reclaim explains **no** displacement
+at all, so "a reclaim moved" cannot dismiss any of it.
 
 That revision also told you to rule out #2795 by checking two counters, at a time when
 the #2795 path incremented **neither** — it reset its own record before both counter

@@ -678,7 +678,7 @@ public:
                           "The #2740 admission reclaim tried to release a pin and found "
                           "another route had already cleared it (a resume ack, or a final "
                           "reaching the wire). The admission still stands, so the session "
-                          "sits one call over its cap until the next admission rejects "
+                          "sits one call over its cap for the lifetime of the over-admitted call "
                           "(#2795). EXPECTED at a low rate - a client racing its own GET "
                           "resume against a streamed POST reaches it. Its purpose is to make "
                           "that residual RULE-OUTABLE: it previously moved no counter at "
@@ -766,15 +766,15 @@ public:
                           "counter");
         metrics_.describe("yuzu_mcp_stream_pin_displaced_total",
                           "A committed streamed-POST final was denied a replay-ring pin slot, "
-                          "so the OLDEST pinned final yielded its eviction exemption to it. NOT "
-                          "by itself proof of an accounting bug: since #2740 the admission "
-                          "reclaim releases a pin deliberately, and two accepted residuals "
-                          "(yuzu_mcp_bridge_pin_release_raced_total, "
-                          "yuzu_mcp_bridge_pin_release_failed_total) each leave a session one "
-                          "call over its cap until the next admission rejects. Rule all three "
-                          "out against their counters before treating this as drift - the "
-                          "runbook owns the procedure. A SUCCESSFUL reclaim cannot cause this, so "
-                          "ordinary traffic does not move it. The displaced final "
+                          "so the OLDEST pinned final yielded its eviction exemption to it. A "
+                          "SUCCESSFUL #2740 admission reclaim CANNOT cause this - it releases "
+                          "one pin and adds one charge, so the session stays AT cap and a slot "
+                          "is always free. Only two paths can: a release that lost a race "
+                          "(yuzu_mcp_bridge_pin_release_raced_total, #2795) and a contained "
+                          "release throw (yuzu_mcp_bridge_pin_release_failed_total, #2805). "
+                          "Rule THOSE TWO out against their counters before treating this as "
+                          "drift - do NOT rule out against the reclaim counter, which explains "
+                          "zero slots. The runbook owns the procedure. The displaced final "
                           "stays in the ring until ordinary eviction and remains fetchable by "
                           "execution_id.",
                           "counter");

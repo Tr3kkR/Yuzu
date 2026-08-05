@@ -388,20 +388,24 @@ public:
     /// admits streamed records against `pinned_count() + unpinned` and this array is sized
     /// to exactly that cap - so reaching it MEANT admission accounting had drifted.
     ///
-    /// Since #2740 that inference no longer holds on its own. Three paths now reach a full
-    /// slot set without drift - but only TWO of them put a session over its cap, and the
-    /// distinction is load-bearing (an earlier revision called all three over-cap paths and
-    /// that error was compiled straight into an alert expression that then subtracted a
-    /// non-cause):
+    /// Since #2740 that inference no longer holds on its own. TWO paths reach a full slot
+    /// set without drift. A third - the admission reclaim - is listed with them because it
+    /// is the mechanism whose two failure arms produce them, but the reclaim itself neither
+    /// over-admits nor displaces. The distinction is load-bearing: an earlier revision called
+    /// all three over-cap paths, and that error was compiled straight into an alert
+    /// expression that then subtracted a non-cause.
     ///
     ///   1. the admission reclaim releases a pin DELIBERATELY, to admit a new streamed
     ///      call in place of a final no wire took delivery of. This does **NOT** put the
     ///      session over cap and CANNOT by itself cause a displacement: it releases one
     ///      pin and adds one charge, so the sum is unchanged, the session stays AT cap,
-    ///      and `publish_impl` always finds a free slot. It is listed here because it is
-    ///      why a full slot set is reachable at all - not as an over-admission;
+    ///      and `publish_impl` always finds a free slot. Note a full set was reachable
+    ///      BEFORE #2740 too - that is the lockout this fix exists to end - so the reclaim
+    ///      is why a session at a full set can now be ADMITTED, never why the set is
+    ///      reachable;
     ///   2. #2795 - the release returns without having cleared the slot, because another
-    ///      route got there first. Client-reachable (racing a GET resume against a POST
+    ///      route got there first. AT MOST one over cap, not certainly: the slot may
+    ///      genuinely have opened, in which case there is no over-admission at all. Client-reachable (racing a GET resume against a POST
     ///      admission on the same session). Counted as
     ///      `yuzu_mcp_bridge_pin_release_raced_total`;
     ///   3. #2805 - the release throws and is contained. Needs a broken platform mutex,
@@ -417,11 +421,21 @@ public:
     /// `reclaimed` is capped at 1 per pass, so the post-state is at most cap + 1. The next
     /// `reserve` re-reads both figures under the same `bridge_mu_` and rejects.
     ///
-    /// "Transiently" is held for the LIFETIME OF THE OVER-ADMITTED CALL - it ends when that
-    /// call's final publishes (which displaces a pin and settles the sum), when the extra
-    /// pin clears by another route, or when the next admission rejects. The bound is the
-    /// #2739 streamed-POST response cap, or the teardown reaper if the execution never
-    /// settles. Idleness is not the variable.
+    /// "Transiently" is held for the LIFETIME OF THE OVER-ADMITTED CALL. It ends when the
+    /// last outstanding charge settles into the full array and displaces, or when the extra
+    /// pin clears by another route. It does NOT end when the next admission rejects: a
+    /// rejection mutates nothing, so it bounds GROWTH, not duration. The bound is the #2739
+    /// streamed-POST response cap, or the teardown reaper if the execution never settles.
+    /// Idleness is not the variable.
+    ///
+    /// AND THE NETTING MUST NEVER COME BACK, at any scope. Not a tuning judgement: this
+    /// counter is per-SESSION state, while both residual counters are UNLABELLED
+    /// PROCESS-WIDE totals. Any subtraction nets session A's residual against session B's
+    /// displacement, and a session label is ruled out by the bounded-label convention, so
+    /// the join can never exist. A residual also explains a displacement up to a response
+    /// cap later, straddling any window. If automation is ever wanted it is a RECORDING
+    /// rule producing a named "unexplained" series ALONGSIDE a retained raw `> 0` alert -
+    /// never a subtraction inside the alerting expression.
     ///
     /// So a full slot set is a SIGNAL TO CORROBORATE, not a verdict. Drift is what remains
     /// after the two OVER-CAP paths above (2 and 3) are ruled out against their counters -
