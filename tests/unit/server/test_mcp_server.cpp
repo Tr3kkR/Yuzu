@@ -750,8 +750,8 @@ struct McpTestServer {
     /// present Origin). Default nullptr/{} = streaming OFF ⇒ pre-2f behaviour.
     yuzu::server::mcp::McpSessionRegistry* session_registry_for_test{nullptr};
     bool streaming_disabled_{false};
-    /// Streamed POST ships OFF in production while #2739/#2740 are open (see
-    /// Config::mcp_streamed_post_enable). The harness turns it ON so the streamed
+    /// Streamed POST ships OFF in production - turning it on is a separate rung,
+    /// not a defect gate (see Config::mcp_streamed_post_enable). The harness turns it ON so the streamed
     /// tests exercise the streamed path - without this every one of them would
     /// silently take the plain path and pass while proving nothing. A test that
     /// wants the shipped default sets this false explicitly.
