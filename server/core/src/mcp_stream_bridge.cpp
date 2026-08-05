@@ -441,11 +441,14 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
             // is a no-op and the admission stands either way. Allocation-free.
             if (displaced.has_value() && !rec->stream->unpin(displaced->event_id)) {
                 // Another route (a resume ack, or a final that reached the wire)
-                // released this id between selection and here. The admission stands
-                // - the slot IS free, which is all the cap cares about - but no
-                // exemption was lost by US, so nothing is counted, audited or
-                // logged. Reporting it would attribute a loss that did not happen
-                // to the admitting principal.
+                // released this id between selection and here. The admission still
+                // stands: the count it was decided on was provisional either way,
+                // and the slot this pin held did open - though an unrelated pin can
+                // have taken it since, so this is not a proof that a slot is free
+                // right now. The residual is bounded by the 4-wide pin array. What
+                // does NOT stand is the report: no exemption was lost by US, so
+                // nothing is counted, audited or logged. Reporting it would
+                // attribute a loss that did not happen to the admitting principal.
                 displaced.reset();
             }
         }
@@ -1104,7 +1107,10 @@ bool McpStreamBridge::on_final_written(const std::string& key) {
     // for a resuming client. Lock order holds - BridgeRecord::mu is above
     // McpStreamState::mu_.
     if (rec->pinned_event_id != 0 && rec->stream) {
-        rec->stream->unpin(rec->pinned_event_id);
+        // Deliberately discarded: this release is best-effort. A false here means
+        // the id was already released (a resume ack, or the admission reclaim), and
+        // nothing downstream branches on which of those happened.
+        (void)rec->stream->unpin(rec->pinned_event_id);
     }
     return true;
 }

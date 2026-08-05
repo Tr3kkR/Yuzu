@@ -486,8 +486,11 @@ public:
     /// admission commits, and in between a resume ack or a delivered final can release the
     /// same id without holding `bridge_mu_`. Crediting the freed slot on a no-op would admit
     /// one call over the per-session cap, and reporting one would audit an exemption loss
-    /// that never happened. Callers that genuinely do not care may ignore the result.
-    bool unpin(std::uint64_t id);
+    /// that never happened. `[[nodiscard]]` precisely BECAUSE one caller deliberately
+    /// ignores it: the rule-(a) release in `on_final_written` is best-effort and writes
+    /// `(void)`, which makes that choice explicit and stops a future reclaim-shaped caller
+    /// dropping the result silently.
+    [[nodiscard]] bool unpin(std::uint64_t id);
 
     /// True while `id` is a pinned (eviction-exempt) final frame. The 2f bridge sweep polls
     /// this: a parked (ring-only) record whose pin has gone - consumed via a GET resume that

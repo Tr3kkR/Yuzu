@@ -1713,11 +1713,16 @@ TEST_CASE("McpStreamState: unpin makes a former final evictable again", "[mcp][s
     for (int i = 0; i < 5; ++i) state.publish("message", "x");
     REQUIRE(state.is_pinned(1)); // survived while pinned
 
-    state.unpin(1);
+    // The RETURN distinguishes "this call released it" from "it was already gone",
+    // which is what the bridge's admission reclaim credits a freed slot on (#2740):
+    // crediting a no-op would admit one call over the per-session cap.
+    CHECK(state.unpin(1));
     CHECK_FALSE(state.is_pinned(1));
     CHECK(state.pinned_count() == 0);
-    state.unpin(1); // idempotent - a second unpin is a no-op
+    CHECK_FALSE(state.unpin(1)); // idempotent - a second unpin is a no-op, and says so
     CHECK(state.pinned_count() == 0);
+    CHECK_FALSE(state.unpin(0));        // the empty-slot sentinel is never a release
+    CHECK_FALSE(state.unpin(999999));   // an id this ring never pinned
 
     for (int i = 0; i < 5; ++i) state.publish("message", "y"); // now id 1 can be evicted
     // Cursor 0 replays the surviving window; id 1 is gone (no longer protected).
@@ -1818,12 +1823,14 @@ TEST_CASE("McpStreamState: unpin of a displaced id no-ops - it cannot release th
     const auto overflow_id = state.publish_final("message", "one-too-many");
     REQUIRE_FALSE(state.is_pinned(ids[0])); // displaced by the overflow
 
-    state.unpin(ids[0]); // the stale release the bridge will eventually issue
+    // The stale release the bridge will eventually issue - and it now SAYS it
+    // released nothing, which is what stops the reclaim crediting a phantom slot.
+    CHECK_FALSE(state.unpin(ids[0]));
     CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession); // nothing released
     CHECK(state.is_pinned(overflow_id));                             // the usurper kept its slot
     CHECK(state.is_pinned(ids[1]));
 
-    state.unpin(overflow_id); // a REAL release still works after the stale one no-op'd
+    CHECK(state.unpin(overflow_id)); // a REAL release still works after the stale one no-op'd
     CHECK_FALSE(state.is_pinned(overflow_id));
     CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession - 1);
 }
