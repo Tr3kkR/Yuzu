@@ -161,8 +161,9 @@ over-disclosing:** `AuditLog:Read` is also seeded to the built-in `Operator`
 and `PlatformEngineer` roles (for the pre-existing `GET
 /api/v1/audit/auth-sample` CC7.2 evidence route and the general audit-log
 read routes), neither of which is granted `UserManagement:Read` (the
-dedicated `/rbac/roles` permission) or `Security:Read` (the dedicated
-`/engine-principals/{id}/roles` permission). Under the original gate, an
+dedicated `/rbac/roles` permission) or, at the time, `Security:Read` (then
+the `/engine-principals/{id}/roles` permission — that route moved to the
+narrower `EnginePrincipal:Read` in #2376; see the addendum at the top). Under the original gate, an
 `Operator` or `PlatformEngineer` — roles explicitly **denied** the
 purpose-built routes for reading the fleet's role-assignment graph — could
 still pull the *entire* grant population, every principal's every role, via

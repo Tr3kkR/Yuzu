@@ -2406,9 +2406,10 @@ flag it for revocation. Covers all three RBAC principal types: **user**,
 > earlier round of this feature gated it on `AuditLog:Read`/`AuditLog:Attest`
 > instead, which over-disclosed the full grant population to the `Operator`
 > and `PlatformEngineer` roles (both seeded `AuditLog:Read` for unrelated
-> reasons, neither seeded `UserManagement:Read`/`Security:Read`, the
+> reasons, neither seeded `UserManagement:Read`/`EnginePrincipal:Read`, the
 > permissions gating the equivalent-sensitivity `/rbac/roles` and
-> `/engine-principals/{id}/roles` routes). See
+> `/engine-principals/{id}/roles` routes — the latter moved off the
+> over-broad `Security:Read` in #2376). See
 > `docs/security-reviews/access-reviews-2026-07-21.md` "#2225 round 2" for
 > the finding and fix.
 

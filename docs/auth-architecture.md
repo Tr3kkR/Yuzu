@@ -1810,8 +1810,10 @@ walkthrough.
   behind a one-time secret-reveal panel, revoked rows showing `superseded_by` +
   revoke detail).
 - **REST gating:** every *mutating* route is human-admin + MFA-step-up gated;
-  the three read routes (list, get, `audit/no-admin`) are human-admin + RBAC
-  gated (`Security:Read`/`AuditLog:Read`) but not step-up gated. Every route —
+  the three read routes are human-admin + RBAC gated but not step-up gated —
+  list and get on `EnginePrincipal:Read` (moved off the over-broad
+  `Security:Read` by #2376, see "The authorization topology floor" above), and
+  `audit/no-admin` on `AuditLog:Read`. Every route —
   reads included — structurally denies a caller whose own session is
   engine-classed (`principal_kind="engine"` / `auth_source="engine_token"`, the
   §9 belt): an engine principal can never read or mutate its own or another

@@ -210,7 +210,9 @@ addressed here:
 
 - the durable fix is a tombstone mechanism (an operator-revoked tuple that
   seeding must not resurrect), which is a change to seeding semantics across
-  every securable — out of scope for this change, tracked separately;
+  every securable — out of scope for this change, **tracked as #2809** (which
+  also relates to #485, the inverse failure of the same mechanism: seeding
+  leaving *stale* grants behind on upgraded deployments);
 - until then, an operator narrowing a built-in role's grant must expect it to
   revert on restart, and should express the narrowing as a custom role or an
   explicit `deny` row instead.

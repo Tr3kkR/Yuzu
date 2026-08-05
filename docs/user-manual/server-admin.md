@@ -297,8 +297,8 @@ non-interactive that reads the three floored surfaces
   `403`s rather than breaking visibly.
 
 Either enable RBAC and grant the job's principal the appropriate role
-(`Reviewer` for access reviews, `EnginePrincipal:Read` for engine-principal
-reads), or move the job to an admin credential.
+(`Reviewer` for access reviews, `UserManagement:Read` for `/rbac/roles`,
+`EnginePrincipal:Read` for engine-principal reads), or move the job to an admin credential.
 
 **One caveat on revoking a built-in role's grant.** Because the seed loops
 above run on *every* boot, a grant you deliberately remove from a built-in
