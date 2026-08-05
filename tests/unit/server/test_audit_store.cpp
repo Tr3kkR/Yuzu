@@ -1139,6 +1139,12 @@ TEST_CASE("AuditStore #2360: a sibling holding the advisory lease skips the pass
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, 0);
+    // #2579 precondition, and here it is load-bearing rather than cosmetic:
+    // without it this pass declines for the MISSING ANCHOR, every assertion below
+    // passes for the wrong reason, and the test stays green through an advisory
+    // lock that does not work at all. Verified by deleting the lock acquisition —
+    // with this line the no-lock case fails as it must; without it it passes.
+    anchor_guard(store);
     seed_rows_with_ttl(db.dsn(), kNow - 100, 5);
     seed_rows_with_ttl(db.dsn(), kNow + kWindow, 1); // a survivor: a lone pass WOULD delete
 
