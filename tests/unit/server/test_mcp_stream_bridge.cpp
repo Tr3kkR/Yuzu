@@ -2377,7 +2377,13 @@ TEST_CASE("bridge sweep races the projector on a charged (streamed) record (TSan
     // Charge released EXACTLY ONCE. Admission = pinned_count() + streamed_unpinned:
     // the 1 orphan pin holds one slot, so EXACTLY 3 fresh streamed reserves fit
     // (1 + 3 == cap 4) WITHOUT reclaiming anything. If the charge had leaked
-    // (stuck held) only 2 would fit; if double-released, a 4th would fit free.
+    // (stuck held) only 2 would fit. MEASURED (governance Gate 8, quality-engineer):
+    // the double-release direction is NOT detected by this test at single-site
+    // granularity - decrement_streamed_locked's own missing-entry floor absorbs one
+    // redundant call, so only breaking BOTH that floor and release_charge's
+    // exactly-once flag reddens it. Two independent guards is the intended defence;
+    // this test measures the leak direction, and the redundancy is what covers the
+    // other.
     const auto displaced_total = [&] {
         return fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value();
     };
@@ -2390,7 +2396,8 @@ TEST_CASE("bridge sweep races the projector on a charged (streamed) record (TSan
     // record the sweep above tore down, so nothing else will ever release it.
     // Admission now reclaims exactly that, which still proves the cap bit here -
     // a leaked charge would have made this the FOURTH occupant rather than a
-    // reclaim, and a double-released charge would have let it in for free.
+    // reclaim. (See the note above for what this does NOT catch: a single-site
+    // double-release is absorbed by the ledger's own floor.)
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
     CHECK(displaced_total() == 1.0);
     CHECK(s.stream->pinned_count() == 0);  // the orphan yielded its slot
