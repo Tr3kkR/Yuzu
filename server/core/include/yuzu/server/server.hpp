@@ -322,9 +322,9 @@ struct Config {
     // MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f)
     bool mcp_streaming_disable{false}; // --mcp-no-streaming: no sessions, GET/DELETE → 405
     /// SSE-on-POST (streamed POST, 2f PR 3b). Ships OFF: the machinery is complete and
-    /// reviewed, but two bounds defects are open against it (#2739 - the response cap
-    /// does not fire on a busy execution; #2740 - an undelivered final holds a session
-    /// streamed slot). Both are fixed in the follow-up PR, which flips this default.
+    /// reviewed, and the four defects that gated the on-by-default flip (#2739, #2740,
+    /// #2785, #2789) are fixed. Turning the default on is a SEPARATE rung - this flag
+    /// stays off until then.
     /// Same shape as Spark's `prefer_spark_`: land the machinery dormant, cut over
     /// where the invariants actually hold. NOT --mcp-no-streaming, which disables the
     /// whole transport (sessions + GET/DELETE) including rungs already shipped.

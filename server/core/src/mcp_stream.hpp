@@ -761,9 +761,9 @@ private:
 ///    WAKE CHANNEL: the projector pokes it, and the pump then asks the bridge
 ///    what to write. Nothing ever enqueues onto that queue.
 ///  - It has a response CAP. The GET channel is open-ended; a POST response is
-///    a request/response exchange, so it is MEANT to be bounded (#2739: the cap does
-///    not fire while progress keeps arriving - the reason streamed POST ships off by
-///    default) and the execution continues
+///    a request/response exchange, so it is MEANT to be bounded (#2739, fixed: the cap
+///    now fires on a busy execution, via the drain-then-settle state in
+///    McpStreamBridge::project_record) and the execution continues
 ///    server-side past the close. That needs a clock of its own, because
 ///    RevalidateGrace privately owns the one injected into it.
 ///  - It NEVER closes the session's stream state. The GET pump owns that stream;

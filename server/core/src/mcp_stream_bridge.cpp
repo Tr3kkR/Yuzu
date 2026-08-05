@@ -76,6 +76,11 @@ constexpr const char* kMetricPinSlotsReject = "yuzu_mcp_bridge_pin_slots_reject_
 // alertable on > 0, and folding a routine event into it would destroy that alarm.
 constexpr const char* kMetricPinDisplacedForAdmission =
     "yuzu_mcp_bridge_pin_displaced_for_admission_total";
+// #2740 / governance: the admission reclaim's release threw and was contained. The
+// record is already committed at that point, so letting it escape would leave a slot
+// nothing reclaims until the arming reaper. "Should never happen" - it needs a broken
+// platform mutex - so any nonzero value is a signal, not a rate.
+constexpr const char* kMetricPinReleaseFailed = "yuzu_mcp_bridge_pin_release_failed_total";
 // Produced ONLY by the bridge's publish_final -> fallback -> poison ladder
 // (below); named in the yuzu_mcp_stream_* family because it describes stream-
 // terminal delivery, not because mcp_stream.cpp increments it (poison_terminal()
@@ -439,17 +444,36 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
             // slot double-counted. `unpin` is id-targeted and idempotent: if a
             // resume ack or on_final_written released the same id in between, this
             // is a no-op and the admission stands either way. Allocation-free.
-            if (displaced.has_value() && !rec->stream->unpin(displaced->event_id)) {
-                // Another route (a resume ack, or a final that reached the wire)
-                // released this id between selection and here. The admission still
-                // stands: the count it was decided on was provisional either way,
-                // and the slot this pin held did open - though an unrelated pin can
-                // have taken it since, so this is not a proof that a slot is free
-                // right now. The residual is bounded by the 4-wide pin array. What
-                // does NOT stand is the report: no exemption was lost by US, so
-                // nothing is counted, audited or logged. Reporting it would
-                // attribute a loss that did not happen to the admitting principal.
-                displaced.reset();
+            if (displaced.has_value()) {
+                bool released = false;
+                try {
+                    released = rec->stream->unpin(displaced->event_id);
+                } catch (...) {
+                    // CONTAINED, and the containment is the point. The record is
+                    // ALREADY committed at this line, so an escaping throw unwinds
+                    // past the handler's degrade-to-plain catch with the admission
+                    // counted and no record the caller believes in - a slot nothing
+                    // reclaims until the arming reaper fires. A mutex acquisition
+                    // is the one throw site this file's fault model treats as real
+                    // (it injects resource_deadlock_would_occur elsewhere), and
+                    // `unpin`'s first act is one. Same shape as the pump's
+                    // contained credit step at on_final_written's call site.
+                    count_pin_release_failed();
+                }
+                if (!released) {
+                    // Either another route (a resume ack, or a final that reached
+                    // the wire) released this id between selection and here, or the
+                    // release above was contained. The admission still stands: the
+                    // count it was decided on was provisional either way, and on
+                    // the raced path the slot this pin held did open - though an
+                    // unrelated pin can have taken it since, so this is not a proof
+                    // that a slot is free right now (#2795). The residual is
+                    // bounded by the 4-wide pin array. What does NOT stand is the
+                    // report: no exemption was released by US, so nothing is
+                    // counted, audited or logged. Reporting it would attribute a
+                    // loss that did not happen to the admitting principal.
+                    displaced.reset();
+                }
             }
         }
     }
@@ -2608,6 +2632,12 @@ void McpStreamBridge::publish_records_gauge(std::size_t n) noexcept {
 void McpStreamBridge::count_pin_displaced_for_admission() noexcept {
     if (metrics_ != nullptr) {
         obs_guard([&] { metrics_->counter(kMetricPinDisplacedForAdmission).increment(); });
+    }
+}
+
+void McpStreamBridge::count_pin_release_failed() noexcept {
+    if (metrics_ != nullptr) {
+        obs_guard([&] { metrics_->counter(kMetricPinReleaseFailed).increment(); });
     }
 }
 

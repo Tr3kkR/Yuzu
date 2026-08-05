@@ -621,7 +621,7 @@ TEST_CASE("bridge pin-ack sweep - resume consumption frees streamed admission",
 }
 
 TEST_CASE("bridge admission - client-gone finals never lock a session out of streaming (#2740)",
-          "[mcp][bridge][2f]") {
+          "[mcp][bridge][2f][ch24]") {
     // A streamed POST whose peer dies before the final is written leaves that
     // final PINNED: the prompt release (on_final_written) is reached only after
     // write_all succeeds, and the remaining routes - a GET resume acking past the
@@ -770,7 +770,7 @@ TEST_CASE("bridge admission - client-gone finals never lock a session out of str
 }
 
 TEST_CASE("bridge admission - ORPHAN pins are reclaimed too (governance UP-1)",
-          "[mcp][bridge][2f]") {
+          "[mcp][bridge][2f][ch24]") {
     // The lockout shape a RECORD scan can never see. Teardown erases a record
     // without unpinning, so its committed final stays pinned with nothing left
     // that could ever release it: the sweep's pin-ack arm needs a record,
@@ -3041,7 +3041,7 @@ TEST_CASE("bridge take_post_batch - a terminal beats an expired cap (C7)",
 
 TEST_CASE("bridge take_post_batch - an expired cap settles one drain pass later, "
           "never at execution pace (#2739)",
-          "[mcp][bridge][2f]") {
+          "[mcp][bridge][2f][ch23]") {
     // Before this fix, cap arbitration was reached only on a pass with neither
     // progress nor terminal pending - so a mailbox that refilled every tick held
     // the response open for the WHOLE execution, and every operator statement
@@ -3112,7 +3112,7 @@ TEST_CASE("bridge take_post_batch - an expired cap settles one drain pass later,
 }
 
 TEST_CASE("McpPostPump: wire frames carry the replay-ring event id (#2785)",
-          "[mcp][bridge][2f]") {
+          "[mcp][bridge][2f][ch25]") {
     // The replay ring commits every streamed-POST frame under a real,
     // monotonically-increasing event id - but until this fix the pump wrote
     // every frame with the 2-arg SseEvent (id 0, "no id"), so a client that

@@ -1011,6 +1011,9 @@ private:
     /// #2740 displacement counter. Never called under bridge_mu_ (the registry has
     /// its own mutex; the admission lock is the global one).
     void count_pin_displaced_for_admission() noexcept;
+    /// #2740: the reclaim's release threw and was contained (the record is already
+    /// committed by then, so the throw must not escape). Never called under bridge_mu_.
+    void count_pin_release_failed() noexcept;
     /// #2740. Called from the admission path with `bridge_mu_` HELD, on the pass
     /// that would otherwise refuse `pin_slots`: NAMES a pin that may be released
     /// so a new streamed call can take its slot. **Selection only — it mutates

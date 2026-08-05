@@ -9504,9 +9504,9 @@ TEST_CASE("Config's shipped default for streamed POST is OFF", "[mcp][2f][3b][co
 
 TEST_CASE("streamed POST ships DORMANT: the default is off and a stream is not opened",
           "[mcp][integration][execute][bridge][2f][3b]") {
-    // The shipped default. 3b's machinery is complete, but #2739 (the 120 s response
-    // cap does not fire on a busy execution) and #2740 (an undelivered final holds a
-    // session streamed slot) are open against it, and four operator surfaces document
+    // The shipped default. 3b's machinery is complete and the four defects that gated
+    // the on-by-default flip (#2739, #2740, #2785, #2789) are fixed; turning the default
+    // on is a separate rung. Four operator surfaces document
     // a bound the implementation does not honour. So it lands off, exactly as Spark
     // landed behind prefer_spark_ = false, and the follow-up PR flips it.
     //

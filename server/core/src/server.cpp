@@ -660,6 +660,17 @@ public:
                           "exemption EXCEPT for an orphan, where no record survives to name one "
                           "and the detail carries the ring event id instead",
                           "counter");
+        metrics_.describe("yuzu_mcp_bridge_pin_release_failed_total",
+                          "The streamed-admission reclaim (#2740) tried to release the pin "
+                          "it had selected and the release THREW; the throw was contained "
+                          "because the record is already committed at that point and an "
+                          "escaping exception would leave a session slot nothing reclaims "
+                          "until the arming reaper fires. Needs a genuinely broken platform "
+                          "mutex, so ANY nonzero value is a signal, not a rate: the "
+                          "admission stood but no exemption was released, so that session "
+                          "is one slot tighter than the cap implies until the pin clears by "
+                          "another route",
+                          "counter");
         metrics_.describe("yuzu_mcp_bridge_charge_release_deferred_total",
                           "Streamed admission charges that could not be released at their natural "
                           "release point and are RETAINED on the record until its teardown "
@@ -776,6 +787,7 @@ public:
         }
         metrics_.counter("yuzu_mcp_bridge_charge_release_deferred_total");
         metrics_.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total");
+        metrics_.counter("yuzu_mcp_bridge_pin_release_failed_total");
         metrics_.counter("yuzu_mcp_bridge_streaming_backstop_total");
         metrics_.counter("yuzu_mcp_stream_terminal_publish_failures_total");
         metrics_.counter("yuzu_mcp_stream_final_unpinned_total");
