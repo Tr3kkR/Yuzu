@@ -625,6 +625,15 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     // silently defeated the move-aside on the Wee Tam MSVC leg (POSIX allows
     // rename-with-open-handle, so it passed on Linux/macOS). All legacy reads
     // are already materialised in memory above.
+    //
+    // `sel` must be finalized BEFORE that close, not left to scope exit:
+    // `SqliteDb::close()` is `sqlite3_close_v2`, which does NOT close a
+    // connection with an outstanding statement — it marks it a zombie and defers
+    // the close (and the OS file handle) until the last statement finalizes
+    // (`sqlite_raii.hpp`). `sel` is function-scoped and lives past this point, so
+    // closing without finalizing it leaves the file locked and the rename below
+    // still fails on Windows.
+    sel.reset();
     legacy.close();
     std::error_code mv_ec;
     auto aside = legacy_db_path;
