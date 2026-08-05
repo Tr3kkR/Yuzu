@@ -1025,6 +1025,11 @@ private:
     ///    lockout shape that survived the first cut of this fix.
     ///  - the OLDEST PARKED record (`kRingOnly`) whose committed final no wire
     ///    took delivery of. Its resume window is the one most likely already past.
+    /// The rule that admits these two and would exclude a third: select a pin only
+    /// when THIS admission is the last path that could ever act on it - an orphan,
+    /// because no record survives to release it; a parked record's final, because
+    /// the reclaim is itself what un-exempts it - never one a live path still owns
+    /// and will release itself.
     /// Returns nullopt when neither exists (every slot backs a live call), or
     /// when ANY of this session's records is mid-projection: the admission sum
     /// transiently counts one settling record as two slots, reserve has always
