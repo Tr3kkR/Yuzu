@@ -80,15 +80,35 @@ primary new element vs the three prior migrations.
   ON CONFLICT DO NOTHING) so no duplication and no loss. Row-count reconciliation
   (legacy count vs migrated count) is logged and asserted, as **equality** — an unexplained
   surplus is as much an unaccounted-for state as a shortfall.
+- **No native audit row may be written before the marker exists.** The resume cursor and its
+  prefix proof (next bullet) both assume every row in PG came from the legacy stream. A row
+  this build wrote itself is not in that stream, so the proof mismatches and the backfill is
+  refused on **every** later boot — permanently, on the host whose evidence the operator is
+  most likely to need. The boot path satisfies this by construction (the backfill runs before
+  anything can log). **Any other writer of a native row MUST run the idempotent backfill
+  first**: the one-shot break-glass CLI paths (`--mfa-reset`, `--break-glass-arm`) do so via
+  `open_one_shot_audit` in `server/core/src/main.cpp`. Adding a writer that skips it is a
+  migration hazard, not a style question.
+- **A sourceless exit may only stamp the marker over an EMPTY table.** The marker asserts the
+  trail is complete; with no legacy source in hand — no file, or a file with no `audit_events`
+  table — nothing on that path can establish it, so rows-present + marker-absent fails closed
+  instead (a replica started while another is still streaming, or a partial backfill whose
+  legacy file was moved aside). The *resume* path is unaffected: it has a source, and the
+  prefix proof is what licenses it.
 - **The `MAX(id)` resume cursor is guarded by a prefix proof.** ADR-0009's trigger is an *empty*
   schema; resuming from `MAX(id)` relaxes that so an interrupted copy can continue, and the
   relaxation is sound only while the rows already in PG *are* that interrupted copy. Before
-  streaming, the migration compares `(COUNT(*), SUM(id))` over PG against the legacy rows at or
-  below the cursor, and **fails closed on any mismatch**. Without it, a marker-absent PG table
-  holding unrelated rows above the legacy id range skips every legacy row, still satisfies the
-  count check, and stamps the mandatory backfill complete having migrated nothing — after which
-  the legacy file is moved aside. A count alone does not close it (equal counts, disjoint ids),
-  which is why the id sum is part of the comparison.
+  streaming, the migration compares five aggregates —
+  `(COUNT(*), SUM(id), SUM(timestamp), MIN(timestamp), MAX(timestamp))` — over PG against the
+  legacy rows at or below the cursor, and **fails closed on any mismatch**. Without it, a
+  marker-absent PG table holding unrelated rows above the legacy id range skips every legacy
+  row, still satisfies the count check, and stamps the mandatory backfill complete having
+  migrated nothing — after which the legacy file is moved aside. A count alone does not close
+  it (equal counts, disjoint ids), which is why the id sum is in the comparison; the id shape
+  alone does not close it either, because ids run `1..k` in *every* deployment (an identity
+  column here, `rowid` there), so a foreign table's first 50 rows carry the same count and id
+  sum as this legacy file's own first 50. Event timestamps are what differ between two
+  deployments, which is why three of the five aggregates are over `timestamp`.
 - **Fail-closed on backfill failure** (ADR-0012 mandatory-backfill contract): a failed/partial
   backfill refuses boot with a loud diagnostic and is retried on the next start — the server
   never serves with a knowingly-incomplete evidence chain. Backfill work is RAII-guarded

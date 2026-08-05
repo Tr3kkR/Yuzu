@@ -1057,7 +1057,7 @@ TEST_CASE("AuditStore #2579: no stored reading + rows already expired declines, 
     // no warning.
     //
     // Deliberately NOT anchored: the absence of a stored reading IS the input.
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, 0);
     REQUIRE(store.is_open());
@@ -1087,7 +1087,7 @@ TEST_CASE("AuditStore #2579: a probe-failed pass does not spend the bootstrap tr
     // deletes with every detector false -- the exact defect #2579 closes,
     // reinstated. The marker is therefore settled at the VERDICT, and every
     // early return before it rolls the whole transaction back.
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, 0);
     REQUIRE(store.is_open());
@@ -1113,7 +1113,7 @@ TEST_CASE("AuditStore #2579: a probe-failed pass does not spend the bootstrap tr
 
 TEST_CASE("AuditStore #2579: consecutive probe failures do not erode the trigger",
           "[pg][audit_store][retention][clock-guard]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, 0);
     REQUIRE(store.is_open());
@@ -1138,7 +1138,7 @@ TEST_CASE("AuditStore #2579: nothing expired means no bootstrap decline",
     // The cost control. A fresh install has no stored reading either, and if the
     // trigger fired on that it would declare an anomaly on every server's first
     // boot -- which is why `no_anchor` is tested AFTER `has_expired`.
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, 0);
     REQUIRE(store.is_open());

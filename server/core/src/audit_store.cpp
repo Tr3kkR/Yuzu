@@ -116,7 +116,7 @@ bool note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason, Degra
     return new_episode || (n % kReadDegradeLogSample) == 0;
 }
 
-// Serialize the four guard facts to a stable string — the durable dedup key
+// Serialize the five guard facts to a stable string — the durable dedup key
 // (mirrors ResponseStore's `facts_ser`). Compares the whole FACT SET, not the
 // classified enum, so a Wipe arriving underneath a standing BadState (the
 // dead-CMOS-then-NTP sequence that silently wiped the whole trail) is NOT
