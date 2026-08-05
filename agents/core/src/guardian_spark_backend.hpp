@@ -75,7 +75,8 @@ public:
         // silent enforcement hole; Fable B4->B1 finding). The propagating throw is
         // terminate-safe (GuardianRollback), cannot corrupt the index (strong-guarantee
         // add), and since #2270 leaves no partial arm_impl state in the engine either -
-        // arm_impl repairs its own bookkeeping on a throw. That is a statement about
+        // arm_impl repairs its own bookkeeping when the throw comes from its allocating
+        // commit, which is the bad_alloc case this branch is about. That is a statement about
         // engine state, NOT a claim that the arm succeeded or that siblings are
         // unaffected: a watch that fails to arm still fails for everyone sharing the
         // key (#2270 UP-9, pre-existing).

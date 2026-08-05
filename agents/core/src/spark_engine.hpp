@@ -90,10 +90,6 @@ struct SparkEngineStats {
     /// resource-gate cross-check doesn't mistake it for `ps -T` (governance S1).
     std::uint64_t watcher_units{0};
     std::uint64_t watch_faults_total{0}; ///< mechanism fault reports (post-arm deaf edges), monotonic
-    /// Arm-rollback cleanups that threw and were swallowed rather than terminating the
-    /// daemon mid-unwind. Nonzero = a rollback could not fully undo itself, so a stale
-    /// armed_/sub_keys_ entry or an orphaned OS watch may survive. Monotonic.
-    std::uint64_t rollback_cleanup_failures{0};
     std::uint64_t consumer_threads_detached{0}; ///< handlers that blocked past the shutdown budget
     std::uint64_t events_total{0};       ///< spark fires (post-dedup, pre-fan-out)
     std::uint64_t queued_delivered_total{0};
@@ -261,17 +257,13 @@ public:
     /// Test seam (#2270): if set, invoked at each labelled allocation point inside
     /// arm_impl() with the phase reached. A test throws from the phase it wants to
     /// simulate an allocation failure at, which is the only way to exercise the
-    /// strong-guarantee paths deterministically — a real std::bad_alloc cannot be
+    /// strong-guarantee path deterministically — a real std::bad_alloc cannot be
     /// aimed at one statement. Same set-then-use contract as the other seams.
     void set_arm_fault_hook_for_test(std::function<void(int phase)> hook);
     /// Reached after arm_impl's armed_ entry is committed and before the sub_keys_
     /// node is allocated: a throw here must leave armed_/sub_keys_ exactly as on
     /// entry (the in-lock layer).
     static constexpr int kArmFaultPhaseBeforeSubKeys = 1;
-    /// Reached after the subscription is published and mu_ is released, before the
-    /// OS watch is armed: a throw here must be undone by arm_impl's rollback (the
-    /// post-commit layer).
-    static constexpr int kArmFaultPhaseAfterCommit = 2;
 
 private:
     struct Subscriber {
@@ -498,12 +490,6 @@ private:
     std::function<void()> arm_race_hook_for_test_;      ///< test seam; null = no-op (set-then-use)
     std::function<void(int)> arm_fault_hook_for_test_;  ///< test seam; null = no-op (set-then-use)
     std::function<void()> disarm_race_hook_for_test_;   ///< test seam; null = no-op (set-then-use)
-    /// ~ArmRollback cleanups that threw and were swallowed to avoid a std::terminate
-    /// during unwinding. Nonzero means an arm rollback could not fully undo itself
-    /// under memory pressure - a real (if rare) leak signal, and the ONLY trace such a
-    /// cleanup leaves behind. Mirrors guardian_rollback_cleanup_failures()
-    /// (guardian_scope_guard.hpp), whose swallow this one is modelled on.
-    std::atomic<std::uint64_t> rollback_cleanup_failures_{0};
 
     // Delivery counters touched by consumer dispatch threads live in a shared
     // block so a detached thread can write them after ~SparkEngine (UP-1). The

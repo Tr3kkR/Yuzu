@@ -481,73 +481,26 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
     //   (1) inside mu_: every allocation happens BEFORE the first shared-state
     //       commit, the one remaining allocating commit is try/caught, and the tail
     //       that publishes the subscription cannot throw (pinned by static_assert).
-    //   (2) after mu_: `rollback` undoes the commit if anything between it and the
-    //       successful return throws (spdlog, a mech-ops mutex lock, the test hook).
+    //
+    // There is deliberately NO post-commit rollback. An earlier revision had one and
+    // it was a net negative: across two review rounds it shipped a wrong branch
+    // predicate (it deleted healthy sibling subscriptions and orphaned live OS
+    // watches on the deduped, timer and pre-start shapes), then a TOCTOU whose
+    // converse re-created the very ghost this fix exists to close - a rollback
+    // running with no locks held, after an unwind window, cannot reliably decide
+    // what it is allowed to undo. The window it guarded is instead made
+    // NON-THROWING: the only allocating statement in it (the log line) is contained
+    // below.
+    //
+    // RESIDUAL, stated rather than papered over: a std::system_error from acquiring
+    // mech_ops_mu_by_type_ or consumers_mu_ below would still leave a committed
+    // subscription whose watch was never armed. std::mutex::lock throws only on
+    // EDEADLK/EINVAL/EAGAIN - a process-is-broken condition, not the memory pressure
+    // #2270 is about - and recovering from it is what the rollback failed twice to
+    // do safely. Out of scope here.
     ISparkMechanism* mech = nullptr;
     SparkParams watch_params;
     SubscriptionId id = 0;
-    bool watch_armed = false;
-
-    // Fires only if we committed and are NOT returning `id`.
-    //
-    // The branch turns on ONE question: did THIS call owe the key its watcher and
-    // fail to deliver it? Only then is the key a failed arm for everyone sharing it
-    // and dropped whole — the rule the watch-failure path below already follows. In
-    // every OTHER shape a plain disarm(id) is correct, and dropping the key is
-    // actively wrong:
-    //   - a deduped arm onto an existing key: someone else's watcher is up and their
-    //     arm() already returned SUCCESS to them;
-    //   - a timer spark (Interval/Disk/Startup): there is no watcher concept at all;
-    //   - any pre-start arm: no watch is armed while !running_ by design — start()'s
-    //     replay arms it.
-    // disarm(id) covers all of those and still erases the key + unwatches when our
-    // subscription was the last one. An earlier revision branched on `watch_armed`
-    // alone, which is false on all three of those shapes, so a rollback deleted
-    // healthy siblings and orphaned a live OS watch (governance sec-F1/UP-10/UP-11).
-    struct ArmRollback {
-        SparkEngine* engine{nullptr};
-        const std::string* key{nullptr};
-        SubscriptionId id{0};
-        /// This call is the one obliged to bring the key's watcher up (a brand-new
-        /// event-driven key on a running engine). Snapshotted at install time.
-        bool owed_watch{false};
-        const bool* watch_armed{nullptr};
-        bool committed{false};
-        ~ArmRollback() noexcept {
-            if (committed || engine == nullptr)
-                return;
-            // A rollback runs while something else is already unwinding, very often
-            // a bad_alloc; its own cleanup allocates (disarm copies the key). A
-            // throw escaping here would be a throw during unwinding → terminate,
-            // killing the whole agent daemon. Surviving with a leaked watcher beats
-            // that (same rationale as GuardianRollback, guardian_scope_guard.hpp).
-            try {
-                if (owed_watch && !*watch_armed) {
-                    std::lock_guard lk(engine->mu_);
-                    // Identity check, NOT just presence. This destructor runs with no
-                    // locks held after an unwind window, so between our throw and here
-                    // a concurrent unregister_consumer can have erased the key and an
-                    // equal-spec arm re-created it — possibly with its watch already
-                    // armed. Dropping by key alone would erase that RENEWED healthy key
-                    // and orphan its watcher. `sub_keys_` still holding OUR id is an
-                    // exact "our commit is still live" proxy: every key-erasure site
-                    // erases its subs' sub_keys_ entries with the key.
-                    auto ki = engine->sub_keys_.find(id);
-                    if (ki != engine->sub_keys_.end() && ki->second == *key)
-                        engine->drop_key_locked(*key);
-                } else {
-                    engine->disarm(id);
-                }
-            } catch (...) {
-                // Nothing safe left to do: even logging allocates. Counted so a
-                // swallowed cleanup is not invisible (governance cs-F2).
-                engine->rollback_cleanup_failures_.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
-        ArmRollback() = default;
-        ArmRollback(const ArmRollback&) = delete;
-        ArmRollback& operator=(const ArmRollback&) = delete;
-    } rollback;
 
     {
         std::lock_guard lk(mu_);
@@ -592,6 +545,12 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
             // watcher — mech stays null, no second watch() (N subscriptions, 1
             // watcher). Reserve now (strong-guarantee: a throw leaves the vector
             // untouched) so the publishing push_back below cannot throw.
+            // LOAD-BEARING AND UNPINNED: deleting this line leaves the whole suite
+            // green (measured), because without a reallocation the publish behaves
+            // identically - the defect it prevents is only reachable when push_back
+            // itself must allocate under memory pressure. The static_assert on
+            // Subscriber's move covers the move, not the reallocation. Do not
+            // "simplify" it away on the strength of a green run.
             existing->subs.reserve(existing->subs.size() + 1);
         }
 
@@ -627,20 +586,20 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
             }
             armed.subs.push_back(std::move(sub));
         }
-        rollback.key = &key;
-        rollback.id = id;
-        rollback.owed_watch = (mech != nullptr);
-        rollback.watch_armed = &watch_armed;
-        rollback.engine = this; // set LAST: arms the guard only once it is fully built
-
         if (!event_driven)
             wheel_cv_.notify_all();
-        if (inserted)
-            spdlog::info("SparkEngine: armed '{}'", key);
+        if (inserted) {
+            // The one allocating statement past the commit, and the reason this
+            // function no longer needs a rollback: spdlog formats into a heap
+            // buffer, so under the very memory pressure #2270 is about it can
+            // throw - and a throw here would strand a committed subscription.
+            // Losing a log line is strictly better than unwinding a live arm.
+            try {
+                spdlog::info("SparkEngine: armed '{}'", key);
+            } catch (...) {
+            }
+        }
     }
-
-    if (arm_fault_hook_for_test_)
-        arm_fault_hook_for_test_(kArmFaultPhaseAfterCommit);
 
     // Arm the OS watch with mu_ RELEASED — watch() may block on handle setup,
     // and an inline emit from the mechanism re-enters under mu_. `mech` is set
@@ -655,22 +614,15 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
         std::lock_guard ops(mech_ops_mu_by_type_.at(spec.type));
         {
             std::lock_guard lk(mu_);
-            if (!armed_.contains(key)) {
-                // The ONLY post-commit exit that used to leave the rollback armed, so
-                // ~ArmRollback ran on an ordinary error return (governance cs-F1). Our
-                // subscription is already gone with the key, so there is nothing to
-                // undo; disarming the guard is the whole fix. Set BEFORE the return
-                // expression — building the message allocates and can throw.
-                rollback.committed = true;
+            if (!armed_.contains(key))
                 return std::unexpected(std::string("spark '") + key +
                                        "' was disarmed before its watch could be armed");
-            }
         }
         // A mechanism must RETURN std::unexpected on failure, not throw — but
         // the real ones can (e.g. spark_file's watch() uses fs::current_path()
         // without an ec overload, which throws on a relative path with a bad
-        // CWD). An escaping throw would unwind PAST the rollback below, leaving
-        // a zombie armed_ entry with no watcher and no id ever returned to the
+        // CWD). An escaping throw would leave a zombie armed_ entry with no
+        // watcher and no id ever returned to the
         // caller — an std::expected-contract violation the caller can neither
         // observe nor disarm (governance UP-7). watch_guarded() turns a throw
         // into a returned failure so it falls into the whole-key teardown.
@@ -678,22 +630,11 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
         if (!w) {
             {
                 std::lock_guard lk(mu_);
-                // Same identity check as the rollback's drop branch: mu_ was released
-                // across watch_guarded(), so a concurrent unregister + equal-spec
-                // re-arm can have replaced this key with a healthy one. Drop only while
-                // OUR subscription is still the one on it.
-                auto ki = sub_keys_.find(id);
-                if (ki != sub_keys_.end() && ki->second == key)
-                    drop_key_locked(key);
+                drop_key_locked(key);
             }
-            // The key is gone; leave nothing for the rollback to undo (a second
-            // teardown would be a harmless no-op, but disarming here keeps the
-            // "exactly one teardown per failed arm" reading true).
-            rollback.committed = true;
             return std::unexpected(std::string("watch mechanism failed to arm '") + key +
                                    "': " + w.error());
         }
-        watch_armed = true;
     }
 
     if (arm_race_hook_for_test_)
@@ -713,11 +654,9 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
         }
         if (!consumer_alive) {
             disarm(id);
-            rollback.committed = true;
             return std::unexpected("consumer unregistered during arm");
         }
     }
-    rollback.committed = true;
     return id;
 }
 
@@ -1256,7 +1195,6 @@ SparkEngineStats SparkEngine::stats() const {
     }
     s.watch_faults_total = watch_faults_.load(std::memory_order_relaxed);
     s.consumer_threads_detached = consumer_threads_detached_.load(std::memory_order_relaxed);
-    s.rollback_cleanup_failures = rollback_cleanup_failures_.load(std::memory_order_relaxed);
     s.events_total = events_total_.load(std::memory_order_relaxed);
     s.queued_delivered_total = delivery_->delivered.load(std::memory_order_relaxed);
     s.queued_dropped_total = delivery_->dropped.load(std::memory_order_relaxed);

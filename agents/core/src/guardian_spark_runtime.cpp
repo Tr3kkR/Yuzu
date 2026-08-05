@@ -131,7 +131,8 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         // If backend_->arm() itself THROWS (a bad_alloc inside arm_impl, no subscription
         // returned), armed_here stays false and this rollback undoes only the
         // Guardian-side mutations. That is sufficient for the engine's OWN bookkeeping:
-        // as of #2270 arm_impl repairs itself on a throw, so there is no partial armed_
+        // as of #2270 arm_impl repairs itself when the throw comes from its own
+        // allocating commit - the memory-pressure case - so there is no partial armed_
         // entry left for anyone to clean. It does NOT make a failed arm invisible - a
         // watch that fails to arm still fails for every rule sharing that spark key
         // (#2270 UP-9, unchanged and pre-existing), and Guardian learns of it through
