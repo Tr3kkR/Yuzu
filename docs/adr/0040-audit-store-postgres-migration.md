@@ -115,9 +115,24 @@ primary new element vs the three prior migrations.
        trail then skips the mandatory backfill on that marker and reports success. 365 days of
        evidence, silently never migrated.
   The *resume* path is unaffected throughout: it has a source, and the prefix proof licenses it.
-  What none of this can rule out is a peer replica whose inserts are not yet visible to this
-  transaction; that residue is why the sourceless stamp logs at WARN naming what it forecloses,
-  and why `upgrading.md` says which host must boot first.
+  The sourceless stamp logs at WARN naming what it forecloses, because a genuinely fresh install
+  cannot be told apart from a fileless replica at the moment of stamping.
+- **Holder-side verification closes the peer-replica gap the three rules above cannot (Gate 4
+  UP-2 / Sol, round 3).** No process can prove *deployment-wide* absence from its own filesystem —
+  a sourceless stamp is honest about what it knows, never about what it doesn't. So the fix does
+  not live on the sourceless side at all: `stamp_complete` additionally writes a
+  `backfill_source_fingerprint` row in the SAME transaction as `backfill_complete` — `"sourceless"`
+  for a sourceless stamp, or the five-aggregate fingerprint (the same shape as the prefix proof
+  above, over the whole legacy trail) for a real backfill. A HOLDER that later boots and finds the
+  marker already set, with its own legacy `audit.db` still present, does not trust the marker: it
+  re-reads that file, computes its own fingerprint, and compares. A match (this host's own prior
+  partial run, or an identical shared-storage sibling's) retries the move-aside that evidently
+  failed; anything else — a mismatched fingerprint, a `"sourceless"` provenance, an unreadable or
+  corrupt file — **refuses to serve**, file untouched at its original path, so the operator can
+  investigate rather than lose the trail silently. This is what actually closes the residue the
+  bullet above could not: `upgrading.md`'s boot-order guidance is now an optimization (avoids a
+  refusal an operator would otherwise have to resolve by hand), not the thing preventing evidence
+  loss.
 - **The `MAX(id)` resume cursor is guarded by a prefix proof.** ADR-0009's trigger is an *empty*
   schema; resuming from `MAX(id)` relaxes that so an interrupted copy can continue, and the
   relaxation is sound only while the rows already in PG *are* that interrupted copy. Before

@@ -677,21 +677,26 @@ is unreachable — there is no SQLite fallback.
   healthcheck `start_period`, so the orchestrator does not kill the server
   mid-backfill and restart it into the same long boot repeatedly. The backfill is
   resumable, so a killed boot is not corrupting — but it wastes the window.
-- **Scale-out: bring up the replica that HOLDS `audit.db` first.** In a
-  multi-replica deployment, start that one server and let it finish the backfill
-  (the `backfill_complete` marker is stamped in `audit_store`) **before**
-  starting the remaining replicas. *Which* replica is not incidental: a replica
-  with no legacy `audit.db` of its own, booted first against an empty table,
-  stamps the completion marker over that emptiness — and the replica that does
-  hold the trail then sees the marker, skips the mandatory backfill, and reports
-  success. The trail is not migrated and `audit.db` is not even moved aside. The
-  server logs a WARNING naming this whenever it marks a backfill complete
-  without a source; on a genuine fresh install that line is routine, and on an
-  upgrade it is the signal that you started the wrong host. (The break-glass
-  one-shots refuse to stamp at all, so they cannot cause this.) Once
-  the marker is present the other replicas see a completed backfill and start
-  normally; retention afterward is single-swept fleet-wide via an advisory lease
-  (see [Audit Log](audit-log.md#the-retention-clock-guard)).
+- **Scale-out: bring up the replica that HOLDS `audit.db` first — recommended,
+  not load-bearing for safety.** In a multi-replica deployment, starting that
+  one server first and letting it finish the backfill (the `backfill_complete`
+  marker is stamped in `audit_store`) before the rest avoids a refusal, but a
+  wrong boot order no longer loses evidence: if a replica with no legacy
+  `audit.db` of its own boots first against an empty table, it stamps the
+  completion marker over that emptiness (logging a WARNING naming what it
+  forecloses — routine on a genuine fresh install, the signal you started the
+  wrong host on an upgrade) — but the replica that DOES hold the trail does
+  **not** silently trust that marker. It re-reads its own `audit.db`, proves
+  (by fingerprint) whether that file's content was ever actually migrated, and
+  **refuses to boot** on a mismatch rather than reporting success over an
+  unmigrated trail. The file is left untouched at its original path — nothing
+  is lost, but that host needs an operator to resolve it (see the recovery
+  procedure below) before it will serve. Getting the boot order right the
+  first time avoids that operator step; it is no longer the thing standing
+  between you and silent evidence loss. Once the marker is present (and, for
+  every OTHER holder, verified) the remaining replicas start normally;
+  retention afterward is single-swept fleet-wide via an advisory lease (see
+  [Audit Log](audit-log.md#the-retention-clock-guard)).
 - **Reads deny-on-degrade.** After cutover, an audit-store or connection-pool
   failure makes `GET /api/v1/audit*` return `503` rather than an empty `200`, so
   an infrastructure blip can never be mistaken for "no audit activity."
@@ -702,6 +707,43 @@ is unreachable — there is no SQLite fallback.
   before it writes its record. Budget for that if you use one during the upgrade
   window; if the backfill cannot complete, the one-shot refuses and changes
   nothing rather than writing a record that would block every later boot.
+
+**This host's trail was never proven migrated (holder-side verification
+refusal).** Different from the case below: the `backfill_complete` marker IS
+already set when this host boots, by a `"sourceless"` stamp (no legacy file
+was ever read before it was set) or by a DIFFERENT file's fingerprint — and
+this host still holds a legacy `audit.db` at its configured path. Rather than
+trust a marker it cannot vouch for, this host tries to verify that ITS file's
+content is what got migrated, and refuses to serve if it cannot: the log line
+names which of four things happened — the fingerprints did not match
+("refusing to serve — legacy ... was NEVER proven migrated"), the file could
+not be opened, the file could not be read as a valid `audit_events` table, or
+its fingerprint could not be computed. All four land you here. The file is
+untouched at its original path in every case — nothing has been lost, but
+this host refuses to serve until an operator resolves which of two things is
+true:
+
+- **This file's content already reached PostgreSQL** — a sibling replica on
+  the same underlying storage streamed it and stamped the marker first. Move
+  or remove this copy of `audit.db` (it is redundant) and restart; with no
+  file at the configured path the ordinary "already migrated" check applies
+  and boot proceeds normally.
+- **This file is the only copy, and its content was never migrated** — the
+  marker was set sourcelessly by a fileless peer (see the scale-out note
+  above) or by an unrelated backfill, and this host's evidence is genuinely
+  still only here. Two options: engage engineering to manually stream this
+  file's rows into `audit_store.audit_events` (a case-specific DBA task, not
+  scripted here — the schema is documented above), or, if the trail is
+  accepted as lost, move `audit.db` aside yourself and restart — the marker is
+  already set, so (unlike the abandon procedure below) no SQL step is needed
+  here; a future boot finds no file at the configured path and proceeds
+  normally. Record the loss in change management either way — this is the
+  same explicit acceptance the abandon procedure below asks for, just without
+  its SQL because there is nothing left for this host to stamp.
+
+If you cannot tell which is true from deployment history alone, treat it as
+the second case — engineering can restore the file from the operator-managed
+backup either way.
 
 **Abandoning an unrecoverable legacy trail.** If the legacy `audit.db` is
 genuinely lost or corrupt and the server is refusing to start because PostgreSQL
