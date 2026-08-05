@@ -113,10 +113,23 @@ struct DispatchDenial {
 /// `has_permission` is injected rather than a live `RbacStore*` so this
 /// function's job stays exactly one question — "is `principal` granted
 /// `operation` on `securable`, right now" — and every HTTP/session-layer
-/// nuance (legacy-open, JIT elevation, MCP tier, engine-principal handling)
-/// stays OUTSIDE it, owned by whatever binds the callback. Never memoize the
-/// callback's answer across calls (ADR-0012 §4) — this function itself never
-/// does, and neither may a caller.
+/// nuance stays OUTSIDE it, owned by whatever binds the callback. Never
+/// memoize the callback's answer across calls (ADR-0012 §4) — this function
+/// itself never does, and neither may a caller.
+///
+/// WHAT THE PRODUCTION BINDER ACTUALLY HANDLES TODAY (server.cpp): legacy-open
+/// (a loaded-and-disabled RbacStore admits, as every other dispatch-adjacent
+/// read here does) and a raw `RbacStore::check_permission`. It does NOT apply
+/// JIT elevation: `auth::effective_role` elevates a cookie session to admin for
+/// its window, and the elevation-aware surface gate (`require_permission`)
+/// admits on that, but this callback receives only a principal STRING and
+/// resolves that principal's BASE grants. So a JIT-elevated operator can clear
+/// the surface gate and then be denied `Forbidden` here for a securable their
+/// base role lacks. That is FAIL-CLOSED — it denies, never over-permits — but
+/// it is a real gap in the elevated-dispatch workflow rather than a design
+/// choice, and whether elevated authority SHOULD reach dispatch is a security
+/// decision that needs its own review. Tracked; do not silently widen this
+/// callback to close it.
 ///
 /// System arm (PLAN item 2): `caller.system == true` is trusted BY
 /// CONSTRUCTION — `DispatchCaller::system` is set explicitly only at

@@ -222,7 +222,7 @@ TEST_CASE("plugin_config_routes: list route fails closed on an authenticated-but
 namespace {
 
 yuzu::test::PgTestTemplate route_tpl{"pluginroutes", [](const std::string& dsn) {
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     pg::SecretCodec codec(provider);
     pg::PgPool pool{{.conninfo = dsn, .size = 1}};
@@ -240,7 +240,7 @@ yuzu::test::PgTestTemplate route_tpl{"pluginroutes", [](const std::string& dsn) 
 }};
 
 struct PgWired {
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider{keys.path};
     pg::SecretCodec codec{provider};
     pg::PgPool pool;

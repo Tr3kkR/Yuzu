@@ -161,7 +161,7 @@ struct TestDb {
 // RbacStore) through a real ScheduleRunner end to end.
 struct Harness {
     TestDb db;
-    yuzu::test::TempDbFile insdb{std::string_view("optwins-ins-")};
+    yuzu::test::TempDbFile insdb{std::string_view("yuzu_test_optwins_ins_")};
 
     ScheduleEngine engine{db.db};
     ExecutionTracker tracker{db.db};

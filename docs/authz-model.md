@@ -280,9 +280,13 @@ Three new header-only files under `server/core/src/`, zero `server.cpp` involvem
   `asset_tags.sync`), each `system_reserved = true`. Every other plugin's rows live in separate
   per-group fragment headers owned by other packages; none of them are aggregated here.
 
-**Not wired to a live dispatch path yet** — same "shipped-incomplete, future tense is load-bearing"
-posture as §1's `CapabilityDeclaration`. `CommandCapabilityRegistry` has no production caller today;
-it is reachable only from `test_command_capability.cpp`.
+**Wired to the live dispatch path.** This paragraph previously recorded the registry as
+shipped-incomplete and reachable only from `test_command_capability.cpp`; PR1.9c ended that.
+`ServerImpl::build_classified_command` (`server.cpp`) constructs a `CommandCapabilityRegistry` over
+all six spans — `core_dispatch_capabilities()` plus the five per-group fragment headers — and every
+`CommandRequest` the server builds is classified and authorized through it. An unclassified or
+ambiguous `plugin.action` is refused there, so the registry is now load-bearing rather than
+declarative.
 
 ### Three new securables
 

@@ -50,7 +50,7 @@ namespace {
 // reaches the shared template (the throwaway KEK's TempDir is destroyed at
 // scope exit and kek_meta is emptied before the template is ever cloned).
 yuzu::test::PgTestTemplate plugincfg_tpl{"plugincfg", [](const std::string& dsn) {
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgPool pool{{.conninfo = dsn, .size = 1}};
@@ -71,7 +71,7 @@ yuzu::test::PgTestTemplate plugincfg_tpl{"plugincfg", [](const std::string& dsn)
 /// pool, `codec.init()` run in the correct order. Callers keep this alive
 /// for the whole test case (it owns the pool and provider the store borrows).
 struct Wired {
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider{keys.path};
     SecretCodec codec{provider};
     PgPool pool;
@@ -389,7 +389,7 @@ TEST_CASE("A degraded/unopened store makes action_allowed return false, never tr
     PgPool bad_pool{{.conninfo = "host=127.0.0.1 port=1 dbname=nonexistent",
                      .size = 1,
                      .connect_timeout_s = 1}};
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PluginConfigStore store{bad_pool, codec};

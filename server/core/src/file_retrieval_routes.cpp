@@ -632,12 +632,22 @@ void register_status(HttpRouteSink& sink, Deps deps) {
                     return;
                 }
                 case SessionAuthOutcome::kExpired: {
-                    // Frozen protocol: any request after expiry -> 410, even a
-                    // read-only status poll. Nothing to discard here (a pure
-                    // status read never touches the blob) — just surface a
-                    // store-side failure for visibility.
+                    // Frozen protocol (ADR-3004): any touch after expiry discards
+                    // the partial and reports 410 — INCLUDING this read-only
+                    // status poll. It is tempting to reason that a pure status
+                    // read never wrote the blob so has nothing to discard, and
+                    // that was this branch's original comment; it is wrong.
+                    // `expire_now` transitions the session to `expired`, so if
+                    // the status poll is the FIRST touch after expiry, no later
+                    // request ever reaches an expiry arm again — chunk, commit
+                    // and cancel all fail earlier on the terminal state. The
+                    // partial would then be orphaned on disk permanently, and
+                    // there is no sweep to collect it. Discard on the same
+                    // condition the other three expiry handlers use.
                     auto expired = deps.store->expire_now(url_upload_id);
-                    if (!expired)
+                    if (expired && *expired)
+                        discard_blob(deps.blob_root / ar.info.destination_key);
+                    else if (!expired)
                         spdlog::warn("upload {}: expire_now (status) failed: {}", url_upload_id,
                                     expired.error());
                     send_reason(res, Reason::kExpired, "session expired");

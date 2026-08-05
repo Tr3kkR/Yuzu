@@ -9615,7 +9615,7 @@ TEST_CASE("streamed POST ships DORMANT: the default is off and a stream is not o
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&,
-                        const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                        const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         dispatched = true;
         return {"cmd-dormant", 1};
     };
@@ -9695,7 +9695,7 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&,
-                        const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                        const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         return {"cmd-streamed", 2};
     };
     const auto audit_has = [&](const std::string& row) {
@@ -9863,7 +9863,7 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
             [&](const std::string&, const std::string&, const std::vector<std::string>&,
                 const std::string&, const std::unordered_map<std::string, std::string>&,
                 const std::string&,
-                const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
                 inner = call_sse(exec_body(745, /*with_token=*/true)); // same id, re-entrant
                 return {"cmd-dup-inflight", 2};
             },
@@ -9966,7 +9966,7 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
             [&](const std::string&, const std::string&, const std::vector<std::string>&,
                 const std::string&, const std::unordered_map<std::string, std::string>&,
                 const std::string&,
-                const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
                 (void)bridge.request_cancel(sid, nlohmann::json(780));
                 return {"cmd-cancelled", 2};
             },
@@ -9988,7 +9988,7 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-none", 0}; },
+               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-none", 0}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
 
@@ -10063,7 +10063,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
         // Reserve leaves the record kArming, which is the only phase that has
@@ -10085,7 +10085,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
 
@@ -10103,7 +10103,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
         REQUIRE(bridge.reserve(sid, "test-user", nlohmann::json(900), nlohmann::json("tok"),
@@ -10123,7 +10123,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
 
@@ -10157,7 +10157,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9live", 2}; },
+               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9live", 2}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
 
@@ -10195,7 +10195,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
 
@@ -10252,7 +10252,7 @@ TEST_CASE("CH-5/CH-6: streamed POSTs debit the shared budget and leave the plain
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
                        const std::string&,
-                       const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                       const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         return {"cmd-ch56", 2};
     };
 

@@ -652,9 +652,16 @@ std::vector<std::string> macos_get_whitelist() {
 // never rung 1 or 2 (sudo changes the privilege boundary, not the
 // acquisition mechanism). quarantine is the endpoint's most disruptive
 // action here — it blocks essentially all traffic except the whitelist —
-// so it is classified Destructive; unquarantine is its genuine, tested
-// undo (exercised end-to-end by scripts/test/instructions_quarantine_survivor.py,
-// which specifically verifies the box is NOT left locked out).
+// so it is classified Destructive AND Irreversible. `unquarantine` restores
+// reachability — scripts/test/instructions_quarantine_survivor.py verifies
+// end-to-end that the box is NOT left locked out — but that is connectivity
+// restoration, not STATE restoration: on macOS `macos_load_ruleset` replaces
+// the whole active pf ruleset via `pfctl -f`, and `macos_unquarantine`
+// deliberately restores only the OS-default /etc/pf.conf rather than replaying
+// the prior state, so any runtime pf rules the endpoint had are permanently
+// lost. Only Linux (a Yuzu-owned iptables chain) and Windows have a genuine
+// undo, so the catalogue row is Irreversible across all platforms — see
+// server/core/src/capability_decls/plugin_action_catalogue_c.hpp.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "quarantine",
