@@ -319,6 +319,10 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
     auto pin_slots_held = PinSlotsHeld::kNotApplicable;
     std::optional<DisplacedPin> displaced;
     bool release_failed = false;  // latched under bridge_mu_, emitted after release
+    // Reserved for the reclaim audit detail, filled after selection and BEFORE the
+    // commit block, so the only allocation that could throw on the reclaim path
+    // happens while a throw still costs nothing (see the audit_contained call).
+    std::string displaced_detail;
     {
         std::lock_guard<std::mutex> lk(bridge_mu_);
         if (shutdown_started_) {
@@ -329,7 +333,7 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
             reject = "global_cap";
         } else if (streamed_intent) {
             // A5: live pins + streamed records that have not pinned yet. Orphan
-            // pins (pressure/pin-ack teardown) stay counted via pinned_count()
+            // pins (pressure/pin-ack teardown) are counted via pinned_count()
             // until the ring releases them; a transient over-count between a pin
             // commit and its ledger decrement rejects fail-closed.
             auto it = streamed_unpinned_.find(session_id);
@@ -350,6 +354,21 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
                 // that throws on the ledger/map commit - and an unpin has no
                 // inverse, so there would be nothing for LedgerRollback to undo.
                 displaced = select_displaceable_pin_locked(session_id, rec->stream);
+                if (displaced.has_value()) {
+                    // Built HERE - after selection, before the ledger bump and the
+                    // map insert. Selection has mutated nothing yet, so a throw
+                    // from this allocation unwinds with the session exactly as it
+                    // was. Building it at the emission site instead put a throwing
+                    // allocation after the commit AND after the release.
+                    displaced_detail =
+                        displaced->orphan
+                            ? "no record referenced it - its owning record was already torn "
+                              "down; the result stays fetchable by execution_id; released ring "
+                              "event_id=" + std::to_string(displaced->event_id)
+                            : std::string("final undelivered as far as the bridge can see; still "
+                                          "fetchable by execution_id and in the ring until "
+                                          "ordinary eviction");
+                }
             }
             // The reclaimed slot counts as free for THIS decision: it is released
             // below on the same `bridge_mu_` hold, so no concurrent reserve can
@@ -504,18 +523,20 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
         // and the ring event id is the only handle the row can carry - it is what
         // joins this row to the ring frame and to the later reap. Carried in the
         // detail rather than leaving the row naming nothing at all.
+        // The detail is built into `disposition` BEFORE this point (above the
+        // `bridge_mu_` block), NOT inline here. Inline, the conditional's composite
+        // type is `std::string`, so BOTH arms allocate in reserve's own frame - at
+        // a point where the record is already committed and the pin already
+        // released. A bad_alloc there escaped into the handler's degrade-to-plain
+        // catch, leaving a committed kArming record and an unreleased charge until
+        // the 300s arming reaper, with the counter above already claiming a
+        // displacement no audit row would ever corroborate. That is precisely the
+        // hazard audit_contained's string_view parameter exists to avoid.
         audit_contained("mcp.bridge.pin_displaced_for_admission", displaced->execution_id,
                         displaced->orphan
                             ? "orphan pin released to admit a new streamed call on this session"
                             : "pin released to admit a new streamed call on this session",
-                        displaced->orphan
-                            ? "no record referenced it - its owning record was already torn down; "
-                              "the result stays fetchable by execution_id; released ring "
-                              "event_id=" +
-                                  std::to_string(displaced->event_id)
-                            : "final undelivered as far as the bridge can see; still fetchable "
-                              "by execution_id and in the ring until ordinary eviction",
-                        AuditResult::kSuccess, principal);
+                        displaced_detail, AuditResult::kSuccess, principal);
         // Evidence floor, matching this file's teardown convention: the counter
         // and the audit row both route through swallowing guards, so a log line is
         // the one trace that survives an obs/audit sink failure. The release

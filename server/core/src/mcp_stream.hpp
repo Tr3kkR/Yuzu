@@ -385,7 +385,9 @@ public:
     /// immediately before the reap, so the trail distinguishes the two causes even
     /// though the reap's own row does not. A tri-state pin status would close it
     /// properly; this comment used to promise that as "the follow-up PR", which is the
-    /// PR that wrote this sentence, so the promise is withdrawn rather than re-dated.
+    /// PR that wrote this sentence, so the promise was withdrawn rather than re-dated -
+    /// and is now tracked as #2801, because a withdrawn promise with no issue behind it
+    /// is just a lost commitment.
     ///
     /// The pin is released by FOUR routes, and they do NOT all mean the client got the
     /// frame: unpin() when the final was written on the POST wire (it did), attach_and_replay

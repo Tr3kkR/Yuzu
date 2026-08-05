@@ -10,7 +10,7 @@ underlying accounting bug gets filed, not so anyone intervenes.
 Every streamed MCP request's final response frame is committed to the session's replay
 ring and **pinned** (exempt from ring eviction) so a client that reconnects late can
 still resume it. The bridge admits streamed requests against the same per-session cap
-the pin-slot array is sized to, so the slots can never legitimately fill.
+the pin-slot array is sized to, so the slots could never legitimately fill - **until #2740**. The streamed-admission reclaim now releases a pin deliberately, and two accepted residuals (#2795, and a contained release throw counted as `yuzu_mcp_bridge_pin_release_failed_total`) can leave a session *transiently one call over its cap*. So a full slot set is no longer proof of drift on its own: check `yuzu_mcp_bridge_pin_displaced_for_admission_total` and #2795 before concluding the admission count and the pin count have genuinely diverged.
 
 - `yuzu_mcp_stream_pin_displaced_total` moving means a session filled every slot
   anyway — the admission count and the pin count have drifted apart. The server

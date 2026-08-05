@@ -195,7 +195,7 @@ PR 2 gave the channel heartbeats and replayed frames; **PR 3a shipped its first 
 
 ## Streamed POST — SSE on the response (2f PR 3b)
 
-**Shipped, OFF by default** (`--mcp-enable-streamed-post`; the flip to on-by-default is a separate rung). The four defects that gated that flip — #2739 (response cap), #2740 (pin-slot lockout), #2785 (resume ids on POST frames) and #2789 (per-principal reject coverage) — are fixed. What gates the flip now is operational rather than correctness: #2791 (no concurrent test for the reclaim's staleness window) and #2792 (the wedge alert's semantics and a runbook for the reclaim counter), both of which reviewers asked to land before the default changes. When enabled, a `tools/call` for `execute_instruction` that carries `_meta.progressToken` **and** an SSE-capable `Accept` gets its POST response held open as an SSE stream: `notifications/progress` frames as the work happens, the JSON-RPC result **last**, then EOF. This is the spec's progress-before-response ordering.
+**Shipped, OFF by default** (`--mcp-enable-streamed-post`; the flip to on-by-default is a separate rung). The four defects that gated that flip — #2739 (response cap), #2740 (pin-slot lockout), #2785 (resume ids on POST frames) and #2789 (per-principal reject coverage) — are fixed. What gates the flip now is operational and documentary rather than correctness: #2791 (no concurrent test for the reclaim's staleness window), #2792 (the wedge alert's semantics and a runbook for the reclaim counters) and #2793 (the customer-manual entries for the reclaim and the streamed-POST 429 causes) — all three asked to land before the default changes. When enabled, a `tools/call` for `execute_instruction` that carries `_meta.progressToken` **and** an SSE-capable `Accept` gets its POST response held open as an SSE stream: `notifications/progress` frames as the work happens, the JSON-RPC result **last**, then EOF. This is the spec's progress-before-response ordering.
 
 ### Opting in
 
@@ -240,7 +240,7 @@ A streamed POST holds an HTTP worker open for its lifetime, so it leases from th
 | Condition | Status | JSON-RPC error | Retry? |
 |---|---|---|---|
 | per-principal or global stream cap | 429 | `-32012` | yes — `Retry-After` + `retry_after_ms` (30s: a streamed slot is held until the work finishes, so the GET figure would just cause a retry storm) |
-| this session's streamed-call cap | 429 | `-32012` | yes, once one finishes (slots are released when a final is delivered, not when the response closes) |
+| this session's streamed-call cap | 429 | `-32012` | yes — retry. Admission first reclaims a slot from an undelivered final (#2740), so a retry can succeed before any call finishes. A refusal that survives that means either every slot is a call genuinely in flight ("wait for one to finish" is then true) or the reclaim found nothing takeable — see "A pin released to admit a new call" above |
 | request id already in flight | 409 | `-32600` | no — use a fresh id |
 | session unknown or expired | 404 | `-32007` | re-`initialize` |
 | streaming disabled / shutting down | 200 | — | none needed; you get the plain response |

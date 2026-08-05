@@ -467,9 +467,11 @@ public:
     /// S1: keyed kArming record insert - dup-key/cap/pin-slot admission BEFORE
     /// create_execution, so every rejection is truthfully "no execution row".
     /// Streamed admission counts LIVE PINS plus streamed records that have not
-    /// pinned yet (`pinned_count() + streamed_unpinned_[session]`) - orphan pins
-    /// left by pressure/pin-ack teardown stay counted until the ring releases
-    /// them (A5/C3; transient over-count rejects fail-closed).
+    /// pinned yet (`pinned_count() + streamed_unpinned_[session]`). Orphan pins
+    /// left by pressure/pin-ack teardown are counted the same way, but since
+    /// #2740 they are no longer permanent: an at-cap admission RECLAIMS one
+    /// rather than refusing (see `select_displaceable_pin_locked`). A transient
+    /// over-count still rejects fail-closed (A5/C3).
     ReserveResult reserve(const std::string& session_id, const std::string& principal,
                           const nlohmann::json& jsonrpc_id,
                           std::optional<nlohmann::json> progress_token, bool streamed_intent);
@@ -1037,18 +1039,30 @@ private:
     /// committed, so a pass that ends up rejecting anyway, or that throws on the
     /// ledger/map commit, destroys no eviction exemption and needs no rollback.
     ///
-    /// Two candidate classes, orphans FIRST because they are strictly deader:
+    /// Two candidate classes, orphans FIRST because they have no surviving releaser
+    /// at all. One caveat on that ordering, deliberately recorded: `teardown_claimed`
+    /// publishes its synthesized terminal and never stamps `pinned_event_id`, so
+    /// between that publish and the record's erase a freshly-minted pin already
+    /// classifies as an orphan. It is therefore reclaimable moments after minting -
+    /// which is correct (nothing will ever release it once the erase lands) but
+    /// means "deader" is a statement about its RELEASE ROUTES, not its age:
     ///  - an ORPHAN pin: a pinned id no live record of this session references.
     ///    The sweep's teardown erases a record WITHOUT unpinning, so these are
     ///    reachable, and no record scan can ever see them — they were the one
     ///    lockout shape that survived the first cut of this fix.
     ///  - the OLDEST PARKED record (`kRingOnly`) whose committed final no wire
     ///    took delivery of. Its resume window is the one most likely already past.
-    /// The rule that admits these two and would exclude a third: select a pin only
-    /// when THIS admission is the last path that could ever act on it - an orphan,
-    /// because no record survives to release it; a parked record's final, because
-    /// the reclaim is itself what un-exempts it - never one a live path still owns
-    /// and will release itself.
+    /// The rule that admits these two and would exclude a third is TWO criteria,
+    /// not one - an earlier single-sentence form ("the last path that could ever
+    /// act on it") was true of orphans but false of the parked class, since a GET
+    /// resume acking past a parked pin still acts on it, which is exactly why the
+    /// `!released` branch in reserve exists. A candidate must satisfy either:
+    ///   (i) NO SURVIVING RELEASER - no record remains that any other path could
+    ///       use to release it (the orphan case); or
+    ///  (ii) DEMAND-DRIVEN EXEMPTION TRANSFER - the reclaim is itself the act that
+    ///       un-exempts it, the frame is RETAINED in the ring, and the result stays
+    ///       durably fetchable (the parked case).
+    /// Never a pin a live path still owns and will release itself.
     /// Returns nullopt when neither exists (every slot backs a live call), or
     /// when ANY of this session's records is mid-projection: the admission sum
     /// transiently counts one settling record as two slots, reserve has always

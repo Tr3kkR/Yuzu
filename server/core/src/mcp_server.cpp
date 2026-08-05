@@ -6053,7 +6053,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                           "still being written frees its slot as it lands. If "
                                           "this persists across several retries, collect the "
                                           "outstanding results by resuming the GET channel with "
-                                          "Last-Event-ID, or re-initialize for a fresh session"
+                                          "the LOWEST id you still need - a cursor from one call "
+                                          "releases every pinned final at or below it on this "
+                                          "session - or re-initialize for a fresh session"
                                         : "this session already has the maximum streamed calls "
                                           "in flight; wait for one to finish";
                                 streamed_reject(

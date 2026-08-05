@@ -291,10 +291,13 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "MCP streamed admission could not release the pin it reclaimed"
+          summary: "MCP streamed admission's pin release THREW and was contained"
           description: >-
             The streamed-admission reclaim (#2740) selected a pin to release and the
-            release itself THREW. It is contained deliberately: the new admission is
+            release itself THREW. This counts ONLY that throw - it does not count a
+            release that merely lost a race to another release route, which is the
+            ordinary residual (#2795) and is deliberately silent. So a zero here does
+            NOT mean no session ever sat over its cap. It is contained deliberately: the new admission is
             already committed at that point, so letting the throw escape would leave a
             session slot nothing reclaims until the arming reaper fires. Like its
             sibling YuzuMcpBridgeChargeReleaseDeferred this needs a genuinely broken
