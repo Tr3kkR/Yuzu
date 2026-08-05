@@ -647,8 +647,8 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
                     "AuditStore: migrate_from_sqlite: marker present but legacy {} exists and "
                     "could not be opened for verification ({}); refusing to serve without proof "
                     "this host's trail was migrated. If this file is known-empty or irrelevant, "
-                    "remove it and restart; otherwise see the recovery procedure in "
-                    "docs/user-manual/upgrading.md.",
+                    "remove it and restart; otherwise see "
+                    "docs/ops-runbooks/audit-store-backfill-recovery.md.",
                     legacy_db_path.string(),
                     verify_db ? sqlite3_errmsg(verify_db.get()) : "open failed");
                 backfill_metric("failed");
@@ -660,7 +660,7 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
                 spdlog::error(
                     "AuditStore: migrate_from_sqlite: marker present but legacy {} is unreadable "
                     "or corrupt; refusing to serve without proof this host's trail was migrated. "
-                    "See docs/user-manual/upgrading.md.",
+                    "See docs/ops-runbooks/audit-store-backfill-recovery.md.",
                     legacy_db_path.string());
                 backfill_metric("failed");
                 return false;
@@ -712,8 +712,8 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
                     "trail — the file is UNTOUCHED at its original path and no evidence has been "
                     "lost, but boot refuses until this is resolved by an operator: confirm "
                     "whether this file's content genuinely reached PostgreSQL (via another "
-                    "replica sharing this storage) or is the ONLY copy (in which case follow the "
-                    "recovery procedure in docs/user-manual/upgrading.md before proceeding).",
+                    "replica sharing this storage) or is the ONLY copy (in which case follow "
+                    "docs/ops-runbooks/audit-store-backfill-recovery.md before proceeding).",
                     legacy_db_path.string(), legacy_fp->count, legacy_fp->id_sum, legacy_fp->ts_sum,
                     stored_fp ? "a DIFFERENT legacy source" : "sourceless — no legacy file was "
                                                               "ever read before this marker was "
@@ -772,7 +772,7 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
                 "the marker, then restart this one), or a partial backfill's legacy audit.db was "
                 "moved aside. Stamping here would bless a knowingly-incomplete evidence chain. If "
                 "the legacy trail is genuinely unrecoverable, follow the abandon procedure in "
-                "docs/user-manual/upgrading.md.",
+                "docs/ops-runbooks/audit-store-backfill-recovery.md.",
                 situation, pg_rows_before);
             backfill_metric("failed");
             return false;

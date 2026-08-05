@@ -659,8 +659,9 @@ is unreachable — there is no SQLite fallback.
   cannot account for. The two ways to reach that state are a replica started
   while another is still streaming (bring up one replica first, below), and a
   partial backfill whose `audit.db` was moved aside before it finished. Restore
-  the legacy file and let the backfill finish, or use the abandon procedure
-  below if it is genuinely unrecoverable.
+  the legacy file and let the backfill finish, or use the abandon procedure in
+  [audit-store-backfill-recovery.md](../ops-runbooks/audit-store-backfill-recovery.md)
+  if it is genuinely unrecoverable.
 - After a verified backfill the legacy `audit.db` is **moved aside, not deleted**
   — it becomes an operator-managed backup of the pre-cutover trail. Relocating or
   archiving that file afterward is expected and safe. Its `-wal`/`-shm` sidecars,
@@ -690,8 +691,9 @@ is unreachable — there is no SQLite fallback.
   (by fingerprint) whether that file's content was ever actually migrated, and
   **refuses to boot** on a mismatch rather than reporting success over an
   unmigrated trail. The file is left untouched at its original path — nothing
-  is lost, but that host needs an operator to resolve it (see the recovery
-  procedure below) before it will serve. Getting the boot order right the
+  is lost, but that host needs an operator to resolve it (see
+  [audit-store-backfill-recovery.md](../ops-runbooks/audit-store-backfill-recovery.md))
+  before it will serve. Getting the boot order right the
   first time avoids that operator step; it is no longer the thing standing
   between you and silent evidence loss. Once the marker is present (and, for
   every OTHER holder, verified) the remaining replicas start normally;
@@ -708,65 +710,12 @@ is unreachable — there is no SQLite fallback.
   window; if the backfill cannot complete, the one-shot refuses and changes
   nothing rather than writing a record that would block every later boot.
 
-**This host's trail was never proven migrated (holder-side verification
-refusal).** Different from the case below: the `backfill_complete` marker IS
-already set when this host boots, by a `"sourceless"` stamp (no legacy file
-was ever read before it was set) or by a DIFFERENT file's fingerprint — and
-this host still holds a legacy `audit.db` at its configured path. Rather than
-trust a marker it cannot vouch for, this host tries to verify that ITS file's
-content is what got migrated, and refuses to serve if it cannot: the log line
-names which of four things happened — the fingerprints did not match
-("refusing to serve — legacy ... was NEVER proven migrated"), the file could
-not be opened, the file could not be read as a valid `audit_events` table, or
-its fingerprint could not be computed. All four land you here. The file is
-untouched at its original path in every case — nothing has been lost, but
-this host refuses to serve until an operator resolves which of two things is
-true:
-
-- **This file's content already reached PostgreSQL** — a sibling replica on
-  the same underlying storage streamed it and stamped the marker first. Move
-  or remove this copy of `audit.db` (it is redundant) and restart; with no
-  file at the configured path the ordinary "already migrated" check applies
-  and boot proceeds normally.
-- **This file is the only copy, and its content was never migrated** — the
-  marker was set sourcelessly by a fileless peer (see the scale-out note
-  above) or by an unrelated backfill, and this host's evidence is genuinely
-  still only here. Two options: engage engineering to manually stream this
-  file's rows into `audit_store.audit_events` (a case-specific DBA task, not
-  scripted here — the schema is documented above), or, if the trail is
-  accepted as lost, move `audit.db` aside yourself and restart — the marker is
-  already set, so (unlike the abandon procedure below) no SQL step is needed
-  here; a future boot finds no file at the configured path and proceeds
-  normally. Record the loss in change management either way — this is the
-  same explicit acceptance the abandon procedure below asks for, just without
-  its SQL because there is nothing left for this host to stamp.
-
-If you cannot tell which is true from deployment history alone, treat it as
-the second case — engineering can restore the file from the operator-managed
-backup either way.
-
-**Abandoning an unrecoverable legacy trail.** If the legacy `audit.db` is
-genuinely lost or corrupt and the server is refusing to start because PostgreSQL
-holds rows with no completion marker, you can declare the migration finished by
-hand. **This is an explicit acceptance that the pre-cutover trail is incomplete
-— record it in change management.** With the server stopped:
-
-```sql
-BEGIN;
--- Both statements are required. The identity sequence MUST be advanced past the
--- backfilled ids, or the first live write collides with one and fails.
-SELECT setval(pg_get_serial_sequence('audit_store.audit_events','id'),
-              GREATEST((SELECT COALESCE(MAX(id),0) FROM audit_store.audit_events), 1),
-              (SELECT COUNT(*) FROM audit_store.audit_events) > 0);
-INSERT INTO audit_store.audit_retention_meta (key, value)
-VALUES ('backfill_complete', EXTRACT(EPOCH FROM now())::bigint::text)
-ON CONFLICT (key) DO NOTHING;
-COMMIT;
-```
-
-(That is the same pair the server itself runs on a successful backfill —
-`stamp_complete` in `server/core/src/audit_store.cpp`.) Start the server
-afterwards; it will see a completed migration and serve.
+**Backfill refused at boot or from a one-shot?** Both refusal shapes — a
+holder-side verification failure (marker already set, this host's file
+unproven) and an unrecoverable legacy trail (marker absent, rows present) —
+including the SQL for the second one, now live in their own runbook:
+[audit-store-backfill-recovery.md](../ops-runbooks/audit-store-backfill-recovery.md).
+Not duplicated here.
 
 **Not affected:** the audit event vocabulary and REST/MCP query surface are
 unchanged; SIEM export recipes keep working. One deliberate behaviour change: on
