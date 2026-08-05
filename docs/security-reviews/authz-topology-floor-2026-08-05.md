@@ -96,7 +96,7 @@ MCP tool call — regardless of which tool — is a JSON-RPC POST to the single
 `/mcp/v1/` endpoint; the tool name lives in the request body, not the URL.
 `list_engine_roles` (floored, `EnginePrincipal:Read` after this change) and
 `list_issued_certs` (deliberately not floored — see decision 4 below,
-`Security:Read`) issue **byte-identical** `perm_fn(req, res, <securable>,
+`Security:Read`) issue **identically-shaped** `perm_fn(req, res, <securable>,
 <operation>)` calls on the same `req.path` (`/mcp/v1/`) — the only thing
 that differs between them is the `(securable_type, operation)` pair passed
 to `perm_fn`, precisely the values the securable-keyed floor matches on. A

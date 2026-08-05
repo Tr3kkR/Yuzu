@@ -130,7 +130,7 @@ Six roles are created automatically and cannot be deleted:
 | **PlatformEngineer** | Full CRUD on InstructionDefinition and InstructionSet; Read on Execution, Schedule, Approval, Tag, AuditLog, Response, Inventory; Read/Write/Delete/Push on GuaranteedState | Authors and managers of YAML instruction definitions, sets, and Guardian rules |
 | **Operator** | Read/Write/Execute/Delete on InstructionDefinition, InstructionSet, Execution, Schedule, Tag; Read and Approve on Approval; Read on AuditLog, Response, and Inventory; Read and Push on GuaranteedState | Day-to-day instruction execution, schedule management, tagging, and Guardian rule distribution |
 | **ApiTokenManager** | Read, Write, Delete on ApiToken (3 permissions) | Create, revoke, and manage API tokens for programmatic access |
-| **ITServiceOwner** | All 5 CRUD operations on 18 securable types, plus Push on GuaranteedState (91 permissions). Excludes UserManagement, Security, ApiToken, EnginePrincipal | Service desk leads, team managers with delegated control over their IT services |
+| **ITServiceOwner** | All 5 CRUD operations on 18 securable types, plus Push on GuaranteedState (91 permissions). Excludes UserManagement, Security, ApiToken, AccessReview, EnginePrincipal | Service desk leads, team managers with delegated control over their IT services |
 | **Viewer** | Read on 21 securable types (all except Infrastructure and AccessReview) (21 permissions) | Helpdesk staff, auditors, read-only dashboards |
 
 ## Securable Types

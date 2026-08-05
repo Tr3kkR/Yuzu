@@ -24,6 +24,7 @@
 #include "engine_principal_store.hpp"
 #include "oidc_provider.hpp"
 #include "rbac_store.hpp"
+#include "sqlite_raii.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -357,26 +358,29 @@ TEST_CASE("RbacStore: an EXISTING pre-#2376 database gains EnginePrincipal on th
     // store construction between the strip and the assertion; that made the
     // "upgrade boot" the third open and the test passed for the wrong reason.
     {
-        sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open(rbac_db_file.path.c_str(), &raw) == SQLITE_OK);
-        REQUIRE(sqlite3_exec(raw,
+        // RAII throughout: every REQUIRE below throws on failure, and a raw
+        // sqlite3*/sqlite3_stmt* pair would unwind past its own close/finalize —
+        // leaking the connection exactly when an assertion catches the regression
+        // this test exists to catch. `SqliteHandleOwner` closes with
+        // `sqlite3_close_v2`, so a still-outstanding statement defers the close
+        // rather than leaking the handle outright.
+        yuzu::test::SqliteHandleOwner<sqlite3> raw;
+        REQUIRE(sqlite3_open(rbac_db_file.path.c_str(), &raw.db) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(raw.db,
                              "DELETE FROM role_permissions WHERE securable_type='EnginePrincipal';"
                              "DELETE FROM securable_types WHERE name='EnginePrincipal';",
                              nullptr, nullptr, nullptr) == SQLITE_OK);
 
         auto count_of = [&](const char* sql) {
-            sqlite3_stmt* s = nullptr;
-            REQUIRE(sqlite3_prepare_v2(raw, sql, -1, &s, nullptr) == SQLITE_OK);
-            REQUIRE(sqlite3_step(s) == SQLITE_ROW);
-            const int n = sqlite3_column_int(s, 0);
-            sqlite3_finalize(s);
-            return n;
+            yuzu::server::SqliteStmt s;
+            REQUIRE(sqlite3_prepare_v2(raw.db, sql, -1, s.addr(), nullptr) == SQLITE_OK);
+            REQUIRE(sqlite3_step(s.get()) == SQLITE_ROW);
+            return sqlite3_column_int(s.get(), 0);
         };
         REQUIRE(count_of("SELECT COUNT(*) FROM securable_types WHERE name='EnginePrincipal';") == 0);
         REQUIRE(count_of(
                     "SELECT COUNT(*) FROM role_permissions WHERE securable_type='EnginePrincipal';")
                 == 0);
-        sqlite3_close(raw);
     }
 
     // The upgrade boot — the FIRST store construction since the strip.
