@@ -85,6 +85,8 @@ YML
             > "$tmp/t/docs/user-manual/metrics.md"
         printf '%s\n' 'YuzuMcpStreamPinDisplaced: rule out yuzu_mcp_bridge_pin_release_raced_total and yuzu_mcp_bridge_pin_release_failed_total.' \
             > "$tmp/t/docs/ops-runbooks/mcp-stream-pin-displacement.md"
+        printf '%s\n' 'yuzu_mcp_bridge_pin_release_raced_total yuzu_mcp_bridge_pin_release_failed_total' > "$tmp/t/docs/mcp-server.md"
+        printf '%s\n' 'yuzu_mcp_bridge_pin_release_raced_total yuzu_mcp_bridge_pin_release_failed_total' > "$tmp/t/docs/adr-1005-execution-plan.md"
         : > "$tmp/t/changelog.d/x.md"
     }
     expect() {  # $1 = case name, $2 = expected exit (0 clean / 1 drift)
@@ -96,7 +98,7 @@ YML
     fixture; expect "baseline consistent fixture is clean" 0
 
     fixture
-    sed -i 's#increase(yuzu_mcp_stream_pin_displaced_total\[15m\]) > 0#(increase(yuzu_mcp_stream_pin_displaced_total[15m]) - increase(yuzu_mcp_bridge_pin_displaced_for_admission_total[15m])) > 0#' \
+    perl -pi -e 's{increase\(yuzu_mcp_stream_pin_displaced_total\[15m\]\) > 0}{(increase(yuzu_mcp_stream_pin_displaced_total[15m]) - increase(yuzu_mcp_bridge_pin_displaced_for_admission_total[15m])) > 0}' \
         "$tmp/t/docs/prometheus/yuzu-alerts.yml"
     expect "netted expr subtracting the reclaim counter" 1
 
@@ -110,14 +112,14 @@ YML
     expect "changelog describing a netted rule" 1
 
     fixture
-    sed -i 's/yuzu_mcp_bridge_pin_release_raced_total//' "$tmp/t/docs/user-manual/metrics.md"
+    printf '%s\n' 'yuzu_mcp_bridge_pin_release_failed_total' > "$tmp/t/docs/user-manual/metrics.md"
     expect "one residual counter named without the other" 1
 
     # The two shapes an adversarial review (kimi + codex, independently) proved this gate
     # did NOT catch while its workflow claimed to protect these surfaces.
     fixture
-    sed -i 's/yuzu_mcp_bridge_pin_release_raced_total//' \
-        "$tmp/t/docs/ops-runbooks/mcp-stream-pin-displacement.md"
+    printf '%s\n' 'YuzuMcpStreamPinDisplaced: rule out yuzu_mcp_bridge_pin_release_failed_total.' \
+        > "$tmp/t/docs/ops-runbooks/mcp-stream-pin-displacement.md"
     expect "RUNBOOK names one residual without the other" 1
 
     fixture
@@ -128,6 +130,21 @@ YML
     fixture
     : > "$tmp/t/docs/ops-runbooks/mcp-stream-pin-displacement.md"
     expect "RUNBOOK names neither residual" 1
+
+    # BC-1/QA-1: check (c) omitted the derivation header, so the banned phrasing passed
+    # green in the very file every DRIFT message tells the reader to go and consult.
+    fixture
+    printf '%s\n' 'Rule all three out against their counters.' >> "$tmp/t/server/core/src/mcp_stream.hpp"
+    expect "DERIVATION HEADER says to rule all three out" 1
+
+    # QA-2: two live docs state the cause set and were in no surface list at all.
+    fixture
+    printf '%s\n' 'The shipped rule, which subtracts the explained paths.' >> "$tmp/t/docs/mcp-server.md"
+    expect "docs/mcp-server.md describes a netted rule" 1
+
+    fixture
+    printf '%s\n' 'yuzu_mcp_bridge_pin_release_failed_total' > "$tmp/t/docs/adr-1005-execution-plan.md"
+    expect "ADR names one residual without the other" 1
 
     printf '\nselftest: %s passed, %s failed\n' "$pass" "$failed"
     [ "$failed" -eq 0 ] || exit 1
@@ -145,6 +162,29 @@ ALERTS="docs/prometheus/yuzu-alerts.yml"
 HELP="server/core/src/server.cpp"
 MANUAL="docs/user-manual/metrics.md"
 HOME_HDR="server/core/src/mcp_stream.hpp"
+RUNBOOK="docs/ops-runbooks/mcp-stream-pin-displacement.md"
+
+# THE STATING SURFACES - ONE list, and every check derives from it.
+#
+# This is deliberately a single array because the two previous versions of this gate kept
+# two hand-maintained lists, and BOTH holes found by review were a divergence between them:
+# an external panel found the runbook missing from the cause-set check, and the next round
+# found the derivation header missing from the phrase check. A list you have to remember to
+# update twice is the defect, not the omissions it produces.
+#
+# Membership rule: a file belongs here if it STATES which counters explain a displacement.
+# docs/mcp-server.md and the ADR were added after review proved they state it and were
+# checked by nothing. If you add a surface that states the claim, add it HERE and both
+# checks pick it up.
+STATING_SURFACES=(
+    "$ALERTS"
+    "$HELP"
+    "$MANUAL"
+    "$HOME_HDR"
+    "$RUNBOOK"
+    "docs/mcp-server.md"
+    "docs/adr-1005-execution-plan.md"
+)
 
 fail=0
 note() { printf '  %s\n' "$*"; }
@@ -161,8 +201,11 @@ done
 # Extract the alert's expr block: from the alert name to the next `labels:` key.
 # ---------------------------------------------------------------------------
 expr_block="$(awk '
-    /^[[:space:]]*-[[:space:]]*alert:[[:space:]]*YuzuMcpStreamPinDisplaced[[:space:]]*$/ { grab=1; next }
-    grab && /^[[:space:]]*labels:/ { grab=0 }
+    # Tolerate a trailing comment on the alert line, and stop at ANY sibling key - an
+    # earlier version stopped only at `labels:`, so a rule ordering `annotations:` first
+    # (valid YAML) pulled annotation prose into the expr block and misdiagnosed it.
+    /^[[:space:]]*-[[:space:]]*alert:[[:space:]]*YuzuMcpStreamPinDisplaced([[:space:]]|#|$)/ { grab=1; next }
+    grab && /^[[:space:]]*(labels|annotations|for|keep_firing_for|-[[:space:]]*alert):/ { grab=0 }
     grab { print }
 ' "$ALERTS")"
 
@@ -189,9 +232,7 @@ fi
 # residual and omitting the other passed green. Both external reviewers reproduced that
 # independently, and CLAUDE.md makes a false-green offered as closure evidence a policy
 # floor - so the gate claiming a surface it did not check was itself the blocking defect.
-RUNBOOK="docs/ops-runbooks/mcp-stream-pin-displacement.md"
-
-for f in "$ALERTS" "$HELP" "$MANUAL" "$HOME_HDR" "$RUNBOOK"; do
+for f in "${STATING_SURFACES[@]}"; do
     [ -f "$f" ] || { bad "missing surface: $f"; continue; }
     has_raced=0; has_failed=0
     grep -q "$RACED" "$f" && has_raced=1
@@ -226,7 +267,7 @@ done
 # Phrase-based and deliberately narrow: it catches the exact wording that shipped twice
 # ("rule all three out") without pretending to understand prose.
 # ---------------------------------------------------------------------------
-for f in "$ALERTS" "$HELP" "$MANUAL" "$RUNBOOK" changelog.d/*.md; do
+for f in "${STATING_SURFACES[@]}" changelog.d/*.md; do
     [ -f "$f" ] || continue
     if grep -qiE 'rule[[:space:]]+(all[[:space:]]+)?three[[:space:]]+(of[[:space:]]+them[[:space:]]+)?out' "$f"; then
         bad "$f says to rule out three causes. There are two; the reclaim explains zero."
@@ -242,5 +283,5 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-printf 'pin-displacement claim set: consistent across %s, %s, %s, %s, %s (+ changelog.d)\n' \
-    "$ALERTS" "$HELP" "$MANUAL" "$HOME_HDR" "$RUNBOOK"
+printf 'pin-displacement claim set: consistent across %s surfaces (+ changelog.d):\n' "${#STATING_SURFACES[@]}"
+printf '  %s\n' "${STATING_SURFACES[@]}"

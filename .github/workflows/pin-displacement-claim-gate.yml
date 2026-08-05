@@ -35,6 +35,7 @@ name: Pin-displacement claim gate
 
 on:
   pull_request:
+    branches: [main, dev]
   push:
     branches: [dev, main]
 

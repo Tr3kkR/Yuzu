@@ -1,15 +1,19 @@
 # Runbook: MCP replay-ring pin displacement / unpinned final
 
 **Alerts:** `YuzuMcpStreamPinDisplaced`, `YuzuMcpStreamFinalUnpinned`,
-`YuzuMcpBridgePinReleaseFailed`
+`YuzuMcpBridgePinReleaseFailed`, `YuzuMcpStreamedPinSlotsWedged`
 **Severity:** warning.
 
 For `YuzuMcpStreamPinDisplaced` and `YuzuMcpStreamFinalUnpinned`: **not a page, no
 remediation.** No data is lost, no restart helps, clients recover on their own. What
 these want from you is a judgement — whether a genuine accounting bug should be filed.
 
-`YuzuMcpBridgePinReleaseFailed` is **different** and the line above does not apply to
-it: it needs a genuinely broken platform mutex, so any nonzero value is a signal about
+`YuzuMcpStreamedPinSlotsWedged` is **also different**: it means clients are being
+REFUSED, which is a user-visible lockout rather than a diagnostic. See its own section
+below — the "no remediation" line above does not apply to it either.
+
+`YuzuMcpBridgePinReleaseFailed` is **different** and the "no remediation" line does not
+apply to it: it needs a genuinely broken platform mutex, so any nonzero value is a signal about
 the HOST, not about MCP. Treat it as you would any other host-fault signal; the MCP-side
 consequence (a session one call over its cap for the lifetime of the over-admitted call) is the
 minor half.
@@ -95,3 +99,45 @@ That was wrong for a more basic reason — a successful reclaim cannot cause a
 displacement at all, so the subtraction removed real signal in proportion to ordinary
 client churn. The alert is a plain threshold again and the rule-out lives here, where a
 human can see which term applied.
+
+## `YuzuMcpStreamedPinSlotsWedged` — a session is being refused, not merely degraded
+
+This alert is the odd one out in this runbook and needs its own path. The three above are
+diagnostics about a session that still works. This one fires on a **sustained** rate of
+`yuzu_mcp_bridge_pin_slots_reject_total{held="pins"}` — streamed calls being REFUSED with
+every slot held by a committed final rather than by a call in flight. A client is losing
+service.
+
+Read *sustained* strictly. Every healthy session passes through `pinned>0, unpinned==0`
+during the charge-to-pin handover, so a single sample is not a wedge; the alert carries a
+`for:` for exactly that reason and that `for:` is load-bearing, not tuning.
+
+**Since #2740 this should be rare**, because admission reclaims a slot rather than
+refusing. A `pins` refusal that survives the reclaim means the reclaim found nothing to
+take, which happens in three states:
+
+1. a final still being WRITTEN by a live pump — clears on retry;
+2. a transient decline while one of the session's records is mid-projection — clears on retry;
+3. a slot genuinely stuck: an unreleasable pin the scan could not attribute.
+
+**What to do.** Only (3) is a real wedge, and only (3) needs you.
+
+1. Capture `yuzu_mcp_bridge_pin_slots_reject_total{held}` for both label values, the
+   `yuzu_mcp_bridge_pin_*` family, and the affected session id from the audit rows.
+2. If the rate is falling on its own, it was (1) or (2). Nothing to do.
+3. If it is flat and sustained with `held="pins"`, the session is wedged. **The client's
+   recovery is its own**: it can resume with `Last-Event-ID` (which releases pins at or
+   below the cursor) or re-initialize for a fresh session — both are in the `429`
+   remediation text it already received. Results stay fetchable by `execution_id`
+   regardless, so nothing is lost.
+4. **Do not restart the server for a single wedged session.** A restart drops every live
+   MCP session and every in-flight streamed request fleet-wide, which is a far larger
+   outage than one client's lockout. Restart is only proportionate if the rate is
+   climbing across many sessions at once, which would indicate a different fault.
+5. File it either way if you reach (3): a genuinely unattributable pin means the reclaim's
+   orphan scan missed something, and that is a bug worth the report.
+
+**Note this alert previously pointed at `mcp-bridge-teardown-recovery.md`**, which has
+never covered it — that doc's subject is a mutex-failure teardown path, and its only
+remediation is a process restart, which is wrong here for the reason in step 4. Tracked
+as #2792.
