@@ -1,6 +1,7 @@
 #pragma once
 
 #include "contract_error.hpp"
+#include "rest_a4_error.hpp"
 #include "transport_auth_slot.hpp"
 
 #include <nlohmann/json.hpp>
@@ -151,19 +152,6 @@ struct B3PlatformResult {
     nlohmann::json data;
 
     friend bool operator==(const B3PlatformResult&, const B3PlatformResult&) = default;
-};
-
-struct A4ErrorEnvelope {
-    std::int32_t code;
-    std::string message;
-    std::string correlation_id;
-    std::optional<std::int64_t> retry_after_ms;
-    std::optional<std::string> remediation;
-    std::optional<std::string> permission;
-    std::optional<std::string> approval_id;
-    std::optional<std::string> status_url;
-
-    friend bool operator==(const A4ErrorEnvelope&, const A4ErrorEnvelope&) = default;
 };
 
 using B3PlatformResponse = std::variant<B3PlatformResult, A4ErrorEnvelope>;
