@@ -881,21 +881,34 @@ groups:
       # outrunning the drain and audit.db grows without bound. Neither counter
       # above moves in that state, so this is the only signal for it.
       #
-      # ASSUMES the default 60-minute cleanup interval: the threshold is "every
-      # pass in the window hit the cap", i.e. 6 passes in 6h. A server started with
-      # a different cleanup_interval_min needs this number adjusted -- PromQL
-      # cannot read the server's own interval, so it cannot be derived here.
+      # NOT a fixed-interval count. An earlier revision assumed every capped
+      # pass is spaced by the full cleanup_interval_min (default 60m) and set
+      # "6 passes in a 6h window" as the threshold -- but audit_next_wait_s
+      # (audit_store.hpp) re-arms the NEXT pass after kAuditBacklogRearmSec
+      # (5s), not the full interval, for as long as the cap keeps binding. A
+      # genuinely stuck backlog therefore produces thousands of increments in
+      # that same 6h window, and the count-based rule fired within about 30
+      # seconds of the first cap hit, not after 6 real hours of sustained
+      # overload -- PERFORMANCE measured this and it was wrong (governance
+      # ROUND 3). This rule asks a threshold-free question instead: has a
+      # cap-hit recurred within every 10-minute slice for the FULL `for:`
+      # duration? 10 minutes is a wide margin over the 5s re-arm (absorbs
+      # scheduling jitter and any non-cap pass interspersed), and `for: 30m`
+      # is what makes this "sustained", not the count. A brief burst that
+      # drains within a few minutes never satisfies `for:` and does not page.
+      # Self-adjusting: if kAuditBacklogRearmSec ever changes, this rule does
+      # not need re-deriving the way the old count-based one did.
       - alert: YuzuAuditRetentionCapBinding
         expr: |
-          increase(yuzu_server_audit_retention_cap_reached_total[6h]) >= 6
+          increase(yuzu_server_audit_retention_cap_reached_total[10m]) > 0
         for: 30m
         labels:
           severity: warning
         annotations:
           summary: "Audit retention is not keeping up with expiry"
           description: >-
-            Every audit retention pass in the last 6 hours hit the per-pass delete cap, so
-            a backlog is carried forward each hour and audit.db is growing. Note the
+            Audit retention has hit the per-pass delete cap continuously for at least 30
+            minutes, so a backlog is being carried forward and audit.db is growing. Note the
             counter is incremented on an OBSERVED backlog or, when the post-delete probe
             could not be read, a conservatively ASSUMED one - an "AuditStore: the post-delete
             backlog probe failed" warning in the log means the remainder was assumed, not
@@ -903,9 +916,9 @@ groups:
             probe, on which the pass skips entirely and this counter cannot have moved.) Check
             yuzu_server_audit_rows_deleted_total to see whether the backlog is moving at
             all. Sustained firing means the fixed drain rate (25,000 rows per cleanup
-            pass) is below this fleet's audit volume, so audit.db grows without bound;
-            the cap is a compile-time constant today, so this needs an engineering
-            escalation rather than a config change.
+            pass, re-armed every 5s while capped) is below this fleet's audit volume, so
+            audit.db grows without bound; the cap is a compile-time constant today, so this
+            needs an engineering escalation rather than a config change.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#capacity"
 
       # THE ABSENCE ALERT. Every other COUNTER-driven rule in this group fires on
