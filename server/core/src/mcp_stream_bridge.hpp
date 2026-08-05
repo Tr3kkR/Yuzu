@@ -424,6 +424,13 @@ public:
     /// Never asserts a fault: a healthy session passes through `kPins` during the
     /// terminal-to-wire flush window, which is why the text points at the metric
     /// rather than declaring one (see `count_pin_slots_reject`).
+    /// Three states, not a bool, even though no consumer distinguishes
+    /// `kNotApplicable` from `kCharges` today (the field is only read inside the
+    /// `pin_slots` arm, so "unset" is unobservable there). The third state keeps
+    /// "this reject was not about pin slots at all" explicit for every OTHER
+    /// reject reason and for success, which a bool would silently collapse into
+    /// "charges" - a wrong answer waiting for the first consumer that reads the
+    /// field outside that arm.
     enum class PinSlotsHeld : int { kNotApplicable, kCharges, kPins };
 
     struct ReserveResult {

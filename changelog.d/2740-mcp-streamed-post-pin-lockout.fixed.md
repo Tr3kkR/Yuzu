@@ -23,4 +23,7 @@
   even though the session stayed alive. Reclaims are counted
   (`yuzu_mcp_bridge_pin_displaced_for_admission_total`, pre-seeded at boot) and
   audited against the admitting principal
-  (`mcp.bridge.pin_displaced_for_admission`).
+  (`mcp.bridge.pin_displaced_for_admission`). One window remains, tracked as
+  #2794: while a torn-down record is still in the map its pin is shielded from
+  the orphan scan - transient in the ordinary teardown, and permanent only if
+  that teardown's erase step itself fails.

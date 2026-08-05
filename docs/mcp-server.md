@@ -195,7 +195,7 @@ PR 2 gave the channel heartbeats and replayed frames; **PR 3a shipped its first 
 
 ## Streamed POST — SSE on the response (2f PR 3b)
 
-**Shipped, OFF by default** (`--mcp-enable-streamed-post`; the flip to on-by-default is a separate rung). The four defects that gated that flip — #2739 (response cap), #2740 (pin-slot lockout), #2785 (resume ids on POST frames) and #2789 (per-principal reject coverage) — are fixed. When enabled, a `tools/call` for `execute_instruction` that carries `_meta.progressToken` **and** an SSE-capable `Accept` gets its POST response held open as an SSE stream: `notifications/progress` frames as the work happens, the JSON-RPC result **last**, then EOF. This is the spec's progress-before-response ordering.
+**Shipped, OFF by default** (`--mcp-enable-streamed-post`; the flip to on-by-default is a separate rung). The four defects that gated that flip — #2739 (response cap), #2740 (pin-slot lockout), #2785 (resume ids on POST frames) and #2789 (per-principal reject coverage) — are fixed. What gates the flip now is operational rather than correctness: #2791 (no concurrent test for the reclaim's staleness window) and #2792 (the wedge alert's semantics and a runbook for the reclaim counter), both of which reviewers asked to land before the default changes. When enabled, a `tools/call` for `execute_instruction` that carries `_meta.progressToken` **and** an SSE-capable `Accept` gets its POST response held open as an SSE stream: `notifications/progress` frames as the work happens, the JSON-RPC result **last**, then EOF. This is the spec's progress-before-response ordering.
 
 ### Opting in
 
