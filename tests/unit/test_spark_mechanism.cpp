@@ -869,12 +869,18 @@ TEST_CASE("arm_impl: a throw AFTER the watch is armed unwatches on rollback (#22
     engine.stop();
 }
 
-TEST_CASE("arm_impl: an allocation failure on a DEDUPED arm leaves the first subscriber intact "
-          "(#2270)",
+// The three cases below all reach the ROLLBACK (phase 2 - past the commit, where the
+// guard is armed). An earlier revision injected the deduped case at phase 1 instead,
+// which sits inside arm_impl's own try/catch BEFORE the guard is installed: its
+// assertions were individually true, its title was broader than its coverage, and
+// deleting the rollback's entire branch left it green. What it missed was a rollback
+// that erased the WHOLE key on every shape where this call did not itself arm the
+// watcher - deleting healthy siblings and orphaning a live OS watch
+// (governance sec-F1 / UP-10 / UP-11).
+
+TEST_CASE("arm_impl rollback: a DEDUPED arm that fails leaves the first subscriber and the "
+          "shared watcher intact (#2270)",
           "[spark][mechanism]") {
-    // The existing-key path. A failed second arm must not disturb the sibling that
-    // is already armed and watching — its subscription, the shared watcher, and the
-    // key all survive untouched.
     SparkEngine engine;
     FakeMechanism* fake = wire_fake(engine, SparkType::File);
     auto c = engine.register_consumer("c", [](const SparkEvent&) {});
@@ -886,22 +892,80 @@ TEST_CASE("arm_impl: an allocation failure on a DEDUPED arm leaves the first sub
     REQUIRE(fake->watch_calls() == 1);
 
     engine.set_arm_fault_hook_for_test([](int phase) {
-        if (phase == SparkEngine::kArmFaultPhaseBeforeSubKeys)
+        if (phase == SparkEngine::kArmFaultPhaseAfterCommit)
             throw std::bad_alloc{};
     });
     CHECK_THROWS_AS(engine.arm(*c, file_spec("/etc/hosts")), std::bad_alloc);
 
+    // The sibling's arm() already returned SUCCESS to its caller - our failure must not
+    // retract it, and the watcher it relies on must stay up.
     CHECK(engine.stats().armed_sparks == 1);
-    CHECK(engine.stats().subscriptions == 1); // only the survivor
-    CHECK(fake->watch_calls() == 1);          // no second watch, none torn down
+    CHECK(engine.stats().subscriptions == 1);
+    CHECK(fake->watch_calls() == 1);
     CHECK(fake->unwatch_calls() == 0);
     CHECK(fake->is_watching("file|10:/etc/hosts"));
 
-    // The survivor is still a working subscription end to end.
     engine.set_arm_fault_hook_for_test(nullptr);
     engine.disarm(*first);
     CHECK(engine.stats().armed_sparks == 0);
-    CHECK(fake->unwatch_calls() == 1);
+    CHECK(fake->unwatch_calls() == 1); // now, and only now, the watch comes down
+    engine.stop();
+}
+
+TEST_CASE("arm_impl rollback: a failed TIMER arm does not delete a healthy timer spark (#2270)",
+          "[spark][mechanism]") {
+    // Timer sparks never have a watcher, so "did this call arm one" is ALWAYS false for
+    // them. Keying the rollback on that alone deleted the whole spark and left zero
+    // residue - nothing to find afterwards (governance UP-11).
+    SparkEngine engine;
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+
+    auto first = engine.arm(*c, interval_spec(60'000));
+    REQUIRE(first.has_value());
+    REQUIRE(engine.stats().armed_sparks == 1);
+
+    engine.set_arm_fault_hook_for_test([](int phase) {
+        if (phase == SparkEngine::kArmFaultPhaseAfterCommit)
+            throw std::bad_alloc{};
+    });
+    CHECK_THROWS_AS(engine.arm(*c, interval_spec(60'000)), std::bad_alloc);
+
+    CHECK(engine.stats().armed_sparks == 1);
+    CHECK(engine.stats().subscriptions == 1);
+    engine.stop();
+}
+
+TEST_CASE("arm_impl rollback: a failed PRE-START arm leaves its sibling for start()'s replay "
+          "(#2270)",
+          "[spark][mechanism]") {
+    // Before start() no watch is armed by design - start()'s replay arms it. So this
+    // call never owes a watcher, and the rollback must not drop the key out from under
+    // a sibling the replay is about to arm (governance UP-10).
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+
+    auto first = engine.arm(*c, file_spec("/etc/hosts")); // pre-start: no watch yet
+    REQUIRE(first.has_value());
+    REQUIRE(fake->watch_calls() == 0);
+
+    engine.set_arm_fault_hook_for_test([](int phase) {
+        if (phase == SparkEngine::kArmFaultPhaseAfterCommit)
+            throw std::bad_alloc{};
+    });
+    CHECK_THROWS_AS(engine.arm(*c, file_spec("/etc/hosts")), std::bad_alloc);
+    engine.set_arm_fault_hook_for_test(nullptr);
+
+    CHECK(engine.stats().armed_sparks == 1);
+    CHECK(engine.stats().subscriptions == 1);
+
+    // The surviving pre-start subscription still gets its watcher from the replay.
+    engine.start();
+    CHECK(fake->watch_calls() == 1);
+    CHECK(fake->is_watching("file|10:/etc/hosts"));
     engine.stop();
 }
 

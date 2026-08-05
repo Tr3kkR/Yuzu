@@ -90,6 +90,10 @@ struct SparkEngineStats {
     /// resource-gate cross-check doesn't mistake it for `ps -T` (governance S1).
     std::uint64_t watcher_units{0};
     std::uint64_t watch_faults_total{0}; ///< mechanism fault reports (post-arm deaf edges), monotonic
+    /// Arm-rollback cleanups that threw and were swallowed rather than terminating the
+    /// daemon mid-unwind. Nonzero = a rollback could not fully undo itself, so a stale
+    /// armed_/sub_keys_ entry or an orphaned OS watch may survive. Monotonic.
+    std::uint64_t rollback_cleanup_failures{0};
     std::uint64_t consumer_threads_detached{0}; ///< handlers that blocked past the shutdown budget
     std::uint64_t events_total{0};       ///< spark fires (post-dedup, pre-fan-out)
     std::uint64_t queued_delivered_total{0};
@@ -494,6 +498,12 @@ private:
     std::function<void()> arm_race_hook_for_test_;      ///< test seam; null = no-op (set-then-use)
     std::function<void(int)> arm_fault_hook_for_test_;  ///< test seam; null = no-op (set-then-use)
     std::function<void()> disarm_race_hook_for_test_;   ///< test seam; null = no-op (set-then-use)
+    /// ~ArmRollback cleanups that threw and were swallowed to avoid a std::terminate
+    /// during unwinding. Nonzero means an arm rollback could not fully undo itself
+    /// under memory pressure - a real (if rare) leak signal, and the ONLY trace such a
+    /// cleanup leaves behind. Mirrors guardian_rollback_cleanup_failures()
+    /// (guardian_scope_guard.hpp), whose swallow this one is modelled on.
+    std::atomic<std::uint64_t> rollback_cleanup_failures_{0};
 
     // Delivery counters touched by consumer dispatch threads live in a shared
     // block so a detached thread can write them after ~SparkEngine (UP-1). The

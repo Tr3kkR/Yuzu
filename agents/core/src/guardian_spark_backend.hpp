@@ -74,7 +74,11 @@ public:
         // `return false`, which apply_rules does not count -> generation advanced ->
         // silent enforcement hole; Fable B4->B1 finding). The propagating throw is
         // terminate-safe (GuardianRollback), cannot corrupt the index (strong-guarantee
-        // add), and since #2270 leaves no partial arm_impl state in the engine either.
+        // add), and since #2270 leaves no partial arm_impl state in the engine either -
+        // arm_impl repairs its own bookkeeping on a throw. That is a statement about
+        // engine state, NOT a claim that the arm succeeded or that siblings are
+        // unaffected: a watch that fails to arm still fails for everyone sharing the
+        // key (#2270 UP-9, pre-existing).
         // STILL OPEN (#2797): the returned-error arm of that same sentence. apply_rules
         // discards reconcile_rule_locked's bool, so the generation-hold described above
         // fires ONLY on a throw - a returned arm failure still advances the generation

@@ -1,5 +1,7 @@
-- Agent: a memory-allocation failure while arming a Spark watch no longer leaves a
-  dead entry behind. Previously an allocation failure part-way through `arm()` could
-  leave a spark recorded as armed with no watcher actually running; a later request
-  to watch the same target would join that dead entry, report success, and monitor
-  nothing until the agent restarted. Arming is now all-or-nothing.
+- Agent: an out-of-memory condition while arming a Spark watch no longer disturbs
+  existing subscriptions or leaves a dead entry behind. Previously it could leave a
+  spark recorded as armed with no watcher running, and a later request to watch the
+  same target would join that dead entry and report success while monitoring nothing.
+  A watch that fails to arm still fails for every subscriber sharing it, which is
+  unchanged. Spark detection is not yet the active path in a default install, so this
+  affects deployments only once it is enabled.
