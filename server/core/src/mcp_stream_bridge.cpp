@@ -449,7 +449,7 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
                 bool released = false;
                 try {
                     released = rec->stream->unpin(displaced->event_id);
-                } catch (...) {  // NOLINT(bugprone-empty-catch) - latched, emitted below
+                } catch (...) {
                     // CONTAINED, and the containment is the point. The record is
                     // ALREADY committed at this line, so an escaping throw unwinds
                     // past the handler's degrade-to-plain catch with the admission

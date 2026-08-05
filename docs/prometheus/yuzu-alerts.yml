@@ -268,10 +268,14 @@ groups:
             A streamed request was refused for want of a session slot, and every
             slot was held by a final the bridge had already committed rather than by
             a call still in flight. After the rule-(a) unpin those pins are released
-            when the final reaches the wire, so a SUSTAINED rate means slots are not
-            coming back and the affected client stays locked out of streaming until
-            it re-initializes, while the 429 it receives tells it to "wait for one to
-            finish" when they already did. The `for` is load-bearing, not tuning: the
+            when the final reaches the wire, and since #2740 admission RECLAIMS such a
+            slot rather than refusing - including an orphan pin no record references.
+            A SUSTAINED rate therefore no longer means the client is locked out; it
+            means the reclaim kept finding nothing to take, which narrows the cause to
+            a final still being written, a transient mid-projection decline, or a
+            genuinely stuck slot. The 429 the client receives says so (it advises a
+            retry, not a wait); "wait for one to finish" is now the charges branch
+            only. The `for` is load-bearing, not tuning: the
             charge-to-pin handover happens at terminal projection but the unpin only
             once the final reaches the wire, so every HEALTHY session passes through
             pinned>0/unpinned==0 during that flush window, and a lone refusal landing
@@ -280,6 +284,26 @@ groups:
             charge is outstanding, so a partial wedge (some pins stuck, one call
             genuinely in flight) is bucketed there and this alert cannot see it.
             Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
+      - alert: YuzuMcpBridgePinReleaseFailed
+        expr: |
+          yuzu_mcp_bridge_pin_release_failed_total > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP streamed admission could not release the pin it reclaimed"
+          description: >-
+            The streamed-admission reclaim (#2740) selected a pin to release and the
+            release itself THREW. It is contained deliberately: the new admission is
+            already committed at that point, so letting the throw escape would leave a
+            session slot nothing reclaims until the arming reaper fires. Like its
+            sibling YuzuMcpBridgeChargeReleaseDeferred this needs a genuinely broken
+            platform mutex, so any non-zero value is a signal about the host rather
+            than a rate to tune. The admission itself stands; that session is one slot
+            tighter than its nominal cap implies until the pin clears by another route
+            (a GET resume acking past it, or session death). Distinct from
+            yuzu_mcp_bridge_pin_displaced_for_admission_total, which counts the
+            SUCCESSFUL reclaims and is expected traffic.
           runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpBridgeChargeReleaseDeferred
         expr: |
