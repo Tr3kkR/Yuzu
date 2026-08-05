@@ -10,7 +10,7 @@ underlying accounting bug gets filed, not so anyone intervenes.
 Every streamed MCP request's final response frame is committed to the session's replay
 ring and **pinned** (exempt from ring eviction) so a client that reconnects late can
 still resume it. The bridge admits streamed requests against the same per-session cap
-the pin-slot array is sized to, so the slots could never legitimately fill - **until #2740**. The streamed-admission reclaim now releases a pin deliberately, and two accepted residuals (#2795, and a contained release throw counted as `yuzu_mcp_bridge_pin_release_failed_total`) can leave a session *transiently one call over its cap*. So a full slot set is no longer proof of drift on its own: check `yuzu_mcp_bridge_pin_displaced_for_admission_total` and #2795 before concluding the admission count and the pin count have genuinely diverged.
+the pin-slot array is sized to, so the slots could never legitimately fill - **until #2740**. The streamed-admission reclaim now releases a pin deliberately, and two accepted residuals (#2795, and a contained release throw counted as `yuzu_mcp_bridge_pin_release_failed_total`) can leave a session *transiently one call over its cap*. So a full slot set is no longer proof of drift on its own: check BOTH `yuzu_mcp_bridge_pin_displaced_for_admission_total` AND `yuzu_mcp_bridge_pin_release_failed_total` before concluding the admission count and the pin count have genuinely diverged. Both matter, and the second is easy to miss: on the contained-throw path the reclaim resets its own record, so the displacement counter stays at **zero** while the release-failed counter moves. A zero displacement count is therefore not evidence of drift on its own.
 
 - `yuzu_mcp_stream_pin_displaced_total` moving means a session filled every slot
   anyway — the admission count and the pin count have drifted apart. The server
@@ -33,9 +33,16 @@ is no client impact at all.
 
 1. Capture the stream metric family (`yuzu_mcp_stream_*`, `yuzu_mcp_bridge_*`) and
    any `mcp.stream.attach` / `mcp.stream.close` audit rows around the increment.
-2. File a bug titled "MCP streamed-POST admission accounting drift" with that
-   capture. The interesting question is how `pinned_count() + unpinned` and the
-   admission cap disagreed.
+2. Rule out the two known-benign causes FIRST, using step 1's capture. If either
+   `yuzu_mcp_bridge_pin_displaced_for_admission_total` or
+   `yuzu_mcp_bridge_pin_release_failed_total` moved on that session in the same
+   window, this is a #2740 admission reclaim or one of its accepted residuals
+   (#2795, or a contained release throw) putting the session transiently one call
+   over its cap — expected, self-correcting, and not drift. Nothing to file.
+   Only if BOTH of those are flat is this genuine drift: file a bug titled "MCP
+   streamed-POST admission accounting drift" with the capture. The interesting
+   question is then how `pinned_count() + unpinned` and the admission cap
+   disagreed.
 3. Do **not** restart the server for this: the counters are cumulative diagnostics,
    the degraded behavior is self-limiting, and a restart destroys the in-memory
    session state you would want to inspect.

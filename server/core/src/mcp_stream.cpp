@@ -74,7 +74,9 @@ constexpr const char* kMetricPublishFailures = "yuzu_mcp_stream_publish_failures
 constexpr const char* kMetricFinalUnpinned = "yuzu_mcp_stream_final_unpinned_total";
 /// An older pinned terminal yielded its eviction-exemption slot to a newer one. NOT expected:
 /// the bridge admits streamed records against `pinned_count() + unpinned`, and the pin array is
-/// sized to exactly that cap, so a full slot set means admission accounting has drifted. This
+/// sized to exactly that cap, so a full slot set meant admission accounting had drifted - until
+/// #2740, whose reclaim releases a pin deliberately and whose two accepted residuals (#2795, and
+/// a contained release throw) can leave a session transiently one over its cap. This
 /// counter carries that reading (the LRU is the graceful degradation, not a licence).
 constexpr const char* kMetricPinDisplaced = "yuzu_mcp_stream_pin_displaced_total";
 /// The final was written to the wire (the client has it), but the bridge's own

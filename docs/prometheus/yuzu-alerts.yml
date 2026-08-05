@@ -188,7 +188,11 @@ groups:
           description: >-
             yuzu_mcp_stream_pin_displaced_total is moving - a session filled every
             replay-ring pin slot, which the bridge's admission cap should make
-            unreachable, so admission accounting has drifted. The server degraded
+            unreachable, so admission accounting has drifted - EXCEPT that since #2740
+            the streamed-admission reclaim releases a pin deliberately, and two accepted
+            residuals (#2795, and a contained release throw counted as
+            yuzu_mcp_bridge_pin_release_failed_total) can leave a session transiently one
+            call over its cap. Rule both out before treating this as drift. The server degraded
             gracefully (the oldest pinned terminal yielded its eviction exemption
             to the newest; the displaced final stays committed and remains
             fetchable by execution_id). No restart needed - this is a diagnostic

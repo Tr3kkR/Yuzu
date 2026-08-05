@@ -365,11 +365,14 @@ public:
     /// terminals, not unconditionally: see the degraded case below.
     ///
     /// The pin is written only AFTER the frame commits, so a pre-commit failure leaves no
-    /// ghost pin and consumes no id. A committed final with no free pin slot should be
+    /// ghost pin and consumes no id. A committed final with no free pin slot used to be
     /// unreachable - the bridge admits streamed records against `pinned_count() + unpinned`
-    /// and this array is sized to exactly that cap - so reaching it means ADMISSION
-    /// ACCOUNTING HAS DRIFTED, reported by `yuzu_mcp_stream_pin_displaced_total` (alertable
-    /// on > 0). In that state the slots degrade as an LRU: the OLDEST pin yields to the
+    /// and this array is sized to exactly that cap - so reaching it meant ADMISSION
+    /// ACCOUNTING HAD DRIFTED, reported by `yuzu_mcp_stream_pin_displaced_total` (alertable
+    /// on > 0). Since #2740 that inference no longer holds on its own: the streamed-admission
+    /// reclaim releases a pin deliberately, and its two accepted residuals (#2795, and a
+    /// contained release throw) can leave a session transiently one call over its cap, so
+    /// drift is a conclusion to reach rather than assume. In that state the slots degrade as an LRU: the OLDEST pin yields to the
     /// newest, because the newest terminal is the one a client is likeliest still waiting to
     /// resume while the oldest has almost certainly been consumed. The displaced final stays
     /// committed and remains in the ring until ordinary eviction reaches it - it loses its
