@@ -214,11 +214,19 @@ decode_rest_a4_error_document(const nlohmann::json& root) {
         return std::unexpected(error(ContractErrorCode::InvalidValue, "/contract",
                                      "A4 errors do not carry a contract header"));
     }
-    if (const auto authority_fields = reject_forbidden_authority_fields(root); !authority_fields) {
+    if (const auto authority_fields = reject_forbidden_authority_fields(root);
+        !authority_fields) {
         return std::unexpected(authority_fields.error());
     }
     if (const auto meta = validate_rest_v1_response_meta(root); !meta) {
         return std::unexpected(meta.error());
+    }
+    // Unknown error members may carry domain details; meta is the control-only
+    // extension point where authority-shaped additions are never valid.
+    if (const auto authority_fields =
+            reject_forbidden_authority_fields_recursive(*root.find("meta"), "/meta");
+        !authority_fields) {
+        return std::unexpected(authority_fields.error());
     }
 
     const auto error_it = root.find("error");

@@ -783,6 +783,31 @@ TEST_CASE("ADR-0031 B3 response tolerates domain additions without treating them
     const auto unsafe_a4 = contracts::decode_b3_platform_response(a4.dump());
     REQUIRE_FALSE(unsafe_a4.has_value());
     CHECK(unsafe_a4.error().code == contracts::ContractErrorCode::ForbiddenAuthorityField);
+
+    SECTION("domain-shaped A4 error additions remain compatible") {
+        const auto nested = nlohmann::json::parse(
+            R"({"error":{"code":503,"message":"service unavailable","correlation_id":"req-contract-0001","retry_after_ms":null,"details":{"subject":"device-a-1","identity":"inventory-record"}},"meta":{"api_version":"v1"}})");
+        CHECK(contracts::decode_b3_platform_response(nested.dump()).has_value());
+    }
+
+    SECTION("A4 meta authority field") {
+        const auto nested = nlohmann::json::parse(
+            R"({"error":{"code":503,"message":"service unavailable","correlation_id":"req-contract-0001","retry_after_ms":null},"meta":{"api_version":"v1","future":{"on_behalf_of":"attacker-authored"}}})");
+        const auto rejected = contracts::decode_b3_platform_response(nested.dump());
+        REQUIRE_FALSE(rejected.has_value());
+        CHECK(rejected.error().code == contracts::ContractErrorCode::ForbiddenAuthorityField);
+        CHECK(rejected.error().path == "/meta/future/on_behalf_of");
+    }
+
+    SECTION("A4 contract header remains the first failure") {
+        const auto ambiguous = nlohmann::json::parse(
+            R"({"contract":null,"credential":"attacker-authored","error":{"code":503,"message":"service unavailable","correlation_id":"req-contract-0001","retry_after_ms":null},"meta":{"api_version":"v1"}})");
+        const auto rejected = contracts::decode_b3_platform_response(ambiguous.dump());
+        REQUIRE_FALSE(rejected.has_value());
+        CHECK(rejected.error().code == contracts::ContractErrorCode::InvalidValue);
+        CHECK(rejected.error().path == "/contract");
+        CHECK(rejected.error().message == "A4 errors do not carry a B3 contract header");
+    }
 }
 
 TEST_CASE("ADR-0031 B3 consumer rejects mismatched correlation and permission",
