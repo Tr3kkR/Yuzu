@@ -629,8 +629,15 @@ is unreachable — there is no SQLite fallback.
 - **A failed or partial backfill fails the boot** — the server refuses to serve
   with a knowingly-incomplete evidence chain, logs a loud diagnostic, and
   **retries on the next start**. It does not silently start with a partial trail.
-  The `yuzu_server_audit_backfill_total{result}` metric (`fresh` / `completed` /
-  `failed`) reports the outcome.
+  **The boot log is your primary signal here, not a metric.** The backfill runs
+  during server construction, and a failure stops the boot before the HTTP
+  listener starts, so `/metrics` is never served on that path and the
+  `yuzu_server_audit_backfill_total{result="failed"}` sample is never scraped.
+  The metric's `fresh` / `completed` values are observable on a server that came
+  up; the shipped `YuzuAuditBackfillFailing` sample rule therefore alerts on the
+  *absence* of a success outcome (see `docs/prometheus/yuzu-alerts.yml`), and a
+  wedged replica among healthy ones shows up as a down instance rather than on
+  that alert.
 - **The backfill only ever runs against an empty `audit_store` schema or its own
   interrupted copy.** Before resuming, it checks that the audit rows already in
   PostgreSQL really are the partial copy of *this* `audit.db`. If they are not —
@@ -641,6 +648,15 @@ is unreachable — there is no SQLite fallback.
   rows it cannot account for and reporting a complete migration. Point the server
   at the right database, or clear `audit_store.audit_events` if those rows are
   not wanted, then restart.
+- **A server with no `audit.db` of its own will not "complete" someone else's
+  partial backfill.** The completion marker asserts the trail is whole, so a
+  server that finds audit rows already in PostgreSQL, no marker, and no usable
+  legacy file **refuses to start** rather than stamping the marker over rows it
+  cannot account for. The two ways to reach that state are a replica started
+  while another is still streaming (bring up one replica first, below), and a
+  partial backfill whose `audit.db` was moved aside before it finished. Restore
+  the legacy file and let the backfill finish, or use the abandon procedure
+  below if it is genuinely unrecoverable.
 - After a verified backfill the legacy `audit.db` is **moved aside, not deleted**
   — it becomes an operator-managed backup of the pre-cutover trail. Relocating or
   archiving that file afterward is expected and safe. Its `-wal`/`-shm` sidecars,
@@ -666,6 +682,36 @@ is unreachable — there is no SQLite fallback.
 - **Reads deny-on-degrade.** After cutover, an audit-store or connection-pool
   failure makes `GET /api/v1/audit*` return `503` rather than an empty `200`, so
   an infrastructure blip can never be mistaken for "no audit activity."
+- **The break-glass one-shots run the backfill too.** `--mfa-reset` and
+  `--break-glass-arm` write an audit record without going through boot, so on an
+  upgraded host the first one of them to run performs the same migration a first
+  boot would (streaming the trail, stamping the marker, moving `audit.db` aside)
+  before it writes its record. Budget for that if you use one during the upgrade
+  window; if the backfill cannot complete, the one-shot refuses and changes
+  nothing rather than writing a record that would block every later boot.
+
+**Abandoning an unrecoverable legacy trail.** If the legacy `audit.db` is
+genuinely lost or corrupt and the server is refusing to start because PostgreSQL
+holds rows with no completion marker, you can declare the migration finished by
+hand. **This is an explicit acceptance that the pre-cutover trail is incomplete
+— record it in change management.** With the server stopped:
+
+```sql
+BEGIN;
+-- Both statements are required. The identity sequence MUST be advanced past the
+-- backfilled ids, or the first live write collides with one and fails.
+SELECT setval(pg_get_serial_sequence('audit_store.audit_events','id'),
+              GREATEST((SELECT COALESCE(MAX(id),0) FROM audit_store.audit_events), 1),
+              (SELECT COUNT(*) FROM audit_store.audit_events) > 0);
+INSERT INTO audit_store.audit_retention_meta (key, value)
+VALUES ('backfill_complete', EXTRACT(EPOCH FROM now())::bigint::text)
+ON CONFLICT (key) DO NOTHING;
+COMMIT;
+```
+
+(That is the same pair the server itself runs on a successful backfill —
+`stamp_complete` in `server/core/src/audit_store.cpp`.) Start the server
+afterwards; it will see a completed migration and serve.
 
 **Not affected:** the audit event vocabulary and REST/MCP query surface are
 unchanged; SIEM export recipes keep working. One deliberate behaviour change: on
