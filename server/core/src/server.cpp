@@ -9974,6 +9974,19 @@ private:
                     "application/json");
                 return;
             }
+            // Range, not just parseability: a negative limit would otherwise
+            // reach PG as `LIMIT -1`, error, and be reported as an audit-store
+            // DEGRADE — 503 plus the read-degrade counter the availability
+            // alert pages on — rather than the client error it is (Gate 2
+            // security). A negative offset is already inert at the store, but
+            // it is a client error here too, so say so.
+            if (q.limit < 1 || q.offset < 0) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"limit must be >= 1 and offset >= 0"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
             // ADR-0040: reads are degrade-distinguishable. A store/pool failure
             // returns nullopt — surface 503, NEVER a false-empty 200 (an audit
@@ -10001,12 +10014,19 @@ private:
                                {"result", e.result}});
             }
             // Total is a best-effort adornment now that the page rows are in
-            // hand; on a degrade fall back to the returned count rather than a
-            // second 503.
+            // hand: it takes a SECOND, independent lease, so it can degrade while
+            // the page rows are perfectly good. Do not answer a second 503 —
+            // but do NOT substitute the page size either. That reads as
+            // `count == total`, i.e. "this page is the whole trail", which is
+            // plausible and wrong on the one store whose entire posture in this
+            // change is that a blip must never read as an absence (Gate 3
+            // cpp-expert + Gate 2 security; the old `0` was at least obviously
+            // wrong). `null` is the honest answer and JSON has it.
             auto total = audit_store_->total_count();
             res.set_content(nlohmann::json({{"events", arr},
                                             {"count", arr.size()},
-                                            {"total", total ? *total : arr.size()}})
+                                            {"total", total ? nlohmann::json(*total)
+                                                            : nlohmann::json(nullptr)}})
                                 .dump(),
                             "application/json");
         });

@@ -4580,6 +4580,15 @@ void RestApiV1::register_routes(
                  }
                  if (q.limit > 1000)
                      q.limit = 1000;
+                 // A negative limit is a client error, not a store degrade: left
+                 // alone it reaches PG as `LIMIT -1`, errors, and reports as an
+                 // audit-availability incident (Gate 2 security).
+                 if (q.limit < 1) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "limit must be >= 1"),
+                                     "application/json");
+                     return;
+                 }
                  q.principal = req.get_param_value("principal");
                  q.action = req.get_param_value("action");
 

@@ -619,6 +619,45 @@ TEST_CASE("AuditStore: wiring metrics pre-seeds both closed label sets",
     CHECK(after.find("yuzu_server_audit_backfill_total{result=\"fresh\"} 0") != std::string::npos);
 }
 
+// Gate 2 security / Gate 3 cpp-expert: a negative limit reached PostgreSQL as
+// `LIMIT -1`, which errors — and this store reports a query error as a DEGRADE,
+// which is the series `YuzuAuditReadDegraded` pages on. So any read-privileged
+// client could fire the evidence-availability alert at will and send the on-call
+// after a database fault that does not exist. The parsers reject it as a 400;
+// the store clamps as defence in depth. Both halves matter: the assertion that
+// the DEGRADE COUNTER DID NOT MOVE is the one that pins the security property,
+// and it is only meaningful because set_metrics pre-seeds the series to 0.
+TEST_CASE("AuditStore: a negative limit clamps rather than reporting a degrade",
+          "[pg][audit_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    REQUIRE(store.log(mk("admin", "auth.login")));
+
+    AuditQuery q;
+    q.limit = -1;
+    auto rows = store.query(q);
+    REQUIRE(rows.has_value()); // a degrade would be nullopt -> 503
+    CHECK(rows->empty());
+    CHECK(metrics.serialize().find(
+              "yuzu_server_audit_read_degrade_total{reason=\"query_error\"} 0") !=
+          std::string::npos);
+
+    // A negative offset is already inert at this seam (the OFFSET clause is
+    // emitted only when offset > 0) — pin that so it stays inert.
+    AuditQuery q2;
+    q2.offset = -5;
+    auto rows2 = store.query(q2);
+    REQUIRE(rows2.has_value());
+    CHECK(rows2->size() == 1);
+    CHECK(metrics.serialize().find(
+              "yuzu_server_audit_read_degrade_total{reason=\"query_error\"} 0") !=
+          std::string::npos);
+}
+
 // Gate 3 performance: at one capped pass per hour the 25k cap stops being a
 // per-pass bound and becomes a permanent drain ceiling, below the rate the
 // store's own write path sustains. A pass that hits the cap AND leaves a real

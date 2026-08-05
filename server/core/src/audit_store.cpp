@@ -1096,8 +1096,20 @@ std::optional<std::vector<AuditEvent>> AuditStore::query(const AuditQuery& q,
     // the cap fetched `limit` rows. No shipped caller reaches it (REST clamps to
     // 1000, MCP to 500 and does not set random_sample), so nothing was exposed;
     // it is the store contract that was wrong.
+    // Clamp at the SINK. A negative limit reaches PostgreSQL as `LIMIT -1`,
+    // which errors (`LIMIT must not be negative`) — and this store reports a
+    // query error as a DEGRADE: 503 plus
+    // `yuzu_server_audit_read_degrade_total{reason="query_error"}`, the series
+    // `YuzuAuditReadDegraded` pages on. So any read-privileged client could make
+    // the evidence-availability control fire at will, and send the on-call after
+    // a database fault that does not exist (Gate 2 security). The parsers below
+    // reject it as the 400 it is; this is the defence-in-depth half, and it uses
+    // the same `std::max(q.limit, 0)` idiom the sample truncation already uses.
+    //
+    // `offset` needs no clamp here: the OFFSET clause is emitted only under
+    // `q.offset > 0`, so a negative offset is already inert at this seam.
     const int64_t fetch_limit = q.random_sample ? static_cast<int64_t>(kAuditSampleScanCap)
-                                                : static_cast<int64_t>(q.limit);
+                                                : static_cast<int64_t>(std::max(q.limit, 0));
     sql += " ORDER BY timestamp DESC LIMIT $" + std::to_string(idx++) + "::bigint";
     binds.push_back(std::to_string(fetch_limit));
     if (q.offset > 0 && !q.random_sample) {
