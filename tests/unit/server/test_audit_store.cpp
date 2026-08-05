@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -414,6 +415,20 @@ TEST_CASE("AuditStore: random_sample over the scan cap is recency-capped + bound
     for (const auto& e : *r)
         CHECK(e.timestamp >=
               static_cast<int64_t>(1000 + n - static_cast<int>(kAuditSampleScanCap)));
+
+    // A limit ABOVE the cap must not lift the cap. The pool is the bound the
+    // header promises and the REST layer reports as `recency_capped`; a caller
+    // asking for more evidence than the cap gets the capped pool, not a bigger
+    // scan. (The fetch used to be max(limit, cap), so this returned 10250.)
+    AuditQuery over;
+    over.action_prefixes = {"auth."};
+    over.random_sample = true;
+    over.limit = 12000;
+    std::size_t over_pool = 0;
+    auto ro = store.query(over, &over_pool);
+    REQUIRE(ro.has_value());
+    CHECK(over_pool == kAuditSampleScanCap);
+    CHECK(ro->size() <= kAuditSampleScanCap);
 }
 
 // ── Mandatory backfill (ADR-0009 / ADR-0040) ─────────────────────────────────
@@ -511,12 +526,12 @@ TEST_CASE("AuditStore: backfill handles a legacy DB without the principal_class 
           "5");
 }
 
-// The reconcile shortfall guard is the sole safety net that stops boot from
-// proceeding with an INCOMPLETE evidence chain (Gate 3 QE BLOCKING — it was
-// untested). Force pg_count < legacy_count deterministically: pre-insert a row
-// whose id is HIGHER than every legacy id, with NO marker. migrate then resumes
-// from MAX(id) (past all legacy rows), migrates nothing, and reconcile sees
-// pg_count(1) < legacy_count(50) → must return false and NOT stamp the marker.
+// Boot must not proceed with an INCOMPLETE evidence chain (Gate 3 QE BLOCKING —
+// it was untested). Pre-insert a row whose id is HIGHER than every legacy id,
+// with NO marker, so the resume cursor would jump past all 50 legacy rows. The
+// prefix proof rejects that first (Postgres holds 1 row at/below the cursor
+// where the legacy db holds 50), with the reconcile shortfall guard behind it —
+// either way: return false, marker unstamped, legacy file left in place.
 TEST_CASE("AuditStore: backfill reconcile shortfall fails closed and does not mark complete",
           "[pg][audit_store][backfill]") {
     YUZU_REQUIRE_PG_DB(db);
@@ -539,6 +554,109 @@ TEST_CASE("AuditStore: backfill reconcile shortfall fails closed and does not ma
                                  "'backfill_complete'") == "0");
     // The legacy file is left in place for the retry (not moved aside).
     CHECK(std::filesystem::exists(legacy));
+}
+
+// The shortfall guard above is NOT sufficient on its own: give Postgres enough
+// unrelated high-id rows and `pg_count >= legacy_count` holds, so the migration
+// would stamp the MANDATORY audit backfill complete having copied ZERO rows and
+// then move the legacy evidence aside. ADR-0009's trigger is "finds its
+// Postgres schema EMPTY and a legacy .db present"; the MAX(id) resume cursor
+// relaxes that for crash-resume, and the prefix proof is what keeps the
+// relaxation sound. Adversarial review reproduced the un-guarded behaviour
+// (migrate returned true, marker stamped, legacy moved aside, 0 rows copied).
+TEST_CASE("AuditStore: backfill refuses a non-prefix Postgres table (no silent zero-row completion)",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bf7_"}};
+    auto legacy = dir.path / "audit.db";
+    build_legacy_audit_db(legacy, /*count=*/50);
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    // 50 rows that are NOT part of this legacy stream, all above its id range —
+    // enough that a count-only check cannot tell the difference.
+    exec_sql(db.dsn(), "INSERT INTO audit_store.audit_events (id, timestamp, principal, "
+                       "principal_role, action, result, ttl_expires_at) OVERRIDING SYSTEM VALUE "
+                       "SELECT 100000 + g, 1000, 'admin','admin','auth.login','success',0 "
+                       "FROM generate_series(1,50) g");
+
+    CHECK_FALSE(store.migrate_from_sqlite(legacy));
+    // Not marked complete: the next boot retries instead of serving an evidence
+    // chain that never received the pre-cutover rows.
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE key = "
+                                 "'backfill_complete'") == "0");
+    // The legacy evidence is still where the operator can recover it.
+    CHECK(std::filesystem::exists(legacy));
+    // And nothing was half-copied on top of the foreign rows.
+    CHECK(row_count(db.dsn()) == 50);
+}
+
+// A resumed backfill is the case the MAX(id) cursor exists for: Postgres already
+// holds a genuine PREFIX of this legacy stream (ids 1..20 of 1..50), so the
+// prefix proof must ACCEPT it and the remaining rows must stream. Pins that the
+// guard above closes the hole without breaking crash-resume.
+TEST_CASE("AuditStore: backfill resumes from a genuine prefix and completes",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bf8_"}};
+    auto legacy = dir.path / "audit.db";
+    build_legacy_audit_db(legacy, /*count=*/50);
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    // Simulate a backfill that crashed after copying ids 1..20.
+    exec_sql(db.dsn(), "INSERT INTO audit_store.audit_events (id, timestamp, principal, "
+                       "principal_role, action, result, ttl_expires_at) OVERRIDING SYSTEM VALUE "
+                       "SELECT g, 1000 + g, 'admin','admin','auth.login','success',0 "
+                       "FROM generate_series(1,20) g");
+
+    REQUIRE(store.migrate_from_sqlite(legacy));
+    CHECK(row_count(db.dsn()) == 50); // 20 already there + 30 streamed, no duplicates
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE key = "
+                                 "'backfill_complete'") == "1");
+    CHECK_FALSE(std::filesystem::exists(legacy));
+}
+
+// The legacy audit.db is moved aside as the one-release rollback net (ADR-0009).
+// A clean shutdown checkpoints the WAL away, but after an unclean stop the
+// committed tail is in `audit.db-wal` — and the main file WITHOUT it does not
+// even expose the audit_events table. Moving only the main file would therefore
+// retain a copy that cannot be opened standalone.
+TEST_CASE("AuditStore: backfill moves the legacy WAL/SHM sidecars with the main file",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bf9_"}};
+    auto legacy = dir.path / "audit.db";
+    build_legacy_audit_db(legacy, /*count=*/5);
+    // An empty WAL is a valid one SQLite will open; it stands in for the tail a
+    // crashed writer leaves behind without needing to crash a writer.
+    const auto wal = std::filesystem::path{legacy.string() + "-wal"};
+    { std::ofstream touch(wal, std::ios::binary); }
+    REQUIRE(std::filesystem::exists(wal));
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.migrate_from_sqlite(legacy));
+
+    CHECK_FALSE(std::filesystem::exists(legacy));
+    CHECK_FALSE(std::filesystem::exists(wal)); // not orphaned in the live db dir
+    // It travelled with the main file: exactly one `audit.db.migrated-*` and a
+    // matching `-wal` beside it.
+    int moved_main = 0, moved_wal = 0;
+    for (const auto& e : std::filesystem::directory_iterator(dir.path)) {
+        const auto n = e.path().filename().string();
+        if (n.rfind("audit.db.migrated-", 0) != 0)
+            continue;
+        if (n.size() > 4 && n.compare(n.size() - 4, 4, "-wal") == 0)
+            ++moved_wal;
+        else
+            ++moved_main;
+    }
+    CHECK(moved_main == 1);
+    CHECK(moved_wal == 1);
 }
 
 // A legacy audit.db is UNTRUSTED-at-rest: years of free-text fields may hold
@@ -596,12 +714,21 @@ TEST_CASE("AuditStore: backfill sanitizes invalid-UTF-8 legacy bytes in every te
     // The row landed with valid UTF-8 (U+FFFD defanged). That the INSERT
     // committed at all proves result/principal_class no longer fail the batch;
     // chr(65533) is U+FFFD, so its presence proves the bytes were scrubbed, not
-    // dropped. (PG TEXT structurally cannot hold a NUL, so there is nothing to
-    // assert about NUL beyond "the row exists".)
+    // dropped.
+    //
+    // The NUL is scrubbed the same way, and there IS something to assert about
+    // it: `detail` is "d\xff\0x", so the byte AFTER the NUL must survive. A
+    // C-string read of the legacy column stops at the NUL and drops it — the
+    // sanitizer then never sees the suffix, and the truncation reads as clean
+    // data. Anchoring on the last character is what makes that distinguishable.
     CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_events WHERE detail LIKE "
                                  "'%' || chr(65533) || '%'") == "1");
     CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_events WHERE "
                                  "principal_class LIKE '%' || chr(65533) || '%'") == "1");
+    // The byte after the embedded NUL survived, and the NUL itself became U+FFFD
+    // rather than an end-of-field.
+    CHECK(query_scalar(db.dsn(), "SELECT RIGHT(detail,1) FROM audit_store.audit_events") == "x");
+    CHECK(query_scalar(db.dsn(), "SELECT length(detail) FROM audit_store.audit_events") == "4");
 }
 
 // Dead-CMOS-then-NTP, driven through the real reap flow (Gate 3 QE SHOULD — the

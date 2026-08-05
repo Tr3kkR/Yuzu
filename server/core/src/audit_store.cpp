@@ -296,6 +296,8 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     // (documented in upgrading.md). A cross-txn advisory lock is deliberately NOT
     // taken here: it would reintroduce the two-lease deadlock this block avoids.
     std::int64_t resume_from = 0;
+    std::int64_t pg_rows_before = 0;
+    std::int64_t pg_id_sum_before = 0;
     {
         auto lease = pool_.acquire();
         if (!lease) {
@@ -317,9 +319,10 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             spdlog::debug("AuditStore: migrate_from_sqlite already completed, skipping");
             return true;
         }
-        pg::PgResult mx = pg::exec_params(lease.get(),
-                                          "SELECT COALESCE(MAX(id),0) FROM audit_store.audit_events",
-                                          std::vector<std::string>{});
+        pg::PgResult mx = pg::exec_params(
+            lease.get(),
+            "SELECT COALESCE(MAX(id),0), COUNT(*), COALESCE(SUM(id),0) FROM audit_store.audit_events",
+            std::vector<std::string>{});
         if (mx.status() != PGRES_TUPLES_OK) {
             spdlog::error("AuditStore: migrate_from_sqlite: resume-point read failed: {}",
                           PQerrorMessage(lease.get()));
@@ -327,6 +330,8 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             return false;
         }
         resume_from = to_i64(PQgetvalue(mx.get(), 0, 0));
+        pg_rows_before = to_i64(PQgetvalue(mx.get(), 0, 1));
+        pg_id_sum_before = to_i64(PQgetvalue(mx.get(), 0, 2));
     }
 
     // 2. Legacy present?
@@ -394,6 +399,61 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
         legacy_count = sqlite3_column_int64(cnt.get(), 0);
     }
 
+    // 3b. PREFIX PROOF (ADR-0009). The ADR's trigger is "finds its Postgres
+    // schema EMPTY and a legacy .db present"; the resume cursor below relaxes
+    // that to "start after MAX(pg.id)" so a crashed backfill can continue. That
+    // relaxation is only sound while the rows already in Postgres ARE the
+    // already-copied prefix of THIS legacy id stream — so prove it rather than
+    // assume it. Without this, marker-absent Postgres holding unrelated rows
+    // above the legacy id range skips every legacy row, still satisfies the
+    // count check below, and stamps the mandatory audit backfill complete having
+    // migrated nothing (the legacy file is then moved aside). No product path
+    // creates that state — a failed backfill refuses to serve and the marker is
+    // never deleted — but a selective restore of `audit_events` without
+    // `audit_retention_meta`, a DSN aimed at another deployment, or a manual
+    // partial import all do, and this store is the SOC 2 evidence chain.
+    // Fingerprint, not just a count: every row already in Postgres sits at or
+    // below the cursor by construction (the cursor IS MAX(pg.id)), so compare
+    // (count, SUM(id)) over that same id range on both sides. A count alone is
+    // not enough — 50 foreign rows above the legacy range and 50 legacy rows
+    // below the cursor agree on count while sharing no id at all.
+    {
+        SqliteStmt pfx;
+        if (sqlite3_prepare_v2(legacy.get(),
+                               "SELECT COUNT(*), COALESCE(SUM(id),0) FROM audit_events WHERE id <= ?",
+                               -1, pfx.addr(), nullptr) != SQLITE_OK) {
+            spdlog::error("AuditStore: migrate_from_sqlite: legacy prefix prepare failed: {}",
+                          sqlite3_errmsg(legacy.get()));
+            backfill_metric("failed");
+            return false;
+        }
+        sqlite3_bind_int64(pfx.get(), 1, resume_from);
+        if (sqlite3_step(pfx.get()) != SQLITE_ROW) {
+            spdlog::error("AuditStore: migrate_from_sqlite: legacy prefix count failed: {}",
+                          sqlite3_errmsg(legacy.get()));
+            backfill_metric("failed");
+            return false;
+        }
+        const std::int64_t legacy_rows_at_or_below = sqlite3_column_int64(pfx.get(), 0);
+        const std::int64_t legacy_id_sum_at_or_below = sqlite3_column_int64(pfx.get(), 1);
+        if (pg_rows_before != legacy_rows_at_or_below ||
+            pg_id_sum_before != legacy_id_sum_at_or_below) {
+            spdlog::error(
+                "AuditStore: migrate_from_sqlite: PostgreSQL already holds {} audit row(s) "
+                "(id sum {}) but the legacy database has {} row(s) (id sum {}) at or below the "
+                "resume point id <= {} — the existing rows are NOT an interrupted copy of {}, so "
+                "resuming from that cursor would skip legacy evidence and still satisfy the row "
+                "count. Refusing to migrate (fail-closed, ADR-0009: the backfill runs against an "
+                "EMPTY schema or its own partial copy, nothing else). Operator remediation: point "
+                "at the correct database, or clear audit_store.audit_events if those rows are not "
+                "wanted, then reboot.",
+                pg_rows_before, pg_id_sum_before, legacy_rows_at_or_below,
+                legacy_id_sum_at_or_below, resume_from, legacy_db_path.string());
+            backfill_metric("failed");
+            return false;
+        }
+    }
+
     // 4. Stream in bounded, id-ordered batches; each batch is one PG txn with a
     // multi-row INSERT ... OVERRIDING SYSTEM VALUE ... ON CONFLICT (id) DO
     // NOTHING (idempotent + resumable). ALL columns copied incl. principal_class
@@ -429,9 +489,18 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
         sqlite3_bind_int64(sel.get(), 1, resume_from);
         sqlite3_bind_int64(sel.get(), 2, static_cast<std::int64_t>(kBackfillBatchRows));
         int rc = SQLITE_DONE;
+        // LENGTH-AWARE, not C-string: `std::string(const char*)` stops at the
+        // first embedded NUL, which would drop the remainder BEFORE
+        // `sanitize_pg_text` can turn that NUL into U+FFFD — truncating rather
+        // than defanging (ADR-0040 requires the latter). Yuzu's own legacy
+        // writer always bound with `-1`, so no row it wrote can carry bytes past
+        // a NUL; this is robustness against anything else that wrote the file.
+        // `ca_store.cpp` uses the same `sqlite3_column_bytes` pattern.
         const auto col = [&](int i) {
             const auto* v = sqlite3_column_text(sel.get(), i);
-            return v ? std::string(reinterpret_cast<const char*>(v)) : std::string{};
+            const int n = sqlite3_column_bytes(sel.get(), i);
+            return v ? std::string(reinterpret_cast<const char*>(v), static_cast<std::size_t>(n))
+                     : std::string{};
         };
         while ((rc = sqlite3_step(sel.get())) == SQLITE_ROW) {
             Row r;
@@ -597,7 +666,12 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             return false;
         }
         const std::int64_t pg_count = to_i64(PQgetvalue(pc.get(), 0, 0));
-        if (pg_count < legacy_count) {
+        // EQUALITY, not "at least" (ADR-0040: "no duplication and no loss").
+        // The prefix proof above establishes that every pre-existing row was
+        // part of this legacy stream, so after a complete copy the two counts
+        // must match exactly; a surplus means rows arrived from somewhere this
+        // migration cannot account for. `InventoryStore` uses the same `!=`.
+        if (pg_count != legacy_count) {
             spdlog::error("AuditStore: migrate_from_sqlite: reconciliation FAILED — legacy has {} "
                           "row(s) but PostgreSQL has {}; refusing to mark complete (fail-closed, "
                           "the next boot retries)",
@@ -639,12 +713,37 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     auto aside = legacy_db_path;
     aside += ".migrated-" + std::to_string(now_epoch());
     std::filesystem::rename(legacy_db_path, aside, mv_ec);
-    if (mv_ec)
+    if (mv_ec) {
         spdlog::warn("AuditStore: migrate_from_sqlite: backfill complete but could not move legacy "
                      "{} aside ({}); it is safe to archive/remove manually",
                      legacy_db_path.string(), mv_ec.message());
-    else
+    } else {
+        // Carry the WAL/SHM sidecars across with the main file. A clean shutdown
+        // checkpoints and removes them, so they are usually ABSENT and this loop
+        // does nothing — but after an unclean stop the committed tail lives in
+        // `-wal`, and MEASURED: opening the main file with its `-wal` removed
+        // reports `no such table: audit_events`. Leaving them behind therefore
+        // does not cost us migrated rows (the read-only backfill above reads
+        // through the WAL and got every row), it costs the RETAINED COPY — the
+        // one-release rollback net ADR-0009 calls load-bearing would be moved
+        // aside unopenable. Same non-fatal posture as the main move.
+        for (const char* suffix : {"-wal", "-shm"}) {
+            auto side = legacy_db_path;
+            side += suffix;
+            std::error_code side_ec;
+            if (!std::filesystem::exists(side, side_ec) || side_ec)
+                continue;
+            auto side_aside = aside;
+            side_aside += suffix;
+            std::filesystem::rename(side, side_aside, side_ec);
+            if (side_ec)
+                spdlog::warn("AuditStore: migrate_from_sqlite: moved the legacy audit db but not "
+                             "its {} sidecar ({}); the retained copy at {} may not open standalone "
+                             "until the sidecar is moved beside it",
+                             suffix, side_ec.message(), aside.string());
+        }
         spdlog::info("AuditStore: migrate_from_sqlite: moved legacy audit db to {}", aside.string());
+    }
 
     backfill_metric("completed");
     return true;
@@ -794,10 +893,17 @@ std::optional<std::vector<AuditEvent>> AuditStore::query(const AuditQuery& q,
     // scan of the window). For random_sample, over-fetch a bounded candidate
     // pool and shuffle+truncate in C++ (Hermes M-1). OFFSET is meaningless under
     // random order, so it is skipped there.
-    const int64_t fetch_limit =
-        q.random_sample ? std::max(static_cast<int64_t>(q.limit),
-                                   static_cast<int64_t>(kAuditSampleScanCap))
-                        : static_cast<int64_t>(q.limit);
+    // The random-sample pool is ALWAYS exactly the cap, never the caller's
+    // limit: below the cap a smaller pool would collapse the sample into "the N
+    // most recent" (no randomness left to draw), and above it the pool would
+    // breach the `<= kAuditSampleScanCap` bound the header promises and the REST
+    // layer reports to an auditor as `recency_capped`. Was `std::max(limit,
+    // cap)`, which honoured the first half and broke the second — a limit above
+    // the cap fetched `limit` rows. No shipped caller reaches it (REST clamps to
+    // 1000, MCP to 500 and does not set random_sample), so nothing was exposed;
+    // it is the store contract that was wrong.
+    const int64_t fetch_limit = q.random_sample ? static_cast<int64_t>(kAuditSampleScanCap)
+                                                : static_cast<int64_t>(q.limit);
     sql += " ORDER BY timestamp DESC LIMIT $" + std::to_string(idx++) + "::bigint";
     binds.push_back(std::to_string(fetch_limit));
     if (q.offset > 0 && !q.random_sample) {

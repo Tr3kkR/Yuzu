@@ -78,13 +78,27 @@ primary new element vs the three prior migrations.
 - **Idempotent + resumable:** a one-time `backfill_complete` marker row in `audit_retention_meta`
   gates re-runs; a crash mid-backfill re-streams from `MAX(id)` already in PG (id-ordered,
   ON CONFLICT DO NOTHING) so no duplication and no loss. Row-count reconciliation
-  (legacy count vs migrated count) is logged and asserted.
+  (legacy count vs migrated count) is logged and asserted, as **equality** — an unexplained
+  surplus is as much an unaccounted-for state as a shortfall.
+- **The `MAX(id)` resume cursor is guarded by a prefix proof.** ADR-0009's trigger is an *empty*
+  schema; resuming from `MAX(id)` relaxes that so an interrupted copy can continue, and the
+  relaxation is sound only while the rows already in PG *are* that interrupted copy. Before
+  streaming, the migration compares `(COUNT(*), SUM(id))` over PG against the legacy rows at or
+  below the cursor, and **fails closed on any mismatch**. Without it, a marker-absent PG table
+  holding unrelated rows above the legacy id range skips every legacy row, still satisfies the
+  count check, and stamps the mandatory backfill complete having migrated nothing — after which
+  the legacy file is moved aside. A count alone does not close it (equal counts, disjoint ids),
+  which is why the id sum is part of the comparison.
 - **Fail-closed on backfill failure** (ADR-0012 mandatory-backfill contract): a failed/partial
   backfill refuses boot with a loud diagnostic and is retried on the next start — the server
   never serves with a knowingly-incomplete evidence chain. Backfill work is RAII-guarded
   (degrade audit + `yuzu_server_audit_backfill_*` metric).
 - The legacy `audit.db` is moved aside (not deleted) after a verified backfill, per the
-  operator-managed-backup convention, so the pre-cutover evidence remains recoverable.
+  operator-managed-backup convention, so the pre-cutover evidence remains recoverable. Its
+  `-wal`/`-shm` sidecars move with it when present: a clean shutdown checkpoints and removes
+  them, but after an unclean stop the committed tail is in the WAL, and the main file without it
+  does not open as a usable database — moving only the main file would retain a copy that cannot
+  be read. (The backfill itself is unaffected: a read-only open reads through the WAL.)
 
 ### Retention (clock-guarded) — the single-writer assumption does NOT port
 

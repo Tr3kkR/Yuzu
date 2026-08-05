@@ -561,9 +561,22 @@ is unreachable — there is no SQLite fallback.
   **retries on the next start**. It does not silently start with a partial trail.
   The `yuzu_server_audit_backfill_total{result}` metric (`fresh` / `completed` /
   `failed`) reports the outcome.
+- **The backfill only ever runs against an empty `audit_store` schema or its own
+  interrupted copy.** Before resuming, it checks that the audit rows already in
+  PostgreSQL really are the partial copy of *this* `audit.db`. If they are not —
+  the usual causes are a DSN pointing at a different deployment's database, or a
+  restore that brought back `audit_events` without `audit_retention_meta` (which
+  carries the `backfill_complete` marker) — the server **refuses to start** with
+  `the existing rows are NOT an interrupted copy of …` rather than resuming past
+  rows it cannot account for and reporting a complete migration. Point the server
+  at the right database, or clear `audit_store.audit_events` if those rows are
+  not wanted, then restart.
 - After a verified backfill the legacy `audit.db` is **moved aside, not deleted**
   — it becomes an operator-managed backup of the pre-cutover trail. Relocating or
-  archiving that file afterward is expected and safe.
+  archiving that file afterward is expected and safe. Its `-wal`/`-shm` sidecars,
+  if the previous server stopped uncleanly and left any, are moved with it: the
+  main file **alone is not a usable copy** when a WAL tail exists, so keep the set
+  together if you relocate it.
 
 **What to expect / do:**
 
