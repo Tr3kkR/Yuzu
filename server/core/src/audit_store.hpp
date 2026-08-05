@@ -138,9 +138,10 @@ inline constexpr std::size_t kAuditSampleScanCap = 10000;
 
 // Rows whose TTL lands more than this far in the future are excluded from the
 // "would this pass delete everything datable?" question. See the .cpp's reap for
-// the full rationale (ported verbatim from the SQLite guard): a forward-skewed
-// row that can never itself expire must not be counted as a survivor, or ONE bad
-// row vetoes the guard for the life of the store.
+// the full rationale (condensed from the SQLite guard's, not carried over
+// verbatim — one paragraph on the direction of error did not survive): a
+// forward-skewed row that can never itself expire must not be counted as a
+// survivor, or ONE bad row vetoes the guard for the life of the store.
 inline constexpr std::int64_t kAuditTtlFutureSlackSec = 2 * 86'400LL;
 
 // Upper bound on rows deleted by ONE retention pass. The load-bearing half of
@@ -292,9 +293,11 @@ public:
     ///
     /// Idempotent: rows written after the writer fix already hold the placeholder.
     /// `detail` is taken BY VALUE and moved through on the common pass-through path:
-    /// this runs per row on every audit read (up to kAuditSampleScanCap rows under
-    /// the reader lock), and a const-ref parameter forced a copy of every row's
-    /// detail whether or not it needed redacting.
+    /// this runs per row on every audit read (up to kAuditSampleScanCap rows on
+    /// the read path), and a const-ref parameter forced a copy of every row's
+    /// detail whether or not it needed redacting. (It used to say "under the
+    /// reader lock" — `mtx_` was deleted by the PostgreSQL migration; the
+    /// substrate serialises, not a store-level mutex.)
     static std::string sanitized_detail(std::string_view target_type, std::string_view target_id,
                                         std::string detail);
 
@@ -338,15 +341,19 @@ public:
         return bootstrap_declines_.load(std::memory_order_relaxed);
     }
 
-    /// Cumulative count of retention passes that did NOT do their job. Seven
-    /// sites: an unreadable pre-delete probe; a failed delete prepare; a failed
-    /// delete step; an unreadable POST-delete backlog probe; a pass refused
+    /// Cumulative count of retention passes that did NOT do their job. The
+    /// sites are, on this substrate: any failed statement inside the pass's
+    /// transaction (the lease probe, the meta read, the re-anchor, the outcome
+    /// probes, the DELETE, the post-delete backlog probe); a pass refused
     /// because the caller's clock was implausible; a pass against a closed
     /// store; and an exception escaping the pass, caught at the thread
-    /// boundary. NOT all of them mean the delete failed -- the post-delete
-    /// backlog probe fires AFTER a successful delete, so the pass drained rows
-    /// and is merely degraded. Read it as "retention is not fully healthy",
-    /// never as "nothing was deleted".
+    /// boundary. Every one of them means NOTHING WAS DELETED: the whole pass
+    /// runs in one transaction, so even the post-delete backlog probe rolls the
+    /// DELETE back when it fails. (It said the opposite — "fires AFTER a
+    /// successful delete … merely degraded" — which was true of the retired
+    /// SQLite store, where that probe was a warning after a committed delete.
+    /// The enumeration was also stale: it counted a `prepare` and a `step` that
+    /// no longer exist.)
     /// Scraped SEPARATELY from
     /// `clock_anomaly_skips_count()` on purpose: both leave rows undeleted, but
     /// one means "the guard is protecting the table" and the other means "the

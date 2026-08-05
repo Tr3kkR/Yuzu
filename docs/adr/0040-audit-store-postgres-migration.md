@@ -4,10 +4,18 @@
 - **Date:** 2026-08-01
 - **Deciders:** pg workstream; security-guardian + docs-writer + compliance-officer (Gate 2/6)
 - **Parents:** ADR-0006/0007/0008(+Correction), ADR-0009, ADR-0012; conventions from
-  ADR-0036 (ResultSetStore), ADR-0037 (InventoryStore), ADR-0038 (GuaranteedStateStore),
-  **ADR-0039 (ResponseStore)** — which established `sanitize_pg_text` (UTF-8 + NUL) and the
-  clock-guarded reap with durable dedup + advisory lock that this store extends. #2360 is the
-  retention clock guard whose behaviour is migration-REQUIRED here.
+  ADR-0036 (ResultSetStore) and ADR-0037 (InventoryStore). The two conventions this store
+  extends, with their actual current homes in the tree rather than an ADR number: the
+  single-sweeper advisory-lease reap is implemented in `result_set_store.cpp` and
+  `software_inventory_store.cpp`; `sanitize_pg_text` (UTF-8-invalid + embedded NUL → U+FFFD)
+  in `management_group_store.cpp` (ADR-0042). #2360 is the retention clock guard whose
+  behaviour is migration-REQUIRED here.
+
+  (An earlier revision of this ADR cited an **ADR-0038 (GuaranteedStateStore)** and an
+  **ADR-0039 (ResponseStore)** five times over as the source of both conventions. Neither
+  file exists, and neither store is on PostgreSQL — `response_store.cpp` and
+  `guaranteed_state_store.cpp` are both still SQLite. Corrected in the Gate 2 docs round;
+  recorded here because a fabricated precedent is exactly the thing later migrations copy.)
 
 ## Context
 
@@ -25,7 +33,8 @@ half of the #2360 clock guard). Public API: `log()` (bool — the evidence-integ
 `query()`, `total_count()`, eight metric accessors, and the retention `cleanup_once` / cleanup
 thread.
 
-Wave 1.3 on the ladder, after ResponseStore (ADR-0039).
+Wave 1.3 on the ladder. ResponseStore has NOT migrated (`docs/postgres-migration-ladder.md`);
+an earlier revision said this store followed it.
 
 ## Decision
 
@@ -84,17 +93,31 @@ primary new element vs the three prior migrations.
   prefix proof (next bullet) both assume every row in PG came from the legacy stream. A row
   this build wrote itself is not in that stream, so the proof mismatches and the backfill is
   refused on **every** later boot — permanently, on the host whose evidence the operator is
-  most likely to need. The boot path satisfies this by construction (the backfill runs before
-  anything can log). **Any other writer of a native row MUST run the idempotent backfill
-  first**: the one-shot break-glass CLI paths (`--mfa-reset`, `--break-glass-arm`) do so via
-  `open_one_shot_audit` in `server/core/src/main.cpp`. Adding a writer that skips it is a
-  migration hazard, not a style question.
-- **A sourceless exit may only stamp the marker over an EMPTY table.** The marker asserts the
-  trail is complete; with no legacy source in hand — no file, or a file with no `audit_events`
-  table — nothing on that path can establish it, so rows-present + marker-absent fails closed
-  instead (a replica started while another is still streaming, or a partial backfill whose
-  legacy file was moved aside). The *resume* path is unaffected: it has a source, and the
-  prefix proof is what licenses it.
+  most likely to need. This is ENFORCED, not conventional: `migrate_from_sqlite` arms a write
+  gate on entry and clears it only on success, and `log()` declines while it is armed. The
+  earlier revision of this bullet said the boot path satisfied the rule "by construction,
+  because the backfill runs before anything can log" — Gate 3 cpp-safety disproved exactly
+  that: `ServerImpl`'s constructor sets `startup_failed_` on a failed backfill and then keeps
+  constructing, and several hooks it installs are guarded only on `is_open()`. The one-shot
+  break-glass CLI paths (`--mfa-reset`, `--break-glass-arm`) additionally run the backfill
+  themselves before logging, via `open_one_shot_audit` in `server/core/src/main.cpp`.
+- **A sourceless exit may only stamp the marker over an EMPTY table, and only from a server
+  boot.** The marker asserts the trail is complete; with no legacy source in hand — no file, or
+  a file with no `audit_events` table — nothing on that path can establish it. Three rules,
+  because the first alone was not enough (Gate 3 architect A-4):
+    1. rows-present + marker-absent fails closed (a replica started while another is still
+       streaming, or a partial backfill whose legacy file was moved aside);
+    2. the emptiness is re-checked INSIDE the stamping transaction, so a peer streaming rows in
+       between cannot slip past a check made outside it;
+    3. only a boot may stamp sourcelessly at all. One-shot CLI paths pass
+       `Sourceless::Refuse` and refuse instead, because a host that merely does not hold
+       `audit.db` would otherwise stamp over its empty table — and the host that DOES hold the
+       trail then skips the mandatory backfill on that marker and reports success. 365 days of
+       evidence, silently never migrated.
+  The *resume* path is unaffected throughout: it has a source, and the prefix proof licenses it.
+  What none of this can rule out is a peer replica whose inserts are not yet visible to this
+  transaction; that residue is why the sourceless stamp logs at WARN naming what it forecloses,
+  and why `upgrading.md` says which host must boot first.
 - **The `MAX(id)` resume cursor is guarded by a prefix proof.** ADR-0009's trigger is an *empty*
   schema; resuming from `MAX(id)` relaxes that so an interrupted copy can continue, and the
   relaxation is sound only while the rows already in PG *are* that interrupted copy. Before
@@ -143,17 +166,36 @@ correct. On PG with N servers, each process holds its own `last_reported_`, so N
 spend the guard independently — a condition reported by server A re-reports on server B, and
 worse, the dedup that stops a legitimately-all-expired store from declining forever breaks.
 
-Fix (the ADR-0039 reap pattern, already shipped, generalised): **single-sweeper advisory lease**
+Fix (the advisory-lease reap pattern already shipped in `result_set_store.cpp` and
+`software_inventory_store.cpp`, generalised): **single-sweeper advisory lease**
 (`pg_try_advisory_xact_lock('audit_store:reap')`) so exactly one process sweeps per tick, AND
 move the per-process dedup state into **durable `audit_retention_meta` rows** (`last_anomaly_facts`
 alongside `last_pass_now`) so the fact-set comparison survives across processes and restarts —
-exactly what ResponseStore's `reap_expired` does with `gc_meta`. `kMaxAuditDeletesPerPass`
+the same shape `result_set_store.cpp`'s sweep uses for its own durable meta. `kMaxAuditDeletesPerPass`
 (25 000) is then preserved as a per-pass drain rate for the ONE sweeping process (the advisory
 lease makes "N × 25k" impossible), so the calibration stays valid.
 
 `loaded_meta_unusable_` (the boot-time "durable reading present but unusable" flag) also becomes a
 durable fact folded into the same `audit_retention_meta` state, so it is not lost when a
 different replica runs the first post-boot pass.
+
+**#2579's missing-anchor decline ports as a DURABLE, FLEET-SHARED fact.** `Facts::no_anchor` —
+"no pass on this database has yet reached a verdict" — is carried by a `bootstrap_settled` row in
+`audit_retention_meta`, settled at the VERDICT rather than at the re-anchor, and counted apart on
+`yuzu_server_audit_retention_bootstrap_declines_total`. Both properties are load-bearing and were
+missing from an earlier revision of this section, which enumerated only five of the six ported
+elements (Gate 3 architect A-6). Durable-and-shared because the SQLite original used a per-process
+flag, which on N replicas is spent by whichever booted first; settled-at-the-verdict because the
+re-anchor happens BEFORE the probes, so deriving the trigger from the stored reading would let one
+transient probe failure spend it permanently — the exact defect #2579 closes.
+
+**Known residue: cross-replica clock divergence** (Gate 2 security). The sanitiser compares one
+replica's `now` against another replica's stamped `last_pass_now`. Divergence larger than the tick
+interval inverts that ordering, so two replicas can alternate `BadState`/`Step` fact sets that
+never match `last_anomaly_facts`, and each declines. Retention still progresses whenever one
+replica wins consecutive leases, and declining is the safe direction — but it is a real
+multi-replica behaviour that the single-writer SQLite guard could not exhibit, and operators
+should keep server clocks in agreement rather than rely on the guard absorbing it.
 
 **Deliberate dedup-semantics change (multi-process correctness).** The SQLite guard had an
 `is_event` exemption: a clock *movement* (a `Step`, or a `BadState` accompanied by a clock event)
@@ -173,7 +215,7 @@ called out here for the consistency/security gates.
 ### Untrusted byte columns (UTF-8 + NUL)
 
 `detail`, `user_agent`, `source_ip`, `principal`, `session_id` and friends are client- or
-agent-supplied free text. Per the ADR-0039 generalisation, they are scrubbed with
+agent-supplied free text. Following `management_group_store.cpp` (ADR-0042), they are scrubbed with
 `sanitize_pg_text` (UTF-8-invalid → U+FFFD **and** embedded NUL → U+FFFD) before the `INSERT`,
 so a hostile or mis-encoded value can never fail the fail-hard write (SQLSTATE 22021 / NUL
 truncation) and take an audit event down. `result`/`principal_class` are enum-controlled and not
@@ -209,6 +251,10 @@ winner sweeps). The in-process cleanup thread's join-before-store-teardown contr
 
 ## Follow-ups
 
-- The `sanitize_pg_text` (UTF-8 + NUL) + advisory-lease-durable-dedup conventions are now used by
-  three stores (ResponseStore, AuditStore, and the GS reap) — promote to the postgres-store
-  playbook as the canonical untrusted-column + clock-guard recipe.
+- The two conventions are now used by, in the tree today: `sanitize_pg_text` —
+  `management_group_store.cpp` and `audit_store.cpp`; the advisory-lease reap with durable
+  dedup — `result_set_store.cpp`, `software_inventory_store.cpp` and `audit_store.cpp`.
+  Promote both to the postgres-store playbook as the canonical untrusted-column + clock-guard
+  recipe, and name **EXISTS, never a counting aggregate**, as the probe form (Gate 3
+  performance measured the difference on this store; `result_set_store.cpp` still carries the
+  counting form and should be converted before the remaining #2508 stores copy it).

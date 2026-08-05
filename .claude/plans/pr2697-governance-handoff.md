@@ -1,0 +1,252 @@
+# PR #2697 (AuditStore -> PostgreSQL) — governance handoff
+
+**State at handoff:** branch `pg/audit-store`, head `3631f04e`, worktree `/home/dgr/yuzu-audit-pg`.
+**Nothing pushed.** Nine commits authored on this branch past the pushed head `31452b85`
+(eight fixes + the `origin/dev` merge). NOTE `git rev-list --count 31452b85..HEAD` reads
+**227**, not 9 — the merge `d928d8ec` brought 218 dev commits with it. Working tree clean. **All four Gate 3 blockers are now fixed** (2026-08-05 session) — see
+"Blockers: CLOSED" below. Gates 4/5/6/6b/8 still not run; Dave held the spend.
+
+Do NOT work in `/home/dgr/Yuzu` — that is Dave's dirty tree on another branch.
+
+## Commits on top of the pushed PR
+
+| sha | what |
+|---|---|
+| `e586a2a8` | Windows CI fix: finalize the streaming `SqliteStmt` before `sqlite3_close_v2` so the legacy `audit.db` move-aside can rename |
+| `7432b4d1` | 4 fixes from a Kimi+Codex adversarial review (prefix proof, sample-pool cap, WAL sidecars, length-aware legacy read) |
+| `d928d8ec` | merge `origin/dev` (218 commits) + carry two controls the port had dropped |
+| `c10fcc68` | arm the advisory-lease test so it can actually fail (Gate 3 QE blocker) |
+| `2e5b1625` | A-1 + A-2: no native audit row before the backfill marker; sourceless exits stamp only over an empty table |
+| `65d98216` | PERF-1: retention probe back to an EXISTS pair (was a full scan) |
+| `71ee717d` | A-3: alert on an observable symptom; `metrics.md`/`upgrading.md` corrected + abandon procedure |
+| `ead4f84c` | non-blocking truth fixes this diff caused (cpp-expert F2/F3, A-5, QE-2, QE-3) |
+| `3631f04e` | adversarial review: pre-seed the metric families the A-3 alert keys on, + 2 LOWs |
+
+## Verification already done (re-derive before trusting)
+
+- Linux full server suite at head `3631f04e`: **87352 assertions / 4588 cases**, all four
+  shards OK, live PG 18. (87169 / 4584 at `c10fcc68`; the delta is the four new tests.)
+- Windows MSVC (DGRHP): `[audit_store]` **3419 assertions / 43 cases**, exit 0 — but that
+  was at `c10fcc68`, BEFORE the four blocker fixes. It does NOT cover this head.
+- Red-green: reverting the three code fixes with tests kept produced exactly 5 red cases,
+  one per fix. The 4th #2579 test correctly stayed green (it asserts the trigger does NOT
+  fire), so the set discriminates rather than merely tracking.
+- The ORIGINAL Windows CI failure (`test_audit_store.cpp:440`, exit 42) was measured
+  red -> green on native MSVC.
+
+- **Independently re-derived by Gate 3 `quality-engineer`**, which reverted each of the
+  three fixes itself, rebuilt, confirmed red, and restored: sec-F1 -> 3 of the 4 #2579 cases
+  fail; sec-F2 -> the contiguous-id case fails with 50 rows of evidence destroyed; F4 ->
+  plaintext `hunter2` leaks. It cleared them as genuinely coupled, not false greens. It also
+  cleared `anchor_guard()` as honest (the `!has_expired -> None` short-circuit means the
+  empty-table pass reaches a real verdict) and confirmed PG advisory locks are per-database,
+  so the fixed lock-key string is not a cross-job hazard.
+
+### Verification NOT completed — redo this
+
+- **Windows CI shard-B filter** (`[pg]~[routes]~[store]~[token]`) on the merged head. It was
+  still running at handover and I stopped it to restore Dave's rig. `[audit_store]` passing
+  is the narrower result; shard B is what the CI leg actually runs.
+
+## Governance run: where it stopped
+
+Gate 1 written; **Gate 2 done** (both findings fixed); **Gate 3 done** (5 agents:
+security-guardian and docs-writer at Gate 2; cpp-safety, cpp-expert, quality-engineer,
+architect, performance at Gate 3). **Gates 4, 5, 6, 6b, 7, 8 NOT RUN.** Gate 3 produced 4
+blockers, so Gates 4/6 were deliberately not launched — they would review a diff that was
+about to change. All five Gate 3 blockers (QE's plus the four) are now fixed; the fix diff
+itself has had NO gate run over it, which is what item 2 below is for.
+
+Rule-file currency: re-checked 2026-08-05 — `CLAUDE.md`, `.claude/routed-concerns.md` and
+`.claude/skills/governance/SKILL.md` all match `origin/dev` in the WORKING TREE. Re-check
+before the next wave (`git diff --quiet origin/dev -- <path>` per file, working tree not
+commit).
+
+## Blockers: CLOSED (2026-08-05)
+
+All four are fixed and committed. What follows REPLACES the original finding text
+(this file is untracked, so that text is not recoverable from git); it states
+what was done and how it was proven. The ledger fragment owed at Gate 8 still
+needs one row per finding — write it from the commit messages, which carry the
+reproductions.
+
+### PERF-1 (performance) — retention probe was a full table scan — `65d98216`
+`audit_store.cpp` now runs an EXISTS pair instead of `count(*) FILTER (...)`, and
+`expiring == 0` became `!has_expired`. Re-measured independently on PG 18, a
+5,000,000-row `audit_events` with 5,000 rows carrying `ttl_expires_at > 0`, after
+`VACUUM ANALYZE`. The scratch table was hand-mirrored from `kMigrations` (same column set
+and the same partial index), NOT created by the store itself: old shape `Parallel Seq Scan`, 61,729 buffers, 196.966 ms; new
+shape two `Index Only Scan`s, 6 buffers, 0.034 ms. (The Gate 3 numbers were
+253.9 ms / 0.084 ms on their own data — same conclusion, different cache state.)
+The dev citation checks out: `origin/dev:server/core/src/audit_store.cpp:728`.
+**Deliberately NOT done:** the finding's second half, moving the anchor stamp out
+of the transaction. Doing so would let one transient probe failure advance the
+stored reading without the pass reaching a verdict — the erosion #2579 exists to
+prevent (`bootstrap_settled` is settled separately for exactly that reason).
+Rolling the whole pass back is the fail-safe; the fix for "the probe keeps
+failing" is the probe that no longer scans. Argued in the commit message — a
+re-reviewer who disagrees should read that before re-raising.
+
+### A-2 (architect) — one-shots wrote native rows before the marker — `2e5b1625`
+Both call sites go through `open_one_shot_audit` (`main.cpp`), which runs the
+idempotent backfill before the store can log. Verified end to end on live PG 18
+with a 5-row legacy `audit.db`: pre-fix binary left native row id=1, zero marker
+rows and `audit.db` in place; the next run refused with the prefix-proof
+diagnostic (whose remediation offers to clear `audit_events` — the break-glass
+row). Post-fix: 5 rows streamed, marker stamped, file moved aside, break-glass
+row written as id 6, exit 0; on the already-poisoned database it refuses and
+exits 1. ADR-0040 now states the rule (`ead4f84c`).
+
+### A-1 (architect) — sourceless exits stamped over a non-empty table — `2e5b1625`
+Both "nothing to migrate" exits (no legacy file; legacy file with no
+`audit_events` table) now go through `complete_without_source`, which stamps only
+over an empty table and otherwise fails closed. The crash-resume path is
+untouched — it has a source, so it never reaches the guard; the comment that
+previously argued no such guard could exist was corrected in place. Red-green:
+neutering `pg_rows_before > 0` fails exactly the two new cases (4 assertions) and
+nothing else **within `[audit_store]`** — that mutation was never run against the full
+server suite, so "nothing else" is scoped to that tag, not to the suite (rule-5 correction,
+2026-08-05; the earlier unscoped wording is in `2e5b1625`'s message and is over-broad). Operator-facing half is in `upgrading.md`, including the abandon
+procedure for an unrecoverable trail (which carries BOTH statements
+`stamp_complete` runs — a hand-stamped marker without the `setval` wedges the first live
+write; MEASURED 2026-08-05 on a scratch PG 18 database, not inferred from the code comment:
+backfilled ids 1..5 via `OVERRIDING SYSTEM VALUE`, then a plain INSERT ->
+`duplicate key value violates unique constraint "audit_events_pkey", Key (id)=(1)`).
+
+### A-3 (architect) — the fail-closed boot condition was unobservable — `71ee717d`
+Premise re-derived: `run()` returns at its first `startup_failed_` check, before
+`bootstrap_default_certs()` and long before the web listener, so `/metrics` is
+never served on that path. The rule now keys on
+`absent_over_time(yuzu_server_audit_backfill_total{result=~"completed|fresh"}[15m])`
+and both its comment and description state what it cannot see (one wedged replica
+among healthy ones is a down instance, not this alert; the boot log is primary).
+`metrics.md` and `upgrading.md` corrected to match. Nothing in CI lints the rules file
+— all 23 files in `.github/workflows/` were enumerated, none references
+`promtool`/`yamllint`/`prometheus`, and the only plausible candidate (`docs-lint.yml`) runs
+CHANGELOG-order, issue-doc and changelog-fragment checks. No promtool in this environment
+either; it parses as YAML (62 rules), no more.
+
+## CLOSED after the handover was first written
+
+- **QE Finding 1 — BLOCKING, fixed in `c10fcc68`.** The advisory-lease test
+  (`test_audit_store.cpp`, "a sibling holding the advisory lease skips the pass quietly")
+  never called `anchor_guard()`, so it declined for the missing anchor rather than the lock:
+  every assertion passed for the wrong reason and the test stayed green through a lock that
+  did nothing. Proven both ways — replacing `pg_try_advisory_xact_lock(...)` with `true` left
+  it PASSING before the fix and FAILS it after. This was self-inflicted: an `anchor_guard`
+  had landed there via a scripted edit matching the wrong construction and I removed it as
+  misplaced without checking whether the test needed one.
+
+- **QE Finding 2 MEDIUM / QE Finding 3 LOW / A-5 MEDIUM / cpp-expert F2+F3 INFO — fixed in
+  `ead4f84c`.** `docs/test-coverage.md`'s AuditStore row rewritten to what the file now
+  covers; the four #2579 tests moved to `YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl)` (46
+  cases / 3583 assertions still green, 10.1s); ADR-0040 now names all five prefix-proof
+  aggregates AND states the two rules A-1/A-2 turn on; `audit_retention_rules.hpp` no longer
+  cites the deleted `bootstrap_pending_` (and its "sole producer" clause is gone —
+  `result_set_store.cpp` builds the same Facts with `no_anchor` pinned false);
+  `audit_store.cpp` says five guard facts, matching `serialize_facts`.
+
+## OPEN NON-BLOCKING (verified by their reporters)
+
+- **QE Finding 4 INFO** — no test drives `migrate_from_sqlite` against a legacy `audit.db`
+  whose `audit_events` exists but is EMPTY (only "no file" / "no table" are covered); and
+  nothing bounds `SUM(timestamp)` in the prefix fingerprint on a pathologically large table.
+
+- **A-4 MEDIUM** `server.cpp:10002-10005` — degraded `total_count()` laundered into
+  `arr.size()`, so a degraded total silently reports the page size. Contradicts the
+  never-a-false-empty contract. Also `"data":null` where siblings use `"meta"`.
+- **cpp-expert F1 LOW** `rest_api_v1.cpp:4574-4582`, `mcp_server.cpp:307,3488` — negative
+  `limit` reaches PG as `LIMIT -1`, failing the query and letting a client drive
+  `yuzu_server_audit_read_degrade_total{reason="query_error"}`. Sibling route clamps; this
+  one does not.
+- **cpp-safety LOW** — `start_cleanup()` is not idempotent in the non-jthread arm
+  (`std::thread` move-assign over a joinable thread is `std::terminate`); the comment at
+  `audit_store.cpp:1098` claiming no spdlog formatting runs under the lock is untrue (nine
+  sites format inside the advisory-lock txn); the batch bound is per-row not per-byte.
+- **cpp-safety SHOULD** — no test calls `start_cleanup()`/`stop_cleanup()`; join-on-destroy,
+  double-stop, stop-during-pass and the non-jthread arm are all unexercised.
+- **cpp-safety INFO** — `legacy_has_table` binds `SQLITE_STATIC`; fine today, UAF for a
+  future `std::string(...).c_str()` caller.
+- **perf INFO** — backfill call site `audit_store.cpp:613` passes `r.detail` from a
+  `const auto&`, forcing one copy per row; `std::move` it.
+- **Resource Ledger correction** — actual counts are 10 lease sites, 19 `PgResult`,
+  6 `SqliteStmt` (Gate 1 said 9/18/5). Two borrowed boundaries were omitted: the
+  `MetricsRegistry*` from `set_metrics`, and the `AuditStore*` borrowed into
+  `agent_service_`/`gateway_service_`/`fleet_topology_store_`.
+- **Not this PR's regression** — reaper ceiling is 25000/pass x 1 pass/hour ~= 6.9 events/s
+  sustained; constants unchanged from the SQLite predecessor, but PERF-1 makes it likelier
+  to bite. Worth its own issue.
+
+## Adversarial review of the FIX commits (2026-08-05, after the blockers closed)
+
+Kimi (dynamic, live PG) + Codex (gpt-5.5 high, PG-blocked by its sandbox) reviewed
+`c10fcc68..ead4f84c`. Synthesis: `/tmp/advrev-2697-fix/SYNTHESIS.md` (tmp — copy it if
+it matters). Both found ONE defect, and it was mine, introduced by the A-3 fix:
+
+**The re-keyed alert pages on every routine restart.** Nothing described or pre-seeded
+`yuzu_server_audit_backfill_total`, and an already-migrated server returns at the marker
+check without reaching an outcome — so a HEALTHY restarted server exports no
+`completed`/`fresh` series and the critical absence rule fires. Kimi graded HIGH and
+BLOCKED; Codex MEDIUM and PASSed. Fixed in `3631f04e` (pre-seed both closed label sets in
+`AuditStore::set_metrics`, + a test; red-green: disabling the seed fails that one case, 8
+assertions, **within `[audit_store]`** — same scope caveat as the A-1 mutation above). Two LOWs fixed with it: the one-shot retention default (365 vs
+`cfg.audit_retention_days`) and the `sqlite3_step` HELP text.
+
+Both reviewers confirmed all six author claims, including the anchor-stamp judgement call
+and the single-construction-site universal. Neither could build Windows.
+
+## Still to do
+
+1. ~~Fix the four blockers~~ — DONE (`2e5b1625`, `65d98216`, `71ee717d`), plus the
+   non-blocking truth defects this diff caused (`ead4f84c`) and the adversarial-review
+   findings (`3631f04e`).
+2. Re-run Gate 2 (`security-guardian` always, `docs-writer` — four docs changed) + every
+   Gate 3 agent whose domain the fix diff touches: `architect` (A-1/A-2/A-5 are its
+   findings), `performance` + `cpp-safety` + `sre` + `compliance-officer` (PERF-1 is a
+   retention-behaviour change → the clock-guard routed row), `cpp-expert` (main.cpp +
+   audit_store.cpp), `quality-engineer` (three new tests + a fixture swap).
+3. Run Gates 4 (happy/unhappy/consistency), 5 if warranted, 6 (compliance-officer, sre,
+   enterprise-readiness), 6b synthesis.
+4. Gate 8 + write the ledger fragment `governance.d/2697-<slug>.<random>.jsonl` (one row per
+   finding; `mktemp -u` + `noclobber`, NOT `mv`).
+5. Windows re-verify after the fixes (the store changed again) — `[audit_store]` AND the
+   shard-B filter `[pg]~[routes]~[store]~[token]`, which has never been run on this head.
+6. Still OPEN and untouched: QE Finding 4, A-4, cpp-expert F1, the three cpp-safety items,
+   the perf INFO copy, the Resource Ledger correction, and the reaper-ceiling issue.
+7. THEN ask Dave before pushing. He has approved: adversarial review, the dev merge,
+   filing #2798, and this governance run. He has NOT approved a push.
+
+## Environment
+
+- Live PG for tests: `export YUZU_TEST_ENABLE_PG=1
+  YUZU_TEST_POSTGRES_DSN=postgresql://yuzu:yuzu@localhost:5433/yuzu` (container
+  `yuzu-advrev-2362-pg`, already up on BigColin, not mine).
+- Adversarial-review synthesis: `/tmp/advrev-pr2697/SYNTHESIS.md` (survives until reboot;
+  copy it if you want it durable).
+- Filed this session: **#2798** (ADR-0009 rollback-window re-entry gap — the refuted
+  "failed rename causes a rollback split" finding, re-scoped to the real ADR-level gap).
+
+### Windows rig — already cleaned up, here is how to redo it
+
+DGRHP is restored: `yuzu-pr3a` detached at `feffdbfa`, clean, scratch removed, and the
+scratch Postgres container deleted. To verify again:
+
+1. `docker run -d --name yuzu-pr2697-pg -p 100.74.176.116:5445:5432 -e POSTGRES_USER=yuzu
+   -e POSTGRES_PASSWORD=yuzu -e POSTGRES_DB=yuzu postgres:18` (bind to the TAILSCALE ip —
+   DGRHP has no local Postgres).
+2. `git bundle create pr2697.bundle pg/audit-store ^origin/dev`, scp to
+   `C:/Users/daver/`, then on DGRHP: `git fetch <bundle> 'pg/audit-store:pr2697-verify'`,
+   `git checkout --detach pr2697-verify` inside `C:/Users/daver/yuzu-pr3a`.
+3. `source ./setup_msvc_env.sh > log 2>&1` (REDIRECT, never a pipe — a pipe runs it in a
+   subshell and the PATH exports are lost), prepend the MSVC `Hostx64/x64` dir to PATH,
+   `vcpkg install --x-install-root=<wt>/vcpkg_installed`, `meson setup build-windows
+   --reconfigure -Dcmake_prefix_path=<wt>/vcpkg_installed/x64-windows -Dbuild_tests=true`,
+   `meson compile -C build-windows yuzu_server_tests`.
+4. Run the exe with `build-windows/tests` + the vcpkg `debug/bin` and `bin` dirs on PATH.
+5. **RESTORE `yuzu-pr3a` to `feffdbfa` and delete the container when done.**
+
+Gotchas that cost time this session: non-login MSYS bash has no coreutils on PATH (export
+`/usr/bin:/bin:/c/Program Files/Git/cmd` at the top of every script you send over); piping
+a long remote build through `tail` locally buffers until it ends, so you see nothing; and
+`LNK1318: Unexpected PDB error; LIMIT (12)` means the DISK IS FULL, not a PDB size limit —
+C: runs at 95-100%.

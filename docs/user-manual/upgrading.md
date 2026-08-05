@@ -677,9 +677,18 @@ is unreachable — there is no SQLite fallback.
   healthcheck `start_period`, so the orchestrator does not kill the server
   mid-backfill and restart it into the same long boot repeatedly. The backfill is
   resumable, so a killed boot is not corrupting — but it wastes the window.
-- **Scale-out: bring up ONE replica first.** In a multi-replica deployment, start
-  a single server and let it finish the backfill (the `backfill_complete` marker
-  is stamped in `audit_store`) **before** starting the remaining replicas. Once
+- **Scale-out: bring up the replica that HOLDS `audit.db` first.** In a
+  multi-replica deployment, start that one server and let it finish the backfill
+  (the `backfill_complete` marker is stamped in `audit_store`) **before**
+  starting the remaining replicas. *Which* replica is not incidental: a replica
+  with no legacy `audit.db` of its own, booted first against an empty table,
+  stamps the completion marker over that emptiness — and the replica that does
+  hold the trail then sees the marker, skips the mandatory backfill, and reports
+  success. The trail is not migrated and `audit.db` is not even moved aside. The
+  server logs a WARNING naming this whenever it marks a backfill complete
+  without a source; on a genuine fresh install that line is routine, and on an
+  upgrade it is the signal that you started the wrong host. (The break-glass
+  one-shots refuse to stamp at all, so they cannot cause this.) Once
   the marker is present the other replicas see a completed backfill and start
   normally; retention afterward is single-swept fleet-wide via an advisory lease
   (see [Audit Log](audit-log.md#the-retention-clock-guard)).

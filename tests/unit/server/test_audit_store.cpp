@@ -619,6 +619,32 @@ TEST_CASE("AuditStore: wiring metrics pre-seeds both closed label sets",
     CHECK(after.find("yuzu_server_audit_backfill_total{result=\"fresh\"} 0") != std::string::npos);
 }
 
+// Gate 3 cpp-expert, who measured both halves on PG 18: `result` and
+// `principal_class` were bound verbatim as "enum-controlled". An embedded NUL
+// stored `"suc"` — a silently truncated audit RESULT — and invalid UTF-8 failed
+// the INSERT outright, losing the event on a fail-hard write path. Every caller
+// in the tree passes a literal today; this pins the store so that stays a
+// property of the store rather than of every caller remembering.
+TEST_CASE("AuditStore: a NUL or invalid UTF-8 in result does not truncate or lose the row",
+          "[pg][audit_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+
+    AuditEvent e = mk("admin", "auth.login");
+    e.result = std::string("suc\0cess", 8); // embedded NUL
+    e.principal_class = "\xff\xfe";         // invalid UTF-8
+    REQUIRE(store.log(e));                   // the event is NOT lost
+
+    auto rows = store.query();
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    // Scrubbed, not truncated: the tail after the NUL survives.
+    CHECK(rows->at(0).result != "suc");
+    CHECK(rows->at(0).result.find("cess") != std::string::npos);
+}
+
 // Gate 2 security / Gate 3 cpp-expert: a negative limit reached PostgreSQL as
 // `LIMIT -1`, which errors — and this store reports a query error as a DEGRADE,
 // which is the series `YuzuAuditReadDegraded` pages on. So any read-privileged

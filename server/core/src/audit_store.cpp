@@ -124,10 +124,12 @@ bool note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason, Degra
 // The `no_anchor` character is part of the set on purpose (#2579): the pass that
 // declines for it also settles the bootstrap marker, so the NEXT pass differs in
 // this very field and is a different set — which is what lets the trigger decline
-// once and then stand down without any anti-latch special case. A pre-#2579
-// stored value is four characters and will not match a five-character set, so the
-// first pass after upgrade sees a changed set and declines once. That is the safe
-// direction (a decline never deletes) and it self-corrects on the next pass.
+// once and then stand down without any anti-latch special case. There is no
+// four-character legacy value to worry about here: migration v1 creates this
+// table fresh, and the SQLite predecessor's meta table held only an INTEGER
+// `last_pass_now`, never a fact-set string. (An earlier revision of this comment
+// reasoned about upgrading from a four-character value, carried over from a
+// store where that was possible.)
 std::string serialize_facts(const audit_retention::Facts& f) {
     return std::string(f.has_expired ? "e" : "-") + (f.would_wipe ? "w" : "-") +
            (f.big_step ? "s" : "-") + (f.prev_unusable ? "u" : "-") + (f.no_anchor ? "b" : "-");
@@ -791,6 +793,25 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             // Never carry a stale marker across; it is stamped fresh below.
             if (key == "backfill_complete")
                 continue;
+            // The legacy table is not STRICT, so this column can hold a
+            // non-integer. `sqlite3_column_int64` would COERCE that to 0, and 0
+            // is a perfectly usable `last_pass_now` — the clock guard would then
+            // anchor on a value that was actually corruption, which is exactly
+            // the "unparseable reading is an anomaly, never a quiet reset"
+            // requirement of the routed clock-guard concern. The SQLite store
+            // checked the column type for this reason; carry the check across
+            // rather than let the migration launder it (Gate 3 cpp-expert F5).
+            if (sqlite3_column_type(ms.get(), 1) != SQLITE_INTEGER) {
+                spdlog::warn("AuditStore: migrate_from_sqlite: legacy audit_retention_meta['{}'] "
+                             "is not an INTEGER; carrying it across as the non-numeric text it is, "
+                             "so the clock guard treats it as an unusable reading rather than 0",
+                             key);
+                const auto* v = sqlite3_column_text(ms.get(), 1);
+                meta_rows.emplace_back(std::move(key),
+                                       v ? sanitize_pg_text(reinterpret_cast<const char*>(v))
+                                         : std::string{"corrupt"});
+                continue;
+            }
             meta_rows.emplace_back(std::move(key),
                                    std::to_string(sqlite3_column_int64(ms.get(), 1)));
         }
@@ -966,8 +987,16 @@ bool AuditStore::log(const AuditEvent& event) {
     const int64_t ts = event.timestamp > 0 ? event.timestamp : now;
     const int64_t ttl = retention_days_ > 0 ? now + static_cast<int64_t>(retention_days_) * 86400 : 0;
 
-    // Sanitize the untrusted free-text columns; result/principal_class are
-    // enum-controlled (ADR-0040) and bound verbatim.
+    // Sanitize EVERY text column, including `result` and `principal_class`.
+    // They were bound verbatim on the claim that they are enum-controlled. All
+    // the assignment sites in the tree today do use literals — but the backfill
+    // path (below) sanitizes both, with a comment explaining precisely why, and
+    // the failure modes are not symmetric with the free-text ones: MEASURED on
+    // PG 18, `result="\xff\xfe"` fails the INSERT and LOSES the event on a
+    // fail-hard write path, and `result="suc\0cess"` stores `"suc"` — a
+    // SILENTLY TRUNCATED audit result. A convention enforced only by every
+    // caller remembering is not what should stand between an audit event and
+    // being dropped (Gate 3 cpp-expert, who ran the bytes).
     pg::PgResult res = pg::exec_params(
         conn,
         "INSERT INTO audit_store.audit_events (timestamp, principal, principal_role, action, "
@@ -981,8 +1010,9 @@ bool AuditStore::log(const AuditEvent& event) {
                                  sanitize_pg_text(event.target_id), sanitize_pg_text(event.detail),
                                  sanitize_pg_text(event.source_ip),
                                  sanitize_pg_text(event.user_agent),
-                                 sanitize_pg_text(event.session_id), event.result,
-                                 std::to_string(ttl), event.principal_class});
+                                 sanitize_pg_text(event.session_id),
+                                 sanitize_pg_text(event.result), std::to_string(ttl),
+                                 sanitize_pg_text(event.principal_class)});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
         emit_failed_.fetch_add(1, std::memory_order_relaxed);
         spdlog::error("AuditStore::log: insert failed for action={}: {}; event lost", event.action,
