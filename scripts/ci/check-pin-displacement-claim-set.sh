@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # check-pin-displacement-claim-set.sh — drift gate for the "what causes a replay-ring pin
-# displacement" claim, which is stated independently on five surfaces plus changelog.d.
+# displacement" claim, which is stated independently on every surface in STATING_SURFACES
+# (see the array below) plus changelog.d fragments.
 #
 # WHY THIS EXISTS. #2740 falsified the claim "a full pin-slot set means admission accounting
 # has drifted". Correcting it across its surfaces took repeated review passes — the run
@@ -34,10 +35,12 @@
 #       reclaim releases one pin and adds one charge, so the session stays AT cap and a slot
 #       is always free. It must never appear in the alert expression, and must never be
 #       presented as something to rule out against.
-#   (b) The two residual counters ARE the cause set. The five stating surfaces -- alert,
-#       HELP, manual, derivation header, and the on-call RUNBOOK -- must name both.
-#       changelog.d fragments are held to both-or-neither instead: a release note need not
-#       enumerate counters, but naming one while omitting the other is the drift shape.
+#   (b) The two residual counters ARE the cause set. Every surface in STATING_SURFACES must
+#       name BOTH. The membership is the array, not this comment - it is deliberately not
+#       enumerated here, for the same reason the case count is not: a list you have to
+#       remember to update twice is the defect. changelog.d fragments are held to
+#       both-or-neither instead: a release note need not enumerate counters, but naming one
+#       while omitting the other is the drift shape.
 #
 # The runbook was NOT in (b) in the first version of this gate, while the workflow header
 # claimed it was. Two external reviewers found that independently and blocked on it, each
@@ -222,9 +225,12 @@ fi
 # ---------------------------------------------------------------------------
 # (b) Every surface that enumerates causes must name BOTH residual counters.
 #
-# A surface "enumerates causes" if it mentions the displacement counter at all. Checking
-# both-or-neither rather than presence alone is deliberate: naming one residual and not the
-# other is the shape that produced the "#2795 is deliberately silent" defect.
+# Membership in STATING_SURFACES is what makes a file subject to this - the check does NOT
+# look for the displacement counter first, so a registered surface that drops the claim
+# entirely is reported too, and that is intended: silently losing the statement is the same
+# drift as stating it wrongly. Checking both-or-neither rather than presence alone is
+# deliberate: naming one residual and not the other is the shape that produced the
+# "#2795 is deliberately silent" defect.
 # ---------------------------------------------------------------------------
 # The RUNBOOK is in this set, not merely the phrase check below. It is the surface an
 # on-call engineer actually executes, and an adversarial review found that leaving it out
@@ -242,7 +248,8 @@ for f in "${STATING_SURFACES[@]}"; do
         note "Both are causes of a displacement; naming one implies the other has no signal,"
         note "which is exactly the defect $RACED was added to end."
     elif [ "$has_raced" -eq 0 ]; then
-        bad "$f mentions the displacement claim but names neither residual counter."
+        bad "$f is a registered stating surface but names neither residual counter."
+        note "Either restate the cause set here, or remove it from STATING_SURFACES."
     fi
 done
 

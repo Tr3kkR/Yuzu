@@ -177,8 +177,10 @@ Two properties worth knowing before editing it:
 - **Add surfaces to `STATING_SURFACES`, not to a loop.** The two holes review found were
   both a divergence between two hand-maintained lists. There is now one.
 
-No build, no `paths:` filter (nothing expensive to skip, and no filter means it always
-reports — see the trap noted for `docker-healthcheck-invariants.yml` below).
+A failing check is **merge-blocking** — the job exits non-zero and the workflow has no
+`continue-on-error`. No build, no `paths:` filter (nothing expensive to skip, and no filter
+means it always reports — see the trap noted for `docker-healthcheck-invariants.yml`
+below).
 
 ### Docker healthcheck invariants (`docker-healthcheck-invariants.yml`, #751)
 

@@ -130,10 +130,22 @@ take, which happens in three states:
    below the cursor) or re-initialize for a fresh session — both are in the `429`
    remediation text it already received. Results stay fetchable by `execution_id`
    regardless, so nothing is lost.
-4. **Do not restart the server for a single wedged session.** A restart drops every live
-   MCP session and every in-flight streamed request fleet-wide, which is a far larger
-   outage than one client's lockout. Restart is only proportionate if the rate is
-   climbing across many sessions at once, which would indicate a different fault.
+4. **Do not restart the server.** A restart drops every live MCP session and every
+   in-flight streamed request fleet-wide — a far larger outage than the lockout you are
+   looking at, and the client's own recovery in step 3 does not need it.
+
+   Be aware you probably **cannot** tell from this alert whether one session is wedged or
+   many: `yuzu_mcp_bridge_pin_slots_reject_total` carries only the `held` label and has no
+   session dimension, so the paging signal cannot separate "one session refused repeatedly"
+   from "many sessions refused once". The audit rows in step 1 give you the session ids you
+   captured, not a population count. **If you cannot establish the scope, treat it as a
+   single session and do not restart** — that is the safe direction, because a wedged
+   session is self-recoverable by the client and a restart is not recoverable for anyone
+   else. Escalate for a `session_id` label on that counter rather than guessing.
+
+   A restart is only worth considering if you have INDEPENDENT evidence of a fleet-wide
+   fault — many clients reporting failure, or another alert firing — and in that case you
+   are no longer troubleshooting this one.
 5. File it either way if you reach (3): a genuinely unattributable pin means the reclaim's
    orphan scan missed something, and that is a bug worth the report.
 

@@ -1,17 +1,18 @@
 name: Pin-displacement claim gate
 
 # Drift gate for the "what causes a replay-ring pin displacement" claim, which is stated
-# independently on five surfaces that must name BOTH residual counters (the alert rule, the
-# /metrics HELP string, the user manual, the derivation header, and the on-call runbook),
-# plus changelog.d fragments under a weaker both-or-neither rule -- a release note may name
-# no counters at all, but naming one while omitting the other is the drift shape.
+# independently on every surface listed in the script's STATING_SURFACES array, each of
+# which must name BOTH residual counters, plus changelog.d fragments under a weaker
+# both-or-neither rule -- a release note may name no counters at all, but naming one while
+# omitting the other is the drift shape. The membership is NOT enumerated here: this comment
+# went stale once already when the array grew.
 #
 # An adversarial review (kimi + codex, independently, each with a reproducing fixture)
 # BLOCKED the first version of this gate because that header claimed the runbook and
 # changelog were protected while the cause-set check covered only four files. A gate that
 # overstates its own coverage is the very defect class it exists to catch, and CLAUDE.md
-# makes a false-green offered as closure evidence a policy floor. The check now covers what
-# this comment claims, and --selftest proves each shape reddens.
+# makes a false-green offered as closure evidence a policy floor. --selftest proves each
+# shape reddens before the real check runs.
 #
 # WHY A GATE AND NOT A CONVENTION. #2740 falsified the claim "a full pin-slot set means
 # admission accounting has drifted", and correcting it across its surfaces defeated a

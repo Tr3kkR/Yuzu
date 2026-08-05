@@ -198,7 +198,7 @@ groups:
             results remain fetchable by execution_id. No restart; this is diagnostic,
             not an outage. Follow docs/ops-runbooks/mcp-stream-pin-displacement.md - it
             owns the procedure and this annotation only points at it.
-          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement"
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement#what-to-do"
       - alert: YuzuMcpStreamFinalUnpinned
         expr: |
           rate(yuzu_mcp_stream_final_unpinned_total[15m]) > 0
@@ -213,7 +213,7 @@ groups:
             resized to zero or the displacement path was bypassed. The affected
             terminal is evictable from the replay ring but remains fetchable by
             execution_id. File a bug; no restart needed.
-          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement"
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement#what-to-do"
       - alert: YuzuMcpBridgeForcedExpireUnavailable
         expr: |
           rate(yuzu_mcp_bridge_forced_expire_total{disposition="synthesize_unavailable"}[15m]) > 0
@@ -259,7 +259,7 @@ groups:
             DELIBERATELY a raw counter test, not increase() over a window: the
             retention lasts until the process restarts, so an alert that cleared
             after 15 minutes would contradict the contract it exists to report.
-            Runbook: docs/ops-runbooks/mcp-stream-pin-displacement.md
+            Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
           runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpStreamedPinSlotsWedged
         expr: |
@@ -289,7 +289,7 @@ groups:
             charge is outstanding, so a partial wedge (some pins stuck, one call
             genuinely in flight) is bucketed there and this alert cannot see it.
             Runbook: docs/ops-runbooks/mcp-stream-pin-displacement.md
-          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement"
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement#yuzumcpstreamedpinslotswedged--a-session-is-being-refused-not-merely-degraded"
       - alert: YuzuMcpBridgePinReleaseFailed
         expr: |
           yuzu_mcp_bridge_pin_release_failed_total > 0
@@ -313,7 +313,7 @@ groups:
             (a GET resume acking past it, or session death). Distinct from
             yuzu_mcp_bridge_pin_displaced_for_admission_total, which counts the
             SUCCESSFUL reclaims and is expected traffic.
-          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement"
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement#what-to-do"
       - alert: YuzuMcpBridgeChargeReleaseDeferred
         expr: |
           yuzu_mcp_bridge_charge_release_deferred_total > 0
@@ -389,7 +389,7 @@ groups:
             raw-counter form is correct ONLY where the retention it reports is
             permanent until restart, which is true of teardown_incomplete and not
             of this.
-            Runbook: docs/ops-runbooks/mcp-stream-pin-displacement.md
+            Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
           runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpBridgeRecordsNearCap
         expr: |
