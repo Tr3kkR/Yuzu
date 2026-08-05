@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <limits>
 #include <optional>
 #include <random>
@@ -284,14 +285,18 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     // is inert until this returns and boot completes), so `MAX(id)` is a safe
     // id-ordered resume cursor after a mid-backfill crash.
     //
-    // Why "PG non-empty AND no backfill_complete marker" is ALWAYS a crash-resume
-    // (Gate 4 architect): native rows can only appear AFTER the marker is stamped
-    // — a fresh install stamps `backfill_complete` before serving, and log() is
-    // inert until boot completes, so the first native write happens strictly
-    // after the marker exists. Therefore no-marker + non-empty is only reachable
-    // via a partial prior backfill, for which resume-from-MAX(id) + ON CONFLICT
-    // DO NOTHING is exactly correct. A "refuse boot if non-empty + no marker"
-    // guard would instead BREAK that legitimate crash-resume, so it is not added.
+    // Why "PG non-empty AND no backfill_complete marker, WITH a legacy source in
+    // hand" is a crash-resume (Gate 4 architect): native rows only appear after
+    // the marker is stamped — a fresh install stamps `backfill_complete` before
+    // serving, log() is inert until boot completes, and every one-shot CLI writer
+    // of a native row runs this backfill first (main.cpp `open_one_shot_audit`;
+    // that call is the whole reason the property holds, and removing it re-opens
+    // Gate 3 architect A-2). So with a source present, no-marker + non-empty is
+    // reachable only via a partial prior backfill, for which resume-from-MAX(id)
+    // + ON CONFLICT DO NOTHING is exactly correct, and a blanket "refuse boot if
+    // non-empty + no marker" guard would BREAK that legitimate resume — hence it
+    // is not added HERE. Without a usable source the same state proves nothing
+    // and IS refused; see `complete_without_source` below.
     //
     // Multi-replica first boot (Gate 6 sre): the supported cutover is single-
     // writer SQLite → shared PG with ONE legacy audit.db (the SQLite substrate
@@ -352,6 +357,41 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
         pg_ts_max_before = to_i64(PQgetvalue(mx.get(), 0, 5));
     }
 
+    // A "nothing to migrate" exit may only stamp the marker over an EMPTY table.
+    // The marker asserts the trail is COMPLETE, and with no migration source in
+    // hand nothing on this path can establish that. Rows + no marker + no usable
+    // source is either a sibling replica still streaming the legacy audit.db
+    // (this replica has none of its own), or a partial backfill whose legacy file
+    // was moved aside — and stamping over either closes a knowingly-incomplete
+    // SOC 2 evidence chain forever, silently (Gate 3 architect A-1). Fail closed
+    // and make the operator decide. NOTE this is deliberately NOT the "refuse
+    // when non-empty + no marker" guard rejected above: the crash-resume path
+    // HAS a source, so it never reaches here.
+    const auto complete_without_source = [&](std::string_view situation) -> bool {
+        if (pg_rows_before > 0) {
+            spdlog::error(
+                "AuditStore: migrate_from_sqlite: refusing to mark the backfill complete — {}, but "
+                "audit_store.audit_events already holds {} row(s) with no backfill_complete marker. "
+                "Another replica may still be streaming the legacy trail (let it finish; it stamps "
+                "the marker, then restart this one), or a partial backfill's legacy audit.db was "
+                "moved aside. Stamping here would bless a knowingly-incomplete evidence chain. If "
+                "the legacy trail is genuinely unrecoverable, follow the abandon procedure in "
+                "docs/user-manual/upgrading.md.",
+                situation, pg_rows_before);
+            backfill_metric("failed");
+            return false;
+        }
+        if (!stamp_complete()) {
+            backfill_metric("failed");
+            return false;
+        }
+        spdlog::info("AuditStore: migrate_from_sqlite: {}; marking backfill complete over an empty "
+                     "audit_events",
+                     situation);
+        backfill_metric("fresh");
+        return true;
+    };
+
     // 2. Legacy present?
     std::error_code ec;
     const bool legacy_exists = std::filesystem::exists(legacy_db_path, ec);
@@ -363,16 +403,9 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     }
     if (!legacy_exists) {
         // Fresh install — nothing to migrate. Stamp complete so every later boot
-        // is a cheap no-op.
-        if (!stamp_complete()) {
-            backfill_metric("failed");
-            return false;
-        }
-        spdlog::info("AuditStore: migrate_from_sqlite: no legacy audit.db at {}; marking backfill "
-                     "complete (fresh install)",
-                     legacy_db_path.string());
-        backfill_metric("fresh");
-        return true;
+        // is a cheap no-op (only over an empty table; see above).
+        return complete_without_source(
+            std::format("no legacy audit.db at {} (fresh install)", legacy_db_path.string()));
     }
 
     // 3. Open the legacy DB read-only.
@@ -388,16 +421,10 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     sqlite3_exec(legacy.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
     if (!legacy_has_table(legacy.get(), "audit_events")) {
         // A legacy file with no audit_events table is not a migration source —
-        // treat like a fresh install rather than looping forever.
-        if (!stamp_complete()) {
-            backfill_metric("failed");
-            return false;
-        }
-        spdlog::warn("AuditStore: migrate_from_sqlite: legacy db {} has no audit_events table; "
-                     "marking backfill complete",
-                     legacy_db_path.string());
-        backfill_metric("fresh");
-        return true;
+        // treat like a fresh install rather than looping forever, subject to the
+        // same empty-table condition.
+        return complete_without_source(
+            std::format("legacy db {} has no audit_events table", legacy_db_path.string()));
     }
     const bool has_principal_class =
         legacy_has_column(legacy.get(), "audit_events", "principal_class");

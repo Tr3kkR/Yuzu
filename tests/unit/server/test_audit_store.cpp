@@ -576,6 +576,106 @@ TEST_CASE("AuditStore: backfill on a fresh install (no legacy) marks complete",
                                  "'backfill_complete'") == "1");
 }
 
+// Gate 3 architect A-1. A "nothing to migrate" exit may stamp the marker only
+// over an EMPTY table: the marker asserts the trail is COMPLETE, and with no
+// source in hand nothing on that path can establish it. Reachable when replica 2
+// boots without a local audit.db while replica 1 is still streaming — before the
+// guard, replica 2 stamped `backfill_complete` over the partial trail and
+// replica 1's retry then short-circuited on the marker and returned true on a
+// knowingly-incomplete evidence chain.
+TEST_CASE("AuditStore: backfill with no legacy source refuses to mark a NON-EMPTY table complete",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    // A sibling replica's partial backfill: rows present, marker absent.
+    exec_sql(db.dsn(), "INSERT INTO audit_store.audit_events (id, timestamp, principal, "
+                       "principal_role, action, result, ttl_expires_at) OVERRIDING SYSTEM VALUE "
+                       "SELECT g, 999 + g, 'admin','admin','auth.login','success',0 "
+                       "FROM generate_series(1,20) g");
+
+    CHECK_FALSE(store.migrate_from_sqlite("/nonexistent-yuzu-test/audit.db"));
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE key = "
+                                 "'backfill_complete'") == "0");
+    CHECK(row_count(db.dsn()) == 20); // the partial trail is left alone
+}
+
+// Same rule on the other sourceless exit: a legacy file that carries no
+// audit_events table is not a migration source either.
+TEST_CASE("AuditStore: backfill with a table-less legacy file refuses over a NON-EMPTY table",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bf11_"}};
+    auto legacy = dir.path / "audit.db";
+    std::filesystem::create_directories(dir.path);
+    {
+        SqliteDb ldb;
+        REQUIRE(sqlite3_open(legacy.string().c_str(), ldb.addr()) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(ldb.get(),
+                             "CREATE TABLE audit_retention_meta (key TEXT PRIMARY KEY, value "
+                             "INTEGER NOT NULL);",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    exec_sql(db.dsn(), "INSERT INTO audit_store.audit_events (id, timestamp, principal, "
+                       "principal_role, action, result, ttl_expires_at) OVERRIDING SYSTEM VALUE "
+                       "SELECT g, 999 + g, 'admin','admin','auth.login','success',0 "
+                       "FROM generate_series(1,20) g");
+
+    CHECK_FALSE(store.migrate_from_sqlite(legacy));
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE key = "
+                                 "'backfill_complete'") == "0");
+
+    // And the same file over an EMPTY table still completes — the guard is the
+    // row count, not the shape of the legacy file.
+    YUZU_REQUIRE_PG_DB(db2);
+    PgPool pool2{{.conninfo = db2.dsn(), .size = 4}};
+    AuditStore store2(pool2);
+    REQUIRE(store2.is_open());
+    CHECK(store2.migrate_from_sqlite(legacy));
+    CHECK(query_scalar(db2.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE key "
+                                  "= 'backfill_complete'") == "1");
+}
+
+// Gate 3 architect A-2 — the ORDER CONTRACT the one-shot CLI paths must follow.
+// `--mfa-reset` / `--break-glass-arm` write a NATIVE audit row without going
+// through boot. Doing that before the backfill marker exists wedges an upgraded
+// host permanently: the prefix proof compares Postgres's rows against the legacy
+// rows at or below the resume cursor, a native row is not one of them, and the
+// mismatch refuses the backfill on EVERY later boot. main.cpp's
+// `open_one_shot_audit` runs the backfill first for exactly this reason.
+TEST_CASE("AuditStore: a native row ahead of the backfill wedges it; backfill-then-log does not",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bf12_"}};
+    auto legacy = dir.path / "audit.db";
+    build_legacy_audit_db(legacy, /*count=*/50);
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+
+    SECTION("native row first — the upgraded host can no longer migrate") {
+        REQUIRE(store.log(mk("root", "mfa.reset.breakglass")));
+        CHECK_FALSE(store.migrate_from_sqlite(legacy));
+        CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE "
+                                     "key = 'backfill_complete'") == "0");
+        CHECK(std::filesystem::exists(legacy)); // evidence still recoverable
+    }
+
+    SECTION("backfill first, then the row — the order open_one_shot_audit enforces") {
+        REQUIRE(store.migrate_from_sqlite(legacy));
+        REQUIRE(store.log(mk("root", "mfa.reset.breakglass")));
+        CHECK(row_count(db.dsn()) == 51);
+        CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE "
+                                     "key = 'backfill_complete'") == "1");
+    }
+}
+
 TEST_CASE("AuditStore: backfill handles a legacy DB without the principal_class column",
           "[pg][audit_store][backfill]") {
     YUZU_REQUIRE_PG_DB(db);
