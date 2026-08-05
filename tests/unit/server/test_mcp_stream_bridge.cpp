@@ -4148,6 +4148,7 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
             double failed{};
             double displaced{};
             std::size_t audits{};
+            std::size_t still_pinned{};
         };
         Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
         auto s = fx.make_session();
@@ -4179,6 +4180,12 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
         out.displaced =
             fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value();
         out.audits = fx.audit_count("mcp.bridge.pin_displaced_for_admission");
+        // POSITIVELY confirm the over-admission rather than inferring it from the absence
+        // of the displaced counter: the pin the reclaim selected is still HELD, so the
+        // session is genuinely one call over its cap. Without this the assertions above
+        // cannot distinguish "the release failed" from "the release worked and some other
+        // bookkeeping step went wrong".
+        out.still_pinned = s.stream->pinned_count();
         return out;
     };
 
@@ -4191,6 +4198,7 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
         // us, so attributing that loss to the admitting principal would be a false record.
         CHECK(out.displaced == 0.0);
         CHECK(out.audits == 0);
+        CHECK(out.still_pinned == 4);  // the pin was NOT released - the session is over cap
     }
 
     SECTION("the release throws (#2805): counted as failed, never as displaced") {
@@ -4200,5 +4208,51 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
         CHECK(out.raced == 0.0);  // the two arms are distinct, not aliases
         CHECK(out.displaced == 0.0);
         CHECK(out.audits == 0);
+        CHECK(out.still_pinned == 4);  // the pin was NOT released - the session is over cap
+    }
+}
+
+// QA-1: the UnpinFault seam's own one-shot/disarm contract, tested directly on a bare
+// McpStreamState with no bridge involved.
+//
+// This exists because a governance reviewer built the whole server suite against a
+// mutation that moved the throw ABOVE the decrement in unpin()'s seam - which would leave
+// a kThrow fault armed forever instead of firing `times` times - and all 235k assertions
+// stayed green. Nothing anywhere guarded the contract that the Resource Ledger asserts.
+// The sibling PublishFault seam has both a direct state-level test and several times=2
+// uses; this one had neither.
+TEST_CASE("UnpinFault: `times` fires exactly N times and then disarms",
+          "[mcp][stream][pins][ch26]") {
+    yuzu::MetricsRegistry reg;
+    mcp::McpStreamState state{mcp::kMcpRingCapDefault, &reg};
+
+    SECTION("kThrow with times=2 throws twice, then resumes normal service") {
+        const std::uint64_t id = state.publish_final("execution-completed", "{}");
+        REQUIRE(id != 0);
+        REQUIRE(state.pinned_count() == 1);
+
+        state.inject_unpin_fault_for_test(mcp::McpStreamState::UnpinFault::kThrow, 2);
+        CHECK_THROWS(state.unpin(id));
+        CHECK_THROWS(state.unpin(id));
+        // Disarmed: the third call does real work. If the decrement ran AFTER the throw
+        // this line would throw instead, and the pin would never clear.
+        CHECK(state.unpin(id));
+        CHECK(state.pinned_count() == 0);
+    }
+
+    SECTION("kRaceLost reports failure without clearing, then the next call clears") {
+        const std::uint64_t id = state.publish_final("execution-completed", "{}");
+        REQUIRE(id != 0);
+        REQUIRE(state.pinned_count() == 1);
+
+        state.inject_unpin_fault_for_test(mcp::McpStreamState::UnpinFault::kRaceLost);
+        CHECK_FALSE(state.unpin(id));
+        // The distinguishing assertion: a raced release must leave the pin ALONE. A seam
+        // that returned false while still clearing the slot would model the residual
+        // wrongly and every test built on it would be quietly meaningless.
+        CHECK(state.pinned_count() == 1);
+
+        CHECK(state.unpin(id));  // fault consumed
+        CHECK(state.pinned_count() == 0);
     }
 }

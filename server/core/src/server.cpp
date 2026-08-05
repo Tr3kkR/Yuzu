@@ -773,8 +773,8 @@ public:
                           "yuzu_mcp_bridge_pin_release_failed_total) each leave a session one "
                           "call over its cap until the next admission rejects. Rule all three "
                           "out against their counters before treating this as drift - the "
-                          "runbook owns the procedure, and the shipped alert nets them out, so "
-                          "alert on that rather than on this counter raw. The displaced final "
+                          "runbook owns the procedure. A SUCCESSFUL reclaim cannot cause this, so "
+                          "ordinary traffic does not move it. The displaced final "
                           "stays in the ring until ordinary eviction and remains fetchable by "
                           "execution_id.",
                           "counter");

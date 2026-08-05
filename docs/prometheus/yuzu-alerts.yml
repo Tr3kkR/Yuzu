@@ -180,32 +180,24 @@ groups:
             this is an allocation-pressure or stream-state signal worth paging.
       - alert: YuzuMcpStreamPinDisplaced
         expr: |
-          (
-            increase(yuzu_mcp_stream_pin_displaced_total[15m])
-            - increase(yuzu_mcp_bridge_pin_displaced_for_admission_total[15m])
-            - increase(yuzu_mcp_bridge_pin_release_raced_total[15m])
-            - increase(yuzu_mcp_bridge_pin_release_failed_total[15m])
-          ) > 0
-        for: 15m
+          increase(yuzu_mcp_stream_pin_displaced_total[15m]) > 0
         labels:
           severity: warning
         annotations:
-          summary: "MCP replay-ring pin displacement not explained by the #2740 reclaim or its residuals"
+          summary: "MCP replay-ring pin slots exhausted (corroborate before treating as drift)"
           description: >-
-            A session filled every replay-ring pin slot, and the displacement is
-            left over after subtracting the three paths that legitimately put a
-            session one call over its cap: the #2740 admission reclaim, a release
-            that lost a race (#2795), and a contained release throw (#2805). The
-            expression nets those out, so what remains is the case actually worth
-            investigating - admission accounting and the pin count genuinely
-            disagreeing. The server degraded gracefully either way: the oldest
-            pinned terminal yielded its eviction exemption to the newest, the
-            displaced final stays committed, and results remain fetchable by
-            execution_id. No restart - this is diagnostic, not an outage. Follow
-            docs/ops-runbooks/mcp-stream-pin-displacement.md; it owns the
-            procedure and this annotation is only a pointer to it. The meaning of
-            a full slot set is defined once, in McpStreamState's "What a FULL
-            PIN-SLOT SET means" block in server/core/src/mcp_stream.hpp.
+            A session filled every replay-ring pin slot and the oldest pin was
+            displaced. A SUCCESSFUL #2740 admission reclaim cannot cause this - it
+            releases one pin and adds one charge, so the session stays AT cap and a
+            slot is always free. Only two paths reach a full set: a release that lost
+            a race (yuzu_mcp_bridge_pin_release_raced_total, #2795) and a contained
+            release throw (yuzu_mcp_bridge_pin_release_failed_total, #2805). Rule
+            those two out; what remains is genuine admission-accounting drift. The
+            server degraded gracefully - the oldest pinned terminal yielded its
+            eviction exemption to the newest, the displaced final stays committed, and
+            results remain fetchable by execution_id. No restart; this is diagnostic,
+            not an outage. Follow docs/ops-runbooks/mcp-stream-pin-displacement.md - it
+            owns the procedure and this annotation only points at it.
           runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement"
       - alert: YuzuMcpStreamFinalUnpinned
         expr: |
@@ -297,7 +289,7 @@ groups:
             charge is outstanding, so a partial wedge (some pins stuck, one call
             genuinely in flight) is bucketed there and this alert cannot see it.
             Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
-          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement"
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpBridgePinReleaseFailed
         expr: |
           yuzu_mcp_bridge_pin_release_failed_total > 0
@@ -309,8 +301,9 @@ groups:
             The streamed-admission reclaim (#2740) selected a pin to release and the
             release itself THREW. This counts ONLY that throw - it does not count a
             release that merely lost a race to another release route, which is the
-            ordinary residual (#2795) and is deliberately silent. So a zero here does
-            NOT mean no session ever sat over its cap. It is contained deliberately: the new admission is
+            ordinary residual (#2795), counted separately as
+            yuzu_mcp_bridge_pin_release_raced_total. So a zero HERE does not mean no
+            session ever sat over its cap - check that counter too. It is contained deliberately: the new admission is
             already committed at that point, so letting the throw escape would leave a
             session slot nothing reclaims until the arming reaper fires. Like its
             sibling YuzuMcpBridgeChargeReleaseDeferred this needs a genuinely broken

@@ -369,23 +369,37 @@ public:
     ///
     /// ### What a FULL PIN-SLOT SET means  <a name="full-slot-set"></a>
     ///
-    /// **This block is the single home of that answer.** The `/metrics` HELP text, the
-    /// alert rules, the runbook, the user manual and the changelog all CITE it and none
-    /// of them restate it. That is deliberate and it is load-bearing: this one sentence
-    /// previously existed as a paraphrase in every file that mentioned it, and when #2740
-    /// falsified the claim, successive review rounds each found and fixed a different
-    /// subset. A claim with many homes cannot be kept true. If you change the answer, change
-    /// it HERE and check that the citations still point at it correctly.
+    /// **This block owns the DERIVATION.** The operator-facing surfaces - the runbook,
+    /// `/metrics` HELP, the alert annotations, the user manual - each carry their own
+    /// short, self-contained statement, because an SRE holding a shipped container image
+    /// does not have this file. They are NOT citations-in-place-of-content and this block
+    /// does not claim they are: an earlier revision asserted "none of them restate it",
+    /// which was false at all five sites it named.
+    ///
+    /// What this block is for: the arithmetic below is a proof obligation over
+    /// `McpStreamBridge::reserve`'s admission expression and `publish_impl`'s slot scan.
+    /// Change either and re-prove it HERE first, then propagate. The reason to keep one
+    /// authoritative derivation is that when #2740 falsified the old claim, successive
+    /// review rounds each found and fixed a different subset of its paraphrases - and the
+    /// round that introduced this block still got the arithmetic wrong in two places and
+    /// shipped one of them into an alert expression.
     ///
     /// Before #2740: a committed final with no free pin slot was unreachable - the bridge
     /// admits streamed records against `pinned_count() + unpinned` and this array is sized
     /// to exactly that cap - so reaching it MEANT admission accounting had drifted.
     ///
-    /// Since #2740 that inference no longer holds on its own, because three paths now put
-    /// a session transiently over its cap by design or by accepted residual:
+    /// Since #2740 that inference no longer holds on its own. Three paths now reach a full
+    /// slot set without drift - but only TWO of them put a session over its cap, and the
+    /// distinction is load-bearing (an earlier revision called all three over-cap paths and
+    /// that error was compiled straight into an alert expression that then subtracted a
+    /// non-cause):
     ///
     ///   1. the admission reclaim releases a pin DELIBERATELY, to admit a new streamed
-    ///      call in place of a final no wire took delivery of;
+    ///      call in place of a final no wire took delivery of. This does **NOT** put the
+    ///      session over cap and CANNOT by itself cause a displacement: it releases one
+    ///      pin and adds one charge, so the sum is unchanged, the session stays AT cap,
+    ///      and `publish_impl` always finds a free slot. It is listed here because it is
+    ///      why a full slot set is reachable at all - not as an over-admission;
     ///   2. #2795 - the release returns without having cleared the slot, because another
     ///      route got there first. Client-reachable (racing a GET resume against a POST
     ///      admission on the same session). Counted as
@@ -397,14 +411,21 @@ public:
     /// its pin from the orphan scan - and does not put a session over cap.)
     ///
     /// THE BOUND IS EXACTLY ONE, and it cannot compound: admission requires
-    /// `pinned + unpinned <= kMaxStreamedPostsPerSession` and adds exactly one charge, and
+    /// `effective_pinned + unpinned < kMaxStreamedPostsPerSession` (note the strict `<`,
+    /// and that `effective_pinned` already subtracts the at-most-one reclaim) and adds
+    /// exactly one charge, and
     /// `reclaimed` is capped at 1 per pass, so the post-state is at most cap + 1. The next
-    /// `reserve` re-reads both figures under the same `bridge_mu_` and rejects. "Transiently"
-    /// therefore means UNTIL THE NEXT ADMISSION REJECTS - which may be a while on an idle
-    /// session, not milliseconds.
+    /// `reserve` re-reads both figures under the same `bridge_mu_` and rejects.
+    ///
+    /// "Transiently" is held for the LIFETIME OF THE OVER-ADMITTED CALL - it ends when that
+    /// call's final publishes (which displaces a pin and settles the sum), when the extra
+    /// pin clears by another route, or when the next admission rejects. The bound is the
+    /// #2739 streamed-POST response cap, or the teardown reaper if the execution never
+    /// settles. Idleness is not the variable.
     ///
     /// So a full slot set is a SIGNAL TO CORROBORATE, not a verdict. Drift is what remains
-    /// after the three paths above are ruled out against their counters - and note that
+    /// after the two OVER-CAP paths above (2 and 3) are ruled out against their counters -
+    /// path 1 explains nothing, because it never puts the session over cap - and note that
     /// ruling out is only possible at all because (2) got its own counter; it previously
     /// moved none, which is precisely how a runbook came to instruct on-call to rule it out
     /// using two counters that both read flat in that exact case.
@@ -480,7 +501,9 @@ public:
         /// it, because the admission it belongs to has already committed by then.
         kThrow,
     };
-    /// `times` arms the same fault for the next N unpins (default 1 = one-shot).
+    /// `times` arms the same fault for the next N unpins (default 1 = one-shot). A THROWN
+    /// fault still consumes its charge - the counter is decremented before the throw - so
+    /// `times=2` means two throws and then normal service, not a permanently armed seam.
     void inject_unpin_fault_for_test(UnpinFault fault, int times = 1);
 
     /// Set a short human-readable log prefix (e.g. the session id) included in publish()'s

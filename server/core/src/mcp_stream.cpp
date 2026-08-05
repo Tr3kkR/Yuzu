@@ -20,6 +20,7 @@
 #include <random>
 #include <functional>
 #include <string_view>
+#include <stdexcept>  // std::runtime_error - the unpin() fault-injection seam throws it
 #include <system_error>
 #include <utility>
 
@@ -68,11 +69,11 @@ constexpr const char* kMetricFramesTruncated = "yuzu_mcp_stream_frames_too_large
 constexpr const char* kMetricPublishFailures = "yuzu_mcp_stream_publish_failures_total";
 // A committed final response was published with NO pin at all. Structurally unreachable
 // while the pin array is non-empty - a full slot set displaces its oldest pin instead
-// (kMetricPinDisplaced below, which carries that signal). Kept as
+// (kMetricPinDisplaced below). Kept as
 // defence in depth: non-zero means the array was resized to zero or the displacement
 // path was bypassed.
 constexpr const char* kMetricFinalUnpinned = "yuzu_mcp_stream_final_unpinned_total";
-/// An older pinned terminal yielded its eviction-exemption slot to a newer one. NOT expected:
+/// An older pinned terminal yielded its eviction-exemption slot to a newer one.
 /// the bridge admits streamed records against `pinned_count() + unpinned`, and the pin array is
 /// sized to exactly that cap. What a full set MEANS since #2740 is defined once -
 /// see McpStreamState's "What a FULL PIN-SLOT SET means" block (mcp_stream.hpp) - and deliberately not restated here. This

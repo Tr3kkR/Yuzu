@@ -72,7 +72,7 @@ constexpr const char* kMetricPinSlotsReject = "yuzu_mcp_bridge_pin_slots_reject_
 // #2740: a new streamed call reclaimed a slot from an already-committed final that
 // no wire took delivery of. This is the EXPECTED, healthy response to disconnecting
 // clients, so it is deliberately its own counter rather than a label on the ring's
-// yuzu_mcp_stream_pin_displaced_total - that family is the corroborate-before-filing signal and is
+// yuzu_mcp_stream_pin_displaced_total - that family is the corroborate-before-filing signal and alerts on >0 and is
 // alertable on > 0, and folding a routine event into it would destroy that alarm.
 constexpr const char* kMetricPinDisplacedForAdmission =
     "yuzu_mcp_bridge_pin_displaced_for_admission_total";
@@ -325,8 +325,8 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
     std::size_t pin_reject_unpinned = 0;
     auto pin_slots_held = PinSlotsHeld::kNotApplicable;
     std::optional<DisplacedPin> displaced;
-    bool release_failed = false;
-    bool release_raced = false;  // latched under bridge_mu_, emitted after release
+    bool release_failed = false;  // latched under bridge_mu_, emitted after it releases
+    bool release_raced = false;  // latched under bridge_mu_, emitted after it releases
     // Reserved for the reclaim audit detail, filled after selection and BEFORE the
     // commit block, so the only allocation that could throw on the reclaim path
     // happens while a throw still costs nothing (see the audit_contained call).
@@ -685,12 +685,12 @@ McpStreamBridge::select_displaceable_pin_locked(const std::string& session_id,
         return std::nullopt;
     }
     // ORPHANS FIRST. A pinned id no surviving record references has no route a
-// POST-ONLY client can reach: the pin-ack sweep needs a record, on_final_written
-// needs a record, and the teardown that erased the record did not unpin. It is
-// NOT unreachable in general - attach_and_replay's cursor ack walks pinned_ids_
-// directly with no record lookup and clears every slot at or below the cursor,
-// orphans included - but that needs a GET channel, which is exactly what the
-// locked-out client in #2740 does not have. Left
+            // POST-ONLY client can reach: the pin-ack sweep needs a record, on_final_written
+            // needs a record, and the teardown that erased the record did not unpin. It is
+            // NOT unreachable in general - attach_and_replay's cursor ack walks pinned_ids_
+            // directly with no record lookup and clears every slot at or below the cursor,
+            // orphans included - but that needs a GET channel, which is exactly what the
+            // locked-out client in #2740 does not have. Left
     // alone, four of these lock the session out of streamed POST permanently - the
     // exact defect #2740 is about, in the one shape a record scan cannot see.
     // Safe only because `projection_in_flight` is false above: that is what rules
