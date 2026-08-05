@@ -128,10 +128,11 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         // assignment after the arm) leaked the subscription and left a ghost index entry
         // that corrupted a future sibling attach. Every undo is a safe no-op if its
         // mutation never ran, and GuardianRollback's destructor is terminate-safe.
-        // SCOPE LIMIT (Sol B4): if backend_->arm() itself THROWS after partially mutating
-        // SparkEngine (a bad_alloc inside arm_impl, no subscription returned), armed_here
-        // stays false and this rollback cannot clean the engine's partial state - that is
-        // a SparkEngine strong-guarantee gap tracked separately as a PR-2 flip blocker.
+        // If backend_->arm() itself THROWS (a bad_alloc inside arm_impl, no subscription
+        // returned), armed_here stays false and this rollback undoes only the Guardian-side
+        // mutations - which is sufficient: SparkEngine::arm_impl is strong-guarantee as of
+        // #2270, so a throwing arm leaves NO engine-side state to repair. This comment
+        // previously recorded that as an open gap; it is closed.
         // (Fable rung-7.7b M3; extends Sol rung-7.5 finding 1.)
         std::shared_ptr<PerKey> pk;
         std::uint64_t sub = 0;
