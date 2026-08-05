@@ -46,6 +46,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -166,6 +167,30 @@ inline constexpr std::size_t kMaxAuditDeletesPerPass = 25000;
 /// the transaction size, and the steady state is unchanged because a pass that
 /// does NOT hit the cap goes back to the full interval.
 inline constexpr int kAuditBacklogRearmSec = 5;
+
+/// The retention guard's outcome probe, in one home so a test can assert its
+/// SHAPE (Gate 3 quality-engineer: reverting this query to the counting form it
+/// replaced left the entire suite green — the only evidence the fix worked was a
+/// hand-run EXPLAIN, so a future revert would ship silently).
+///
+/// Two properties are load-bearing and are what the test pins:
+///   * EXISTS, never a counting aggregate. The guard only ever asks "any?", and
+///     a `count(*) FILTER (...)` has no statement-level WHERE, so every row —
+///     including the `ttl_expires_at = 0` majority, which sits OUTSIDE the
+///     partial index — must be visited before either count is known.
+///   * the `ttl_expires_at > 0` predicate, which is what makes the partial index
+///     `idx_audit_ttl_id` eligible at all.
+///
+/// The test deliberately does NOT assert a query plan. The planner is
+/// cost-based, and at unit-test table sizes a sequential scan is legitimately
+/// cheaper; asserting "Index Only Scan" there would pin an accident. Gate 3
+/// performance measured the plans at 5M rows, and found the SURVIVOR half flips
+/// to a Seq Scan once a backlog exists — the probe is index-driven in the
+/// healthy and would-wipe cases, not unconditionally.
+inline constexpr std::string_view kAuditRetentionProbeSql =
+    "SELECT EXISTS(SELECT 1 FROM audit_store.audit_events WHERE ttl_expires_at > 0 AND "
+    "ttl_expires_at < $1::bigint), EXISTS(SELECT 1 FROM audit_store.audit_events WHERE "
+    "ttl_expires_at > 0 AND ttl_expires_at >= $1::bigint AND ttl_expires_at <= $2::bigint)";
 
 /// How long the retention thread waits before its next pass. Extracted so the
 /// DECISION is testable without driving the thread or the clock: the sleep is

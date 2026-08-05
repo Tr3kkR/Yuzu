@@ -1364,7 +1364,14 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         }
 
         // Detect by OUTCOME: two EXISTS probes answer the whole question, and
-        // both are answerable from the index alone. A forward-skewed row past
+        // both CAN be answered from the index — with a caveat the earlier
+        // wording did not carry: Gate 3 performance measured the SURVIVOR half
+        // flipping to a Seq Scan once a backlog exists, because the planner
+        // prefers a cheap-startup scan when survivors look plentiful and cannot
+        // know they sit at the end of the heap. Index-driven in the healthy and
+        // would-wipe cases; proportional to the backlog otherwise, and still
+        // well inside the pass timeout at the scale that was measured. A
+        // forward-skewed row past
         // `now + window + slack` can never expire, so it is EXCLUDED from the
         // survivor question — else one bad row vetoes the guard for the store's
         // life.
@@ -1385,10 +1392,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         // column.
         const std::int64_t datable_horizon = now + window + kAuditTtlFutureSlackSec;
         pg::PgResult probe = pg::exec_params(
-            conn,
-            "SELECT EXISTS(SELECT 1 FROM audit_store.audit_events WHERE ttl_expires_at > 0 AND "
-            "ttl_expires_at < $1::bigint), EXISTS(SELECT 1 FROM audit_store.audit_events WHERE "
-            "ttl_expires_at > 0 AND ttl_expires_at >= $1::bigint AND ttl_expires_at <= $2::bigint)",
+            conn, std::string(kAuditRetentionProbeSql).c_str(),
             std::vector<std::string>{std::to_string(now), std::to_string(datable_horizon)});
         if (probe.status() != PGRES_TUPLES_OK) {
             spdlog::error("AuditStore: reap probe failed: {}", PQerrorMessage(conn));

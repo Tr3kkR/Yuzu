@@ -684,6 +684,33 @@ TEST_CASE("AuditStore: a negative limit clamps rather than reporting a degrade",
           std::string::npos);
 }
 
+// Gate 3 quality-engineer, on a fix of mine: it reverted the retention probe to
+// the counting form PERF-1 replaced and the ENTIRE suite stayed green — the only
+// evidence the fix worked was a hand-run EXPLAIN in a commit message, so a
+// future revert would ship silently. This pins the two properties that make the
+// probe index-eligible. It asserts SHAPE, not a query plan: the planner is
+// cost-based and at this table size a sequential scan is legitimately cheaper,
+// so a plan assertion here would pin an accident rather than the contract.
+TEST_CASE("AuditStore: the retention probe stays EXISTS-shaped and index-eligible",
+          "[audit_store][retention]") {
+    const std::string sql{kAuditRetentionProbeSql};
+    // EXISTS, never a counting aggregate: a count with no statement-level WHERE
+    // must visit the ttl_expires_at = 0 majority, which sits outside the partial
+    // index, so it degenerates to a full scan of the evidence table every pass.
+    CHECK(sql.find("EXISTS(") != std::string::npos);
+    CHECK(sql.find("count(") == std::string::npos);
+    CHECK(sql.find("COUNT(") == std::string::npos);
+    CHECK(sql.find("FILTER") == std::string::npos);
+    // Both halves must carry the partial index's own predicate, or the index is
+    // not eligible at all.
+    std::size_t at = 0, predicates = 0;
+    while ((at = sql.find("ttl_expires_at > 0", at)) != std::string::npos) {
+        ++predicates;
+        at += 1;
+    }
+    CHECK(predicates == 2);
+}
+
 // Gate 3 performance: at one capped pass per hour the 25k cap stops being a
 // per-pass bound and becomes a permanent drain ceiling, below the rate the
 // store's own write path sustains. A pass that hits the cap AND leaves a real
@@ -699,6 +726,31 @@ TEST_CASE("AuditStore: a binding cap re-arms in seconds, everything else waits t
     // above the measured per-pass cost and well below the default interval.
     STATIC_REQUIRE(kAuditBacklogRearmSec > 0);
     STATIC_REQUIRE(kAuditBacklogRearmSec < 60);
+}
+
+// Gate 3 quality-engineer: no test drove a legacy audit.db whose audit_events
+// table EXISTS but is EMPTY. It is a distinct path from the sourceless exits —
+// there IS a source, so the prefix proof and reconciliation run; they just run
+// over zero rows.
+TEST_CASE("AuditStore: an empty legacy audit_events table completes as a real backfill",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bf14_"}};
+    auto legacy = dir.path / "audit.db";
+    build_legacy_audit_db(legacy, /*count=*/0); // table present, zero rows
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.migrate_from_sqlite(legacy));
+
+    CHECK(row_count(db.dsn()) == 0);
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE key = "
+                                 "'backfill_complete'") == "1");
+    CHECK_FALSE(std::filesystem::exists(legacy)); // moved aside like any verified backfill
+    // The write gate cleared, and the identity sequence is usable.
+    CHECK(store.log(mk("admin", "post.empty.backfill")));
+    CHECK(row_count(db.dsn()) == 1);
 }
 
 // Gate 3 cpp-safety. A backfill that STARTED and did not finish gates the write
