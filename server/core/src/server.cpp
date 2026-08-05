@@ -650,8 +650,10 @@ public:
                           "routine event in would destroy that alarm. Do not page on it; a "
                           "sustained rate is a CLIENT-fleet signal (peers dropping before "
                           "collection), and each event also emits an audit row "
-                          "(mcp.bridge.pin_displaced_for_admission) naming the principal and the "
-                          "execution whose result lost its eviction exemption",
+                          "(mcp.bridge.pin_displaced_for_admission) naming the principal that "
+                          "caused it. That row's target is the execution whose result lost its "
+                          "exemption EXCEPT for an orphan, where no record survives to name one "
+                          "and the detail carries the ring event id instead",
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_charge_release_deferred_total",
                           "Streamed admission charges that could not be released at their natural "

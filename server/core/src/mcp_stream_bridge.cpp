@@ -348,7 +348,18 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
             // The reclaimed slot counts as free for THIS decision: it is released
             // below on the same `bridge_mu_` hold, so no concurrent reserve can
             // observe the interim state and over-admit.
-            const std::size_t effective_pinned = pinned - (displaced.has_value() ? 1U : 0U);
+            //
+            // `pinned` is RE-READ rather than reused from above: `teardown_claimed`
+            // publishes (and so can pin) WITHOUT `bridge_mu_`, so a pin can appear
+            // between the first count and the selection snapshot. Subtracting from
+            // the stale figure would then credit a slot that was never counted and
+            // admit one call over the per-session cap. The clamp is belt-and-braces
+            // for the same reason the re-read exists - `pinned` is unsigned, and a
+            // count that reads 0 here must not wrap to SIZE_MAX and reject for the
+            // wrong reason.
+            const std::size_t pinned_now = rec->stream->pinned_count();
+            const std::size_t reclaimed = displaced.has_value() && pinned_now > 0 ? 1U : 0U;
+            const std::size_t effective_pinned = pinned_now - reclaimed;
             if (effective_pinned + unpinned >= kMaxStreamedPostsPerSession) {
                 reject = "pin_slots";
                 displaced.reset();  // rejecting: nothing is released, nothing to report
@@ -431,13 +442,19 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
         // as meaning the bridge's own background work. Stamping that here would
         // put a client-caused release beyond non-repudiation (Decision 15(j)) and
         // hide it from any SIEM rule keyed on `principal != "system"`.
+        // An ORPHAN has no surviving record, so `target_id` is necessarily empty
+        // and the ring event id is the only handle the row can carry - it is what
+        // joins this row to the ring frame and to the later reap. Carried in the
+        // detail rather than leaving the row naming nothing at all.
         audit_contained("mcp.bridge.pin_displaced_for_admission", displaced->execution_id,
                         displaced->orphan
                             ? "orphan pin released to admit a new streamed call on this session"
                             : "pin released to admit a new streamed call on this session",
                         displaced->orphan
-                            ? "no record referenced it - its owning record was already torn "
-                              "down; the result stays fetchable by execution_id"
+                            ? "no record referenced it - its owning record was already torn down; "
+                              "the result stays fetchable by execution_id; released ring "
+                              "event_id=" +
+                                  std::to_string(displaced->event_id)
                             : "final undelivered as far as the bridge can see; still fetchable "
                               "by execution_id and in the ring until ordinary eviction",
                         AuditResult::kSuccess, principal);
