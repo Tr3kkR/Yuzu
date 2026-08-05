@@ -1206,26 +1206,41 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             return false; // fail closed — roll back the whole pass
         }
 
-        // Detect by OUTCOME: two counts answer the whole question and stay
-        // index-driven. A forward-skewed row past `now + window + slack` can
-        // never expire, so it is EXCLUDED from the survivor question — else one
-        // bad row vetoes the guard for the store's life.
+        // Detect by OUTCOME: two EXISTS probes answer the whole question, and
+        // both are answerable from the index alone. A forward-skewed row past
+        // `now + window + slack` can never expire, so it is EXCLUDED from the
+        // survivor question — else one bad row vetoes the guard for the store's
+        // life.
+        //
+        // EXISTS, NOT `count(*) FILTER (...)`. The guard only ever asks "any?",
+        // and the counting form has no statement-level WHERE, so every row —
+        // including the `ttl_expires_at = 0` majority, which sits OUTSIDE the
+        // partial index `idx_audit_ttl_id ... WHERE ttl_expires_at > 0` declared
+        // in kMigrations above — must be visited before either count is known.
+        // That is a full scan of the audit trail on every pass, on the one table
+        // designed to grow without bound (Gate 3 performance PERF-1; plan
+        // evidence in the commit message). EXISTS carries the `> 0` predicate
+        // into the index and stops at the first matching row.
+        //
+        // The SQLite-side note about `BETWEEN` being load-bearing does NOT
+        // transfer: Postgres expands BETWEEN to exactly these two comparisons,
+        // and either way the pair is one index range condition on the leading
+        // column.
         const std::int64_t datable_horizon = now + window + kAuditTtlFutureSlackSec;
         pg::PgResult probe = pg::exec_params(
             conn,
-            "SELECT count(*) FILTER (WHERE ttl_expires_at > 0 AND ttl_expires_at < $1::bigint) AS "
-            "expiring, count(*) FILTER (WHERE ttl_expires_at > 0 AND ttl_expires_at >= $1::bigint "
-            "AND ttl_expires_at <= $2::bigint) AS survivor FROM audit_store.audit_events",
+            "SELECT EXISTS(SELECT 1 FROM audit_store.audit_events WHERE ttl_expires_at > 0 AND "
+            "ttl_expires_at < $1::bigint), EXISTS(SELECT 1 FROM audit_store.audit_events WHERE "
+            "ttl_expires_at > 0 AND ttl_expires_at >= $1::bigint AND ttl_expires_at <= $2::bigint)",
             std::vector<std::string>{std::to_string(now), std::to_string(datable_horizon)});
         if (probe.status() != PGRES_TUPLES_OK) {
             spdlog::error("AuditStore: reap probe failed: {}", PQerrorMessage(conn));
             return false;
         }
-        const std::int64_t expiring = to_i64(PQgetvalue(probe.get(), 0, 0));
-        const std::int64_t survivor = to_i64(PQgetvalue(probe.get(), 0, 1));
+        const bool has_expired = to_bool(PQgetvalue(probe.get(), 0, 0));
+        const bool has_survivor = to_bool(PQgetvalue(probe.get(), 0, 1));
 
-        const bool has_expired = expiring > 0;
-        const bool would_wipe = has_expired && survivor == 0;
+        const bool would_wipe = has_expired && !has_survivor;
         // Supplement to would_wipe: a half-window jump expires a large slice
         // while leaving survivors, which the cap bounds but nothing else reports.
         // Gated on window > 0 and strictly greater than the absolute floor.
@@ -1306,7 +1321,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                 return false;
             }
         }
-        if (expiring == 0)
+        if (!has_expired)
             return true; // nothing to do
 
         // Bounded, oldest-first delete so even an allowed wipe ages out at a
