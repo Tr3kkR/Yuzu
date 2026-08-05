@@ -78,6 +78,27 @@ Yuzu has strong product depth (agent/server/gateway architecture, RBAC, policy e
 
 - SSO configuration records, role assignment exports, access review sign-offs, and sampled auth logs.
 
+**Addendum — the access-review export was readable by any authenticated user on a
+default install until #2376 (CC6.2/CC6.1).** Recorded here because this section cites
+"role assignment exports, access review sign-offs" as CC6.2 evidence, and that evidence
+surface carried a real access-control gap for the period before #2376 shipped. RBAC
+ships **disabled** by default, and with it disabled the pre-RBAC legacy fallback in
+`require_permission` allowed **every** `Read` to any authenticated non-engine session —
+so `GET /api/v1/access-reviews/export`, which produces the complete fleet-wide grant
+population, was readable by a plain `user` on the shipped default posture, despite being
+nominally gated on the dedicated `AccessReview:Read` securable that #2324 cut for exactly
+this purpose. The same was true of `GET /api/v1/rbac/roles` and the engine-principal
+grant graph.
+
+#2376 closes it: those three reads now require an `admin` effective role regardless of
+the RBAC toggle, enforced at a single chokepoint (`authz_topology_floor.hpp`), with a
+dedicated `yuzu_auth_topology_floor_denied_total{permission}` counter as the queryable
+CC7.2 signal. An auditor testing this control should attempt each read with a non-admin
+session on an RBAC-off install and expect `403`. **For any assessment covering a period
+before #2376, treat the grant-population export as having been accessible to all
+authenticated principals unless RBAC was explicitly enabled on that deployment.** Full
+decision record: `docs/security-reviews/authz-topology-floor-2026-08-05.md`.
+
 **Addendum — machine-identity resource-bounding (CC6.6, PR 4.4).** Engine
 principals (ADR-1005 class) are already least-privilege by construction —
 default-deny RBAC resolution, structurally barred from admin/built-in/

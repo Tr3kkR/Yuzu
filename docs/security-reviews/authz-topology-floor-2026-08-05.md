@@ -191,6 +191,34 @@ so that class of change is exactly what needs a version-gated migration.
 Adding a brand-new securable with brand-new grants has no equivalent
 removal step, so it needed none here.
 
+**The cost of this choice, recorded deliberately (governance UP-4).** The
+property that makes no-migration work — `seed_defaults()` re-seeding
+unconditionally on every boot — is the same property that means a grant an
+operator **deliberately revokes** does not stay revoked. If an operator
+removes `('Viewer', 'EnginePrincipal', 'Read')` while the `EnginePrincipal`
+securable row remains, the next restart re-inserts it via `INSERT OR IGNORE`,
+with no audit line distinguishing "re-seeded by boot" from "set by an
+operator". An operator's least-privilege narrowing is silently undone.
+
+This is **pre-existing and repo-wide**: it is true of every one of the 23
+seeded securables and every built-in role grant, and was true before this
+change. It is recorded here rather than left implicit because this change
+does not merely inherit the behaviour — it *depends* on it, and a decision
+doc that cites the upside of unconditional re-seeding while omitting its
+downside would be selectively honest. Two consequences follow, and neither is
+addressed here:
+
+- the durable fix is a tombstone mechanism (an operator-revoked tuple that
+  seeding must not resurrect), which is a change to seeding semantics across
+  every securable — out of scope for this change, tracked separately;
+- until then, an operator narrowing a built-in role's grant must expect it to
+  revert on restart, and should express the narrowing as a custom role or an
+  explicit `deny` row instead.
+
+`rbac_store.cpp`'s v4 migration is the only existing precedent for permanent
+removal, and it is one-way and version-gated precisely because `INSERT OR
+IGNORE` cannot express a deletion.
+
 ## Hard-invariant check
 
 - The floor set is a fixed, `constexpr` array (`kTopologyFloor`) — no

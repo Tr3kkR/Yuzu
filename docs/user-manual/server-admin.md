@@ -280,6 +280,35 @@ UI or `RbacStore::set_permission()` directly. `Security:Read` alone no
 longer reaches `/api/v1/engine-principals*` or its MCP twins after this
 upgrade.
 
+**Check your automation, not just your operators — this is the failure that
+hides.** Neither breaking direction produces a startup warning or a migration
+prompt. Both surface only as a `403` at some later moment, and that moment may
+be inside a script rather than in front of a person. Audit anything
+non-interactive that reads the three floored surfaces
+(`/api/v1/access-reviews/export`, `/api/v1/rbac/roles`,
+`/api/v1/engine-principals*` and their MCP twins) under a **non-admin** token:
+
+- A **compliance evidence collector** is the dangerous case. If it pulls the
+  access-review export on a schedule and treats a non-`2xx` as "no grants to
+  report" rather than as a hard failure, it will keep succeeding while
+  silently collecting nothing — potentially for a whole audit period. Confirm
+  yours fails loudly on `403`, and re-check the first collection after upgrade.
+- A **monitoring or inventory job** on a non-admin token will start logging
+  `403`s rather than breaking visibly.
+
+Either enable RBAC and grant the job's principal the appropriate role
+(`Reviewer` for access reviews, `EnginePrincipal:Read` for engine-principal
+reads), or move the job to an admin credential.
+
+**One caveat on revoking a built-in role's grant.** Because the seed loops
+above run on *every* boot, a grant you deliberately remove from a built-in
+role — for example revoking `Viewer`'s `EnginePrincipal:Read` — is re-inserted
+on the next restart, with no audit line distinguishing it from an
+operator-set grant. This is long-standing behaviour for every seeded
+securable, not new here, but it is worth knowing before you narrow a built-in
+role: express the narrowing as a **custom role** or an explicit `deny` row
+instead, both of which survive a restart.
+
 ### vNEXT — the `mcp.` instruction-definition id prefix is reserved (#2442) (breaking)
 
 **Who this affects.** Anyone whose instruction definitions include an id beginning `mcp.`. No

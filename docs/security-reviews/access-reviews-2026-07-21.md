@@ -48,6 +48,18 @@ was corrected).
   schema `access_review_store`) — born-on-Postgres (ADR-0006), two tables
   (`access_review_campaign`, `access_review_attestation`), authoritative/
   fail-hard posture (ADR-0012 §1).
+> **Addendum (2026-08-05, #2376) — read the "granted only to" claims below as
+> RBAC-ON-scoped until #2376.** This document describes the `AccessReview`
+> securable's grant model accurately, but that model only governed access when
+> RBAC was *enabled*. RBAC ships **disabled** by default, and with it disabled
+> the pre-RBAC legacy fallback in `require_permission` allowed every `Read` to
+> any authenticated non-engine session — so on a default install the
+> fleet-wide grant export was reachable by a plain `user` regardless of the
+> dedicated securable this review cut. #2376 closes that with an admin floor
+> that holds regardless of the RBAC toggle, which makes the statements below
+> true unconditionally rather than only under RBAC-on. See
+> `docs/security-reviews/authz-topology-floor-2026-08-05.md`.
+
 - **RBAC:** new dedicated `AccessReview` securable type with two operations,
   `Read` (export/get/list) and `Attest` (open/attest/close), granted only to
   `Administrator` and a new seeded `Reviewer` role (`AccessReview:Read` +
