@@ -1121,11 +1121,25 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
         }
         std::vector<std::pair<std::string, std::string>> meta_rows;
         int rc = SQLITE_DONE;
+        // LENGTH-AWARE, not C-string: `std::string(const char*)` stops at the
+        // first embedded NUL, which for `key` would silently rename the row
+        // (a truncated key still writes, just under the wrong name) and for
+        // `value` would carry a truncated reading past the "unparseable is
+        // an anomaly" check below instead of into it — e.g. a legacy value
+        // of `"0\0junk"` (non-INTEGER, so this branch runs) would truncate to
+        // `"0"`, which parses as a clean anchor of 0 rather than the unusable
+        // reading it actually is. Same `sqlite3_column_bytes` pattern as the
+        // row-copy `col()` lambda above.
+        const auto meta_col = [&](int i) {
+            const auto* v = sqlite3_column_text(ms.get(), i);
+            const int n = sqlite3_column_bytes(ms.get(), i);
+            return v ? std::string(reinterpret_cast<const char*>(v), static_cast<std::size_t>(n))
+                     : std::string{};
+        };
         while ((rc = sqlite3_step(ms.get())) == SQLITE_ROW) {
-            const auto* k = sqlite3_column_text(ms.get(), 0);
-            if (!k)
+            if (!sqlite3_column_text(ms.get(), 0))
                 continue;
-            std::string key(reinterpret_cast<const char*>(k));
+            std::string key = meta_col(0);
             // Never carry a stale marker across; it is stamped fresh below.
             if (key == "backfill_complete")
                 continue;
@@ -1142,10 +1156,10 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
                              "is not an INTEGER; carrying it across as the non-numeric text it is, "
                              "so the clock guard treats it as an unusable reading rather than 0",
                              key);
-                const auto* v = sqlite3_column_text(ms.get(), 1);
                 meta_rows.emplace_back(std::move(key),
-                                       v ? sanitize_pg_text(reinterpret_cast<const char*>(v))
-                                         : std::string{"corrupt"});
+                                       sqlite3_column_text(ms.get(), 1)
+                                           ? sanitize_pg_text(meta_col(1))
+                                           : std::string{"corrupt"});
                 continue;
             }
             meta_rows.emplace_back(std::move(key),

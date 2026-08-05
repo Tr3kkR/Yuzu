@@ -780,6 +780,70 @@ TEST_CASE("AuditStore: an empty legacy audit_events table completes as a real ba
     CHECK(row_count(db.dsn()) == 1);
 }
 
+TEST_CASE("AuditStore: a NUL-embedded legacy meta value is carried intact, not truncated",
+          "[pg][audit_store][backfill]") {
+    // Round-2 fix-round defect: the meta-copy branch read a non-INTEGER value
+    // via sqlite3_column_text + an implicit strlen'd std::string(const char*)
+    // constructor, silently dropping everything past the first embedded NUL
+    // — the exact truncation-not-defanging trap the row-copy col() lambda a
+    // few dozen lines above already guards against and cites in its own
+    // comment. "0\0junk" is NOT usable here: this build's SQLite coerces it
+    // to a clean INTEGER 0 at BIND time (its own numeric-affinity check also
+    // stops at the first NUL), never reaching the vulnerable TEXT branch at
+    // all — measured directly against this checkout's vcpkg sqlite3 before
+    // writing this test. "junk\0more" starts with a non-digit, so no
+    // affinity coercion applies and the TEXT branch is genuinely exercised.
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bfnul_"}};
+    auto legacy = dir.path / "audit.db";
+    std::filesystem::create_directories(legacy.parent_path());
+    {
+        SqliteDb sdb;
+        REQUIRE(sqlite3_open(legacy.string().c_str(), sdb.addr()) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(sdb.get(),
+                             "CREATE TABLE audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                             "timestamp INTEGER NOT NULL, principal TEXT NOT NULL, "
+                             "principal_role TEXT NOT NULL, action TEXT NOT NULL, target_type TEXT, "
+                             "target_id TEXT, detail TEXT, source_ip TEXT, user_agent TEXT, "
+                             "session_id TEXT, result TEXT NOT NULL, ttl_expires_at INTEGER "
+                             "DEFAULT 0, principal_class TEXT NOT NULL DEFAULT '');",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(sdb.get(),
+                             "CREATE TABLE audit_retention_meta (key TEXT PRIMARY KEY, value "
+                             "INTEGER NOT NULL);",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+        SqliteStmt stmt;
+        REQUIRE(sqlite3_prepare_v2(sdb.get(),
+                                   "INSERT INTO audit_retention_meta (key, value) VALUES "
+                                   "('last_pass_now', ?)",
+                                   -1, stmt.addr(), nullptr) == SQLITE_OK);
+        const char nul_value[] = "junk\0more"; // 9 bytes; sizeof() includes the trailing '\0'
+        REQUIRE(sqlite3_bind_text(stmt.get(), 1, nul_value, sizeof(nul_value) - 1,
+                                  SQLITE_STATIC) == SQLITE_OK);
+        REQUIRE(sqlite3_step(stmt.get()) == SQLITE_DONE);
+    }
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.migrate_from_sqlite(legacy));
+
+    // "more" was not dropped — sanitize_pg_text defangs the embedded NUL
+    // (U+FFFD) rather than losing the bytes after it. A truncating read
+    // would carry only "junk" (4 bytes) into Postgres and lose "more"
+    // entirely.
+    auto raw = query_scalar(
+        db.dsn(), "SELECT value FROM audit_store.audit_retention_meta WHERE key = 'last_pass_now'");
+    CHECK(raw.find("more") != std::string::npos);
+
+    // End-to-end: either way (truncated to "junk" or carried intact) this
+    // value is non-numeric, so the clock guard treats it as an unusable
+    // reading (BadState) rather than crashing or silently anchoring — the
+    // data-loss regression above is the one this test exists to catch.
+    CHECK(store.cleanup_once(pg_now(db.dsn())) == 0);
+    CHECK(store.clock_anomaly_skips_count() == 1);
+}
+
 // Gate 3 cpp-safety. A backfill that STARTED and did not finish gates the write
 // path. `ServerImpl`'s constructor sets `startup_failed_` and then keeps
 // constructing — several of its audit hooks are guarded only on `is_open()` —
