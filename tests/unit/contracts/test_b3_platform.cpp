@@ -713,6 +713,7 @@ TEST_CASE("ADR-0031 B3 response rejects ambiguous and malformed outcomes",
         REQUIRE_FALSE(decoded.has_value());
         CHECK(decoded.error().code == contracts::ContractErrorCode::InvalidValue);
         CHECK(decoded.error().path == "/contract");
+        CHECK(decoded.error().message == "A4 errors do not carry a B3 contract header");
     }
 
     SECTION("A4 retry field is required") {
