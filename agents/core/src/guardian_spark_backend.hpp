@@ -74,12 +74,14 @@ public:
         // `return false`, which apply_rules does not count -> generation advanced ->
         // silent enforcement hole; Fable B4->B1 finding). The propagating throw is
         // terminate-safe (GuardianRollback), cannot corrupt the index (strong-guarantee
-        // add), and since #2270 leaves no partial arm_impl state in the engine either -
-        // arm_impl repairs its own bookkeeping when the throw comes from its allocating
-        // commit, which is the bad_alloc case this branch is about. That is a statement about
-        // engine state, NOT a claim that the arm succeeded or that siblings are
-        // unaffected: a watch that fails to arm still fails for everyone sharing the
-        // key (#2270 UP-9, pre-existing).
+        // add), and since #2270 leaves no partial arm_impl state in the engine either.
+        // Precisely: a bad_alloc can escape arm_impl only from its pre-commit/in-lock
+        // phase, whose rollback restores armed_/sub_keys_ exactly, because past the
+        // commit every allocating statement left is inside a catch-all. The residuals
+        // are enumerated in arm_impl and deliberately not restated here. That is a
+        // statement about engine state, NOT a
+        // claim that the arm succeeded or that siblings are unaffected: a watch that
+        // fails to arm still fails for everyone sharing the key (#2270 UP-9, pre-existing).
         // STILL OPEN (#2797): the returned-error arm of that same sentence. apply_rules
         // discards reconcile_rule_locked's bool, so the generation-hold described above
         // fires ONLY on a throw - a returned arm failure still advances the generation

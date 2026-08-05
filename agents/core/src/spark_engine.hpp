@@ -90,6 +90,11 @@ struct SparkEngineStats {
     /// resource-gate cross-check doesn't mistake it for `ps -T` (governance S1).
     std::uint64_t watcher_units{0};
     std::uint64_t watch_faults_total{0}; ///< mechanism fault reports (post-arm deaf edges), monotonic
+    /// Mechanism unwatch() calls that THREW during the consumer-race teardown
+    /// (#2270). Non-zero means an OS watch outlived its armed_ entry and will
+    /// persist until stop() — the one residual teardown_arm_race cannot repair.
+    /// Monotonic; see teardown_arm_race() for why it is contained, not propagated.
+    std::uint64_t unwatch_failures_total{0};
     std::uint64_t consumer_threads_detached{0}; ///< handlers that blocked past the shutdown budget
     std::uint64_t events_total{0};       ///< spark fires (post-dedup, pre-fan-out)
     std::uint64_t queued_delivered_total{0};
@@ -248,6 +253,15 @@ public:
     /// ghost-subscription race window (#1994) instead of a timing-dependent
     /// stress loop. Same set-then-use contract as the other race-hook seams.
     void set_arm_race_hook_for_test(std::function<void()> hook);
+    /// Test seam (#2270): if set, invoked once inside arm() AFTER the consumer
+    /// pre-check releases consumers_mu_ and BEFORE arm_impl() runs — no locks
+    /// held. This is the only deterministic reach into the FIRST half of the M1
+    /// window: set_arm_race_hook_for_test fires after the insert, so a hook that
+    /// unregisters from there has unregister_consumer() perform the teardown
+    /// itself and arm_impl's own teardown degenerates to a no-op. Unregistering
+    /// from HERE leaves nothing for the scan to find, so the teardown's real-work
+    /// branch (including the OS unwatch) runs. Same set-then-use contract.
+    void set_arm_precheck_race_hook_for_test(std::function<void()> hook);
     /// Test seam: if set, invoked once inside disarm() and
     /// unregister_consumer(), after mu_ is released and before the
     /// staleness-rechecked mechanism unwatch() call — lets a test
@@ -264,6 +278,17 @@ public:
     /// node is allocated: a throw here must leave armed_/sub_keys_ exactly as on
     /// entry (the in-lock layer).
     static constexpr int kArmFaultPhaseBeforeSubKeys = 1;
+    /// Reached inside watch_guarded()'s catch arms, before the watch error is
+    /// completed from its pre-sized buffer. Pins CONTAINMENT, not rollback: a throw
+    /// here must not escape watch_guarded (it would escape arm_impl past a committed
+    /// subscription — the #2270 ghost — and escape the void start() on the replay
+    /// path). DEFENCE IN DEPTH, not a live-path guard: completion is BoundedMsg::finish,
+    /// which is noexcept by construction, so no production statement at this point can
+    /// throw today. The seam pins that property portably, on the platforms where the
+    /// Linux-only allocation counter in the tests cannot run.
+    /// CONTRACT: fires with this spark type's mech_ops_mu_by_type_ entry HELD. Throw or
+    /// observe only — re-entering the engine self-deadlocks on that non-recursive mutex.
+    static constexpr int kArmFaultPhaseWatchErrorBuild = 2;
 
 private:
     struct Subscriber {
@@ -338,10 +363,23 @@ private:
 
     std::expected<SubscriptionId, std::string> arm_impl(SparkSpec spec, Subscriber sub);
     /// Drop one spark key and every subscription fanned out from it. Caller holds
-    /// mu_ and owns any OS-watch teardown. The single teardown used by BOTH failed-
-    /// arm paths (a failed watch, and arm_impl's post-commit rollback) — see the
-    /// definition for why a failed arm drops the whole key rather than one sub.
+    /// mu_ and owns any OS-watch teardown. Used by arm_impl's failed-WATCH teardown
+    /// — see the definition for why a failed watch drops the whole key rather than
+    /// one sub. The consumer-race path does NOT use it: losing that race invalidates
+    /// one subscription, not the key, so it goes through teardown_arm_race().
+    /// (The post-commit rollback this doc used to name was deleted in 6c1d6942.)
+    /// Allocates nothing — map/node erases and string compares only.
     void drop_key_locked(const std::string& key);
+    /// Undo ONE subscription after arm_impl loses the M1 consumer race, allocating
+    /// nothing (the caller owns `key` and `type`, so nothing has to be copied). A
+    /// specialization of disarm(), which cannot be used here: it copies the key,
+    /// formats a log line and copies the key again (disarm(), three sites) — under
+    /// the memory pressure #2270 is about, any of those can throw and strand the
+    /// subscription this call exists to remove. Keep the two in lockstep.
+    /// NOT noexcept: mutex acquisition can raise std::system_error (the residual
+    /// stated in arm_impl); turning that into std::terminate would be worse.
+    void teardown_arm_race(SubscriptionId id, const std::string& key, SparkType type,
+                           bool event_driven);
     /// Validate + normalise (cadence flooring). Returns the effective cadence
     /// (0 for the event-driven and startup types, which have no wheel cadence).
     std::expected<std::uint64_t, std::string> validate_and_floor(const SparkSpec& spec) const;
@@ -488,6 +526,7 @@ private:
     std::atomic<std::uint64_t> consumer_join_budget_ms_{kConsumerJoinBudgetMs}; ///< test seam
     std::function<void()> register_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
     std::function<void()> arm_race_hook_for_test_;      ///< test seam; null = no-op (set-then-use)
+    std::function<void()> arm_precheck_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
     std::function<void(int)> arm_fault_hook_for_test_;  ///< test seam; null = no-op (set-then-use)
     std::function<void()> disarm_race_hook_for_test_;   ///< test seam; null = no-op (set-then-use)
 
@@ -498,6 +537,7 @@ private:
     std::shared_ptr<DeliveryCounters> delivery_{std::make_shared<DeliveryCounters>()};
     std::atomic<std::uint64_t> consumer_threads_detached_{0};
     std::atomic<std::uint64_t> watch_faults_{0}; ///< monotonic mechanism fault-report count
+    std::atomic<std::uint64_t> unwatch_failures_{0}; ///< monotonic throwing-unwatch count (#2270)
 
     // Counters updated outside mu_ (delivery paths) — atomics.
     std::atomic<std::uint64_t> events_total_{0};
