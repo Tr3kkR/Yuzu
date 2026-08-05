@@ -68,11 +68,20 @@ public:
 void* tally_and_alloc(std::size_t n, std::size_t align) {
     if (g_counting)
         ++g_allocs;
-    // A zero-size request must still yield a distinct pointer.
-    void* p = (align > alignof(std::max_align_t))
-                  ? std::aligned_alloc(align, ((n == 0 ? 1 : n) + align - 1) / align * align)
-                  : std::malloc(n == 0 ? 1 : n);
-    return p;
+    const std::size_t want = (n == 0 ? 1 : n); // zero-size must still yield a distinct pointer
+    if (align > alignof(std::max_align_t)) {
+        // Round UP to a multiple of align, as aligned_alloc requires — but the naive
+        // (want + align - 1) / align * align WRAPS for huge want. Measured: want =
+        // SIZE_MAX - 5 with align 64 rounds to 0, and glibc's aligned_alloc(64, 0)
+        // returns a NON-NULL pointer, so operator new would hand back a 64-byte block
+        // for an ~18-exabyte request and the caller would write far past it
+        // (governance round 4, cs-1). Refuse the request instead; the caller's
+        // new_handler loop then throws bad_alloc, which is the correct outcome.
+        if (want > SIZE_MAX - (align - 1))
+            return nullptr;
+        return std::aligned_alloc(align, (want + align - 1) / align * align);
+    }
+    return std::malloc(want);
 }
 
 /// malloc-or-new_handler loop, per [new.delete.single].
@@ -84,6 +93,18 @@ void* alloc_or_throw(std::size_t n, std::size_t align) {
         if (h == nullptr)
             throw std::bad_alloc{};
         h();
+    }
+}
+
+/// The nothrow forms must still run an installed new_handler — [new.delete.single]
+/// specifies them as calling the throwing form and converting bad_alloc to nullptr,
+/// not as skipping the handler. Calling tally_and_alloc directly (as an earlier
+/// revision did) silently bypassed it (governance round 4, cs-1).
+void* alloc_nothrow(std::size_t n, std::size_t align) noexcept {
+    try {
+        return alloc_or_throw(n, align);
+    } catch (...) {
+        return nullptr;
     }
 }
 } // namespace
@@ -99,16 +120,16 @@ void* operator new[](std::size_t n, std::align_val_t a) {
     return alloc_or_throw(n, static_cast<std::size_t>(a));
 }
 void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
-    return tally_and_alloc(n, alignof(std::max_align_t));
+    return alloc_nothrow(n, alignof(std::max_align_t));
 }
 void* operator new[](std::size_t n, const std::nothrow_t&) noexcept {
-    return tally_and_alloc(n, alignof(std::max_align_t));
+    return alloc_nothrow(n, alignof(std::max_align_t));
 }
 void* operator new(std::size_t n, std::align_val_t a, const std::nothrow_t&) noexcept {
-    return tally_and_alloc(n, static_cast<std::size_t>(a));
+    return alloc_nothrow(n, static_cast<std::size_t>(a));
 }
 void* operator new[](std::size_t n, std::align_val_t a, const std::nothrow_t&) noexcept {
-    return tally_and_alloc(n, static_cast<std::size_t>(a));
+    return alloc_nothrow(n, static_cast<std::size_t>(a));
 }
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete[](void* p) noexcept { std::free(p); }
@@ -195,9 +216,12 @@ private:
     spdlog::level::level_enum prev_;
 };
 
-/// Grow sub_keys_'s bucket array past anything the measured arm needs, so a
-/// rehash cannot land inside a measurement and read as an engine allocation.
-void warm_buckets(SparkEngine& engine, SparkEngine::ConsumerId c) {
+/// Warm the malloc arena with arm/disarm churn before a measurement, so first-touch
+/// arena growth cannot land inside a counted window and read as an engine allocation.
+/// NOT a bucket/rehash warm-up: `sub_keys_` is a std::map (a red-black tree), so it
+/// has no bucket array and never rehashes — it allocates exactly one node per insert.
+/// An earlier version of this comment claimed otherwise (governance round 4, sec-3).
+void warm_arena(SparkEngine& engine, SparkEngine::ConsumerId c) {
     std::vector<SparkEngine::SubscriptionId> ids;
     for (int i = 0; i < 128; ++i) {
         auto s = engine.arm(c, SparkSpec{SparkType::Interval,
@@ -235,10 +259,13 @@ TEST_CASE("the interposer actually reaches the engine's allocations", "[spark][a
 
 TEST_CASE("arm_impl: the failed-watch path allocates nothing after the commit (#2270)",
           "[spark][alloc]") {
-    // The window round 3 got wrong. Counting starts inside the mechanism's
-    // watch() — i.e. after the commit, after the publish, after the "armed" log —
-    // and ends when arm() returns, so it covers exactly: the mechanism's return,
-    // drop_key_locked, the error completion, and the return itself.
+    // The window round 3 got wrong. Counting is armed from the phase-1 fault seam,
+    // which fires immediately BEFORE sub_keys_.emplace, and stops when arm() returns
+    // — so the window is that emplace plus everything after it: the publish, the
+    // contained "armed" log, the mechanism's return, drop_key_locked, the error
+    // completion, and the return itself. (An earlier version of this comment said
+    // counting started inside the mechanism's watch(); it does not, and the sibling
+    // comment below always had it right — governance round 4, sec-2.)
     //
     // MUTATION EVIDENCE: restoring the pre-fix concat
     //   std::string("watch mechanism failed to arm '") + key + "': " + w.error()
@@ -248,7 +275,7 @@ TEST_CASE("arm_impl: the failed-watch path allocates nothing after the commit (#
     auto c = engine.register_consumer("c", [](const SparkEvent&) {});
     REQUIRE(c.has_value());
     engine.start();
-    warm_buckets(engine, *c);
+    warm_arena(engine, *c);
     QuietLog quiet;
 
     mech->set_fail(true);
@@ -301,7 +328,7 @@ TEST_CASE("arm_impl: the deduped commit publishes without allocating (#2270 rese
     auto c = engine.register_consumer("c", [](const SparkEvent&) {});
     REQUIRE(c.has_value());
     engine.start();
-    warm_buckets(engine, *c);
+    warm_arena(engine, *c);
     QuietLog quiet;
 
     auto first = engine.arm(*c, long_file_spec());

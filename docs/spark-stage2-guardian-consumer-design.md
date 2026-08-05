@@ -272,7 +272,13 @@ stuck-Unknown rule still re-reads its target every ~5 s forever, so only the *wi
 fixed, not the *read* flood (UP-6); (c) the **server-side rollup/consumer** for the suppression
 tag (the signal is agent-heartbeat-only today) - this is **pilot-trust-blocking**, not just SOC2
 evidence, because after suppression the only current-errored-state view is the no-TTL census, and
-`/status.errored_rules` is still the fail-closed placeholder. The census edge-record still depends
+`/status.errored_rules` is still the fail-closed placeholder. **(d) the four-artefact egress for
+`arm_race_unwatch_failures_total` (#2270)** - the heartbeat tag ships, but the server-side rollup,
+the `docs/user-manual/metrics.md` row and an alert rule do not, so an orphaned OS watch is
+per-device forensics rather than fleet detection. Same class as (c) and same reason it matters:
+the residual it reports is a leaked watch in the agent's sole detection primitive, and on Windows
+it is not reclaimed by `stop()` at all (only a process restart releases it), so the cost is
+permanent and cumulative rather than self-healing. The census edge-record still depends
 on the sole production `attach_rule` hardcoding `emit_compliant_edge=true` - do NOT sever that.
 
 ### PR-1 hardening items (commit order 1→2→3→4→7→5→6→9→8)
@@ -581,8 +587,20 @@ and MCP `tools/list`), and enforces RBAC + audit at the API layer — not a
 dashboard fragment. This section ticks every #1939 item.
 
 ### Fleet metrics (agent heartbeat → Prometheus)
+- **`arm_race_unwatch_failures_total` (#2270 — agent side SHIPPED, fleet rollup
+  DEFERRED):** counts mechanism `unwatch()` calls that THREW during `arm_impl`'s
+  consumer-race teardown, where the throw is contained rather than propagated. Emitted
+  as the sparse heartbeat tag `yuzu.spark_arm_race_unwatch_failures`. **Scope is in the
+  name and is deliberately not fleet-wide:** it covers `teardown_arm_race` only — the
+  sibling `disarm()` and `unregister_consumer()` unwatch sites propagate and are NOT
+  counted, so a zero does not mean "no orphaned watches". The `{os}` rollup, the
+  `docs/user-manual/metrics.md` row and an alert rule are **deferred to the
+  `prefer_spark` flip** on the same grounds as `retiring`/`retiring_cap`
+  (`spark_fleet_tags.hpp`): with `prefer_spark_` false nothing arms, so the gauge would
+  be structurally absent fleet-wide and unfalsifiable. Tracked as item (d) of the flip
+  gate above.
 - **Agent:** emit `SparkEngineStats` as `yuzu.spark_*` heartbeat `status_tags`.
-  `SparkEngineStats` (`spark_engine.hpp:81`) carries `armed_faulted`,
+  `SparkEngineStats` (`spark_engine.hpp`, the `SparkEngineStats` struct) carries `armed_faulted`,
   `watch_faults_total`, `mech_watch_rejected_total`, `mech_quarantined_total`,
   `mech_slow_op_total` (the #2011 counters already exist in the struct, not yet
   emitted) **plus** `queued_dropped_total`, `consumer_errors_total`, and the

@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <string_view>
@@ -1026,7 +1027,7 @@ TEST_CASE("arm_impl: losing the consumer race after the pre-check tears the watc
     CHECK(fake->watch_calls() == 1);   // the watch DID come up...
     CHECK(fake->unwatch_calls() == 1); // ...and the teardown took it back down
     CHECK_FALSE(fake->is_watching("file|10:/etc/hosts"));
-    CHECK(engine.stats().unwatch_failures_total == 0);
+    CHECK(engine.stats().arm_race_unwatch_failures_total == 0);
     engine.stop();
 }
 
@@ -1135,9 +1136,13 @@ TEST_CASE("arm_impl: a THROWING unwatch during the consumer-race teardown is con
           "[spark][mechanism]") {
     // The stated residual. unwatch() is not noexcept and the real mechanisms
     // allocate inside it, so under the memory pressure this whole layer is about it
-    // can throw. By then the bookkeeping is already consistent, so the throw is
+    // can throw. By then the engine's bookkeeping is consistent, so the throw is
     // contained rather than propagated — but the OS watch it failed to drop outlives
-    // its armed_ entry, and unwatch_failures_total is how an operator finds out.
+    // its armed_ entry (reclaimed by stop() on Linux; on Windows it can persist for
+    // the life of the process — see teardown_arm_race). The counter below is the only
+    // egress: it reaches an operator as the sparse heartbeat tag
+    // `yuzu.spark_arm_race_unwatch_failures`, because the fallback log line is itself
+    // inside a catch-all and is dropped under the same OOM.
     SparkEngine engine;
     FakeMechanism* fake = wire_fake(engine, SparkType::File);
     auto c = engine.register_consumer("c", [](const SparkEvent&) {});
@@ -1155,7 +1160,7 @@ TEST_CASE("arm_impl: a THROWING unwatch during the consumer-race teardown is con
     CHECK(sub.error() == "consumer unregistered during arm"); // the clean error still arrives
     CHECK(engine.stats().armed_sparks == 0);                  // bookkeeping IS consistent
     CHECK(engine.stats().subscriptions == 0);
-    CHECK(engine.stats().unwatch_failures_total == 1); // and the residual is observable
+    CHECK(engine.stats().arm_race_unwatch_failures_total == 1); // and the residual is observable
     engine.stop();
 }
 

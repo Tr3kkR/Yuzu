@@ -90,11 +90,19 @@ struct SparkEngineStats {
     /// resource-gate cross-check doesn't mistake it for `ps -T` (governance S1).
     std::uint64_t watcher_units{0};
     std::uint64_t watch_faults_total{0}; ///< mechanism fault reports (post-arm deaf edges), monotonic
-    /// Mechanism unwatch() calls that THREW during the consumer-race teardown
-    /// (#2270). Non-zero means an OS watch outlived its armed_ entry and will
-    /// persist until stop() — the one residual teardown_arm_race cannot repair.
-    /// Monotonic; see teardown_arm_race() for why it is contained, not propagated.
-    std::uint64_t unwatch_failures_total{0};
+    /// Mechanism unwatch() calls that THREW during the ARM-RACE teardown (#2270).
+    /// SCOPE IS IN THE NAME ON PURPOSE: this covers teardown_arm_race ONLY. The two
+    /// sibling unwatch call sites — disarm() and unregister_consumer() — propagate
+    /// instead and are NOT counted here, so a zero does NOT mean "no orphaned
+    /// watches fleet-wide". Every other counter in this struct is scope-complete;
+    /// this one is not, and an alert built on it must say so.
+    /// Non-zero means an OS watch outlived its armed_ entry: on Linux it is reclaimed
+    /// by stop(), on Windows it can persist for the life of the process (see
+    /// teardown_arm_race for why the bound differs per platform).
+    /// Monotonic. Surfaced as the sparse heartbeat tag `yuzu.spark_arm_race_unwatch_failures`;
+    /// the fleet rollup, metrics.md row and alert rule are deferred to the
+    /// prefer_spark flip alongside `retiring`/`retiring_cap` (spark_fleet_tags.hpp).
+    std::uint64_t arm_race_unwatch_failures_total{0};
     std::uint64_t consumer_threads_detached{0}; ///< handlers that blocked past the shutdown budget
     std::uint64_t events_total{0};       ///< spark fires (post-dedup, pre-fan-out)
     std::uint64_t queued_delivered_total{0};
@@ -262,21 +270,32 @@ public:
     /// from HERE leaves nothing for the scan to find, so the teardown's real-work
     /// branch (including the OS unwatch) runs. Same set-then-use contract.
     void set_arm_precheck_race_hook_for_test(std::function<void()> hook);
-    /// Test seam: if set, invoked once inside disarm() and
-    /// unregister_consumer(), after mu_ is released and before the
-    /// staleness-rechecked mechanism unwatch() call — lets a test
-    /// deterministically force a concurrent equal-spec re-arm into the M2
-    /// late-unwatch race window (#1994). Same set-then-use contract.
+    /// Test seam: if set, invoked inside disarm(), unregister_consumer() AND
+    /// teardown_arm_race() (#2270 added the third site, and the M2 case in
+    /// test_spark_mechanism.cpp depends on it) — after mu_ is released and before the
+    /// staleness-rechecked mechanism unwatch() call. Lets a test deterministically
+    /// force a concurrent equal-spec re-arm into the M2 late-unwatch race window
+    /// (#1994). Same set-then-use contract. No locks are held when it fires.
     void set_disarm_race_hook_for_test(std::function<void()> hook);
     /// Test seam (#2270): if set, invoked at each labelled allocation point inside
-    /// arm_impl() with the phase reached. A test throws from the phase it wants to
-    /// simulate an allocation failure at, which is the only way to exercise the
-    /// strong-guarantee path deterministically — a real std::bad_alloc cannot be
-    /// aimed at one statement. Same set-then-use contract as the other seams.
+    /// arm_impl() AND inside start()'s pre-start replay (phase 2 fires from both —
+    /// watch_guarded is shared by the two arm paths, and a replay case depends on it).
+    /// A test throws from the phase it wants to simulate an allocation failure at,
+    /// which is the only way to exercise the strong-guarantee path deterministically —
+    /// a real std::bad_alloc cannot be aimed at one statement. Same set-then-use
+    /// contract as the other seams.
     void set_arm_fault_hook_for_test(std::function<void(int phase)> hook);
+    /// PHASE ORDINALS ARE BURNED, NEVER REUSED. 1 and 2 are live; the
+    /// kArmFaultPhaseAfterCommit family that once held further ordinals was deleted
+    /// with the post-commit rollback in 6c1d6942 and those numbers stay retired, so a
+    /// reader of an old test or ledger row cannot be misled by a recycled value. Add a
+    /// third phase as 3, and document its lock contract as both of these do.
+    ///
     /// Reached after arm_impl's armed_ entry is committed and before the sub_keys_
     /// node is allocated: a throw here must leave armed_/sub_keys_ exactly as on
     /// entry (the in-lock layer).
+    /// CONTRACT: fires with the non-recursive mu_ HELD. Throw or observe only —
+    /// re-entering the engine from this phase self-deadlocks.
     static constexpr int kArmFaultPhaseBeforeSubKeys = 1;
     /// Reached inside watch_guarded()'s catch arms, before the watch error is
     /// completed from its pre-sized buffer. Pins CONTAINMENT, not rollback: a throw
@@ -333,6 +352,20 @@ private:
     static_assert(std::is_nothrow_move_assignable_v<Armed>,
                   "arm_impl move-assigns Armed into the committed map entry; a throwing "
                   "move would leave a ghost armed_ entry (#2270)");
+    // Move-ASSIGNMENT, which the two asserts above do NOT cover: teardown_arm_race runs
+    // std::erase_if(subs, ...) in the post-commit window, where nothing may throw, and
+    // erase_if move-assigns Subscribers. is_nothrow_move_assignable_v<Armed> does not
+    // reach it transitively — vector's move-assign is nothrow for std::allocator
+    // regardless of T. NOT standard-guaranteed: [func.wrap.func.con] declares
+    // std::function's move-assignment with no exception specification, and P0771R1
+    // strengthened only the move CONSTRUCTOR. All three implementations strengthen it
+    // anyway, MEASURED in governance round 4: libstdc++ 15 = true, and MSVC
+    // (cl.exe /std:c++latest on the DGRHP rig) = true; libc++ declares it _NOEXCEPT.
+    // If a future platform disagrees this fails to COMPILE, loudly and immediately,
+    // which is the tripwire working — far better than a silent throw past the commit.
+    static_assert(std::is_nothrow_move_assignable_v<Subscriber>,
+                  "teardown_arm_race erase_if move-assigns Subscribers after the commit; "
+                  "a throwing move-assign would strand a live subscription (#2270)");
 
     /// Delivery counters touched by consumer dispatch threads. Heap-owned via a
     /// shared_ptr the threads capture, so a DETACHED consumer thread (a handler
@@ -537,7 +570,7 @@ private:
     std::shared_ptr<DeliveryCounters> delivery_{std::make_shared<DeliveryCounters>()};
     std::atomic<std::uint64_t> consumer_threads_detached_{0};
     std::atomic<std::uint64_t> watch_faults_{0}; ///< monotonic mechanism fault-report count
-    std::atomic<std::uint64_t> unwatch_failures_{0}; ///< monotonic throwing-unwatch count (#2270)
+    std::atomic<std::uint64_t> arm_race_unwatch_failures_{0}; ///< monotonic; teardown_arm_race ONLY (#2270)
 
     // Counters updated outside mu_ (delivery paths) — atomics.
     std::atomic<std::uint64_t> events_total_{0};
