@@ -72,6 +72,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace yuzu::agent {
@@ -253,6 +254,20 @@ public:
     /// deterministically force a concurrent equal-spec re-arm into the M2
     /// late-unwatch race window (#1994). Same set-then-use contract.
     void set_disarm_race_hook_for_test(std::function<void()> hook);
+    /// Test seam (#2270): if set, invoked at each labelled allocation point inside
+    /// arm_impl() with the phase reached. A test throws from the phase it wants to
+    /// simulate an allocation failure at, which is the only way to exercise the
+    /// strong-guarantee paths deterministically — a real std::bad_alloc cannot be
+    /// aimed at one statement. Same set-then-use contract as the other seams.
+    void set_arm_fault_hook_for_test(std::function<void(int phase)> hook);
+    /// Reached after arm_impl's armed_ entry is committed and before the sub_keys_
+    /// node is allocated: a throw here must leave armed_/sub_keys_ exactly as on
+    /// entry (the in-lock layer).
+    static constexpr int kArmFaultPhaseBeforeSubKeys = 1;
+    /// Reached after the subscription is published and mu_ is released, before the
+    /// OS watch is armed: a throw here must be undone by arm_impl's rollback (the
+    /// post-commit layer).
+    static constexpr int kArmFaultPhaseAfterCommit = 2;
 
 private:
     struct Subscriber {
@@ -283,6 +298,21 @@ private:
         std::vector<Subscriber> subs;
     };
 
+    // #2270 tripwires. arm_impl's publishing tail runs AFTER its first shared-state
+    // commit, so it must not throw: it move-assigns an Armed into the map entry and
+    // moves a Subscriber into already-reserved vector capacity. Both are nothrow
+    // today (every member bottoms out in std::string / std::vector / std::function /
+    // trivial types). Adding a throwing-move member to either struct would silently
+    // reopen the ghost-entry hole this ordering closes, so it fails to COMPILE here
+    // instead — the same tripwire idiom as kMaxProcessIoWorkers in
+    // guardian_io_executor.hpp.
+    static_assert(std::is_nothrow_move_constructible_v<Subscriber>,
+                  "arm_impl publishes a Subscriber into reserved capacity after its "
+                  "first commit; a throwing move would leave a ghost armed_ entry (#2270)");
+    static_assert(std::is_nothrow_move_assignable_v<Armed>,
+                  "arm_impl move-assigns Armed into the committed map entry; a throwing "
+                  "move would leave a ghost armed_ entry (#2270)");
+
     /// Delivery counters touched by consumer dispatch threads. Heap-owned via a
     /// shared_ptr the threads capture, so a DETACHED consumer thread (a handler
     /// that blocked past the shutdown budget, UP-1) can keep writing them safely
@@ -311,6 +341,11 @@ private:
     };
 
     std::expected<SubscriptionId, std::string> arm_impl(SparkSpec spec, Subscriber sub);
+    /// Drop one spark key and every subscription fanned out from it. Caller holds
+    /// mu_ and owns any OS-watch teardown. The single teardown used by BOTH failed-
+    /// arm paths (a failed watch, and arm_impl's post-commit rollback) — see the
+    /// definition for why a failed arm drops the whole key rather than one sub.
+    void drop_key_locked(const std::string& key);
     /// Validate + normalise (cadence flooring). Returns the effective cadence
     /// (0 for the event-driven and startup types, which have no wheel cadence).
     std::expected<std::uint64_t, std::string> validate_and_floor(const SparkSpec& spec) const;
@@ -457,6 +492,7 @@ private:
     std::atomic<std::uint64_t> consumer_join_budget_ms_{kConsumerJoinBudgetMs}; ///< test seam
     std::function<void()> register_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
     std::function<void()> arm_race_hook_for_test_;      ///< test seam; null = no-op (set-then-use)
+    std::function<void(int)> arm_fault_hook_for_test_;  ///< test seam; null = no-op (set-then-use)
     std::function<void()> disarm_race_hook_for_test_;   ///< test seam; null = no-op (set-then-use)
 
     // Delivery counters touched by consumer dispatch threads live in a shared
