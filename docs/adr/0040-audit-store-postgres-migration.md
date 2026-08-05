@@ -194,11 +194,15 @@ revision of this guard compared one replica's own process `now` against the dura
 `last_pass_now`, so replicas whose clocks disagreed could alternate `BadState`/`Step` fact sets
 that never matched `last_anomaly_facts` and each declined forever. The decision now reads
 PostgreSQL's OWN clock (`SELECT EXTRACT(EPOCH FROM now())::bigint`) inside the same advisory-lock
-transaction that already serialises every sweeper — the same idiom `result_set_store.cpp` and
-`software_inventory_store.cpp` use — so every replica compares against the identical reading
-regardless of its own process clock's accuracy. The caller-supplied `now` remains only a liveness
-signal (`last_pass_unixtime_`) and the pre-txn implausibility guard; it has no bearing on the
-retention verdict. PostgreSQL is authoritative for this decision.
+transaction that already serialises every sweeper, so every replica compares against the
+identical reading regardless of its own process clock's accuracy. The caller-supplied `now`
+remains only a liveness signal (`last_pass_unixtime_`) and the pre-txn implausibility guard; it
+has no bearing on the retention verdict. PostgreSQL is authoritative for this decision.
+**Not yet a codebase-wide idiom**: the single-sweeper advisory lease is precedented in
+`result_set_store.cpp`/`software_inventory_store.cpp`, but reading PG's own clock to drive an
+ongoing retention verdict is not — `ResultSetStore::gc_sweep` (the same `#2360`-class guard it
+was copied from) still compares against its own process clock via `now_epoch()` and carries this
+identical divergence. Deferred, ladder-wide follow-up; not fixed by this PR.
 
 **Deliberate dedup-semantics change (multi-process correctness).** The SQLite guard had an
 `is_event` exemption: a clock *movement* (a `Step`, or a `BadState` accompanied by a clock event)

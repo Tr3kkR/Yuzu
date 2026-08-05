@@ -1663,10 +1663,18 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         // sweeper already serialises through (the advisory lock above), so
         // reading its clock HERE — after the lock, inside this transaction —
         // gives every replica the identical comparison point regardless of
-        // its own process clock's accuracy. `EXTRACT(EPOCH FROM now())` is
-        // the existing idiom for this in the codebase (`result_set_store.cpp`,
-        // `software_inventory_store.cpp`); `now()` is the transaction's start
-        // time, stable and adequate for a single-statement read.
+        // its own process clock's accuracy. `EXTRACT(EPOCH FROM now())::bigint`
+        // is SQL this codebase already runs (`software_inventory_store.cpp`'s
+        // migration backfill), and the single-sweeper advisory lease itself is
+        // precedented in `result_set_store.cpp`/`software_inventory_store.cpp`
+        // — but reading PG's clock to DRIVE an ongoing retention verdict is new
+        // here: `ResultSetStore::gc_sweep` (the same `#2360`-class guard,
+        // `result_set_store.cpp:1312`) still compares against its own process
+        // clock via `now_epoch()`, carrying the identical cross-replica
+        // divergence this fix closes for AuditStore. That sibling is a
+        // deferred follow-up, not a precedent this fix is copying. `now()` is
+        // the transaction's start time, stable and adequate for a
+        // single-statement read.
         pg::PgResult clk = pg::exec_params(conn, "SELECT EXTRACT(EPOCH FROM now())::bigint",
                                            std::vector<std::string>{});
         if (clk.status() != PGRES_TUPLES_OK) {
