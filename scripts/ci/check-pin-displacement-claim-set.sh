@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # check-pin-displacement-claim-set.sh — drift gate for the "what causes a replay-ring pin
-# displacement" claim, which is stated on four operator-facing surfaces at once.
+# displacement" claim, which is stated independently on five surfaces plus changelog.d.
 #
 # WHY THIS EXISTS. #2740 falsified the claim "a full pin-slot set means admission accounting
 # has drifted". Correcting it across its surfaces took repeated review passes — the run
@@ -24,17 +24,25 @@
 #   - `/metrics` HELP saying "rule all three out"
 #   - a changelog telling operators to alert via a netted rule that no longer exists
 #
-# (Each is recorded in the ledger cited above, with the pass that found it. The gate's
-# self-test below reproduces all three plus a fourth shape, so the list is exercised, not
-# just asserted.)
+# (Each is recorded in the ledger cited above, with the pass that found it. The --selftest
+# below reproduces every shape in this list and the runbook/changelog shapes an adversarial
+# review added, so the list is exercised rather than asserted. Its case count is not
+# restated here - run it.)
 #
 # THE INVARIANT, in two halves:
 #   (a) `yuzu_mcp_bridge_pin_displaced_for_admission_total` is NOT a cause. A successful
 #       reclaim releases one pin and adds one charge, so the session stays AT cap and a slot
 #       is always free. It must never appear in the alert expression, and must never be
 #       presented as something to rule out against.
-#   (b) The two residual counters ARE the cause set, and every surface that enumerates
-#       causes must name both.
+#   (b) The two residual counters ARE the cause set. The five stating surfaces -- alert,
+#       HELP, manual, derivation header, and the on-call RUNBOOK -- must name both.
+#       changelog.d fragments are held to both-or-neither instead: a release note need not
+#       enumerate counters, but naming one while omitting the other is the drift shape.
+#
+# The runbook was NOT in (b) in the first version of this gate, while the workflow header
+# claimed it was. Two external reviewers found that independently and blocked on it, each
+# with a fixture: a runbook naming one residual passed green. That is the same false-green
+# class this gate exists to end, so it is now covered and self-tested.
 #
 # Derivation and proof: `What a FULL PIN-SLOT SET means` in server/core/src/mcp_stream.hpp.
 #
@@ -75,7 +83,8 @@ YML
             > "$tmp/t/server/core/src/mcp_stream.hpp"
         printf '%s\n' 'yuzu_mcp_bridge_pin_release_raced_total yuzu_mcp_bridge_pin_release_failed_total' \
             > "$tmp/t/docs/user-manual/metrics.md"
-        : > "$tmp/t/docs/ops-runbooks/mcp-stream-pin-displacement.md"
+        printf '%s\n' 'YuzuMcpStreamPinDisplaced: rule out yuzu_mcp_bridge_pin_release_raced_total and yuzu_mcp_bridge_pin_release_failed_total.' \
+            > "$tmp/t/docs/ops-runbooks/mcp-stream-pin-displacement.md"
         : > "$tmp/t/changelog.d/x.md"
     }
     expect() {  # $1 = case name, $2 = expected exit (0 clean / 1 drift)
@@ -103,6 +112,22 @@ YML
     fixture
     sed -i 's/yuzu_mcp_bridge_pin_release_raced_total//' "$tmp/t/docs/user-manual/metrics.md"
     expect "one residual counter named without the other" 1
+
+    # The two shapes an adversarial review (kimi + codex, independently) proved this gate
+    # did NOT catch while its workflow claimed to protect these surfaces.
+    fixture
+    sed -i 's/yuzu_mcp_bridge_pin_release_raced_total//' \
+        "$tmp/t/docs/ops-runbooks/mcp-stream-pin-displacement.md"
+    expect "RUNBOOK names one residual without the other" 1
+
+    fixture
+    printf '%s\n' 'yuzu_mcp_stream_pin_displaced_total is explained by yuzu_mcp_bridge_pin_release_failed_total.' \
+        > "$tmp/t/changelog.d/x.md"
+    expect "CHANGELOG fragment names one residual without the other" 1
+
+    fixture
+    : > "$tmp/t/docs/ops-runbooks/mcp-stream-pin-displacement.md"
+    expect "RUNBOOK names neither residual" 1
 
     printf '\nselftest: %s passed, %s failed\n' "$pass" "$failed"
     [ "$failed" -eq 0 ] || exit 1
@@ -158,7 +183,16 @@ fi
 # both-or-neither rather than presence alone is deliberate: naming one residual and not the
 # other is the shape that produced the "#2795 is deliberately silent" defect.
 # ---------------------------------------------------------------------------
-for f in "$ALERTS" "$HELP" "$MANUAL" "$HOME_HDR"; do
+# The RUNBOOK is in this set, not merely the phrase check below. It is the surface an
+# on-call engineer actually executes, and an adversarial review found that leaving it out
+# made this gate false-green for exactly the drift it exists to stop: a runbook naming one
+# residual and omitting the other passed green. Both external reviewers reproduced that
+# independently, and CLAUDE.md makes a false-green offered as closure evidence a policy
+# floor - so the gate claiming a surface it did not check was itself the blocking defect.
+RUNBOOK="docs/ops-runbooks/mcp-stream-pin-displacement.md"
+
+for f in "$ALERTS" "$HELP" "$MANUAL" "$HOME_HDR" "$RUNBOOK"; do
+    [ -f "$f" ] || { bad "missing surface: $f"; continue; }
     has_raced=0; has_failed=0
     grep -q "$RACED" "$f" && has_raced=1
     grep -q "$FAILED" "$f" && has_failed=1
@@ -171,14 +205,28 @@ for f in "$ALERTS" "$HELP" "$MANUAL" "$HOME_HDR"; do
     fi
 done
 
+# changelog.d fragments get the weaker BOTH-OR-NEITHER rule, deliberately. A fragment may
+# legitimately describe the fix without enumerating counter names at all - customer release
+# notes are not a rule-out procedure - but naming ONE residual while omitting the other is
+# the "#2795 is deliberately silent" shape that shipped once already, and that must fail.
+for f in changelog.d/*.md; do
+    [ -f "$f" ] || continue
+    has_raced=0; has_failed=0
+    grep -q "$RACED" "$f" && has_raced=1
+    grep -q "$FAILED" "$f" && has_failed=1
+    if [ "$has_raced" -ne "$has_failed" ]; then
+        bad "$f names one residual counter but not the other (raced=$has_raced failed=$has_failed)."
+        note "A fragment may name neither, but naming one implies the other has no signal."
+    fi
+done
+
 # ---------------------------------------------------------------------------
 # (c) No surface may instruct the reader to rule out against the reclaim counter.
 #
 # Phrase-based and deliberately narrow: it catches the exact wording that shipped twice
 # ("rule all three out") without pretending to understand prose.
 # ---------------------------------------------------------------------------
-for f in "$ALERTS" "$HELP" "$MANUAL" docs/ops-runbooks/mcp-stream-pin-displacement.md \
-         changelog.d/*.md; do
+for f in "$ALERTS" "$HELP" "$MANUAL" "$RUNBOOK" changelog.d/*.md; do
     [ -f "$f" ] || continue
     if grep -qiE 'rule[[:space:]]+(all[[:space:]]+)?three[[:space:]]+(of[[:space:]]+them[[:space:]]+)?out' "$f"; then
         bad "$f says to rule out three causes. There are two; the reclaim explains zero."
@@ -194,5 +242,5 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-printf 'pin-displacement claim set: consistent across %s, %s, %s, %s\n' \
-    "$ALERTS" "$HELP" "$MANUAL" "$HOME_HDR"
+printf 'pin-displacement claim set: consistent across %s, %s, %s, %s, %s (+ changelog.d)\n' \
+    "$ALERTS" "$HELP" "$MANUAL" "$HOME_HDR" "$RUNBOOK"
