@@ -263,6 +263,14 @@ TEST_CASE("ScheduleRunner: requires_approval submits one ticket and holds the oc
     REQUIRE(pending.size() == 1);
     CHECK(pending[0].definition_id == "test.def");
     CHECK(pending[0].submitted_by == "admin");
+    // #2442 — the scheduler must declare its minting surface AT THIS CALL SITE.
+    // Nothing asserted it here before (Doomgoose review, PR #2790): the store's
+    // own tests pass the origin in themselves, so they prove the column
+    // round-trips and say nothing about what schedule_runner passes. Dropping
+    // the argument in a refactor would default this row to kUnspecified — the
+    // value #2442 deliberately EXEMPTS — and silently reopen the forgery vector.
+    CHECK(pending[0].origin == yuzu::server::ApprovalOrigin::kSchedule);
+    CHECK(yuzu::server::declares_non_mcp_surface(pending[0].origin));
 
     // Occurrence held: not advanced, still due.
     auto s = h.get(id);

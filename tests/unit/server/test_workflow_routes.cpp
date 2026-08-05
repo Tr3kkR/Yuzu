@@ -19,6 +19,7 @@
  *   - Detail agent grid switches to decile bucketing above 1024 agents.
  */
 
+#include "approval_manager.hpp"
 #include "execution_event_bus.hpp"
 #include "stream_budget.hpp"
 #include "execution_tracker.hpp"
@@ -64,6 +65,11 @@ struct ExecHarness {
     // alive while ~ExecutionTracker runs (it doesn't close, only finalizes
     // statements), then SqliteHandleGuard closes the handle on destruction.
     SqliteHandleGuard tracker_guard;
+    /// #2442 regression net: ApprovalManager also takes a raw sqlite3*, so it
+    /// gets the same guard treatment for the same reason — declared here so it
+    /// outlives `approvals` and closes the handle only after that store has
+    /// finalized its statements.
+    SqliteHandleGuard appr_guard;
     /// Declared BEFORE `sink`, so it destructs AFTER it. `sink` — not `routes` —
     /// owns the route lambdas that capture `&metrics`, so this ordering is what
     /// keeps the borrowed pointer valid for as long as a handler could run. An
@@ -76,7 +82,7 @@ struct ExecHarness {
     /// pre-existing test on the unmetered path; the admission tests pass one in.
     yuzu::server::detail::StreamBudget* stream_budget{nullptr};
 
-    fs::path tracker_db, instr_db, resp_db, wf_db;
+    fs::path tracker_db, instr_db, resp_db, wf_db, appr_db;
     std::unique_ptr<ExecutionTracker> tracker;
     std::unique_ptr<InstructionStore> instructions;
     std::unique_ptr<ResponseStore> responses;
@@ -85,6 +91,10 @@ struct ExecHarness {
     /// file leaves it nullptr, and a fourth SQLite file per harness would be
     /// unpaid cost on ~60 constructions (CLAUDE.md test-efficiency discipline).
     std::unique_ptr<WorkflowEngine> workflows;
+    /// #2442: opt-in ApprovalManager so POST /api/instructions/:id/execute can
+    /// reach its approval-gate branch. Opt-in for the same reason `workflows`
+    /// is — an extra SQLite file on ~60 harness constructions is unpaid cost.
+    std::unique_ptr<ApprovalManager> approvals;
     /// PR 3: per-execution SSE bus. Constructed BEFORE the tracker (see
     /// member-order comment) so the tracker can attach. Pointer is also
     /// passed into WorkflowRoutes::Deps so the SSE handler is registered.
@@ -153,12 +163,13 @@ struct ExecHarness {
     explicit ExecHarness(bool with_bus = true,
                          yuzu::server::detail::StreamBudget* budget = nullptr,
                          bool wire_exec_visible_arg = true,
-                         bool with_workflow_engine = false)
+                         bool with_workflow_engine = false, bool with_approvals = false)
         : stream_budget(budget),
           tracker_db(uniq("wf-routes-exec")), instr_db(uniq("wf-routes-inst")),
-          resp_db(uniq("wf-routes-resp")), wf_db(uniq("wf-routes-wf")) {
+          resp_db(uniq("wf-routes-resp")), wf_db(uniq("wf-routes-wf")),
+          appr_db(uniq("wf-routes-appr")) {
         wire_exec_visible = wire_exec_visible_arg;
-        for (auto& p : {tracker_db, instr_db, resp_db, wf_db})
+        for (auto& p : {tracker_db, instr_db, resp_db, wf_db, appr_db})
             fs::remove(p);
 
         // ExecutionTracker takes a raw sqlite3* — open it via the guard so a
@@ -189,6 +200,13 @@ struct ExecHarness {
         if (with_workflow_engine) {
             workflows = std::make_unique<WorkflowEngine>(wf_db);
             REQUIRE(workflows->is_open());
+        }
+
+        if (with_approvals) {
+            REQUIRE(sqlite3_open(appr_db.string().c_str(), &appr_guard.db) == SQLITE_OK);
+            approvals = std::make_unique<ApprovalManager>(appr_guard.db);
+            approvals->create_tables();
+            REQUIRE(approvals->is_open());
         }
 
         auto auth_fn = [](const httplib::Request&,
@@ -270,10 +288,19 @@ struct ExecHarness {
         wf_deps.execution_event_bus = event_bus.get();
         wf_deps.stream_budget = stream_budget; // ADR-0034 admission (nullptr = unmetered)
         wf_deps.metrics = &metrics;            // #2500 targeting-refusal counter
+        // #2442: nullptr unless opted in, so every pre-existing test keeps the
+        // fail-closed 503 path for an approval-gated definition.
+        wf_deps.approval_manager = approvals.get();
         routes.register_routes(sink, std::move(wf_deps));
     }
 
     ~ExecHarness() {
+        // Drop the store before its handle is closed (see appr_guard).
+        approvals.reset();
+        if (appr_guard.db) {
+            sqlite3_close(appr_guard.db);
+            appr_guard.db = nullptr;
+        }
         workflows.reset();
         responses.reset();
         instructions.reset();
@@ -298,7 +325,7 @@ struct ExecHarness {
         // a separate remove failure (e.g. file already gone, parent dir
         // missing) happens.
         std::error_code ec;
-        for (auto& p : {tracker_db, instr_db, resp_db, wf_db}) {
+        for (auto& p : {tracker_db, instr_db, resp_db, wf_db, appr_db}) {
             fs::remove(p, ec);
             fs::remove(p.string() + "-wal", ec);
             fs::remove(p.string() + "-shm", ec);
@@ -1797,4 +1824,44 @@ TEST_CASE("CDX-FV-03 — workflow execute FAILS CLOSED when the exec-visible der
     CHECK(h.dispatch_calls == 1);
     REQUIRE(h.last_dispatch_exec_visible.has_value()); // PRESENT (deny), not nullopt
     CHECK(h.last_dispatch_exec_visible->empty());      // EMPTY → production sink reaches no one
+}
+
+// ---------------------------------------------------------------------------
+// #2442 — the REST instruction gate must declare its minting surface
+// ---------------------------------------------------------------------------
+//
+// The origin recorded at submit() is the whole of what makes a ticket minted
+// here REFUSABLE at the MCP recall. Nothing asserted it AT THIS CALL SITE:
+// test_approval_manager.cpp pins the store by passing the origin itself, which
+// proves the column round-trips and says nothing about what this handler
+// passes. A refactor dropping the argument would default the row to
+// kUnspecified — the value #2442 deliberately EXEMPTS from the guard — and
+// reopen the cross-surface forgery vector with every suite still green.
+// (Doomgoose review, PR #2790.)
+TEST_CASE("WorkflowRoutes: an approval-gated instruction mints with origin=kInstruction",
+          "[workflow][routes][approval][security]") {
+    ExecHarness h(/*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/false, /*with_approvals=*/true);
+
+    InstructionDefinition d;
+    d.id = "def-GATED";
+    d.name = "Gated";
+    d.type = "question";
+    d.plugin = "test";
+    d.action = "list";
+    d.approval_mode = "always";
+    REQUIRE(h.instructions->create_definition(d).has_value());
+
+    auto res = h.sink.Post("/api/instructions/def-GATED/execute",
+                           R"({"params":{},"agent_ids":["agent-1"]})");
+    REQUIRE(res);
+
+    auto pending = h.approvals->query({.status = "pending"});
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].definition_id == "def-GATED");
+    // THE ASSERTION THIS TEST EXISTS FOR.
+    CHECK(pending[0].origin == ApprovalOrigin::kInstruction);
+    // And the property that origin buys: a ticket from this surface is refused
+    // by the MCP recall's guard. kUnspecified would NOT be.
+    CHECK(declares_non_mcp_surface(pending[0].origin));
 }
