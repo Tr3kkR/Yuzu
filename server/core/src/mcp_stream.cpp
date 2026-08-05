@@ -854,6 +854,12 @@ void McpStreamState::unpin(std::uint64_t id) {
     }
 }
 
+std::array<std::uint64_t, kMaxStreamedPostsPerSession> McpStreamState::pinned_ids_snapshot()
+    const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return pinned_ids_;
+}
+
 std::size_t McpStreamState::pinned_count() const {
     std::lock_guard<std::mutex> lk(mu_);
     std::size_t n = 0;

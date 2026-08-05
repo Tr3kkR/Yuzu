@@ -381,9 +381,13 @@ public:
     /// one and records both as terminal_delivered - a wrong audit fact rather than a
     /// wrong comment. That gap is fixed in the follow-up PR (a tri-state pin status).
     ///
-    /// The pin is released by unpin() (final written on the POST wire), by attach_and_replay
-    /// when a cursor proves consumption (Last-Event-ID >= its id), by displacement as above,
-    /// or with the whole object. Same return contract and boundary as publish().
+    /// The pin is released by FOUR routes, and they do NOT all mean the client got the
+    /// frame: unpin() when the final was written on the POST wire (it did), attach_and_replay
+    /// when a cursor proves consumption (it did), ring LRU displacement as above (it did
+    /// not — accounting drift), and the bridge's admission reclaim (#2740; it did not — the
+    /// session needed the slot for a new streamed call). Anything that treats a missing pin
+    /// as proof of delivery must consult the audit trail, not the pin alone. Or with the
+    /// whole object. Same return contract and boundary as publish().
     std::uint64_t publish_final(std::string_view event_type, std::string_view data) noexcept;
 
     /// Deterministic fault injection for publish() — TEST SEAM ONLY. The throw sites
@@ -476,6 +480,15 @@ public:
     /// this: a parked (ring-only) record whose pin has gone - consumed via a GET resume that
     /// acked past it - can be torn down. Const, cheap (scans the fixed pin array under mu_).
     bool is_pinned(std::uint64_t id) const;
+
+    /// The whole pin array in ONE `mu_` acquisition (0 = empty slot). Two callers
+    /// need the SET, not a membership test: the bridge's admission reclaim has to
+    /// find a pin no record references (an ORPHAN — the sweep's teardown erases a
+    /// record without unpinning, so orphans are reachable and are the one lockout
+    /// shape a record scan can never see), and polling `is_pinned` per candidate
+    /// would take this mutex once per record while the global admission lock is
+    /// held. Returned by value: the caller must not hold `mu_` while it reasons.
+    std::array<std::uint64_t, kMaxStreamedPostsPerSession> pinned_ids_snapshot() const;
 
     /// Poison the session stream: no terminal frame could be delivered (publish_final failed
     /// twice) and the durable result must be fetched by execution_id instead. Sets a sticky

@@ -5916,16 +5916,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // The three wiring deps are part of eligibility, not assertions: a
                 // build_handler caller that omits any of them (every pre-3b test)
                 // gets today's plain path rather than a stream it cannot service.
-                // 3b ships DORMANT. The machinery below is complete and reviewed, but
-                // two bounds defects are open against it - #2739 (the 120 s response
-                // cap does not fire on a busy execution; the arbitration is in
-                // mcp_stream_bridge.cpp's project_record, gated on !want_progress &&
-                // !want_terminal) and #2740 (an undelivered final holds one of the
-                // session's four streamed slots; the admission sum is in
-                // McpStreamBridge::reserve). Shipping it
-                // on by default would put a documented bound on four operator surfaces
-                // that the implementation does not honour. The follow-up PR carries
-                // both fixes, hardened over five governance rounds, and flips this.
+                // 3b still ships DORMANT, but no longer because it is unsound: the
+                // four defects that gated the flip are fixed - #2739 (the response
+                // cap now fires on a busy execution: the drain-then-settle state in
+                // mcp_stream_bridge.cpp's project_record), #2740 (an undelivered
+                // final no longer holds a session slot for good: the reclaim in
+                // McpStreamBridge::reserve), #2785 (POST frames carry the ring event
+                // id) and #2789 (per-principal reject coverage). Turning the default
+                // on is a SEPARATE rung, so this flag stays off here.
                 //
                 // nullptr reads as OFF, so every caller that does not opt in - incl.
                 // every pre-3b test - gets the plain path, matching the wiring-deps
@@ -6033,23 +6031,29 @@ McpServer::HandlerFn McpServer::build_handler(
                                 // outstanding (calls that reserved and have not
                                 // settled a terminal), and was actively misleading
                                 // when every slot held a COMMITTED final no wire had
-                                // taken delivery of - waiting is exactly what does not
-                                // clear that, and a conforming client honouring
-                                // retry_after_ms slid the session TTL on every retry
-                                // so it never idled out either. Admission now displaces
-                                // the oldest such final rather than refusing, so this
-                                // arm is reached only when the remaining pins belong to
-                                // finals still being written, or to ring-side orphans
-                                // no record references - neither of which a wait fixes,
-                                // and both of which a fresh session does.
+                                // taken delivery of - a conforming client honouring
+                                // retry_after_ms slid the session TTL on every retry,
+                                // so it never idled out either.
+                                //
+                                // Admission now reclaims such a final - parked or
+                                // orphaned - rather than refusing, so reaching this arm
+                                // means the reclaim found nothing to take. Three states
+                                // do that, and the text must be true of ALL of them:
+                                // a final still being WRITTEN by a live pump (which a
+                                // short wait does clear), and a transient decline while
+                                // one of the session's records is mid-projection (which
+                                // a retry clears) - so "waiting will not help" would be
+                                // false. Retrying is honest for both; only the third,
+                                // a genuinely stuck slot, needs a fresh session, and
+                                // the client cannot tell which it is from here.
                                 const char* pin_remediation =
                                     rr.pin_slots_held == McpStreamBridge::PinSlotsHeld::kPins
                                         ? "this session's streamed slots are held by results "
-                                          "that have not reached a client rather than by live "
-                                          "calls, so waiting will not free one: resume on the "
-                                          "GET channel to collect them, or re-initialize for a "
-                                          "fresh session. A rate here is reported by "
-                                          "yuzu_mcp_bridge_pin_slots_reject_total{held=\"pins\"}"
+                                          "that have not yet reached a client. Retry: a result "
+                                          "still being written frees its slot as it lands. If "
+                                          "this persists across several retries, collect the "
+                                          "outstanding results by resuming the GET channel with "
+                                          "Last-Event-ID, or re-initialize for a fresh session"
                                         : "this session already has the maximum streamed calls "
                                           "in flight; wait for one to finish";
                                 streamed_reject(

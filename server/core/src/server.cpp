@@ -638,6 +638,21 @@ public:
                           "And \"charges\" is not purely benign: it is emitted whenever ANY "
                           "charge is outstanding, so a PARTIAL wedge is bucketed there unseen",
                           "counter");
+        metrics_.describe("yuzu_mcp_bridge_pin_displaced_for_admission_total",
+                          "Streamed admissions that reclaimed a session slot from an "
+                          "already-committed final no wire took delivery of (#2740) - either a "
+                          "parked record's, or an ORPHAN pin whose record a teardown erased "
+                          "without unpinning. EXPECTED, not a fault: it is the healthy response "
+                          "to clients that drop before their results land, and without it four "
+                          "such calls locked a session out of streamed POST permanently. "
+                          "Deliberately NOT a label on yuzu_mcp_stream_pin_displaced_total, "
+                          "whose family means accounting drift and alerts on >0 - folding a "
+                          "routine event in would destroy that alarm. Do not page on it; a "
+                          "sustained rate is a CLIENT-fleet signal (peers dropping before "
+                          "collection), and each event also emits an audit row "
+                          "(mcp.bridge.pin_displaced_for_admission) naming the principal and the "
+                          "execution whose result lost its eviction exemption",
+                          "counter");
         metrics_.describe("yuzu_mcp_bridge_charge_release_deferred_total",
                           "Streamed admission charges that could not be released at their natural "
                           "release point and are RETAINED on the record until its teardown "
@@ -753,6 +768,7 @@ public:
             metrics_.counter("yuzu_mcp_bridge_pin_slots_reject_total", {{"held", held}});
         }
         metrics_.counter("yuzu_mcp_bridge_charge_release_deferred_total");
+        metrics_.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total");
         metrics_.counter("yuzu_mcp_bridge_streaming_backstop_total");
         metrics_.counter("yuzu_mcp_stream_terminal_publish_failures_total");
         metrics_.counter("yuzu_mcp_stream_final_unpinned_total");

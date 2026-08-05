@@ -1012,27 +1012,45 @@ private:
     /// its own mutex; the admission lock is the global one).
     void count_pin_displaced_for_admission() noexcept;
     /// #2740. Called from the admission path with `bridge_mu_` HELD, on the pass
-    /// that is about to refuse `pin_slots`: releases the pin of this session's
-    /// OLDEST parked record whose committed final no wire ever took delivery of,
-    /// so a new streamed call can be admitted in its place. Returns that record's
-    /// execution id and the released event id, or nullopt when no such record
-    /// exists (every slot is a live call, or the pins are ring-side orphans no
-    /// record references - see the reserve() call site for why an orphan is NOT
-    /// displaced ring-side).
+    /// that would otherwise refuse `pin_slots`: NAMES a pin that may be released
+    /// so a new streamed call can take its slot. **Selection only — it mutates
+    /// nothing.** The caller unpins only after the admission has actually
+    /// committed, so a pass that ends up rejecting anyway, or that throws on the
+    /// ledger/map commit, destroys no eviction exemption and needs no rollback.
+    ///
+    /// Two candidate classes, orphans FIRST because they are strictly deader:
+    ///  - an ORPHAN pin: a pinned id no live record of this session references.
+    ///    The sweep's teardown erases a record WITHOUT unpinning, so these are
+    ///    reachable, and no record scan can ever see them — they were the one
+    ///    lockout shape that survived the first cut of this fix.
+    ///  - the OLDEST PARKED record (`kRingOnly`) whose committed final no wire
+    ///    took delivery of. Its resume window is the one most likely already past.
+    /// Returns nullopt when neither exists (every slot backs a live call), or
+    /// when ANY of this session's records is mid-projection: the admission sum
+    /// transiently counts one settling record as two slots, reserve has always
+    /// failed CLOSED on that reading, and a reclaim must inherit it rather than
+    /// act on a slot that was never really occupied. That claim flag is an exact
+    /// discriminator — it also covers the window in which the terminal ladder has
+    /// pinned a final but the bridge has not yet stamped `pinned_event_id`, which
+    /// is precisely when a LIVE call's pin would look like an orphan.
     ///
     /// Deliberately under the SAME `bridge_mu_` hold as the admission decision:
-    /// releasing the lock to unpin and then re-admitting is a TOCTOU between two
-    /// concurrent reserves on one session, and every sweep claim path takes
-    /// `bridge_mu_` too, so holding it is also what fences a teardown from
-    /// claiming a candidate mid-scan. Lock order is the declared
-    /// `bridge_mu_ -> BridgeRecord::mu -> McpStreamState::mu_` (on_final_written's
-    /// order). Allocation-free apart from the returned id, and the metric/audit
-    /// for a displacement must be emitted by the CALLER after the lock releases.
+    /// every sweep claim path takes `bridge_mu_` too, so holding it is what fences
+    /// a teardown from claiming a candidate between selection and release. Lock
+    /// order is the declared `bridge_mu_ -> BridgeRecord::mu -> McpStreamState::mu_`
+    /// (on_final_written's order). The metric and audit row for a release are
+    /// emitted by the CALLER, after the lock is dropped.
     struct DisplacedPin {
-        std::string execution_id;
+        std::string execution_id;  ///< empty for an orphan — no record survives to name it
         std::uint64_t event_id = 0;
+        bool orphan = false;
     };
-    std::optional<DisplacedPin> displace_parked_pin_locked(const std::string& session_id);
+    /// `stream` comes from the CALLER (which already resolved it for the record it
+    /// is admitting), not from a record found in the scan: the orphan case can
+    /// have ZERO records left for the session, and deriving the ring from a record
+    /// would make exactly that case unreachable.
+    std::optional<DisplacedPin> select_displaceable_pin_locked(
+        const std::string& session_id, const std::shared_ptr<McpStreamState>& stream);
     void flush_record_obs(BridgeRecord& rec) noexcept;
     void flush_core_obs() noexcept;
     /// `detail` is a string_view, NOT a `const std::string&`: every caller passes a

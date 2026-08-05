@@ -676,7 +676,11 @@ TEST_CASE("bridge admission - client-gone finals never lock a session out of str
         // The lockout is gone for good, not merely deferred by one: each further
         // client-gone call displaces the next-oldest rather than refusing.
         for (int i = 6; i <= 8; ++i) {
-            CHECK(fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok);
+            auto rr = fx.bridge->reserve(s.id, "alice", json(i), json("t"), true);
+            INFO("reserve " << i << " reject="
+                            << (rr.reject_reason == nullptr ? "none" : rr.reject_reason)
+                            << " pinned=" << s.stream->pinned_count());
+            CHECK(rr.ok);
         }
     }
 
@@ -763,6 +767,52 @@ TEST_CASE("bridge admission - client-gone finals never lock a session out of str
         CHECK_FALSE(fx.bridge->phase_for(s.id, json(1)).has_value());
         CHECK(fx.bridge->phase_for(s.id, json(2)).has_value());  // siblings untouched
     }
+}
+
+TEST_CASE("bridge admission - ORPHAN pins are reclaimed too (governance UP-1)",
+          "[mcp][bridge][2f]") {
+    // The lockout shape a RECORD scan can never see. Teardown erases a record
+    // without unpinning, so its committed final stays pinned with nothing left
+    // that could ever release it: the sweep's pin-ack arm needs a record,
+    // on_final_written needs a record, and a cursor-less GET resume releases
+    // nothing (rule 1b only unpins for a cursor at or above the pinned id). Four
+    // of these lock the session out of streamed POST permanently - and unlike the
+    // parked-record case, the session stays alive, so even session death does not
+    // clear it. `ring_only_pressure_cap = 0` makes the sweep tear a parked record
+    // down on sight, which is the production path (pressure) that produces these.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    const auto displaced_total = [&] {
+        return fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value();
+    };
+
+    for (int i = 1; i <= 4; ++i) {
+        const std::string exec = "exec-orphan-" + std::to_string(i);
+        REQUIRE(poll_until([&] {
+            return fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok;
+        }));
+        REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
+        REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(i)));  // peer gone, no final written
+        fx.bus.publish(exec, "execution-completed", kCompleted, /*is_terminal=*/true);
+        REQUIRE(poll_until([&] {
+            return s.stream->pinned_count() == static_cast<std::size_t>(i);
+        }));
+        // The pressure teardown erases the record and leaves the pin behind.
+        REQUIRE(poll_until([&] {
+            fx.bridge->sweep();
+            return !fx.bridge->phase_for(s.id, json(i)).has_value();
+        }));
+    }
+    REQUIRE(s.stream->pinned_count() == 4);   // four pins...
+    REQUIRE(fx.bridge->record_count() == 0);  // ...and not one record to find them by
+
+    // Admission must reclaim one anyway.
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(9), json("t"), true).ok);
+    CHECK(displaced_total() == 1.0);
+    CHECK(s.stream->pinned_count() == 3);
+    CHECK(fx.audit_count("mcp.bridge.pin_displaced_for_admission") == 1);
 }
 
 TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final is never lost",
@@ -2326,18 +2376,24 @@ TEST_CASE("bridge sweep races the projector on a charged (streamed) record (TSan
     CHECK(s.stream->pinned_count() == 1);     // its pin survives the torn-down record (spec E3)
     // Charge released EXACTLY ONCE. Admission = pinned_count() + streamed_unpinned:
     // the 1 orphan pin holds one slot, so EXACTLY 3 fresh streamed reserves fit
-    // (1 + 3 == cap 4) and the 4th is rejected. If the charge had leaked (stuck
-    // held) only 2 would fit; if double-released, the accounting would be wrong.
+    // (1 + 3 == cap 4) WITHOUT reclaiming anything. If the charge had leaked
+    // (stuck held) only 2 would fit; if double-released, a 4th would fit free.
+    const auto displaced_total = [&] {
+        return fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value();
+    };
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), true).ok);
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(3), json("t"), true).ok);
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(4), json("t"), true).ok);
-    auto pin_reject2 = fx.bridge->reserve(s.id, "alice", json(5), json("t"), true);
-    // Null-guarded like the sibling at the C6a test: if the cap ever fails to
-    // bite, std::string(nullptr) is UB and kills the whole binary instead of
-    // failing this assertion cleanly.
-    CHECK(std::string(pin_reject2.reject_reason == nullptr ? ""
-                                                           : pin_reject2.reject_reason) ==
-          "pin_slots");
+    CHECK(displaced_total() == 0.0);  // all three fit in the free slots
+    // The FOURTH is the cap probe. It used to be refused outright, which is the
+    // #2740 lockout this branch removes: the slot is held by an ORPHAN pin whose
+    // record the sweep above tore down, so nothing else will ever release it.
+    // Admission now reclaims exactly that, which still proves the cap bit here -
+    // a leaked charge would have made this the FOURTH occupant rather than a
+    // reclaim, and a double-released charge would have let it in for free.
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+    CHECK(displaced_total() == 1.0);
+    CHECK(s.stream->pinned_count() == 0);  // the orphan yielded its slot
 }
 
 TEST_CASE("bridge real final - the terminal payload contract is pinned by a REAL ExecutionTracker "

@@ -11,3 +11,12 @@
   fetchable by `execution_id`. Live calls are never displaced, so the per-session
   concurrency limit is unchanged, and the remaining refusal now states which of
   the two states it is in rather than always claiming calls are in flight.
+- MCP streamed POST: orphaned replay-ring pins — a committed final whose owning
+  record a teardown erased without unpinning — are reclaimed by admission too
+  (#2740). Nothing else could ever release them (the pin-ack sweep and the
+  delivered-final path both need a record, and a cursor-less GET resume releases
+  nothing), so four of them locked a session out of streamed POST permanently
+  even though the session stayed alive. Reclaims are counted
+  (`yuzu_mcp_bridge_pin_displaced_for_admission_total`, pre-seeded at boot) and
+  audited against the admitting principal
+  (`mcp.bridge.pin_displaced_for_admission`).
