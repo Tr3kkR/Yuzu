@@ -183,14 +183,39 @@ inline constexpr int kAuditBacklogRearmSec = 5;
 ///
 /// The test deliberately does NOT assert a query plan. The planner is
 /// cost-based, and at unit-test table sizes a sequential scan is legitimately
-/// cheaper; asserting "Index Only Scan" there would pin an accident. Gate 3
-/// performance measured the plans at 5M rows, and found the SURVIVOR half flips
-/// to a Seq Scan once a backlog exists — the probe is index-driven in the
-/// healthy and would-wipe cases, not unconditionally.
+/// cheaper; asserting "Index Only Scan" there would pin an accident.
+///
+/// The two halves are NOT the same shape, and that asymmetry is deliberate
+/// (round-3 performance finding, 1f). Gate 3 performance measured the plans
+/// at 5M rows and found the SURVIVOR half — the range check —
+/// planner-dependent: it can flip to a Seq Scan once a backlog exists,
+/// because bare `EXISTS(SELECT 1 FROM t WHERE range-cond)` gives the planner
+/// no signal beyond the range's estimated selectivity, and a wide window
+/// (retention_days can be 365) with sparse real matches at the tail is
+/// exactly the shape that estimate gets wrong. The EXPIRED half does not
+/// need the same treatment: during a genuine backlog the vast majority of
+/// rows satisfy `< now`, so EXISTS finds a match within the first few rows
+/// under ANY scan strategy — a Seq Scan is not a performance problem there,
+/// only on the survivor side, where matches are a needle at the end of the
+/// value range. The survivor half is rewritten as
+/// `ORDER BY ttl_expires_at LIMIT 1 ... IS NOT NULL`: ordering by the
+/// partial index's leading column plus a LIMIT is a plan-independent signal
+/// — a Seq Scan would need a full sort before it could apply the LIMIT, so
+/// the pre-ordered index path wins regardless of the range's selectivity
+/// estimate. Verified locally against a 5M-row scratch table matching this
+/// schema (including a stale-statistics variant, ANALYZE run before the
+/// survivor rows existed): both forms returned an Index Only Scan there, so
+/// the specific Seq Scan flip Gate 3 measured was not reproduced at that
+/// scale in this session — the rewrite is applied on the strength of that
+/// prior, cited measurement plus the plan-independence argument above, not a
+/// fresh repro of the regression itself. Correctness (not just plan shape)
+/// is pinned by the store-level clock-guard tests, which exercise both
+/// outcomes this probe feeds.
 inline constexpr std::string_view kAuditRetentionProbeSql =
     "SELECT EXISTS(SELECT 1 FROM audit_store.audit_events WHERE ttl_expires_at > 0 AND "
-    "ttl_expires_at < $1::bigint), EXISTS(SELECT 1 FROM audit_store.audit_events WHERE "
-    "ttl_expires_at > 0 AND ttl_expires_at >= $1::bigint AND ttl_expires_at <= $2::bigint)";
+    "ttl_expires_at < $1::bigint), (SELECT 1 FROM audit_store.audit_events WHERE "
+    "ttl_expires_at > 0 AND ttl_expires_at >= $1::bigint AND ttl_expires_at <= $2::bigint "
+    "ORDER BY ttl_expires_at LIMIT 1) IS NOT NULL";
 
 /// How long the retention thread waits before its next pass. Extracted so the
 /// DECISION is testable without driving the thread or the clock: the sleep is

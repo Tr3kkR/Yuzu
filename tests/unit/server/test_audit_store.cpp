@@ -718,18 +718,35 @@ TEST_CASE("AuditStore: a negative limit clamps rather than reporting a degrade",
 // probe index-eligible. It asserts SHAPE, not a query plan: the planner is
 // cost-based and at this table size a sequential scan is legitimately cheaper,
 // so a plan assertion here would pin an accident rather than the contract.
-TEST_CASE("AuditStore: the retention probe stays EXISTS-shaped and index-eligible",
+TEST_CASE("AuditStore: the retention probe stays index-eligible, and the survivor "
+          "half stays ORDER BY/LIMIT-shaped (1f)",
           "[audit_store][retention]") {
     const std::string sql{kAuditRetentionProbeSql};
-    // EXISTS, never a counting aggregate: a count with no statement-level WHERE
-    // must visit the ttl_expires_at = 0 majority, which sits outside the partial
+    // Never a counting aggregate: a count with no statement-level WHERE must
+    // visit the ttl_expires_at = 0 majority, which sits outside the partial
     // index, so it degenerates to a full scan of the evidence table every pass.
-    CHECK(sql.find("EXISTS(") != std::string::npos);
     CHECK(sql.find("count(") == std::string::npos);
     CHECK(sql.find("COUNT(") == std::string::npos);
     CHECK(sql.find("FILTER") == std::string::npos);
-    // Both halves must carry the partial index's own predicate, or the index is
-    // not eligible at all.
+    // The two halves are deliberately NOT the same shape (1f): the expired
+    // half stays a bare EXISTS (fine — during a backlog almost every row
+    // matches, so it finds one within the first few rows regardless of scan
+    // strategy). Exactly one EXISTS(, not two.
+    std::size_t exists_at = 0, exists_count = 0;
+    while ((exists_at = sql.find("EXISTS(", exists_at)) != std::string::npos) {
+        ++exists_count;
+        exists_at += 1;
+    }
+    CHECK(exists_count == 1);
+    // The survivor half is ORDER BY <indexed column> LIMIT 1 ... IS NOT NULL:
+    // a plan-independent signal that survives a bad selectivity estimate on a
+    // wide, sparsely-matched range (a Seq Scan would need a full sort before
+    // it could apply the LIMIT, so the pre-ordered index path wins
+    // regardless of the estimate).
+    CHECK(sql.find("ORDER BY ttl_expires_at LIMIT 1") != std::string::npos);
+    CHECK(sql.find(") IS NOT NULL") != std::string::npos);
+    // Both halves must still carry the partial index's own predicate, or the
+    // index is not eligible at all.
     std::size_t at = 0, predicates = 0;
     while ((at = sql.find("ttl_expires_at > 0", at)) != std::string::npos) {
         ++predicates;

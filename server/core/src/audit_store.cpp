@@ -1783,15 +1783,12 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             return false; // fail closed — roll back the whole pass
         }
 
-        // Detect by OUTCOME: two EXISTS probes answer the whole question, and
-        // both CAN be answered from the index — with a caveat the earlier
-        // wording did not carry: Gate 3 performance measured the SURVIVOR half
-        // flipping to a Seq Scan once a backlog exists, because the planner
-        // prefers a cheap-startup scan when survivors look plentiful and cannot
-        // know they sit at the end of the heap. Index-driven in the healthy and
-        // would-wipe cases; proportional to the backlog otherwise, and still
-        // well inside the pass timeout at the scale that was measured. A
-        // forward-skewed row past
+        // Detect by OUTCOME: two probes answer the whole question, both
+        // index-eligible. The two halves are deliberately different SHAPES —
+        // see `kAuditRetentionProbeSql`'s own comment (1f) for why the
+        // survivor half is `ORDER BY ... LIMIT 1` rather than a second bare
+        // EXISTS, and don't re-derive it here; this is the read site, not the
+        // definition. A forward-skewed row past
         // `now + window + slack` can never expire, so it is EXCLUDED from the
         // survivor question — else one bad row vetoes the guard for the store's
         // life.
