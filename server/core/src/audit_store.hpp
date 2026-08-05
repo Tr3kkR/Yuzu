@@ -372,9 +372,16 @@ public:
     /// probes, the DELETE, the post-delete backlog probe); a pass refused
     /// because the caller's clock was implausible; a pass against a closed
     /// store; and an exception escaping the pass, caught at the thread
-    /// boundary. Every one of them means NOTHING WAS DELETED: the whole pass
-    /// runs in one transaction, so even the post-delete backlog probe rolls the
-    /// DELETE back when it fails. (It said the opposite — "fires AFTER a
+    /// boundary (`run_cleanup`'s `catch (...)`). EVERY SITE INSIDE THE
+    /// TRANSACTION means nothing was deleted: the whole pass runs in one
+    /// transaction, so even the post-delete backlog probe rolls the DELETE
+    /// back when it fails. The thread-boundary catch is the ONE exception —
+    /// it wraps the WHOLE `cleanup_once` call, including the post-commit
+    /// bookkeeping (`rows_deleted_`/`cap_reached_` counters, the `spdlog::info`
+    /// summary) that runs AFTER `with_txn_for` has already committed a real
+    /// delete, so an exception thrown there (allocation in the log formatter
+    /// is the realistic source) counts a pass that DID delete rows as failed.
+    /// (An earlier revision of this comment said the opposite — "fires AFTER a
     /// successful delete … merely degraded" — which was true of the retired
     /// SQLite store, where that probe was a warning after a committed delete.
     /// The enumeration was also stale: it counted a `prepare` and a `step` that
