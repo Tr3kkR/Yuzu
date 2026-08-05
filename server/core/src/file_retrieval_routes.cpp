@@ -205,9 +205,40 @@ void discard_blob(const std::filesystem::path& path) {
 /// a single-writer-per-session client, so this is a narrower residual gap,
 /// not the common case — would need a distributed lock (a genuine
 /// architecture decision, out of this package's scope).
+///
+/// The map is REFCOUNT-EVICTED rather than grow-only. It is a process-static
+/// keyed by a client-supplied path segment, so a grow-only map is unbounded
+/// memory reachable by anyone who can name well-formed upload ids — and the
+/// natural lifetime of a slot is exactly "while someone holds it". `Guard`
+/// below releases the mutex and then drops the map entry when this holder was
+/// the last reference: `use_count() == 1` is evaluated under `map_mu_`, which
+/// is the same lock `acquire` takes before handing a slot out, so no concurrent
+/// acquirer can be mid-way between reading the slot and copying the
+/// `shared_ptr` when the check runs.
 class UploadWriteLocks {
 public:
-    std::unique_lock<std::mutex> acquire(const std::string& upload_id) {
+    /// RAII holder: unlocks, then evicts the map entry if nobody else holds it.
+    class Guard {
+    public:
+        Guard(UploadWriteLocks& owner, std::string upload_id, std::shared_ptr<std::mutex> m)
+            : owner_(&owner), upload_id_(std::move(upload_id)), m_(std::move(m)), lock_(*m_) {}
+        Guard(const Guard&) = delete;
+        Guard& operator=(const Guard&) = delete;
+        Guard(Guard&&) = delete;
+        Guard& operator=(Guard&&) = delete;
+        ~Guard() {
+            lock_.unlock();
+            owner_->release(upload_id_, m_);
+        }
+
+    private:
+        UploadWriteLocks* owner_;
+        std::string upload_id_;
+        std::shared_ptr<std::mutex> m_;
+        std::unique_lock<std::mutex> lock_;
+    };
+
+    [[nodiscard]] Guard acquire(const std::string& upload_id) {
         std::shared_ptr<std::mutex> m;
         {
             std::lock_guard<std::mutex> g(map_mu_);
@@ -216,10 +247,28 @@ public:
                 slot = std::make_shared<std::mutex>();
             m = slot;
         }
-        return std::unique_lock<std::mutex>(*m);
+        return Guard(*this, upload_id, std::move(m));
+    }
+
+    [[nodiscard]] std::size_t size_for_test() {
+        std::lock_guard<std::mutex> g(map_mu_);
+        return locks_.size();
     }
 
 private:
+    void release(const std::string& upload_id, std::shared_ptr<std::mutex>& m) {
+        std::lock_guard<std::mutex> g(map_mu_);
+        auto it = locks_.find(upload_id);
+        // The map holds one reference and this Guard holds the other, so a
+        // use_count of 2 means no other holder or waiter exists. Compare the
+        // stored pointer too: an erase-and-reinsert between this Guard's
+        // acquire and its release would otherwise let it evict a slot that is
+        // not the one it took.
+        if (it != locks_.end() && it->second == m && m.use_count() == 2)
+            locks_.erase(it);
+        m.reset();
+    }
+
     std::mutex map_mu_;
     std::unordered_map<std::string, std::shared_ptr<std::mutex>> locks_;
 };
@@ -271,6 +320,20 @@ void register_mint(HttpRouteSink& sink, Deps deps) {
             params.declared_max_size = it->get<std::int64_t>();
         if (auto it = body.find("ttl_secs"); it != body.end() && it->is_number_integer())
             params.requested_ttl_secs = it->get<std::int64_t>();
+
+        // The MCP twin enforces `^[0-9a-f]{64}$` on this field through its
+        // input schema; REST accepted anything and persisted it verbatim.
+        // That is not cosmetic: a stored non-hash is non-empty, so
+        // `verify_commit`'s grant-expected leg runs and can never match, and
+        // a commit mismatch cancels the session and deletes the blob after
+        // the grant is already redeemed — a typo at mint time silently
+        // yields a grant that can never be used, with no retry. Mint is the
+        // only point where the operator can still fix it.
+        if (!upload_grant::is_valid_expected_sha256(params.expected_sha256)) {
+            send_generic(res, 400,
+                         "expected_sha256 must be 64 lowercase hex characters, or omitted");
+            return;
+        }
 
         const auto now = resolve_now(deps);
         auto minted = deps.store->mint(params, now);
@@ -402,6 +465,30 @@ void send_session_auth_error(httplib::Response& res, SessionAuthOutcome outcome)
     }
 }
 
+/// Admission gate run BEFORE `upload_write_locks().acquire(...)` on every
+/// handler that takes the write lock. The lock map is keyed by a value the
+/// CLIENT supplies, so acquiring first and authenticating second let an
+/// unauthenticated caller both create map entries and contend the mutex a
+/// legitimate uploader is using. Refcount eviction bounds the memory; this
+/// bounds who can reach the lock at all.
+///
+/// It admits on anything OTHER than `kSessionUnknown` — the outcome that
+/// collapses "no such upload_id" and "the secret did not match". Every other
+/// outcome means the credential IS valid for a real session, and the
+/// in-critical-section `authenticate_session` remains the authoritative read:
+/// expiry, terminal state and store-unavailable all carry mutations or
+/// state-dependent responses that must happen under the lock, so this gate
+/// deliberately does not try to answer them.
+[[nodiscard]] bool admit_to_write_lock(const Deps& deps, const std::string& upload_id,
+                                       const std::string& secret, httplib::Response& res) {
+    const auto outcome = deps.store->authenticate_session(upload_id, secret, resolve_now(deps)).outcome;
+    if (outcome == SessionAuthOutcome::kSessionUnknown) {
+        send_session_auth_error(res, outcome);
+        return false;
+    }
+    return true;
+}
+
 void register_session_open(HttpRouteSink& sink, Deps deps) {
     sink.Post("/api/v1/uploads", [deps](const httplib::Request& req, httplib::Response& res) {
         if (!require_tls(deps, res))
@@ -465,6 +552,14 @@ void register_chunk(HttpRouteSink& sink, Deps deps) {
                     send_reason(res, Reason::kSessionUnknown, "session unknown or invalid credential");
                     return;
                 }
+
+                // Authenticate BEFORE touching the lock map — it is keyed by a
+                // client-supplied path segment, so acquiring first would let an
+                // unauthenticated caller create entries and contend a legitimate
+                // uploader's mutex. The in-lock authenticate below stays the
+                // authoritative read.
+                if (!admit_to_write_lock(deps, url_upload_id, cred->secret, res))
+                    return;
 
                 // Serialize the whole write critical section (authenticate ->
                 // offset check -> file write -> offset CAS) per upload_id —
@@ -677,6 +772,14 @@ void register_commit(HttpRouteSink& sink, Deps deps) {
                      return;
                  }
 
+                 // Authenticate BEFORE touching the lock map — it is keyed by a
+                 // client-supplied path segment, so acquiring first would let an
+                 // unauthenticated caller create entries and contend a legitimate
+                 // uploader's mutex. The in-lock authenticate below stays the
+                 // authoritative read.
+                 if (!admit_to_write_lock(deps, url_upload_id, cred->secret, res))
+                     return;
+
                  // Same per-upload serialization as the chunk route — commit
                  // reads the blob back (compute_file_sha256_hex), which must
                  // never race an in-flight chunk write for the same upload.
@@ -794,6 +897,14 @@ void register_cancel(HttpRouteSink& sink, Deps deps) {
                        return;
                    }
 
+                   // Authenticate BEFORE touching the lock map — it is keyed by a
+                   // client-supplied path segment, so acquiring first would let an
+                   // unauthenticated caller create entries and contend a legitimate
+                   // uploader's mutex. The in-lock authenticate below stays the
+                   // authoritative read.
+                   if (!admit_to_write_lock(deps, url_upload_id, cred->secret, res))
+                       return;
+
                    // Same per-upload serialization as chunk/commit — cancel
                    // must never discard a blob a concurrent in-flight chunk
                    // write (or commit) still owns.
@@ -850,5 +961,7 @@ void register_file_retrieval_routes(HttpRouteSink& sink, Deps deps) {
     register_commit(sink, deps);
     register_cancel(sink, deps);
 }
+
+std::size_t upload_write_lock_count_for_test() { return upload_write_locks().size_for_test(); }
 
 } // namespace yuzu::server

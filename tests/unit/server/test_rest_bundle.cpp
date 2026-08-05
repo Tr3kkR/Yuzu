@@ -101,7 +101,7 @@ struct BundleHarness {
                                  const std::string& scope_expr,
                                  const std::unordered_map<std::string, std::string>&,
                                  const std::string& exec_id,
-                                 const yuzu::server::authz::VisibleSet&)
+                                 const yuzu::server::DispatchCaller&)
                 -> std::pair<std::string, int> {
                 calls.push_back({plugin, action, scope_expr, exec_id, agent_ids});
                 return {"cmd-" + plugin + "-" + action, dispatch_sent};

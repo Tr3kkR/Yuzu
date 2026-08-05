@@ -325,11 +325,21 @@ enum class CommitCheck {
 /// "size was fine but hash was wrong" leaks more than the agent needs to
 /// retry-from-scratch). `grant_expected_sha256_hex` empty means the grant
 /// carried no expected hash (that leg is skipped, not treated as a match).
-[[nodiscard]] inline CommitCheck verify_commit(std::int64_t actual_size, std::int64_t declared_size,
+///
+/// The size leg is a CAP, not an equality requirement — the same reading
+/// `total_exceeds_declared` above states and the only one the grant's own
+/// field name (`declared_max_size`) supports. It used to test `!=`, which
+/// 422'd every honest upload smaller than the grant's maximum: the session
+/// is cancelled and the blob deleted on a mismatch, and the grant is
+/// already redeemed by then, so the agent had no retry. Callers pass the
+/// grant's `declared_max_size` here, so an equality test was only ever
+/// satisfiable by a client that happened to send exactly the cap.
+[[nodiscard]] inline CommitCheck verify_commit(std::int64_t actual_size,
+                                               std::int64_t declared_max_size,
                                                std::string_view computed_sha256_hex,
                                                std::string_view client_sha256_hex,
                                                std::string_view grant_expected_sha256_hex) {
-    if (actual_size != declared_size)
+    if (actual_size > declared_max_size)
         return CommitCheck::kMismatch;
     if (!hex_equal_ci(computed_sha256_hex, client_sha256_hex))
         return CommitCheck::kMismatch;
@@ -347,6 +357,28 @@ enum class CommitCheck {
 /// the blob layout. Extend deliberately, not by widening the grammar.
 [[nodiscard]] inline bool is_valid_retention_class(std::string_view rc) noexcept {
     return rc == "standard" || rc == "extended" || rc == "transient";
+}
+
+/// A mint request's OPTIONAL `expected_sha256`: absent (empty) or exactly 64
+/// lowercase hex characters — the same grammar the MCP `mint_upload_grant`
+/// tool's input schema enforces via `"pattern": "^[0-9a-f]{64}$"`.
+///
+/// The REST twin accepted anything and persisted it verbatim, which is not a
+/// cosmetic gap: a stored non-hash value is non-empty, so `verify_commit`'s
+/// grant-expected leg runs and can never match a real digest. Every commit
+/// against that grant 422s, and a commit mismatch cancels the session and
+/// deletes the blob while the grant is already redeemed — so a typo at mint
+/// time silently converts the grant into one that can never be used, with no
+/// retry. Rejecting at mint is the only point where the operator can still
+/// fix it. Validated here (not in the store) so both surfaces share one
+/// grammar and it is unit-testable without a database.
+/// Reuses `is_lowercase_hex` rather than re-spelling the character class:
+/// the digest and the credential secret are both 64 lowercase hex chars, so
+/// one grammar covers both and cannot drift.
+[[nodiscard]] inline bool is_valid_expected_sha256(std::string_view hex) noexcept {
+    if (hex.empty())
+        return true; // absent — the grant simply carries no expected hash.
+    return is_lowercase_hex(hex, kCredentialSecretHexLen);
 }
 
 /// The ONLY inputs are server-minted identifiers: the (pre-validated)

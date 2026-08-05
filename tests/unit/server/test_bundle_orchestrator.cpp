@@ -37,8 +37,8 @@ struct FakeDispatch {
                       const std::vector<std::string>& agent_ids, const std::string& /*scope*/,
                       const std::unordered_map<std::string, std::string>& /*params*/,
                       const std::string& correlation,
-                      const yuzu::server::authz::VisibleSet& exec_visible) -> std::pair<std::string, int> {
-            calls.push_back(Call{plugin, action, correlation, agent_ids, exec_visible});
+                      const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
+            calls.push_back(Call{plugin, action, correlation, agent_ids, caller.exec_visible});
             return {"cmd-" + plugin + "-" + action, sent};
         };
     }
@@ -224,7 +224,7 @@ TEST_CASE("orchestrator: a throwing dispatch step is isolated, manifest still st
     BundleOrchestrator::DispatchFn throwing =
         [&n](const std::string& plugin, const std::string& action, const std::vector<std::string>&,
              const std::string&, const std::unordered_map<std::string, std::string>&,
-             const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+             const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         if (++n == 2)
             throw std::runtime_error("gRPC write failed");
         return {"cmd-" + plugin + "-" + action, 1};

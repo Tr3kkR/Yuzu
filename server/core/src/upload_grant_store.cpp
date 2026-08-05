@@ -389,6 +389,7 @@ OpenSessionResult UploadGrantStore::open_session(const std::string& grant_id,
     // `upload_grant::is_expired`'s exact-boundary rule (`now == expires_at`
     // is still valid; only `now > expires_at` is expired).
     bool redeemed_miss = false;
+    std::string miss_state; ///< the grant's CURRENT state when the CAS missed
     const bool txn_ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         pg::PgResult upd = pg::exec_params(
             conn,
@@ -404,6 +405,23 @@ OpenSessionResult UploadGrantStore::open_session(const std::string& grant_id,
             // (already redeemed/revoked, or expired). Nothing to roll back;
             // commit the (no-op) transaction and report the miss below.
             redeemed_miss = true;
+            // Re-read the CURRENT state inside this same transaction rather
+            // than inferring the reason from the step-1 snapshot. The
+            // snapshot can be stale in exactly the way that matters: a grant
+            // that read 'minted' at step 1 and was REVOKED before this CAS
+            // misses here, and the snapshot-based fallback below would then
+            // report `grant_already_redeemed` — a 409 that confirms the
+            // grant existed and was valid, defeating the deliberate collapse
+            // of revoked onto `grant_unknown` (401) twenty lines above,
+            // whose whole point is never to confirm a revoked grant once
+            // existed. A failed re-read leaves `miss_state` empty, which the
+            // fallback treats as "unknown" and answers with the same
+            // non-committal 401 — the safe direction.
+            pg::PgResult cur = pg::exec_params(
+                conn, "SELECT state FROM upload_grant_store.grants WHERE grant_id=$1",
+                std::vector<std::string>{grant_id});
+            if (cur.status() == PGRES_TUPLES_OK && PQntuples(cur.get()) == 1)
+                miss_state = PQgetvalue(cur.get(), 0, 0);
             return true;
         }
 
@@ -429,14 +447,25 @@ OpenSessionResult UploadGrantStore::open_session(const std::string& grant_id,
         return result;
     }
     if (redeemed_miss) {
-        // Disambiguate against the step-1 snapshot: if it was already not
-        // 'minted' (or already visibly expired) at step 1, that alone
-        // explains the miss. Otherwise the miss is a concurrent redemption
-        // that landed between step 1 and this UPDATE — the other caller won
-        // the atomic race, and this caller reports the same
-        // grant_already_redeemed reason a straightforward replay would.
-        result.outcome = (state == "minted" && now > expires_at) ? OpenSessionOutcome::kExpired
-                                                                  : OpenSessionOutcome::kAlreadyRedeemed;
+        // Disambiguate against the grant's CURRENT state, re-read inside the
+        // CAS transaction above — NOT the step-1 snapshot, which can be
+        // stale in the one direction that leaks (see the re-read's comment).
+        //
+        //   revoked / gone / unreadable -> kGrantUnknown (401). A revoked
+        //     grant reads exactly like one that never existed, matching the
+        //     non-race path twenty lines above; an unreadable one is
+        //     answered the same way because that is the non-committal
+        //     direction.
+        //   still 'minted' -> the CAS can only have missed on the expiry
+        //     predicate, so this is a genuine expiry.
+        //   anything else ('redeemed') -> a concurrent caller won the atomic
+        //     race, which is the same fact a straightforward replay reports.
+        if (miss_state == "revoked" || miss_state.empty())
+            result.outcome = OpenSessionOutcome::kGrantUnknown;
+        else if (miss_state == "minted")
+            result.outcome = OpenSessionOutcome::kExpired;
+        else
+            result.outcome = OpenSessionOutcome::kAlreadyRedeemed;
         return result;
     }
 

@@ -26,6 +26,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 using yuzu::server::Deps;
 using yuzu::server::UploadGrantListAuthorization;
@@ -392,6 +393,129 @@ TEST_CASE("commit succeeds with the correct sha256 and returns actual_size", "[s
     auto cj = body_json(commit_res);
     CHECK(cj["state"] == "committed");
     CHECK(cj["actual_size"] == 3);
+    CHECK(cj["sha256"] == sha256_abc);
+}
+
+TEST_CASE("unauthenticated chunk/commit/cancel requests never grow the write-lock map",
+          "[server][routes][upload]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, routes_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::test::TempDir blob_dir{"yuzu_test_upload_blobs_"};
+    TestRouteSink sink;
+    yuzu::server::register_file_retrieval_routes(
+        sink, make_deps(store, blob_dir.path, std::make_shared<std::int64_t>(1000)));
+
+    // The lock map is a PROCESS-STATIC keyed by a client-supplied path
+    // segment. It used to be acquire-then-authenticate with no erase and no
+    // cap anywhere, so any well-formed-but-unauthenticated id permanently
+    // added an entry — unbounded memory reachable without a credential.
+    const auto before = yuzu::server::upload_write_lock_count_for_test();
+
+    for (int i = 0; i < 50; ++i) {
+        const std::string fake_id(16, static_cast<char>('a' + (i % 6)));
+        const std::string fake_cred = fake_id + "." + std::string(64, 'f');
+        const std::unordered_map<std::string, std::string> hdr{
+            {"X-Yuzu-Upload-Session", fake_cred}};
+
+        auto chunk = sink.dispatch("PUT", "/api/v1/uploads/" + fake_id + "/chunk", "x",
+                                   "application/octet-stream",
+                                   {{"X-Yuzu-Upload-Session", fake_cred},
+                                    {"Content-Range", content_range(0, 0, 1)}});
+        REQUIRE(chunk != nullptr);
+        CHECK(chunk->status == 401);
+
+        auto commit = sink.dispatch("POST", "/api/v1/uploads/" + fake_id + "/commit",
+                                    nlohmann::json{{"sha256", std::string(64, '0')}}.dump(),
+                                    "application/json", hdr);
+        REQUIRE(commit != nullptr);
+        CHECK(commit->status == 401);
+
+        auto cancel =
+            sink.dispatch("DELETE", "/api/v1/uploads/" + fake_id, "", "application/json", hdr);
+        REQUIRE(cancel != nullptr);
+        CHECK(cancel->status == 401);
+    }
+
+    CHECK(yuzu::server::upload_write_lock_count_for_test() == before);
+}
+
+TEST_CASE("a completed authenticated upload leaves no write-lock entry behind",
+          "[server][routes][upload]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, routes_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::test::TempDir blob_dir{"yuzu_test_upload_blobs_"};
+    TestRouteSink sink;
+    yuzu::server::register_file_retrieval_routes(
+        sink, make_deps(store, blob_dir.path, std::make_shared<std::int64_t>(1000)));
+
+    // The authenticated path must be bounded too: eviction is what makes the
+    // map's lifetime "while someone holds it" rather than "forever".
+    const auto before = yuzu::server::upload_write_lock_count_for_test();
+
+    const std::string payload = "abc";
+    const std::string sha256_abc =
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    std::string upload_id;
+    const std::string session_cred = mint_and_open(sink, "agent-1", 4096, upload_id);
+
+    auto chunk_res = sink.dispatch(
+        "PUT", "/api/v1/uploads/" + upload_id + "/chunk", payload, "application/octet-stream",
+        {{"X-Yuzu-Upload-Session", session_cred}, {"Content-Range", content_range(0, 2, 3)}});
+    REQUIRE(chunk_res->status == 200);
+
+    auto commit_res = sink.dispatch("POST", "/api/v1/uploads/" + upload_id + "/commit",
+                                    nlohmann::json{{"sha256", sha256_abc}}.dump(),
+                                    "application/json",
+                                    {{"X-Yuzu-Upload-Session", session_cred}});
+    REQUIRE(commit_res->status == 200);
+
+    CHECK(yuzu::server::upload_write_lock_count_for_test() == before);
+}
+
+TEST_CASE("commit succeeds when the upload is SMALLER than the grant's declared_max_size",
+          "[server][routes][upload]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, routes_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::test::TempDir blob_dir{"yuzu_test_upload_blobs_"};
+    TestRouteSink sink;
+    yuzu::server::register_file_retrieval_routes(
+        sink, make_deps(store, blob_dir.path, std::make_shared<std::int64_t>(1000)));
+
+    // Every other commit test in this file mints `declared_max_size ==
+    // payload.size()`, which is exactly why the `!=` size check survived: the
+    // field is a CAP, and an operator minting a generous grant for a file
+    // whose final size is not known up front is the ORDINARY case. Under the
+    // old equality test this 422'd, cancelled the session and deleted the
+    // blob — with the grant already redeemed, so there was no retry.
+    const std::string payload = "abc";
+    const std::string sha256_abc =
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    std::string upload_id;
+    const std::string session_cred =
+        mint_and_open(sink, "agent-1", /*declared_max_size=*/4096, upload_id);
+
+    auto chunk_res = sink.dispatch(
+        "PUT", "/api/v1/uploads/" + upload_id + "/chunk", payload, "application/octet-stream",
+        {{"X-Yuzu-Upload-Session", session_cred}, {"Content-Range", content_range(0, 2, 3)}});
+    REQUIRE(chunk_res != nullptr);
+    REQUIRE(chunk_res->status == 200);
+
+    auto commit_res = sink.dispatch("POST", "/api/v1/uploads/" + upload_id + "/commit",
+                                    nlohmann::json{{"sha256", sha256_abc}}.dump(),
+                                    "application/json",
+                                    {{"X-Yuzu-Upload-Session", session_cred}});
+    REQUIRE(commit_res != nullptr);
+    REQUIRE(commit_res->status == 200);
+    auto cj = body_json(commit_res);
+    CHECK(cj["state"] == "committed");
+    CHECK(cj["actual_size"] == 3); // the ACTUAL size, not the declared cap
     CHECK(cj["sha256"] == sha256_abc);
 }
 

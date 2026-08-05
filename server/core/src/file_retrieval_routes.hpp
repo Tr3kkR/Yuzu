@@ -30,6 +30,7 @@
 
 #include <httplib.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -122,5 +123,15 @@ struct Deps {
 /// function (not a class method) — the frozen deliverable signature;
 /// server.cpp constructs one `Deps` and calls this once.
 void register_file_retrieval_routes(HttpRouteSink& sink, Deps deps);
+
+/// Live entry count of the process-static per-upload write-lock map.
+///
+/// A test seam, and deliberately the only window onto that map: the map is
+/// keyed by a client-supplied path segment, so "does an unauthenticated
+/// request leave an entry behind" is a property no route response can
+/// express — the request is rejected either way, and only the map size
+/// distinguishes a bounded implementation from an unbounded one. Read-only
+/// and side-effect-free, so exposing it costs production nothing.
+[[nodiscard]] std::size_t upload_write_lock_count_for_test();
 
 } // namespace yuzu::server

@@ -41,6 +41,7 @@
 #include "plugin_config_store.hpp"
 #include "upload_grant_store.hpp"
 #include "file_retrieval_routes.hpp"
+#include "upload_grant_parsers.hpp" // kDefaultChunkMaxBytes + the frozen error envelope (BR-008)
 #include "x509_ca.hpp"
 #include "compliance_eval.hpp"
 #include "custom_properties_store.hpp"
@@ -141,6 +142,7 @@
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
+#include "schedule_arming_check.hpp"
 #include "schedule_routes.hpp"
 #include "schedule_runner.hpp"
 #include "dashboard_routes.hpp"
@@ -896,6 +898,46 @@ public:
         metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                          {{"route", "dispatch_closure"},
                           {"reason", std::string(yuzu::server::kReasonClosureNoTarget)}});
+        // ── Dispatch chokepoint + gateway wire-capability denials ─────────
+        //
+        // These three series answer "did the gate run and refuse?" — a question
+        // that has no answer at all while the counter is created lazily inside
+        // its own denial branch. Absent-vs-zero is exactly the distinction that
+        // matters here: an unseeded gateway-capability counter reads identically
+        // whether the gateway is advertising the capability correctly or the
+        // check never executed because the arming message was silently dropped
+        // (CC-03 — the gateway's CONNECTED advertisement is a `gen_server:cast`
+        // that `yuzu_gw_upstream.erl` drops on an open circuit or a full notify
+        // queue, with no retry). Seeding them makes the blind state visible.
+        //
+        // Both label sets are closed: `reason` is every `DispatchDenialReason`
+        // enumerator, `capability` is the one wire capability the server gates
+        // on today.
+        metrics_.describe("yuzu_server_dispatch_denied_total",
+                          "Dispatches refused by the classification/authorization chokepoint "
+                          "(`build_classified_command`), labelled by which gate refused. "
+                          "`kill_switched` is an operator-thrown emergency stop, deliberately "
+                          "distinct from the `forbidden` authorization verdict.",
+                          "counter");
+        for (auto reason : {"unclassified", "ambiguous", "anonymous_operator", "forbidden",
+                            "kill_switched"}) {
+            metrics_.counter("yuzu_server_dispatch_denied_total", {{"reason", reason}});
+        }
+        metrics_.describe("yuzu_server_dispatch_tag_invalid_total",
+                          "ClassifiedCommands whose dispatch_tag failed to decode at the send "
+                          "path — a defensive check behind the type invariant, so any non-zero "
+                          "value is a server-side defect.",
+                          "counter");
+        metrics_.counter("yuzu_server_dispatch_tag_invalid_total");
+        metrics_.describe("yuzu_server_gateway_capability_denied_total",
+                          "Dispatches refused because the routing gateway has not advertised the "
+                          "named wire capability in its most recent CONNECTED notification. Zero "
+                          "means the check ran and passed; absent would mean it never ran.",
+                          "counter");
+        metrics_.counter(
+            "yuzu_server_gateway_capability_denied_total",
+            {{"capability", std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}});
+
         // #2437 transport-layer body rejection (pre-routing, pre-auth). No
         // `tool` label: the body is never read, so nothing is known about the
         // call beyond its path — a tool label here would be a fabrication.
@@ -905,6 +947,18 @@ public:
         // default and evade the cap entirely).
         for (auto reason : {"over_cap", "unmeasurable"}) {
             metrics_.counter("yuzu_mcp_body_too_large_total", {{"reason", reason}});
+        }
+        // BR-008: the upload chunk PUT's pre-routing twin. Its own series, not
+        // a label on the MCP one — they are different transports with
+        // different caps, and folding them together would make an MCP
+        // dashboard count upload traffic.
+        metrics_.describe("yuzu_upload_chunk_body_rejected_total",
+                          "Upload chunk PUTs refused at the transport layer, before the body was "
+                          "read: over the 8 MiB chunk cap, or carrying framing this server "
+                          "cannot size in advance.",
+                          "counter");
+        for (auto reason : {"over_cap", "unmeasurable"}) {
+            metrics_.counter("yuzu_upload_chunk_body_rejected_total", {{"reason", reason}});
         }
         for (auto reason : {"client_disconnect", "superseded", "session_terminated",
                             "credential_revoked", "auth_unavailable", "internal_error",
@@ -6665,6 +6719,9 @@ private:
             case yuzu::server::detail::DispatchDenialReason::Forbidden:
                 reason_label = "forbidden";
                 break;
+            case yuzu::server::detail::DispatchDenialReason::KillSwitched:
+                reason_label = "kill_switched";
+                break;
             }
             metrics_
                 .counter("yuzu_server_dispatch_denied_total",
@@ -6680,10 +6737,49 @@ private:
         }
 
         const auto& cap = *decision;
+
+        // PER-ACTION KILL SWITCH (branch review / adversarial HIGH). Until this
+        // wiring landed, `PluginConfigStore::action_allowed` had ZERO production
+        // callers while `/api/v1/plugin-config/{plugin}/kill-switch` told the
+        // operator it was "a reliable emergency stop" — an operator could throw
+        // the switch mid-incident, get a 200, and watch the action keep running.
+        // The claim is only true if a dispatch path actually consults it, and
+        // this is that path: the single command builder every CommandRequest
+        // producer routes through.
+        //
+        // Placed AFTER classification+authorization deliberately: an unclassified
+        // or forbidden dispatch should report that, not be masked by a kill
+        // switch, and the switch is keyed on a plugin.action we have confirmed
+        // exists. `action_allowed` is fail-closed by contract — a closed store, a
+        // lease timeout or a query failure all return false — so a degraded
+        // config store disables the action rather than silently permitting it
+        // (ADR-0036). It is checked on EVERY dispatch and never memoized: an
+        // emergency stop that takes effect on the next cache expiry is not one.
+        if (plugin_config_store_ != nullptr &&
+            !plugin_config_store_->action_allowed(cap.plugin, cap.action)) {
+            metrics_.counter("yuzu_server_dispatch_denied_total", {{"reason", "kill_switched"}})
+                .increment();
+            spdlog::warn("dispatch denied: {}:{} reason=kill_switched caller={}", plugin, action,
+                         caller.system ? std::string("system")
+                                       : (caller.principal.empty() ? std::string("(anonymous)")
+                                                                   : caller.principal));
+            return std::unexpected(yuzu::server::detail::DispatchDenial{
+                yuzu::server::detail::DispatchDenialReason::KillSwitched,
+                std::string(cap.securable), cap.operation});
+        }
+
         detail::pb::CommandRequest cmd;
         cmd.set_command_id(command_id);
-        cmd.set_plugin(plugin);
-        cmd.set_action(action);
+        // BR-009: build the wire from the CANONICAL names the catalogue holds,
+        // not the caller's raw strings. `classify()` is deliberately
+        // case-insensitive on both halves, but the agent matches plugin names
+        // case-SENSITIVELY (`cmd.plugin() == handle.descriptor()->name`), so a
+        // caller passing `plugin="TAR"` was authorized here and then rejected
+        // on the endpoint as "plugin not found". `cap` is the row classification
+        // just resolved, so its spelling is the one the catalogue and the agent
+        // agree on.
+        cmd.set_plugin(std::string(cap.plugin));
+        cmd.set_action(std::string(cap.action));
         for (const auto& [k, v] : parameters)
             (*cmd.mutable_parameters())[k] = v;
         if (!payload.empty())
@@ -7735,6 +7831,97 @@ private:
                   // throw reach httplib's UNGUARDED WebSocket-upgrade call site
                   // and take the process down.
                   res.status = unmeasurable_cause ? 411 : 413;
+                  return httplib::Server::HandlerResponse::Handled;
+              }
+            }
+
+            // BR-008: the SAME pre-routing treatment for the upload chunk PUT.
+            // Its 8 MiB limit (`chunk_exceeds_max`) is enforced in the handler,
+            // which httplib reaches only AFTER buffering the whole body — up to
+            // its 100 MB default. The chunk route gates on a session credential
+            // the handler itself reads, not on the auth chokepoint, so without
+            // this an UNAUTHENTICATED caller makes the server allocate ~100 MB
+            // per connection before the advertised cap is ever consulted. The
+            // in-handler check stays: this is a transport bound in front of it,
+            // not a replacement for it.
+            //
+            // Guarded the same way as the MCP branch, for the same reason —
+            // httplib's WebSocket-upgrade call site is outside its own
+            // try/catch and ThreadPool::worker runs tasks bare, so an escaped
+            // throw here is std::terminate.
+            if (is_upload_chunk_path(req.path)) {
+              bool upload_unmeasurable_cause = false;
+              try {
+                const auto cap =
+                    static_cast<std::uint64_t>(yuzu::server::upload_grant::kDefaultChunkMaxBytes);
+                const bool oversize = upload_chunk_body_exceeds_cap(
+                    req.path, req.get_header_value_u64("Content-Length", 0), cap);
+                const bool unmeasurable = upload_chunk_body_unmeasurable(
+                    req.path, req.method, req.has_header("Content-Length"),
+                    req.get_header_value("Transfer-Encoding"),
+                    req.get_header_value("Content-Encoding"));
+                upload_unmeasurable_cause = unmeasurable;
+                if (oversize || unmeasurable) {
+                    // Pre-auth ingress rejection with no principal to audit:
+                    // metric plus a sampled log, per observability-conventions.
+                    // One throttle counter PER REASON — a shared one lets a
+                    // cheap over_cap flood suppress the rarer unmeasurable
+                    // line behind it (the #2437 lesson, applied here too).
+                    static std::atomic<std::uint64_t> up_over_cap_hits{0};
+                    static std::atomic<std::uint64_t> up_unmeasurable_hits{0};
+                    constexpr std::uint64_t kBodyLogEvery = 100;
+                    auto& hits = unmeasurable ? up_unmeasurable_hits : up_over_cap_hits;
+                    if (hits.fetch_add(1, std::memory_order_relaxed) % kBodyLogEvery == 0) {
+                        spdlog::warn("[BR-008] rejected {} {} from {}: {} (1 log per {} "
+                                     "rejections; the counter records all)",
+                                     onbehalf::sanitize_for_log(req.method, 16),
+                                     onbehalf::sanitize_for_log(req.path),
+                                     onbehalf::sanitize_for_log(req.remote_addr, 64),
+                                     unmeasurable ? "unmeasurable body" : "body over cap",
+                                     kBodyLogEvery);
+                    }
+                    try {
+                        metrics_
+                            .counter("yuzu_upload_chunk_body_rejected_total",
+                                     {{"reason", unmeasurable ? "unmeasurable" : "over_cap"}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                        // Observability must never kill the process — same
+                        // containment rationale as the MCP twin above.
+                    }
+                    // The frozen upload protocol's own envelope and reason
+                    // set, NOT the A4 envelope the MCP branch uses: this
+                    // path belongs to that protocol, and `chunk_too_large` is
+                    // already its published 413 reason for exactly this
+                    // condition. An unmeasurable body has no frozen reason —
+                    // it is a transport-framing refusal, not one of the ten —
+                    // so it gets the generic 411 shape instead of a
+                    // fabricated eleventh value.
+                    if (unmeasurable) {
+                        res.status = 411;
+                        res.set_content(
+                            nlohmann::json{
+                                {"error",
+                                 {{"code", 411},
+                                  {"message", "upload chunks must carry a body this server can "
+                                              "size in advance: send Content-Length, no "
+                                              "Transfer-Encoding, and no Content-Encoding other "
+                                              "than identity"}}},
+                                {"meta", {{"api_version", "v1"}}}}
+                                .dump(),
+                            "application/json");
+                    } else {
+                        res.status = 413;
+                        res.set_content(
+                            yuzu::server::upload_grant::error_envelope(
+                                yuzu::server::upload_grant::Reason::kChunkTooLarge,
+                                "chunk exceeds the maximum chunk size"),
+                            "application/json");
+                    }
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+              } catch (...) { // NOLINT(bugprone-empty-catch)
+                  res.status = upload_unmeasurable_cause ? 411 : 413;
                   return httplib::Server::HandlerResponse::Handled;
               }
             }
@@ -12449,7 +12636,7 @@ private:
                    const std::string& execution_id) -> std::pair<std::string, int> {
             // Background engines + legacy callers dispatch as SYSTEM (unfiltered):
             // exec_visible = nullopt (DispatchCaller's default). Operator surfaces
-            // that must confine call command_dispatch_confined_fn / the caller-typed
+            // that must confine call command_dispatch_caller_fn / the caller-typed
             // sibling below instead. Both funnel through the ONE dispatch_confined
             // seam. broadcast_on_none=false: an unnamed target here reaches nobody
             // (#2500), never the fleet.
@@ -12459,38 +12646,19 @@ private:
         };
 
         // #1788 / CDX-R7-02 / K-R7-02: the operator-facing confined entry.
-        // Identical to command_dispatch_fn but carries the caller's
-        // Execution:Execute visible set so dashboard + workflow dispatch narrow
-        // to it, exactly as /api/command and MCP do. Same seam
-        // (dispatch_confined), one extra parameter.
+        // Identical to command_dispatch_fn but carries the caller (identity +
+        // Execution:Execute visible set) so every operator dispatch surface —
+        // REST v1, dashboard, workflow, MCP — narrows to it, exactly as
+        // /api/command does. Same seam (dispatch_confined), one extra parameter.
         //
-        // PLAN-006: kept at its ORIGINAL bare-VisibleSet signature — unlike the
-        // three DispatchFn/CommandDispatchFn typedefs this wave widened
-        // (McpServer, DashboardRoutes, WorkflowRoutes) — because this exact
-        // closure is ALSO fed straight into `RestApiV1::CommandDispatchFn`
-        // below (rest_api_v1.hpp), a fourth, REST-owned typedef out of scope
-        // for this wave. `command_dispatch_caller_fn`, immediately below, is
-        // the sibling WorkflowRoutes now takes instead — same dispatch_confined
-        // seam, real caller identity threaded through.
-        auto command_dispatch_confined_fn =
-            [this](const std::string& plugin, const std::string& action,
-                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-                   const std::unordered_map<std::string, std::string>& parameters,
-                   const std::string& execution_id,
-                   const yuzu::server::authz::VisibleSet& exec_visible)
-            -> std::pair<std::string, int> {
-            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
-                                     execution_id,
-                                     yuzu::server::DispatchCaller{.exec_visible = exec_visible},
-                                     /*broadcast_on_none=*/false);
-        };
-
-        // PLAN-006: the CommandDispatchFn WorkflowRoutes now takes — same seam,
-        // same broadcast_on_none posture as command_dispatch_confined_fn above,
-        // but forwards the caller's identity (not just its visible set) through
-        // to dispatch_confined. Cannot simply widen command_dispatch_confined_fn
-        // in place: that closure's signature must stay VisibleSet-based to keep
-        // feeding RestApiV1::CommandDispatchFn (rest_api_v1.hpp, out of scope).
+        // PR1.9c: there used to be a second, bare-VisibleSet sibling here
+        // (`command_dispatch_confined_fn`) kept only because
+        // `RestApiV1::CommandDispatchFn` had not been widened. It built a
+        // `DispatchCaller` with an EMPTY principal, which
+        // `build_classified_command` refuses as `AnonymousOperator` before the
+        // legacy-open bypass — so every REST v1 dispatch was undeliverable.
+        // REST now takes the caller like everyone else and that closure is
+        // deleted; there is deliberately only ONE confined entry point again.
         auto command_dispatch_caller_fn =
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
@@ -12656,6 +12824,16 @@ private:
         metrics_.describe("yuzu_schedule_tick_errors_total",
                           "Schedule runner tick() exceptions caught (alertable on sustained rate)",
                           "counter");
+        // The one sibling that was never described. It is also the one whose
+        // absent-vs-zero distinction carries a security meaning: the arming
+        // check is fail-closed on an UNSET callback, so "no denials" and "the
+        // re-verification never ran" must not read alike on a dashboard.
+        metrics_.describe("yuzu_schedule_arming_denied_total",
+                          "Scheduled occurrences refused because the arming principal failed "
+                          "re-verification at fire time (or the arming callback was unwired, "
+                          "which denies fail-closed). Zero means the check ran and passed.",
+                          "counter");
+        metrics_.counter("yuzu_schedule_arming_denied_total");
         schedule_runner_ = std::make_unique<ScheduleRunner>(ScheduleRunner::Deps{
             .schedule_engine = schedule_engine_.get(),
             .instruction_store = instruction_store_.get(),
@@ -12672,42 +12850,21 @@ private:
             // consults on every other dispatch (capability_registry_,
             // PR1.9c) so a schedule's required (securable, operation) can
             // never drift from what a live dispatch of the same
-            // plugin.action would require. Fail-closed on every unresolved
-            // input: an unclassified/ambiguous plugin.action (ADR-0033 §2 —
-            // "a missing or unparseable classification means the capability
-            // does not exist"), a missing RBAC store, or a store error all
-            // deny the fire — a schedule must never dispatch under
-            // authority the server cannot presently confirm. RBAC
-            // legacy-open (rbac_enforcement_in_effect() false) admits,
-            // matching every other authz call site's posture.
+            // plugin.action would require.
+            //
+            // The decision rule itself lives in `schedule_arming_check.hpp`
+            // and is NOT restated here. It used to be inline, with a
+            // hand-copied mirror in the tests that had already drifted —
+            // BR-003's system_reserved branch landed here and never reached
+            // the copy, so the confused-deputy fix was untested. The header
+            // is now the single copy both this lambda and
+            // `test_operator_surface_twins.cpp` exercise; the fail-closed
+            // cases and the legacy-open posture are documented there.
             .arming_check = [this](const std::string& principal, const std::string& plugin,
                                    const std::string& action) -> bool {
-                const auto classified = capability_registry_.classify(plugin, action);
-                if (!classified)
-                    return false;
-                // BR-003 (branch review): a schedule is OPERATOR-authored but
-                // fires through `command_dispatch_fn`, which dispatches as
-                // `DispatchCaller{.system = true}`. The chokepoint's
-                // system_reserved guard (agent_registry.hpp) only refuses
-                // NON-system callers, so without this check a schedule is a
-                // confused deputy: an operator who may not dispatch
-                // `tar.fleet_snapshot` directly could schedule it — the
-                // definition ships operator-referencable
-                // (content/definitions/tar.yaml, `crossplatform.tar.fleet_snapshot`)
-                // — and the fire would reach the fleet under system authority.
-                // Refuse here, where the operator's provenance is still known;
-                // the reserved rows are server-initiated by construction
-                // (server.cpp issues them itself) and have no legitimate
-                // schedule caller.
-                if (classified->system_reserved)
-                    return false;
-                if (!rbac_store_ || !rbac_store_->is_open())
-                    return false;
-                if (!rbac_enforcement_in_effect(rbac_store_.get()))
-                    return true;
-                return rbac_store_->check_permission(
-                    principal, std::string(classified->securable),
-                    std::string(yuzu::server::authz::to_string(classified->operation)));
+                return yuzu::server::schedule_arming_permitted(capability_registry_,
+                                                               rbac_store_.get(), principal,
+                                                               plugin, action);
             },
         });
         schedule_tick_thread_ = std::thread([this]() {
@@ -14861,7 +15018,7 @@ private:
             // longer type-compatible with this parameter at all: the wrong
             // choice stopped being available rather than merely being avoided.
             // Empty closure would 503 those routes.
-            command_dispatch_confined_fn,
+            command_dispatch_caller_fn,
             // PR2 MFA step-up gate for the high-risk REST handlers; empty
             // closure disables the gate (preserves pre-PR2 behaviour).
             step_up_fn,

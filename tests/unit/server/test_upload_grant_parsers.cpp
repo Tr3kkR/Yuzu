@@ -170,15 +170,61 @@ TEST_CASE("verify_commit succeeds only when size and both hashes agree", "[serve
 
 TEST_CASE("verify_commit collapses EVERY failure mode to the same kMismatch outcome",
           "[server][upload]") {
-    // Size mismatch alone.
-    CHECK(verify_commit(/*actual=*/99, /*declared=*/100, "deadbeef", "deadbeef", "") ==
+    // Size OVER the cap alone.
+    CHECK(verify_commit(/*actual=*/101, /*declared_max=*/100, "deadbeef", "deadbeef", "") ==
           CommitCheck::kMismatch);
     // Client-supplied hash mismatch alone.
     CHECK(verify_commit(100, 100, "deadbeef", "cafef00d", "") == CommitCheck::kMismatch);
     // Grant's expected hash mismatch alone (client hash matches computed).
     CHECK(verify_commit(100, 100, "deadbeef", "deadbeef", "cafef00d") == CommitCheck::kMismatch);
     // All three wrong at once — still just kMismatch, nothing more specific.
-    CHECK(verify_commit(1, 100, "aaaa", "bbbb", "cccc") == CommitCheck::kMismatch);
+    CHECK(verify_commit(1000, 100, "aaaa", "bbbb", "cccc") == CommitCheck::kMismatch);
+}
+
+TEST_CASE("is_valid_expected_sha256 matches the MCP twin's ^[0-9a-f]{64}$ grammar",
+          "[server][upload]") {
+    const std::string valid(64, 'a');
+    CHECK(is_valid_expected_sha256(valid));
+    CHECK(is_valid_expected_sha256(
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    // Absent is legal — the field is optional and the grant then carries no
+    // expected hash (verify_commit skips that leg entirely).
+    CHECK(is_valid_expected_sha256(""));
+
+    // Everything the REST mint used to accept and persist verbatim. Each of
+    // these is non-empty, so verify_commit's grant-expected leg would RUN
+    // and could never match — turning the grant into one no commit can ever
+    // satisfy, after it has already been redeemed.
+    CHECK_FALSE(is_valid_expected_sha256("not a hash"));
+    CHECK_FALSE(is_valid_expected_sha256(std::string(63, 'a'))); // too short
+    CHECK_FALSE(is_valid_expected_sha256(std::string(65, 'a'))); // too long
+    CHECK_FALSE(is_valid_expected_sha256(std::string(64, 'A'))); // uppercase
+    CHECK_FALSE(is_valid_expected_sha256(std::string(64, 'g'))); // non-hex
+    CHECK_FALSE(is_valid_expected_sha256("sha256:" + valid));
+}
+
+TEST_CASE("verify_commit treats declared_max_size as a CAP, not an equality requirement",
+          "[server][upload]") {
+    // The caller passes the grant's `declared_max_size`, which the frozen
+    // protocol and `total_exceeds_declared` both describe as a maximum. An
+    // equality test 422'd every honest upload smaller than the cap — and
+    // because a commit mismatch cancels the session and deletes the blob
+    // while the grant is already redeemed, that gave the agent no retry.
+    CHECK(verify_commit(/*actual=*/1, /*declared_max=*/100, "deadbeef", "deadbeef", "") ==
+          CommitCheck::kOk);
+    CHECK(verify_commit(/*actual=*/99, /*declared_max=*/100, "deadbeef", "deadbeef", "deadbeef") ==
+          CommitCheck::kOk);
+    // A zero-byte upload under a non-zero cap is still a size-legal commit;
+    // the hash legs remain the thing that decides whether it is the RIGHT
+    // content.
+    CHECK(verify_commit(/*actual=*/0, /*declared_max=*/100, "deadbeef", "deadbeef", "") ==
+          CommitCheck::kOk);
+    // Exactly at the cap stays legal — `>` not `>=`.
+    CHECK(verify_commit(/*actual=*/100, /*declared_max=*/100, "deadbeef", "deadbeef", "") ==
+          CommitCheck::kOk);
+    // One byte over is not.
+    CHECK(verify_commit(/*actual=*/101, /*declared_max=*/100, "deadbeef", "deadbeef", "") ==
+          CommitCheck::kMismatch);
 }
 
 TEST_CASE("verify_commit treats an empty grant-expected hash as 'no constraint', not a match target",

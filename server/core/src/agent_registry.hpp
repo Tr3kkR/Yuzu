@@ -84,6 +84,13 @@ enum class DispatchDenialReason : uint8_t {
     Forbidden,         ///< Classified, but `caller` may not issue it — either an
                        ///< operator lacking the resolved securable/operation, or
                        ///< ANY operator attempting a `system_reserved` row.
+    KillSwitched,      ///< Classified and authorized, but the per-action kill
+                       ///< switch is OFF for this `plugin.action` (or the config
+                       ///< store is degraded, which `action_allowed` reports as
+                       ///< disabled — never as enabled). Deliberately DISTINCT
+                       ///< from `Forbidden`: this is an operator-thrown
+                       ///< emergency stop, not an authorization verdict, and an
+                       ///< incident review needs to tell the two apart.
 };
 
 /// A refused dispatch. `securable`/`operation` are populated only once

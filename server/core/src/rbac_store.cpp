@@ -949,6 +949,14 @@ std::expected<void, std::string> RbacStore::delete_role(const std::string& name)
     sqlite3_bind_text(s, 1, name.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(s);
     sqlite3_finalize(s);
+    // delete_role: `roles(name)` is ON DELETE CASCADE from role_permissions AND
+    // principal_roles, so this strips grants from every holder — and
+    // `check_permission` is cache-first, keyed on (username, securable,
+    // operation) and only expired by this call. Without it a revoked
+    // principal keeps a cached `true` until some unrelated write bumps
+    // the generation, which the schedule arming re-check would then read
+    // as current authority.
+    invalidate_perm_cache();
     return {};
 }
 
@@ -1474,6 +1482,10 @@ std::expected<void, std::string> RbacStore::delete_group(const std::string& name
     sqlite3_bind_text(s, 1, name.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(s);
     sqlite3_finalize(s);
+    // delete_group: removes the memberships that granted members their roles — `check_permission` is cache-first and only this call
+    // expires it, so a stale `true`/`false` would otherwise outlive the
+    // membership change (see delete_role for the full reasoning).
+    invalidate_perm_cache();
     return {};
 }
 
@@ -1517,6 +1529,10 @@ std::expected<void, std::string> RbacStore::add_group_member(const std::string& 
     sqlite3_bind_text(s, 2, username.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(s);
     sqlite3_finalize(s);
+    // add_group_member: a newly-granted principal must not read a cached deny — `check_permission` is cache-first and only this call
+    // expires it, so a stale `true`/`false` would otherwise outlive the
+    // membership change (see delete_role for the full reasoning).
+    invalidate_perm_cache();
     return {};
 }
 
@@ -1533,6 +1549,13 @@ std::expected<void, std::string> RbacStore::remove_group_member(const std::strin
     sqlite3_bind_text(s, 2, username.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(s);
     sqlite3_finalize(s);
+    // remove_group_member: THE canonical revocation for a group-derived grant — and
+    // `check_permission` is cache-first, keyed on (username, securable,
+    // operation) and only expired by this call. Without it a revoked
+    // principal keeps a cached `true` until some unrelated write bumps
+    // the generation, which the schedule arming re-check would then read
+    // as current authority.
+    invalidate_perm_cache();
     return {};
 }
 

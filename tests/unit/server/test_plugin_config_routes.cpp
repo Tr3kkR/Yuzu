@@ -271,10 +271,18 @@ TEST_CASE("plugin_config_routes: config PUT/GET/DELETE round-trip over HTTP",
     auto put_body = body(put->body);
     CHECK(put_body["data"]["value"] == "mail.example.com");
     CHECK(put_body["data"]["updated_by"] == "alice");
-    REQUIRE(h.audits.size() == 1);
+    // BR-006: one mutation writes a PAIR of rows — `attempted` before the
+    // store is touched, then the real outcome once it has answered. The
+    // pre-mutation row must never claim `success`, or a mutation that fails
+    // after the row lands leaves the log asserting a change that never was.
+    REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[0].action == "plugin_config.set");
+    CHECK(h.audits[0].result == "attempted");
     CHECK(h.audits[0].target_type == "PluginConfig");
     CHECK(h.audits[0].target_id == "email.smtp.host");
+    CHECK(h.audits[1].action == "plugin_config.set");
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].target_id == "email.smtp.host");
 
     auto get = h.sink.Get("/api/v1/plugin-config/email/smtp.host");
     REQUIRE(get);
@@ -309,12 +317,18 @@ TEST_CASE("plugin_config_routes: secret PUT response is metadata only — no val
     CHECK_FALSE(body(sput->body)["data"].contains("value"));
     CHECK(sput->body.find(plaintext) == std::string::npos);
 
-    // The audit detail is redacted too.
-    REQUIRE_FALSE(h.audits.empty());
-    const auto& last = h.audits.back();
-    CHECK(last.action == "plugin_secret.set");
-    CHECK(last.detail.find(plaintext) == std::string::npos);
-    CHECK(last.detail.find("REDACTED") != std::string::npos);
+    // The audit detail is redacted too — in EVERY row, not just the last.
+    // BR-006 added a second (outcome) row per mutation, which is a second
+    // place a secret could leak; asserting only `back()` would not see a
+    // plaintext `attempted` row.
+    REQUIRE(h.audits.size() == 2);
+    for (const auto& row : h.audits) {
+        CHECK(row.action == "plugin_secret.set");
+        CHECK(row.detail.find(plaintext) == std::string::npos);
+        CHECK(row.detail.find("REDACTED") != std::string::npos);
+    }
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].result == "success");
 
     auto sdel = h.sink.Delete("/api/v1/plugin-config/email/api_key/secret");
     REQUIRE(sdel);
@@ -360,9 +374,12 @@ TEST_CASE("plugin_config_routes: kill-switch PUT flips the switch and is audited
     CHECK(data["reason"] == "incident 99");
     CHECK(data["set_by"] == "alice");
 
-    REQUIRE_FALSE(h.audits.empty());
-    CHECK(h.audits.back().action == "plugin_config.kill_switch.set");
-    CHECK(h.audits.back().target_id == "firewall.block");
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].action == "plugin_config.kill_switch.set");
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[0].target_id == "firewall.block");
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].target_id == "firewall.block");
 
     auto get = h.sink.Get("/api/v1/plugin-config/firewall/kill-switch?action=block");
     REQUIRE(get);
@@ -407,6 +424,61 @@ TEST_CASE("plugin_config_routes: a dropped audit row fails the write closed (503
         "SELECT 1 FROM plugin_config_store.secrets WHERE plugin = 'email' AND key = 'api_key'")};
     REQUIRE(chk.status() == PGRES_TUPLES_OK);
     CHECK(PQntuples(chk.get()) == 0);
+}
+
+TEST_CASE("plugin_config_routes: BR-006 — a mutation that fails AFTER the audit row lands is "
+          "recorded as `failure`, never left asserting `success`",
+          "[pg][server][routes][config][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    // Deleting a SECRET that does not exist is a genuine post-audit store
+    // failure. The secret plane is write-only by design, so its delete route
+    // has no existence pre-check available: it audits `attempted`, calls
+    // `delete_secret`, and only then learns the row was absent (NotFound).
+    //
+    // That is the exact window the old pre-audit-`success` posture lied
+    // about — it wrote `success` first and never revisited it, so the
+    // compliance log permanently asserted a secret deletion that never
+    // happened. The CONFIG delete route is deliberately NOT used here: it
+    // has a cheap existence pre-check and 404s before emitting any audit row
+    // at all, so it cannot reach this window (and asserting against it was
+    // this test's own first, wrong, premise).
+    auto del = h.sink.Delete("/api/v1/plugin-config/email/never_existed/secret");
+    REQUIRE(del);
+    CHECK(del->status == 404);
+
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].action == "plugin_secret.delete");
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].action == "plugin_secret.delete");
+    CHECK(h.audits[1].result == "failure");
+    // Neither row may claim the deletion succeeded.
+    for (const auto& row : h.audits)
+        CHECK(row.result != "success");
+}
+
+TEST_CASE("plugin_config_routes: deleting an absent CONFIG key emits no audit row at all "
+          "(the existence pre-check runs first, by design)",
+          "[pg][server][routes][config][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    // The companion to the case above, pinning the deliberate asymmetry so a
+    // later "consistency" change cannot quietly move the config route onto
+    // the secret route's audit-then-discover shape. A double-delete/retry of
+    // an already-absent config key must not manufacture an `attempted` row
+    // for a mutation the server already knows it will not perform.
+    auto del = h.sink.Delete("/api/v1/plugin-config/email/never.existed");
+    REQUIRE(del);
+    CHECK(del->status == 404);
+    CHECK(h.audits.empty());
 }
 
 TEST_CASE("plugin_config_routes: PUT rejects a missing/non-string value field with 400",

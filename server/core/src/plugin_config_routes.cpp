@@ -127,18 +127,53 @@ void write_store_error(httplib::Response& res, PluginConfigStore::Error err) {
                                 httplib::Response& res, const std::string& action,
                                 const std::string& target_type, const std::string& target_id,
                                 const std::string& detail_str) {
-    const bool persisted = detail::emit_behavioral_audit(audit_fn, req, res, action, "success",
+    // BR-006: the pre-mutation row records `attempted`, NOT `success`. It used
+    // to claim success, which made the evidence chain lie in the exact window
+    // it exists to cover: the audit insert lands, the store call then fails on
+    // a lease timeout / encrypt error / concurrent delete, the caller correctly
+    // gets a 503 — and the compliance log permanently asserts a configuration
+    // or secret change that never happened. `emit_behavioral_audit` already
+    // takes the result string, so honesty here costs nothing.
+    //
+    // The fail-closed property is unchanged and is the reason the row is
+    // written FIRST: if the evidence cannot be persisted, the mutation is not
+    // attempted at all. Callers pair this with `audit_outcome(...)` below to
+    // record what actually happened once the store has answered.
+    const bool persisted = detail::emit_behavioral_audit(audit_fn, req, res, action, "attempted",
                                                           target_type, target_id, detail_str);
     if (!persisted) {
         res.status = 503;
         res.set_content(
-            error_json_a4(503, "the operation succeeded but its audit record could not be "
-                               "persisted; treat as failed",
+            error_json_a4(503, "the audit record could not be persisted, so the operation was "
+                               "NOT performed; retry once the audit store recovers",
                           make_correlation_id()),
             kJson);
         return false;
     }
     return true;
+}
+
+/// BR-006 second half: record what the store ACTUALLY did, after it answered.
+/// Pairs with `audit_or_503`'s pre-mutation `attempted` row — together they
+/// give a reviewer an evidence chain that cannot assert a change which did not
+/// occur, and cannot lose a change that did.
+///
+/// Deliberately NOT fail-closed and deliberately `[[nodiscard]]`-free: the
+/// mutation has already happened by the time this runs, so refusing it is not
+/// on the table, and 503-ing a completed write would be a worse lie than the
+/// one BR-006 fixes. A dropped outcome row leaves the `attempted` row standing,
+/// which reads as "started, outcome unknown" — the honest reading of exactly
+/// that state. It is logged at warn so the gap is visible rather than silent.
+void audit_outcome(const Deps::AuditFn& audit_fn, const httplib::Request& req,
+                   httplib::Response& res, const std::string& action, bool ok,
+                   const std::string& target_type, const std::string& target_id,
+                   const std::string& detail_str) {
+    if (!detail::emit_behavioral_audit(audit_fn, req, res, action, ok ? "success" : "failure",
+                                       target_type, target_id, detail_str)) {
+        spdlog::warn("plugin-config: {} outcome row ({}) could not be persisted for {}; the "
+                     "'attempted' row stands and the outcome is unrecorded",
+                     action, ok ? "success" : "failure", target_id);
+    }
 }
 
 nlohmann::json config_json(const PluginConfigStore::ConfigEntry& e) {
@@ -308,9 +343,13 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
                 auto result =
                     deps.store->set_kill_switch(plugin, action, enabled, reason, actor(*session));
                 if (!result) {
+                    audit_outcome(deps.audit_fn, req, res, "plugin_config.kill_switch.set", /*ok=*/false,
+                                  "PluginConfig", target_id, detail_str);
                     write_store_error(res, result.error());
                     return;
                 }
+                audit_outcome(deps.audit_fn, req, res, "plugin_config.kill_switch.set", /*ok=*/true, "PluginConfig",
+                              target_id, detail_str);
                 nlohmann::json out = {{"data", kill_switch_json(*result)},
                                       {"meta", {{"api_version", "v1"}}}};
                 res.set_content(out.dump(), kJson);
@@ -361,9 +400,13 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
 
                 auto result = deps.store->set_secret(plugin, key, *value, actor(*session));
                 if (!result) {
+                    audit_outcome(deps.audit_fn, req, res, "plugin_secret.set", /*ok=*/false,
+                                  "PluginSecret", target_id, detail_str);
                     write_store_error(res, result.error());
                     return;
                 }
+                audit_outcome(deps.audit_fn, req, res, "plugin_secret.set", /*ok=*/true, "PluginSecret",
+                              target_id, detail_str);
                 nlohmann::json out = {{"data", secret_meta_json(*result)},
                                       {"meta", {{"api_version", "v1"}}}};
                 res.set_content(out.dump(), kJson);
@@ -400,9 +443,13 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
 
                    auto result = deps.store->delete_secret(plugin, key);
                    if (!result) {
+                       audit_outcome(deps.audit_fn, req, res, "plugin_secret.delete", /*ok=*/false,
+                                     "PluginSecret", target_id, "deleted");
                        write_store_error(res, result.error());
                        return;
                    }
+                   audit_outcome(deps.audit_fn, req, res, "plugin_secret.delete", /*ok=*/true, "PluginSecret",
+                                 target_id, "deleted");
                    nlohmann::json out = {{"deleted", true}, {"meta", {{"api_version", "v1"}}}};
                    res.set_content(out.dump(), kJson);
                });
@@ -466,9 +513,13 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
 
                 auto result = deps.store->set_config(plugin, key, *value, actor(*session));
                 if (!result) {
+                    audit_outcome(deps.audit_fn, req, res, "plugin_config.set", /*ok=*/false,
+                                  "PluginConfig", target_id, detail_str);
                     write_store_error(res, result.error());
                     return;
                 }
+                audit_outcome(deps.audit_fn, req, res, "plugin_config.set", /*ok=*/true, "PluginConfig",
+                              target_id, detail_str);
                 nlohmann::json out = {{"data", config_json(*result)}, {"meta", {{"api_version", "v1"}}}};
                 res.set_content(out.dump(), kJson);
             });
@@ -504,9 +555,13 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
 
                    auto result = deps.store->delete_config(plugin, key);
                    if (!result) {
+                       audit_outcome(deps.audit_fn, req, res, "plugin_config.delete", /*ok=*/false,
+                                     "PluginConfig", target_id, "deleted");
                        write_store_error(res, result.error());
                        return;
                    }
+                   audit_outcome(deps.audit_fn, req, res, "plugin_config.delete", /*ok=*/true, "PluginConfig",
+                                 target_id, "deleted");
                    nlohmann::json out = {{"deleted", true}, {"meta", {{"api_version", "v1"}}}};
                    res.set_content(out.dump(), kJson);
                });

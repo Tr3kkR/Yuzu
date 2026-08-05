@@ -1,7 +1,8 @@
 #pragma once
 
-#include "authz_model.hpp"    // #1788: VisibleSet — DispatchFn confinement param
+#include "authz_model.hpp"    // #1788: VisibleSet — dispatch() confinement param
 #include "bundle_service.hpp" // BundleStepSpec, DispatchedStep, BundleAggregate
+#include "dispatch_caller.hpp" // PR1.9c: DispatchCaller — DispatchFn's caller param
 
 #include <cstddef>
 #include <cstdint>
@@ -57,7 +58,14 @@ public:
         // both). The orchestrator never derives or re-decides this set itself
         // (governance UP-8) — it threads through whatever `dispatch()`'s caller
         // supplied unchanged; see that method's doc comment below.
-        const yuzu::server::authz::VisibleSet& exec_visible)>;
+        //
+        // PR1.9c: this carries the whole CALLER, not just the visible set.
+        // `build_classified_command` refuses an empty `DispatchCaller::principal`
+        // as `AnonymousOperator` BEFORE the legacy-open bypass, so a
+        // VisibleSet-only shape made every bundle step undeliverable on both
+        // surfaces. `dispatch()` already receives `principal`, so the caller is
+        // assembled there — no new data crosses this boundary.
+        const yuzu::server::DispatchCaller& caller)>;
 
     /// Per-step audit sink, request-bound by the wrapper (so the core stays
     /// req-free). Called once per step with a transport-agnostic verb.

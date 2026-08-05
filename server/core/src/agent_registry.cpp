@@ -457,6 +457,32 @@ bool tag_is_valid(const pb::CommandRequest& cmd, yuzu::MetricsRegistry& metrics,
 /// reaches `send_to`/`send_to_all`, and `build_classified_command` always
 /// stamps one), so this check applies unconditionally on the gateway-routed
 /// arm — never silently downgraded to "send anyway, tag be damned".
+///
+/// DECISION (CC-03, adversarial review): the `session.gateway_node.empty()`
+/// early-return is DEFENSIVE, not the decision point, and is deliberately
+/// left as an allow. Both callers only enter the gateway arm when
+/// `gateway_node` is non-empty, so an empty node never reaches this check in
+/// production — flipping it to deny would change nothing and would misstate
+/// where the real hazard lives.
+///
+/// The real hazard is upstream and is a DELIVERY problem, not a gate-posture
+/// one. `gateway_node` (and `gateway_wire_capabilities` with it) is written
+/// only by `NotifyStreamStatus`'s CONNECTED arm, which the gateway delivers
+/// as an Erlang `gen_server:cast` (`yuzu_gw_upstream.erl`) that is dropped
+/// with no retry when the circuit is open or ≥10 notifies are in flight. A
+/// proxied agent whose arming notification was dropped therefore sits with
+/// `gateway_node == ""`, `send_to` takes the DIRECT-STREAM branch, and the
+/// command is written into the gateway's proxy Subscribe stream and never
+/// reaches the agent — the #1004 black-hole the `gateway_node`-first
+/// ordering exists to prevent. Hardening this check cannot see that state,
+/// because the state it would need to observe was never delivered.
+///
+/// What ships here instead: the two deny counters are PRE-REGISTERED at boot
+/// (server.cpp's metrics seed block), so "the check ran and passed" (zero)
+/// is distinguishable from "the check never ran" (absent) — which is exactly
+/// the blind state a dropped arming message produces. Making the arming
+/// delivery itself reliable or reconcilable is a gateway-side change with
+/// its own wire implications and is deliberately NOT folded in here.
 bool gateway_capability_missing(const AgentSession& session, yuzu::MetricsRegistry& metrics,
                                 const std::string& agent_id) {
     if (session.gateway_node.empty())

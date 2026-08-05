@@ -527,6 +527,36 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
     return is_mcp_path(path) && content_length > cap;
 }
 
+/// The PATH-AGNOSTIC half of the measurability decision: does this request's
+/// FRAMING let the server size the body before reading it? Extracted so the
+/// MCP cap and the upload-chunk cap below share one copy of the rules — a
+/// second hand-written copy is precisely how `Transfer-Encoding: Chunked`
+/// slipped through an earlier round of this same check.
+[[nodiscard]] inline bool body_framing_unmeasurable(std::string_view method,
+                                                    bool has_content_length,
+                                                    std::string_view transfer_encoding,
+                                                    std::string_view content_encoding) noexcept {
+    // Any framing we do not solely control.
+    if (!transfer_encoding.empty())
+        return true;
+    // Any encoding that makes Content-Length measure something other than what
+    // gets buffered. Case-insensitive, because header VALUES are compared
+    // case-insensitively by every library that reads them, including ours now.
+    if (!content_encoding.empty()) {
+        const bool identity =
+            content_encoding.size() == 8 &&
+            std::equal(content_encoding.begin(), content_encoding.end(), "identity",
+                       [](char a, char b) {
+                           return (a | 0x20) == (b | 0x20);
+                       });
+        if (!identity)
+            return true;
+    }
+    if ((method == "POST" || method == "PUT" || method == "PATCH") && !has_content_length)
+        return true;
+    return false;
+}
+
 /// True when an MCP request carries a body this server cannot size before
 /// reading it, and must therefore refuse (411) rather than admit.
 ///
@@ -578,27 +608,53 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
                                                 bool has_content_length,
                                                 std::string_view transfer_encoding,
                                                 std::string_view content_encoding) noexcept {
-    if (!is_mcp_path(path))
-        return false;
-    // Any framing we do not solely control.
-    if (!transfer_encoding.empty())
-        return true;
-    // Any encoding that makes Content-Length measure something other than what
-    // gets buffered. Case-insensitive, because header VALUES are compared
-    // case-insensitively by every library that reads them, including ours now.
-    if (!content_encoding.empty()) {
-        const bool identity =
-            content_encoding.size() == 8 &&
-            std::equal(content_encoding.begin(), content_encoding.end(), "identity",
-                       [](char a, char b) {
-                           return (a | 0x20) == (b | 0x20);
-                       });
-        if (!identity)
-            return true;
-    }
-    if ((method == "POST" || method == "PUT" || method == "PATCH") && !has_content_length)
-        return true;
-    return false;
+    return is_mcp_path(path) &&
+           body_framing_unmeasurable(method, has_content_length, transfer_encoding,
+                                     content_encoding);
+}
+
+// ── Upload chunk body cap (BR-008) ──────────────────────────────────────────
+//
+// The chunk route enforces its 8 MiB limit in the HANDLER, which runs only
+// AFTER httplib has already buffered the entire body — up to its 100 MB
+// default. So an UNAUTHENTICATED caller (the chunk route gates on a session
+// credential the handler reads, not on the ordinary auth chokepoint) could
+// make the server allocate ~100 MB per connection before the cap it
+// advertises was ever consulted. These predicates move the decision in front
+// of the body read, exactly as #2437 did for MCP, and reuse that surface's
+// framing rules rather than restating them.
+
+/// Path scoping for the upload chunk cap: `PUT /api/v1/uploads/{id}/chunk`.
+///
+/// Matched by prefix + suffix rather than by re-implementing the route's
+/// `([a-f0-9]+)` regex. A pre-routing gate must never be NARROWER than the
+/// surface it protects — the MCP scoping comment above records the same
+/// lesson, where scoping to `/mcp/v1/` instead of `/mcp/` left a
+/// one-character evasion. Being deliberately wider here costs nothing: a
+/// path that matches this shape but no route still 404s, and it does so
+/// without buffering 100 MB first.
+[[nodiscard]] inline bool is_upload_chunk_path(std::string_view path) noexcept {
+    return path.starts_with("/api/v1/uploads/") && path.ends_with("/chunk");
+}
+
+[[nodiscard]] inline bool upload_chunk_body_exceeds_cap(std::string_view path,
+                                                        std::uint64_t content_length,
+                                                        std::uint64_t cap) noexcept {
+    return is_upload_chunk_path(path) && content_length > cap;
+}
+
+/// Companion to the above — a chunk PUT whose body this server cannot size in
+/// advance. Same reasoning as the MCP twin: `content_length == 0` is a SIZE
+/// answer, not a measurability one, so a caller must consult both or reopen
+/// the bypass. The agent uploader always sends an identity-encoded body with
+/// a Content-Length (it must, to build the `Content-Range` header the
+/// protocol requires), so this costs a conforming client nothing.
+[[nodiscard]] inline bool upload_chunk_body_unmeasurable(
+    std::string_view path, std::string_view method, bool has_content_length,
+    std::string_view transfer_encoding, std::string_view content_encoding) noexcept {
+    return is_upload_chunk_path(path) &&
+           body_framing_unmeasurable(method, has_content_length, transfer_encoding,
+                                     content_encoding);
 }
 
 /// The unauthenticated-allowlist decision for the server's pre-routing

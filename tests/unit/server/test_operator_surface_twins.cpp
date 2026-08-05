@@ -38,12 +38,14 @@
 
 #include "approval_manager.hpp"
 #include "authz_model.hpp"
+#include "capability_decls/core_dispatch_capabilities.hpp"
 #include "capability_decls/plugin_action_catalogue_a.hpp"
 #include "command_capability.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "mcp_server_testonly.hpp"
 #include "rbac_store.hpp"
+#include "schedule_arming_check.hpp"
 #include "schedule_engine.hpp"
 #include "schedule_runner.hpp"
 
@@ -62,26 +64,23 @@ using namespace yuzu::server::mcp;
 
 namespace {
 
-// ── The seam under test: server.cpp's arming_check lambda, mirrored ────────
+// ── The seam under test: server.cpp's arming_check rule, SHARED ───────────
 //
-// This is the EXACT decision rule server.cpp's ScheduleRunner::Deps
-// `.arming_check` lambda implements (see the "D7/PLAN-003 (p14)" comment at
-// its construction site) — reproduced here so it is independently testable
-// with a real CommandCapabilityRegistry and a real RbacStore, without a live
-// ServerImpl. Any change to the real lambda's decision rule must be mirrored
-// here too, or this test stops proving anything about the shipped seam.
-bool compose_arming_check(const CommandCapabilityRegistry& registry, RbacStore* rbac,
+// This is no longer a mirror. It forwards to `schedule_arming_permitted`
+// (schedule_arming_check.hpp) — the same function server.cpp's
+// ScheduleRunner::Deps `.arming_check` lambda calls — so there is exactly
+// one copy of the decision rule and the drift this file's previous
+// hand-copied version suffered is unrepresentable.
+//
+// That drift was real, not hypothetical: BR-003's `system_reserved` branch
+// landed in the lambda and never reached the copy here, so the
+// confused-deputy fix was untested and freely revertible while this file
+// stayed green. The wrapper is kept only so the existing call sites below
+// read unchanged.
+bool compose_arming_check(const CommandCapabilityRegistry& registry, const RbacStore* rbac,
                           const std::string& principal, const std::string& plugin,
                           const std::string& action) {
-    const auto classified = registry.classify(plugin, action);
-    if (!classified)
-        return false;
-    if (!rbac || !rbac->is_open())
-        return false;
-    if (!rbac_enforcement_in_effect(rbac))
-        return true;
-    return rbac->check_permission(principal, std::string(classified->securable),
-                                  std::string(yuzu::server::authz::to_string(classified->operation)));
+    return yuzu::server::schedule_arming_permitted(registry, rbac, principal, plugin, action);
 }
 
 } // namespace
@@ -107,6 +106,43 @@ TEST_CASE("arming_check composition: null/closed RbacStore denies fail-closed",
           "[server][routes][mcp]") {
     CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
     CHECK_FALSE(compose_arming_check(registry, nullptr, "alice", "filesystem", "exists"));
+}
+
+TEST_CASE("arming_check composition: a system_reserved capability is refused to every operator "
+          "(BR-003 confused deputy)",
+          "[server][routes][mcp]") {
+    // THE branch that drifted. A schedule is operator-authored but fires
+    // through `command_dispatch_fn`, which dispatches as
+    // `DispatchCaller{.system = true}`; the chokepoint's system_reserved
+    // guard only refuses NON-system callers, so without this denial an
+    // operator could schedule `tar.fleet_snapshot` — a definition that ships
+    // operator-referencable — and reach the fleet under system authority.
+    //
+    // The registry is composed over BOTH fragments deliberately:
+    // `plugin_action_catalogue_a()` declares no system_reserved row at all
+    // (see its header note), so a registry built from it alone cannot
+    // express this case — which is part of why the old mirror never covered
+    // it. `tar.fleet_snapshot` is declared by the core fragment.
+    CommandCapabilityRegistry registry{capdecls::core_dispatch_capabilities(),
+                                       capdecls::plugin_action_catalogue_a()};
+
+    RbacStore rbac(":memory:");
+    rbac.set_rbac_enabled(true);
+    // Administrator holds every (securable, operation) pair, so RBAC alone
+    // would ADMIT — the denial has to come from the system_reserved branch,
+    // not from a missing grant. That is what makes this a real test of it.
+    REQUIRE(rbac.assign_role(PrincipalRole{"user", "alice", "Administrator"}).has_value());
+    CHECK_FALSE(compose_arming_check(registry, &rbac, "alice", "tar", "fleet_snapshot"));
+
+    // Legacy-open RBAC does not rescue it either: the reserved check runs
+    // BEFORE the enforcement-in-effect early-return.
+    RbacStore open_rbac(":memory:");
+    CHECK_FALSE(compose_arming_check(registry, &open_rbac, "alice", "tar", "fleet_snapshot"));
+
+    // Sanity: a non-reserved row in the same composed registry still admits,
+    // so the denial above is specific to system_reserved and not the
+    // composition failing wholesale.
+    CHECK(compose_arming_check(registry, &rbac, "alice", "filesystem", "exists"));
 }
 
 TEST_CASE("arming_check composition: RBAC legacy-open (disabled) admits regardless of grant",
