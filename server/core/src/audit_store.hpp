@@ -150,6 +150,30 @@ inline constexpr std::int64_t kAuditTtlFutureSlackSec = 2 * 86'400LL;
 // the 0.6M rows/day @ 60-min-interval calibration stays valid.
 inline constexpr std::size_t kMaxAuditDeletesPerPass = 25000;
 
+/// Re-arm delay after a pass that hit the per-pass cap AND left a real backlog.
+///
+/// The cap bounds how much one pass may delete; it was never meant to bound the
+/// DRAIN RATE, but at one pass per hour that is exactly what it did: 25,000/h =
+/// 6.94 rows/s, against a store whose own INSERT path measures three orders of
+/// magnitude faster. Above that write rate the evidence table grows permanently
+/// and never converges, and a one-off backlog (a retention-days reduction, a
+/// migrated legacy trail with a longer horizon) takes months to clear. Gate 3
+/// performance measured both halves; the figures live in that finding, not here.
+///
+/// A capped pass costs tens of milliseconds end to end, so re-arming in seconds
+/// rather than an hour is close to free: the cap still bounds the lease hold and
+/// the transaction size, and the steady state is unchanged because a pass that
+/// does NOT hit the cap goes back to the full interval.
+inline constexpr int kAuditBacklogRearmSec = 5;
+
+/// How long the retention thread waits before its next pass. Extracted so the
+/// DECISION is testable without driving the thread or the clock: the sleep is
+/// not the interesting part, the "a binding cap must not wait an hour" rule is.
+[[nodiscard]] inline constexpr int audit_next_wait_s(bool cap_bound_with_backlog,
+                                                     int cleanup_interval_min) noexcept {
+    return cap_bound_with_backlog ? kAuditBacklogRearmSec : cleanup_interval_min * 60;
+}
+
 // Threshold for the elapsed-time detector. ABSOLUTE -- how far the clock moved
 // has nothing to do with how long rows are kept. Deriving it from the retention
 // window is the fatal mistake (at 365d it becomes a YEAR and never fires). Set
@@ -201,7 +225,26 @@ public:
     /// already complete; FALSE on any failure — the caller MUST refuse boot
     /// (fail-closed: never serve with a knowingly-incomplete evidence chain, retry
     /// next start). The verified-migrated legacy file is moved aside, not deleted.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
+    ///
+    /// A FAILED call ARMS the write gate: `log()` declines until a later call
+    /// succeeds. That is not belt-and-braces — `ServerImpl`'s constructor sets
+    /// `startup_failed_` and then KEEPS CONSTRUCTING, and several of its own
+    /// audit-emitting hooks are guarded only on `is_open()`, so without this a
+    /// boot that refuses to serve still writes native rows ahead of the marker
+    /// and wedges every later boot on the prefix proof (Gate 3 cpp-safety).
+    ///
+    /// `sourceless` decides what happens when there is nothing to migrate — no
+    /// legacy file, or a legacy file with no `audit_events` table:
+    ///   * `StampIfEmpty` (boot): stamp the completion marker, but ONLY over an
+    ///     empty table, re-checked inside the stamping transaction.
+    ///   * `Refuse`: do not stamp under any circumstance. One-shot CLI paths pass
+    ///     this — a CLI invocation must never be what declares the fleet's
+    ///     evidence migration complete, because a host that simply does not hold
+    ///     `audit.db` would otherwise foreclose the real migration on the host
+    ///     that does (Gate 3 architect A-4).
+    enum class Sourceless { StampIfEmpty, Refuse };
+    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path,
+                                           Sourceless sourceless = Sourceless::StampIfEmpty);
 
     /// Persist an audit event. FAIL-HARD: returns true iff the row was written.
     /// The bool is part of the SOC 2 CC6.6/CC7.2 evidence-integrity chain —
@@ -356,6 +399,16 @@ private:
     int retention_days_;
     int cleanup_interval_min_;
     yuzu::MetricsRegistry* metrics_{nullptr};
+
+    /// Set when `migrate_from_sqlite` starts, cleared only when it SUCCEEDS.
+    /// While set, `log()` declines: a store whose mandatory backfill did not
+    /// complete must not put native rows ahead of the marker, because the prefix
+    /// proof then rejects the legacy trail on every later boot. A store that was
+    /// never asked to migrate (unit tests, and any future caller) is unaffected —
+    /// the gate arms on the attempt, not on construction, so it cannot silently
+    /// disable audit for a caller that has no legacy trail to worry about.
+    /// Atomic because serving threads read it while boot writes it.
+    std::atomic<bool> backfill_pending_{false};
 
     // Cumulative event write counters bucketed by `result`. Lock-free.
     std::atomic<uint64_t> events_success_{0};

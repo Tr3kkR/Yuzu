@@ -619,6 +619,107 @@ TEST_CASE("AuditStore: wiring metrics pre-seeds both closed label sets",
     CHECK(after.find("yuzu_server_audit_backfill_total{result=\"fresh\"} 0") != std::string::npos);
 }
 
+// Gate 3 performance: at one capped pass per hour the 25k cap stops being a
+// per-pass bound and becomes a permanent drain ceiling, below the rate the
+// store's own write path sustains. A pass that hits the cap AND leaves a real
+// backlog must therefore re-arm in seconds; anything else keeps the interval.
+TEST_CASE("AuditStore: a binding cap re-arms in seconds, everything else waits the interval",
+          "[audit_store][retention]") {
+    CHECK(audit_next_wait_s(/*cap_bound_with_backlog=*/true, 60) == kAuditBacklogRearmSec);
+    CHECK(audit_next_wait_s(/*cap_bound_with_backlog=*/true, 1) == kAuditBacklogRearmSec);
+    // No backlog: the configured cadence, untouched.
+    CHECK(audit_next_wait_s(/*cap_bound_with_backlog=*/false, 60) == 3600);
+    CHECK(audit_next_wait_s(/*cap_bound_with_backlog=*/false, 1) == 60);
+    // The re-arm is a floor on responsiveness, not on load: it must stay well
+    // above the measured per-pass cost and well below the default interval.
+    STATIC_REQUIRE(kAuditBacklogRearmSec > 0);
+    STATIC_REQUIRE(kAuditBacklogRearmSec < 60);
+}
+
+// Gate 3 cpp-safety. A backfill that STARTED and did not finish gates the write
+// path. `ServerImpl`'s constructor sets `startup_failed_` and then keeps
+// constructing — several of its audit hooks are guarded only on `is_open()` —
+// so without the gate a boot that refuses to serve still writes native rows
+// ahead of the marker, and the prefix proof then refuses every later boot.
+TEST_CASE("AuditStore: a failed backfill declines writes until one succeeds",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bf13_"}};
+    auto legacy = dir.path / "audit.db";
+    build_legacy_audit_db(legacy, /*count=*/100);
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    // Another deployment's rows: same id shape, different event times, so the
+    // prefix proof rejects them and the backfill fails.
+    exec_sql(db.dsn(), "INSERT INTO audit_store.audit_events (id, timestamp, principal, "
+                       "principal_role, action, result, ttl_expires_at) OVERRIDING SYSTEM VALUE "
+                       "SELECT g, 500000 + g, 'admin','admin','auth.login','success',0 "
+                       "FROM generate_series(1,50) g");
+    REQUIRE_FALSE(store.migrate_from_sqlite(legacy));
+
+    // The gate is armed. A write here would be the native row that wedges the
+    // next boot, so it is declined and counted as a write failure.
+    const auto failed_before = store.emit_failed_count();
+    CHECK_FALSE(store.log(mk("admin", "post.failed.backfill")));
+    CHECK(store.emit_failed_count() == failed_before + 1);
+    CHECK(row_count(db.dsn()) == 50); // nothing written
+
+    // Not a one-way latch: clear the obstruction, complete the backfill, and
+    // writes resume.
+    exec_sql(db.dsn(), "DELETE FROM audit_store.audit_events");
+    REQUIRE(store.migrate_from_sqlite(legacy));
+    CHECK(store.log(mk("admin", "post.good.backfill")));
+}
+
+// Gate 3 architect A-4. A one-shot CLI may COMPLETE a real backfill, but it must
+// never declare the migration done merely because THIS host holds no legacy
+// audit.db — that stamps the marker over an empty table, and the host that does
+// hold the trail then skips the mandatory backfill on that marker and reports
+// success.
+TEST_CASE("AuditStore: a sourceless Refuse caller may not stamp; boot still may",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+
+    CHECK_FALSE(store.migrate_from_sqlite("/nonexistent-yuzu-test/audit.db",
+                                          AuditStore::Sourceless::Refuse));
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE key = "
+                                 "'backfill_complete'") == "0");
+    // Refusing arms the write gate too — the caller is expected to abort.
+    CHECK_FALSE(store.log(mk("root", "mfa.reset.breakglass")));
+
+    // The boot path, over the same empty table, still stamps and re-opens writes.
+    REQUIRE(store.migrate_from_sqlite("/nonexistent-yuzu-test/audit.db"));
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE key = "
+                                 "'backfill_complete'") == "1");
+    CHECK(store.log(mk("root", "mfa.reset.breakglass")));
+}
+
+// Gate 3 quality-engineer: the retention thread's lifecycle had no test at all.
+// This pins start -> stop -> stop-again -> destroy. It deliberately does NOT
+// call start_cleanup() twice: that is a KNOWN defect in the non-jthread arm
+// (move-assigning over a joinable std::thread is std::terminate), and a test
+// that crashes the suite is not a regression net. Tracked separately.
+TEST_CASE("AuditStore: the cleanup thread stops idempotently and joins on destroy",
+          "[pg][audit_store][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    {
+        // A 1-minute interval: the first pass never fires inside the test, so
+        // this exercises teardown, not the pass itself.
+        AuditStore store(pool, kGuardRetentionDays, 1);
+        REQUIRE(store.is_open());
+        store.start_cleanup();
+        store.stop_cleanup();
+        store.stop_cleanup(); // idempotent
+    }                         // ~AuditStore joins an already-stopped thread
+    SUCCEED("cleanup thread torn down without hang or terminate");
+}
+
 // Gate 3 architect A-1. A "nothing to migrate" exit may stamp the marker only
 // over an EMPTY table: the marker asserts the trail is COMPLETE, and with no
 // source in hand nothing on that path can establish it. Reachable when replica 2

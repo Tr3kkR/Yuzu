@@ -159,7 +159,13 @@ open_one_shot_audit(yuzu::server::pg::PgPool& pool, const std::filesystem::path&
                   << " without an audit record\n";
         return nullptr;
     }
-    if (!audit->migrate_from_sqlite(legacy_audit_db)) {
+    // Sourceless::Refuse — a one-shot may COMPLETE a real backfill, but it must
+    // never declare the migration complete merely because THIS host holds no
+    // legacy audit.db. That stamps the marker over an empty table, and the host
+    // that DOES hold the trail then skips the mandatory backfill on that marker
+    // and reports success (Gate 3 architect A-4).
+    if (!audit->migrate_from_sqlite(legacy_audit_db,
+                                    yuzu::server::AuditStore::Sourceless::Refuse)) {
         spdlog::error("{}: the one-time legacy audit backfill from {} did not complete (see prior "
                       "log lines); refusing to {}. Writing an audit row ahead of the backfill "
                       "marker would block every later server boot (ADR-0040). Resolve the backfill "

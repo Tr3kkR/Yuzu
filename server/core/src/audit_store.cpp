@@ -270,9 +270,20 @@ void AuditStore::set_metrics(yuzu::MetricsRegistry* m) {
 
 // ── Backfill (ADR-0009 MANDATORY class / ADR-0040) ───────────────────────────
 
-bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path) {
+bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path,
+                                     Sourceless sourceless) {
     if (!open_)
         return false;
+
+    // Arm the write gate for the duration. It is cleared only where this
+    // function SUCCEEDS; every failure path below leaves it armed, so `log()`
+    // declines until a later attempt succeeds. See the header for why the
+    // constructor's own audit hooks make this necessary rather than defensive.
+    backfill_pending_.store(true, std::memory_order_release);
+    const auto backfill_ok = [this] {
+        backfill_pending_.store(false, std::memory_order_release);
+        return true;
+    };
 
     const auto backfill_metric = [this](const char* result) {
         if (metrics_)
@@ -286,8 +297,29 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     // backfill supplies explicit ids via OVERRIDING SYSTEM VALUE, so without
     // this the sequence still starts at 1 and the first live log() would collide
     // with a backfilled id and fail the fail-HARD write forever.
-    const auto stamp_complete = [this]() -> bool {
-        return pool_.with_txn_for(kBackfillTxnTimeout, [](PGconn* c) -> bool {
+    // `require_empty` is for the sourceless callers: the emptiness they checked
+    // outside this transaction is a TOCTOU read — a peer replica can stream rows
+    // in between. Re-checking INSIDE the stamping transaction closes it, because
+    // the marker and the check then commit or roll back together.
+    const auto stamp_complete = [this](bool require_empty = false) -> bool {
+        return pool_.with_txn_for(kBackfillTxnTimeout, [require_empty](PGconn* c) -> bool {
+            if (require_empty) {
+                pg::PgResult n = pg::exec_params(
+                    c, "SELECT COUNT(*) FROM audit_store.audit_events", std::vector<std::string>{});
+                if (n.status() != PGRES_TUPLES_OK) {
+                    spdlog::error("AuditStore: migrate_from_sqlite: emptiness re-check failed: {}",
+                                  PQerrorMessage(c));
+                    return false;
+                }
+                if (to_i64(PQgetvalue(n.get(), 0, 0)) > 0) {
+                    spdlog::error(
+                        "AuditStore: migrate_from_sqlite: refusing to mark the backfill complete — "
+                        "audit_events became NON-EMPTY while this pass was deciding, so another "
+                        "process is writing or streaming into it. Let that process finish; it "
+                        "stamps the marker.");
+                    return false;
+                }
+            }
             pg::PgResult sv = pg::exec_params(
                 c,
                 "SELECT setval(pg_get_serial_sequence('audit_store.audit_events','id'), "
@@ -316,9 +348,14 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     // 1. Idempotency marker + resume point, on a short-lived lease released
     // before any legacy I/O (holding two size-1-pool leases at once deadlocks).
     // Resume point ASSUMES the intended cutover shape (PG starts empty, legacy
-    // present): during backfill the only rows in PG are backfilled ones (log()
-    // is inert until this returns and boot completes), so `MAX(id)` is a safe
-    // id-ordered resume cursor after a mid-backfill crash.
+    // present): during backfill the only rows in PG are backfilled ones, so
+    // `MAX(id)` is a safe id-ordered resume cursor after a mid-backfill crash.
+    // What makes that true is the write gate at the top of `log()` — this
+    // function armed `backfill_pending_` on entry, so nothing can write a native
+    // row until it succeeds. It is NOT true by virtue of "boot has not completed
+    // yet": the constructor keeps running after a failed backfill and its own
+    // audit hooks would otherwise fire (Gate 3 cpp-safety disproved the earlier
+    // wording, which claimed exactly that).
     //
     // Why "PG non-empty AND no backfill_complete marker, WITH a legacy source in
     // hand" is a crash-resume (Gate 4 architect): native rows only appear after
@@ -370,7 +407,7 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
         }
         if (PQntuples(mk.get()) > 0) {
             spdlog::debug("AuditStore: migrate_from_sqlite already completed, skipping");
-            return true;
+            return backfill_ok();
         }
         pg::PgResult mx =
             pg::exec_params(lease.get(),
@@ -416,15 +453,38 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             backfill_metric("failed");
             return false;
         }
-        if (!stamp_complete()) {
+        // A one-shot CLI (or any other Refuse caller) must never be the thing
+        // that declares the fleet's evidence migration complete. A host that
+        // merely does not hold `audit.db` would otherwise stamp over its empty
+        // table, and the host that DOES hold the legacy trail then boots, sees
+        // the marker, and skips the mandatory backfill reporting success —
+        // 365 days of evidence silently never migrated (Gate 3 architect A-4).
+        if (sourceless == Sourceless::Refuse) {
+            spdlog::error(
+                "AuditStore: migrate_from_sqlite: {} — refusing to declare the backfill complete "
+                "from this entry point. Only a server boot may do that, because this process "
+                "cannot tell a genuine fresh install from a host that simply does not hold the "
+                "legacy audit.db. Start the server once, then retry.",
+                situation);
             backfill_metric("failed");
             return false;
         }
-        spdlog::info("AuditStore: migrate_from_sqlite: {}; marking backfill complete over an empty "
-                     "audit_events",
+        if (!stamp_complete(/*require_empty=*/true)) {
+            backfill_metric("failed");
+            return false;
+        }
+        // WARN, not info: on a genuine fresh install this is routine, but this
+        // code cannot distinguish that from a replica whose peer holds the
+        // legacy trail — and in the second case it has just foreclosed the
+        // migration. Name what was foreclosed so the line is actionable.
+        spdlog::warn("AuditStore: migrate_from_sqlite: {}; marking the backfill COMPLETE over an "
+                     "empty audit_events. If any host in this deployment still holds a legacy "
+                     "audit.db, its trail will now NOT be migrated — that host's boot will skip "
+                     "the backfill on this marker. Expected on a fresh install; see "
+                     "docs/user-manual/upgrading.md if this is an upgrade.",
                      situation);
         backfill_metric("fresh");
-        return true;
+        return backfill_ok();
     };
 
     // 2. Legacy present?
@@ -860,12 +920,32 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     }
 
     backfill_metric("completed");
-    return true;
+    return backfill_ok();
 }
 
 // ── Write (FAIL-HARD) ────────────────────────────────────────────────────────
 
 bool AuditStore::log(const AuditEvent& event) {
+    // A mandatory backfill that STARTED and did not finish gates the write path.
+    // A native row written now sits ahead of the `backfill_complete` marker, and
+    // the prefix proof then rejects the legacy trail on every later boot — the
+    // host is permanently unbootable and the documented remediation deletes the
+    // very rows written here. Declining is the safe direction: the caller sees
+    // fail-hard false, exactly as for any other persistence failure.
+    //
+    // NOT redundant with the caller refusing to serve. `ServerImpl`'s ctor sets
+    // `startup_failed_` on a failed backfill and then KEEPS CONSTRUCTING —
+    // `startup_failed_` is not read again for ~600 lines — and several hooks it
+    // installs on the way (the secret-codec audit hook among them) are guarded
+    // only on `is_open()` (Gate 3 cpp-safety).
+    if (backfill_pending_.load(std::memory_order_acquire)) {
+        emit_failed_.fetch_add(1, std::memory_order_relaxed);
+        spdlog::error("AuditStore::log: the mandatory legacy backfill has not completed; declining "
+                      "action={} rather than writing a native row ahead of the completion marker "
+                      "(that would refuse every later boot). Resolve the backfill first.",
+                      event.action);
+        return false;
+    }
     if (!open_) {
         // Audit DB not open — surface as a failure so callers can flag the gap
         // on the response (HIGH-2, PR #883). Operators running audit-off never
@@ -1450,22 +1530,33 @@ void AuditStore::stop_cleanup() {
 #endif
 }
 
+// `wait_s` is recomputed after every pass: the full interval normally, but
+// kAuditBacklogRearmSec while the per-pass cap is BINDING and a real backlog
+// remains. Draining at one capped pass per hour is what turns the cap into a
+// permanent growth ceiling rather than a per-pass bound (see the constant).
+// The signal is `cap_reached_` moving, which `cleanup_once` increments only when
+// the cap bound AND its post-delete probe found a genuine remainder — so a
+// declined pass, or an exact-boundary pass that drained the last row, returns to
+// the full interval rather than spinning.
 #ifdef __cpp_lib_jthread
 void AuditStore::run_cleanup(std::stop_token stop) {
+    int wait_s = cleanup_interval_min_ * 60;
     while (!stop.stop_requested()) {
-        for (int i = 0; i < cleanup_interval_min_ * 60 && !stop.stop_requested(); ++i)
+        for (int i = 0; i < wait_s && !stop.stop_requested(); ++i)
             std::this_thread::sleep_for(std::chrono::seconds(1));
         if (stop.stop_requested())
             break;
 #else
 void AuditStore::run_cleanup() {
+    int wait_s = cleanup_interval_min_ * 60;
     while (!stop_requested_.load()) {
-        for (int i = 0; i < cleanup_interval_min_ * 60 && !stop_requested_.load(); ++i)
+        for (int i = 0; i < wait_s && !stop_requested_.load(); ++i)
             std::this_thread::sleep_for(std::chrono::seconds(1));
         if (stop_requested_.load())
             break;
 #endif
         const auto now = now_epoch();
+        const uint64_t caps_before = cap_reached_.load(std::memory_order_relaxed);
         // NOTHING may escape a thread function: an exception here is
         // std::terminate. cleanup_once allocates and formats, so the surface is
         // real (#2037 class).
@@ -1488,6 +1579,8 @@ void AuditStore::run_cleanup() {
                 // Nothing escapes a thread function, not even a failure to report.
             }
         }
+        wait_s = audit_next_wait_s(cap_reached_.load(std::memory_order_relaxed) > caps_before,
+                                   cleanup_interval_min_);
     }
 }
 
