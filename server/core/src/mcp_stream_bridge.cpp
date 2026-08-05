@@ -377,10 +377,13 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
                 reject = "pin_slots";
                 displaced.reset();  // rejecting: nothing is released, nothing to report
                 // Charges outstanding means calls that reserved and have not
-                // settled a terminal - ordinarily in flight. Pins alone means
-                // every slot is a committed final awaiting delivery, and no
-                // amount of waiting moves it. The remediation differs by that
-                // much, so the caller is told which.
+                // settled a terminal - ordinarily in flight, so a wait is true
+                // advice. Pins alone means every slot is a committed final
+                // awaiting delivery AND the reclaim above found none of them
+                // takeable; two of the three states that produces clear on a
+                // retry, so that arm advises retrying rather than waiting. The
+                // remediation differs by that much, so the caller is told which
+                // - see PinSlotsHeld's contract for the full state list.
                 pin_slots_held = unpinned > 0 ? PinSlotsHeld::kCharges : PinSlotsHeld::kPins;
                 // Captured, NOT emitted here: the metrics registry has its own mutex
                 // and the label map allocates, and this is inside bridge_mu_ - the

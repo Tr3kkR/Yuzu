@@ -410,10 +410,17 @@ public:
 
     /// What was actually holding this session's streamed slots when a `pin_slots`
     /// reject was emitted (#2740). The refusal's remediation is chosen from this,
-    /// because ONE sentence cannot be true of both states: `kCharges` means calls
-    /// that reserved and have not settled a terminal (ordinarily in flight - the
-    /// text may say "wait"), `kPins` means every slot is a COMMITTED final that no
-    /// wire has taken delivery of, where waiting is exactly what will not help.
+    /// because ONE sentence cannot be true of both states. `kCharges` means calls
+    /// that reserved and have not settled a terminal - ordinarily in flight, so
+    /// "wait for one to finish" is true advice. `kPins` means every slot is a
+    /// COMMITTED final that no wire has taken delivery of AND the reclaim found
+    /// none of them takeable, which happens in three states: a final still being
+    /// WRITTEN by a live pump, a transient decline while one of this session's
+    /// records is mid-projection, or a slot genuinely stuck. The first two clear
+    /// on retry and the client cannot tell which it is in, so the `kPins` text
+    /// advises a retry FIRST and only then a resume or a fresh session - do not
+    /// reintroduce "waiting will not help" here, which was true only before the
+    /// reclaim existed.
     /// Never asserts a fault: a healthy session passes through `kPins` during the
     /// terminal-to-wire flush window, which is why the text points at the metric
     /// rather than declaring one (see `count_pin_slots_reject`).
