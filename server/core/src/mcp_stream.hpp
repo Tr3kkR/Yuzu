@@ -379,15 +379,21 @@ public:
     /// so "almost certainly been consumed" is a likelihood, not a fact. Saying otherwise
     /// matters because the sweep cannot tell a displaced pin from a cursor-acknowledged
     /// one and records both as terminal_delivered - a wrong audit fact rather than a
-    /// wrong comment. That gap is fixed in the follow-up PR (a tri-state pin status).
+    /// wrong comment. STILL OPEN, and #2740's admission reclaim widened it by adding a
+    /// third way for a pin to vanish without a client having seen anything. It is
+    /// mitigated, not closed: a reclaim emits `mcp.bridge.pin_displaced_for_admission`
+    /// immediately before the reap, so the trail distinguishes the two causes even
+    /// though the reap's own row does not. A tri-state pin status would close it
+    /// properly; this comment used to promise that as "the follow-up PR", which is the
+    /// PR that wrote this sentence, so the promise is withdrawn rather than re-dated.
     ///
     /// The pin is released by FOUR routes, and they do NOT all mean the client got the
     /// frame: unpin() when the final was written on the POST wire (it did), attach_and_replay
     /// when a cursor proves consumption (it did), ring LRU displacement as above (it did
     /// not — accounting drift), and the bridge's admission reclaim (#2740; it did not — the
-    /// session needed the slot for a new streamed call). Anything that treats a missing pin
-    /// as proof of delivery must consult the audit trail, not the pin alone. Or with the
-    /// whole object. Same return contract and boundary as publish().
+    /// session needed the slot for a new streamed call). A pin also dies with the whole
+    /// object. Anything that treats a missing pin as proof of delivery must consult the
+    /// audit trail, not the pin alone. Same return contract and boundary as publish().
     std::uint64_t publish_final(std::string_view event_type, std::string_view data) noexcept;
 
     /// Deterministic fault injection for publish() — TEST SEAM ONLY. The throw sites
@@ -474,7 +480,14 @@ public:
 
     /// Release the eviction-exemption on a pinned final frame (unpin rule (a): the final was
     /// written on the POST wire). Idempotent - an unknown/already-cleared id is a no-op.
-    void unpin(std::uint64_t id);
+    ///
+    /// Returns TRUE only if THIS call cleared the slot. The bridge's admission reclaim
+    /// (#2740) needs that distinction: it selects a pin, then releases it after the
+    /// admission commits, and in between a resume ack or a delivered final can release the
+    /// same id without holding `bridge_mu_`. Crediting the freed slot on a no-op would admit
+    /// one call over the per-session cap, and reporting one would audit an exemption loss
+    /// that never happened. Callers that genuinely do not care may ignore the result.
+    bool unpin(std::uint64_t id);
 
     /// True while `id` is a pinned (eviction-exempt) final frame. The 2f bridge sweep polls
     /// this: a parked (ring-only) record whose pin has gone - consumed via a GET resume that

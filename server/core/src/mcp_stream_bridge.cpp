@@ -357,6 +357,13 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
             // for the same reason the re-read exists - `pinned` is unsigned, and a
             // count that reads 0 here must not wrap to SIZE_MAX and reject for the
             // wrong reason.
+            //
+            // The re-read alone is NOT sufficient, which is why the release below
+            // is what finally decides: a count measures SLOTS, not the identity of
+            // the one selected. A resume ack or a delivered final can release the
+            // selected id (neither takes `bridge_mu_`) while an unrelated pin
+            // appears, leaving the count full. So this decision is provisional and
+            // is confirmed by `unpin` reporting that it really cleared the slot.
             const std::size_t pinned_now = rec->stream->pinned_count();
             const std::size_t reclaimed = displaced.has_value() && pinned_now > 0 ? 1U : 0U;
             const std::size_t effective_pinned = pinned_now - reclaimed;
@@ -374,7 +381,12 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
                 // global admission lock. Taking a slower shared lock under a broad
                 // one is the shape this very round removed from the pump; the
                 // sibling count_reject already defers for the same reason.
-                pin_reject_pinned = pinned;
+                // `pinned_now`, NOT the pre-selection `pinned`: the label must be
+                // derived from the same reading the refusal was decided on, or the
+                // wedge alert and the client's remediation describe different
+                // states (the counter's own comment says it lives at the reject
+                // site so it cannot drift from the admission expression).
+                pin_reject_pinned = pinned_now;
                 pin_reject_unpinned = unpinned;
             }
         }
@@ -427,8 +439,14 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
             // slot double-counted. `unpin` is id-targeted and idempotent: if a
             // resume ack or on_final_written released the same id in between, this
             // is a no-op and the admission stands either way. Allocation-free.
-            if (displaced.has_value()) {
-                rec->stream->unpin(displaced->event_id);
+            if (displaced.has_value() && !rec->stream->unpin(displaced->event_id)) {
+                // Another route (a resume ack, or a final that reached the wire)
+                // released this id between selection and here. The admission stands
+                // - the slot IS free, which is all the cap cares about - but no
+                // exemption was lost by US, so nothing is counted, audited or
+                // logged. Reporting it would attribute a loss that did not happen
+                // to the admitting principal.
+                displaced.reset();
             }
         }
     }

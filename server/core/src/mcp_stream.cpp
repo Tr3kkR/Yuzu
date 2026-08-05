@@ -841,17 +841,18 @@ bool McpStreamState::is_pinned(std::uint64_t id) const {
     return is_pinned_locked(id);
 }
 
-void McpStreamState::unpin(std::uint64_t id) {
+bool McpStreamState::unpin(std::uint64_t id) {
     if (id == 0) {
-        return;
+        return false;
     }
     std::lock_guard<std::mutex> lk(mu_);
     for (auto& slot : pinned_ids_) {
         if (slot == id) {
-            slot = 0; // now evictable; a later publish may reclaim its ring space
-            return;   // ids are unique - at most one slot holds it
+            slot = 0;    // now evictable; a later publish may reclaim its ring space
+            return true; // ids are unique - at most one slot holds it
         }
     }
+    return false; // already released by another route, or never pinned
 }
 
 std::array<std::uint64_t, kMaxStreamedPostsPerSession> McpStreamState::pinned_ids_snapshot()

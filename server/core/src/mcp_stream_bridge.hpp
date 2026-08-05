@@ -1035,8 +1035,12 @@ private:
     /// is precisely when a LIVE call's pin would look like an orphan.
     ///
     /// Deliberately under the SAME `bridge_mu_` hold as the admission decision:
-    /// every sweep claim path takes `bridge_mu_` too, so holding it is what fences
-    /// a teardown from claiming a candidate between selection and release. Lock
+    /// every sweep CLAIM takes `bridge_mu_` too, so holding it is what fences a
+    /// teardown from claiming a candidate between selection and release. Note the
+    /// fence covers the claim, NOT the publish: `teardown_claimed` goes on to
+    /// synthesize and pin a terminal without `bridge_mu_`, so a pin can still
+    /// appear underneath this scan. That is why the admission is confirmed by the
+    /// release reporting success rather than by any count taken here. Lock
     /// order is the declared `bridge_mu_ -> BridgeRecord::mu -> McpStreamState::mu_`
     /// (on_final_written's order). The metric and audit row for a release are
     /// emitted by the CALLER, after the lock is dropped.
