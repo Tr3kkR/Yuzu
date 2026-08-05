@@ -1,4 +1,5 @@
 #include "audit_store.hpp"
+#include "config_secret_keys.hpp"
 
 #include "audit_retention_rules.hpp"
 #include "pg/pg_exec.hpp"
@@ -119,9 +120,16 @@ bool note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason, Degra
 // classified enum, so a Wipe arriving underneath a standing BadState (the
 // dead-CMOS-then-NTP sequence that silently wiped the whole trail) is NOT
 // suppressed: the fact set differs, so the pass declines again.
+// The `no_anchor` character is part of the set on purpose (#2579): the pass that
+// declines for it also settles the bootstrap marker, so the NEXT pass differs in
+// this very field and is a different set — which is what lets the trigger decline
+// once and then stand down without any anti-latch special case. A pre-#2579
+// stored value is four characters and will not match a five-character set, so the
+// first pass after upgrade sees a changed set and declines once. That is the safe
+// direction (a decline never deletes) and it self-corrects on the next pass.
 std::string serialize_facts(const audit_retention::Facts& f) {
     return std::string(f.has_expired ? "e" : "-") + (f.would_wipe ? "w" : "-") +
-           (f.big_step ? "s" : "-") + (f.prev_unusable ? "u" : "-");
+           (f.big_step ? "s" : "-") + (f.prev_unusable ? "u" : "-") + (f.no_anchor ? "b" : "-");
 }
 
 // ── Postgres schema (ADR-0040): the FINAL column set of the SQLite store's
@@ -296,8 +304,13 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     // (documented in upgrading.md). A cross-txn advisory lock is deliberately NOT
     // taken here: it would reintroduce the two-lease deadlock this block avoids.
     std::int64_t resume_from = 0;
+    // Fingerprint of what Postgres already holds, compared below against the
+    // legacy rows at or below the resume cursor.
     std::int64_t pg_rows_before = 0;
     std::int64_t pg_id_sum_before = 0;
+    std::int64_t pg_ts_sum_before = 0;
+    std::int64_t pg_ts_min_before = 0;
+    std::int64_t pg_ts_max_before = 0;
     {
         auto lease = pool_.acquire();
         if (!lease) {
@@ -319,10 +332,12 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             spdlog::debug("AuditStore: migrate_from_sqlite already completed, skipping");
             return true;
         }
-        pg::PgResult mx = pg::exec_params(
-            lease.get(),
-            "SELECT COALESCE(MAX(id),0), COUNT(*), COALESCE(SUM(id),0) FROM audit_store.audit_events",
-            std::vector<std::string>{});
+        pg::PgResult mx =
+            pg::exec_params(lease.get(),
+                            "SELECT COALESCE(MAX(id),0), COUNT(*), COALESCE(SUM(id),0), "
+                            "COALESCE(SUM(timestamp),0), COALESCE(MIN(timestamp),0), "
+                            "COALESCE(MAX(timestamp),0) FROM audit_store.audit_events",
+                            std::vector<std::string>{});
         if (mx.status() != PGRES_TUPLES_OK) {
             spdlog::error("AuditStore: migrate_from_sqlite: resume-point read failed: {}",
                           PQerrorMessage(lease.get()));
@@ -332,6 +347,9 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
         resume_from = to_i64(PQgetvalue(mx.get(), 0, 0));
         pg_rows_before = to_i64(PQgetvalue(mx.get(), 0, 1));
         pg_id_sum_before = to_i64(PQgetvalue(mx.get(), 0, 2));
+        pg_ts_sum_before = to_i64(PQgetvalue(mx.get(), 0, 3));
+        pg_ts_min_before = to_i64(PQgetvalue(mx.get(), 0, 4));
+        pg_ts_max_before = to_i64(PQgetvalue(mx.get(), 0, 5));
     }
 
     // 2. Legacy present?
@@ -412,15 +430,28 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     // never deleted — but a selective restore of `audit_events` without
     // `audit_retention_meta`, a DSN aimed at another deployment, or a manual
     // partial import all do, and this store is the SOC 2 evidence chain.
-    // Fingerprint, not just a count: every row already in Postgres sits at or
-    // below the cursor by construction (the cursor IS MAX(pg.id)), so compare
-    // (count, SUM(id)) over that same id range on both sides. A count alone is
-    // not enough — 50 foreign rows above the legacy range and 50 legacy rows
-    // below the cursor agree on count while sharing no id at all.
+    // Fingerprint on CONTENT, not on id shape. Every row already in Postgres
+    // sits at or below the cursor by construction (the cursor IS MAX(pg.id)), so
+    // both sides are compared over that same id range.
+    //
+    // Which columns, and why it is not just the ids: a count alone is defeated by
+    // any equal-sized foreign set, and (count, SUM(id)) is defeated SYSTEMATICALLY
+    // rather than by coincidence — ids are `GENERATED ALWAYS AS IDENTITY` here and
+    // rowid in the legacy file, so they run 1..k contiguously in EVERY deployment.
+    // A foreign table holding ids 1..k therefore produces exactly the same count
+    // and id-sum as this legacy file's own first k rows, the cursor skips those k
+    // legacy rows, and the equality reconciliation downstream still balances. The
+    // timestamps are the part that differs between two deployments: they are real
+    // event times, not a sequence. Comparing SUM/MIN/MAX of them alongside the id
+    // aggregates means a false match needs two databases whose first k audit rows
+    // coincide in count, id-sum, timestamp-sum, earliest and latest — which is a
+    // different claim entirely from "both tables start at id 1".
     {
         SqliteStmt pfx;
         if (sqlite3_prepare_v2(legacy.get(),
-                               "SELECT COUNT(*), COALESCE(SUM(id),0) FROM audit_events WHERE id <= ?",
+                               "SELECT COUNT(*), COALESCE(SUM(id),0), COALESCE(SUM(timestamp),0), "
+                               "COALESCE(MIN(timestamp),0), COALESCE(MAX(timestamp),0) FROM "
+                               "audit_events WHERE id <= ?",
                                -1, pfx.addr(), nullptr) != SQLITE_OK) {
             spdlog::error("AuditStore: migrate_from_sqlite: legacy prefix prepare failed: {}",
                           sqlite3_errmsg(legacy.get()));
@@ -436,19 +467,28 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
         }
         const std::int64_t legacy_rows_at_or_below = sqlite3_column_int64(pfx.get(), 0);
         const std::int64_t legacy_id_sum_at_or_below = sqlite3_column_int64(pfx.get(), 1);
+        const std::int64_t legacy_ts_sum_at_or_below = sqlite3_column_int64(pfx.get(), 2);
+        const std::int64_t legacy_ts_min_at_or_below = sqlite3_column_int64(pfx.get(), 3);
+        const std::int64_t legacy_ts_max_at_or_below = sqlite3_column_int64(pfx.get(), 4);
         if (pg_rows_before != legacy_rows_at_or_below ||
-            pg_id_sum_before != legacy_id_sum_at_or_below) {
+            pg_id_sum_before != legacy_id_sum_at_or_below ||
+            pg_ts_sum_before != legacy_ts_sum_at_or_below ||
+            pg_ts_min_before != legacy_ts_min_at_or_below ||
+            pg_ts_max_before != legacy_ts_max_at_or_below) {
             spdlog::error(
                 "AuditStore: migrate_from_sqlite: PostgreSQL already holds {} audit row(s) "
-                "(id sum {}) but the legacy database has {} row(s) (id sum {}) at or below the "
+                "(id sum {}, timestamp sum {}, earliest {}, latest {}) but the legacy database has "
+                "{} row(s) (id sum {}, timestamp sum {}, earliest {}, latest {}) at or below the "
                 "resume point id <= {} — the existing rows are NOT an interrupted copy of {}, so "
-                "resuming from that cursor would skip legacy evidence and still satisfy the row "
-                "count. Refusing to migrate (fail-closed, ADR-0009: the backfill runs against an "
+                "resuming from that cursor would skip legacy evidence while the row counts still "
+                "balanced. Refusing to migrate (fail-closed, ADR-0009: the backfill runs against an "
                 "EMPTY schema or its own partial copy, nothing else). Operator remediation: point "
                 "at the correct database, or clear audit_store.audit_events if those rows are not "
                 "wanted, then reboot.",
-                pg_rows_before, pg_id_sum_before, legacy_rows_at_or_below,
-                legacy_id_sum_at_or_below, resume_from, legacy_db_path.string());
+                pg_rows_before, pg_id_sum_before, pg_ts_sum_before, pg_ts_min_before,
+                pg_ts_max_before, legacy_rows_at_or_below, legacy_id_sum_at_or_below,
+                legacy_ts_sum_at_or_below, legacy_ts_min_at_or_below, legacy_ts_max_at_or_below,
+                resume_from, legacy_db_path.string());
             backfill_metric("failed");
             return false;
         }
@@ -558,7 +598,19 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
                 params.push_back(sanitize_pg_text(r.action));
                 params.push_back(sanitize_pg_text(r.target_type));
                 params.push_back(sanitize_pg_text(r.target_id));
-                params.push_back(sanitize_pg_text(r.detail));
+                // Redact credentials captured in pre-fix `config.update` rows
+                // DURING the copy, not only on read. The ladder's migration
+                // contract required this decision to be made explicitly, so:
+                // the substrate never receives the plaintext. Reads redact
+                // identically, so nothing legitimately readable is lost, and
+                // unlike an ADR-0010 SecretCodec column there is no rekey story
+                // for a credential sitting in free-form text — CLAUDE.md's "a
+                // secret is NEVER a plain Postgres column" applies to a value
+                // that lands in one by migration just as much as by writer.
+                // The unredacted original is not destroyed: it remains in the
+                // legacy file, which is moved aside rather than deleted.
+                params.push_back(
+                    sanitize_pg_text(sanitized_detail(r.target_type, r.target_id, r.detail)));
                 params.push_back(sanitize_pg_text(r.source_ip));
                 params.push_back(sanitize_pg_text(r.user_agent));
                 params.push_back(sanitize_pg_text(r.session_id));
@@ -929,7 +981,11 @@ std::optional<std::vector<AuditEvent>> AuditStore::query(const AuditQuery& q,
         e.action = text_col(res.get(), i, 4);
         e.target_type = text_col(res.get(), i, 5);
         e.target_id = text_col(res.get(), i, 6);
-        e.detail = text_col(res.get(), i, 7);
+        // Read-time redaction of credentials captured in pre-fix
+        // `config.update` rows (see sanitized_detail). Applied at the ROW
+        // MATERIALISATION point so every reader gets it — the SQLite store
+        // did this and the port must not drop it.
+        e.detail = sanitized_detail(e.target_type, e.target_id, text_col(res.get(), i, 7));
         e.source_ip = text_col(res.get(), i, 8);
         e.user_agent = text_col(res.get(), i, 9);
         e.session_id = text_col(res.get(), i, 10);
@@ -949,6 +1005,36 @@ std::optional<std::vector<AuditEvent>> AuditStore::query(const AuditQuery& q,
         }
     }
     return results;
+}
+
+std::string AuditStore::sanitized_detail(std::string_view target_type, std::string_view target_id,
+                                         std::string detail) {
+    // Keyed on the TARGET (a runtime-config row naming a secret key), not on one
+    // writer's action string. `config.update` is the only such writer today, but
+    // keying on it would leave a future writer -- a settings handler recording the
+    // same key under its own verb -- outside the rule, and nothing would fail.
+    // Still narrow: a blanket "redact anything that looks secret" across every audit
+    // detail would gut the evidence value of the log, which is what this store is for.
+    if (target_type != "RuntimeConfig" || !is_secret_config_key(target_id))
+        return detail;
+    if (detail.empty())
+        return detail;
+
+    // ONLY the exact shape today's writer emits -- a detail that STARTS `value=` --
+    // keeps its `value=` label. Anything else is replaced wholesale.
+    //
+    // An earlier revision preserved `detail.substr(0, pos)` for a `value=` found at
+    // ANY offset, to keep a future writer's surrounding context. Two reviewers
+    // independently rejected that, and both were right: a writer that placed the
+    // credential BEFORE a `value=` token would have had it preserved verbatim, and
+    // the comment promising that context is kept held only for one token ordering
+    // that nothing enforces. No writer of either shape exists today, so this gives
+    // up nothing real and removes a trap that fires the moment someone trusts the
+    // comment. If a future writer needs context to survive, give `detail` structure
+    // (named JSON fields) rather than adding a second string-surgery rule.
+    if (detail.rfind("value=", 0) == 0)
+        return "value=" + std::string(kRedactedPlaceholder);
+    return std::string(kRedactedPlaceholder);
 }
 
 std::optional<std::size_t> AuditStore::total_count() const {
@@ -1014,6 +1100,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
     std::size_t deleted = 0;
     bool skipped_lock = false;
     bool declined = false;
+    bool declined_no_anchor = false;
     bool cap_backlog = false;
     bool persist_failed = false;
     std::string decline_msg;
@@ -1036,7 +1123,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         pg::PgResult meta = pg::exec_params(
             conn,
             "SELECT key, value FROM audit_store.audit_retention_meta WHERE key IN ('last_pass_now',"
-            "'last_anomaly_facts')",
+            "'last_anomaly_facts','bootstrap_settled')",
             std::vector<std::string>{});
         if (meta.status() != PGRES_TUPLES_OK) {
             spdlog::error("AuditStore: reap meta read failed: {}", PQerrorMessage(conn));
@@ -1045,6 +1132,12 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         std::optional<std::int64_t> prev;
         bool prev_unusable = false;
         std::string last_facts;
+        // #2579: has ANY pass on this database ever reached a verdict? Durable
+        // and SHARED rather than the per-process flag the SQLite store carries,
+        // because on Postgres N replicas sweep the same table and a process-local
+        // trigger would be spent by whichever replica happened to boot first
+        // (ADR-0012 / the routed clock-guard concern's single-writer caveat).
+        bool bootstrap_settled = false;
         for (int i = 0; i < PQntuples(meta.get()); ++i) {
             const std::string key = text_col(meta.get(), i, 0);
             const std::string val = text_col(meta.get(), i, 1);
@@ -1060,6 +1153,8 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                     prev = static_cast<std::int64_t>(v);
             } else if (key == "last_anomaly_facts") {
                 last_facts = val;
+            } else if (key == "bootstrap_settled") {
+                bootstrap_settled = true;
             }
         }
         // A reading ahead of the clock (backward NTP correction) or negative
@@ -1113,9 +1208,31 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         const audit_retention::Facts facts{.has_expired = has_expired,
                                            .would_wipe = would_wipe,
                                            .big_step = big_step,
-                                           .prev_unusable = prev_unusable};
+                                           .prev_unusable = prev_unusable,
+                                           .no_anchor = !bootstrap_settled};
         const audit_retention::Anomaly anomaly = audit_retention::classify(facts);
         const std::string facts_ser = serialize_facts(facts);
+
+        // The pass has now REACHED A VERDICT, so settle the bootstrap marker —
+        // and settle it HERE, not at the re-anchor above. The re-anchor happens
+        // before the probes, so deriving the trigger from the stored reading
+        // would let one transient probe failure spend it permanently: the next
+        // pass would see a reading, call itself anchored, and delete with every
+        // detector false — the exact defect #2579 closes. Every early return
+        // above this line rolls the whole transaction back, so a pass that never
+        // reached a verdict leaves the trigger armed.
+        if (!bootstrap_settled) {
+            pg::PgResult settle = pg::exec_params(
+                conn,
+                "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES "
+                "('bootstrap_settled', '1') ON CONFLICT (key) DO NOTHING",
+                std::vector<std::string>{});
+            if (settle.status() != PGRES_COMMAND_OK) {
+                spdlog::error("AuditStore: reap bootstrap settle failed: {}", PQerrorMessage(conn));
+                persist_failed = true;
+                return false;
+            }
+        }
 
         if (anomaly != audit_retention::Anomaly::None) {
             // Decline-once per DISTINCT fact set: a new anomaly declines and
@@ -1134,7 +1251,21 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                     return false;
                 }
                 declined = true;
-                decline_msg = "AuditStore: retention clock anomaly (facts=" + facts_ser +
+                // A missing-anchor decline is counted APART from the clock
+                // anomalies (#2579). It asserts only that nothing can yet be
+                // ruled out — a weaker claim than "the clock moved in a way that
+                // would have wiped evidence", which is what the sibling counter's
+                // alert says. Sharing the counter would make that alert's own
+                // description untrue for this case and fire it on every server
+                // carrying a backlog through an upgrade.
+                declined_no_anchor = (anomaly == audit_retention::Anomaly::NoAnchor);
+                decline_msg =
+                    declined_no_anchor
+                        ? std::string(
+                              "AuditStore: no usable previous retention clock reading and rows are "
+                              "already expired — declining this pass and anchoring; the next pass "
+                              "has a comparison point and proceeds (#2579)")
+                        : "AuditStore: retention clock anomaly (facts=" + facts_ser +
                               ") — declining this pass; an identical next pass will drain, capped";
                 return true; // commit the stamp + anomaly record
             }
@@ -1196,7 +1327,10 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
     if (skipped_lock)
         return 0; // another replica swept this tick
     if (declined) {
-        clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
+        if (declined_no_anchor)
+            bootstrap_declines_.fetch_add(1, std::memory_order_relaxed);
+        else
+            clock_anomaly_skips_.fetch_add(1, std::memory_order_relaxed);
         spdlog::warn("{}", decline_msg);
         return 0;
     }

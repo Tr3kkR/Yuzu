@@ -94,6 +94,28 @@ void seed_rows_with_ttl(const std::string& dsn, std::int64_t ttl, int count) {
                       ")");
 }
 
+/// Put a store in the state of one that has already completed a pass, so the
+/// bootstrap trigger (#2579) does not fire.
+///
+/// Needed because #2579 makes "no stored reading, and rows already expired" a
+/// decline in its own right. Almost every guard test here is about something
+/// else -- the cap, the dedup rule, one specific trigger -- and each would
+/// otherwise spend its first pass absorbing a bootstrap decline it never meant
+/// to exercise. This states the precondition those tests always assumed
+/// implicitly; the ones that ARE about the bootstrap do not call it.
+///
+/// A pass over an EMPTY table is the whole mechanism, and it is exact rather
+/// than approximate: `cleanup_once` anchors the reading and settles the marker
+/// before it probes, and with nothing expired the rule short-circuits to `None`,
+/// so no counter moves, nothing is deleted and no anomaly is recorded. Call it
+/// BEFORE seeding. The default is an hour back, comfortably inside the 7-day
+/// step threshold, so it cannot itself provoke a `Step`.
+void anchor_guard(AuditStore& store, std::int64_t last_pass_now = kNow - 3600) {
+    REQUIRE(store.cleanup_once(last_pass_now) == 0);
+    REQUIRE(store.clock_anomaly_skips_count() == 0);
+    REQUIRE(store.bootstrap_declines_count() == 0);
+}
+
 std::int64_t row_count(const std::string& dsn) {
     return std::stoll(query_scalar(dsn, "SELECT COUNT(*) FROM audit_store.audit_events"));
 }
@@ -339,6 +361,48 @@ TEST_CASE("AuditStore: non-UTF-8 / embedded-NUL free text is defanged, the write
 
 // ── #4: action-prefix scoping + random-sample ────────────────────────────────
 
+TEST_CASE("AuditStore::sanitized_detail is idempotent and leaves an empty detail alone",
+          "[audit_store][secret]") {
+    // Rows written after the writer fix already hold the placeholder; applying the
+    // read-time rule again must not double-wrap or invent content.
+    CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_client_secret",
+                                       "value=<redacted>") == "value=<redacted>");
+    CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_client_secret", "").empty());
+    CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_issuer", "value=https://idp") ==
+          "value=https://idp");
+    // No leading `value=`: we cannot tell which part is the credential, so the whole
+    // detail goes. Fail safe, not fail open.
+    CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_client_secret", "raw-leak") ==
+          "<redacted>");
+    // The credential written BEFORE a value= token -- the case the old prefix-
+    // preserving rule leaked verbatim.
+    CHECK(AuditStore::sanitized_detail("RuntimeConfig", "oidc_client_secret", "s3cr3t value=x") ==
+          "<redacted>");
+}
+
+TEST_CASE("AuditStore: a pre-existing config.update secret detail is redacted on READ",
+          "[pg][audit_store][secret]") {
+    // Defence in depth behind the backfill-time redaction: a row that reaches the
+    // table by any other route (a restore, a hand-written import) must still not
+    // disclose the credential through the six readers. The port dropped this
+    // entirely at one point, which is why it is pinned here.
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    exec_sql(db.dsn(),
+             "INSERT INTO audit_store.audit_events (timestamp, principal, principal_role, action, "
+             "target_type, target_id, detail, result, ttl_expires_at) VALUES "
+             "(1000,'admin','admin','config.update','RuntimeConfig','oidc_client_secret',"
+             "'value=hunter2-the-real-secret','success',0)");
+
+    auto r = store.query();
+    REQUIRE(r.has_value());
+    REQUIRE(r->size() == 1);
+    CHECK((*r)[0].detail == "value=<redacted>");
+    CHECK((*r)[0].detail.find("hunter2") == std::string::npos);
+}
+
 TEST_CASE("AuditStore: action_prefixes scopes to the auth surface",
           "[pg][audit_store][auth-sample]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
@@ -487,9 +551,12 @@ TEST_CASE("AuditStore: backfill resumes from MAX(id) after a partial run",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool);
     REQUIRE(store.is_open());
+    // 999+g mirrors build_legacy_audit_db's own stamping (id g carries timestamp
+    // 1000+(g-1)). It has to MATCH: a resume prefix is a copy of these very rows,
+    // and the prefix proof compares their content, not just their ids.
     exec_sql(db.dsn(), "INSERT INTO audit_store.audit_events (id, timestamp, principal, "
                        "principal_role, action, result, ttl_expires_at) OVERRIDING SYSTEM VALUE "
-                       "SELECT g, 1000+g, 'admin','admin','auth.login','success',0 FROM "
+                       "SELECT g, 999+g, 'admin','admin','auth.login','success',0 FROM "
                        "generate_series(1,20) g");
 
     REQUIRE(store.migrate_from_sqlite(legacy));
@@ -596,6 +663,82 @@ TEST_CASE("AuditStore: backfill refuses a non-prefix Postgres table (no silent z
 // holds a genuine PREFIX of this legacy stream (ids 1..20 of 1..50), so the
 // prefix proof must ACCEPT it and the remaining rows must stream. Pins that the
 // guard above closes the hole without breaking crash-resume.
+TEST_CASE("AuditStore: backfill redacts a pre-fix config.update secret during the copy",
+          "[pg][audit_store][backfill][secret]") {
+    // The ladder's migration contract makes this an explicit decision rather than
+    // a default: rows are deliberately never rewritten in SQLite, so an
+    // un-redacted copy would land a plaintext credential in the Postgres
+    // substrate, where there is no rekey story for a secret embedded in free
+    // text. Reads redact identically, so nothing legitimately readable is lost.
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bf11_"}};
+    auto legacy = dir.path / "audit.db";
+    std::filesystem::create_directories(legacy.parent_path());
+    {
+        SqliteDb ldb;
+        REQUIRE(sqlite3_open(legacy.string().c_str(), ldb.addr()) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(ldb.get(),
+                             "CREATE TABLE audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                             "timestamp INTEGER NOT NULL, principal TEXT NOT NULL, principal_role "
+                             "TEXT NOT NULL, action TEXT NOT NULL, target_type TEXT, target_id "
+                             "TEXT, detail TEXT, source_ip TEXT, user_agent TEXT, session_id TEXT, "
+                             "result TEXT NOT NULL, ttl_expires_at INTEGER DEFAULT 0, "
+                             "principal_class TEXT NOT NULL DEFAULT '');",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(ldb.get(),
+                             "INSERT INTO audit_events (timestamp, principal, principal_role, "
+                             "action, target_type, target_id, detail, result, ttl_expires_at) "
+                             "VALUES (1000,'admin','admin','config.update','RuntimeConfig',"
+                             "'oidc_client_secret','value=hunter2-the-real-secret','success',0);",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.migrate_from_sqlite(legacy));
+
+    // The plaintext is not in the substrate at all — checked against the column,
+    // not through a reader that would redact it either way.
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_events WHERE detail LIKE "
+                                 "'%hunter2%'") == "0");
+    CHECK(query_scalar(db.dsn(), "SELECT detail FROM audit_store.audit_events") ==
+          "value=<redacted>");
+}
+
+TEST_CASE("AuditStore: backfill refuses a foreign table whose ids are CONTIGUOUS from 1",
+          "[pg][audit_store][backfill]") {
+    // The case the id-shape fingerprint could not see, and the one that actually
+    // occurs. Ids are GENERATED ALWAYS AS IDENTITY here and rowid in the legacy
+    // file, so BOTH run 1..k in every deployment: a foreign table holding ids
+    // 1..50 has exactly the same count and id-sum as this legacy file's own first
+    // 50 rows. The cursor then skips those 50 legacy rows, 50 more stream in, and
+    // the equality reconciliation balances at 100 == 100 — a completed mandatory
+    // backfill that destroyed 50 rows of pre-cutover evidence.
+    //
+    // The timestamps are what differ between two deployments, which is why they
+    // are in the fingerprint.
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bf10_"}};
+    auto legacy = dir.path / "audit.db";
+    build_legacy_audit_db(legacy, /*count=*/100); // legacy ids 1..100, timestamps 1000..1099
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    // Another deployment's first 50 rows: same id shape, different event times.
+    exec_sql(db.dsn(), "INSERT INTO audit_store.audit_events (id, timestamp, principal, "
+                       "principal_role, action, result, ttl_expires_at) OVERRIDING SYSTEM VALUE "
+                       "SELECT g, 500000 + g, 'admin','admin','auth.login','success',0 "
+                       "FROM generate_series(1,50) g");
+
+    CHECK_FALSE(store.migrate_from_sqlite(legacy));
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE key = "
+                                 "'backfill_complete'") == "0");
+    CHECK(std::filesystem::exists(legacy)); // evidence still recoverable
+    CHECK(row_count(db.dsn()) == 50);       // nothing streamed on top
+}
+
 TEST_CASE("AuditStore: backfill resumes from a genuine prefix and completes",
           "[pg][audit_store][backfill]") {
     YUZU_REQUIRE_PG_DB(db);
@@ -607,9 +750,10 @@ TEST_CASE("AuditStore: backfill resumes from a genuine prefix and completes",
     AuditStore store(pool);
     REQUIRE(store.is_open());
     // Simulate a backfill that crashed after copying ids 1..20.
+    // Same content as the legacy rows it stands in for (id g -> timestamp 999+g).
     exec_sql(db.dsn(), "INSERT INTO audit_store.audit_events (id, timestamp, principal, "
                        "principal_role, action, result, ttl_expires_at) OVERRIDING SYSTEM VALUE "
-                       "SELECT g, 1000 + g, 'admin','admin','auth.login','success',0 "
+                       "SELECT g, 999 + g, 'admin','admin','auth.login','success',0 "
                        "FROM generate_series(1,20) g");
 
     REQUIRE(store.migrate_from_sqlite(legacy));
@@ -767,6 +911,7 @@ TEST_CASE("AuditStore #2360: a first pass that would wipe every datable row decl
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, /*cleanup_interval_min=*/0);
     REQUIRE(store.is_open());
+    anchor_guard(store); // #2579 precondition: this test is not about the bootstrap
     seed_rows_with_ttl(db.dsn(), kNow - 100, 10); // every row already expired
 
     CHECK(store.cleanup_once(kNow) == 0); // declines (would_wipe)
@@ -793,12 +938,116 @@ TEST_CASE("AuditStore #2360: a datable survivor means no wipe, so the pass delet
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, 0);
+    anchor_guard(store); // #2579 precondition: this test is not about the bootstrap
     seed_rows_with_ttl(db.dsn(), kNow - 100, 10);    // expired
     seed_rows_with_ttl(db.dsn(), kNow + kWindow, 1); // healthy survivor
 
     CHECK(store.cleanup_once(kNow) == 10);
     CHECK(row_count(db.dsn()) == 1);
     CHECK(store.clock_anomaly_skips_count() == 0);
+}
+
+TEST_CASE("AuditStore #2579: no stored reading + rows already expired declines, once",
+          "[pg][audit_store][retention][clock-guard]") {
+    // The disclosed shape, end to end. A host whose clock was ALREADY skewed
+    // forward before its first guarded pass: rows written before the skew look
+    // expired, rows written after it are still inside the window, so the
+    // would-expire-everything test does not fire and -- before this trigger --
+    // nothing else did either. The pass deleted, with no decline, no counter and
+    // no warning.
+    //
+    // Deliberately NOT anchored: the absence of a stored reading IS the input.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool, kGuardRetentionDays, 0);
+    REQUIRE(store.is_open());
+    seed_rows_with_ttl(db.dsn(), kNow - 100, 10);    // expired: written before the skew
+    seed_rows_with_ttl(db.dsn(), kNow + kWindow, 2); // datable survivors: written after it
+
+    REQUIRE(store.cleanup_once(kNow) == 0); // was 10 before #2579
+    CHECK(row_count(db.dsn()) == 12);
+    CHECK(store.bootstrap_declines_count() == 1);
+    // The signal separation is the contract, not an implementation detail: this
+    // decline must not fire the alert that means "the clock moved".
+    CHECK(store.clock_anomaly_skips_count() == 0);
+
+    // Once, not forever. The declining pass settled the marker, so the next pass
+    // has a comparison point and proceeds -- paced by the cap as always.
+    CHECK(store.cleanup_once(kNow + 1) == 10);
+    CHECK(row_count(db.dsn()) == 2);
+    CHECK(store.bootstrap_declines_count() == 1); // and NOT counted twice
+}
+
+TEST_CASE("AuditStore #2579: a probe-failed pass does not spend the bootstrap trigger",
+          "[pg][audit_store][retention][clock-guard]") {
+    // `cleanup_once` re-anchors BEFORE it probes, so a pass whose probes then
+    // fail has consumed the anchor without ever reaching a verdict. Deriving the
+    // trigger from the stored reading would let ONE transient probe failure
+    // disarm it permanently: pass 2 sees a reading, calls itself anchored, and
+    // deletes with every detector false -- the exact defect #2579 closes,
+    // reinstated. The marker is therefore settled at the VERDICT, and every
+    // early return before it rolls the whole transaction back.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool, kGuardRetentionDays, 0);
+    REQUIRE(store.is_open());
+    seed_rows_with_ttl(db.dsn(), kNow - 100, 10);
+    seed_rows_with_ttl(db.dsn(), kNow + kWindow, 2);
+
+    // Pass 1 cannot probe -- and DOES re-anchor on its way past.
+    exec_sql(db.dsn(), "ALTER TABLE audit_store.audit_events RENAME TO audit_events_hidden");
+    CHECK(store.cleanup_once(kNow) == 0);
+    CHECK(store.cleanup_failed_count() == 1);
+    CHECK(store.bootstrap_declines_count() == 0); // no verdict was reached
+    exec_sql(db.dsn(), "ALTER TABLE audit_store.audit_events_hidden RENAME TO audit_events");
+
+    // Pass 2 must STILL decline. Without the verdict-point settle it deleted all 10.
+    CHECK(store.cleanup_once(kNow + 1) == 0);
+    CHECK(store.bootstrap_declines_count() == 1);
+    CHECK(row_count(db.dsn()) == 12);
+
+    // ...and having now reached a verdict, it is spent: pass 3 drains.
+    CHECK(store.cleanup_once(kNow + 2) == 10);
+    CHECK(row_count(db.dsn()) == 2);
+}
+
+TEST_CASE("AuditStore #2579: consecutive probe failures do not erode the trigger",
+          "[pg][audit_store][retention][clock-guard]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool, kGuardRetentionDays, 0);
+    REQUIRE(store.is_open());
+    seed_rows_with_ttl(db.dsn(), kNow - 100, 10);
+    seed_rows_with_ttl(db.dsn(), kNow + kWindow, 2);
+
+    exec_sql(db.dsn(), "ALTER TABLE audit_store.audit_events RENAME TO audit_events_hidden");
+    for (int i = 0; i < 3; ++i)
+        CHECK(store.cleanup_once(kNow + i) == 0);
+    CHECK(store.cleanup_failed_count() == 3);
+    CHECK(store.bootstrap_declines_count() == 0); // no verdict on any of them
+    exec_sql(db.dsn(), "ALTER TABLE audit_store.audit_events_hidden RENAME TO audit_events");
+
+    // Still armed after three failures.
+    CHECK(store.cleanup_once(kNow + 10) == 0);
+    CHECK(store.bootstrap_declines_count() == 1);
+    CHECK(row_count(db.dsn()) == 12);
+}
+
+TEST_CASE("AuditStore #2579: nothing expired means no bootstrap decline",
+          "[pg][audit_store][retention][clock-guard]") {
+    // The cost control. A fresh install has no stored reading either, and if the
+    // trigger fired on that it would declare an anomaly on every server's first
+    // boot -- which is why `no_anchor` is tested AFTER `has_expired`.
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool, kGuardRetentionDays, 0);
+    REQUIRE(store.is_open());
+    seed_rows_with_ttl(db.dsn(), kNow + kWindow, 3); // nothing expired
+
+    CHECK(store.cleanup_once(kNow) == 0);
+    CHECK(store.bootstrap_declines_count() == 0);
+    CHECK(store.clock_anomaly_skips_count() == 0);
+    CHECK(row_count(db.dsn()) == 3);
 }
 
 TEST_CASE("AuditStore #2360: one forward-skew far-future row cannot disarm the guard",
@@ -819,6 +1068,7 @@ TEST_CASE("AuditStore #2360: the per-pass cap paces a large expiry and reports a
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, 0);
+    anchor_guard(store); // #2579 precondition: this test is not about the bootstrap
     constexpr int kSurplus = 7;
     seed_rows_with_ttl(db.dsn(), kNow - 100, static_cast<int>(kMaxAuditDeletesPerPass) + kSurplus);
     seed_rows_with_ttl(db.dsn(), kNow + kWindow, 1); // survivor → not a would_wipe
@@ -844,6 +1094,7 @@ TEST_CASE("AuditStore #2360: the clock-step guard survives a restart via durable
     {
         AuditStore first(pool, kGuardRetentionDays, 0);
         REQUIRE(first.is_open());
+        anchor_guard(first); // #2579 precondition: this test is about the durable STEP
         seed_rows_with_ttl(db.dsn(), kNow - 100, 5);
         seed_rows_with_ttl(db.dsn(), kNow + kWindow, 1); // survivor: no would_wipe
         REQUIRE(first.cleanup_once(kNow) == 5);

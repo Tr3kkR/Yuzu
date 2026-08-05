@@ -1902,11 +1902,21 @@ bool RbacStore::check_scoped_permission(const std::string& username,
     if (!pg)
         return false;
 
+    // CONFINEMENT reads are now degrade-distinguishable (ADR-0042): a `nullopt`
+    // means the mgmt-store degraded (store-not-open / pool-acquire timeout /
+    // query error), NOT a genuine empty. Treat it as DenyAll (fail-closed) — a
+    // silent empty here would drop the agent's reachable groups and could admit
+    // a scoped grant that a DENY assignment should have blocked (fail-open).
     auto groups = mgmt_store->get_agent_groups(agent_id);
+    if (!groups)
+        return false; // mgmt-store degrade → deny
     std::unordered_set<std::string> reachable;
-    for (const auto& gid : groups) {
+    for (const auto& gid : *groups) {
         reachable.insert(gid);
-        for (const auto& aid : mgmt_store->get_ancestor_ids(gid))
+        auto ancestors = mgmt_store->get_ancestor_ids(gid);
+        if (!ancestors)
+            return false; // mgmt-store degrade → deny
+        for (const auto& aid : *ancestors)
             reachable.insert(aid);
     }
     if (reachable.empty())

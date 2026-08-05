@@ -72,6 +72,40 @@ invalid_name_fixture_plugin = shared_library(
   install: false,
 )
 
+# ── Test fixture: FROZEN ABI3-layout plugin (PLAN-03 — real backward-compat) ──
+# A genuine old-layout plugin compiled against the FROZEN tests/fixtures/abi3/
+# plugin_abi3.h (quoted include, resolved next to the .cpp) — deliberately NOT
+# yuzu_sdk_dep, so it never picks up the live ABI4 header. test_capability_
+# descriptor.cpp dlopens it by explicit path to prove the ABI4 loader still
+# accepts an ABI3 descriptor (MIN=1). name_prefix '' so it lands at
+# <builddir>/tests/abi3_fixture_plugin<ext> like the fixtures above.
+abi3_fixture_plugin = shared_library(
+  'abi3_fixture_plugin',
+  files('fixtures/abi3/abi3_fixture_plugin.cpp'),
+  name_prefix: '',
+  install: false,
+)
+
+# ── Test fixture: ABI4 plugin that DECLARES capabilities (PR1.1 finding F10) ─
+# Every shipped plugin is still undeclared, so the capability-matrix gate only
+# ever observed the all-undeclared state and proved nothing about how
+# capmatrix-gen renders a real declaration. This fixture is the declared input
+# tests/shell/test_capability_matrix_gate.sh feeds to the real binary.
+# yuzu_sdk_dep only (header-only declare_dependency): the module must stay
+# self-contained so the shell test can copy it into a hermetic fixture tree.
+# name_prefix '' so it lands at <builddir>/tests/abi4_declared_fixture_plugin<ext>.
+# build-ci B3: this target used to sit in no test's `depends:`/`link_depends`
+# anywhere, so it built ONLY via build_by_default and nothing in the meson
+# graph noticed if it stopped building — see the "capability matrix gate
+# shell tests" test() near the end of this file, which now depends on it.
+abi4_declared_fixture_plugin = shared_library(
+  'abi4_declared_fixture_plugin',
+  files('fixtures/abi4/abi4_declared_fixture_plugin.cpp'),
+  name_prefix: '',
+  dependencies: [yuzu_sdk_dep],
+  install: false,
+)
+
 # ── Agent unit tests ──────────────────────────────────────────────────────────
 #
 # Proto-dep choice is platform-conditional (#572 + Windows MSVC follow-up):
@@ -201,9 +235,15 @@ agent_test_exe = executable(
     'unit/agent/test_msi_macos.cpp',          # C-1.21: pkgutil --pkg-info parser (P8)
     'unit/agent/test_bitlocker_macos.cpp',    # A-1.16: diskutil apfs list parser (P8)
     'unit/test_subprocess_runner.cpp',        # #2273: agent-core bounded subprocess runner (POSIX deadline/reap)
+    'unit/test_subprocess_launch_spec.cpp',   # PR1.2: host-agnostic pure launch-spec tests (run on Windows too)
+    'unit/test_capability_descriptor.cpp',    # PR1.1: ABI4 descriptor + plugin->host result seam + declared-vs-observable honesty
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
     'unit/test_event_logs_macos.cpp',         # BR-08: pure `log show` SubprocessResult classifier
     'unit/test_users_macos_last.cpp',         # qe-M1: pure `last -y` timestamp/weekday parsers
+    'unit/test_user_profile_model.cpp',       # PR1.7: pure ProfileList/HKU model (runs on every host)
+    'unit/test_registry_local_dispatcher.cpp', # PR1.7 remediation fix #3: real registry.dll driven
+                                                # end to end via LocalDispatcher (Windows-only; a no-op
+                                                # TU elsewhere via the file's own #ifdef _WIN32 guard)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -240,8 +280,9 @@ agent_test_exe = executable(
   # what puts sqlite3.h on the test TU's include path (same shape as tar_test_deps).
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep],
   # Ensure the fixture plugins are built before the test runs so the lookups
-  # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
-  link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
+  # inside test_plugin_loader.cpp / test_capability_descriptor.cpp find them
+  # under MESON_BUILD_ROOT/tests/.
+  link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
@@ -265,7 +306,7 @@ test(
   args: agent_test_args,
   suite: 'agent',
   timeout: 240, # restored after moving the two [tsan-heavy] spin-loop tests to sanitizer-only (#2345): plain suite is ~28s, so 240s is ~8x headroom and surfaces a genuine hang rather than absorbing it into a loose ceiling.
-  depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
+  depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin],
 )
 
 # ── cert_store macOS honest-unsupported unit test (A-1.20 / P8; BR-001/BR-003
@@ -396,6 +437,7 @@ if build_server
       'unit/server/test_auth_db_pg.cpp',
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_cidr_match.cpp',
+      'unit/server/test_runtime_config_secret_redaction.cpp',
       'unit/server/test_nvd.cpp',
       'unit/server/test_cpe_identity_resolver.cpp',
       'unit/server/test_update_registry.cpp',
@@ -447,6 +489,7 @@ if build_server
       'unit/server/test_management_group_store.cpp',
       'unit/server/test_dashboard_tar_retention.cpp',
       'unit/server/test_dashboard_tar_fragments.cpp',
+      'unit/server/test_dashboard_results_columns.cpp', # PR1.7 remediation: resolve_render_columns/render_results
       'unit/server/test_route_sink_harness.cpp',
       'unit/server/test_rest_tar_purge.cpp',
       'unit/server/test_api_token_store.cpp',
@@ -519,6 +562,8 @@ if build_server
       'unit/server/test_kek_rotate_control.cpp', # #2530 B3/B4 — rotate control-flow ordering + half-commit classification
       'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
+      'unit/server/test_authz_model.cpp', # PR1.4: registry-independent authz model + #1788 per-device visibility (all four arms)
+      'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',
       'unit/server/test_mcp_session.cpp',
@@ -537,6 +582,8 @@ if build_server
       'unit/server/test_license_store.cpp',
       'unit/server/test_rest_api_t2.cpp',
       'unit/server/test_rest_api_tokens.cpp',
+      'unit/server/test_rest_tag_routes.cpp',   # K-05: REST tag-route authz wiring (CDX-03/CDX-R4-02/B4)
+      'unit/server/test_rest_quarantine_routes.cpp',   # CDX-P1-02: REST quarantine-route authz wiring
       'unit/server/test_rest_api_events.cpp',
       'unit/server/test_rest_software_packages.cpp',
       'unit/server/test_rest_inventory_software.cpp',
@@ -553,6 +600,7 @@ if build_server
       'unit/server/test_insecure_tls_gate.cpp',
       'unit/server/test_settings_routes_users.cpp',
       'unit/server/test_settings_routes_dex_alerts.cpp',
+      'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
@@ -642,8 +690,14 @@ if build_server
     # YUZU_TEST_ENABLE_PG exposes the PostgresTestDb fixture in
     # test_helpers.hpp — only the server suite links libpq, so the guard
     # keeps the agent/tar suites (which share the header) libpq-free.
+    # /bigobj: yuzu_server_core_lib already carries it; this target did not, and it
+    # links test_mcp_server.cpp (10k+ lines, 263 TEST_CASEs) plus
+    # test_mcp_stream_bridge.cpp. Catch2 emits per-TEST_CASE COMDAT sections and
+    # MSVC's C1128 limit is a hard 65,279 - so the gap is a build-time cliff on one
+    # platform only, with no runtime component. Free on every other compiler.
     cpp_args: https_cpp_args + test_partial_init_args +
-              ['-DCPPHTTPLIB_LISTEN_BACKLOG=128', '-DYUZU_TEST_ENABLE_PG'],
+              ['-DCPPHTTPLIB_LISTEN_BACKLOG=128', '-DYUZU_TEST_ENABLE_PG'] +
+              (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
     # Server unit tests #include <openssl/...> directly (e.g.
     # test_plugin_signing_helpers.cpp). yuzu_server_core_dep does not
     # propagate the OpenSSL include path, so declare it explicitly here
@@ -787,6 +841,62 @@ test('flake-retry selftest',
   suite: 'docs',
   timeout: 30,
 )
+
+# PR1.2 (ADR-3002 Decision-10a): pure-logic selftest of the lexical spawn gate —
+# a seeded raw-spawn fixture must fail and the sanctioned-runner allowlist case
+# must pass. Wired here so the gate's own matcher is enforced on every platform
+# with bash, mirroring the flake-retry selftest above. Guarded so Windows (no
+# bash) skips cleanly rather than erroring at configure.
+_bash_test = find_program('bash', required: false)
+if _bash_test.found()
+  test('plugin-spawn lexical gate selftest',
+    _bash_test,
+    args: [files('../scripts/ci/check-plugin-spawn-lexical.sh'), '--selftest'],
+    suite: 'docs',
+    timeout: 60,
+  )
+endif
+
+# QE-INFO / build-ci B3: tests/shell/test_capability_matrix_gate.sh (PR1.1
+# finding F10 — see the abi4_declared_fixture_plugin comment near the top of
+# this file) was wired ONLY as a separate post-build step in ci.yml, never as
+# a meson test(), so a local `meson test` never ran it. Wiring it here also
+# gives abi4_declared_fixture_plugin its first `depends:` entry anywhere in
+# the meson graph: until now it built ONLY via build_by_default, so nothing
+# noticed if it silently stopped building (build-ci B3).
+#
+# capmatrix-gen itself cannot be added to `depends:` here: the top-level
+# meson.build subdirs `tools/capmatrix-gen` AFTER `tests`, so its
+# executable() object is not yet in scope in this file — reordering that is
+# a root-meson.build change outside this package. The script hard-requires
+# the binary to already exist (`[ -e "$CAPGEN" ]`) and fails loudly, exactly
+# as it does from its ci.yml step today, so a build that skipped it is still
+# caught — just by this test failing rather than by the meson graph refusing
+# to schedule it.
+#
+# CDX-P1-04/K-5: that "caught, not skipped" reasoning only holds when
+# capmatrix-gen SHOULD have been built. Under `-Dbuild_examples=false` (a
+# supported configuration, meson.build:508's `if build_agent and
+# build_examples`) the top-level build deliberately never builds
+# capmatrix-gen at all — there are no agents/plugins/*/ subdirs configured
+# for it to inspect — so this test's hard `[ -x "$CAPGEN" ]` requirement
+# would fail loudly for a configuration that is correct by design, not
+# broken. Gate registration on the SAME condition tools/capmatrix-gen's own
+# build is gated on (root meson.build: `if build_agent and build_examples`),
+# so `-Dbuild_agent=false` or `-Dbuild_examples=false` (with -Dbuild_tests=true)
+# both get a clean `meson test` rather than a false-red gate (gov-fix/build-ci:
+# the build_examples-only guard reproduced the same false-red class this PR
+# fixed under `-Dbuild_agent=false -Dbuild_tests=true`, since capmatrix-gen
+# lives under `if build_agent`).
+if _bash_test.found() and meson.can_run_host_binaries() and build_agent and build_examples
+  test('capability matrix gate shell tests (#2204 F10)',
+    _bash_test,
+    args: [files('shell/test_capability_matrix_gate.sh'), meson.project_build_root()],
+    suite: 'docs',
+    timeout: 120,
+    depends: [abi3_fixture_plugin, abi4_declared_fixture_plugin],
+  )
+endif
 
 # End-to-end fake-Meson contract. In particular, an expired/malformed flake
 # registry must fail before the real test runner could be invoked. The script

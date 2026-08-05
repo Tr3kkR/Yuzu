@@ -778,7 +778,8 @@ Plugins for Windows-specific system management: registry operations and WMI quer
 | `key_exists` | Check whether a registry key exists. Parameters: `hive`, `key`. Returns boolean. |
 | `enumerate_keys` | List all subkeys under a registry key. Parameters: `hive`, `key`. |
 | `enumerate_values` | List all value names and types under a registry key. Parameters: `hive`, `key`. |
-| `get_user_value` | Read a registry value from a specific user's NTUSER.DAT hive. Loads the hive via `RegLoadKey` if the user is not logged in. Requires `SE_RESTORE_NAME` and `SE_BACKUP_NAME` privileges. Parameters: `username`, `key`, `name` (optional). |
+| `get_user_value` | Read a registry value from a specific user's hive. Resolves the profile via ProfileList (by `username` or an explicit `sid`), then reads the live `HKEY_USERS\<SID>` hive if the user is logged in, or loads that profile's NTUSER.DAT via `RegLoadKey` as a fallback. Requires `SE_RESTORE_NAME` and `SE_BACKUP_NAME` privileges for the offline-hive fallback only. Parameters: `username` or `sid` (one required), `key`, `name` (optional). Known limitation: two concurrent reads against the same logged-out user's hive can collide on the offline mount — the second surfaces an honest `error|failed to load hive`, self-resolving on retry. |
+| `list_profiles` | Enumerate local user profiles: SID, resolved profile name, profile path, and whether the profile's hive is currently loaded under `HKEY_USERS`. System profiles (LocalSystem, LocalService, NetworkService) are excluded. No parameters. |
 
 ### wmi
 
@@ -824,7 +825,7 @@ The following plugins are defined in the roadmap but not yet implemented. They a
 
 ### Overview
 
-All agent plugins share a common architecture based on a **stable C ABI** defined in `sdk/include/yuzu/plugin.h`. This ABI is designed to remain binary-compatible across compiler versions and agent upgrades, so plugins can be updated independently of the agent binary.
+All agent plugins share a common architecture based on a **stable C ABI** defined in `sdk/include/yuzu/plugin.h`. This ABI is designed to remain binary-compatible across compiler versions and agent upgrades, so plugins can be updated independently of the agent binary. The ABI is currently at version 4 (`YUZU_PLUGIN_ABI_VERSION`); the agent still loads plugins built against any version back to `YUZU_PLUGIN_ABI_VERSION_MIN` (1) — a major-version bump does not mean existing plugins need recompiling. See `sdk/README.md`'s ABI compatibility table for the full version-by-version breakdown.
 
 A **C++23 CRTP wrapper** (`sdk/include/yuzu/plugin.hpp`) provides ergonomic C++ authoring on top of the C ABI. The `YUZU_PLUGIN_EXPORT` macro handles symbol visibility and the export table automatically.
 

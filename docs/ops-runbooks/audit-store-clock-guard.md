@@ -34,6 +34,22 @@ log line (step 3 below); it names its own trigger.
 operational fault drains roughly 600k rows/day. The alert is the control. The
 guard is the seatbelt.
 
+**The bootstrap decline (#2579), and why it is not one of your alerts.** A pass
+that begins with NO stored clock reading while rows are already expired declines
+once, warns, and anchors the reading - it cannot tell whether the clock was wrong
+before the guard ever ran, so it holds back rather than delete. That decline
+raises `yuzu_server_audit_retention_bootstrap_declines_total` and NOT the
+clock-anomaly series, deliberately: it makes no claim that the clock moved, so it
+must not fire an alert that says one did. Expect 0 or 1 per database, typically on
+the upgrade to schema v3. A value that keeps climbing means the anchor is not
+surviving, and `YuzuAuditRetentionAnchorNotSurviving` fires on it. Read
+`yuzu_server_audit_retention_persist_failed_total` beside it, but it is NOT
+equivalent coverage: if the reading is destroyed out of band (restore from a
+pre-v3 backup, a rehydrated replica, a disk rollback) the write succeeds every
+pass and that counter stays at zero. The
+full trigger list and the reasoning behind these signals live on the canonical
+page: [Limits](../user-manual/audit-log.md#the-retention-clock-guard).
+
 ## YuzuAuditPersistFailures - audit WRITES are failing
 
 Not a retention problem, and much louder than one:
@@ -70,6 +86,9 @@ cannot see it.
      check fired; the line prints the measured gap against the threshold.
    - `"the stored retention clock reading is not usable"` - the persisted
      reading was ahead of now, negative, non-integer or unreadable.
+   - `"no stored clock reading to compare against"` - the bootstrap decline
+     (#2579). This one does NOT raise the clock-anomaly counter, so it cannot be
+     what fired THIS alert; you are seeing it beside another trigger.
 4. If the line reads `"the first retention pass against this database"`, **do NOT
    stand it down on sight** - treat it exactly as the wipe case above and confirm
    the clock before letting the next pass drain. That line carries its own
@@ -80,7 +99,12 @@ time sync; a recent `audit_retention_days` reduction needs nothing. Note the log
 line names the TRIGGER, not the root cause: a reduction and a clock jump can both
 surface as the wipe line, which is why step 1 comes first. The next pass then
 resumes, paced. If the clock was genuinely wrong, decide before it drains whether
-the already-expired rows should be preserved (snapshot `audit.db` now).
+the already-expired rows should be preserved - page the window out through
+`/api/audit` per
+[Protecting evidence right now](../user-manual/audit-log.md#the-retention-clock-guard),
+which works on any deployment. Do NOT reach for a file-level snapshot here: a
+raw copy of a live WAL database can be torn, and the shipped server image
+carries no `sqlite3` to take a clean one.
 
 **If declines REPEAT, step 1 is not sufficient on its own.** Work the
 "Was this expected?" ladder on the canonical page before concluding the clock is

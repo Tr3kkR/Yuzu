@@ -16,7 +16,7 @@
 # ecosystem — new releases will open a PR with the new digest rather than
 # silently repointing the `:latest` tag at a new SHA. Refresh cadence also
 # documented in docs/security/scorecard-token.md.
-FROM ghcr.io/actions/actions-runner:latest@sha256:08c30b0a7105f64bddfc485d2487a22aa03932a791402393352fdf674bda2c29
+FROM ghcr.io/actions/actions-runner:latest@sha256:0cfdcc701ce933c6d243c6b0b2da767366dc9f2e99961d4c3754b0b78084cdda
 
 USER root
 

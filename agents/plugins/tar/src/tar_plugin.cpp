@@ -2075,25 +2075,14 @@ private:
     // on that platform and any known constraint. Pipe-delimited so the
     // existing dashboard renderer can show it as a table without a JSON
     // codec change.
+    // #2204: derived entirely from yuzu::tar::support_level_name(), the one
+    // place that maps the unified support-level enum to its operator-facing
+    // name — this function no longer keeps its own copy of that mapping.
     int do_compatibility(yuzu::CommandContext& ctx) {
         ctx.write_output("header|source|os|status|capture_method|notes");
         for (const auto& src : yuzu::tar::capture_sources()) {
             for (const auto& os : src.os_support) {
-                std::string_view status_str;
-                switch (os.status) {
-                case yuzu::tar::OsSupportStatus::kSupported:
-                    status_str = "supported";
-                    break;
-                case yuzu::tar::OsSupportStatus::kSupportedConstrained:
-                    status_str = "constrained";
-                    break;
-                case yuzu::tar::OsSupportStatus::kPlanned:
-                    status_str = "planned";
-                    break;
-                case yuzu::tar::OsSupportStatus::kUnsupported:
-                    status_str = "unsupported";
-                    break;
-                }
+                std::string_view status_str = yuzu::tar::support_level_name(os.status);
                 ctx.write_output(std::format("row|{}|{}|{}|{}|{}", src.name, os.os, status_str,
                                              os.capture_method, os.notes));
             }

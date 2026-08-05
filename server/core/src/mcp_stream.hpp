@@ -16,7 +16,8 @@
 ///   * The replay ring is BOUNDED (Decision 15(d)). A cursor whose frames have
 ///     been evicted is never silently gapped: the caller 404s and the client
 ///     re-initializes, refetching durable state by `execution_id`.
-///   * A live stream re-validates its credential every heartbeat tick and dies
+///   * A live stream re-validates its credential once per tick (~3 s), independent
+///     of whether a heartbeat frame is emitted that tick, and dies
 ///     within one tick of a revocation (Decision 15(c)); an INDETERMINATE auth
 ///     backend (a blip, not a revocation) gets a bounded grace window instead of
 ///     a mass kill (Decision 15(i)).
@@ -30,6 +31,11 @@
 /// mutex (a stalled peer must not block a publisher).
 
 #include "event_bus.hpp"
+// McpPostPump's tick is expressed in McpStreamBridge::PostBatch. The dependency
+// runs presentation -> core, which is the sanctioned direction (G1); the bridge
+// header forward-declares McpStreamState rather than including this one, so
+// there is no cycle.
+#include "mcp_stream_bridge.hpp"
 #include "stream_budget.hpp"
 
 #include <array>
@@ -87,6 +93,12 @@ inline constexpr std::chrono::milliseconds kMcpStreamTickDefault{3000};
 /// (Decision 15(i) — no mass kill on a blip).
 inline constexpr std::chrono::milliseconds kMcpRevalidateGraceDefault{60000};
 
+/// Decision 15: how long a streamed-POST response stays open before it is closed
+/// with `kCapExpired`. The execution is NOT cancelled - it continues server-side
+/// and its result stays collectable by GET resume or by `execution_id` - so this
+/// bounds a held connection, never the work.
+inline constexpr std::chrono::milliseconds kMcpStreamedPostCapDefault{120000};
+
 /// `retry_after_ms` on a stream-cap 429. Honest, not aspirational: a slot frees
 /// only when a live stream ends, and a dead peer is detected within one tick
 /// (3 s) plus its socket write failure — so a retry sooner than this cannot
@@ -103,6 +115,15 @@ inline constexpr std::int64_t kMcpStreamCapRetryAfterMs = 5000;
 /// half-second that would have a flaky client 429-storming us sixty times while it
 /// dutifully obeyed our own advice.
 inline constexpr std::int64_t kMcpHandoverRetryAfterMs = 5000;
+
+/// `retry_after_ms` for a streamed-POST admission denial. Deliberately NOT the GET
+/// figure above: a GET slot frees when a dead peer is detected (one tick plus a
+/// write failure), but a streamed-POST slot is held until the WORK finishes or the
+/// response cap elapses. Advising 5 s there has a conforming client burn ~24 full
+/// auth + rate-limit + routing passes before a slot could possibly free - retry
+/// amplification on exactly the surface agentic workers hammer. A quarter of the
+/// cap is a floor that can actually be true.
+inline constexpr std::int64_t kMcpStreamedPostRetryAfterMs = 30000;
 
 /// Ring / sink frames are the shared `detail::SseEvent` (whose `id` field carries
 /// the per-session event id). Deliberately NOT a bespoke type: the id used to be
@@ -156,11 +177,13 @@ enum class McpStreamClose {
     kCredentialRevoked,  ///< re-validation said the credential is definitively gone
     kAuthUnavailable,    ///< re-validation was indeterminate past the grace window
     kInternalError,      ///< the pump caught an exception — OUR fault, not the client's
-    // The next three are produced ONLY by the streamed-POST surface (2f PR 3b); the GET pump
+    // The next four are produced ONLY by the streamed-POST surface (2f PR 3b); the GET pump
     // never emits them. Declared here so to_string / close_remediation / the metric seed cover
-    // the whole closed reason set from C4, before their producers land in C6c/C7.
+    // the whole closed reason set from C4. Their producer code shipped in 3b, but only runs
+    // when --mcp-enable-streamed-post is set (not the default): the POST pump emits all four.
     kCancelled,          ///< the client sent notifications/cancelled; the execution continues
     kCapExpired,         ///< the streamed-POST response time cap elapsed; the execution continues
+    kRecordGone,         ///< the bridge can no longer serve this key (erased, or shutting down)
     kCompleted,          ///< the final was delivered then EOF — no close frame is written for this
 };
 const char* to_string(McpStreamClose reason);
@@ -333,15 +356,32 @@ public:
     std::uint64_t publish_ring_only(std::string_view event_type, std::string_view data) noexcept;
 
     /// Commit a streamed request's FINAL response frame: ring-only (as publish_ring_only)
-    /// AND eviction-EXEMPT (pinned) while the session lives, so a resume always recovers the
-    /// terminal even after the ring wraps (Decision 15(f), bounded one pending per streamed
-    /// request by kMaxStreamedPostsPerSession).
+    /// AND eviction-EXEMPT (pinned), so a resume recovers the terminal even after the ring
+    /// wraps (Decision 15(f), bounded one pending per streamed request by
+    /// kMaxStreamedPostsPerSession).
+    ///
+    /// The exemption holds for the **kMaxStreamedPostsPerSession most recent** pinned
+    /// terminals, not unconditionally: see the degraded case below.
     ///
     /// The pin is written only AFTER the frame commits, so a pre-commit failure leaves no
-    /// ghost pin and consumes no id. A committed final with no free pin slot (never expected -
-    /// the bridge caps streamed records at the pin count) still commits, unpinned, rather
-    /// than losing a real terminal. The pin is released by unpin() (final written on the POST
-    /// wire), by attach_and_replay when a cursor proves consumption (Last-Event-ID >= its id),
+    /// ghost pin and consumes no id. A committed final with no free pin slot should be
+    /// unreachable - the bridge admits streamed records against `pinned_count() + unpinned`
+    /// and this array is sized to exactly that cap - so reaching it means ADMISSION
+    /// ACCOUNTING HAS DRIFTED, reported by `yuzu_mcp_stream_pin_displaced_total` (alertable
+    /// on > 0). In that state the slots degrade as an LRU: the OLDEST pin yields to the
+    /// newest, because the newest terminal is the one a client is likeliest still waiting to
+    /// resume while the oldest has almost certainly been consumed. The displaced final stays
+    /// committed and remains in the ring until ordinary eviction reaches it - it loses its
+    /// eviction EXEMPTION, nothing more.
+    ///
+    /// NOT "delivered". These frames are ring-only; nothing delivers one except a resume,
+    /// so "almost certainly been consumed" is a likelihood, not a fact. Saying otherwise
+    /// matters because the sweep cannot tell a displaced pin from a cursor-acknowledged
+    /// one and records both as terminal_delivered - a wrong audit fact rather than a
+    /// wrong comment. That gap is fixed in the follow-up PR (a tri-state pin status).
+    ///
+    /// The pin is released by unpin() (final written on the POST wire), by attach_and_replay
+    /// when a cursor proves consumption (Last-Event-ID >= its id), by displacement as above,
     /// or with the whole object. Same return contract and boundary as publish().
     std::uint64_t publish_final(std::string_view event_type, std::string_view data) noexcept;
 
@@ -661,10 +701,120 @@ private:
     std::function<bool()> session_alive_;
     Config cfg_;
     yuzu::MetricsRegistry* metrics_ = nullptr;
+    ClockFn clock_; ///< copy of the injected clock; `grace_` owns the other one
+    /// When the next credential re-check falls due. SEEDED IN THE CTOR to
+    /// `now + cfg_.tick`, never left default-constructed: a default `time_point` is the
+    /// steady_clock EPOCH, which would make the first pass's wait budget zero and turn it
+    /// into an instant no-op pass. That is not hypothetical - it shipped on an earlier
+    /// attempt at this fix and silently invalidated the test that certified the wake path.
+    ///
+    /// This drives the GATE only. The DRAIN still runs on every wake, so progress reaches
+    /// the wire as it happens; only the two store round trips (credential re-validation and
+    /// the session TTL slide) ride the tick.
+    std::chrono::steady_clock::time_point next_check_{};
     // The credential re-validation grace policy (revoke/indeterminate/valid/stale, jitter,
     // #2367 staleness clamp). Owns all of the grace state + the injected clock; this pump keeps
     // only the wire action taken on its verdict. Constructed from cfg_ + the ClockFn.
     RevalidateGrace grace_;
+};
+
+/// The streamed-POST response pump (2f PR 3b): progress frames, then the
+/// JSON-RPC result LAST, then EOF. A SIBLING of McpStreamPump, not a subclass -
+/// that class has no virtuals and no protected state - and it lives in this
+/// header for one hard reason: `write_all` and `count_stream_close` are in
+/// mcp_stream.cpp's anonymous namespace, so a pump defined anywhere else could
+/// not reuse them.
+///
+/// Differences from the GET pump, all of them load-bearing:
+///  - Its frames come from the BRIDGE, not from its sink queue. A streamed
+///    record publishes ring-only (deliver_live=false), so the sink is a pure
+///    WAKE CHANNEL: the projector pokes it, and the pump then asks the bridge
+///    what to write. Nothing ever enqueues onto that queue.
+///  - It has a response CAP. The GET channel is open-ended; a POST response is
+///    a request/response exchange, so it is MEANT to be bounded (#2739: the cap does
+///    not fire while progress keeps arriving - the reason streamed POST ships off by
+///    default) and the execution continues
+///    server-side past the close. That needs a clock of its own, because
+///    RevalidateGrace privately owns the one injected into it.
+///  - It NEVER closes the session's stream state. The GET pump owns that stream;
+///    closing it here would kill a concurrent GET channel that this request has
+///    no authority over.
+class McpPostPump {
+public:
+    struct Config {
+        std::chrono::milliseconds tick = kMcpStreamTickDefault;
+        /// Decision 15: the streamed-POST response is bounded, then closed with
+        /// kCapExpired while the execution continues; the client collects the
+        /// result by GET resume or by execution_id. A documented SHOULD
+        /// deviation ("SHOULD NOT close before sending the response") taken as a
+        /// resource bound with a resumable escape.
+        std::chrono::milliseconds cap = kMcpStreamedPostCapDefault;
+        std::chrono::milliseconds revalidate_grace = kMcpRevalidateGraceDefault;
+        std::chrono::milliseconds revalidate_grace_jitter_max{0};
+        std::chrono::milliseconds revalidate_max_staleness{0};
+    };
+
+    /// Aliased, NOT redeclared: `write_all` is typed to McpStreamPump::WriteFn,
+    /// and a fresh std::function typedef is a distinct type that would not bind.
+    using WriteFn = McpStreamPump::WriteFn;
+    using ClockFn = McpStreamPump::ClockFn;
+    /// What the bridge hands back for one tick. Injected as a callable rather
+    /// than a bridge pointer so this half stays testable without a live bridge,
+    /// matching how the GET pump takes `revalidate` / `session_alive`.
+    using TakeBatchFn = std::function<McpStreamBridge::PostBatch(bool cap_expired)>;
+    using FinalWrittenFn = std::function<void()>;
+
+    McpPostPump(std::shared_ptr<sse_bus::SseSinkState> sink, TakeBatchFn take_batch,
+                FinalWrittenFn on_final_written, std::function<StreamRevalidate()> revalidate,
+                std::function<bool()> session_alive);
+    // Two ctors rather than `Config cfg = {}` for the same reason as
+    // McpStreamPump: GCC rejects a defaulted brace-init of an incomplete
+    // enclosing class.
+    McpPostPump(std::shared_ptr<sse_bus::SseSinkState> sink, TakeBatchFn take_batch,
+                FinalWrittenFn on_final_written, std::function<StreamRevalidate()> revalidate,
+                std::function<bool()> session_alive, Config cfg, ClockFn clock = {},
+                yuzu::MetricsRegistry* metrics = nullptr,
+                std::string correlation_id = {}, std::string execution_id = {});
+
+    /// true = keep the response open, false = the provider is done. Hard
+    /// noexcept boundary: httplib runs providers on a bare ThreadPool task.
+    bool pump_once(const WriteFn& write);
+
+    /// Why this response closed, for the releaser's `mcp.stream.close` audit.
+    /// FIRST reason wins (the first is the cause; later ones are its
+    /// consequences), and every close path records BEFORE its observability, so
+    /// the audit can never disagree with yuzu_mcp_stream_closes_total. kNone =
+    /// the pump never closed it, which the releaser reads as the client going
+    /// away - the modal case, since httplib checks liveness before each tick.
+    [[nodiscard]] McpStreamClose close_reason() const noexcept;
+
+private:
+    void note_close_reason(McpStreamClose reason) noexcept;
+    /// Publishes "this response is over" into the sink flag the bridge's cancel
+    /// interlock reads, on every path that ends the response. See the definition.
+    void mark_sink_closed() noexcept;
+    bool pump_once_impl(const WriteFn& write);
+    /// Writes the close frame (except for kCompleted, which EOFs after a real
+    /// final) and always returns false.
+    bool finish(const WriteFn& write, McpStreamClose reason);
+
+    std::shared_ptr<sse_bus::SseSinkState> sink_;
+    TakeBatchFn take_batch_;
+    FinalWrittenFn on_final_written_;
+    std::function<StreamRevalidate()> revalidate_;
+    std::function<bool()> session_alive_;
+    Config cfg_;
+    yuzu::MetricsRegistry* metrics_ = nullptr;
+    std::string correlation_id_;
+    std::string execution_id_;
+    ClockFn clock_;
+    std::chrono::steady_clock::time_point deadline_;
+    /// Next credential re-validation / session-touch. Separate from the wait
+    /// timeout: the poke wakes this pump per publication, but the store round trips
+    /// stay on the tick.
+    std::chrono::steady_clock::time_point next_check_{};
+    RevalidateGrace grace_;
+    std::atomic<McpStreamClose> close_reason_{McpStreamClose::kNone};
 };
 
 /// The `GET /mcp/v1/` tail, called by `McpServer::build_get_handler` after its

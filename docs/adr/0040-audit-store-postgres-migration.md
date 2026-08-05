@@ -93,6 +93,16 @@ primary new element vs the three prior migrations.
   backfill refuses boot with a loud diagnostic and is retried on the next start — the server
   never serves with a knowingly-incomplete evidence chain. Backfill work is RAII-guarded
   (degrade audit + `yuzu_server_audit_backfill_*` metric).
+- **Read-time credential redaction (`sanitized_detail`) ports, and the backfill applies it
+  too.** The migration ladder requires this to be an explicit decision rather than a default,
+  so: it is applied at the PG row-materialisation point (every reader) AND during the copy, so
+  the substrate never receives the plaintext. Pre-fix `config.update` rows hold an OIDC client
+  secret in free-form `detail` text, and unlike an ADR-0010 `SecretCodec` column there is no
+  rekey story for that — CLAUDE.md's "a secret is NEVER a plain Postgres column" binds a value
+  that arrives by migration exactly as it binds one that arrives by writer. Nothing legitimately
+  readable is lost (reads redact identically) and the unredacted original is not destroyed: it
+  stays in the legacy file, which is moved aside rather than deleted. Operators who set the
+  secret before the writer fix should still rotate it.
 - The legacy `audit.db` is moved aside (not deleted) after a verified backfill, per the
   operator-managed-backup convention, so the pre-cutover evidence remains recoverable. Its
   `-wal`/`-shm` sidecars move with it when present: a clean shutdown checkpoints and removes

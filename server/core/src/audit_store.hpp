@@ -219,6 +219,38 @@ public:
     /// Degrade-distinguishable total row count: `std::nullopt` on degrade.
     [[nodiscard]] std::optional<std::size_t> total_count() const;
 
+    /// The `detail` a reader should see for a row, given its target.
+    ///
+    /// Keyed on the TARGET -- a `RuntimeConfig` row naming a secret-valued key --
+    /// rather than on a writer's action string, so a future writer recording the same
+    /// key under a different verb is covered without anyone remembering to extend a
+    /// list. A detail that STARTS `value=` keeps that label and loses the value; ANY
+    /// other shape is replaced wholesale, because we cannot then tell which part is
+    /// the credential. Deliberately not "preserve everything before the first
+    /// `value=`" -- that preserved a credential written before the token, and made
+    /// the guarantee depend on an ordering nothing enforces.
+    ///
+    /// A `config.update` on a secret-valued key recorded `value=<the secret>` in
+    /// `detail` before that write path was fixed. Those rows are ALREADY on disk on
+    /// any install that set the secret before upgrading, and fixing the writer does
+    /// nothing for them: the readers serialise `detail` verbatim, so a seeded
+    /// Operator (`AuditLog:Read`) could still read a live credential out of history.
+    ///
+    /// Redaction is applied on READ rather than by rewriting the rows, deliberately.
+    /// An audit row is compliance evidence; editing history to hide a mistake is a
+    /// worse posture than declining to disclose it, and a DELETE/UPDATE sweep over
+    /// audit_events is exactly the kind of thing that must not become routine.
+    /// The plaintext therefore remains at rest (unchanged by this) and stops being
+    /// DISCLOSED. Operators who set the secret pre-upgrade should still rotate it.
+    ///
+    /// Idempotent: rows written after the writer fix already hold the placeholder.
+    /// `detail` is taken BY VALUE and moved through on the common pass-through path:
+    /// this runs per row on every audit read (up to kAuditSampleScanCap rows under
+    /// the reader lock), and a const-ref parameter forced a copy of every row's
+    /// detail whether or not it needed redacting.
+    static std::string sanitized_detail(std::string_view target_type, std::string_view target_id,
+                                        std::string detail);
+
     /// Cumulative audit-event write counts grouped by `result` value. Exposed for
     /// Prometheus scraping; reset at process start. Lock-free reads.
     uint64_t events_written(const std::string& result) const noexcept;
@@ -235,12 +267,44 @@ public:
         return clock_anomaly_skips_.load(std::memory_order_relaxed);
     }
 
-    /// Cumulative count of retention passes that did NOT do their job (probe
-    /// failure, delete failure, closed store, implausible caller clock, or an
-    /// exception at the thread boundary). Read as "retention is not fully
-    /// healthy", never as "nothing was deleted". Scraped SEPARATELY from
-    /// clock_anomaly_skips so an operator can tell "the guard is protecting the
-    /// table" from "the cleanup loop is broken".
+    /// Cumulative count of passes declined for the ONE reason that is not a
+    /// statement about the clock: there was no usable previous reading to
+    /// compare against and rows were already expired (#2579).
+    ///
+    /// Deliberately NOT folded into `clock_anomaly_skips_count()`, and the
+    /// separation is semantic before it is operational. That counter's alert
+    /// says the clock "moved in a way that WOULD have wiped audit evidence";
+    /// this decline asserts nothing of the sort -- only that nothing can yet
+    /// rule it out, which is a weaker claim and a different incident. Sharing
+    /// the counter would have made the sibling alert's own description untrue
+    /// for this case, and fired it on every server carrying a backlog through
+    /// an upgrade.
+    ///
+    /// Expected to be 0 or 1 per database in the ordinary course: the pass that
+    /// declines also anchors the reading, so the next one has a comparison
+    /// point. A value that keeps climbing means the anchor is not surviving.
+    /// `..._retention_persist_failed_total` is a PARTIAL signal for that, not an
+    /// equivalent one: when the reading is destroyed out of band -- a restore
+    /// from a pre-v3 backup, a rehydrated replica, a disk rollback -- the write
+    /// succeeds every pass and that counter never moves.
+    uint64_t bootstrap_declines_count() const noexcept {
+        return bootstrap_declines_.load(std::memory_order_relaxed);
+    }
+
+    /// Cumulative count of retention passes that did NOT do their job. Seven
+    /// sites: an unreadable pre-delete probe; a failed delete prepare; a failed
+    /// delete step; an unreadable POST-delete backlog probe; a pass refused
+    /// because the caller's clock was implausible; a pass against a closed
+    /// store; and an exception escaping the pass, caught at the thread
+    /// boundary. NOT all of them mean the delete failed -- the post-delete
+    /// backlog probe fires AFTER a successful delete, so the pass drained rows
+    /// and is merely degraded. Read it as "retention is not fully healthy",
+    /// never as "nothing was deleted".
+    /// Scraped SEPARATELY from
+    /// `clock_anomaly_skips_count()` on purpose: both leave rows undeleted, but
+    /// one means "the guard is protecting the table" and the other means "the
+    /// cleanup loop is broken". A single counter could not tell an operator
+    /// which, so an unbounded-growth audit table would look like a working guard.
     uint64_t cleanup_failed_count() const noexcept {
         return cleanup_failed_.load(std::memory_order_relaxed);
     }
@@ -298,6 +362,7 @@ private:
     // Retention-guard counters (#2360). Atomic because the /metrics scrape reads
     // them without synchronisation.
     std::atomic<uint64_t> clock_anomaly_skips_{0};
+    std::atomic<uint64_t> bootstrap_declines_{0};
     std::atomic<uint64_t> cleanup_failed_{0};
     std::atomic<uint64_t> rows_deleted_{0};
     std::atomic<uint64_t> cap_reached_{0};
