@@ -9,9 +9,10 @@
   `mcp.bridge.pin_displaced_for_admission`. The displaced result is unpinned, not
   erased: it stays in the replay ring until ordinary eviction and remains
   fetchable by `execution_id`. Live calls are never displaced, so the per-session
-  concurrency limit is intact by construction - with one bounded exception
-  tracked as #2795, where a release that loses a race still admits and can leave
-  a session transiently one over. The remaining refusal now distinguishes
+  concurrency limit is intact by construction - with two bounded exceptions,
+  each leaving a session transiently one over: #2795, where a release that loses a
+  race still admits; and a release whose own attempt throws, contained and counted
+  as `yuzu_mcp_bridge_pin_release_failed_total`. The remaining refusal now distinguishes
   slots held by calls in flight from slots held by results that have not reached
   a client, rather than always claiming calls are in flight.
 - MCP streamed POST: orphaned replay-ring pins — a committed final whose owning

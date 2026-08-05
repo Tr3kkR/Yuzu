@@ -9505,10 +9505,10 @@ TEST_CASE("Config's shipped default for streamed POST is OFF", "[mcp][2f][3b][co
 TEST_CASE("streamed POST ships DORMANT: the default is off and a stream is not opened",
           "[mcp][integration][execute][bridge][2f][3b]") {
     // The shipped default. 3b's machinery is complete and the four defects that gated
-    // the on-by-default flip (#2739, #2740, #2785, #2789) are fixed; turning the default
-    // on is a separate rung. Four operator surfaces document
-    // a bound the implementation does not honour. So it lands off, exactly as Spark
-    // landed behind prefer_spark_ = false, and the follow-up PR flips it.
+    // the on-by-default flip (#2739, #2740, #2785, #2789) are fixed, so the operator
+    // surfaces that document its bounds are now true of the implementation. It stays
+    // off because turning the default on is a SEPARATE rung - the same shape as Spark
+    // landing behind prefer_spark_ = false, cut over once the invariants hold.
     //
     // This test exists because an unpinned default is how dormancy silently ends: the
     // harness sets streamed_post_enabled_ = true for every OTHER streamed test, so

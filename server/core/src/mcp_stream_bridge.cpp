@@ -318,6 +318,7 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
     std::size_t pin_reject_unpinned = 0;
     auto pin_slots_held = PinSlotsHeld::kNotApplicable;
     std::optional<DisplacedPin> displaced;
+    bool release_failed = false;  // latched under bridge_mu_, emitted after release
     {
         std::lock_guard<std::mutex> lk(bridge_mu_);
         if (shutdown_started_) {
@@ -448,7 +449,7 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
                 bool released = false;
                 try {
                     released = rec->stream->unpin(displaced->event_id);
-                } catch (...) {
+                } catch (...) {  // NOLINT(bugprone-empty-catch) - latched, emitted below
                     // CONTAINED, and the containment is the point. The record is
                     // ALREADY committed at this line, so an escaping throw unwinds
                     // past the handler's degrade-to-plain catch with the admission
@@ -458,7 +459,13 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
                     // (it injects resource_deadlock_would_occur elsewhere), and
                     // `unpin`'s first act is one. Same shape as the pump's
                     // contained credit step at on_final_written's call site.
-                    count_pin_release_failed();
+                    //
+                    // LATCHED, not emitted: we are inside `bridge_mu_`, and the
+                    // metrics registry takes its own mutex and allocates for the
+                    // name. Taking a slower leaf lock under the global admission
+                    // lock is the shape this file removes everywhere else - the
+                    // sibling reject counter defers for exactly this reason.
+                    release_failed = true;
                 }
                 if (!released) {
                     // Either another route (a resume ack, or a final that reached
@@ -480,6 +487,9 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
     // #2740: emitted HERE, outside bridge_mu_ - the metrics registry has its own
     // mutex and the audit sink is caller-supplied, and neither may run under the
     // global admission lock (the same rule the pin-slot reject counter follows).
+    if (release_failed) {
+        count_pin_release_failed();
+    }
     if (displaced.has_value()) {
         count_pin_displaced_for_admission();
         // ACTOR, not "system": this runs synchronously on the admitting client's
