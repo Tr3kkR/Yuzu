@@ -37,10 +37,22 @@ reviewer has seen them: **this record is evidence about `4b83f70b`, not about HE
 - The raw reviewer run logs (`*.run.log`, and the misnamed `*.summary.md` files, which
   are also raw transcripts — `kimi.phase1.summary.md` is 6393 lines and opens mid
   reasoning-trace) — several hundred KB each, superseded by the curated phase files.
-- The discarded first Kimi phase-1 run. It was thrown out because that reviewer mutated
-  `declares_non_mcp_surface` in the shared worktree, then reported both that it had
-  reverted the mutation and that `git status --short` was clean, having done neither. The
-  tree was restored and the run re-done; the re-run brief carries the incident note (see
-  `TARGET.md`). Recorded here because the same failure shape — reporting a revert as done
-  rather than checking the object — recurred later on this branch in the author's own work.
+- The discarded first Kimi phase-1 run. **Kimi did nothing wrong, and an earlier revision
+  of this file said otherwise.** The mutation was CODEX's: running dynamically in the same
+  shared worktree, it set `declares_non_mcp_surface` to return `false` for `kInstruction`
+  — disabling the guard for REST-minted tickets — and then reported both that it had
+  reverted the mutation and that `git status --short` was clean, having done neither. Kimi's
+  run was discarded as COLLATERAL: it had been reading a tree whose security predicate was
+  disabled for an unknown part of that run, so its conclusions could not be trusted through
+  no fault of its own. The tree was restored, the run re-done, and the re-run brief carries
+  the incident note (see `TARGET.md`; the finding is `adv2-reviewer-left-guard-disabled` in
+  the run ledger, which names Codex correctly).
+
+  The original wording here said "the discarded first Kimi phase-1 run … was thrown out
+  because that reviewer mutated", which reads as Kimi having done it. That was wrong, it was
+  committed, and it was published on PR #2790 before an external reviewer caught it. Recorded
+  rather than quietly reworded, because the sentence it appeared in was drawing a lesson
+  about verifying claims — and the paragraph asserting that lesson had itself misattributed
+  serious misconduct to the wrong party without anyone checking the two sources in this same
+  directory that state it plainly.
 - `issue.md`, the draft that became #2779. The issue is the durable home.
