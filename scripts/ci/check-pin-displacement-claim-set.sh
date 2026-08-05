@@ -3,11 +3,15 @@
 # displacement" claim, which is stated on four operator-facing surfaces at once.
 #
 # WHY THIS EXISTS. #2740 falsified the claim "a full pin-slot set means admission accounting
-# has drifted". Fixing it took thirteen governance rounds, because the claim lives as an
-# independent paraphrase on every surface that mentions it and each round found and fixed a
-# different subset. Round twelve designated one normative home and had every other site cite
-# it; round thirteen still shipped two stale copies, one in a customer changelog, one in the
-# `/metrics` HELP string. A convention did not hold. This does.
+# has drifted". Correcting it across its surfaces took repeated review passes — the run
+# ledger for that work is governance.d/2740-streamed-post-flip-set.csK3yu.jsonl, which is
+# the one home for how many and what each found; this comment deliberately does not restate
+# a count. The shape that mattered is what recurred: the claim lives as an independent
+# paraphrase on every surface that mentions it, so each pass found and fixed a different
+# subset. The pass that designated a single normative home and had every other site cite it
+# STILL shipped two stale copies — one in a customer changelog, one in the `/metrics` HELP
+# string — under four reviewers actively looking for exactly that. A convention did not
+# hold. This does.
 #
 # WHAT IT CHECKS, AND WHY THAT AND NOT THE PROSE. It does NOT try to diff the derivation —
 # the lexical-gate approach walls at exactly that boundary and is parked for that reason.
@@ -16,9 +20,13 @@
 # on-call engineer acts on, and every defect this gate exists to catch was a disagreement
 # about its membership:
 #
-#   - the alert expression subtracting a counter that explains nothing (round 12)
-#   - `/metrics` HELP saying "rule all three out" (round 13)
-#   - a changelog telling operators to alert via a netted rule that no longer exists (13)
+#   - the alert expression subtracting a counter that explains nothing
+#   - `/metrics` HELP saying "rule all three out"
+#   - a changelog telling operators to alert via a netted rule that no longer exists
+#
+# (Each is recorded in the ledger cited above, with the pass that found it. The gate's
+# self-test below reproduces all three plus a fourth shape, so the list is exercised, not
+# just asserted.)
 #
 # THE INVARIANT, in two halves:
 #   (a) `yuzu_mcp_bridge_pin_displaced_for_admission_total` is NOT a cause. A successful
@@ -34,6 +42,72 @@
 # Exit:   0 = consistent, 1 = drift (message names the surface and the discrepancy)
 
 set -euo pipefail
+
+# (ROOT is re-read below for the normal path.)
+# --selftest: prove the detector reddens on each defect shape it claims to catch, using
+# fixtures in a scratch dir - never the real tree. Runs in CI BEFORE the real check, on the
+# plugin-spawn-gate.yml precedent: a gate nobody has watched fail is an assertion, not a
+# check (claim-discipline rule 5).
+if [ "${1:-}" = "--selftest" ]; then
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    pass=0; failed=0
+    fixture() {  # $1 = case name; builds a minimal consistent tree, then the caller breaks it
+        rm -rf "$tmp/t"; mkdir -p "$tmp/t/docs/prometheus" "$tmp/t/docs/user-manual" \
+            "$tmp/t/docs/ops-runbooks" "$tmp/t/server/core/src" "$tmp/t/changelog.d"
+        cat > "$tmp/t/docs/prometheus/yuzu-alerts.yml" <<'YML'
+groups:
+  - name: mcp
+    rules:
+      - alert: YuzuMcpStreamPinDisplaced
+        expr: |
+          increase(yuzu_mcp_stream_pin_displaced_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          description: >-
+            causes are yuzu_mcp_bridge_pin_release_raced_total and
+            yuzu_mcp_bridge_pin_release_failed_total.
+YML
+        printf '%s\n' 'yuzu_mcp_bridge_pin_release_raced_total yuzu_mcp_bridge_pin_release_failed_total' \
+            > "$tmp/t/server/core/src/server.cpp"
+        printf '%s\n' 'yuzu_mcp_bridge_pin_release_raced_total yuzu_mcp_bridge_pin_release_failed_total' \
+            > "$tmp/t/server/core/src/mcp_stream.hpp"
+        printf '%s\n' 'yuzu_mcp_bridge_pin_release_raced_total yuzu_mcp_bridge_pin_release_failed_total' \
+            > "$tmp/t/docs/user-manual/metrics.md"
+        : > "$tmp/t/docs/ops-runbooks/mcp-stream-pin-displacement.md"
+        : > "$tmp/t/changelog.d/x.md"
+    }
+    expect() {  # $1 = case name, $2 = expected exit (0 clean / 1 drift)
+        if bash "$self" "$tmp/t" >/dev/null 2>&1; then got=0; else got=1; fi
+        if [ "$got" = "$2" ]; then pass=$((pass+1)); printf '  ok    %s\n' "$1"
+        else failed=$((failed+1)); printf '  FAIL  %s (expected exit %s, got %s)\n' "$1" "$2" "$got"; fi
+    }
+
+    fixture; expect "baseline consistent fixture is clean" 0
+
+    fixture
+    sed -i 's#increase(yuzu_mcp_stream_pin_displaced_total\[15m\]) > 0#(increase(yuzu_mcp_stream_pin_displaced_total[15m]) - increase(yuzu_mcp_bridge_pin_displaced_for_admission_total[15m])) > 0#' \
+        "$tmp/t/docs/prometheus/yuzu-alerts.yml"
+    expect "netted expr subtracting the reclaim counter" 1
+
+    fixture
+    printf '%s\n' 'Rule all three out against their counters.' >> "$tmp/t/server/core/src/server.cpp"
+    expect '"rule all three out" in the /metrics HELP' 1
+
+    fixture
+    printf '%s\n' 'Alert via the shipped rule, which subtracts the explained paths.' \
+        >> "$tmp/t/changelog.d/x.md"
+    expect "changelog describing a netted rule" 1
+
+    fixture
+    sed -i 's/yuzu_mcp_bridge_pin_release_raced_total//' "$tmp/t/docs/user-manual/metrics.md"
+    expect "one residual counter named without the other" 1
+
+    printf '\nselftest: %s passed, %s failed\n' "$pass" "$failed"
+    [ "$failed" -eq 0 ] || exit 1
+    exit 0
+fi
 
 ROOT="${1:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$ROOT"

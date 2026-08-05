@@ -5,12 +5,13 @@ name: Pin-displacement claim gate
 # the user manual, and the derivation header) plus the runbook and changelog fragments.
 #
 # WHY A GATE AND NOT A CONVENTION. #2740 falsified the claim "a full pin-slot set means
-# admission accounting has drifted". Correcting it took thirteen governance rounds: the
-# claim exists as an independent paraphrase on every surface that mentions it, and each
-# round found and fixed a different subset. Round twelve designated one normative home and
-# had the others cite it; round thirteen still shipped two stale copies -- one in a customer
-# changelog, one in the /metrics HELP an on-call engineer reads with no repo access. Nine
-# reviewers were actively looking. The convention did not hold, so this is the instrument.
+# admission accounting has drifted", and correcting it across its surfaces defeated a
+# convention: the claim exists as an independent paraphrase everywhere it appears, so each
+# review pass fixed a different subset, and the pass that designated a single normative home
+# still shipped two stale copies under reviewers looking for exactly that.
+#
+# The history is NOT restated here -- see scripts/ci/check-pin-displacement-claim-set.sh's
+# header, which owns it, and the run ledger it cites.
 #
 # WHAT IT CHECKS. Not the prose -- the lexical approach walls at exactly that boundary and
 # is parked for that reason. It checks the CAUSE SET: which counters each surface names as
@@ -40,6 +41,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Self-test the detector (fixtures) before trusting it on real source
+        run: bash scripts/ci/check-pin-displacement-claim-set.sh --selftest
 
       - name: Check the cause set agrees across every surface
         run: bash scripts/ci/check-pin-displacement-claim-set.sh
