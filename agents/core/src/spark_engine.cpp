@@ -74,7 +74,13 @@ public:
         // Sized-then-filled, so this really is ONE allocation. Constructing from the
         // prefix and then resize()ing measured TWO whenever the prefix exceeded the
         // SSO threshold, which both production prefixes do.
-        std::copy_n(prefix.data(), prefix.size(), buf_.data());
+        // Same null-data() guard as finish(): an empty string_view has a null data(),
+        // and libc++ reaches __builtin_memmove(dst, nullptr, 0) where libstdc++
+        // short-circuits. Unreachable today — every ctor site passes a non-empty
+        // literal — but the guard belongs on both copies or on neither, and the round
+        // that added it to finish() left this one exposed (Gate 8, cs8-2).
+        if (!prefix.empty())
+            std::copy_n(prefix.data(), prefix.size(), buf_.data());
     }
     /// NON-COPYABLE by construction: a copy would allocate prefix_ + headroom, which
     /// is precisely the cost this class exists to keep out of the post-commit window.
@@ -621,8 +627,11 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
     // disarm(), emit_event dispatch and every other arm(), on the ordinary success
     // path, to save work only a failing arm needs (governance round 4, happy-path
     // HP-1 + sre). `event_driven` is known here, so the shape test that matters is
-    // available without the lock; a deduped event-driven arm now builds carriers it
-    // will not use, which is the cheaper side of the trade.
+    // available without the lock. Four shapes now build carriers they will not use -
+    // a deduped event-driven arm, a PRE-START event-driven arm (which previously built
+    // nothing, since the build sat inside `if (running_)`), and an arm rejected inside
+    // the lock for `stopped_` or an unsupported type. All are bounded, per-call, and off
+    // the mutex, which is the cheaper side of the trade (Gate 8 - SRE8-4).
     std::string consumer_race_msg;
     std::string disarmed_mid_arm_msg;
     BoundedMsg watch_threw_msg;
@@ -838,14 +847,24 @@ void SparkEngine::teardown_arm_race(SubscriptionId id, const std::string& key, S
         auto ki = sub_keys_.find(id);
         if (ki == sub_keys_.end())
             return; // unregister_consumer's scan already removed us — nothing to undo
-        // Key off the LOCATED entry, not the caller's string, exactly as disarm() and
-        // unregister_consumer() do. Both are identical today, but if they ever
-        // diverged, keying off the caller would make erase_if match nothing while
-        // sub_keys_.erase(ki) below still ran — leaving a live subscription that keeps
-        // receiving events and can never be disarmed. Reading ki->second costs nothing
-        // (the no-copy argument for taking `key` from the caller is about disarm()'s
-        // std::string COPY, which this is not).
-        auto ai = armed_.find(ki->second);
+        // Key off the LOCATED entry, not the caller's string, as disarm() does. The two
+        // are identical today — `sub_keys_` has exactly one insert site and ids are
+        // monotonic and never reused — but if they ever diverged, keying off the caller
+        // would make erase_if match nothing while sub_keys_.erase(ki) below still ran,
+        // leaving a live subscription that keeps receiving events and can never be
+        // disarmed. Reading ki->second costs nothing (the no-copy argument for taking
+        // `key` from the caller is about disarm()'s std::string COPY, which this is not).
+        //
+        // SCOPE OF THIS HARDENING, stated exactly because an earlier revision overclaimed
+        // it (Gate 8 — sec8-3, CA8-2): `located` covers the find and the erase_if it
+        // guards, and NOTHING further. It is a reference INTO sub_keys_, so it dangles
+        // the moment sub_keys_.erase(ki) runs below — the log, the M2 re-check and the
+        // unwatch necessarily keep using the caller's `key`, which is sound because the
+        // two are provably equal (one insert site, ids never reused). Copying it out to
+        // use later would reintroduce exactly the allocation this teardown exists to
+        // avoid. Do not "finish the job" by binding it wider without reading this.
+        const std::string& located = ki->second;
+        auto ai = armed_.find(located);
         if (ai != armed_.end()) {
             auto& subs = ai->second.subs;
             std::erase_if(subs, [&](const Subscriber& s) { return s.id == id; });
@@ -902,7 +921,8 @@ void SparkEngine::teardown_arm_race(SubscriptionId id, const std::string& key, S
         //   * Linux/sd-bus: the OS watch outlives its armed_ entry and IS reclaimed by
         //     stop() (and by unregister_consumer, and re-adopted by a later equal-spec
         //     arm, since watch() is idempotent per key).
-        //   * WINDOWS/spark_file: worse. push_retiring() takes the DirWatch BY VALUE,
+        //   * WINDOWS/spark_file: worse. push_retiring() takes the OWNING unique_ptr BY
+        //     VALUE,
         //     so a throwing push_back destroys it with an IOCP completion still
         //     pending, and stop()'s UAF quarantine walks dirs_/ancestors_/retiring_ —
         //     none of which now hold it. The completion dangles for the REMAINING

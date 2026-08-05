@@ -73,6 +73,17 @@ inline constexpr const char* kSparkTagArmedFaulted = "yuzu.spark_armed_faulted";
 inline constexpr const char* kSparkTagWatchFaults = "yuzu.spark_watch_faults";
 inline constexpr const char* kSparkTagQueuedDropped = "yuzu.spark_queued_dropped";
 inline constexpr const char* kSparkTagConsumerErrors = "yuzu.spark_consumer_errors";
+/// #2270. Mechanism unwatch() calls that THREW during arm_impl's consumer-race
+/// teardown, where the throw is contained rather than propagated. Registered HERE
+/// even though no `yuzu_fleet_*` rollup consumes it yet: key registration is what
+/// binds the agent writer to the server reader, and omitting it is exactly what let
+/// the writer-reader guard case in test_spark_fleet_tags.cpp pass green against a key
+/// it could not see (governance round 4 Gate 8 — sec8-1, doc8-3, SRE8-1). The {os}
+/// rollup, the metrics.md row and an alert rule are deferred to the prefer_spark flip.
+/// SCOPE: teardown_arm_race ONLY — disarm() and unregister_consumer() propagate
+/// instead and are not counted, so a zero here is not a fleet-wide all-clear.
+inline constexpr const char* kSparkTagArmRaceUnwatchFailures =
+    "yuzu.spark_arm_race_unwatch_failures";
 
 // ── Per-mechanism-type key composition ────────────────────────────────────────
 // A per-type key is `kSparkTagPrefix + <mechanism-token> + "_" + <metric-suffix>`,

@@ -273,9 +273,11 @@ fixed, not the *read* flood (UP-6); (c) the **server-side rollup/consumer** for 
 tag (the signal is agent-heartbeat-only today) - this is **pilot-trust-blocking**, not just SOC2
 evidence, because after suppression the only current-errored-state view is the no-TTL census, and
 `/status.errored_rules` is still the fail-closed placeholder. **(d) the four-artefact egress for
-`arm_race_unwatch_failures_total` (#2270)** - the heartbeat tag ships, but the server-side rollup,
-the `docs/user-manual/metrics.md` row and an alert rule do not, so an orphaned OS watch is
-per-device forensics rather than fleet detection. Same class as (c) and same reason it matters:
+`arm_race_unwatch_failures_total` (#2270)** - the heartbeat tag ships and its key is registered in
+`spark_fleet_tags.hpp`, but no rollup consumes it, there is no `docs/user-manual/metrics.md` row and
+no alert rule, and no REST route or dashboard renders raw `status_tags` - so an orphaned OS watch is
+not fleet-detectable and is not per-device queryable either; the value reaches the server and is
+read by nothing. Same class as (c) and same reason it matters:
 the residual it reports is a leaked watch in the agent's sole detection primitive, and on Windows
 it is not reclaimed by `stop()` at all (only a process restart releases it), so the cost is
 permanent and cumulative rather than self-healing. The census edge-record still depends

@@ -285,12 +285,6 @@ public:
     /// a real std::bad_alloc cannot be aimed at one statement. Same set-then-use
     /// contract as the other seams.
     void set_arm_fault_hook_for_test(std::function<void(int phase)> hook);
-    /// PHASE ORDINALS ARE BURNED, NEVER REUSED. 1 and 2 are live; the
-    /// kArmFaultPhaseAfterCommit family that once held further ordinals was deleted
-    /// with the post-commit rollback in 6c1d6942 and those numbers stay retired, so a
-    /// reader of an old test or ledger row cannot be misled by a recycled value. Add a
-    /// third phase as 3, and document its lock contract as both of these do.
-    ///
     /// Reached after arm_impl's armed_ entry is committed and before the sub_keys_
     /// node is allocated: a throw here must leave armed_/sub_keys_ exactly as on
     /// entry (the in-lock layer).
@@ -307,7 +301,15 @@ public:
     /// Linux-only allocation counter in the tests cannot run.
     /// CONTRACT: fires with this spark type's mech_ops_mu_by_type_ entry HELD. Throw or
     /// observe only — re-entering the engine self-deadlocks on that non-recursive mutex.
-    static constexpr int kArmFaultPhaseWatchErrorBuild = 2;
+    ///
+    /// ORDINAL 3, NOT 2, DELIBERATELY. Ordinal 2 was `kArmFaultPhaseAfterCommit` until
+    /// 6c1d6942 deleted it with the post-commit rollback. Round 4 first reintroduced 2
+    /// under this new meaning, which meant a pre-round-4 test or ledger row citing
+    /// "phase 2" resolved to something else entirely — and seven ledger rows across the
+    /// two #2270 fragments do cite it. Renumbered to 3 so retired ordinals stay retired
+    /// (Gate 8 — CA8-1, doc8-2). Retired so far: 2. Add the next phase as 4, and
+    /// document its lock contract as both live phases do.
+    static constexpr int kArmFaultPhaseWatchErrorBuild = 3;
 
 private:
     struct Subscriber {

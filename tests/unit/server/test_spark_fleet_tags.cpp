@@ -40,6 +40,8 @@ static_assert(std::string_view(detail::kSparkTagArmedFaulted) == "yuzu.spark_arm
 static_assert(std::string_view(detail::kSparkTagWatchFaults) == "yuzu.spark_watch_faults");
 static_assert(std::string_view(detail::kSparkTagQueuedDropped) == "yuzu.spark_queued_dropped");
 static_assert(std::string_view(detail::kSparkTagConsumerErrors) == "yuzu.spark_consumer_errors");
+static_assert(std::string_view(detail::kSparkTagArmRaceUnwatchFailures) ==
+              "yuzu.spark_arm_race_unwatch_failures");
 static_assert(std::string_view(detail::kSparkTagPrefix) == "yuzu.spark_");
 
 // MECHANISM-TOKEN BIND: the fleet `mechanism` label values MUST equal the agent's
@@ -100,18 +102,23 @@ TEST_CASE("agent emit keys bind exactly to the server tag constants", "[spark][f
         detail::kSparkTagRunning,        detail::kSparkTagDisabled,
         detail::kSparkTagMechs,          detail::kSparkTagArmedFaulted,
         detail::kSparkTagWatchFaults,    detail::kSparkTagQueuedDropped,
-        detail::kSparkTagConsumerErrors};
+        detail::kSparkTagConsumerErrors, detail::kSparkTagArmRaceUnwatchFailures};
     for (const char* mech : detail::kSparkMechTokens)
         for (const char* metric : detail::kSparkMetricTokens)
             reader_keys.insert(detail::spark_type_metric_tag(mech, metric));
 
     // Emit with EVERY counter non-zero for all three mechanisms, so every key the
-    // agent can produce is exercised.
+    // agent can produce is exercised. THAT IS THE WHOLE POINT OF THIS CASE, and it is
+    // only true if this list is extended whenever the agent gains a counter: #2270
+    // added arm_race_unwatch_failures_total, left it out here, and the case passed
+    // green against a key it never emitted (Gate 8 — sec8-1, doc8-3). A new counter
+    // that is emitted sparsely is INVISIBLE to this bind unless it is set non-zero.
     SparkEngineStats ss;
     ss.armed_faulted = 1;
     ss.watch_faults_total = 2;
     ss.queued_dropped_total = 3;
     ss.consumer_errors_total = 4;
+    ss.arm_race_unwatch_failures_total = 8;
     std::map<SparkType, SparkMechanismStats> by_type;
     for (SparkType t : {SparkType::File, SparkType::Registry, SparkType::Service}) {
         SparkMechanismStats ms;
@@ -134,6 +141,7 @@ TEST_CASE("agent emit keys bind exactly to the server tag constants", "[spark][f
     CHECK(tags.at(detail::kSparkTagMechs) == "file,service,registry"); // SparkType enum order
     CHECK(tags.count(detail::kSparkTagArmedFaulted) == 1);
     CHECK(tags.count(detail::kSparkTagConsumerErrors) == 1);
+    CHECK(tags.count(detail::kSparkTagArmRaceUnwatchFailures) == 1);
     CHECK(tags.count(detail::spark_type_metric_tag("registry", "quarantined")) == 1);
 }
 

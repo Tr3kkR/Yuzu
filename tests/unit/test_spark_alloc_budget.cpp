@@ -269,7 +269,9 @@ TEST_CASE("arm_impl: the failed-watch path allocates nothing after the commit (#
     //
     // MUTATION EVIDENCE: restoring the pre-fix concat
     //   std::string("watch mechanism failed to arm '") + key + "': " + w.error()
-    // makes this 3, not 0.
+    // takes this budget from 2 to 5 (measured). An earlier version of this line said
+    // "3, not 0", which was left over from a draft that measured a different window
+    // and contradicted the assertion 20 lines below it (Gate 8 - CA8-4).
     SparkEngine engine;
     CountingMechanism* mech = wire(engine);
     auto c = engine.register_consumer("c", [](const SparkEvent&) {});
