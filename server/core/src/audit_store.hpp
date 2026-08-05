@@ -415,11 +415,17 @@ public:
         return persist_failed_.load(std::memory_order_relaxed);
     }
 
-    /// Run exactly ONE retention pass against `now` (epoch seconds) and return
-    /// the number of rows deleted. Returns 0 when the pass declined (clock
-    /// guard), when nothing was expired, when another replica held the advisory
-    /// lease, or when the pass failed. Factored out so tests can drive a pass at
-    /// an arbitrary `now` without sleeping the cleanup interval.
+    /// Run exactly ONE retention pass and return the number of rows deleted.
+    /// Returns 0 when the pass declined (clock guard), when nothing was
+    /// expired, when another replica held the advisory lease, or when the pass
+    /// failed. `now` (epoch seconds) is the CALLER's clock — since #2360/1d it
+    /// gates only the pre-txn implausibility check and stamps the liveness
+    /// gauge (`last_pass_unixtime_`); the retention DECISION itself reads
+    /// PostgreSQL's own clock inside the advisory-lock transaction (ADR-0040
+    /// "Cross-replica clock divergence"), so a test cannot drive which anomaly
+    /// classifies by varying `now` alone — it must read `pg_now(dsn)` (or
+    /// hand-write the durable `audit_retention_meta` row) to control the
+    /// decision.
     std::size_t cleanup_once(std::int64_t now);
 
     void start_cleanup();

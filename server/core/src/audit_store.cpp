@@ -1649,6 +1649,42 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             return true; // another replica is sweeping; not a failure
         }
 
+        // PostgreSQL's OWN clock, not the caller's, for every DECISION below.
+        // The caller-supplied `now` remains a liveness signal only
+        // (`last_pass_unixtime_`, stamped before this transaction even runs)
+        // and still gates the cheap pre-txn implausibility check.
+        //
+        // Gate 4 unhappy-path UP-2 / Sol: comparing one replica's PROCESS
+        // clock against `last_pass_now` — itself stamped by whichever
+        // replica's process clock swept last — means clock disagreement
+        // BETWEEN replicas, not just an NTP jump on one machine, can make two
+        // sweepers alternate distinct fact sets forever, each declining a
+        // pass the other just anchored. PostgreSQL is the ONE authority every
+        // sweeper already serialises through (the advisory lock above), so
+        // reading its clock HERE — after the lock, inside this transaction —
+        // gives every replica the identical comparison point regardless of
+        // its own process clock's accuracy. `EXTRACT(EPOCH FROM now())` is
+        // the existing idiom for this in the codebase (`result_set_store.cpp`,
+        // `software_inventory_store.cpp`); `now()` is the transaction's start
+        // time, stable and adequate for a single-statement read.
+        pg::PgResult clk = pg::exec_params(conn, "SELECT EXTRACT(EPOCH FROM now())::bigint",
+                                           std::vector<std::string>{});
+        if (clk.status() != PGRES_TUPLES_OK) {
+            spdlog::error("AuditStore: reap clock read failed: {}", PQerrorMessage(conn));
+            return false;
+        }
+        const std::int64_t pg_now = to_i64(PQgetvalue(clk.get(), 0, 0));
+        // Same overflow guard as the pre-txn check on the caller's clock,
+        // applied to PG's — `datable_horizon` below adds `window + slack` to
+        // this value, and it is cheap to bound both sources the same way
+        // rather than trust one implicitly because it is "the database".
+        if (pg_now > kMaxPlausibleNow) {
+            spdlog::error("AuditStore: reap declined — PostgreSQL's own clock reading ({}) is "
+                          "implausible",
+                          pg_now);
+            return false;
+        }
+
         // Durable dedup state (shared across replicas + restarts).
         pg::PgResult meta = pg::exec_params(
             conn,
@@ -1689,7 +1725,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         }
         // A reading ahead of the clock (backward NTP correction) or negative
         // (corruption) cannot be reasoned about — decline either way.
-        if (prev && (*prev < 0 || *prev > now)) {
+        if (prev && (*prev < 0 || *prev > pg_now)) {
             prev_unusable = true;
             prev.reset();
         }
@@ -1702,7 +1738,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             conn,
             "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES ('last_pass_now', $1) "
             "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            std::vector<std::string>{std::to_string(now)});
+            std::vector<std::string>{std::to_string(pg_now)});
         if (stamp.status() != PGRES_COMMAND_OK) {
             spdlog::error("AuditStore: reap meta stamp failed: {}", PQerrorMessage(conn));
             persist_failed = true;
@@ -1736,10 +1772,10 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         // transfer: Postgres expands BETWEEN to exactly these two comparisons,
         // and either way the pair is one index range condition on the leading
         // column.
-        const std::int64_t datable_horizon = now + window + kAuditTtlFutureSlackSec;
+        const std::int64_t datable_horizon = pg_now + window + kAuditTtlFutureSlackSec;
         pg::PgResult probe = pg::exec_params(
             conn, std::string(kAuditRetentionProbeSql).c_str(),
-            std::vector<std::string>{std::to_string(now), std::to_string(datable_horizon)});
+            std::vector<std::string>{std::to_string(pg_now), std::to_string(datable_horizon)});
         if (probe.status() != PGRES_TUPLES_OK) {
             spdlog::error("AuditStore: reap probe failed: {}", PQerrorMessage(conn));
             return false;
@@ -1752,7 +1788,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
         // while leaving survivors, which the cap bounds but nothing else reports.
         // Gated on window > 0 and strictly greater than the absolute floor.
         const bool big_step = prev.has_value() && window > 0 && has_expired &&
-                              (now - *prev) > kAuditMinBigStepSec;
+                              (pg_now - *prev) > kAuditMinBigStepSec;
 
         const audit_retention::Facts facts{.has_expired = has_expired,
                                            .would_wipe = would_wipe,
@@ -1838,7 +1874,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             "DELETE FROM audit_store.audit_events WHERE id IN (SELECT id FROM "
             "audit_store.audit_events WHERE ttl_expires_at > 0 AND ttl_expires_at < $1::bigint "
             "ORDER BY ttl_expires_at ASC, id ASC LIMIT $2::bigint) RETURNING id",
-            std::vector<std::string>{std::to_string(now),
+            std::vector<std::string>{std::to_string(pg_now),
                                      std::to_string(static_cast<std::int64_t>(
                                          kMaxAuditDeletesPerPass))});
         if (del.status() != PGRES_TUPLES_OK) {
@@ -1855,7 +1891,7 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
                 conn,
                 "SELECT EXISTS(SELECT 1 FROM audit_store.audit_events WHERE ttl_expires_at > 0 AND "
                 "ttl_expires_at < $1::bigint)",
-                std::vector<std::string>{std::to_string(now)});
+                std::vector<std::string>{std::to_string(pg_now)});
             if (more.status() != PGRES_TUPLES_OK) {
                 spdlog::error("AuditStore: reap backlog probe failed: {}", PQerrorMessage(conn));
                 return false;

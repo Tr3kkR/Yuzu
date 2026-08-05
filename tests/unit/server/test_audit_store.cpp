@@ -83,7 +83,27 @@ AuditEvent mk(const std::string& principal, const std::string& action,
 // ── Retention-guard fixtures ────────────────────────────────────────────────
 constexpr int kGuardRetentionDays = 1;
 constexpr std::int64_t kWindow = static_cast<std::int64_t>(kGuardRetentionDays) * 86400;
-constexpr std::int64_t kNow = 1'700'000'000;
+
+// PostgreSQL's OWN clock, queried directly — the retention DECISION (Gate 4
+// unhappy-path UP-2 / Sol) now reads `now()` inside the advisory-lock
+// transaction rather than trusting the CALLER's clock, so a fixed historical
+// constant (the old `kNow = 1'700'000'000`, ~Nov 2023) no longer has any
+// relationship to what the guard actually compares against — a "survivor"
+// row seeded at `kNow + kWindow` is, by 2026, already YEARS in the past
+// relative to the real clock the decision uses, and every test built on that
+// assumption either passed for the wrong reason or failed outright. Every
+// clock-guard test below computes its own `now` from this helper and builds
+// all relative math off it.
+std::int64_t pg_now(const std::string& dsn) {
+    return std::stoll(query_scalar(dsn, "SELECT EXTRACT(EPOCH FROM now())::bigint"));
+}
+
+// For the two tests below that deliberately never open a live connection
+// (an unreachable PgPool) — there is no `dsn` to read `pg_now` from, and
+// `cleanup_once` returns before the value would matter anyway (`!open_`
+// short-circuits ahead of every clock use). Any plausible reading works;
+// named so it reads as deliberate rather than a stray literal.
+constexpr std::int64_t kArbitraryPlausibleTime = 1'700'000'000;
 
 // Seed `count` rows all carrying the same ttl_expires_at (and timestamp), via a
 // second connection, so a test can place rows at a chosen distance from the
@@ -110,9 +130,16 @@ void seed_rows_with_ttl(const std::string& dsn, std::int64_t ttl, int count) {
 /// than approximate: `cleanup_once` anchors the reading and settles the marker
 /// before it probes, and with nothing expired the rule short-circuits to `None`,
 /// so no counter moves, nothing is deleted and no anomaly is recorded. Call it
-/// BEFORE seeding. The default is an hour back, comfortably inside the 7-day
-/// step threshold, so it cannot itself provoke a `Step`.
-void anchor_guard(AuditStore& store, std::int64_t last_pass_now = kNow - 3600) {
+/// BEFORE seeding.
+///
+/// `now` is REQUIRED, not defaulted. Since #2360/1d the retention DECISION
+/// reads PostgreSQL's own clock, not this argument — `cleanup_once`'s `now`
+/// only gates the pre-txn implausibility check and stamps the liveness gauge
+/// (`last_pass_unixtime_`), so its value has no bearing on which anomaly, if
+/// any, gets classified. It stays required rather than defaulted so a call
+/// site cannot assume otherwise; pass any plausible reading, e.g. `pg_now(dsn)`
+/// or an offset from one.
+void anchor_guard(AuditStore& store, std::int64_t last_pass_now) {
     REQUIRE(store.cleanup_once(last_pass_now) == 0);
     REQUIRE(store.clock_anomaly_skips_count() == 0);
     REQUIRE(store.bootstrap_declines_count() == 0);
@@ -1410,16 +1437,17 @@ TEST_CASE("AuditStore: backfill sanitizes invalid-UTF-8 legacy bytes in every te
 TEST_CASE("AuditStore #2360: a corrupt clock reading under a would-wipe declines, never drains",
           "[pg][audit_store][retention][clock-guard]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    const std::int64_t now = pg_now(db.dsn());
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, /*cleanup_interval_min=*/0);
     REQUIRE(store.is_open());
-    seed_rows_with_ttl(db.dsn(), kNow - 100, 10); // every row expired → would_wipe
+    seed_rows_with_ttl(db.dsn(), now - 100, 10); // every row expired → would_wipe
     // Poison the durable clock reading with a non-numeric value → prev_unusable.
     exec_sql(db.dsn(), "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES "
                        "('last_pass_now', 'not-a-number') ON CONFLICT (key) DO UPDATE SET value = "
                        "EXCLUDED.value");
 
-    CHECK(store.cleanup_once(kNow) == 0);          // declines (BadState/prev_unusable)
+    CHECK(store.cleanup_once(now) == 0);           // declines (BadState/prev_unusable)
     CHECK(row_count(db.dsn()) == 10);              // nothing deleted on the corrupt pass
     CHECK(store.clock_anomaly_skips_count() == 1); // reported
     CHECK(store.rows_deleted_count() == 0);
@@ -1435,13 +1463,14 @@ TEST_CASE("AuditStore #2360: a first pass that would wipe every datable row decl
           "then drains",
           "[pg][audit_store][retention][clock-guard]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    const std::int64_t now = pg_now(db.dsn());
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, /*cleanup_interval_min=*/0);
     REQUIRE(store.is_open());
-    anchor_guard(store); // #2579 precondition: this test is not about the bootstrap
-    seed_rows_with_ttl(db.dsn(), kNow - 100, 10); // every row already expired
+    anchor_guard(store, now - 3600); // #2579 precondition: this test is not about the bootstrap
+    seed_rows_with_ttl(db.dsn(), now - 100, 10); // every row already expired
 
-    CHECK(store.cleanup_once(kNow) == 0); // declines (would_wipe)
+    CHECK(store.cleanup_once(now) == 0); // declines (would_wipe)
     CHECK(row_count(db.dsn()) == 10);
     CHECK(store.clock_anomaly_skips_count() == 1);
     CHECK(store.cleanup_failed_count() == 0);
@@ -1449,13 +1478,13 @@ TEST_CASE("AuditStore #2360: a first pass that would wipe every datable row decl
                                  "'last_anomaly_facts'") == "1");
 
     // Identical next pass: suppressed repeat → drains, capped.
-    CHECK(store.cleanup_once(kNow + 1) == 10);
+    CHECK(store.cleanup_once(now + 1) == 10);
     CHECK(row_count(db.dsn()) == 0);
     CHECK(store.clock_anomaly_skips_count() == 1); // not counted twice
     CHECK(store.rows_deleted_count() == 10);
 
     // A clean pass clears the durable anomaly fact set.
-    CHECK(store.cleanup_once(kNow + 2) == 0);
+    CHECK(store.cleanup_once(now + 2) == 0);
     CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE key = "
                                  "'last_anomaly_facts'") == "0");
 }
@@ -1463,13 +1492,14 @@ TEST_CASE("AuditStore #2360: a first pass that would wipe every datable row decl
 TEST_CASE("AuditStore #2360: a datable survivor means no wipe, so the pass deletes immediately",
           "[pg][audit_store][retention][clock-guard]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    const std::int64_t now = pg_now(db.dsn());
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, 0);
-    anchor_guard(store); // #2579 precondition: this test is not about the bootstrap
-    seed_rows_with_ttl(db.dsn(), kNow - 100, 10);    // expired
-    seed_rows_with_ttl(db.dsn(), kNow + kWindow, 1); // healthy survivor
+    anchor_guard(store, now - 3600); // #2579 precondition: this test is not about the bootstrap
+    seed_rows_with_ttl(db.dsn(), now - 100, 10);    // expired
+    seed_rows_with_ttl(db.dsn(), now + kWindow, 1); // healthy survivor
 
-    CHECK(store.cleanup_once(kNow) == 10);
+    CHECK(store.cleanup_once(now) == 10);
     CHECK(row_count(db.dsn()) == 1);
     CHECK(store.clock_anomaly_skips_count() == 0);
 }
@@ -1485,13 +1515,14 @@ TEST_CASE("AuditStore #2579: no stored reading + rows already expired declines, 
     //
     // Deliberately NOT anchored: the absence of a stored reading IS the input.
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    const std::int64_t now = pg_now(db.dsn());
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, 0);
     REQUIRE(store.is_open());
-    seed_rows_with_ttl(db.dsn(), kNow - 100, 10);    // expired: written before the skew
-    seed_rows_with_ttl(db.dsn(), kNow + kWindow, 2); // datable survivors: written after it
+    seed_rows_with_ttl(db.dsn(), now - 100, 10);    // expired: written before the skew
+    seed_rows_with_ttl(db.dsn(), now + kWindow, 2); // datable survivors: written after it
 
-    REQUIRE(store.cleanup_once(kNow) == 0); // was 10 before #2579
+    REQUIRE(store.cleanup_once(now) == 0); // was 10 before #2579
     CHECK(row_count(db.dsn()) == 12);
     CHECK(store.bootstrap_declines_count() == 1);
     // The signal separation is the contract, not an implementation detail: this
@@ -1500,7 +1531,7 @@ TEST_CASE("AuditStore #2579: no stored reading + rows already expired declines, 
 
     // Once, not forever. The declining pass settled the marker, so the next pass
     // has a comparison point and proceeds -- paced by the cap as always.
-    CHECK(store.cleanup_once(kNow + 1) == 10);
+    CHECK(store.cleanup_once(now + 1) == 10);
     CHECK(row_count(db.dsn()) == 2);
     CHECK(store.bootstrap_declines_count() == 1); // and NOT counted twice
 }
@@ -1515,47 +1546,49 @@ TEST_CASE("AuditStore #2579: a probe-failed pass does not spend the bootstrap tr
     // reinstated. The marker is therefore settled at the VERDICT, and every
     // early return before it rolls the whole transaction back.
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    const std::int64_t now = pg_now(db.dsn());
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, 0);
     REQUIRE(store.is_open());
-    seed_rows_with_ttl(db.dsn(), kNow - 100, 10);
-    seed_rows_with_ttl(db.dsn(), kNow + kWindow, 2);
+    seed_rows_with_ttl(db.dsn(), now - 100, 10);
+    seed_rows_with_ttl(db.dsn(), now + kWindow, 2);
 
     // Pass 1 cannot probe -- and DOES re-anchor on its way past.
     exec_sql(db.dsn(), "ALTER TABLE audit_store.audit_events RENAME TO audit_events_hidden");
-    CHECK(store.cleanup_once(kNow) == 0);
+    CHECK(store.cleanup_once(now) == 0);
     CHECK(store.cleanup_failed_count() == 1);
     CHECK(store.bootstrap_declines_count() == 0); // no verdict was reached
     exec_sql(db.dsn(), "ALTER TABLE audit_store.audit_events_hidden RENAME TO audit_events");
 
     // Pass 2 must STILL decline. Without the verdict-point settle it deleted all 10.
-    CHECK(store.cleanup_once(kNow + 1) == 0);
+    CHECK(store.cleanup_once(now + 1) == 0);
     CHECK(store.bootstrap_declines_count() == 1);
     CHECK(row_count(db.dsn()) == 12);
 
     // ...and having now reached a verdict, it is spent: pass 3 drains.
-    CHECK(store.cleanup_once(kNow + 2) == 10);
+    CHECK(store.cleanup_once(now + 2) == 10);
     CHECK(row_count(db.dsn()) == 2);
 }
 
 TEST_CASE("AuditStore #2579: consecutive probe failures do not erode the trigger",
           "[pg][audit_store][retention][clock-guard]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    const std::int64_t now = pg_now(db.dsn());
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, 0);
     REQUIRE(store.is_open());
-    seed_rows_with_ttl(db.dsn(), kNow - 100, 10);
-    seed_rows_with_ttl(db.dsn(), kNow + kWindow, 2);
+    seed_rows_with_ttl(db.dsn(), now - 100, 10);
+    seed_rows_with_ttl(db.dsn(), now + kWindow, 2);
 
     exec_sql(db.dsn(), "ALTER TABLE audit_store.audit_events RENAME TO audit_events_hidden");
     for (int i = 0; i < 3; ++i)
-        CHECK(store.cleanup_once(kNow + i) == 0);
+        CHECK(store.cleanup_once(now + i) == 0);
     CHECK(store.cleanup_failed_count() == 3);
     CHECK(store.bootstrap_declines_count() == 0); // no verdict on any of them
     exec_sql(db.dsn(), "ALTER TABLE audit_store.audit_events_hidden RENAME TO audit_events");
 
     // Still armed after three failures.
-    CHECK(store.cleanup_once(kNow + 10) == 0);
+    CHECK(store.cleanup_once(now + 10) == 0);
     CHECK(store.bootstrap_declines_count() == 1);
     CHECK(row_count(db.dsn()) == 12);
 }
@@ -1566,12 +1599,13 @@ TEST_CASE("AuditStore #2579: nothing expired means no bootstrap decline",
     // trigger fired on that it would declare an anomaly on every server's first
     // boot -- which is why `no_anchor` is tested AFTER `has_expired`.
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    const std::int64_t now = pg_now(db.dsn());
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, 0);
     REQUIRE(store.is_open());
-    seed_rows_with_ttl(db.dsn(), kNow + kWindow, 3); // nothing expired
+    seed_rows_with_ttl(db.dsn(), now + kWindow, 3); // nothing expired
 
-    CHECK(store.cleanup_once(kNow) == 0);
+    CHECK(store.cleanup_once(now) == 0);
     CHECK(store.bootstrap_declines_count() == 0);
     CHECK(store.clock_anomaly_skips_count() == 0);
     CHECK(row_count(db.dsn()) == 3);
@@ -1580,12 +1614,13 @@ TEST_CASE("AuditStore #2579: nothing expired means no bootstrap decline",
 TEST_CASE("AuditStore #2360: one forward-skew far-future row cannot disarm the guard",
           "[pg][audit_store][retention][clock-guard]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    const std::int64_t now = pg_now(db.dsn());
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, 0);
-    seed_rows_with_ttl(db.dsn(), kNow - 100, 10);
-    seed_rows_with_ttl(db.dsn(), kNow + kWindow + kAuditTtlFutureSlackSec + 1000, 1); // implausible
+    seed_rows_with_ttl(db.dsn(), now - 100, 10);
+    seed_rows_with_ttl(db.dsn(), now + kWindow + kAuditTtlFutureSlackSec + 1000, 1); // implausible
 
-    CHECK(store.cleanup_once(kNow) == 0); // still declines — far-future row is not a survivor
+    CHECK(store.cleanup_once(now) == 0); // still declines — far-future row is not a survivor
     CHECK(row_count(db.dsn()) == 11);
     CHECK(store.clock_anomaly_skips_count() == 1);
 }
@@ -1593,20 +1628,21 @@ TEST_CASE("AuditStore #2360: one forward-skew far-future row cannot disarm the g
 TEST_CASE("AuditStore #2360: the per-pass cap paces a large expiry and reports a backlog",
           "[pg][audit_store][retention][clock-guard][slow]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    const std::int64_t now = pg_now(db.dsn());
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, 0);
-    anchor_guard(store); // #2579 precondition: this test is not about the bootstrap
+    anchor_guard(store, now - 3600); // #2579 precondition: this test is not about the bootstrap
     constexpr int kSurplus = 7;
-    seed_rows_with_ttl(db.dsn(), kNow - 100, static_cast<int>(kMaxAuditDeletesPerPass) + kSurplus);
-    seed_rows_with_ttl(db.dsn(), kNow + kWindow, 1); // survivor → not a would_wipe
+    seed_rows_with_ttl(db.dsn(), now - 100, static_cast<int>(kMaxAuditDeletesPerPass) + kSurplus);
+    seed_rows_with_ttl(db.dsn(), now + kWindow, 1); // survivor → not a would_wipe
 
-    CHECK(store.cleanup_once(kNow) == kMaxAuditDeletesPerPass);
+    CHECK(store.cleanup_once(now) == kMaxAuditDeletesPerPass);
     CHECK(store.cap_reached_count() == 1);
     CHECK(store.rows_deleted_count() == kMaxAuditDeletesPerPass);
     CHECK(store.clock_anomaly_skips_count() == 0); // an over-cap backlog is NOT an anomaly
 
     // The pass that clears the backlog does NOT count as cap-reached.
-    CHECK(store.cleanup_once(kNow + 1) == kSurplus);
+    CHECK(store.cleanup_once(now + 1) == kSurplus);
     CHECK(store.cap_reached_count() == 1);
     CHECK(row_count(db.dsn()) == 1);
 }
@@ -1616,26 +1652,41 @@ TEST_CASE("AuditStore #2360: the clock-step guard survives a restart via durable
     // The elapsed-time step is the only detector that survives a write landing
     // after the jump. Held in memory it would compare against nothing on the
     // first pass of a new process; the durable last_pass_now closes that.
+    //
+    // The decision clock is PostgreSQL's own `now()` (#2360/1d), which a fast
+    // unit test cannot make jump. What a genuine jump (or a long outage) WOULD
+    // leave behind is reachable, though: a `last_pass_now` row far older than
+    // the current real reading. `cleanup_once` reads that row back verbatim
+    // (audit_store.cpp's meta read, above the stamp), so hand-writing it here
+    // reproduces the post-jump state exactly rather than approximating it.
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    const std::int64_t now = pg_now(db.dsn());
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     {
         AuditStore first(pool, kGuardRetentionDays, 0);
         REQUIRE(first.is_open());
-        anchor_guard(first); // #2579 precondition: this test is about the durable STEP
-        seed_rows_with_ttl(db.dsn(), kNow - 100, 5);
-        seed_rows_with_ttl(db.dsn(), kNow + kWindow, 1); // survivor: no would_wipe
-        REQUIRE(first.cleanup_once(kNow) == 5);
+        anchor_guard(first, now - 3600); // #2579 precondition: this test is about the durable STEP
+        seed_rows_with_ttl(db.dsn(), now - 100, 5);
+        seed_rows_with_ttl(db.dsn(), now + kWindow, 1); // survivor: no would_wipe
+        REQUIRE(first.cleanup_once(now) == 5);
         REQUIRE(first.clock_anomaly_skips_count() == 0);
     }
-    // A fresh store (new process) over the same DB. The clock is now more than a
-    // whole retention window ahead and a write has landed at the new time, so the
-    // outcome test alone sees nothing wrong — only the durable step catches it.
+    // Simulate what a restart after a large clock jump (or a long outage) would
+    // find durably stored: a `last_pass_now` far older than the current real
+    // reading. Direct SQL, not a store method — no product path writes this
+    // row to an arbitrary value, only the guard itself.
+    exec_sql(db.dsn(), "UPDATE audit_store.audit_retention_meta SET value = '" +
+                            std::to_string(now - kAuditMinBigStepSec - 10) +
+                            "' WHERE key = 'last_pass_now'");
+
+    // A fresh store (new process) over the same DB. From the OUTCOME alone —
+    // some expired rows, one survivor — nothing looks wrong; only the durable
+    // step catches it.
     AuditStore second(pool, kGuardRetentionDays, 0);
     REQUIRE(second.is_open());
-    const std::int64_t jumped = kNow + kAuditMinBigStepSec + 1;
-    seed_rows_with_ttl(db.dsn(), kNow + 10, 5);     // expired at the new reading
-    seed_rows_with_ttl(db.dsn(), jumped + 3600, 1); // survivor at the new reading
-    CHECK(second.cleanup_once(jumped) == 0);
+    seed_rows_with_ttl(db.dsn(), now - 100, 5);          // already expired
+    seed_rows_with_ttl(db.dsn(), now + kWindow + 10, 1); // survivor
+    CHECK(second.cleanup_once(now) == 0);
     CHECK(second.clock_anomaly_skips_count() == 1);
 }
 
@@ -1644,7 +1695,7 @@ TEST_CASE("AuditStore #2360: a closed store counts a failed pass, not silence",
     PgPool bad{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
     AuditStore store(bad, kGuardRetentionDays, 0);
     REQUIRE_FALSE(store.is_open());
-    CHECK(store.cleanup_once(kNow) == 0);
+    CHECK(store.cleanup_once(kArbitraryPlausibleTime) == 0);
     CHECK(store.cleanup_failed_count() == 1);
     CHECK(store.clock_anomaly_skips_count() == 0);
     CHECK(store.retention_passes_count() == 1); // liveness still moves
@@ -1664,6 +1715,7 @@ TEST_CASE("AuditStore #2360: an implausible caller clock is refused before any a
 TEST_CASE("AuditStore #2360: a sibling holding the advisory lease skips the pass quietly",
           "[pg][audit_store][retention][clock-guard]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    const std::int64_t now = pg_now(db.dsn());
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool, kGuardRetentionDays, 0);
     // #2579 precondition, and here it is load-bearing rather than cosmetic:
@@ -1671,9 +1723,9 @@ TEST_CASE("AuditStore #2360: a sibling holding the advisory lease skips the pass
     // passes for the wrong reason, and the test stays green through an advisory
     // lock that does not work at all. Verified by deleting the lock acquisition —
     // with this line the no-lock case fails as it must; without it it passes.
-    anchor_guard(store);
-    seed_rows_with_ttl(db.dsn(), kNow - 100, 5);
-    seed_rows_with_ttl(db.dsn(), kNow + kWindow, 1); // a survivor: a lone pass WOULD delete
+    anchor_guard(store, now - 3600);
+    seed_rows_with_ttl(db.dsn(), now - 100, 5);
+    seed_rows_with_ttl(db.dsn(), now + kWindow, 1); // a survivor: a lone pass WOULD delete
 
     // Hold the fleet-wide reap lease on a separate connection's open txn.
     PgConn locker{PQconnectdb(db.dsn().c_str())};
@@ -1684,13 +1736,53 @@ TEST_CASE("AuditStore #2360: a sibling holding the advisory lease skips the pass
                        "SELECT pg_advisory_xact_lock(hashtextextended('audit_store:reap', 0))")};
     REQUIRE(lk.ok());
 
-    CHECK(store.cleanup_once(kNow) == 0);     // skipped — lease held elsewhere
+    CHECK(store.cleanup_once(now) == 0);      // skipped — lease held elsewhere
     CHECK(row_count(db.dsn()) == 6);          // nothing deleted
     CHECK(store.cleanup_failed_count() == 0); // a skip is NOT a failure
     CHECK(store.clock_anomaly_skips_count() == 0);
 
     PgResult rollback{PQexec(locker.get(), "ROLLBACK")};
     REQUIRE(rollback.ok());
+}
+
+TEST_CASE("AuditStore #2360/1d: a skewed process clock cannot change the verdict",
+          "[pg][audit_store][retention][clock-guard]") {
+    // Gate 4 unhappy-path UP-2 / Sol: before this fix, the DECISION read the
+    // CALLER's clock, so two replicas whose process clocks disagreed could
+    // derive different datable_horizon/would_wipe verdicts from the SAME
+    // underlying rows — each could anchor a reading the other then treated as
+    // an anomaly, alternating forever. Since #2360/1d every decision reads
+    // PostgreSQL's OWN clock inside the advisory-lock transaction, so the
+    // CALLER's `now` — however skewed — cannot move the verdict. Two replicas
+    // reading wildly different process clocks against the same rows still
+    // agree, because neither's reading is what gets compared.
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    const std::int64_t now = pg_now(db.dsn());
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore replica_a(pool, kGuardRetentionDays, 0);
+    AuditStore replica_b(pool, kGuardRetentionDays, 0);
+    REQUIRE(replica_a.is_open());
+    REQUIRE(replica_b.is_open());
+    anchor_guard(replica_a, now - 3600); // #2579 precondition: this test is about clock skew
+    seed_rows_with_ttl(db.dsn(), now - 100, 5);      // expired by the REAL clock
+    seed_rows_with_ttl(db.dsn(), now + kWindow, 1);  // a survivor by the REAL clock
+
+    // Replica A's process clock reads a month BEHIND real time; replica B's
+    // reads a month AHEAD. Under a caller-clock-driven decision, A would see
+    // nothing expired yet (its own `now` sits before every ttl) and B would
+    // see everything past `datable_horizon` (excluded as implausibly future),
+    // so the two would disagree about whether the pass should delete at all.
+    const std::int64_t behind = now - 30 * 86400;
+    const std::int64_t ahead = now + 30 * 86400;
+
+    CHECK(replica_a.cleanup_once(behind) == 5); // still governed by PG's real clock
+    CHECK(replica_a.clock_anomaly_skips_count() == 0);
+    CHECK(row_count(db.dsn()) == 1); // the survivor remains
+
+    CHECK(replica_b.cleanup_once(ahead) == 0); // real clock agrees: nothing left to expire
+    CHECK(replica_b.clock_anomaly_skips_count() == 0);
+    CHECK(replica_b.cleanup_failed_count() == 0);
+    CHECK(row_count(db.dsn()) == 1); // unchanged — no mutual decline, no double-delete
 }
 
 TEST_CASE("AuditStore #2360: classify pins the anomaly precedence with no database",

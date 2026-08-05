@@ -189,13 +189,16 @@ flag, which on N replicas is spent by whichever booted first; settled-at-the-ver
 re-anchor happens BEFORE the probes, so deriving the trigger from the stored reading would let one
 transient probe failure spend it permanently — the exact defect #2579 closes.
 
-**Known residue: cross-replica clock divergence** (Gate 2 security). The sanitiser compares one
-replica's `now` against another replica's stamped `last_pass_now`. Divergence larger than the tick
-interval inverts that ordering, so two replicas can alternate `BadState`/`Step` fact sets that
-never match `last_anomaly_facts`, and each declines. Retention still progresses whenever one
-replica wins consecutive leases, and declining is the safe direction — but it is a real
-multi-replica behaviour that the single-writer SQLite guard could not exhibit, and operators
-should keep server clocks in agreement rather than rely on the guard absorbing it.
+**Cross-replica clock divergence — closed (#2360/1d, Gate 4 unhappy-path UP-2 / Sol).** An earlier
+revision of this guard compared one replica's own process `now` against the durable
+`last_pass_now`, so replicas whose clocks disagreed could alternate `BadState`/`Step` fact sets
+that never matched `last_anomaly_facts` and each declined forever. The decision now reads
+PostgreSQL's OWN clock (`SELECT EXTRACT(EPOCH FROM now())::bigint`) inside the same advisory-lock
+transaction that already serialises every sweeper — the same idiom `result_set_store.cpp` and
+`software_inventory_store.cpp` use — so every replica compares against the identical reading
+regardless of its own process clock's accuracy. The caller-supplied `now` remains only a liveness
+signal (`last_pass_unixtime_`) and the pre-txn implausibility guard; it has no bearing on the
+retention verdict. PostgreSQL is authoritative for this decision.
 
 **Deliberate dedup-semantics change (multi-process correctness).** The SQLite guard had an
 `is_event` exemption: a clock *movement* (a `Step`, or a `BadState` accompanied by a clock event)
