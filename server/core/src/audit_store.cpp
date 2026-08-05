@@ -592,9 +592,25 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             // Marker present. An ordinary restart has no legacy file left at
             // this path — a completed backfill moves it aside — so that is the
             // cheap, common case: nothing further to check.
+            //
+            // A stat FAILURE is not the same fact as "genuinely absent", and
+            // must not be handled the same way: this branch existed to fail
+            // OPEN on any error (a permissions problem, a transient I/O fault
+            // on the legacy path) exactly where the marker-ABSENT branch below
+            // fails CLOSED on the identical class of error. Both sides read
+            // the same filesystem entry to decide whether a verification is
+            // owed; only one of them refused when it could not find out.
             std::error_code exists_ec;
             const bool file_still_here = std::filesystem::exists(legacy_db_path, exists_ec);
-            if (exists_ec || !file_still_here) {
+            if (exists_ec) {
+                spdlog::error(
+                    "AuditStore: migrate_from_sqlite: cannot stat legacy path {} to verify a "
+                    "completed backfill: {}; refusing rather than assuming the file is gone.",
+                    legacy_db_path.string(), exists_ec.message());
+                backfill_metric("failed");
+                return false;
+            }
+            if (!file_still_here) {
                 spdlog::debug("AuditStore: migrate_from_sqlite already completed, skipping");
                 return backfill_ok();
             }

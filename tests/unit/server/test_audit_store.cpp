@@ -1017,6 +1017,36 @@ TEST_CASE("AuditStore: marker present + a corrupt legacy file refuses rather tha
     CHECK(std::filesystem::exists(junk)); // untouched
 }
 
+// Round-3 finding (Fable review): this path used to treat a filesystem STAT
+// ERROR the same as "file genuinely absent" — std::filesystem::exists(path,
+// ec) with ec truthy — and silently skip verification (backfill_ok()),
+// trusting an unproven marker. The marker-ABSENT branch a few dozen lines
+// below has always failed closed on the identical class of error (a bare
+// `if (ec) { ...; return false; }`); this branch now matches it.
+TEST_CASE("AuditStore: marker present + an unstattable legacy path refuses, not skips",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+
+    AuditStore storeA(pool);
+    REQUIRE(storeA.is_open());
+    REQUIRE(storeA.migrate_from_sqlite("/nonexistent-yuzu-test/audit.db")); // sourceless stamp
+
+    // A symlink loop: stat() fails with ELOOP, which std::filesystem::exists
+    // reports via a non-empty error_code rather than treating it as
+    // "absent" — exactly the "cannot determine" case this refusal exists for.
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bfloop_"}};
+    std::filesystem::create_directories(dir.path);
+    auto a = dir.path / "a";
+    auto b = dir.path / "b";
+    std::filesystem::create_symlink(b, a);
+    std::filesystem::create_symlink(a, b);
+
+    AuditStore storeB(pool);
+    REQUIRE(storeB.is_open());
+    CHECK_FALSE(storeB.migrate_from_sqlite(a));
+}
+
 // Gate 4 unhappy-path UP-1, the ORIGINAL repro, with no marker yet: a legacy
 // file with SOME bytes that fail to parse as a SQLite header must not be
 // diagnosed as "no audit_events table, treat as a fresh install" —
