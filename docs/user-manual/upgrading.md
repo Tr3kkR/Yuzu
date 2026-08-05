@@ -637,7 +637,11 @@ is unreachable — there is no SQLite fallback.
   up; the shipped `YuzuAuditBackfillFailing` sample rule therefore alerts on the
   *absence* of a success outcome (see `docs/prometheus/yuzu-alerts.yml`), and a
   wedged replica among healthy ones shows up as a down instance rather than on
-  that alert.
+  that alert. **Silence that rule for the upgrade window if your legacy
+  `audit.db` is large enough to make the first boot long** — the server does not
+  serve `/metrics` until the backfill finishes, so a healthy multi-hour backfill
+  looks exactly like a wedged one from outside. The boot log is what tells them
+  apart.
 - **The backfill only ever runs against an empty `audit_store` schema or its own
   interrupted copy.** Before resuming, it checks that the audit rows already in
   PostgreSQL really are the partial copy of *this* `audit.db`. If they are not —

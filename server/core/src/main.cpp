@@ -144,9 +144,13 @@ static bool break_glass_user_valid(yuzu::server::AuthDB& db, const std::string& 
 // unusable; `refuse_action` names the mutation being refused.
 static std::unique_ptr<yuzu::server::AuditStore>
 open_one_shot_audit(yuzu::server::pg::PgPool& pool, const std::filesystem::path& legacy_audit_db,
-                    std::string_view flag, std::string_view refuse_action,
+                    int retention_days, std::string_view flag, std::string_view refuse_action,
                     std::string_view extra_remediation = {}) {
-    auto audit = std::make_unique<yuzu::server::AuditStore>(pool);
+    // Retention comes from config, NOT the constructor default: a site running
+    // --audit-retention-days=90 would otherwise get break-glass evidence rows on
+    // a 365-day horizon — the highest-stakes rows outliving the policy that
+    // governs the rest of the trail (adversarial review, Kimi L1).
+    auto audit = std::make_unique<yuzu::server::AuditStore>(pool, retention_days);
     if (!audit->is_open()) {
         spdlog::error("{}: Postgres audit store (schema audit_store) is not writable; refusing to "
                       "{} without an audit record. Check --postgres-dsn reachability and retry.{}",
@@ -1323,7 +1327,8 @@ int main(int argc, char* argv[]) {
         // this one-shot writes a NATIVE row, and doing that ahead of the marker
         // is what blocks every later boot (see open_one_shot_audit).
         auto audit = open_one_shot_audit(
-            *auth_pg_pool, cfg.db_dir() / "audit.db", "--mfa-reset", "clear MFA",
+            *auth_pg_pool, cfg.db_dir() / "audit.db", cfg.audit_retention_days, "--mfa-reset",
+            "clear MFA",
             " Or perform the reset via your documented break-glass SQL path (which you must then "
             "record in change management).");
         if (!audit)
@@ -1404,7 +1409,8 @@ int main(int argc, char* argv[]) {
         // (auth_pg_pool non-null — guarded by `if (!auth_db)` above). The helper
         // also completes the legacy backfill first (order contract).
         auto audit = open_one_shot_audit(*auth_pg_pool, cfg.db_dir() / "audit.db",
-                                         "--break-glass-arm", "arm break-glass");
+                                         cfg.audit_retention_days, "--break-glass-arm",
+                                         "arm break-glass");
         if (!audit)
             return EXIT_FAILURE;
         auto armed = auth_db->arm_break_glass(cfg.break_glass_user, cfg.break_glass_window_secs);

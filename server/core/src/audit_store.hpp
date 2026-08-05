@@ -178,13 +178,17 @@ public:
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
     /// Wire a metrics registry for `yuzu_server_audit_read_degrade_total{reason}`
-    /// (degrade-distinguishable reads). Set ONCE during single-threaded startup,
+    /// (degrade-distinguishable reads) and `yuzu_server_audit_backfill_total{result}`
+    /// (the one-time backfill outcome). Set ONCE during single-threaded startup,
     /// before serving — read without synchronisation on serving threads. A null
     /// registry (default, e.g. unit tests) disables emission; every emit site is
     /// null-guarded. The eight retention/write counters below are ALSO exposed as
     /// lock-free atomic accessors, scraped as gauges by the server maintenance
     /// loop independently of this registry.
-    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+    ///
+    /// Wiring a registry PRE-SEEDS both closed label sets to 0 — load-bearing for
+    /// the absence-keyed backfill alert; see the definition.
+    void set_metrics(yuzu::MetricsRegistry* m);
 
     /// MANDATORY backfill (ADR-0009 mandatory class / ADR-0040). On first boot
     /// against an empty `audit_store.audit_events` with a legacy `audit.db`

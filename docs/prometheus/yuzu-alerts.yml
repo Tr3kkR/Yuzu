@@ -1003,11 +1003,22 @@ groups:
       # to boot publishes no audit-backfill series at all -- so that is what this
       # alerts on.
       #
+      # THIS RULE DEPENDS ON THE PRE-SEED. `AuditStore::set_metrics` initialises
+      # the whole `result` set to 0 when a registry is wired, which is what makes
+      # "series absent" mean "no server is serving". Without it the ordinary
+      # restart of an already-migrated server exports nothing (it returns at the
+      # backfill marker check without reaching an outcome) and this rule pages on
+      # every routine restart. Do not drop the seed and keep this expression.
+      #
       # LIMITS, stated because the alert reads stronger than it is: it fires only
       # when NO scraped server reports a completed/fresh backfill, so in a
       # multi-replica deployment one wedged replica among healthy ones will not
-      # trip it (that one shows up as a down instance, `up == 0`). The BOOT LOG
-      # is the primary signal in every case; this is the outside-in backstop.
+      # trip it (that one shows up as a down instance, `up == 0`). It ALSO fires
+      # during a legitimately long first-boot backfill on a large legacy
+      # audit.db, because the server does not serve /metrics until the backfill
+      # finishes — expected during that upgrade window; silence it for the
+      # window (upgrading.md says so too). The BOOT LOG is the primary signal in
+      # every case; this is the outside-in backstop.
       - alert: YuzuAuditBackfillFailing
         expr: |
           absent_over_time(yuzu_server_audit_backfill_total{result=~"completed|fresh"}[15m])

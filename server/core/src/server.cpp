@@ -1401,11 +1401,15 @@ public:
                           "from_result_set: scope references that failed owner-checked "
                           "resolution at dispatch (set absent, expired, or not owned)",
                           "counter");
-        // Audit-pipeline observability (governance PR4 OBS-4). Increments when
-        // audit_store->add_event()'s SQLite step does not return DONE — pages
-        // operators that the audit chain itself is degraded.
+        // Audit-pipeline observability (governance PR4 OBS-4). Increments when an
+        // audit write does not persist — pages operators that the audit chain
+        // itself is degraded. ADR-0040 made that write a PostgreSQL INSERT, so
+        // the failure modes are store-not-open, pool-acquire timeout and query
+        // error, NOT the retired SQLite step this HELP used to name.
         metrics_.describe("yuzu_server_audit_emit_failed_total",
-                          "Audit events that failed to persist (sqlite3_step != DONE)", "counter");
+                          "Audit events that failed to persist to the PostgreSQL audit_store "
+                          "(store not open, pool acquire timeout, or INSERT error)",
+                          "counter");
         // #2360 retention clock guard. The two counters answer DIFFERENT
         // questions and must not be collapsed: skips means the guard declined a
         // delete that would have wiped the evidence table (this server's clock

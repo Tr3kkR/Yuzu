@@ -233,6 +233,41 @@ AuditStore::~AuditStore() {
     stop_cleanup();
 }
 
+void AuditStore::set_metrics(yuzu::MetricsRegistry* m) {
+    metrics_ = m;
+    if (!m)
+        return;
+    // Pre-seed both closed label sets this store owns, per
+    // docs/observability-conventions.md: a bounded-label counter is initialised
+    // at startup so the family is present on a healthy server and `absent()`
+    // alerts stay meaningful.
+    //
+    // LOAD-BEARING for the backfill family. `YuzuAuditBackfillFailing` keys on
+    // the ABSENCE of a success outcome, and the ordinary restart of an
+    // already-migrated server returns at the marker check in
+    // `migrate_from_sqlite` without ever reaching an outcome — so an unseeded
+    // family means a HEALTHY server exports no `completed`/`fresh` series and
+    // the critical alert fires on every routine restart. Seeded where the store
+    // OWNS the family rather than in server.cpp's metrics block (where the
+    // management-group twin is seeded) so that wiring a registry is what
+    // guarantees the series, and a unit test can pin it.
+    m->describe("yuzu_server_audit_backfill_total",
+                "Outcome of the one-time legacy audit.db -> PostgreSQL backfill (ADR-0040): "
+                "completed = streamed and reconciled; fresh = nothing to migrate; failed = "
+                "fail-closed refusal. All three stay 0 on a restart that finds the "
+                "backfill_complete marker already stamped",
+                "counter");
+    for (const char* result : {"completed", "fresh", "failed"})
+        m->counter("yuzu_server_audit_backfill_total", {{"result", result}});
+
+    m->describe("yuzu_server_audit_read_degrade_total",
+                "Audit READ queries that could not be served and returned 503 instead of a "
+                "false-empty 200 (deny-on-degrade), by reason",
+                "counter");
+    for (const char* reason : {kReasonStoreNotOpen, kReasonPoolTimeout, kReasonQueryError})
+        m->counter("yuzu_server_audit_read_degrade_total", {{"reason", reason}});
+}
+
 // ── Backfill (ADR-0009 MANDATORY class / ADR-0040) ───────────────────────────
 
 bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path) {

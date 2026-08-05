@@ -19,6 +19,8 @@
 #include "pg/pg_raii.hpp"
 #include "sqlite_raii.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -574,6 +576,47 @@ TEST_CASE("AuditStore: backfill on a fresh install (no legacy) marks complete",
     REQUIRE(store.migrate_from_sqlite("/nonexistent-yuzu-test/audit.db"));
     CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE key = "
                                  "'backfill_complete'") == "1");
+}
+
+// Adversarial review (Kimi H1 / Codex C-P2-1), and the reason the A-3 alert is
+// keyed the way it is. `YuzuAuditBackfillFailing` fires on the ABSENCE of a
+// success outcome, so the family has to exist on a healthy server — and the
+// ordinary restart of an already-migrated server reaches NO outcome at all: it
+// returns at the marker check. Without the pre-seed in `set_metrics`, that
+// healthy restart exports nothing and the critical alert pages every time.
+// Both halves are asserted here: the seed exists, and the marker-present restart
+// leaves it at 0 rather than incrementing something untrue.
+TEST_CASE("AuditStore: wiring metrics pre-seeds both closed label sets",
+          "[pg][audit_store][metrics]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    const std::string seeded = metrics.serialize();
+    for (const char* result : {"completed", "fresh", "failed"})
+        CHECK(seeded.find(std::string("yuzu_server_audit_backfill_total{result=\"") + result +
+                          "\"} 0") != std::string::npos);
+    for (const char* reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
+        CHECK(seeded.find(std::string("yuzu_server_audit_read_degrade_total{reason=\"") + reason +
+                          "\"} 0") != std::string::npos);
+
+    // An already-migrated server restarting: marker present, so migrate_from_sqlite
+    // short-circuits. The success series must still be THERE (else the alert
+    // pages) and must still read 0 (else the counter lies about what happened).
+    REQUIRE(store.migrate_from_sqlite("/nonexistent-yuzu-test/audit.db")); // stamps the marker
+    AuditStore restarted(pool);
+    REQUIRE(restarted.is_open());
+    yuzu::MetricsRegistry restart_metrics;
+    restarted.set_metrics(&restart_metrics);
+    REQUIRE(restarted.migrate_from_sqlite("/nonexistent-yuzu-test/audit.db"));
+    const std::string after = restart_metrics.serialize();
+    CHECK(after.find("yuzu_server_audit_backfill_total{result=\"completed\"} 0") !=
+          std::string::npos);
+    CHECK(after.find("yuzu_server_audit_backfill_total{result=\"fresh\"} 0") != std::string::npos);
 }
 
 // Gate 3 architect A-1. A "nothing to migrate" exit may stamp the marker only
