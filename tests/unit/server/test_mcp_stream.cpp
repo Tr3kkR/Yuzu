@@ -1611,10 +1611,10 @@ TEST_CASE("McpStreamState: a pinned final survives a full ring wrap (CH-2, Decis
 
 TEST_CASE("McpStreamState: pin slots are a bounded LRU, not first-come-permanent",
           "[mcp][stream][pins]") {
-    // WHAT THIS PINS. Exhausting the four pin slots means admission accounting has already
-    // drifted - `publish_final` runs only for a kRingOnly record, and the bridge admits
-    // streamed records against `pinned_count() + unpinned` with the array sized to exactly
-    // that cap. So this is the DEGRADED path, not an ordinary one.
+    // WHAT THIS PINS. What exhausting the four pin slots MEANS is defined once - see
+    // McpStreamState's "What a FULL PIN-SLOT SET means" block in mcp_stream.hpp. Since
+    // #2740 it no longer implies drift on its own, so this is a degradation path that
+    // is genuinely REACHABLE, which is why it is worth pinning behaviourally here.
     //
     // The old fallback sacrificed the wrong frame: it committed the NEWEST terminal
     // unpinned. A pin exists so a terminal survives a ring wrap and a late resume can
@@ -1780,12 +1780,15 @@ TEST_CASE("McpStreamState: a pre-commit publish_final failure writes no pin and 
 TEST_CASE("McpStreamState: a final past the pin bound displaces the OLDEST pin",
           "[mcp][stream][pins]") {
     // REPLACES an earlier test that asserted the overflow final commits UNPINNED. Its
-    // premise - that reaching this state means admission accounting drifted - is CORRECT and
-    // is preserved here; what it got wrong was which frame to sacrifice. Committing the
+    // premise - that reaching this state means admission accounting drifted - was correct
+    // WHEN WRITTEN and #2740 has since falsified it (three paths now reach a full set
+    // legitimately; see mcp_stream.hpp's "What a FULL PIN-SLOT SET means"). What the old
+    // test got wrong, and what this one fixes, was which frame to sacrifice - and that
+    // part is independent of why the slots are full. Committing the
     // newest terminal unprotected leaves the request most likely still waiting for its
     // answer as the evictable one, while the oldest pin, almost certainly consumed already,
-    // keeps its exemption. The slots now degrade as an LRU, and the drift is still reported
-    // (via `pin_displaced_total`, which is alertable) rather than silently absorbed.
+    // keeps its exemption. The slots now degrade as an LRU, and the displacement is still
+    // reported (via `pin_displaced_total`) rather than silently absorbed.
     yuzu::MetricsRegistry reg;
     mcp::McpStreamState state{mcp::kMcpRingCapDefault, &reg};
     std::vector<std::uint64_t> ids;

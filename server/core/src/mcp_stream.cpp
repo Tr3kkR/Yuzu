@@ -68,15 +68,14 @@ constexpr const char* kMetricFramesTruncated = "yuzu_mcp_stream_frames_too_large
 constexpr const char* kMetricPublishFailures = "yuzu_mcp_stream_publish_failures_total";
 // A committed final response was published with NO pin at all. Structurally unreachable
 // while the pin array is non-empty - a full slot set displaces its oldest pin instead
-// (kMetricPinDisplaced below, which now carries the admission-drift reading). Kept as
+// (kMetricPinDisplaced below, which carries that signal). Kept as
 // defence in depth: non-zero means the array was resized to zero or the displacement
 // path was bypassed.
 constexpr const char* kMetricFinalUnpinned = "yuzu_mcp_stream_final_unpinned_total";
 /// An older pinned terminal yielded its eviction-exemption slot to a newer one. NOT expected:
 /// the bridge admits streamed records against `pinned_count() + unpinned`, and the pin array is
-/// sized to exactly that cap, so a full slot set meant admission accounting had drifted - until
-/// #2740, whose reclaim releases a pin deliberately and whose two accepted residuals (#2795, and
-/// a contained release throw) can leave a session transiently one over its cap. This
+/// sized to exactly that cap. What a full set MEANS since #2740 is defined once -
+/// see McpStreamState's "What a FULL PIN-SLOT SET means" block (mcp_stream.hpp) - and deliberately not restated here. This
 /// counter carries that reading (the LRU is the graceful degradation, not a licence).
 constexpr const char* kMetricPinDisplaced = "yuzu_mcp_stream_pin_displaced_total";
 /// The final was written to the wire (the client has it), but the bridge's own
@@ -433,12 +432,11 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
         // eviction never touches). Writing the id only now means a pre-commit push_back throw
         // leaves no ghost pin.
         if (pinned) {
-            // WHAT HAPPENS WHEN THE SLOTS ARE FULL. Reaching this state means admission
-            // accounting has already drifted: `publish_final` runs only for a kRingOnly
-            // record (`publish_terminal_ladder`), the bridge admits streamed records against
-            // `pinned_count() + unpinned >= kMaxStreamedPostsPerSession`, and the array is
-            // sized to exactly that cap - so a full set should be unreachable. It is a
-            // DRIFT SIGNAL, not an ordinary event, and `pin_displaced_total` is alertable.
+            // WHAT HAPPENS WHEN THE SLOTS ARE FULL. What a full set MEANS is defined
+            // once - see McpStreamState's "What a FULL PIN-SLOT SET means" block in
+            // mcp_stream.hpp - and is deliberately not restated here. Since #2740 it is
+            // a signal to CORROBORATE, not a verdict: the state is reachable, so this
+            // branch is a real degradation path rather than an impossible one.
             //
             // But the old fallback made the drift worse than it needed to be: it committed
             // the newest terminal UNPINNED, which is the wrong one to sacrifice. A pin
@@ -843,11 +841,32 @@ bool McpStreamState::is_pinned(std::uint64_t id) const {
     return is_pinned_locked(id);
 }
 
+void McpStreamState::inject_unpin_fault_for_test(UnpinFault fault, int times) {
+    std::lock_guard<std::mutex> lk(mu_);
+    unpin_fault_ = fault;
+    unpin_fault_remaining_ = fault == UnpinFault::kNone ? 0 : times;
+}
+
 bool McpStreamState::unpin(std::uint64_t id) {
     if (id == 0) {
         return false;
     }
     std::lock_guard<std::mutex> lk(mu_);
+    // TEST SEAM (see UnpinFault). Consumed BEFORE the scan so an armed fault models the
+    // failure regardless of whether the id is still pinned - which is the point for
+    // kRaceLost, whose whole premise is that another route already cleared it.
+    if (unpin_fault_remaining_ > 0) {
+        const UnpinFault fault = unpin_fault_;
+        if (--unpin_fault_remaining_ == 0) {
+            unpin_fault_ = UnpinFault::kNone;
+        }
+        if (fault == UnpinFault::kThrow) {
+            throw std::runtime_error("injected unpin fault");
+        }
+        if (fault == UnpinFault::kRaceLost) {
+            return false;
+        }
+    }
     for (auto& slot : pinned_ids_) {
         if (slot == id) {
             slot = 0;    // now evictable; a later publish may reclaim its ring space

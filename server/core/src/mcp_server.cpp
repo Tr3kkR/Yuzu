@@ -6056,7 +6056,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                           "ONE BELOW the lowest id you still need: replay "
                                           "starts strictly ABOVE the cursor, and the cursor "
                                           "releases every pinned final at or below it on this "
-                                          "session - or re-initialize for a fresh session"
+                                          "session. If the resume answers with a gap, or you have no "
+                                          "cursor to send, re-initialize for a "
+                                          "fresh session and fetch results by "
+                                          "execution_id"
                                         : "this session already has the maximum streamed calls "
                                           "in flight; wait for one to finish";
                                 streamed_reject(

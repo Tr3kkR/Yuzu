@@ -4127,3 +4127,78 @@ TEST_CASE("a client-driven bridge audit carries the caller, not \"system\"",
     }
     CHECK(found);
 }
+
+// #2740's admission reclaim has two accepted residuals, and BOTH were untestable and one
+// was also UNCOUNTED until this round. That combination is why they matter more than their
+// severity suggests: a runbook shipped telling operators to rule the raced case out by
+// checking two counters, and the raced case moved neither, so the procedure concluded
+// "genuine accounting drift" for precisely the residual it was written to excuse.
+//
+// The seam (`UnpinFault`) exists to make both reachable from one thread. What each arm
+// pins here is the same three-part contract: the admission STANDS (the residual is an
+// over-admission, not a refusal), the pin is NOT credited as displaced (we did not release
+// it, so attributing a loss to the admitting principal would be false), and the arm's OWN
+// counter moves so an operator can tell which residual they are looking at.
+TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts separately",
+          "[mcp][bridge][pins][ch26]") {
+    const auto drive = [](mcp::McpStreamState::UnpinFault fault) {
+        struct Out {
+            bool admitted{};
+            double raced{};
+            double failed{};
+            double displaced{};
+            std::size_t audits{};
+        };
+        Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+        auto s = fx.make_session();
+
+        // Fill every pin slot with a parked, undelivered final - the state in which the
+        // next admission must reclaim rather than refuse.
+        for (int i = 1; i <= 4; ++i) {
+            const std::string exec = "exec-residual-" + std::to_string(i);
+            REQUIRE(poll_until([&] {
+                return fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok;
+            }));
+            REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
+            REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
+                    Bridge::ArmOutcome::kArmed);
+            REQUIRE(fx.bridge->on_post_closed(s.id, json(i)));  // peer gone before the final
+            fx.bus.publish(exec, "execution-completed", kCompleted, /*is_terminal=*/true);
+            REQUIRE(poll_until([&] {
+                return s.stream->pinned_count() == static_cast<std::size_t>(i);
+            }));
+        }
+        REQUIRE(s.stream->pinned_count() == 4);
+
+        // Arm the residual, then make the admission that triggers the reclaim.
+        s.stream->inject_unpin_fault_for_test(fault);
+        Out out;
+        out.admitted = fx.bridge->reserve(s.id, "alice", json(99), json("t"), true).ok;
+        out.raced = fx.reg.counter("yuzu_mcp_bridge_pin_release_raced_total").value();
+        out.failed = fx.reg.counter("yuzu_mcp_bridge_pin_release_failed_total").value();
+        out.displaced =
+            fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value();
+        out.audits = fx.audit_count("mcp.bridge.pin_displaced_for_admission");
+        return out;
+    };
+
+    SECTION("the release loses a race (#2795): counted as raced, never as displaced") {
+        const auto out = drive(mcp::McpStreamState::UnpinFault::kRaceLost);
+        CHECK(out.admitted);      // the admission stands - this is the over-admission
+        CHECK(out.raced == 1.0);  // ...and it is now VISIBLE, which was the whole defect
+        CHECK(out.failed == 0.0);
+        // Not credited as a displacement, and not audited: no exemption was released by
+        // us, so attributing that loss to the admitting principal would be a false record.
+        CHECK(out.displaced == 0.0);
+        CHECK(out.audits == 0);
+    }
+
+    SECTION("the release throws (#2805): counted as failed, never as displaced") {
+        const auto out = drive(mcp::McpStreamState::UnpinFault::kThrow);
+        CHECK(out.admitted);
+        CHECK(out.failed == 1.0);
+        CHECK(out.raced == 0.0);  // the two arms are distinct, not aliases
+        CHECK(out.displaced == 0.0);
+        CHECK(out.audits == 0);
+    }
+}

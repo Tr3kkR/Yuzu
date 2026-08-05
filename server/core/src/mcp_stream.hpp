@@ -365,14 +365,51 @@ public:
     /// terminals, not unconditionally: see the degraded case below.
     ///
     /// The pin is written only AFTER the frame commits, so a pre-commit failure leaves no
-    /// ghost pin and consumes no id. A committed final with no free pin slot used to be
-    /// unreachable - the bridge admits streamed records against `pinned_count() + unpinned`
-    /// and this array is sized to exactly that cap - so reaching it meant ADMISSION
-    /// ACCOUNTING HAD DRIFTED, reported by `yuzu_mcp_stream_pin_displaced_total` (alertable
-    /// on > 0). Since #2740 that inference no longer holds on its own: the streamed-admission
-    /// reclaim releases a pin deliberately, and its two accepted residuals (#2795, and a
-    /// contained release throw) can leave a session transiently one call over its cap, so
-    /// drift is a conclusion to reach rather than assume. In that state the slots degrade as an LRU: the OLDEST pin yields to the
+    /// ghost pin and consumes no id.
+    ///
+    /// ### What a FULL PIN-SLOT SET means  <a name="full-slot-set"></a>
+    ///
+    /// **This block is the single home of that answer.** The `/metrics` HELP text, the
+    /// alert rules, the runbook, the user manual and the changelog all CITE it and none
+    /// of them restate it. That is deliberate and it is load-bearing: this one sentence
+    /// previously existed as a paraphrase in every file that mentioned it, and when #2740
+    /// falsified the claim, successive review rounds each found and fixed a different
+    /// subset. A claim with many homes cannot be kept true. If you change the answer, change
+    /// it HERE and check that the citations still point at it correctly.
+    ///
+    /// Before #2740: a committed final with no free pin slot was unreachable - the bridge
+    /// admits streamed records against `pinned_count() + unpinned` and this array is sized
+    /// to exactly that cap - so reaching it MEANT admission accounting had drifted.
+    ///
+    /// Since #2740 that inference no longer holds on its own, because three paths now put
+    /// a session transiently over its cap by design or by accepted residual:
+    ///
+    ///   1. the admission reclaim releases a pin DELIBERATELY, to admit a new streamed
+    ///      call in place of a final no wire took delivery of;
+    ///   2. #2795 - the release returns without having cleared the slot, because another
+    ///      route got there first. Client-reachable (racing a GET resume against a POST
+    ///      admission on the same session). Counted as
+    ///      `yuzu_mcp_bridge_pin_release_raced_total`;
+    ///   3. #2805 - the release throws and is contained. Needs a broken platform mutex,
+    ///      so not client-reachable. Counted as `yuzu_mcp_bridge_pin_release_failed_total`.
+    ///
+    /// (#2794 is NOT one of these. It is a separate class - a torn-down record shielding
+    /// its pin from the orphan scan - and does not put a session over cap.)
+    ///
+    /// THE BOUND IS EXACTLY ONE, and it cannot compound: admission requires
+    /// `pinned + unpinned <= kMaxStreamedPostsPerSession` and adds exactly one charge, and
+    /// `reclaimed` is capped at 1 per pass, so the post-state is at most cap + 1. The next
+    /// `reserve` re-reads both figures under the same `bridge_mu_` and rejects. "Transiently"
+    /// therefore means UNTIL THE NEXT ADMISSION REJECTS - which may be a while on an idle
+    /// session, not milliseconds.
+    ///
+    /// So a full slot set is a SIGNAL TO CORROBORATE, not a verdict. Drift is what remains
+    /// after the three paths above are ruled out against their counters - and note that
+    /// ruling out is only possible at all because (2) got its own counter; it previously
+    /// moved none, which is precisely how a runbook came to instruct on-call to rule it out
+    /// using two counters that both read flat in that exact case.
+    ///
+    /// In the degraded state the slots behave as an LRU: the OLDEST pin yields to the
     /// newest, because the newest terminal is the one a client is likeliest still waiting to
     /// resume while the oldest has almost certainly been consumed. The displaced final stays
     /// committed and remains in the ring until ordinary eviction reaches it - it loses its
@@ -395,7 +432,8 @@ public:
     /// The pin is released by FOUR routes, and they do NOT all mean the client got the
     /// frame: unpin() when the final was written on the POST wire (it did), attach_and_replay
     /// when a cursor proves consumption (it did), ring LRU displacement as above (it did
-    /// not — accounting drift), and the bridge's admission reclaim (#2740; it did not — the
+    /// not — a full slot set; see "What a FULL PIN-SLOT SET means" above), and the
+    /// bridge's admission reclaim (#2740; it did not — the
     /// session needed the slot for a new streamed call). A pin also dies with the whole
     /// object. Anything that treats a missing pin as proof of delivery must consult the
     /// audit trail, not the pin alone. Same return contract and boundary as publish().
@@ -422,6 +460,28 @@ public:
     /// real-final and fallback-final publishes happen inside ONE projector pass, so the
     /// seam cannot be re-armed between them from the test thread.
     void inject_publish_fault_for_test(PublishFault fault, int times = 1);
+
+    /// Deterministic fault injection for unpin() — TEST SEAM ONLY, mirroring the publish
+    /// seam above. It exists because the two accepted residuals of #2740's admission
+    /// reclaim are otherwise unreachable from a single-threaded test: both need the
+    /// release to fail, and one of them needs it to fail by LOSING A RACE, which a test
+    /// cannot stage without the concurrency window tracked as #2791.
+    ///
+    /// Not a convenience. Before this seam the residuals were untestable AND (for the
+    /// raced arm) uncounted, and a runbook was shipped instructing operators to rule the
+    /// raced case out via counters that could not move for it.
+    enum class UnpinFault {
+        kNone,
+        /// Models another route (a resume ack, or a final reaching the wire) having
+        /// cleared the slot between selection and release: unpin returns false WITHOUT
+        /// throwing and without clearing anything (#2795).
+        kRaceLost,
+        /// Models a broken platform mutex: the lock throws (#2805). The bridge contains
+        /// it, because the admission it belongs to has already committed by then.
+        kThrow,
+    };
+    /// `times` arms the same fault for the next N unpins (default 1 = one-shot).
+    void inject_unpin_fault_for_test(UnpinFault fault, int times = 1);
 
     /// Set a short human-readable log prefix (e.g. the session id) included in publish()'s
     /// rare WARN lines so an operator can attribute a dropped/anomalous frame to a session.
@@ -562,6 +622,8 @@ private:
     std::uint64_t evictions_ = 0;
     std::uint64_t generation_ = 0;
     PublishFault publish_fault_ = PublishFault::kNone;  ///< test seam; guarded by mu_
+    UnpinFault unpin_fault_ = UnpinFault::kNone;       ///< test seam; guarded by mu_
+    int unpin_fault_remaining_ = 0;                    ///< unpins left that consume it
     int publish_fault_remaining_ = 0;  ///< publishes left that consume publish_fault_; guarded by mu_
     // Write-once at mint before the stream is shared (set_log_context contract); read
     // unlocked in publish()'s WARN paths. Never mutated after the stream goes live.

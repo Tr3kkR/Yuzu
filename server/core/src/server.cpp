@@ -652,7 +652,7 @@ public:
                           "to clients that drop before their results land, and without it four "
                           "such calls locked a session out of streamed POST permanently. "
                           "Deliberately NOT a label on yuzu_mcp_stream_pin_displaced_total, "
-                          "whose family means accounting drift and alerts on >0 - folding a "
+                          "which is the corroborate-before-filing signal - folding a "
                           "routine event in would destroy that alarm. Do not page on it; a "
                           "sustained rate has two causes worth telling apart: clients dropping "
                           "before collection, and server-side ring pressure tearing parked "
@@ -673,6 +673,17 @@ public:
                           "admission stood but no exemption was released, so that session "
                           "is one slot tighter than the cap implies until the pin clears by "
                           "another route",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_pin_release_raced_total",
+                          "The #2740 admission reclaim tried to release a pin and found "
+                          "another route had already cleared it (a resume ack, or a final "
+                          "reaching the wire). The admission still stands, so the session "
+                          "sits one call over its cap until the next admission rejects "
+                          "(#2795). EXPECTED at a low rate - a client racing its own GET "
+                          "resume against a streamed POST reaches it. Its purpose is to make "
+                          "that residual RULE-OUTABLE: it previously moved no counter at "
+                          "all, so an operator checking whether a full pin-slot set was real "
+                          "drift saw every signal flat in exactly this case.",
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_charge_release_deferred_total",
                           "Streamed admission charges that could not be released at their natural "
@@ -754,20 +765,18 @@ public:
                           "bypassed. Alert on > 0",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_pin_displaced_total",
-                          "An older pinned terminal yielded its eviction-exemption slot to a newer "
-                          "one. NOT expected: the bridge admits streamed records against "
-                          "pinned_count() + unpinned and the pin array is sized to exactly that "
-                          "cap, so a full slot set means ADMISSION ACCOUNTING HAS DRIFTED - this "
-                          "counter inherits the drift reading the unpinned counter used to carry. "
-                          "Since #2740 a full slot set is no longer proof of drift on its own: "
-                          "the admission reclaim releases a pin deliberately, and two accepted "
-                          "residuals (#2795, and a contained release throw counted as "
-                          "yuzu_mcp_bridge_pin_release_failed_total) can leave a session "
-                          "transiently one call over its cap - rule those out first. "
-                          "The displacement itself is the graceful degradation (the oldest "
-                          "terminal, likeliest already consumed, yields instead of the newest "
-                          "going unprotected); the displaced final becomes evictable from the "
-                          "replay ring, still recoverable by execution_id. Alert on > 0",
+                          "A committed streamed-POST final was denied a replay-ring pin slot, "
+                          "so the OLDEST pinned final yielded its eviction exemption to it. NOT "
+                          "by itself proof of an accounting bug: since #2740 the admission "
+                          "reclaim releases a pin deliberately, and two accepted residuals "
+                          "(yuzu_mcp_bridge_pin_release_raced_total, "
+                          "yuzu_mcp_bridge_pin_release_failed_total) each leave a session one "
+                          "call over its cap until the next admission rejects. Rule all three "
+                          "out against their counters before treating this as drift - the "
+                          "runbook owns the procedure, and the shipped alert nets them out, so "
+                          "alert on that rather than on this counter raw. The displaced final "
+                          "stays in the ring until ordinary eviction and remains fetchable by "
+                          "execution_id.",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_final_credit_failed_total",
                           "A streamed-POST final was written to the wire (the client has it), but "
@@ -796,6 +805,7 @@ public:
         metrics_.counter("yuzu_mcp_bridge_charge_release_deferred_total");
         metrics_.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total");
         metrics_.counter("yuzu_mcp_bridge_pin_release_failed_total");
+        metrics_.counter("yuzu_mcp_bridge_pin_release_raced_total");
         metrics_.counter("yuzu_mcp_bridge_streaming_backstop_total");
         metrics_.counter("yuzu_mcp_stream_terminal_publish_failures_total");
         metrics_.counter("yuzu_mcp_stream_final_unpinned_total");

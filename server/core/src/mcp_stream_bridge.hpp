@@ -1032,6 +1032,21 @@ private:
     /// `bridge_mu_` and this is called after it releases - never under it, like every
     /// other counter on the admission path.
     void count_pin_release_failed() noexcept;
+    /// #2740 / #2795: the reclaim's release returned WITHOUT throwing and without
+    /// having cleared the slot - another route (a resume ack, or a final reaching the
+    /// wire) got there first. The admission still stands, so the session can sit
+    /// transiently one call over its cap until the next `reserve` rejects.
+    ///
+    /// This exists because that residual was otherwise INVISIBLE: the branch resets
+    /// `displaced`, which suppresses the displacement counter, the audit row and the
+    /// log line together, and it does not latch `release_failed` either. Two governance
+    /// reviewers independently found that a runbook telling an operator to rule the
+    /// residual out by checking the other two counters was therefore unsound - both
+    /// read flat in exactly the case being ruled out. Deliberately a COUNTER and not an
+    /// audit row: no exemption was released by us, so there is no loss to attribute to
+    /// the admitting principal (that is why the audit is suppressed here at all).
+    /// Never called under `bridge_mu_`, like every other counter on this path.
+    void count_pin_release_raced() noexcept;
     /// #2740. Called from the admission path with `bridge_mu_` HELD, on the pass
     /// that would otherwise refuse `pin_slots`: NAMES a pin that may be released
     /// so a new streamed call can take its slot. **Selection only — it mutates

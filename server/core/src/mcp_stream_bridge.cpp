@@ -72,7 +72,7 @@ constexpr const char* kMetricPinSlotsReject = "yuzu_mcp_bridge_pin_slots_reject_
 // #2740: a new streamed call reclaimed a slot from an already-committed final that
 // no wire took delivery of. This is the EXPECTED, healthy response to disconnecting
 // clients, so it is deliberately its own counter rather than a label on the ring's
-// yuzu_mcp_stream_pin_displaced_total - that family means accounting drift and is
+// yuzu_mcp_stream_pin_displaced_total - that family is the corroborate-before-filing signal and is
 // alertable on > 0, and folding a routine event into it would destroy that alarm.
 constexpr const char* kMetricPinDisplacedForAdmission =
     "yuzu_mcp_bridge_pin_displaced_for_admission_total";
@@ -81,6 +81,13 @@ constexpr const char* kMetricPinDisplacedForAdmission =
 // nothing reclaims until the arming reaper. "Should never happen" - it needs a broken
 // platform mutex - so any nonzero value is a signal, not a rate.
 constexpr const char* kMetricPinReleaseFailed = "yuzu_mcp_bridge_pin_release_failed_total";
+// #2740 / #2795: the reclaim's release lost a race - it returned false without
+// throwing, so another route had already cleared the slot. Unlike the throw above this
+// is REACHABLE by an ordinary client (racing its own GET resume against a streamed
+// POST admission), and unlike the throw it moves neither of the other two counters.
+// Without this the residual is unobservable, which is what made the "check both
+// counters" rule-out unsound.
+constexpr const char* kMetricPinReleaseRaced = "yuzu_mcp_bridge_pin_release_raced_total";
 // Produced ONLY by the bridge's publish_final -> fallback -> poison ladder
 // (below); named in the yuzu_mcp_stream_* family because it describes stream-
 // terminal delivery, not because mcp_stream.cpp increments it (poison_terminal()
@@ -318,7 +325,8 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
     std::size_t pin_reject_unpinned = 0;
     auto pin_slots_held = PinSlotsHeld::kNotApplicable;
     std::optional<DisplacedPin> displaced;
-    bool release_failed = false;  // latched under bridge_mu_, emitted after release
+    bool release_failed = false;
+    bool release_raced = false;  // latched under bridge_mu_, emitted after release
     // Reserved for the reclaim audit detail, filled after selection and BEFORE the
     // commit block, so the only allocation that could throw on the reclaim path
     // happens while a throw still costs nothing (see the audit_contained call).
@@ -499,8 +507,17 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
                     // that a slot is free right now (#2795). The residual is
                     // bounded by the 4-wide pin array. What does NOT stand is the
                     // report: no exemption was released by US, so nothing is
-                    // counted, audited or logged. Reporting it would attribute a
-                    // loss that did not happen to the admitting principal.
+                    // counted, audited or logged as a DISPLACEMENT. Reporting one
+                    // would attribute a loss that did not happen to the admitting
+                    // principal.
+                    //
+                    // The raced arm still gets its OWN counter (#2795), because
+                    // "nothing to report" was read as "nothing to observe" and it is
+                    // not: this arm leaves the session transiently one call over its
+                    // cap while moving neither of the other two counters, so an
+                    // operator ruling the residual out by checking them found both
+                    // flat in exactly the case they were checking for.
+                    release_raced = !release_failed;
                     displaced.reset();
                 }
             }
@@ -511,6 +528,9 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
     // global admission lock (the same rule the pin-slot reject counter follows).
     if (release_failed) {
         count_pin_release_failed();
+    }
+    if (release_raced) {
+        count_pin_release_raced();
     }
     if (displaced.has_value()) {
         count_pin_displaced_for_admission();
@@ -664,9 +684,13 @@ McpStreamBridge::select_displaceable_pin_locked(const std::string& session_id,
     if (projection_in_flight) {
         return std::nullopt;
     }
-    // ORPHANS FIRST. A pinned id no surviving record references can NEVER be
-    // released by any other route: the pin-ack sweep needs a record, on_final_written
-    // needs a record, and the teardown that erased the record did not unpin. Left
+    // ORPHANS FIRST. A pinned id no surviving record references has no route a
+// POST-ONLY client can reach: the pin-ack sweep needs a record, on_final_written
+// needs a record, and the teardown that erased the record did not unpin. It is
+// NOT unreachable in general - attach_and_replay's cursor ack walks pinned_ids_
+// directly with no record lookup and clears every slot at or below the cursor,
+// orphans included - but that needs a GET channel, which is exactly what the
+// locked-out client in #2740 does not have. Left
     // alone, four of these lock the session out of streamed POST permanently - the
     // exact defect #2740 is about, in the one shape a record scan cannot see.
     // Safe only because `projection_in_flight` is false above: that is what rules
@@ -2672,6 +2696,12 @@ void McpStreamBridge::count_pin_displaced_for_admission() noexcept {
 void McpStreamBridge::count_pin_release_failed() noexcept {
     if (metrics_ != nullptr) {
         obs_guard([&] { metrics_->counter(kMetricPinReleaseFailed).increment(); });
+    }
+}
+
+void McpStreamBridge::count_pin_release_raced() noexcept {
+    if (metrics_ != nullptr) {
+        obs_guard([&] { metrics_->counter(kMetricPinReleaseRaced).increment(); });
     }
 }
 
