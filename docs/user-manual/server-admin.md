@@ -194,6 +194,92 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — an authorization-topology floor now applies regardless of RBAC, and engine-principal reads move off `Security:Read` (#2376) (breaking)
+
+This note has **two independent breaking directions** — read both, they
+affect different deployments.
+
+**Direction 1 — RBAC-disabled installs lose three non-admin reads.**
+
+**Who this affects.** Any deployment running with `[rbac] enabled = false`
+(the shipped default) where a non-admin, authenticated session was relying
+on reading one of: the fleet-wide access-review export
+(`/api/v1/access-reviews*`), `GET /api/v1/rbac/roles`, or the
+engine-principal inventory/roles (`/api/v1/engine-principals*` and the
+`list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP
+tools). RBAC-enabled deployments are unaffected by this direction (see
+"Why" below).
+
+**Why.** RBAC ships disabled by default. With RBAC disabled, the legacy
+authorization fallback previously allowed **every** authenticated
+non-engine session to perform **every** `Read` — including reads of the
+authorization topology itself. A plain non-admin `user` on a default,
+just-installed server could read who holds what role and pull the complete
+access-review grant population that exists to be SOC 2 CC6.2 evidence. As
+of this release, `AccessReview:Read`, `UserManagement:Read`, and
+`EnginePrincipal:Read` (see Direction 2) require the `admin` session role
+**regardless of the RBAC toggle**. This is not configurable — there is no
+setting that reopens it. Full design rationale:
+`docs/security-reviews/authz-topology-floor-2026-08-05.md`.
+
+**What does NOT change.** A live RBAC grant is unaffected — under
+RBAC-**enabled** enforcement, a non-admin holding the seeded `Reviewer`
+role still reaches the access-review export exactly as before; a non-admin
+holding `UserManagement:Read`/`EnginePrincipal:Read` (e.g. the built-in
+`Viewer` role holds both) still reaches the other two reads. The floor only
+engages inside the RBAC-off legacy fallback.
+
+**What to do.** If a non-admin session needs one of these three reads,
+enable RBAC and grant the matching role:
+
+```cfg
+[rbac]
+enabled = true
+```
+
+- Access-review export → assign the built-in `Reviewer` role.
+- `/rbac/roles` → the built-in `Viewer` role already holds
+  `UserManagement:Read`, or grant it directly.
+- Engine-principal reads → the built-in `Viewer` role already holds
+  `EnginePrincipal:Read` (see Direction 2), or grant it directly.
+
+See [`rbac.md`](rbac.md) "The authorization topology floor" and "Before
+enabling RBAC in production" before flipping the toggle on a live fleet —
+turning RBAC on also applies management-group-scoped device visibility
+immediately.
+
+**Direction 2 — RBAC-enabled deployments with a custom role granted
+`Security:Read` for engine-principal access must re-grant.**
+
+**Who this affects.** Any RBAC-**enabled** deployment with a **custom**
+role (not `Administrator`/`Viewer`, which are updated automatically — see
+below) that was granted `Security:Read` specifically so its holders could
+reach `GET /api/v1/engine-principals*` or the
+`list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP
+tools.
+
+**Why.** Those reads moved off `Security:Read` onto a new, narrower
+`EnginePrincipal:Read` securable (the same move #2324 made cutting
+`AccessReview` away from `AuditLog:*`) — `Security:Read` also gates
+unrelated operational reads (quarantine visibility, CA issued-certs,
+`/ca/root-csr`, KEK status) that stay on `Security:Read` unchanged and
+un-floored.
+
+**What changes automatically.** No schema migration is required — the new
+`EnginePrincipal` securable and its `Administrator` (full CRUD) and
+`Viewer` (`Read`) grants are seeded idempotently on every server boot
+(`RbacStore::seed_defaults()`'s `INSERT OR IGNORE` loops), so the two
+built-in roles pick it up on the next boot automatically, with no operator
+action, matching exactly the access they held via `Security:Read` before
+this change.
+
+**What to do.** A custom role does **not** get this automatic re-seed.
+Check whether any custom role was granted `Security:Read` for this
+purpose, and if so, grant it `EnginePrincipal:Read` too — via the Settings
+UI or `RbacStore::set_permission()` directly. `Security:Read` alone no
+longer reaches `/api/v1/engine-principals*` or its MCP twins after this
+upgrade.
+
 ### vNEXT — the `mcp.` instruction-definition id prefix is reserved (#2442) (breaking)
 
 **Who this affects.** Anyone whose instruction definitions include an id beginning `mcp.`. No

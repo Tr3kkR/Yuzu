@@ -4,7 +4,7 @@ Yuzu implements granular role-based access control with deny-overrides-allow sem
 
 ## Enabling RBAC
 
-RBAC is controlled by a global toggle. When disabled, all authenticated users have full access (with a legacy fallback: write/delete/execute/approve operations still require the `admin` session role). When enabled, every API call and UI action is checked against the caller's assigned roles.
+RBAC is controlled by a global toggle. When disabled, all authenticated users have full access (with a legacy fallback: write/delete/execute/approve operations still require the `admin` session role) — **except** a small, fixed set of reads that require admin regardless of the toggle; see "The authorization topology floor" below. When enabled, every API call and UI action is checked against the caller's assigned roles.
 
 Toggle RBAC via the Settings page or the server configuration file:
 
@@ -48,6 +48,67 @@ enabled = true
 > effective (the gate change is tracked in #1634). Today the filter's only active
 > effect is the corrupt-store fail-closed described above.
 
+## The authorization topology floor (#2376)
+
+Three reads are treated as **authorization topology** rather than ordinary
+operational data, and require the `admin` session role no matter how the
+`[rbac] enabled` toggle is set:
+
+| Securable:Operation | Surface |
+|---|---|
+| `AccessReview:Read` | The fleet-wide access-review grant export (SOC 2 CC6.2 evidence), `GET /api/v1/access-reviews*` |
+| `UserManagement:Read` | `GET /api/v1/rbac/roles` and the rest of the RBAC role graph |
+| `EnginePrincipal:Read` | The engine-principal inventory and grant graph, `GET /api/v1/engine-principals*` and the `list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP tools |
+
+**Why this exists.** With RBAC **disabled**, the legacy fallback described
+above allows any authenticated non-engine session to perform every `Read` —
+that includes these three. On a default install (RBAC ships disabled) that
+handed a plain `user` session read access to the authorization topology
+itself: who holds what role, and the complete access-review grant
+population that is supposed to *be* SOC 2 CC6.2 evidence of controlled
+access. The floor closes that gap by denying these three reads to a
+non-admin whenever the legacy fallback is the branch in effect — never by
+changing behavior under a live RBAC grant.
+
+**This does not affect RBAC-enabled deployments beyond the one closed
+gap.** The floor only ever engages inside the legacy (RBAC-off) fallback; a
+live RBAC branch always answers first when RBAC is enabled and enforced. In
+particular, a non-admin holding the seeded `Reviewer` role (`AccessReview:Read`
++ `AccessReview:Attest`) continues to reach the access-review export exactly
+as before — the floor never overrides that grant.
+
+**If you are relying on a non-admin reaching one of these three reads on an
+RBAC-disabled install,** that access is now denied. The supported remedy is
+to enable RBAC and grant the appropriate role rather than to expect a
+non-admin session to reach authorization topology while RBAC is off:
+
+- For the access-review export: enable RBAC and assign the built-in
+  `Reviewer` role (`AccessReview:Read` + `AccessReview:Attest`).
+- For `/rbac/roles`: enable RBAC and grant `UserManagement:Read` (the
+  built-in `Viewer` role holds it already).
+- For the engine-principal inventory/roles reads: enable RBAC and grant
+  `EnginePrincipal:Read` (the built-in `Viewer` role holds it already; a
+  **custom** role that was granted `Security:Read` specifically to reach
+  these routes must be re-granted `EnginePrincipal:Read` — see "Upgrade
+  Notes" in [`server-admin.md`](server-admin.md)).
+
+The floor is deliberately **not configurable** — there is no setting that
+widens it back open. It is keyed on `(securable, operation)`, not on route
+path, because an MCP tool and a REST route can share the same wire path
+(every MCP tool call goes through the single `/mcp/v1/` JSON-RPC endpoint)
+while gating different securables; a route-keyed floor could not
+distinguish them. A denial from the floor is audited with a distinct reason
+(`"topology floor: ..."` on the `auth.permission_required` /
+`auth.scoped_permission_required` audit actions, `result=denied`) and
+counted in `yuzu_auth_topology_floor_denied_total{permission}`, separate
+from an ordinary legacy-fallback denial, so a spike in floored denials is
+visible without grepping audit-log text.
+
+See `docs/auth-architecture.md` → "The authorization topology floor
+(#2376)" for the full design rationale, and
+`docs/security-reviews/authz-topology-floor-2026-08-05.md` for the recorded
+decision (including what was deliberately excluded from the floor and why).
+
 ## Concepts
 
 | Concept | Description |
@@ -65,12 +126,12 @@ Six roles are created automatically and cannot be deleted:
 
 | Role | Permissions | Use case |
 |---|---|---|
-| **Administrator** | All 5 CRUD operations on all 20 securable types, plus Push on GuaranteedState (101 permissions) | Server admins, security team leads |
+| **Administrator** | All 5 CRUD operations on all 23 securable types, plus Push on GuaranteedState and Attest on AccessReview (117 permissions) | Server admins, security team leads |
 | **PlatformEngineer** | Full CRUD on InstructionDefinition and InstructionSet; Read on Execution, Schedule, Approval, Tag, AuditLog, Response, Inventory; Read/Write/Delete/Push on GuaranteedState | Authors and managers of YAML instruction definitions, sets, and Guardian rules |
 | **Operator** | Read/Write/Execute/Delete on InstructionDefinition, InstructionSet, Execution, Schedule, Tag; Read and Approve on Approval; Read on AuditLog, Response, and Inventory; Read and Push on GuaranteedState | Day-to-day instruction execution, schedule management, tagging, and Guardian rule distribution |
 | **ApiTokenManager** | Read, Write, Delete on ApiToken (3 permissions) | Create, revoke, and manage API tokens for programmatic access |
-| **ITServiceOwner** | All 5 CRUD operations on 17 securable types, plus Push on GuaranteedState (86 permissions). Excludes UserManagement, Security, ApiToken | Service desk leads, team managers with delegated control over their IT services |
-| **Viewer** | Read on 19 securable types (all except Infrastructure) (19 permissions) | Helpdesk staff, auditors, read-only dashboards |
+| **ITServiceOwner** | All 5 CRUD operations on 18 securable types, plus Push on GuaranteedState (91 permissions). Excludes UserManagement, Security, ApiToken, EnginePrincipal | Service desk leads, team managers with delegated control over their IT services |
+| **Viewer** | Read on 21 securable types (all except Infrastructure and AccessReview) (21 permissions) | Helpdesk staff, auditors, read-only dashboards |
 
 ## Securable Types
 
@@ -96,6 +157,7 @@ Six roles are created automatically and cannot be deleted:
 | `FileRetrieval` | File upload and download operations |
 | `GuaranteedState` | Guardian (Guaranteed State) policy rules, events, and status |
 | `Inventory` | Installed-software inventory synced from endpoints (ADR-0016) |
+| `EnginePrincipal` | Engine-principal inventory and fleet-wide grant-graph reads (list/get engine principals, list their assigned roles) — cut away from `Security` (#2376) so this narrower read is not gated by the same broad permission that also covers CA/quarantine/KEK operational reads. See "The authorization topology floor" below. |
 
 ## Operations
 
@@ -257,7 +319,7 @@ curl -s -b cookies.txt \
 }
 ```
 
-(Truncated for brevity. The full ITServiceOwner role contains 50 permissions across 10 securable types.)
+(Truncated for brevity. The full ITServiceOwner role contains 91 permissions across 18 securable types.)
 
 ### Custom Roles (Planned)
 

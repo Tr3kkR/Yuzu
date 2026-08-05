@@ -1,0 +1,247 @@
+# Security review — Authorization topology floor (#2376)
+
+**Date:** 2026-08-05
+**Change:** `server/core/src/authz_topology_floor.hpp` (new) +
+`AuthRoutes::require_permission`/`require_scoped_permission`
+(`auth_routes.cpp`) + a new `EnginePrincipal` RBAC securable
+(`rbac_store.cpp` `seed_defaults()`) + the engine-principal REST routes
+(`rest_api_v1.cpp`) and MCP twins `list_engine_principals`,
+`get_engine_principal`, `list_engine_roles` (`mcp_server.cpp`)
+**Branch:** `feat/authz-topology-floor`
+**Purpose of this record:** #2376 asks explicitly that this decision be
+recorded "so it isn't re-litigated" — this file is that record, not a
+design proposal.
+
+## What shipped
+
+- **The defect closed.** `RbacStore::rbac_enabled_` defaults `false` (a
+  fresh install runs with RBAC off). With RBAC off,
+  `AuthRoutes::require_permission`/`require_scoped_permission` fall through
+  to a legacy branch that allows every `Read` to any authenticated
+  non-engine session. On a default install that gave a plain `user` session
+  fleet-wide read access to the authorization TOPOLOGY itself: the
+  fleet-wide access-review export (SOC 2 CC6.2 evidence), `GET
+  /api/v1/rbac/roles`, and the engine-principal grant graph.
+- **A new `EnginePrincipal` securable** (`Read` only), cut away from the
+  over-broad `Security:Read`, carrying REST `GET /api/v1/engine-principals`,
+  `GET /api/v1/engine-principals/{id}`, `GET
+  /api/v1/engine-principals/{id}/roles`, and the MCP twins
+  `list_engine_principals`, `get_engine_principal`, `list_engine_roles`.
+  Seeded to `Administrator` (full CRUD via the existing cross-type loop)
+  and `Viewer` (`Read`) — the same two roles that reached these routes via
+  `Security:Read` before the cut.
+- **The topology floor**: `{AccessReview:Read, UserManagement:Read,
+  EnginePrincipal:Read}` require the `admin` session role regardless of the
+  RBAC on/off toggle (`authz_topology_floor.hpp`'s
+  `topology_floor_applies()`), consulted only inside the legacy (RBAC-off)
+  fallback of both `require_permission` and `require_scoped_permission`.
+- **Audit + metric.** A floored denial is audited with a distinct reason
+  (`"topology floor: ..."` on `auth.permission_required`/
+  `auth.scoped_permission_required`, `result=denied`) and counted in
+  `yuzu_auth_topology_floor_denied_total{permission}`.
+
+## Decisions recorded
+
+### 1. The floor holds regardless of the RBAC toggle, and is applied ONLY in the legacy branch — the ordering is load-bearing
+
+The floor set is checked unconditionally against the toggle: it denies a
+non-admin whenever the legacy (RBAC-off) branch is the branch in effect,
+with no exception for "but I turned RBAC on and granted a role for this."
+That property is what closes the defect — a toggle-conditional floor would
+still leave the RBAC-off default wide open, which is the exact posture a
+fresh install ships with.
+
+The floor is applied **only** inside the legacy fallback, never ahead of,
+or instead of, the live-RBAC branch (`rbac_enforcement_in_effect` at
+`auth_routes.cpp:699`, which always `return`s — true or false — before the
+legacy branch's code is reached in both `require_permission` and
+`require_scoped_permission`). This is not a stylistic choice; it is what
+makes the floor compatible with the pre-existing `AccessReview` design.
+#2324 cut `AccessReview` as its own securable specifically so a non-admin
+`Reviewer` role could be seeded `AccessReview:Read` and reach the
+access-review export **without** being `admin` — that is the entire reason
+`AccessReview` is a securable distinct from an admin-gated concept. Had the
+floor run ahead of the live-RBAC branch (or replaced the branch order), a
+`Reviewer` holding a live `AccessReview:Read` grant under RBAC-enabled
+enforcement would be denied by the floor before their grant was ever
+consulted — silently breaking the one legitimate non-admin path to this
+data and destroying the reason the securable exists. Because the
+legacy-branch-only application is structural (the live-RBAC branch always
+returns first), this cannot silently regress by someone reordering
+independent `if` blocks later without touching the control-flow shape
+itself.
+
+**Consequence, stated explicitly:** under RBAC-enabled enforcement, a
+non-admin `Reviewer` continues to reach the access-review export exactly as
+before this change. The floor changes behavior on RBAC-**off** installs
+only.
+
+### 2. Not configurable
+
+There is no setting, environment variable, or config key that widens the
+floor set or disables it. A toggle that can re-open a security floor is a
+footgun, not a feature — it would give an operator (or an attacker who
+gained config-write access) a one-line way to undo the fix. The floor set
+is a `constexpr` array in `authz_topology_floor.hpp`; changing it requires
+a code change and its own review, not an operational setting.
+
+### 3. Securable-keyed, not route-keyed — and route-keying cannot see the MCP twins
+
+The floor matches on `(securable_type, operation)`, the same pair
+`require_permission`/`require_scoped_permission` already receive from every
+caller — not on `req.path`. A route-keyed design (matching on the URL the
+request arrived on) was considered and rejected for a concrete, checkable
+reason: **it cannot distinguish the MCP tool twins from each other.** Every
+MCP tool call — regardless of which tool — is a JSON-RPC POST to the single
+`/mcp/v1/` endpoint; the tool name lives in the request body, not the URL.
+`list_engine_roles` (floored, `EnginePrincipal:Read` after this change) and
+`list_issued_certs` (deliberately not floored — see decision 4 below,
+`Security:Read`) issue **byte-identical** `perm_fn(req, res, <securable>,
+<operation>)` calls on the same `req.path` (`/mcp/v1/`) — the only thing
+that differs between them is the `(securable_type, operation)` pair passed
+to `perm_fn`, precisely the values the securable-keyed floor matches on. A
+floor keyed on `req.path` would either have to float over every MCP tool
+alike (over-flooring `list_issued_certs` and everything else on that path)
+or have no way at all to single out `list_engine_roles` on that transport.
+Securable-keying is the only design that reaches both the REST route and
+its MCP twin through one check with no special-casing per transport.
+
+### 4. `Security:Read` considered and excluded — too coarse
+
+`Security:Read` was the permission the engine-principal reads used before
+this change (`{"list_engine_principals", {"Security", "Read"}}` etc. in
+`mcp_server.cpp`'s tool-security table, and the equivalent `perm_fn(req,
+res, "Security", "Read")` calls in `rest_api_v1.cpp`, both now moved to
+`EnginePrincipal`). Flooring `Security:Read` directly — instead of cutting
+a new securable — was considered and rejected because `Security:Read`
+gates four collateral, purely operational surfaces that are not
+authorization topology and should not require admin on an RBAC-off
+install:
+
+1. Quarantine visibility.
+2. CA issued-certs (`GET /api/v1/ca/issued`, MCP `list_issued_certs`).
+3. `/ca/root-csr`.
+4. KEK status.
+
+Flooring `Security:Read` wholesale would have swept all four of these into
+the floor alongside the engine-principal reads, denying them to non-admins
+on RBAC-off installs where they work today and are not the topology this
+floor exists to protect. This is exactly why part 1 of the fix (the
+`EnginePrincipal` cut) exists: a floor can only be as narrow as the
+securable it is keyed on, so the engine-principal reads first had to move
+to a securable that carries nothing else.
+
+### 5. `ApiToken:Read` and `ManagementGroup:Read` considered and excluded
+
+Both were considered against the same test applied to `Security:Read`:
+does this permission gate authorization *topology* (who has what access),
+or operational data? Neither does. `ApiToken:Read` gates API-token
+lifecycle metadata; `ManagementGroup:Read` gates the device-grouping
+hierarchy. Both are operational data an RBAC-off install is reasonably
+expected to expose to any authenticated user under the existing legacy
+posture — floor scope is capped at the three permissions that answer "who
+holds what access", which the introductory defect describes.
+
+### 6. Viewer keeps `EnginePrincipal:Read` — a deliberate scope boundary, not an oversight
+
+`Viewer` is seeded `EnginePrincipal:Read` (`rbac_store.cpp`'s
+`viewer_types[]`), matching the `Security:Read` grant it held on these same
+routes before the cut. This means that under RBAC-**enabled** enforcement,
+a `Viewer`-role principal can still list engine principals and their
+role assignments — the same access `Viewer` had before this change,
+unchanged.
+
+This was a deliberate choice, not an oversight, and a distinct question
+from the one this PR answers. **Narrowing the RBAC-on role model** — e.g.
+deciding `Viewer` should no longer see the engine-principal grant graph at
+all — is a separate decision with its own blast radius (it would change
+behavior for every RBAC-enabled deployment that has ever relied on
+`Viewer`'s read-only posture including this surface) and was **not** taken
+here. This PR's job is closing the RBAC-**off** gap (the topology floor);
+it deliberately preserves the RBAC-on status quo for every built-in role,
+`Viewer` included, so the two changes cannot be conflated as one when
+someone reviews the audit trail later. If tightening `Viewer`'s
+RBAC-enabled scope is wanted, it is a follow-up with its own review, not a
+side effect of this one.
+
+### 7. No schema migration
+
+`RbacStore::create_tables()`'s migration list was not extended for the new
+`EnginePrincipal` securable. `seed_defaults()` runs **unconditionally** on
+every `RbacStore` construction, and its seed loops (`types[]`,
+`viewer_types[]`, the `Administrator` CRUD loop) are all `INSERT OR
+IGNORE`. That combination means an **existing** deployment picks up the new
+securable row and its Administrator/Viewer grants on the very next boot,
+with zero migration machinery required — the row and its permission tuples
+simply don't exist yet, `INSERT OR IGNORE` inserts them, and re-running the
+same seed on every subsequent boot is a no-op. This is the same mechanism
+that introduced `AccessReview` and `SoftwareLicensing`, both added as plain
+entries in `seed_defaults()`'s type/grant arrays with no accompanying
+migration.
+
+A migration is needed only when a change **cannot** be expressed as an
+idempotent additive re-seed. `rbac_store.cpp`'s v4 migration is the
+counter-example that proves the rule: it `DELETE`s three specific
+`(role_name, securable_type, operation)` tuples
+(`('Administrator', 'AuditLog', 'Attest')`,
+`('Reviewer', 'AuditLog', 'Read')`, `('Reviewer', 'AuditLog', 'Attest')`)
+that predate the `AccessReview` securable and would otherwise linger
+forever as stale grants — `INSERT OR IGNORE` has no way to *remove* a row,
+so that class of change is exactly what needs a version-gated migration.
+Adding a brand-new securable with brand-new grants has no equivalent
+removal step, so it needed none here.
+
+## Hard-invariant check
+
+- The floor set is a fixed, `constexpr` array (`kTopologyFloor`) — no
+  runtime-mutable state, no config key reaches it. ✅
+- `topology_floor_applies()` is a pure string-comparison predicate with no
+  side effects; it cannot itself deny or allow anything — only the two
+  legacy-branch call sites act on its result. ✅
+- Both `require_permission` and `require_scoped_permission` gained the
+  identical floor check — flooring only one of the two structurally
+  identical legacy branches was explicitly avoided (see the comment at
+  `auth_routes.cpp` in `require_scoped_permission`); no floored
+  `(securable, operation)` pair reaches the scoped variant today, but the
+  check is there so a **future** scoped topology read cannot silently skip
+  the floor by landing in the branch nobody remembered to also floor. ✅
+- The floor never runs ahead of, or replaces, the live-RBAC branch in
+  either function — verified structurally: `rbac_enforcement_in_effect`'s
+  `if` block always `return`s before the legacy branch's statements
+  execute. ✅
+- `EnginePrincipal`'s seed grants (`Administrator` full CRUD, `Viewer`
+  `Read`) exactly reproduce the pre-cut `Security:Read` access those two
+  roles held on these three routes — grepped `rbac_store.cpp`'s
+  `types[]`/`viewer_types[]` diff: `EnginePrincipal` appended to both,
+  nothing removed from either. ✅
+- Both REST routes and all three MCP twins were moved to
+  `EnginePrincipal:Read` together — grepped `mcp_server.cpp`'s
+  `kToolSecurityRows[]` and the three `tier_allows(tier, "Security",
+  "Read")`/`perm_fn(req, res, "Security", "Read")` call sites for
+  `list_engine_principals`/`get_engine_principal`/`list_engine_roles`: none
+  remain on `Security:Read`. ✅
+- The four `Security:Read` collateral surfaces named in decision 4
+  (quarantine visibility, CA issued-certs, `/ca/root-csr`, KEK status)
+  remain on `Security:Read`, untouched by this change. ✅
+
+## Tests
+
+Owned by a sibling change on this branch:
+`tests/unit/server/test_authz_topology_floor.cpp` (new) and the
+corresponding `tests/meson.build` registration. Not verified in this
+review pass — see that file for coverage of the floor predicate, the
+audit-reason text, the metric emission, and the RBAC-on/`Reviewer`
+non-interaction.
+
+## Residual / follow-ups
+
+- **The RBAC-on `Viewer` scope for `EnginePrincipal:Read` is unreviewed as
+  a standalone question** (decision 6) — if a future review decides
+  `Viewer` should not see the engine-principal grant graph, that is a
+  separate, explicitly-scoped change.
+- **`Security:Read`'s four collateral surfaces are unaffected by this PR**
+  and remain reachable by any authenticated non-admin on an RBAC-off
+  install, same as before. If any of those four is later judged to also be
+  authorization topology (none is, per decision 4, as of this review),
+  that is a separate securable-cut-and-floor decision, not an extension of
+  this floor's scope by reinterpretation.

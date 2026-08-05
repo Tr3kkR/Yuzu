@@ -674,7 +674,7 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Unassign a role from a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}}}
     },
     "/engine-principals/{id}/roles": {
-      "get": {"summary": "List fleet-wide RBAC roles assigned to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "responses": {"200": {"description": "List of role assignments"}, "403": {"description": "Requires Security:Read"}, "503": {"description": "RBAC store unavailable"}}},
+      "get": {"summary": "List fleet-wide RBAC roles assigned to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "responses": {"200": {"description": "List of role assignments"}, "403": {"description": "Requires EnginePrincipal:Read"}, "503": {"description": "RBAC store unavailable"}}},
       "post": {"summary": "Assign a fleet-wide RBAC role to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["role"], "properties": {"role": {"type": "string"}}}}}}, "responses": {"201": {"description": "Role assigned"}, "400": {"description": "Bad JSON / missing role / unknown role / admin-or-built-in role rejected (design §4.2)"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No active engine principal with that id"}, "503": {"description": "RBAC or engine-principal store unavailable"}}}
     },
     "/engine-principals/{id}/roles/{role}": {
@@ -686,10 +686,10 @@ const std::string& openapi_spec() {
         R"json(,
     "/engine-principals": {
       "post": {"summary": "Create a new engine-principal identity", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["slug", "display_name", "owner_username", "justification", "classification"], "properties": {"slug": {"type": "string", "description": "Reserved 'engine:<slug>' namespace suffix — lowercase letters, digits, '.', '_', '-' only, max 128 chars"}, "display_name": {"type": "string"}, "owner_username": {"type": "string", "description": "Must reference an existing user (owner-FK)"}, "justification": {"type": "string"}, "classification": {"type": "string", "enum": ["internal", "external"]}}}}}}, "responses": {"201": {"description": "Created; {principal_id}"}, "400": {"description": "Bad JSON, invalid/duplicate slug, missing justification, unknown owner_username, or invalid classification"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "503": {"description": "Engine-principal store, or owner-lookup, unavailable"}}},
-      "get": {"summary": "List every engine principal", "tags": ["Security"], "responses": {"200": {"description": "List of engine principals with active_credential_count"}, "403": {"description": "Requires Security:Read"}, "503": {"description": "Engine-principal store unavailable"}}}
+      "get": {"summary": "List every engine principal", "tags": ["Security"], "responses": {"200": {"description": "List of engine principals with active_credential_count"}, "403": {"description": "Requires EnginePrincipal:Read"}, "503": {"description": "Engine-principal store unavailable"}}}
     },
     "/engine-principals/{id}": {
-      "get": {"summary": "Get one engine principal and its active credentials", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "responses": {"200": {"description": "Engine principal detail + active_credentials[] (secrets masked)"}, "403": {"description": "Requires Security:Read"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal store unavailable"}}},
+      "get": {"summary": "Get one engine principal and its active credentials", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "responses": {"200": {"description": "Engine principal detail + active_credentials[] (secrets masked)"}, "403": {"description": "Requires EnginePrincipal:Read"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal store unavailable"}}},
       "delete": {"summary": "Revoke an engine principal (terminal) and its active credentials", "tags": ["Security"], "description": "Cross-store ordering invariant: credentials are revoked FIRST (ApiTokenStore::revoke_for_principal), the identity SECOND — never the reverse.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"superseded_by": {"type": "string"}}}}}}, "responses": {"200": {"description": "Revoked (idempotent — success even if already revoked); {revoked, credentials_revoked}"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal or credential store unavailable"}}}
     },
     "/engine-principals/{id}/credentials": {
@@ -2120,7 +2120,7 @@ void RestApiV1::register_routes(
     // in the current global model).
     sink.Get(R"(/api/v1/engine-principals/([a-z0-9._-]+)/roles)",
              [perm_fn, audit_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn(req, res, "Security", "Read"))
+                 if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                      return;
                  // is_open() distinguishes "no roles" from "rbac.db down": a
                  // closed store must 503, never return [] implying the
@@ -2724,7 +2724,7 @@ void RestApiV1::register_routes(
     sink.Get("/api/v1/engine-principals",
              [perm_fn, auth_fn, audit_fn, eps, token_store](
                  const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn(req, res, "Security", "Read"))
+                 if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                      return;
                  if (!eps || !eps->is_open()) {
                      res.status = 503;
@@ -2769,7 +2769,7 @@ void RestApiV1::register_routes(
     sink.Get(R"(/api/v1/engine-principals/([^/]+))",
              [perm_fn, auth_fn, audit_fn, eps, token_store](
                  const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn(req, res, "Security", "Read"))
+                 if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                      return;
                  if (!eps || !eps->is_open()) {
                      res.status = 503;

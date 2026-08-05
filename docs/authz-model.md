@@ -24,9 +24,10 @@ if the ADR is amended before PR1.9 lands, this schema may need a rework pass.
 
 ### Vocabulary
 
-- **`securable`** — reuses an existing `RbacStore::list_securable_types()` entry (22 seeded types,
-  `rbac_store.cpp:291-327`, read-only reference for this PR) wherever one accurately describes the
-  protected resource. A Module minting a genuinely new securable is an ADR-0033 §2 escape hatch that
+- **`securable`** — reuses an existing `RbacStore::list_securable_types()` entry (23 seeded types
+  as of #2376's `EnginePrincipal` cut, `rbac_store.cpp:302-348`, read-only reference for this PR)
+  wherever one accurately describes the protected resource. A Module minting a genuinely new
+  securable is an ADR-0033 §2 escape hatch that
   is **not built yet** — its own stated precondition is the runtime capability-declaration registry,
   which is PR1.9's job, not this one's.
 - **`operation`** — `yuzu::server::authz::Operation`. ADR-0033 §2 names "the existing six" as
@@ -80,7 +81,7 @@ classifies a capability; it never grants one.
 
 ### Seed catalogue
 
-`kSeedCatalogue` is five representative rows, not a full mirror of `RbacStore`'s 21 securables × 7
+`kSeedCatalogue` is five representative rows, not a full mirror of `RbacStore`'s 23 securables × 7
 operations — it exists so PR1.9 has real rows to migrate and so this header's own tests exercise
 `is_valid`, not to be the registry itself. It includes an ordinary CRUD read (`Response:Read`), a
 `Tag:Write` (mirrors `mcp_policy.hpp`'s existing Tag special-case), `Execution:Execute` (the
