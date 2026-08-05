@@ -816,6 +816,172 @@ TEST_CASE("AuditStore: a sourceless Refuse caller may not stamp; boot still may"
     CHECK(store.log(mk("root", "mfa.reset.breakglass")));
 }
 
+// Gate 3 architect A-4, round 2 (Sol). The finding above closed the CLI arm
+// but left the arm that actually matters open: a REPLICA that boots without a
+// legacy file still stamps `backfill_complete` over its own empty table, and
+// nothing stopped a LATER boot on a host that DOES hold the real trail from
+// trusting that marker. This is the holder-side verification that closes it:
+// the marker's recorded provenance is "sourceless" (no fingerprint a real
+// file could ever match), so a holder with real, non-empty content refuses
+// rather than silently reporting success over a trail nobody streamed.
+TEST_CASE("AuditStore: a sourceless marker does not validate a holder's real, unmigrated file",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+
+    // Replica A: no legacy file, boots first, stamps sourcelessly.
+    AuditStore storeA(pool);
+    REQUIRE(storeA.is_open());
+    REQUIRE(storeA.migrate_from_sqlite("/nonexistent-yuzu-test/audit.db"));
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE key = "
+                                 "'backfill_complete'") == "1");
+
+    // Replica B, same table: DOES hold a real, non-empty legacy file that was
+    // never read by anyone.
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bf15_"}};
+    auto legacy = dir.path / "audit.db";
+    build_legacy_audit_db(legacy, /*count=*/10);
+
+    AuditStore storeB(pool);
+    REQUIRE(storeB.is_open());
+    CHECK_FALSE(storeB.migrate_from_sqlite(legacy));
+    // Nothing lost: the file is untouched, and boot refuses rather than
+    // silently reporting a migration that never happened.
+    CHECK(std::filesystem::exists(legacy));
+    CHECK_FALSE(storeB.log(mk("admin", "post.refused.holder")));
+}
+
+// The other outcome of the same verification: a legacy file whose content
+// GENUINELY was migrated (this host's own prior run, whose move-aside failed
+// afterward) must not be permanently stuck refusing. Simulates a failed
+// move-aside by copying the already-migrated file back to the original path
+// after a real, successful backfill, then retrying.
+TEST_CASE("AuditStore: a genuinely-migrated file left behind by a failed move is retried, "
+          "not refused",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bf16_"}};
+    auto legacy = dir.path / "audit.db";
+    build_legacy_audit_db(legacy, /*count=*/7);
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.migrate_from_sqlite(legacy));
+    CHECK_FALSE(std::filesystem::exists(legacy)); // moved aside on success
+
+    // Simulate a failed move-aside: put an IDENTICAL copy of the migrated
+    // file back at the original path — exactly what a real rename failure
+    // would have left there.
+    std::filesystem::path migrated;
+    for (const auto& entry : std::filesystem::directory_iterator(dir.path)) {
+        if (entry.path().string().find(".migrated-") != std::string::npos) {
+            migrated = entry.path();
+            break;
+        }
+    }
+    REQUIRE_FALSE(migrated.empty());
+    std::error_code cp_ec;
+    std::filesystem::copy_file(migrated, legacy, cp_ec);
+    REQUIRE_FALSE(cp_ec);
+    REQUIRE(std::filesystem::exists(legacy));
+
+    // A later boot finds the marker present AND the file back: the
+    // fingerprint matches what `stamp_complete` proved the first time, so it
+    // retries the move rather than refusing.
+    AuditStore store2(pool);
+    REQUIRE(store2.is_open());
+    CHECK(store2.migrate_from_sqlite(legacy));
+    CHECK_FALSE(std::filesystem::exists(legacy)); // moved aside again
+    CHECK(store2.log(mk("admin", "post.retry.moveaside")));
+}
+
+// Gate 4 unhappy-path UP-1, applied specifically to the marker-present
+// verification path: a corrupt/unreadable file left at the original path
+// must not be treated as "nothing to verify" (which would silently trust an
+// unproven marker) or waved through as a match. `sqlite3_open_v2` succeeds
+// lazily on junk bytes (measured); the corruption surfaces at the first real
+// read, inside `legacy_has_table`.
+TEST_CASE("AuditStore: marker present + a corrupt legacy file refuses rather than trusting it",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+
+    AuditStore storeA(pool);
+    REQUIRE(storeA.is_open());
+    REQUIRE(storeA.migrate_from_sqlite("/nonexistent-yuzu-test/audit.db")); // sourceless stamp
+
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bf17_"}};
+    auto junk = dir.path / "audit.db";
+    std::filesystem::create_directories(dir.path);
+    {
+        std::ofstream f(junk, std::ios::binary);
+        f << "not a sqlite database, just some junk bytes";
+    }
+    REQUIRE(std::filesystem::exists(junk));
+
+    AuditStore storeB(pool);
+    REQUIRE(storeB.is_open());
+    CHECK_FALSE(storeB.migrate_from_sqlite(junk));
+    CHECK(std::filesystem::exists(junk)); // untouched
+}
+
+// Gate 4 unhappy-path UP-1, the ORIGINAL repro, with no marker yet: a legacy
+// file with SOME bytes that fail to parse as a SQLite header must not be
+// diagnosed as "no audit_events table, treat as a fresh install" —
+// `legacy_has_table` returning Error (not Absent) is what pins that.
+// `sqlite3_open_v2(SQLITE_OPEN_READONLY)` succeeds lazily even on junk bytes
+// (measured); the corruption surfaces only at the first real read.
+TEST_CASE("AuditStore: 38 bytes of junk is never treated as a fresh install",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bf18_"}};
+    auto junk = dir.path / "audit.db";
+    std::filesystem::create_directories(dir.path);
+    {
+        std::ofstream f(junk, std::ios::binary);
+        f << "not a sqlite database, just 38 by!"; // 38 bytes
+    }
+    REQUIRE(std::filesystem::exists(junk));
+
+    CHECK_FALSE(store.migrate_from_sqlite(junk));
+    CHECK(std::filesystem::exists(junk)); // untouched, not silently "fresh"
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE key = "
+                                 "'backfill_complete'") == "0");
+}
+
+// The companion, NEGATIVE case for the same code path: a genuinely ZERO-BYTE
+// file is not "corrupt" in the sense above — measured, `sqlite3_open_v2`
+// succeeds and the FIRST `sqlite_master` read returns EMPTY (0 rows, no
+// error), because SQLite treats a 0-length file as a valid, uninitialized
+// database rather than a garbled one. `legacy_has_table` correctly reports
+// `Absent`, not `Error`. That is the right call, not a gap: a 0-byte file
+// cannot encode any evidence, so there is nothing for a fresh-install
+// diagnosis to lose — unlike the 38-byte case above, which fails to parse
+// specifically because it HAS content that isn't a valid header.
+TEST_CASE("AuditStore: a zero-byte legacy file is legitimately sourceless, not corrupt",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bf19_"}};
+    auto empty_file = dir.path / "audit.db";
+    std::filesystem::create_directories(dir.path);
+    { std::ofstream f(empty_file, std::ios::binary); } // 0 bytes
+    REQUIRE(std::filesystem::exists(empty_file));
+    REQUIRE(std::filesystem::file_size(empty_file) == 0);
+
+    REQUIRE(store.migrate_from_sqlite(empty_file));
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE key = "
+                                 "'backfill_complete'") == "1");
+}
+
 // Gate 3 quality-engineer: the retention thread's lifecycle had no test at all.
 // This pins start -> stop -> stop-again -> destroy. It deliberately does NOT
 // call start_cleanup() twice: that is a KNOWN defect in the non-jthread arm

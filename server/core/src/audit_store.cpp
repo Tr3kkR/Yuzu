@@ -199,13 +199,126 @@ bool legacy_has_column(sqlite3* db, const char* table, const char* col) {
     return false;
 }
 
-bool legacy_has_table(sqlite3* db, const char* table) {
+// Three outcomes, not two. `sqlite3_prepare_v2` failing (corrupt file, encrypted
+// file, disk I/O error — bytes present that do not parse as a SQLite header)
+// is NOT the same fact as "the table genuinely does not exist" — the former
+// means this process cannot see what the file holds, the latter means it can
+// see the file holds nothing of interest. Collapsing them to one `bool` let a
+// corrupt `audit.db` read as "no source, fresh install" and silently forfeit
+// the mandatory backfill (Gate 4 unhappy-path UP-1, measured on a 38-byte junk
+// file). A genuinely zero-byte file is `Absent`, not `Error` — measured
+// separately: SQLite treats 0 bytes as a valid, uninitialized database and
+// `sqlite_master` reads back empty rather than failing, which is the correct
+// answer, since a 0-byte file cannot encode any evidence to lose.
+enum class LegacyTableStatus { Present, Absent, Error };
+
+LegacyTableStatus legacy_has_table(sqlite3* db, const char* table) {
     SqliteStmt s;
     if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", -1,
                            s.addr(), nullptr) != SQLITE_OK)
-        return false;
+        return LegacyTableStatus::Error;
     sqlite3_bind_text(s.get(), 1, table, -1, SQLITE_STATIC);
-    return sqlite3_step(s.get()) == SQLITE_ROW;
+    const int rc = sqlite3_step(s.get());
+    if (rc == SQLITE_ROW)
+        return LegacyTableStatus::Present;
+    if (rc == SQLITE_DONE)
+        return LegacyTableStatus::Absent;
+    return LegacyTableStatus::Error;
+}
+
+// ── Legacy content fingerprint ────────────────────────────────────────────
+//
+// One shape, two uses. `(COUNT, SUM(id), SUM(timestamp), MIN(timestamp),
+// MAX(timestamp))` over `audit_events`, optionally bounded to `id <= max_id`:
+//   * bounded — the ADR-0009 prefix proof at resume time, comparing against
+//     what PG already holds at or below the resume cursor;
+//   * unbounded (`max_id = nullopt`) — the WHOLE file's fingerprint, computed
+//     once a backfill has streamed every row, and stored as this run's
+//     `backfill_source_fingerprint` alongside the completion marker. That
+//     stored value is what a LATER boot compares a still-present legacy file
+//     against (see `migrate_from_sqlite`'s marker-present branch) — never
+//     against PG's live content, which drifts as retention deletes backfilled
+//     rows and native writes accumulate. A stored fingerprint is immutable
+//     once written and immune to that drift; PG's current state is not.
+//
+// Ids run `1..k` contiguously in every deployment (`GENERATED ALWAYS AS
+// IDENTITY` here, `rowid` there), so a count or an id-sum alone is defeated
+// SYSTEMATICALLY by any other table of the same size, not by coincidence —
+// the timestamp components are what actually differ between two histories.
+struct LegacyFingerprint {
+    std::int64_t count = 0;
+    std::int64_t id_sum = 0;
+    std::int64_t ts_sum = 0;
+    std::int64_t ts_min = 0;
+    std::int64_t ts_max = 0;
+
+    [[nodiscard]] std::string to_string() const {
+        return std::format("{}:{}:{}:{}:{}", count, id_sum, ts_sum, ts_min, ts_max);
+    }
+    bool operator==(const LegacyFingerprint&) const = default;
+};
+
+std::optional<LegacyFingerprint> legacy_fingerprint(sqlite3* legacy,
+                                                     std::optional<std::int64_t> max_id) {
+    const char* sql =
+        max_id ? "SELECT COUNT(*), COALESCE(SUM(id),0), COALESCE(SUM(timestamp),0), "
+                 "COALESCE(MIN(timestamp),0), COALESCE(MAX(timestamp),0) FROM audit_events "
+                 "WHERE id <= ?"
+               : "SELECT COUNT(*), COALESCE(SUM(id),0), COALESCE(SUM(timestamp),0), "
+                 "COALESCE(MIN(timestamp),0), COALESCE(MAX(timestamp),0) FROM audit_events";
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(legacy, sql, -1, s.addr(), nullptr) != SQLITE_OK)
+        return std::nullopt;
+    if (max_id)
+        sqlite3_bind_int64(s.get(), 1, *max_id);
+    if (sqlite3_step(s.get()) != SQLITE_ROW)
+        return std::nullopt;
+    LegacyFingerprint fp;
+    fp.count = sqlite3_column_int64(s.get(), 0);
+    fp.id_sum = sqlite3_column_int64(s.get(), 1);
+    fp.ts_sum = sqlite3_column_int64(s.get(), 2);
+    fp.ts_min = sqlite3_column_int64(s.get(), 3);
+    fp.ts_max = sqlite3_column_int64(s.get(), 4);
+    return fp;
+}
+
+// Parses a `LegacyFingerprint::to_string()` value read back from
+// `audit_retention_meta`. `nullopt` on any malformed input (wrong field count,
+// non-numeric field) — a fingerprint that fails to parse is exactly as
+// untrustworthy as one that fails to match, and the caller treats both
+// identically (refuse, never "assume it matches").
+std::optional<LegacyFingerprint> parse_fingerprint(std::string_view s) {
+    std::vector<std::string_view> parts;
+    std::size_t start = 0;
+    for (;;) {
+        const std::size_t colon = s.find(':', start);
+        parts.push_back(s.substr(
+            start, colon == std::string_view::npos ? std::string_view::npos : colon - start));
+        if (colon == std::string_view::npos)
+            break;
+        start = colon + 1;
+    }
+    if (parts.size() != 5)
+        return std::nullopt;
+    std::int64_t values[5];
+    for (std::size_t i = 0; i < 5; ++i) {
+        if (parts[i].empty())
+            return std::nullopt;
+        const std::string part_str(parts[i]);
+        errno = 0;
+        char* end = nullptr;
+        const long long v = std::strtoll(part_str.c_str(), &end, 10);
+        if (errno != 0 || end != part_str.c_str() + part_str.size())
+            return std::nullopt;
+        values[i] = static_cast<std::int64_t>(v);
+    }
+    LegacyFingerprint fp;
+    fp.count = values[0];
+    fp.id_sum = values[1];
+    fp.ts_sum = values[2];
+    fp.ts_min = values[3];
+    fp.ts_max = values[4];
+    return fp;
 }
 
 } // namespace
@@ -292,6 +405,49 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             metrics_->counter("yuzu_server_audit_backfill_total", {{"result", result}}).increment();
     };
 
+    // Move a verified legacy file aside (never delete). Shared by the normal
+    // end-of-backfill path and the marker-present verification path below —
+    // the latter exists specifically to RETRY a move that failed on an earlier
+    // boot (Windows file-in-use, a transient permissions issue). Failure here
+    // is non-fatal in both callers: the trail's presence in PG has already been
+    // established by the time this runs, so a rename failure only means the
+    // retained copy stays where it is and a later boot tries again.
+    const auto move_legacy_aside = [&legacy_db_path]() {
+        std::error_code mv_ec;
+        auto aside = legacy_db_path;
+        aside += ".migrated-" + std::to_string(now_epoch());
+        std::filesystem::rename(legacy_db_path, aside, mv_ec);
+        if (mv_ec) {
+            spdlog::warn(
+                "AuditStore: migrate_from_sqlite: could not move legacy {} aside ({}); it is safe "
+                "to archive/remove manually, or a later boot retries",
+                legacy_db_path.string(), mv_ec.message());
+            return;
+        }
+        // Carry the WAL/SHM sidecars across with the main file — see the
+        // move-aside rationale where this was originally inline: a clean
+        // shutdown checkpoints them away, but after an unclean stop the
+        // committed tail lives in `-wal`, and the retained copy is unopenable
+        // standalone without it.
+        for (const char* suffix : {"-wal", "-shm"}) {
+            auto side = legacy_db_path;
+            side += suffix;
+            std::error_code side_ec;
+            if (!std::filesystem::exists(side, side_ec) || side_ec)
+                continue;
+            auto side_aside = aside;
+            side_aside += suffix;
+            std::filesystem::rename(side, side_aside, side_ec);
+            if (side_ec)
+                spdlog::warn(
+                    "AuditStore: migrate_from_sqlite: moved the legacy audit db but not its {} "
+                    "sidecar ({}); the retained copy at {} may not open standalone until the "
+                    "sidecar is moved beside it",
+                    suffix, side_ec.message(), aside.string());
+        }
+        spdlog::info("AuditStore: migrate_from_sqlite: moved legacy audit db to {}", aside.string());
+    };
+
     // Stamp the one-time completion marker + advance the identity sequence past
     // the migrated ids, atomically. Called once at the end (and on the
     // no-legacy fresh-install path with an empty table). Advancing the sequence
@@ -303,48 +459,73 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     // outside this transaction is a TOCTOU read — a peer replica can stream rows
     // in between. Re-checking INSIDE the stamping transaction closes it, because
     // the marker and the check then commit or roll back together.
-    const auto stamp_complete = [this](bool require_empty = false) -> bool {
-        return pool_.with_txn_for(kBackfillTxnTimeout, [require_empty](PGconn* c) -> bool {
-            if (require_empty) {
-                pg::PgResult n = pg::exec_params(
-                    c, "SELECT COUNT(*) FROM audit_store.audit_events", std::vector<std::string>{});
-                if (n.status() != PGRES_TUPLES_OK) {
-                    spdlog::error("AuditStore: migrate_from_sqlite: emptiness re-check failed: {}",
+    //
+    // `source_fingerprint` is stamped in the SAME transaction as the marker —
+    // one commit, one fact. It is what a LATER boot, finding the marker present
+    // AND a legacy file still on disk, compares that file's own fingerprint
+    // against (see the marker-present branch below). A real backfill passes the
+    // whole-file `LegacyFingerprint` it just proved; `complete_without_source`
+    // passes the literal `"sourceless"`, which can never equal a real
+    // fingerprint — so a host with a genuine, non-empty legacy file can never
+    // be waved through by a marker some OTHER process stamped without ever
+    // reading a file (Gate 3 architect A-4 / Sol: local absence must not be
+    // trusted as proof of deployment-wide absence).
+    const auto stamp_complete = [this](bool require_empty, std::string_view source_fingerprint) -> bool {
+        return pool_.with_txn_for(
+            kBackfillTxnTimeout, [require_empty, source_fingerprint](PGconn* c) -> bool {
+                if (require_empty) {
+                    pg::PgResult n = pg::exec_params(c,
+                                                     "SELECT COUNT(*) FROM audit_store.audit_events",
+                                                     std::vector<std::string>{});
+                    if (n.status() != PGRES_TUPLES_OK) {
+                        spdlog::error(
+                            "AuditStore: migrate_from_sqlite: emptiness re-check failed: {}",
+                            PQerrorMessage(c));
+                        return false;
+                    }
+                    if (to_i64(PQgetvalue(n.get(), 0, 0)) > 0) {
+                        spdlog::error(
+                            "AuditStore: migrate_from_sqlite: refusing to mark the backfill "
+                            "complete — audit_events became NON-EMPTY while this pass was "
+                            "deciding, so another process is writing or streaming into it. Let "
+                            "that process finish; it stamps the marker.");
+                        return false;
+                    }
+                }
+                pg::PgResult sv = pg::exec_params(
+                    c,
+                    "SELECT setval(pg_get_serial_sequence('audit_store.audit_events','id'), "
+                    "GREATEST((SELECT COALESCE(MAX(id),0) FROM audit_store.audit_events), 1), "
+                    "(SELECT COUNT(*) FROM audit_store.audit_events) > 0)",
+                    std::vector<std::string>{});
+                if (sv.status() != PGRES_TUPLES_OK) {
+                    spdlog::error("AuditStore: migrate_from_sqlite: sequence advance failed: {}",
                                   PQerrorMessage(c));
                     return false;
                 }
-                if (to_i64(PQgetvalue(n.get(), 0, 0)) > 0) {
-                    spdlog::error(
-                        "AuditStore: migrate_from_sqlite: refusing to mark the backfill complete — "
-                        "audit_events became NON-EMPTY while this pass was deciding, so another "
-                        "process is writing or streaming into it. Let that process finish; it "
-                        "stamps the marker.");
+                pg::PgResult mk = pg::exec_params(
+                    c,
+                    "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES "
+                    "('backfill_complete', $1) ON CONFLICT (key) DO NOTHING",
+                    std::vector<std::string>{std::to_string(now_epoch())});
+                if (mk.status() != PGRES_COMMAND_OK) {
+                    spdlog::error("AuditStore: migrate_from_sqlite: marker stamp failed: {}",
+                                  PQerrorMessage(c));
                     return false;
                 }
-            }
-            pg::PgResult sv = pg::exec_params(
-                c,
-                "SELECT setval(pg_get_serial_sequence('audit_store.audit_events','id'), "
-                "GREATEST((SELECT COALESCE(MAX(id),0) FROM audit_store.audit_events), 1), "
-                "(SELECT COUNT(*) FROM audit_store.audit_events) > 0)",
-                std::vector<std::string>{});
-            if (sv.status() != PGRES_TUPLES_OK) {
-                spdlog::error("AuditStore: migrate_from_sqlite: sequence advance failed: {}",
-                              PQerrorMessage(c));
-                return false;
-            }
-            pg::PgResult mk = pg::exec_params(
-                c,
-                "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES "
-                "('backfill_complete', $1) ON CONFLICT (key) DO NOTHING",
-                std::vector<std::string>{std::to_string(now_epoch())});
-            if (mk.status() != PGRES_COMMAND_OK) {
-                spdlog::error("AuditStore: migrate_from_sqlite: marker stamp failed: {}",
-                              PQerrorMessage(c));
-                return false;
-            }
-            return true;
-        });
+                pg::PgResult fp = pg::exec_params(
+                    c,
+                    "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES "
+                    "('backfill_source_fingerprint', $1) ON CONFLICT (key) DO NOTHING",
+                    std::vector<std::string>{std::string(source_fingerprint)});
+                if (fp.status() != PGRES_COMMAND_OK) {
+                    spdlog::error(
+                        "AuditStore: migrate_from_sqlite: source-fingerprint stamp failed: {}",
+                        PQerrorMessage(c));
+                    return false;
+                }
+                return true;
+            });
     };
 
     // 1. Idempotency marker + resume point, on a short-lived lease released
@@ -408,7 +589,132 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             return false;
         }
         if (PQntuples(mk.get()) > 0) {
-            spdlog::debug("AuditStore: migrate_from_sqlite already completed, skipping");
+            // Marker present. An ordinary restart has no legacy file left at
+            // this path — a completed backfill moves it aside — so that is the
+            // cheap, common case: nothing further to check.
+            std::error_code exists_ec;
+            const bool file_still_here = std::filesystem::exists(legacy_db_path, exists_ec);
+            if (exists_ec || !file_still_here) {
+                spdlog::debug("AuditStore: migrate_from_sqlite already completed, skipping");
+                return backfill_ok();
+            }
+
+            // A legacy file exists ALONGSIDE a completed marker. Two honest
+            // explanations: (a) THIS host (or an identical shared-storage
+            // sibling) completed a real backfill and the move-aside failed
+            // afterward — safe to retry; (b) a DIFFERENT process stamped the
+            // marker (a sourceless boot on a fileless peer, or another
+            // replica's own unrelated backfill) and THIS host's trail was
+            // NEVER migrated (Gate 3 architect A-4, and Sol's diagnosis of
+            // why two rounds of guards on the sourceless SIDE failed to close
+            // it: no process can prove deployment-wide absence from its own
+            // filesystem, so the fix has to live on the holder's side).
+            //
+            // Distinguish them by PROVENANCE, not by comparing this file
+            // against PG's CURRENT content — that comparison decays: retention
+            // deletes backfilled rows over time and native writes accumulate,
+            // so a perfectly healthy, long-running server would eventually
+            // fail a live-content comparison. Compare instead against the
+            // fingerprint `stamp_complete` recorded IN THE MARKER at the
+            // moment a real backfill proved completeness — that value is
+            // written once, in the same transaction as the marker, and never
+            // changes afterward.
+            spdlog::warn(
+                "AuditStore: migrate_from_sqlite: backfill_complete is set but legacy {} still "
+                "exists; verifying this host's trail was actually migrated before trusting the "
+                "marker",
+                legacy_db_path.string());
+            SqliteDb verify_db;
+            if (sqlite3_open_v2(legacy_db_path.string().c_str(), verify_db.addr(),
+                                SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+                spdlog::error(
+                    "AuditStore: migrate_from_sqlite: marker present but legacy {} exists and "
+                    "could not be opened for verification ({}); refusing to serve without proof "
+                    "this host's trail was migrated. If this file is known-empty or irrelevant, "
+                    "remove it and restart; otherwise see the recovery procedure in "
+                    "docs/user-manual/upgrading.md.",
+                    legacy_db_path.string(),
+                    verify_db ? sqlite3_errmsg(verify_db.get()) : "open failed");
+                backfill_metric("failed");
+                return false;
+            }
+            sqlite3_exec(verify_db.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
+            const auto table_status = legacy_has_table(verify_db.get(), "audit_events");
+            if (table_status == LegacyTableStatus::Error) {
+                spdlog::error(
+                    "AuditStore: migrate_from_sqlite: marker present but legacy {} is unreadable "
+                    "or corrupt; refusing to serve without proof this host's trail was migrated. "
+                    "See docs/user-manual/upgrading.md.",
+                    legacy_db_path.string());
+                backfill_metric("failed");
+                return false;
+            }
+            if (table_status == LegacyTableStatus::Absent) {
+                // A table-less file left behind is not a migration source —
+                // nothing here could have been lost. Same posture as "no
+                // file at all".
+                spdlog::debug("AuditStore: migrate_from_sqlite: legacy {} has no audit_events "
+                              "table; nothing to verify",
+                              legacy_db_path.string());
+                return backfill_ok();
+            }
+            const auto legacy_fp = legacy_fingerprint(verify_db.get(), std::nullopt);
+            if (!legacy_fp) {
+                spdlog::error("AuditStore: migrate_from_sqlite: marker present but legacy {} "
+                              "fingerprint read failed; refusing to serve without proof this "
+                              "host's trail was migrated.",
+                              legacy_db_path.string());
+                backfill_metric("failed");
+                return false;
+            }
+            if (legacy_fp->count == 0) {
+                // Empty table left behind — nothing to lose regardless of who
+                // stamped the marker or why.
+                return backfill_ok();
+            }
+            pg::PgResult fp_row = pg::exec_params(
+                lease.get(),
+                "SELECT value FROM audit_store.audit_retention_meta WHERE key = "
+                "'backfill_source_fingerprint'",
+                std::vector<std::string>{});
+            if (fp_row.status() != PGRES_TUPLES_OK) {
+                spdlog::error(
+                    "AuditStore: migrate_from_sqlite: source-fingerprint lookup failed: {}",
+                    PQerrorMessage(lease.get()));
+                backfill_metric("failed");
+                return false;
+            }
+            const std::optional<LegacyFingerprint> stored_fp =
+                PQntuples(fp_row.get()) > 0 ? parse_fingerprint(text_col(fp_row.get(), 0, 0))
+                                            : std::nullopt;
+            if (!stored_fp || *stored_fp != *legacy_fp) {
+                spdlog::error(
+                    "AuditStore: migrate_from_sqlite: refusing to serve — legacy {} ({} row(s), "
+                    "id-sum {}, timestamp-sum {}) was NEVER proven migrated. The completion "
+                    "marker's recorded provenance is {}. Some other process declared this "
+                    "deployment's evidence migration complete without ever reading this host's "
+                    "trail — the file is UNTOUCHED at its original path and no evidence has been "
+                    "lost, but boot refuses until this is resolved by an operator: confirm "
+                    "whether this file's content genuinely reached PostgreSQL (via another "
+                    "replica sharing this storage) or is the ONLY copy (in which case follow the "
+                    "recovery procedure in docs/user-manual/upgrading.md before proceeding).",
+                    legacy_db_path.string(), legacy_fp->count, legacy_fp->id_sum, legacy_fp->ts_sum,
+                    stored_fp ? "a DIFFERENT legacy source" : "sourceless — no legacy file was "
+                                                              "ever read before this marker was "
+                                                              "stamped");
+                backfill_metric("failed");
+                return false;
+            }
+            // Fingerprints match exactly: this file's content IS what a real
+            // backfill proved migrated (this host's own prior run, or an
+            // identical shared-storage file a sibling replica streamed). Safe
+            // to retry the move-aside that evidently failed before.
+            verify_db.close();
+            move_legacy_aside();
+            spdlog::info(
+                "AuditStore: migrate_from_sqlite: verified legacy {} matches the migrated trail; "
+                "retried the move-aside",
+                legacy_db_path.string());
             return backfill_ok();
         }
         pg::PgResult mx =
@@ -471,7 +777,7 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             backfill_metric("failed");
             return false;
         }
-        if (!stamp_complete(/*require_empty=*/true)) {
+        if (!stamp_complete(/*require_empty=*/true, /*source_fingerprint=*/"sourceless")) {
             backfill_metric("failed");
             return false;
         }
@@ -516,7 +822,30 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
         return false;
     }
     sqlite3_exec(legacy.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
-    if (!legacy_has_table(legacy.get(), "audit_events")) {
+    const auto audit_events_status = legacy_has_table(legacy.get(), "audit_events");
+    if (audit_events_status == LegacyTableStatus::Error) {
+        // A prepare failure here is NOT "no table" — it means this file HAS
+        // bytes that fail to parse as a SQLite header: corrupt, encrypted, or
+        // otherwise unreadable (Gate 4 unhappy-path UP-1, measured on a
+        // 38-byte junk file). Routing that through `complete_without_source`
+        // declared a corrupt evidence trail a "fresh install" and silently
+        // forfeited it. A file this process cannot read is not proof there is
+        // nothing to migrate. A genuinely ZERO-BYTE file is a DIFFERENT,
+        // legitimate case, not this one — measured, it opens and its
+        // `sqlite_master` read returns EMPTY (Absent), not an error, because
+        // SQLite treats 0 bytes as a valid uninitialized database. That is
+        // correct: a 0-byte file cannot encode any evidence, so there is
+        // nothing to lose by treating it the same as no file at all.
+        spdlog::error(
+            "AuditStore: migrate_from_sqlite: legacy db {} could not be read (corrupt, "
+            "encrypted, or otherwise unreadable); refusing to treat an unreadable file as "
+            "having nothing to migrate. Repair or restore the file, or move it aside by hand "
+            "if it is genuinely not a migration source, then retry.",
+            legacy_db_path.string());
+        backfill_metric("failed");
+        return false;
+    }
+    if (audit_events_status == LegacyTableStatus::Absent) {
         // A legacy file with no audit_events table is not a migration source —
         // treat like a fresh install rather than looping forever, subject to the
         // same empty-table condition.
@@ -525,21 +854,10 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     }
     const bool has_principal_class =
         legacy_has_column(legacy.get(), "audit_events", "principal_class");
-
-    // Legacy row count for reconciliation.
-    std::int64_t legacy_count = 0;
-    {
-        SqliteStmt cnt;
-        if (sqlite3_prepare_v2(legacy.get(), "SELECT COUNT(*) FROM audit_events", -1, cnt.addr(),
-                               nullptr) != SQLITE_OK ||
-            sqlite3_step(cnt.get()) != SQLITE_ROW) {
-            spdlog::error("AuditStore: migrate_from_sqlite: legacy count failed: {}",
-                          sqlite3_errmsg(legacy.get()));
-            backfill_metric("failed");
-            return false;
-        }
-        legacy_count = sqlite3_column_int64(cnt.get(), 0);
-    }
+    // (No separate early row-count read: the prefix-proof fingerprint query
+    // immediately below already reads the file's aggregate shape, and the
+    // reconciliation fingerprint after streaming reads it again — a third,
+    // standalone COUNT(*) added nothing but a stale value to keep in sync.)
 
     // 3b. PREFIX PROOF (ADR-0009). The ADR's trigger is "finds its Postgres
     // schema EMPTY and a legacy .db present"; the resume cursor below relaxes
@@ -571,34 +889,17 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     // coincide in count, id-sum, timestamp-sum, earliest and latest — which is a
     // different claim entirely from "both tables start at id 1".
     {
-        SqliteStmt pfx;
-        if (sqlite3_prepare_v2(legacy.get(),
-                               "SELECT COUNT(*), COALESCE(SUM(id),0), COALESCE(SUM(timestamp),0), "
-                               "COALESCE(MIN(timestamp),0), COALESCE(MAX(timestamp),0) FROM "
-                               "audit_events WHERE id <= ?",
-                               -1, pfx.addr(), nullptr) != SQLITE_OK) {
-            spdlog::error("AuditStore: migrate_from_sqlite: legacy prefix prepare failed: {}",
+        const auto prefix_fp = legacy_fingerprint(legacy.get(), resume_from);
+        if (!prefix_fp) {
+            spdlog::error("AuditStore: migrate_from_sqlite: legacy prefix fingerprint read "
+                          "failed: {}",
                           sqlite3_errmsg(legacy.get()));
             backfill_metric("failed");
             return false;
         }
-        sqlite3_bind_int64(pfx.get(), 1, resume_from);
-        if (sqlite3_step(pfx.get()) != SQLITE_ROW) {
-            spdlog::error("AuditStore: migrate_from_sqlite: legacy prefix count failed: {}",
-                          sqlite3_errmsg(legacy.get()));
-            backfill_metric("failed");
-            return false;
-        }
-        const std::int64_t legacy_rows_at_or_below = sqlite3_column_int64(pfx.get(), 0);
-        const std::int64_t legacy_id_sum_at_or_below = sqlite3_column_int64(pfx.get(), 1);
-        const std::int64_t legacy_ts_sum_at_or_below = sqlite3_column_int64(pfx.get(), 2);
-        const std::int64_t legacy_ts_min_at_or_below = sqlite3_column_int64(pfx.get(), 3);
-        const std::int64_t legacy_ts_max_at_or_below = sqlite3_column_int64(pfx.get(), 4);
-        if (pg_rows_before != legacy_rows_at_or_below ||
-            pg_id_sum_before != legacy_id_sum_at_or_below ||
-            pg_ts_sum_before != legacy_ts_sum_at_or_below ||
-            pg_ts_min_before != legacy_ts_min_at_or_below ||
-            pg_ts_max_before != legacy_ts_max_at_or_below) {
+        const LegacyFingerprint pg_before{pg_rows_before, pg_id_sum_before, pg_ts_sum_before,
+                                          pg_ts_min_before, pg_ts_max_before};
+        if (pg_before != *prefix_fp) {
             spdlog::error(
                 "AuditStore: migrate_from_sqlite: PostgreSQL already holds {} audit row(s) "
                 "(id sum {}, timestamp sum {}, earliest {}, latest {}) but the legacy database has "
@@ -609,10 +910,9 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
                 "EMPTY schema or its own partial copy, nothing else). Operator remediation: point "
                 "at the correct database, or clear audit_store.audit_events if those rows are not "
                 "wanted, then reboot.",
-                pg_rows_before, pg_id_sum_before, pg_ts_sum_before, pg_ts_min_before,
-                pg_ts_max_before, legacy_rows_at_or_below, legacy_id_sum_at_or_below,
-                legacy_ts_sum_at_or_below, legacy_ts_min_at_or_below, legacy_ts_max_at_or_below,
-                resume_from, legacy_db_path.string());
+                pg_before.count, pg_before.id_sum, pg_before.ts_sum, pg_before.ts_min,
+                pg_before.ts_max, prefix_fp->count, prefix_fp->id_sum, prefix_fp->ts_sum,
+                prefix_fp->ts_min, prefix_fp->ts_max, resume_from, legacy_db_path.string());
             backfill_metric("failed");
             return false;
         }
@@ -692,6 +992,16 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
         if (batch.empty())
             break;
 
+        // Rows this batch ACTUALLY inserted, per `PQcmdTuples` — not
+        // `batch.size()`. `ON CONFLICT (id) DO NOTHING` silently drops a row
+        // whose id collides with one already in PG, and on a clean resume
+        // that should never happen (the query is `WHERE id > resume_from`,
+        // and `resume_from` tracks PG's own MAX(id)) — a discard here means a
+        // FOREIGN writer put a row at an id this legacy file also claims (Gate
+        // 3 architect F2 / Sol: the fingerprint reconciliation below is what
+        // actually catches the consequence, but this is where the count
+        // itself stops lying about what happened).
+        std::int64_t batch_inserted = 0;
         const bool ok = pool_.with_txn_for(kBackfillTxnTimeout, [&](PGconn* c) -> bool {
             std::string sql =
                 "INSERT INTO audit_store.audit_events (id, timestamp, principal, principal_role, "
@@ -757,6 +1067,7 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
                               PQerrorMessage(c));
                 return false;
             }
+            batch_inserted = to_i64(PQcmdTuples(ins.get()));
             return true;
         });
         if (!ok) {
@@ -765,7 +1076,20 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             backfill_metric("failed");
             return false;
         }
-        inserted += static_cast<std::int64_t>(batch.size());
+        if (batch_inserted != static_cast<std::int64_t>(batch.size())) {
+            // Not fatal by itself — the whole-file reconciliation below is
+            // what decides pass/fail — but this is the earliest, most precise
+            // signal that a foreign row occupied one of this legacy file's
+            // ids, so it is worth a loud line even if reconciliation later
+            // happens to balance.
+            spdlog::warn(
+                "AuditStore: migrate_from_sqlite: batch offered {} row(s) but PostgreSQL "
+                "accepted only {} — {} row(s) collided with an id already present (ON CONFLICT "
+                "DO NOTHING discarded them); the reconciliation fingerprint below will refuse "
+                "the backfill if that discard is not accounted for",
+                batch.size(), batch_inserted, static_cast<std::int64_t>(batch.size()) - batch_inserted);
+        }
+        inserted += batch_inserted;
         resume_from = batch.back().id;
         if (batch.size() < kBackfillBatchRows)
             break;
@@ -774,7 +1098,19 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     // 5. Copy audit_retention_meta (durable clock-guard reading). Legacy `value`
     // is INTEGER; PG `value` is TEXT — copy as text. DO NOTHING never clobbers a
     // reading a running replica has already advanced past.
-    if (legacy_has_table(legacy.get(), "audit_retention_meta")) {
+    const auto retention_meta_status = legacy_has_table(legacy.get(), "audit_retention_meta");
+    if (retention_meta_status == LegacyTableStatus::Error) {
+        // The SAME handle just read `audit_events` fine, so this would be a
+        // genuine anomaly rather than routine corruption — but the tri-state
+        // exists precisely so a read failure is never silently folded into
+        // "the table doesn't exist" (Gate 4 unhappy-path UP-1).
+        spdlog::error("AuditStore: migrate_from_sqlite: legacy audit_retention_meta existence "
+                      "check failed: {}",
+                      sqlite3_errmsg(legacy.get()));
+        backfill_metric("failed");
+        return false;
+    }
+    if (retention_meta_status == LegacyTableStatus::Present) {
         SqliteStmt ms;
         if (sqlite3_prepare_v2(legacy.get(), "SELECT key, value FROM audit_retention_meta", -1,
                                ms.addr(), nullptr) != SQLITE_OK) {
@@ -843,7 +1179,23 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
         }
     }
 
-    // 6. Row-count reconciliation (ADR-0040: logged AND asserted).
+    // 6. Whole-file FINGERPRINT reconciliation (ADR-0040: logged AND asserted).
+    // Not a bare count. A bare count is defeated by a foreign writer occupying
+    // an id this legacy file also claims: `ON CONFLICT (id) DO NOTHING`
+    // silently drops the legacy row, and IF a native row already held that id
+    // (Gate 3 architect F2 / Sol's diagnosis of the A-4 race — a fileless peer
+    // stamps the marker sourcelessly, then writes native rows starting at
+    // id=1, the same id this legacy file's own first row claims), the total
+    // row count comes out unchanged: one row lost, one row gained, same id.
+    // `SUM(id)` does not catch it either — the id itself is still there,
+    // just holding different content. The TIMESTAMP components do: a native
+    // write's timestamp is "now", a legacy event's timestamp is historical,
+    // and they coincide only by extraordinary coincidence.
+    //
+    // This whole-file fingerprint is ALSO what gets stamped as
+    // `backfill_source_fingerprint` below — the value a LATER boot compares a
+    // still-present legacy file against (see the marker-present branch).
+    LegacyFingerprint whole_legacy_fp;
     {
         auto lease = pool_.acquire();
         if (!lease) {
@@ -853,34 +1205,61 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             return false;
         }
         pg::PgResult pc = pg::exec_params(
-            lease.get(), "SELECT COUNT(*) FROM audit_store.audit_events", std::vector<std::string>{});
+            lease.get(),
+            "SELECT COUNT(*), COALESCE(SUM(id),0), COALESCE(SUM(timestamp),0), "
+            "COALESCE(MIN(timestamp),0), COALESCE(MAX(timestamp),0) FROM "
+            "audit_store.audit_events",
+            std::vector<std::string>{});
         if (pc.status() != PGRES_TUPLES_OK) {
-            spdlog::error("AuditStore: migrate_from_sqlite: reconciliation count failed: {}",
-                          PQerrorMessage(lease.get()));
+            spdlog::error(
+                "AuditStore: migrate_from_sqlite: reconciliation fingerprint read failed: {}",
+                PQerrorMessage(lease.get()));
             backfill_metric("failed");
             return false;
         }
-        const std::int64_t pg_count = to_i64(PQgetvalue(pc.get(), 0, 0));
+        const LegacyFingerprint pg_fp{to_i64(PQgetvalue(pc.get(), 0, 0)),
+                                      to_i64(PQgetvalue(pc.get(), 0, 1)),
+                                      to_i64(PQgetvalue(pc.get(), 0, 2)),
+                                      to_i64(PQgetvalue(pc.get(), 0, 3)),
+                                      to_i64(PQgetvalue(pc.get(), 0, 4))};
+        const auto legacy_fp = legacy_fingerprint(legacy.get(), std::nullopt);
+        if (!legacy_fp) {
+            spdlog::error(
+                "AuditStore: migrate_from_sqlite: legacy whole-file fingerprint read failed: {}",
+                sqlite3_errmsg(legacy.get()));
+            backfill_metric("failed");
+            return false;
+        }
+        whole_legacy_fp = *legacy_fp;
         // EQUALITY, not "at least" (ADR-0040: "no duplication and no loss").
         // The prefix proof above establishes that every pre-existing row was
-        // part of this legacy stream, so after a complete copy the two counts
-        // must match exactly; a surplus means rows arrived from somewhere this
-        // migration cannot account for. `InventoryStore` uses the same `!=`.
-        if (pg_count != legacy_count) {
-            spdlog::error("AuditStore: migrate_from_sqlite: reconciliation FAILED — legacy has {} "
-                          "row(s) but PostgreSQL has {}; refusing to mark complete (fail-closed, "
-                          "the next boot retries)",
-                          legacy_count, pg_count);
+        // part of this legacy stream, so after a complete copy the two
+        // fingerprints must match exactly.
+        if (pg_fp != whole_legacy_fp) {
+            spdlog::error(
+                "AuditStore: migrate_from_sqlite: reconciliation FAILED — legacy has {} row(s) "
+                "(id sum {}, timestamp sum {}, earliest {}, latest {}) but PostgreSQL has {} "
+                "row(s) (id sum {}, timestamp sum {}, earliest {}, latest {}); refusing to mark "
+                "complete (fail-closed, the next boot retries). A matching row COUNT with a "
+                "differing fingerprint means a foreign write occupies one of this file's ids — "
+                "see the batch-collision warning above, if one was logged.",
+                whole_legacy_fp.count, whole_legacy_fp.id_sum, whole_legacy_fp.ts_sum,
+                whole_legacy_fp.ts_min, whole_legacy_fp.ts_max, pg_fp.count, pg_fp.id_sum,
+                pg_fp.ts_sum, pg_fp.ts_min, pg_fp.ts_max);
             backfill_metric("failed");
             return false;
         }
         spdlog::info("AuditStore: migrate_from_sqlite: reconciled — legacy {} row(s), PostgreSQL "
                      "{} row(s) ({} inserted this run)",
-                     legacy_count, pg_count, inserted);
+                     whole_legacy_fp.count, pg_fp.count, inserted);
     }
 
-    // 7. Advance the identity sequence + stamp the one-time marker atomically.
-    if (!stamp_complete()) {
+    // 7. Advance the identity sequence + stamp the one-time marker atomically,
+    // together with the fingerprint that PROVES it: a later boot finding this
+    // marker AND a still-present legacy file compares that file against
+    // exactly this value (see the marker-present branch above), never against
+    // PG's live content.
+    if (!stamp_complete(/*require_empty=*/false, whole_legacy_fp.to_string())) {
         backfill_metric("failed");
         return false;
     }
@@ -888,7 +1267,8 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     // 8. Move the verified legacy file aside (not delete) — the pre-cutover
     // evidence stays recoverable (operator-managed-backup convention). Failure
     // here is NON-fatal: the backfill is already committed + marked, so a
-    // rename failure must not refuse boot.
+    // rename failure must not refuse boot (a later boot's marker-present
+    // verification retries it — see `move_legacy_aside` and the branch above).
     // Close the legacy read-only handle FIRST: Windows refuses to rename a file
     // with an open handle (ERROR_SHARING_VIOLATION), so leaving `legacy` open
     // silently defeated the move-aside on the Wee Tam MSVC leg (POSIX allows
@@ -904,41 +1284,7 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     // still fails on Windows.
     sel.reset();
     legacy.close();
-    std::error_code mv_ec;
-    auto aside = legacy_db_path;
-    aside += ".migrated-" + std::to_string(now_epoch());
-    std::filesystem::rename(legacy_db_path, aside, mv_ec);
-    if (mv_ec) {
-        spdlog::warn("AuditStore: migrate_from_sqlite: backfill complete but could not move legacy "
-                     "{} aside ({}); it is safe to archive/remove manually",
-                     legacy_db_path.string(), mv_ec.message());
-    } else {
-        // Carry the WAL/SHM sidecars across with the main file. A clean shutdown
-        // checkpoints and removes them, so they are usually ABSENT and this loop
-        // does nothing — but after an unclean stop the committed tail lives in
-        // `-wal`, and MEASURED: opening the main file with its `-wal` removed
-        // reports `no such table: audit_events`. Leaving them behind therefore
-        // does not cost us migrated rows (the read-only backfill above reads
-        // through the WAL and got every row), it costs the RETAINED COPY — the
-        // one-release rollback net ADR-0009 calls load-bearing would be moved
-        // aside unopenable. Same non-fatal posture as the main move.
-        for (const char* suffix : {"-wal", "-shm"}) {
-            auto side = legacy_db_path;
-            side += suffix;
-            std::error_code side_ec;
-            if (!std::filesystem::exists(side, side_ec) || side_ec)
-                continue;
-            auto side_aside = aside;
-            side_aside += suffix;
-            std::filesystem::rename(side, side_aside, side_ec);
-            if (side_ec)
-                spdlog::warn("AuditStore: migrate_from_sqlite: moved the legacy audit db but not "
-                             "its {} sidecar ({}); the retained copy at {} may not open standalone "
-                             "until the sidecar is moved beside it",
-                             suffix, side_ec.message(), aside.string());
-        }
-        spdlog::info("AuditStore: migrate_from_sqlite: moved legacy audit db to {}", aside.string());
-    }
+    move_legacy_aside();
 
     backfill_metric("completed");
     return backfill_ok();
