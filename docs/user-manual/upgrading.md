@@ -1221,9 +1221,11 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
   rows, so a large backlog ages out over hours rather than in one statement.
   Watch `yuzu_server_audit_retention_cap_reached_total` alongside
   `yuzu_server_audit_rows_deleted_total` to see whether a backlog is draining.
-  That cap is a fixed drain rate, which implies a sustained ceiling of roughly
-  6.9 audit events/second - compare it against your own event rate before
-  deploying at scale. Note that changing `--audit-retention-days` never re-dates
+  The cap paces at two different cadences depending on whether a backlog is
+  forming — see [Audit Log § Capacity](audit-log.md#capacity) for both
+  figures; comparing your event rate against only the quiet-operation one is
+  overly conservative by roughly three orders of magnitude. Note that
+  changing `--audit-retention-days` never re-dates
   existing rows (`ttl_expires_at` is stamped at INSERT), so a reduction does not
   reclaim disk retroactively. Operator triage when the guard declines a pass:
   [audit-log.md § The retention clock guard](audit-log.md#the-retention-clock-guard).

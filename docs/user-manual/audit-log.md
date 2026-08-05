@@ -627,27 +627,59 @@ cap itself introduces, which neither of the first two would show.
 
 ### Capacity
 
-**The drain is a fixed 25,000 rows per hourly pass** -- about 600,000 rows/day, or
-a sustained ceiling of roughly **6.9 audit events/second**. Above that, expiry
-outruns deletion and the audit store grows without bound;
-`yuzu_server_audit_retention_cap_reached_total` is the signal. Compare that figure
-against your own audit-event rate before deploying at scale. The cap is a
-compile-time constant today, so exceeding it needs an engineering change rather
-than configuration.
+**Two different cadences, not one.** A pass that does NOT hit the per-pass
+25,000-row cap re-arms after the full `cleanup_interval_min` (default 60
+minutes). A pass that DOES hit the cap AND leaves a genuine remainder
+re-arms after `kAuditBacklogRearmSec` (5 seconds) instead — `audit_next_wait_s`
+in `audit_store.hpp` — and keeps doing so every subsequent pass until a pass
+clears the backlog. An earlier revision of this section quoted only the first
+cadence as if it were the hard ceiling; it is not — it is the QUIET
+threshold, the rate below which `cap_reached_total` never moves at all.
 
-The **file-size** ceiling is likely to bind first, though this is an estimate
-rather than a measurement: sustaining 6.9 events/second for a 365-day retention
-window means roughly 219M rows. At an assumed ~200 bytes/row that is on the order
+- **Quiet-operation threshold: ~6.9 audit events/second** (25,000 rows /
+  hourly pass, ~600,000 rows/day). Stay under this and the guard never
+  enters backlog mode — `yuzu_server_audit_retention_cap_reached_total`
+  stays at 0.
+- **The actual drain ceiling is far higher**, because backlog mode
+  self-accelerates: once `cap_reached_total` starts moving, passes run every
+  5 seconds instead of every hour, each still capped at 25,000 rows — up to
+  **~5,000 rows/second** if the DELETE itself stays fast relative to the
+  5-second floor. Measured this session (not a promise for every
+  environment — DELETE cost scales with backlog size, hardware, and
+  concurrent load): a 25,000-row capped delete against a 200,000-row backlog
+  took 44 ms, and against a 5,000,000-row backlog took 570 ms — both
+  comfortably inside the 5-second floor, so the achieved cadence there is
+  genuinely bound by the 5-second sleep, not by DELETE execution time.
+  Exceeding ~6.9 events/second is normal, expected, and self-corrects; the
+  store only grows WITHOUT BOUND if the sustained write rate exceeds the
+  backlog-recovery ceiling itself, which is roughly three orders of
+  magnitude higher than the quiet-operation figure this section used to
+  present as the ceiling.
+- **`yuzu_server_audit_retention_cap_reached_total` rising is not itself a
+  problem** — it means backlog mode engaged, which is the system doing its
+  job faster, not falling behind. Falling behind is `cap_reached_total`
+  rising and STAYING elevated for a sustained period with
+  `yuzu_server_audit_rows_deleted_total` not keeping pace — see
+  `YuzuAuditRetentionCapBinding` (`docs/prometheus/yuzu-alerts.yml`), which
+  alerts on sustained capping, not on a single capped pass.
+
+The cap (25,000 rows/pass) and the re-arm floor (5 seconds) are both
+compile-time constants today, so raising either needs an engineering change
+rather than configuration.
+
+The **file-size** ceiling is likely to bind before the drain-rate ceiling
+does, though this is an estimate rather than a measurement: sustaining even
+the QUIET threshold of 6.9 events/second for a 365-day retention window
+means roughly 219M rows. At an assumed ~200 bytes/row that is on the order
 of 44 GB plus a comparable index footprint in the `audit_store.audit_events`
-table -- but row size
-varies with `principal`, `action`, `detail`, `target` and `user_agent`, so treat
-the byte figure as an order of magnitude, not a threshold. A deployment
-approaching the drain-rate ceiling has a storage problem before it has a
-retention-pacing problem. Audit rows are emitted per REQUEST rather than per
-device, but not only for operator requests: agent enrolment, fleet-topology pushes
-and rejections, and background schedule execution all write rows too, so fleet
-size does influence the rate. Measure your own `yuzu_server_audit_events_total`
-rate rather than assuming an operator-only workload.
+table -- but row size varies with `principal`, `action`, `detail`, `target`
+and `user_agent`, so treat the byte figure as an order of magnitude, not a
+threshold. Audit rows are emitted per REQUEST rather than per device, but
+not only for operator requests: agent enrolment, fleet-topology pushes and
+rejections, and background schedule execution all write rows too, so fleet
+size does influence the rate. Measure your own
+`yuzu_server_audit_events_total` rate rather than assuming an operator-only
+workload.
 
 **The cap also bounds each pass's transaction size.** The old unguarded delete
 cleared its whole backlog in one transaction; capping the pass at 25,000 rows
