@@ -348,6 +348,20 @@ surface being redeemable on another. Consuming it still required the schema chec
 gate, per-handler RBAC and a human approval, so this closes a namespace confusion rather than an
 open escalation.
 
+**Approval tickets outstanding at the upgrade must be re-requested.** This release records which
+surface minted each approval, and rows that predate the column carry no surface at all. Rather than
+assume one they may not have come from, the upgrade labels them with a sentinel that fails closed —
+so an approval ticket approved before the upgrade is refused at recall. It is reported as `approval
+already used (one-time ticket)` even though it was never consumed: that message is deliberately
+identical for every refusal so the recall cannot be used to probe which surface minted a ticket, and
+that is why this note exists rather than the error explaining itself.
+
+Recover by calling the tool again without `approval_id` to mint a fresh ticket and have it
+re-approved. Nothing is lost but the review. The affected population is only what is outstanding at
+upgrade time, it does not grow afterwards, and approvals expire after 7 days regardless. On the
+server side the refusal is distinguishable: the audit row records `refused: foreign_origin`, not the
+uniform client message.
+
 **What changes.** Creating a definition whose id starts `mcp.` is refused with a 400 on every
 authoring route that accepts an explicit id — `POST /api/instructions`, `POST
 /api/instructions/yaml`, and `POST /api/instructions/import` — and such a definition is skipped

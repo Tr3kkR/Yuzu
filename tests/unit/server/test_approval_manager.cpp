@@ -1300,7 +1300,6 @@ TEST_CASE("ApprovalManager: migration v7 reaches a store already at v5",
     // value. v7 is what reaches those. Both rows below carry origin='' and are
     // distinguished ONLY by submitted_at against schema_meta.upgraded_at.
     TestDb tdb;
-    const long long stamp = 1000000;
     REQUIRE(sqlite3_exec(tdb.db,
                          "CREATE TABLE schema_meta (store TEXT PRIMARY KEY,"
                          " version INTEGER NOT NULL, upgraded_at INTEGER NOT NULL DEFAULT 0);"
@@ -1327,7 +1326,6 @@ TEST_CASE("ApprovalManager: migration v7 reaches a store already at v5",
                          "INSERT INTO approvals (id, definition_id, submitted_at, origin)"
                          " VALUES ('mcp-mint', 'mcp.delete_tag', 1000001, '');",
                          nullptr, nullptr, nullptr) == SQLITE_OK);
-    (void)stamp;
 
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
