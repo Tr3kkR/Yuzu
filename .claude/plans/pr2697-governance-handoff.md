@@ -1,10 +1,55 @@
 # PR #2697 (AuditStore -> PostgreSQL) — governance handoff
 
-**State at handoff:** branch `pg/audit-store`, head `3631f04e`, worktree `/home/dgr/yuzu-audit-pg`.
-**Nothing pushed.** Nine commits authored on this branch past the pushed head `31452b85`
-(eight fixes + the `origin/dev` merge). NOTE `git rev-list --count 31452b85..HEAD` reads
-**227**, not 9 — the merge `d928d8ec` brought 218 dev commits with it. Working tree clean. **All four Gate 3 blockers are now fixed** (2026-08-05 session) — see
-"Blockers: CLOSED" below. Gates 4/5/6/6b/8 still not run; Dave held the spend.
+**State as of 2026-08-06 (round 3 complete):** branch `pg/audit-store`, head `2adfda9e`,
+worktree `/home/dgr/yuzu-audit-pg`. **Nothing pushed.** 31 commits authored on this branch
+(first-parent, no-merges) past the pushed head `31452b85`. Working tree clean.
+
+**Round 3 (this session) is DONE — Phase 1 (code) and Phase 2 (docs) of the governing plan
+(`/home/dgr/.claude/plans/how-do-we-get-ethereal-sunbeam.md`) are both complete:**
+- **1a** Marker authority — holder-side fingerprint verification (`a1dc268c`), implementing
+  Sol's diagnosed fix shape. Fable-reviewed afterward (independent, adversarial): confirmed
+  sound, confirmed the deviation from Sol's literal "fail every sourceless boot" rule is
+  deliberate and defensible (a never-booted-on-new-binary holder is a known, deferred,
+  fleet-level detection gap, not a hole in this fix).
+- **1b** Reconciliation integrity — `PQcmdTuples` + fingerprint completion check (folded into 1a).
+- **1c** Corrupt legacy file typed tri-state (folded into 1a).
+- **1d** Retention clock authority — PG's own clock inside the advisory-lock txn, not the
+  caller's (`e3f77a18`); self-caught a false precedent claim in its own comment next commit
+  (`4586964b` — result_set_store.cpp does NOT already do this, verified by reading it).
+- **1e** Five round-2 fix-round defects: MCP `query_audit_log` limit clamp (`ce8962ba`),
+  "nothing was deleted" universal qualified (`30ea8b3d`), `YuzuAuditRetentionCapBinding`
+  threshold re-derived for the 5s re-arm (`79733544`), NUL-truncation in the meta-copy path
+  (`243a6d02`), one-shot lockout docs (`c7695a7c`).
+- **1f** Performance — `ORDER BY/LIMIT` rewrite of the survivor probe (`0dd16d3b`); measured
+  locally (5M-row scratch table) rather than re-citing the prior agent's unverified figures.
+- **Fable follow-up** (`fb121eff`): a real code fix Fable's review caught — marker-present path
+  failed OPEN on a filesystem stat error where the marker-absent path fails closed; fixed +
+  tested (symlink-loop repro).
+- **Phase 2 docs consolidation**, six commits (`8dd12ddb`, `fe33b219`, `c17d0d63`, `c4168f6a`,
+  `6c721bed` + the ADR/upgrading fixes folded into 1a/1e): biggest finding was the drain-rate
+  "sustained ceiling" quoted in FIVE docs (including the SOC2 customer-facing sizing doc) was
+  ~700x too conservative — every doc quoted only the quiet-operation cadence (6.9 events/s) as
+  if it were the hard ceiling, ignoring the 5s backlog-recovery re-arm (measured ceiling: up to
+  ~5,000/s). New runbook `docs/ops-runbooks/audit-store-backfill-recovery.md`. Playbook +
+  ADR-0040 gained the ladder-wide normative rules.
+- **CI fix** (`2adfda9e`): found running `meson test --suite docs` as a final check —
+  `flake-retry.py`'s shard-filter selftest pin had gone stale relative to `66a55fcc` (earlier
+  in this same branch), a real policy-floor test breakage. Fixed.
+
+Every code fix has red-green mutation-test proof in its own commit message. Full server suite
+(4 shards, live PG 18) and `docs` suite (8/8) both green at current head.
+
+**STILL OWED before this can merge** — Phase 3/4/5 of the governing plan, not started this
+session: Gates 4/5/6/6b/8 have never run on ANY of round 3's diff (round 2's Gate 3 blockers
+are what round 3 fixed; round 3 itself is ungoverned). `quality-engineer` (mutation-sweep,
+must run alone/isolated). `build-ci` (meson.build/tests/meson.build changes never reviewed).
+Windows re-verify on DGRHP — has NEVER run on this branch since `c10fcc68`, before every
+round-2 AND round-3 fix. Deferred issues not yet filed (sibling-store marker-authority gap for
+ManagementGroupStore/ResultSetStore — now ALSO includes ResultSetStore's clock-divergence gap,
+found while fixing 1d; Sol's conflict-equality reconciliation; the still-open cpp-safety trio;
+etc. — see ROUND 3 section below for the fuller list, re-triage before filing since some may be
+fixed now). **Ask Dave before running governance** (standing rule — checkpoint before the
+spend) and **before pushing** (separate standing rule, always).
 
 Do NOT work in `/home/dgr/Yuzu` — that is Dave's dirty tree on another branch.
 
@@ -194,6 +239,154 @@ assertions, **within `[audit_store]`** — same scope caveat as the A-1 mutation
 
 Both reviewers confirmed all six author claims, including the anchor-stamp judgement call
 and the single-construction-site universal. Neither could build Windows.
+
+## Governance run 2 (2026-08-05) — Gates 1/2/3 + Gate 7 DONE, ledger written
+
+Ledger: `governance.d/2697-audit-store-postgres.jpGglq.jsonl`, 33 findings — 6 BLOCKING,
+9 SHOULD, 17 NICE, 1 REJECTED. 21 fixed, 11 deferred to issues, 1 rejected.
+
+Agents run: Gate 2 `security-guardian` + `docs-writer`; Gate 3 `architect`, `cpp-expert`,
+`cpp-safety`, `quality-engineer`, `performance`, `cross-platform`. **Gate 3 was launched
+before Gate 2's security agent returned**, so Gate 3 saw only the docs findings — that makes
+them independent reporters rather than downstream echoes, which is why the total-laundering
+defect carries `independent_reporters: 3`.
+
+### Fix commits (Gate 7)
+
+| sha | what |
+|---|---|
+| `39a36740` | write gate on an incomplete backfill (cs-1); sourceless stamp policy + in-txn emptiness re-check (A-4); retention re-arms on a binding cap (PERF-2) |
+| `4920db87` | negative limit is a 400, not a degrade (sec-F1); degraded `total` is null (sec-F3/ce-F1) |
+| `66a55fcc` | `[audit_store]` moved to the lighter Windows PG shard (CP-1) |
+| `003578ac` | ADR's invented ADR-0038/0039 precedent, four false comments, live-path sanitisation, meta integer detector |
+| `6bdd1bc7` | probe-shape guard (the PERF-1 fix had NO test), empty-legacy-table path |
+| `cc303f9f` | the run ledger |
+
+### The shape that cost this round
+
+Three blockers were the SAME defect class as fixes I had already made, one door along:
+A-4 is the empty-table twin of A-1 (I closed stamping over ROWS); cs-1 is the boot-path twin
+of A-2 (I closed the CLI path); sec-F3 was filed LOW in the previous round and came back as a
+3-reporter BLOCKING. `[[feedback-fix-commit-ships-next-defect]]` — fix the SINK.
+
+### Process defect this run produced (`proc-1`)
+
+Three Gate 3 agents were given write access to ONE worktree. cpp-safety built from
+quality-engineer's in-flight mutation and drew a false conclusion from it; a phantom
+`TEST_CASE` from a stale object file appeared in a full-suite run. QE discarded and redid all
+four mutations under a clean-tree discipline after I warned it. **Next run: give every
+mutating agent its own worktree.** I then made a worse version of the same mistake myself —
+`git checkout -- <file>` to revert a mutation, which wiped ~120 lines of uncommitted
+implementation in that file. Commit before mutating; revert the mutation, not the file.
+
+### STILL OWED before this PR can pass
+
+1. **Gate 8 re-review** — the fix diff touches `audit_store.{cpp,hpp}`, `main.cpp`,
+   `server.cpp`, `rest_api_v1.cpp`, `mcp_server.cpp`, `tests/meson.build` and six docs, so
+   the re-trigger set is essentially the whole Gate 2+3 roster plus `build-ci` (meson) and
+   `sre` (retention cadence + alert text).
+2. **Gates 4, 5, 6, 6b have NEVER run on this PR.**
+3. **Windows**: shard B has never run on this branch, and the only Windows run at all was at
+   `c10fcc68`, before every fix. The shard rebalance does not discharge this.
+4. **11 deferred findings to file as issues** — PERF-3/4/5/6, A-7, A-10, docs-3, ce-F6,
+   qe-A2gap, CP-2, CP-3, plus the still-open cpp-safety items (non-idempotent
+   `start_cleanup`, the false no-spdlog-under-lock comment, per-row batch bound,
+   `SQLITE_STATIC`).
+
+## ROUND 3 — Gates 4/6/8 findings + Sol's verdict (2026-08-05, session end)
+
+Head is still `cc303f9f`; NOTHING from this round is fixed. Sol's full opinion is saved beside this
+file at `.claude/plans/pr2697-sol-opinion.md`.
+
+### Sol's verdict, which I agree with
+
+**Stop polishing `Sourceless`.** The rule that matters:
+
+> No process may declare "no legacy audit trail exists" based only on its local filesystem.
+
+A host-local absence of `audit.db` cannot prove deployment-wide absence, and a server boot has no more
+authority to claim it than a CLI one-shot does. That declaration needs either positive proof from a
+valid source, or an explicit durable deployment-level attestation. Documentation + a WARN cannot repair
+an information deficit — and in Kubernetes nobody controls which replica starts first.
+
+Sol's model: a real migration state (`awaiting_source` / `copying` / `verified` / `no_legacy_attested`
+/ `needs_repair`), where only `verified` and `no_legacy_attested` permit serving and native writes, and
+only an explicit operator/install-time authority can create `no_legacy_attested`.
+
+**THIS IS LADDER-WIDE, not an audit defect.** I checked after reading Sol:
+`ManagementGroupStore::migrate_from_sqlite:995` has the identical `if (!legacy_exists)` -> "marking
+complete (fresh install)" shape, and that store is the AUTHORITATIVE confinement substrate.
+`ResultSetStore:349-367` too. The fix belongs in ADR-0012 / `docs/postgres-store-playbook.md` as the
+recipe, not only here. **Check this before doing anything else in round 3.**
+
+### Round-3 blockers (none fixed)
+
+Marker authority (Sol + architect F1 + UP-5 + enterprise-readiness), and note the detection gap
+enterprise-readiness found: the replica that SKIPS its migration takes `spdlog::debug` at
+`audit_store.cpp:410-413` with NO `backfill_metric()` call, so the loss is invisible on the host where
+it happens — wrong host, wrong log level, and masked fleet-wide in the alert. A cheap detector exists
+regardless of the redesign: at the marker-present return, if a legacy file IS present, that is
+"I hold a trail and I am not migrating it" -> WARN + a distinct metric label.
+
+Reconciliation (architect F2, sharpened by Sol): the completion check is a bare `COUNT(*)`
+(`:846`/`:869`), and `inserted += batch.size()` at `:768` is unconditional after
+`ON CONFLICT (id) DO NOTHING` — so the count of rows OFFERED is reported as rows inserted and nothing
+observes the discard. Sol's stronger point: five aggregates check id/timestamp SHAPE, not event
+identity; two rows can share id+timestamp and differ in principal/action/detail. For mandatory
+evidence, conflicts need exact equality on the canonical row.
+
+Corrupt/zero-length legacy file treated as a fresh install (UP-1, measured; Sol concurs — needs a typed
+`Present`/`Absent`/`Error`, because a parse error is never an absence).
+
+Cross-replica clock divergence (UP-2, sec-F4). Sol's class-level fix is better than anything proposed:
+take retention decisions and `last_pass_now` from POSTGRES's clock inside the advisory-lock
+transaction, so every sweeper compares one authority. He grades it HIGH/SHOULD, below silent loss.
+
+Marker loss locking out boot AND break-glass (UP-6). Sol's correction: the "clear
+audit_store.audit_events" advice is at `:610`, the source-present prefix-mismatch path, not the
+sourceless one; and "permanent" means no product-path recovery, not irrecoverable.
+
+MY OWN fix-round defects: MCP `query_audit_log` now returns a silent empty page (the `"minimum":1` I
+added is never validated — `compiled_input_schemas().at().validate()` has ONE call site, `:3203`,
+inside `if (requires_approval(...))`, and `AuditLog:Read` never requires approval); the replacement
+"every site means NOTHING WAS DELETED" universal is false for the thread-boundary catch; the 5s re-arm
+mis-arms `YuzuAuditRetentionCapBinding` (6 increments in ~30s trips a 6h rule); the meta branch
+NUL-truncates via `reinterpret_cast` + implicit `strlen` (the correct idiom with
+`sqlite3_column_bytes` is 40 lines above at `:663`); one-shots now refuse on a never-booted host.
+
+Docs: the drain-rate ceiling is falsified in FIVE shipped docs, each line read rather than
+pattern-matched: `audit-log.md:630`, `upgrading.md:1183`,
+`enterprise-readiness-soc2-first-customer.md:260`, `yuzu-alerts.yml:905`,
+`audit-store-clock-guard.md:127`. (docs-writer said nine; its count included `server-admin.md:2180`,
+which is about pacing and remains true. `audit-log.md:547` likewise.) The runbook is the worst of
+them: `:133` tells an operator to compute a backlog drain estimate from the stale figure and open an
+engineering ticket with that number.
+`audit-store-clock-guard.md` is cited by three shipped alerts and diagnoses SQLite throughout.
+`auth-db-recovery.md:318-326` tells an operator the break-glass row lands in `<data-dir>/audit.db` and
+describes SQLite auto-creating a fresh one — false, on a recovery path. `rest-api.md` documents neither
+breaking change. The changelog omits the live-write sanitisation fix.
+
+PERFORMANCE MEASURED my re-arm justification and it is wrong. THESE ARE THE AGENT'S MEASUREMENTS,
+not re-derived by me — re-run them before treating any figure as load-bearing. A capped pass with a
+real backlog is **169 ms mean / 465 ms max**, not the 41-49 ms I cited (that figure was measured with no backlog — the
+only state the re-arm never runs in). It also measured **9.3 MB WAL per pass = 1.80 MB/s = 6.5 GB/h**
+at the 5s cadence, which my comment does not mention. The PERF-3 `LIMIT 1` rewrite I deferred as LOW
+takes the pass to **59.5 ms** and removes a 57-465 ms non-determinism (`synchronize_seqscans`) — it is
+now the fix that makes my own justification true.
+
+### Gate status
+Gate 8 re-review: security-guardian, architect, cpp-safety, docs-writer, performance DONE.
+Gate 4: all three DONE. Gate 6: sre, compliance-officer, enterprise-readiness DONE.
+NOT run: `build-ci` (tests/meson.build), `quality-engineer` (must run ALONE — it mutates),
+Gate 5 chaos (warranted: 15 UP entries + 7 consistency findings), Gate 6b synthesis.
+
+cpp-safety Gate 8 also flagged the round-2 Resource Ledger correction (line 217 above) as
+now further stale: 1a's holder-verification branch (`audit_store.cpp`, marker-present +
+legacy-file-still-here path) added a fourth `SqliteDb` — `verify_db` — never counted
+anywhere. It is RAII (opens `SQLITE_OPEN_READONLY`, closes at scope exit, no manual
+cleanup), so this is a ledger-completeness gap, not an ownership defect — recorded here
+rather than in `audit_store.cpp` itself, since the Resource Ledger lives in the Gate 1
+summary/handoff doc, not in code comments.
 
 ## Still to do
 
