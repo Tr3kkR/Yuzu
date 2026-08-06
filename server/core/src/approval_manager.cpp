@@ -233,8 +233,15 @@ void ApprovalManager::create_tables() {
         // `upgraded_at` after EVERY migration, so by the time v7 runs the value
         // names when v6 finished — seconds ago — not when the column appeared.
         // A test caught this by asserting a post-column undeclared mint SURVIVES;
-        // it did not. No migration can observe v5's stamp, because every later
-        // migration overwrites it.
+        // it did not. v6 COULD have observed v5's stamp — `set_version` fires
+        // after each migration's SQL, so during v6 the value still named v5's
+        // completion. But v6 has already shipped to exactly the databases this
+        // needs to reach, so the window closed before it was noticed. No
+        // migration addable NOW can see it: every later one overwrites the
+        // stamp. Stated precisely because "impossible" would send the next
+        // author looking for a different mechanism that does not exist, when
+        // the real lesson is that a migration carrying a back-fill must be
+        // written in the same step as the column.
         //
         // So this is deliberately blunt, and it is the SAME outcome the release
         // path already produces: on a server upgrading from any release, v5
