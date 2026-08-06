@@ -39,9 +39,42 @@ DiscoveryDoc build_discovery_doc(json body) {
 
 // Serve `doc` through the standard ETag / Cache-Control / 304 contract
 // (mirrors GET /api/v1/guaranteed-state/schemas, rest_api_v1.cpp).
-void serve_doc(const httplib::Request& req, httplib::Response& res, const DiscoveryDoc& doc) {
+/// Whether a discovery document is the SAME for every caller, or varies with the
+/// caller's own authorization.
+///
+/// This distinction is a security control, not a performance tunable (#2376,
+/// adversarial-review CDX-P2-002). A route whose body depends on the caller's
+/// permissions serves two different representations under ONE URL. Marked
+/// `public`, a shared/intermediary cache may store the privileged
+/// representation and hand it to an unprivileged caller — which walks the
+/// protected half straight across the authorization boundary that the
+/// per-request permission probe just enforced. `private` forbids shared caches
+/// from storing it at all; `Vary` additionally keeps a caller-local cache from
+/// reusing one credential's response for another.
+///
+/// Getting this wrong is invisible in every unit test — the handler returns the
+/// correct body to each caller, and the leak happens in an intermediary nobody
+/// mocks. Choose deliberately when adding a discovery route: if ANY part of the
+/// body is gated on the caller's grants, it is `PerCaller`.
+enum class DocAudience {
+    Everyone,  ///< identical for all callers — safe to share
+    PerCaller, ///< varies with the caller's grants — never shareable
+};
+
+void serve_doc(const httplib::Request& req, httplib::Response& res, const DiscoveryDoc& doc,
+               DocAudience audience) {
     res.set_header("ETag", doc.etag);
-    res.set_header("Cache-Control", "public, max-age=300");
+    if (audience == DocAudience::PerCaller) {
+        res.set_header("Cache-Control", "private, max-age=300");
+        // All THREE credential channels this server accepts must be named, or a
+        // caller-local cache keyed on the named ones alone can serve caller A's
+        // representation to caller B. `X-Yuzu-Token` was missing (Hermes pass 2):
+        // two API-token callers send neither Cookie nor Authorization, so their
+        // cache keys were identical. See auth_routes.cpp's credential resolution.
+        res.set_header("Vary", "Authorization, Cookie, X-Yuzu-Token");
+    } else {
+        res.set_header("Cache-Control", "public, max-age=300");
+    }
     if (req.get_header_value("If-None-Match") == doc.etag) {
         res.status = 304;
         return;
@@ -53,31 +86,65 @@ void serve_doc(const httplib::Request& req, httplib::Response& res, const Discov
 
 // ── /discover/permissions ──────────────────────────────────────────────────
 
-DiscoveryDoc build_permissions_catalog(RbacStore& rbac_store) {
-    json roles_arr = json::array();
-    for (const auto& role : rbac_store.list_roles()) {
-        json perms_arr = json::array();
-        for (const auto& p : rbac_store.get_role_permissions(role.name)) {
-            perms_arr.push_back({{"securable_type", p.securable_type},
-                                 {"operation", p.operation},
-                                 {"effect", p.effect}});
-        }
-        roles_arr.push_back({{"name", role.name},
-                             {"description", role.description},
-                             {"is_system", role.is_system},
-                             {"permissions", std::move(perms_arr)}});
-    }
-
+DiscoveryDoc build_permissions_catalog(RbacStore& rbac_store, bool include_roles) {
+    // #2376: the catalogue is TWO things with different sensitivities, and the
+    // split is the whole point of this parameter.
+    //
+    //   * the TAXONOMY (`securable_types`, `operations`) — a static list of what
+    //     the RBAC model can express. Not authorization topology: it says nothing
+    //     about who holds what, and an agentic worker needs it to author a grant
+    //     at all (A2 discovery). Stays readable at the route's `Infrastructure:Read`.
+    //
+    //   * the ROLE GRID (`roles[].permissions[]`) — every role's actual granted
+    //     securable/operation/effect. That IS the authorization topology the
+    //     #2376 floor exists to protect, and it is strictly MORE than
+    //     `GET /api/v1/rbac/roles` discloses, which the floor already gates on
+    //     `UserManagement:Read`. Serving it here on the route's broader
+    //     `Infrastructure:Read` made this an alternate transport around the
+    //     floor: on an RBAC-off install (the default) the legacy fallback allows
+    //     every `Read` to any authenticated session, so a plain `user` refused at
+    //     /rbac/roles could read the entire grid here instead.
+    //
+    // Found by the adversarial-review panel (Codex) AFTER a 14-agent governance
+    // run passed the change — that run verified coverage of the floored
+    // SECURABLES and never asked which OTHER securable reaches the same DATA.
+    // Do not re-merge these two halves under one gate.
     json body = {
         {"version", 1},
         {"description",
          "RBAC permission catalog: every securable_type x operation pair the RBAC "
-         "store recognizes, plus the full role -> allowed-operations grid. "
-         "Agentic-first (A1/A2) discovery — docs/agentic-first-principle.md."},
+         "store recognizes. The full role -> allowed-operations grid is included "
+         "only for callers holding UserManagement:Read (#2376 authorization-topology "
+         "floor). Agentic-first (A1/A2) discovery — docs/agentic-first-principle.md."},
         {"securable_types", rbac_store.list_securable_types()},
         {"operations", rbac_store.list_operations()},
-        {"roles", std::move(roles_arr)},
     };
+
+    if (include_roles) {
+        json roles_arr = json::array();
+        for (const auto& role : rbac_store.list_roles()) {
+            json perms_arr = json::array();
+            for (const auto& p : rbac_store.get_role_permissions(role.name)) {
+                perms_arr.push_back({{"securable_type", p.securable_type},
+                                     {"operation", p.operation},
+                                     {"effect", p.effect}});
+            }
+            roles_arr.push_back({{"name", role.name},
+                                 {"description", role.description},
+                                 {"is_system", role.is_system},
+                                 {"permissions", std::move(perms_arr)}});
+        }
+        body["roles"] = std::move(roles_arr);
+    } else {
+        // Say so EXPLICITLY rather than omitting silently. An agentic worker that
+        // cannot tell "no roles exist" from "you may not see them" will report the
+        // fleet has no RBAC roles — the same absent-vs-empty trap the upgrade note
+        // warns evidence collectors about.
+        body["roles_omitted"] = true;
+        body["roles_omitted_reason"] =
+            "requires UserManagement:Read (#2376 authorization-topology floor); "
+            "the securable_types and operations taxonomy above is unaffected";
+    }
     return build_discovery_doc(std::move(body));
 }
 
@@ -377,7 +444,18 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::AuthFn auth_fn,
                  // A corrupt/locked store row can throw mid-scan — a raw 500 would
                  // break the A4 contract this surface teaches (governance UP-11).
                  try {
-                     serve_doc(req, res, build_permissions_catalog(*rbac_store));
+                     // Probe for the grid permission with a throwaway response
+                     // (the established idiom — see the quarantine per-record
+                     // admit probe in rest_api_v1.cpp). A denial here must NOT
+                     // 403 the route: the taxonomy is still served.
+                     httplib::Response probe;
+                     const bool include_roles =
+                         perm_fn(req, probe, "UserManagement", "Read");
+                     serve_doc(req, res,
+                               build_permissions_catalog(*rbac_store, include_roles),
+                               // PerCaller: the role grid is present only for a
+                               // UserManagement:Read holder (see the probe above).
+                               DocAudience::PerCaller);
                  } catch (const std::exception&) {
                      discover_503(res, "discovery store read failed");
                  }
@@ -392,7 +470,8 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::AuthFn auth_fn,
                      return;
                  }
                  try {
-                     serve_doc(req, res, build_instructions_catalog(*instruction_store));
+                     serve_doc(req, res, build_instructions_catalog(*instruction_store),
+                               DocAudience::Everyone);
                  } catch (const std::exception&) {
                      discover_503(res, "discovery store read failed");
                  }
@@ -405,14 +484,14 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::AuthFn auth_fn,
                  // openapi_spec_json() is compiled-in — no store dependency, always
                  // answerable (matches the scope-kinds "answers even when everything
                  // else is down" property).
-                 serve_doc(req, res, build_routes_catalog(openapi_spec_json()));
+                 serve_doc(req, res, build_routes_catalog(openapi_spec_json()), DocAudience::Everyone);
              });
 
     sink.Get("/api/v1/discover/scope-kinds",
              [perm_fn](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Infrastructure", "Read"))
                      return;
-                 serve_doc(req, res, scope_kinds_catalog());
+                 serve_doc(req, res, scope_kinds_catalog(), DocAudience::Everyone);
              });
 
     sink.Get("/api/v1/discover/plugins",
@@ -439,7 +518,13 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::AuthFn auth_fn,
                          enrich = instruction_store;
                  }
                  try {
-                     serve_doc(req, res, build_plugins_catalog(*agent_registry, enrich));
+                     // PerCaller: `enrich` gates parameter_schema on the caller's
+                     // InstructionDefinition:Read. That has varied per caller since the
+                     // enrichment gate landed, so this route was publicly cacheable while
+                     // permission-varying BEFORE #2376 — a pre-existing instance of the
+                     // same class, fixed here because the fix is the shared helper.
+                     serve_doc(req, res, build_plugins_catalog(*agent_registry, enrich),
+                               DocAudience::PerCaller);
                  } catch (const std::exception&) {
                      discover_503(res, "discovery store read failed");
                  }

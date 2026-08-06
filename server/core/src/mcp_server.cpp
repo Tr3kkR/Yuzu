@@ -719,7 +719,7 @@ static const ToolDef kTools[] = {
 
     {"list_engine_principals",
      "List engine principals with each principal's active-credential count (admin/auditor "
-     "surface). Mirrors GET /api/v1/engine-principals. Requires Security:Read.",
+     "surface). Mirrors GET /api/v1/engine-principals. Requires EnginePrincipal:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("include_revoked":{"type":"boolean","default":true,"description":"false restricts to lifecycle_state=active only"})j"
      R"j(}})j",
@@ -727,7 +727,7 @@ static const ToolDef kTools[] = {
 
     {"get_engine_principal",
      "Get one engine principal's identity row plus its active-credential count. Mirrors GET "
-     "/api/v1/engine-principals/{id}. Requires Security:Read.",
+     "/api/v1/engine-principals/{id}. Requires EnginePrincipal:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"})j"
      R"j(},"required":["principal_id"]})j",
@@ -930,7 +930,7 @@ static const ToolDef kTools[] = {
      "List the fleet-wide RBAC roles currently assigned to one engine principal — the "
      "read-only discovery step before assign_engine_role/unassign_engine_role, and the way "
      "to audit what an autonomous module can actually do right now. Mirrors GET "
-     "/api/v1/engine-principals/{id}/roles. Requires Security:Read.",
+     "/api/v1/engine-principals/{id}/roles. Requires EnginePrincipal:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix"})j"
      R"j(},"required":["principal_id"]})j",
@@ -1281,8 +1281,8 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"mint_engine_credential", {"Security", "Write"}},
     {"rotate_engine_credential", {"Security", "Write"}},
     {"confirm_engine_rotation", {"Security", "Write"}},
-    {"list_engine_principals", {"Security", "Read"}},
-    {"get_engine_principal", {"Security", "Read"}},
+    {"list_engine_principals", {"EnginePrincipal", "Read"}},
+    {"get_engine_principal", {"EnginePrincipal", "Read"}},
     {"audit_engine_no_admin", {"AuditLog", "Read"}},
     // PR 4.2 (design §4.1) — engine-principal role-assignment MCP twins of
     // /api/v1/engine-principals/{id}/roles. Mutations map to Security:Write
@@ -1292,7 +1292,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // note above on why this invariant matters).
     {"assign_engine_role", {"Security", "Write"}},
     {"unassign_engine_role", {"Security", "Write"}},
-    {"list_engine_roles", {"Security", "Read"}},
+    {"list_engine_roles", {"EnginePrincipal", "Read"}},
     // Agentic demo/read helpers.
     {"get_fleet_posture_fast", {"Infrastructure", "Read"}},
     {"classify_operational_question", {"Infrastructure", "Read"}},
@@ -1427,7 +1427,7 @@ constexpr std::string_view kRbacSecurables[] = {
     "AuditLog",       "Response",           "ManagementGroup",       "ApiToken",
     "Security",       "Policy",             "DeviceToken",           "SoftwareDeployment",
     "License",        "FileRetrieval",      "GuaranteedState",       "Inventory",
-    "AccessReview",   "SoftwareLicensing"};
+    "AccessReview",   "SoftwareLicensing",  "EnginePrincipal"};
 
 // Borrowed (name, input_schema_json) row for the registration validator's
 // 4th sequence (#2405). Views are valid only for the duration of the call.
@@ -5916,16 +5916,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // The three wiring deps are part of eligibility, not assertions: a
                 // build_handler caller that omits any of them (every pre-3b test)
                 // gets today's plain path rather than a stream it cannot service.
-                // 3b ships DORMANT. The machinery below is complete and reviewed, but
-                // two bounds defects are open against it - #2739 (the 120 s response
-                // cap does not fire on a busy execution; the arbitration is in
-                // mcp_stream_bridge.cpp's project_record, gated on !want_progress &&
-                // !want_terminal) and #2740 (an undelivered final holds one of the
-                // session's four streamed slots; the admission sum is in
-                // McpStreamBridge::reserve). Shipping it
-                // on by default would put a documented bound on four operator surfaces
-                // that the implementation does not honour. The follow-up PR carries
-                // both fixes, hardened over five governance rounds, and flips this.
+                // 3b still ships DORMANT, but no longer because it is unsound: the
+                // four defects that gated the flip are fixed - #2739 (the response
+                // cap now fires on a busy execution: the drain-then-settle state in
+                // mcp_stream_bridge.cpp's project_record), #2740 (an undelivered
+                // final no longer holds a session slot for good: the reclaim in
+                // McpStreamBridge::reserve), #2785 (POST frames carry the ring event
+                // id) and #2789 (per-principal reject coverage). Turning the default
+                // on is a SEPARATE rung, so this flag stays off here.
                 //
                 // nullptr reads as OFF, so every caller that does not opt in - incl.
                 // every pre-3b test - gets the plain path, matching the wiring-deps
@@ -6025,12 +6023,50 @@ McpServer::HandlerFn McpServer::build_handler(
                                 return;
                             } else {
                                 // global_cap | pin_slots - capacity, retryable.
+                                //
+                                // #2740: the pin_slots remediation is chosen by what
+                                // was actually holding the slots, because ONE sentence
+                                // cannot be true of both states. "Wait for one to
+                                // finish" is sound advice while charges are
+                                // outstanding (calls that reserved and have not
+                                // settled a terminal), and was actively misleading
+                                // when every slot held a COMMITTED final no wire had
+                                // taken delivery of - a conforming client honouring
+                                // retry_after_ms slid the session TTL on every retry,
+                                // so it never idled out either.
+                                //
+                                // Admission now reclaims such a final - parked or
+                                // orphaned - rather than refusing, so reaching this arm
+                                // means the reclaim found nothing to take. Three states
+                                // do that, and the text must be true of ALL of them:
+                                // a final still being WRITTEN by a live pump (which a
+                                // short wait does clear), and a transient decline while
+                                // one of the session's records is mid-projection (which
+                                // a retry clears) - so "waiting will not help" would be
+                                // false. Retrying is honest for both; only the third,
+                                // a genuinely stuck slot, needs a fresh session, and
+                                // the client cannot tell which it is from here.
+                                const char* pin_remediation =
+                                    rr.pin_slots_held == McpStreamBridge::PinSlotsHeld::kPins
+                                        ? "this session's streamed slots are held by results "
+                                          "that have not yet reached a client. Retry: a result "
+                                          "still being written frees its slot as it lands. If "
+                                          "this persists across several retries, collect the "
+                                          "outstanding results by resuming the GET channel with "
+                                          "ONE BELOW the lowest id you still need: replay "
+                                          "starts strictly ABOVE the cursor, and the cursor "
+                                          "releases every pinned final at or below it on this "
+                                          "session. If the resume answers with a gap, or you have no "
+                                          "cursor to send, re-initialize for a "
+                                          "fresh session and fetch results by "
+                                          "execution_id"
+                                        : "this session already has the maximum streamed calls "
+                                          "in flight; wait for one to finish";
                                 streamed_reject(
                                     429, mcp::kMcpStreamCap, "Streamed request capacity reached",
                                     why == "pin_slots" ? "post_pin_slots" : "post_global_cap",
                                     why == "pin_slots"
-                                        ? "this session already has the maximum streamed calls in "
-                                          "flight; wait for one to finish"
+                                        ? pin_remediation
                                         : "retry shortly, or retry without an SSE Accept for a "
                                           "plain response",
                                     mcp::kMcpStreamedPostRetryAfterMs);
@@ -8036,13 +8072,13 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "list_engine_roles") {
-                if (!tier_allows(tier, "Security", "Read")) {
+                if (!tier_allows(tier, "EnginePrincipal", "Read")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Security", "Read"))
+                if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                     return;
                 if (!rbac_store || !rbac_store->is_open()) {
                     res.set_content(error_response(id, kInternalError, "RBAC store not available"),
@@ -8202,13 +8238,13 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "list_engine_principals") {
-                if (!tier_allows(tier, "Security", "Read")) {
+                if (!tier_allows(tier, "EnginePrincipal", "Read")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Security", "Read"))
+                if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                     return;
                 if (deny_if_engine_session())
                     return;
@@ -8249,13 +8285,13 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "get_engine_principal") {
-                if (!tier_allows(tier, "Security", "Read")) {
+                if (!tier_allows(tier, "EnginePrincipal", "Read")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Security", "Read"))
+                if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                     return;
                 if (deny_if_engine_session())
                     return;
@@ -9347,7 +9383,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto doc = yuzu::server::build_permissions_catalog(*rbac_store);
+                // #2376: same split as the REST twin — probe for the grid
+                // permission, never deny the whole tool over it.
+                httplib::Response perm_probe;
+                const bool include_roles =
+                    perm_fn(req, perm_probe, "UserManagement", "Read");
+                auto doc =
+                    yuzu::server::build_permissions_catalog(*rbac_store, include_roles);
                 auto result = tool_result(doc.json, kObjectOutputSchema);
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");
