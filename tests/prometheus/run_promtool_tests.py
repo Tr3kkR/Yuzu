@@ -224,26 +224,31 @@ def inspect_test_file() -> CaseFacts | None:
     try:
         import yaml  # noqa: PLC0415 - see below
     except ImportError:
-        # FAIL CLOSED WHEN OPTED IN. Without PyYAML the case-count and
-        # rule_files-binding checks are skipped, and those are what stop a
-        # vacuous run reporting success - so degrading them silently is worst
-        # exactly where the gate is authoritative. The `docs-lint` job runs this
-        # script DIRECTLY, with no `meson setup`, so the repo's PyYAML build
-        # dependency does NOT vouch for that environment (external review,
-        # #2553: the reviewer who checked the runner image rejected the
-        # meson-implies-PyYAML argument, and was right).
+        # FAIL CLOSED, UNCONDITIONALLY. Without PyYAML the assertion-count checks
+        # cannot run, and those are the whole reason a green promtool exit counts
+        # as evidence - promtool itself exits 0 on a suite that asserts nothing.
         #
-        # Unset opt-in = a developer running it by hand: skip, do not block.
-        if os.environ.get(DOCKER_OPT_IN):
-            sys.exit(
-                "FAIL: PyYAML is unavailable, so the case-count and rule_files "
-                "binding checks cannot run - and those are what stop a vacuous "
-                f"run passing. Refusing to report success from the {DOCKER_OPT_IN} "
-                "path on a weakened gate. Install PyYAML (`pip install pyyaml`)."
-            )
-        print("note: PyYAML unavailable; skipping the assertion-count checks",
-              flush=True)
-        return None
+        # An earlier revision fail-closed only when the docker opt-in was set, on
+        # the reasoning that an unset opt-in meant a developer running it by hand
+        # who should not be blocked. That was wrong, and BOTH external reviewers
+        # blocked on it independently (#2553): a native promtool of the pinned
+        # major reaches this function with the opt-in UNSET, so the guard
+        # switched itself off on exactly the path the docstring promises will
+        # "run it, and FAIL on a bad rule". Reproduced three times - a fake
+        # major-3 promtool, PyYAML blocked, a case with no assertion blocks, and
+        # the harness exited 0.
+        #
+        # This CANNOT redden a CI leg. `main()` returns SKIP (77) before `gate()`
+        # is ever called whenever there is no usable promtool and no opt-in, and
+        # no CI leg has a native promtool - so this line is unreachable there.
+        # Measured, because that is the regression two reviewers warned about.
+        sys.exit(
+            "FAIL: PyYAML is unavailable, so the assertion-count checks cannot "
+            "run - and those are what stop a suite that asserts nothing from "
+            "reporting success. Refusing to call a promtool exit 0 evidence on a "
+            "weakened gate. Install PyYAML (`pip install pyyaml`), or unset any "
+            "promtool from PATH to skip these tests instead."
+        )
     try:
         with (REPO_ROOT / TESTS).open(encoding="utf-8") as fh:
             doc = yaml.safe_load(fh) or {}
