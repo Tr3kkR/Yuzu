@@ -315,6 +315,28 @@ three `get_group_roles` call sites that test whether the *caller* is an
 `ITServiceOwner`, and the self-read of one's own roles — are correctly outside
 this table.
 
+### 10. The probe reuses the auditing gate, so the new counter is noisy — known, filed, not fixed here
+
+`security-guardian`'s final pass on the fix diff caught this and correctly declined to gate on it.
+
+The probe pattern decisions 8 and 9 introduce calls `require_permission` a second time with a
+throwaway response. That function **audits and meters every denial**, so an ordinary non-admin
+calling `/api/v1/discover/permissions` (or the mgmt-group roles route) now emits an
+`auth.permission_required` `denied` row and increments
+`yuzu_auth_topology_floor_denied_total{permission="UserManagement:Read"}` — the counter this very
+change introduced as the signal for someone probing the authorization topology. Routine discovery
+traffic is therefore indistinguishable from the attack the metric exists to surface.
+
+**Not fixed here, deliberately.** A non-auditing probe mode changes an authorization chokepoint, which
+warrants its own review rather than a late addition to a security PR — and the idiom is not new: the
+pre-existing quarantine per-record admit probe does exactly the same thing. Tracked as **#2829**,
+which must migrate all the probe call sites together.
+
+**Documented rather than left implicit.** `docs/user-manual/rbac.md` now carries an explicit caveat
+telling operators not to alert on this counter alone until #2829 lands. Shipping a metric as an
+alertable security signal while knowing it is polluted would be harmful operator guidance, which is
+the one category of finding this change has been most careful about.
+
 ## Hard-invariant check
 
 - The floor set is a fixed, `constexpr` array (`kTopologyFloor`) — no

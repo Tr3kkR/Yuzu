@@ -101,6 +101,14 @@ distinguish them. A denial from the floor is audited with a distinct reason
 (`"topology floor: ..."` on the `auth.permission_required` /
 `auth.scoped_permission_required` audit actions, `result=denied`) and
 counted in `yuzu_auth_topology_floor_denied_total{permission}`, separate
+
+> **Caveat — this counter is currently noisy (#2829).** Routes that PROBE a second
+> permission to decide whether to include part of a response — `GET /api/v1/discover/permissions`,
+> its MCP twin, and `GET /api/v1/management-groups/{id}/roles` — run that probe through the same
+> auditing permission gate. An ordinary non-admin call therefore increments this counter and writes
+> an `auth.permission_required` `denied` row for a permission the caller never asked for. Until
+> #2829 lands, do **not** alert on this counter alone as evidence of someone probing the
+> authorization topology — correlate with the route in the audit row first.
 from an ordinary legacy-fallback denial, so a spike in floored denials is
 visible without grepping audit-log text.
 
