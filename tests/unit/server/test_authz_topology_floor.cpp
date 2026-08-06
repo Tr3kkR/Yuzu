@@ -44,6 +44,7 @@
 #include <memory>
 #include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -64,10 +65,10 @@ yuzu::test::PgTestTemplate authz_floor_audit_tpl{"authzflooraudit", [](const std
         throw std::runtime_error("authzflooraudit template: store failed to migrate");
 }};
 
-/// Wires a real (SQLite-backed) RbacStore + AuditStore behind AuthRoutes, so
-/// each test only has to mint a cookie session and call
+/// Wires a real SQLite-backed RbacStore + Postgres-backed AuditStore (ADR-0040)
+/// behind AuthRoutes, so each test only has to mint a cookie session and call
 /// require_permission/require_scoped_permission directly — no ApiTokenStore
-/// (PG-backed) or engine-principal machinery needed for the human-session
+/// (also PG-backed) or engine-principal machinery needed for the human-session
 /// matrix below (`api_token_store=nullptr`; AuthRoutes null-guards it, and
 /// resolve_session's cookie branch never touches it — mirrors
 /// test_auth_routes_hardened.cpp's HardenedHarness).
@@ -86,6 +87,18 @@ struct FloorFixture {
 
     FloorFixture() {
         REQUIRE(rbac_store.is_open());
+        // Gate 3 quality-engineer (merge-fix retroactive review): unlike
+        // HardenedHarness, this fixture has no earlier-constructed PG member
+        // to inherit a SKIP from (rbac_store above is SQLite-only) — needs
+        // its own explicit guard, matching ModelHarness's shape
+        // (test_access_review_model.cpp) exactly. Without this, every
+        // FloorFixture-constructing TEST_CASE hard-FAILs rather than skips
+        // when YUZU_TEST_POSTGRES_DSN is unset, breaking the standard
+        // skip-vs-fail contract for local dev runs with no Postgres up (not
+        // CI-visible — ensure-postgres.sh guarantees a DSN there).
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
         audit_db.emplace(authz_floor_audit_tpl);
         INFO("[FloorFixture] audit db status (blank == ok): " << audit_db->error());
         REQUIRE(audit_db->available());

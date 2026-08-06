@@ -185,6 +185,25 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   first-generation `if (!legacy_exists) → mark complete` shape this closes; porting the
   holder-side check to them is tracked, not yet done (#2697 deferred this ladder-wide — the fix
   landed for AuditStore only, as the mandatory-evidence case).
+- **Long-lived migration branches accumulate test-file drift against the pre-migration API —
+  budget for it on every `dev`-merge, not just the first.** Any test file that constructs the
+  store via its old constructor fails to compile once the branch merges current `origin/dev` —
+  whether that file already existed and gained new cases in `dev` while the migration branch was
+  in flight, or is brand new, added by an unrelated, already-merged PR that forked before the
+  migration branch did. The CI merge-ref build fails on all platforms either way; this is not a
+  defect in the migrating branch's own work, and it recurred twice within `AuditStore`'s own
+  migration (#2697): once against an existing file gaining cases in `dev`, once against a
+  brand-new file from an unrelated already-merged PR. The fix is always the same mechanical
+  shape: migrate the test's construction to `PgTestTemplate`/`PgPool` following an established
+  Harness in the same directory, reconcile any call site relying on the old return type (the
+  previous bullet's decision on authoritative-read typing), give the migrated fixture its own
+  explicit `if (pg_admin_dsn_env() == nullptr) SKIP(...)` guard if it has no earlier-constructed
+  PG member to inherit one from (copying a Harness's SKIP-via-earlier-member shape onto a
+  fixture that lacks that earlier member silently turns "skip locally" into "hard-fail
+  locally"), and tag `[pg]` on exactly the `TEST_CASE`s whose bodies construct the migrated
+  fixture — verified per case, never blanket-applied to the file. A branch expected to outlive a
+  single `dev`-sync cycle should re-sync frequently: a smaller delta is easier to triage for
+  which changed test file touches the store's old constructor.
 
 ## Anti-patterns reviewers reject
 
