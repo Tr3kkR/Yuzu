@@ -81,28 +81,38 @@ MCP_SERVER_DOC="docs/mcp-server.md"
 ADR_DOC="docs/adr-1005-execution-plan.md"
 
 # A multi-line claim_region() extractor's stop condition is a FORMAT ASSUMPTION about
-# future edits (e.g. "the next decision item starts with `N. **`"), not a syntactic
-# guarantee - unlike an all-`grab`ped C++ describe() call, prose formatting can drift
-# without anyone intending to break the gate. If a future sibling item is reformatted so
-# the stop pattern never matches, grab keeps consuming lines - which can absorb a sibling's
-# unrelated mention of a residual counter into the CURRENT claim's region and silently
-# re-open the #2827 masking class this gate exists to close (reproduced against the ADR
-# extractor in governance review of this same PR - a "16)" heading instead of "16." never
-# matched the stop regex, and item 16's incidental counter mention got absorbed into
-# decision 15's region, masking a deliberately stale decision-15 claim).
+# future edits (e.g. "the next table row starts with `|`"), not a syntactic guarantee -
+# unlike an all-`grab`ped C++ describe() call bounded by a fixed string, prose/config
+# formatting can drift without anyone intending to break the gate. If a future sibling
+# item is reformatted so the stop pattern never matches, grab keeps consuming lines -
+# which can absorb a sibling's unrelated mention of a residual counter into the CURRENT
+# claim's region and silently re-open the #2827 masking class this gate exists to close.
 #
-# TWO DEFENSES, not one, because they close different-sized failures. The real fix for the
-# reproduced case is a STOP PATTERN broad enough to recognize a plausible reformat - the
-# ADR's now matches any `N.`/`N)` numbered item regardless of emphasis style, and
-# MCP_SERVER_DOC's now also stops at the next bold paragraph lead, not blank-line-only. A
-# hardened pattern still can't enumerate every future format, so MAX_REGION_LINES is a
-# SEPARATE backstop against the case a hardened pattern can't help: a terminator that
-# matches nothing at all and runs to EOF, or absorbs many lines rather than one. It is
-# deliberately sized well above every surface's real region (the largest today, the hpp
-# derivation block, is ~105 lines) rather than tuned to catch a small absorption - a first
-# attempt at a tight shared cap (60) both false-DRIFTed on that legitimately-long block and
-# did nothing against the 1-line exploit it was meant to catch, which is why the stop
-# patterns, not the cap, are the primary defense.
+# Two rounds of governance review on this same PR proved that for FREE-FORM PROSE (no
+# syntax external to this file enforces a "next item" shape), no finite stop-pattern
+# broadening closes this class - there is always another plausible reformat one step
+# outside it (demonstrated against the ADR arm: `16) *Title*` defeated the first stop
+# regex, and after broadening it to accept any numbered-list start, a lettered/decimal/
+# em-dash sibling item still would have defeated the second). ADR_DOC and MCP_SERVER_DOC
+# - the two arms with no syntax forcing a predictable sibling shape - are therefore
+# single-line captures now (see their own arms), sidestepping the guessing game rather
+# than continuing to chase it.
+#
+# The remaining multi-line arms (ALERTS, HELP, RUNBOOK, HOME_HDR) keep scanning multiple
+# lines because their stop conditions are anchored to EXTERNAL SYNTAX a human can't
+# casually reformat without also breaking something else that would be independently
+# caught - YAML alerting-rule structure, a C++ string literal's closing paren, a markdown
+# table's leading `|`, a Doxygen `///` comment prefix. Each still gets an explicit
+# `terminated` flag (matching HELP's original design) so running off the end of the file
+# without ever positively confirming the boundary fails closed rather than silently
+# printing whatever was captured - "another pattern happened to match" and "we ran out of
+# file" must not be indistinguishable outcomes. MAX_REGION_LINES bounds the same four arms
+# against a terminator that matches nothing at all and runs on for many lines rather than
+# EOF; it is sized well above every one of their real regions (the largest today, the hpp
+# derivation block, is ~105 lines) - a first attempt at a tight shared cap (60) both
+# false-DRIFTed on that legitimately-long block and did nothing against a 1-line
+# absorption, which is why a size cap was never the right defense for the single-line
+# arms' problem in the first place.
 MAX_REGION_LINES=250
 
 # THE STATING SURFACES - ONE list, and every check that iterates surfaces (checks b/c/d;
@@ -156,7 +166,7 @@ claim_region() {
                     if (n == 1) { grab = 1; buf = line "\n"; cnt = 1; next }
                     grab = 0; next
                 }
-                grab && line ~ /^[[:space:]]*#?[[:space:]]*-[[:space:]]*alert:/ { grab = 0 }
+                grab && line ~ /^[[:space:]]*#?[[:space:]]*-[[:space:]]*alert:/ { grab = 0; terminated = 1 }
                 grab {
                     cnt++
                     if (cnt > max) { overrun = 1; grab = 0; next }
@@ -166,6 +176,7 @@ claim_region() {
                     if (n == 0) { print "ERR anchor-missing"; exit 1 }
                     if (n > 1)  { print "ERR anchor-ambiguous"; exit 1 }
                     if (overrun) { print "ERR region-overrun"; exit 1 }
+                    if (!terminated) { print "ERR terminator-missing"; exit 1 }
                     printf "%s", buf
                 }
             ' "$f"
@@ -225,7 +236,7 @@ claim_region() {
                     grab = 0; next
                 }
                 grab {
-                    if (index(stripped, "|") != 1) { grab = 0; next }
+                    if (index(stripped, "|") != 1) { grab = 0; terminated = 1; next }
                     cnt++
                     if (cnt > max) { overrun = 1; grab = 0; next }
                     buf = buf line "\n"
@@ -234,6 +245,7 @@ claim_region() {
                     if (n == 0) { print "ERR anchor-missing"; exit 1 }
                     if (n > 1)  { print "ERR anchor-ambiguous"; exit 1 }
                     if (overrun) { print "ERR region-overrun"; exit 1 }
+                    if (!terminated) { print "ERR terminator-missing"; exit 1 }
                     printf "%s", buf
                 }
             ' "$f"
@@ -252,8 +264,8 @@ claim_region() {
                     grab = 0; next
                 }
                 grab {
-                    if (index(stripped, "/// ###") == 1) { grab = 0; next }
-                    if (index(stripped, "///") != 1) { grab = 0; next }
+                    if (index(stripped, "/// ###") == 1) { grab = 0; terminated = 1; next }
+                    if (index(stripped, "///") != 1) { grab = 0; terminated = 1; next }
                     cnt++
                     if (cnt > max) { overrun = 1; grab = 0; next }
                     buf = buf line "\n"
@@ -262,79 +274,79 @@ claim_region() {
                     if (n == 0) { print "ERR anchor-missing"; exit 1 }
                     if (n > 1)  { print "ERR anchor-ambiguous"; exit 1 }
                     if (overrun) { print "ERR region-overrun"; exit 1 }
+                    if (!terminated) { print "ERR terminator-missing"; exit 1 }
                     printf "%s", buf
                 }
             ' "$f"
             ;;
         "$MCP_SERVER_DOC")
-            # Region = the "A pin released to admit a new call" paragraph: anchor line
-            # through the next blank line OR the next bold-lead paragraph, whichever comes
-            # first. Anchored at LINE START - the phrase also occurs mid-line in a same-file
-            # cross-reference table row, which a bare `index() > 0` anchor would count as a
-            # second occurrence and wrongly call ambiguous.
-            #
-            # The bold-lead stop is defense-in-depth, not merely blank-line: every paragraph
-            # in this section follows a `**Title.**` lead-in convention (see "Monotonicity.",
-            # "Terminal durability." nearby), so a future edit that drops the blank-line
-            # separator between two paragraphs still stops correctly, rather than absorbing
-            # the next paragraph's prose into this one's claim region.
-            awk -v max="$MAX_REGION_LINES" '
+            # Region = the anchor line ONLY - single-line capture, like MANUAL. NOT a
+            # multi-line scan for "the next paragraph": an earlier version of this arm
+            # scanned to a blank line or a bold-lead line, and governance review on this
+            # same PR proved that a FINITE stop pattern for "what does the next paragraph
+            # look like" can always be evaded by some plausible future reformat (the same
+            # problem hit ADR_DOC below, worse - see its comment for the fuller account).
+            # The real claim here has always been one physical line; single-line capture
+            # cannot absorb a neighbor's content because it never looks past the anchor.
+            # If this paragraph is ever legitimately rewrapped across multiple lines, this
+            # extractor under-captures the wrapped portion - which fails CLOSED (the
+            # region tests as "names one" or "names neither") and forces a claim_region()
+            # update, rather than silently absorbing whatever text follows.
+            awk '
                 { line = $0; sub(/\r$/, "", line); stripped = line; sub(/^[[:space:]]+/, "", stripped) }
                 index(stripped, "**A pin released to admit a new call") == 1 {
                     n++
-                    if (n == 1) { grab = 1; buf = line "\n"; cnt = 1; next }
-                    grab = 0; next
-                }
-                grab && cnt >= 1 && index(stripped, "**") == 1 { grab = 0; next }
-                grab {
-                    if (stripped == "") { grab = 0; next }
-                    cnt++
-                    if (cnt > max) { overrun = 1; grab = 0; next }
-                    buf = buf line "\n"
+                    if (n == 1) { buf = line "\n" }
+                    next
                 }
                 END {
                     if (n == 0) { print "ERR anchor-missing"; exit 1 }
                     if (n > 1)  { print "ERR anchor-ambiguous"; exit 1 }
-                    if (overrun) { print "ERR region-overrun"; exit 1 }
                     printf "%s", buf
                 }
             ' "$f"
             ;;
         "$ADR_DOC")
-            # Region = the whole Decision-15 numbered item: anchor line through the line
-            # before the next numbered decision or heading. Anchored on the decision's own
-            # title, NOT a dated "AMENDED <date>" marker - a marker anchor rots the moment a
-            # later amendment is appended as a new paragraph, freezing the region on the
-            # OLD text while the live claim migrates past it.
+            # Region = the anchor line ONLY - single-line capture, like MANUAL and (as of
+            # this fix) MCP_SERVER_DOC above.
             #
-            # Stop pattern deliberately matches ANY markdown ordered-list item start -
-            # `[0-9]+` then `.` or `)` then whitespace - not a specific emphasis style.
-            # A stop pattern requiring `**` bold immediately after the number was defeated
-            # in governance review of this same PR: a sibling item written `16) *Title*`
-            # (paren delimiter, single-asterisk emphasis) matched neither the old regex nor
-            # `^#`, so the scan ran past it into item 17, absorbing item 16's unrelated
-            # counter mention into decision 15's claim region. The number+delimiter+space
-            # shape is markdown's own list-item syntax, not this file's style choice, so it
-            # is far less likely to drift than a specific emphasis convention - though it is
-            # still a format assumption, not a guarantee, which is what MAX_REGION_LINES is
-            # the backstop for.
-            awk -v max="$MAX_REGION_LINES" '
+            # This arm previously scanned multi-line, stopping at "the next numbered
+            # decision item". Two rounds of governance review on this same PR proved that
+            # approach cannot be made safe by broadening the stop pattern: the first
+            # version (`^[0-9]+\.[[:space:]]+\*\*`, requiring bold emphasis) was defeated by
+            # a sibling item written `16) *Title*` (paren delimiter, single-asterisk
+            # emphasis) - neither the stop regex nor `^#` matched it, so the scan ran past
+            # it into item 17, absorbing item 16's unrelated counter mention into decision
+            # 15's claim region and masking a deliberately stale decision-15 claim. The
+            # broadened second version (`^[0-9]+[.)][[:space:]]`, any ordered-list start)
+            # closed THAT exploit but was then shown to still evade on other ordinary
+            # reformats no maintainer would consider unusual - a lettered sub-item
+            # ("15a."), a decimal sub-item ("15.1."), or an em-dash-led item ("— Decision
+            # 16:"). A `MAX_REGION_LINES` backstop does not help either: a realistic
+            # sibling-item absorption is 1-3 lines, far under any cap sized to tolerate
+            # this block's own legitimate content.
+            #
+            # No finite "what does the next item look like" pattern closes this class -
+            # there is always another plausible format one step outside it. Single-line
+            # capture sidesteps the guessing game entirely: decision 15s real content,
+            # including BOTH of its in-place amendments ("AMENDED 2026-08-05" and "FURTHER
+            # AMENDED 2026-08-05"), has always been appended to the SAME physical line -
+            # this file's own established editing convention is to lengthen a decision
+            # in place, not to spawn a new paragraph - so single-line capture matches how
+            # this file is actually edited, not merely how it happens to look today. A
+            # future rewrap fails closed exactly as described in the MCP_SERVER_DOC arm
+            # above and forces a claim_region() update rather than silently absorbing a
+            # sibling item in whatever format it uses.
+            awk '
                 { line = $0; sub(/\r$/, "", line) }
                 line ~ /^15\.[[:space:]]+\*\*MCP Streamable HTTP transport/ {
                     n++
-                    if (n == 1) { grab = 1; buf = line "\n"; cnt = 1; next }
-                    grab = 0; next
-                }
-                grab && (line ~ /^[0-9]+[.)][[:space:]]/ || line ~ /^#/) { grab = 0 }
-                grab {
-                    cnt++
-                    if (cnt > max) { overrun = 1; grab = 0; next }
-                    buf = buf line "\n"
+                    if (n == 1) { buf = line "\n" }
+                    next
                 }
                 END {
                     if (n == 0) { print "ERR anchor-missing"; exit 1 }
                     if (n > 1)  { print "ERR anchor-ambiguous"; exit 1 }
-                    if (overrun) { print "ERR region-overrun"; exit 1 }
                     printf "%s", buf
                 }
             ' "$f"
@@ -437,8 +449,7 @@ HPP
         cat > "$tmp/t/$MCP_SERVER_DOC" <<'MD'
 Some other text.
 
-**A pin released to admit a new call.** Explains yuzu_mcp_bridge_pin_release_raced_total
-and yuzu_mcp_bridge_pin_release_failed_total as the two causes.
+**A pin released to admit a new call.** Explains yuzu_mcp_bridge_pin_release_raced_total and yuzu_mcp_bridge_pin_release_failed_total as the two causes.
 
 A cross-reference table row mentions "A pin released to admit a new call" again mid-line,
 which must not count as a second anchor.
@@ -533,7 +544,7 @@ MD
     expect "MASK-HPP: derivation block loses raced" 1 "names one residual"
 
     fixture
-    perl -0777 -pi -e 's/Explains yuzu_mcp_bridge_pin_release_raced_total\nand yuzu_mcp_bridge_pin_release_failed_total as the two causes\./Explains yuzu_mcp_bridge_pin_release_failed_total as the cause./' \
+    perl -pi -e 's/Explains yuzu_mcp_bridge_pin_release_raced_total and yuzu_mcp_bridge_pin_release_failed_total as the two causes\./Explains yuzu_mcp_bridge_pin_release_failed_total as the cause./' \
         "$tmp/t/$MCP_SERVER_DOC"
     expect "MASK-MCP-SERVER: claim paragraph loses raced, cross-ref phrase intact" 1 "names one residual"
 
@@ -542,11 +553,13 @@ MD
         "$tmp/t/$ADR_DOC"
     expect "MASK-ADR: Decision-15 loses raced, sibling item 14 keeps it" 1 "names one residual"
 
-    # --- Gate 4 regression: the exact shape governance review reproduced against this PR.
-    # A sibling decision item in an alternate numbering format ("16)" instead of "16.")
-    # must NOT be absorbed into decision 15's region - if it were, its incidental mention
-    # of the missing residual would mask decision 15's own stale claim, exactly as the
-    # unhardened stop pattern let happen before this fix.
+    # --- Gate 4 regression: the exact shape governance review reproduced against this PR,
+    # against ADR_DOC's OLD multi-line extractor - a sibling decision item in an alternate
+    # numbering format ("16)" instead of "16.") got absorbed into decision 15's region,
+    # masking a deliberately stale decision-15 claim. That extractor is now single-line
+    # capture (see claim_region()'s ADR_DOC arm), which closes the class structurally: this
+    # fixture proves decision 15's own stale claim is caught NO MATTER what any sibling item
+    # looks like, because no sibling item is ever scanned at all.
     fixture
     printf '%s\n' \
         '14. **Earlier decision** unrelated.' \
@@ -554,28 +567,44 @@ MD
         '16) *Later decision, alternate numbering format* mentions yuzu_mcp_bridge_pin_release_raced_total in passing for unrelated context.' \
         '17. **Final decision** wraps up.' \
         > "$tmp/t/$ADR_DOC"
-    expect "ADR: alternate-format sibling item (16)) is not absorbed into decision 15's region" 1 "names one residual"
+    expect "ADR: single-line capture catches a stale claim regardless of sibling item format" 1 "names one residual"
 
-    # --- Gate 4 regression: MCP_SERVER_DOC's bold-lead stop (added alongside the ADR fix)
-    # must catch a paragraph that runs directly into the next bold-lead paragraph with no
-    # blank-line separator - the same masking shape, one surface over.
+    # --- Gate 4 regression: the same proof for MCP_SERVER_DOC, whose OLD extractor scanned
+    # to a blank line or bold-lead paragraph and could analogously absorb an adjacent
+    # paragraph. Single-line capture means the next paragraph's format - or its very
+    # existence - is irrelevant: this fixture's stale claim is caught even with a sibling
+    # paragraph immediately following, no blank line, mentioning the missing residual.
     fixture
     printf '%s\n' \
-        '**A pin released to admit a new call.** Explains yuzu_mcp_bridge_pin_release_failed_total' \
-        'as the cause; the raced case cannot happen here.' \
+        '**A pin released to admit a new call.** Explains yuzu_mcp_bridge_pin_release_failed_total as the cause; the raced case cannot happen here.' \
         '**Terminal durability.** Unrelated paragraph mentioning yuzu_mcp_bridge_pin_release_raced_total' \
         'in passing, immediately following with no blank-line separator.' \
         > "$tmp/t/$MCP_SERVER_DOC"
-    expect "MCP_SERVER_DOC: next bold-lead paragraph is not absorbed when the blank line is missing" 1 "names one residual"
+    expect "MCP_SERVER_DOC: single-line capture ignores an immediately-following sibling paragraph" 1 "names one residual"
 
-    # --- Gate 4 regression: MAX_REGION_LINES fires when a terminator truly never matches -
-    # not merely a reformatted-but-recognizable sibling (the two cases above), but a
-    # genuinely broken/absent boundary that would otherwise run to EOF.
+    # --- Gate 4 regression: MAX_REGION_LINES actually fires when a terminator truly never
+    # matches, for one of the arms that still legitimately scans multiple lines (HOME_HDR -
+    # ADR_DOC/MCP_SERVER_DOC no longer use this mechanism at all, see their arms above).
     fixture
-    { printf '15. **MCP Streamable HTTP transport** yuzu_mcp_bridge_pin_release_raced_total and yuzu_mcp_bridge_pin_release_failed_total.\n'
-      for i in $(seq 1 260); do printf 'plain prose line %d, no numbering, no heading, never a stop pattern.\n' "$i"; done
-    } > "$tmp/t/$ADR_DOC"
-    expect "REGION-OVERRUN: ADR terminator never matches, exceeds MAX_REGION_LINES" 1 "exceeded"
+    { printf '    /// ### What a FULL PIN-SLOT SET means\n'
+      printf '    /// yuzu_mcp_bridge_pin_release_raced_total and yuzu_mcp_bridge_pin_release_failed_total.\n'
+      for i in $(seq 1 260); do printf '    /// plain prose line %d, never a /// ### subheading.\n' "$i"; done
+    } > "$tmp/t/$HOME_HDR"
+    expect "REGION-OVERRUN: hpp terminator never matches, exceeds MAX_REGION_LINES" 1 "exceeded"
+
+    # --- Gate 4 regression: a terminator that never matches AND never runs past
+    # MAX_REGION_LINES either (the file simply ends first) must still fail closed. Every
+    # remaining multi-line arm's `terminated` flag (added alongside MAX_REGION_LINES) is
+    # what catches this - "another pattern happened to match" and "we ran out of file"
+    # must not be indistinguishable outcomes. Truncates hpp right after a few /// lines
+    # with nothing following at all: grab never turns off, cnt stays far under the cap,
+    # but `terminated` was never set.
+    fixture
+    printf '%s\n' \
+        '    /// ### What a FULL PIN-SLOT SET means' \
+        '    /// yuzu_mcp_bridge_pin_release_raced_total and yuzu_mcp_bridge_pin_release_failed_total.' \
+        > "$tmp/t/$HOME_HDR"
+    expect "TERMINATOR-MISSING: hpp block runs to real EOF, under the line cap, never confirmed" 1 "terminator"
 
     # --- check (b): region names neither residual ---
     fixture
