@@ -62,8 +62,16 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 SKIP = 77
+
+
+class CaseFacts(NamedTuple):
+    """What the test file declares. `assertions` is the load-bearing one."""
+    cases: int
+    assertions: int
+    caseless: int
 
 # Pinned as tag@digest, the form this repo uses elsewhere (`busybox:1.37@sha256:`,
 # `postgres:18.4-bookworm@sha256:`): the tag keeps the version readable for a
@@ -140,8 +148,8 @@ def run(argv: list[str], timeout: int = 300) -> tuple[int, str]:
     return proc.returncode, out
 
 
-def check_gate_output(check_out: str, test_out: str, declared_cases: int | None,
-                      rules_bound: bool | None = True) -> str | None:
+def check_gate_output(check_out: str, test_out: str,
+                      facts: CaseFacts | None) -> str | None:
     """The reason this run proves nothing, or None if it is real evidence.
 
     PROMTOOL EXITS 0 ON AN EMPTY RUN, and that is the whole reason this function
@@ -150,36 +158,47 @@ def check_gate_output(check_out: str, test_out: str, declared_cases: int | None,
       `test rules` against a `rule_files:` glob matching no file prints
       "WARNING: no file match pattern <path>" and then "SUCCESS", rc 0.
       A test file whose `tests:` list is empty also prints "SUCCESS", rc 0.
+      A test file whose cases have NO ASSERTION BLOCKS also prints "SUCCESS",
+      rc 0 - and that one got through an earlier version of this function,
+      which counted cases (#2553, Gate 5).
 
-    So a rules file renamed without updating the test file's relative
-    `rule_files:` - exactly the edit that would also carry a rule change -
-    turns this gate green having loaded zero rules and asserted nothing. A
-    green check that proves nothing is worse than no check, because it is
-    reported as evidence.
+    So an edit that leaves the cases in place but removes what they assert -
+    commented out while debugging, lost in a merge - turns this gate green
+    having validated 62 rules and checked none of them. A green check that
+    proves nothing is worse than no check, because it is reported as evidence.
+
+    NOTE the decoy case - `rule_files:` naming some OTHER existing rules file -
+    needs no check here. It is self-detecting: the suite asserts specific
+    alertnames FIRE, those alertnames do not exist in another file, and promtool
+    exits non-zero on its own. An earlier revision reimplemented Go's
+    `filepath.Glob` to catch it and that seam produced three findings of its own,
+    one of them a false-PASS. Deleted rather than maintained.
     """
     if "no file match pattern" in test_out:
         return ("`test rules` matched NO rule file - its `rule_files:` path is "
                 "stale, so zero rules were loaded and every case vacuously "
                 "passed. promtool exits 0 for this; the gate must not.")
-    if rules_bound is False:
-        return (f"`test rules` did not load {RULES} - nothing in the test file's "
-                f"`rule_files:` resolves to it (it is missing, or it names some "
-                f"OTHER file), so the cases asserted nothing about the rules "
-                f"`check rules` just validated. promtool reports no warning for "
-                f"this, because from its side nothing is wrong.")
     m = re.search(r"SUCCESS:\s*(\d+)\s+rules found", check_out)
     if not m:
         return ("`check rules` did not report a rule count; cannot confirm any "
                 "rule was loaded.")
     if int(m.group(1)) == 0:
         return "`check rules` loaded 0 rules - nothing was validated."
-    if declared_cases is not None and declared_cases == 0:
-        return f"{TESTS} declares no test cases - nothing was asserted."
+    if facts is not None:
+        if facts.cases == 0:
+            return f"{TESTS} declares no test cases - nothing was asserted."
+        if facts.assertions == 0:
+            return (f"{TESTS} declares {facts.cases} case(s) and ZERO assertions "
+                    f"- promtool exits 0 on that, so the run validated the rules "
+                    f"and checked none of them.")
+        if facts.caseless:
+            return (f"{TESTS} has {facts.caseless} case(s) with no assertion "
+                    f"block; each is dead weight that reads as coverage.")
     return None
 
 
-def inspect_test_file() -> tuple[int | None, bool | None]:
-    """`(declared case count, whether it loads RULES)`; None where unknowable.
+def inspect_test_file() -> CaseFacts | None:
+    """What the test file actually asserts, or None if it cannot be read.
 
     A MISSING PARSER AND AN UNPARSEABLE FILE ARE DIFFERENT. Without PyYAML we
     genuinely cannot answer, and must not redden the gate for it (the
@@ -212,9 +231,9 @@ def inspect_test_file() -> tuple[int | None, bool | None]:
                 f"run passing. Refusing to report success from the {DOCKER_OPT_IN} "
                 "path on a weakened gate. Install PyYAML (`pip install pyyaml`)."
             )
-        print("note: PyYAML unavailable; skipping case-count and rule_files checks",
+        print("note: PyYAML unavailable; skipping the assertion-count checks",
               flush=True)
-        return None, None
+        return None
     try:
         with (REPO_ROOT / TESTS).open(encoding="utf-8") as fh:
             doc = yaml.safe_load(fh) or {}
@@ -222,57 +241,35 @@ def inspect_test_file() -> tuple[int | None, bool | None]:
         sys.exit(f"FAIL: {TESTS} is present but could not be parsed ({ex}).")
     if not isinstance(doc, dict):
         sys.exit(f"FAIL: {TESTS} did not parse to a mapping (got {type(doc).__name__}).")
-    cases = len(doc.get("tests") or [])
-    base = (REPO_ROOT / TESTS).parent
-    want = (REPO_ROOT / RULES).resolve()
-    bound = any(resolves_to_rules(base, want, str(p))
-                for p in doc.get("rule_files") or [])
-    return cases, bound
-
-
-def resolves_to_rules(base: Path, want: Path, pattern: str) -> bool:
-    """Does this `rule_files:` entry load `want`, by PROMTOOL's rules?
-
-    Split out and parameterised so `--selftest` can exercise it. It previously
-    could not: the shipped test file's single entry is a literal, the literal
-    branch returns True, `any()` short-circuits, and the glob branch was never
-    executed on any leg.
-
-    `**` IS NOT RECURSIVE HERE, and that is the whole subtlety. promtool uses Go's
-    `filepath.Glob`, where `**` is just two adjacent `*` inside ONE path segment;
-    Python's `Path.glob` recurses. Left alone, that gap runs the wrong way: a
-    `**` pattern promtool does NOT match would look bound to us, and the gate
-    would pass having asserted nothing about the rules it validated - the exact
-    false-green this check exists to stop. Collapsing `**` to `*` restores Go's
-    semantics. MEASURED against promtool 3.13.1, from `tests/prometheus`:
-    `../../docs/**/*.yml` matches, `../../**/*.yml` does not, and this agrees
-    with the collapsed form in both directions.
-    """
-    # Literal first: it handles `..` segments and plain paths, and `Path.glob`
-    # rejects some of what a literal join accepts.
-    try:
-        if base.joinpath(pattern).resolve() == want:
-            return True
-    except (OSError, ValueError):
-        pass
-    while "**" in pattern:
-        pattern = pattern.replace("**", "*")
-    try:
-        return any(q.resolve() == want for q in base.glob(pattern))
-    except (OSError, ValueError, IndexError, NotImplementedError, RecursionError):
-        return False
+    tests = doc.get("tests") or []
+    # COUNT ASSERTIONS, NOT CASES. A case whose `promql_expr_test:` block is
+    # removed still counts as a case, and promtool still exits 0. MEASURED
+    # (#2553, Gate 5): stripping every assertion block while keeping all 13
+    # cases produced `SUCCESS: 62 rules found`, `test rules` SUCCESS and rc 0
+    # from this harness - the exact false-green this guard exists to stop,
+    # reached through the guard itself.
+    assertions = 0
+    caseless = 0
+    for case in tests:
+        if not isinstance(case, dict):
+            continue
+        n = (len(case.get("promql_expr_test") or [])
+             + len(case.get("alert_rule_test") or []))
+        assertions += n
+        if n == 0:
+            caseless += 1
+    return CaseFacts(cases=len(tests), assertions=assertions, caseless=caseless)
 
 
 def gate(promtool_argv: list[str], rules: str, tests: str) -> int:
     """`check rules` then `test rules`, then prove the run was not vacuous."""
-    rc, check_out = run(promtool_argv + ["check", "rules", rules])
+    rc, check_out = run(promtool_argv + ["check", "rules", rules], timeout=120)
     if rc:
         return rc
-    rc, test_out = run(promtool_argv + ["test", "rules", tests])
+    rc, test_out = run(promtool_argv + ["test", "rules", tests], timeout=120)
     if rc:
         return rc
-    cases, bound = inspect_test_file()
-    reason = check_gate_output(check_out, test_out, cases, bound)
+    reason = check_gate_output(check_out, test_out, inspect_test_file())
     if reason:
         sys.exit(f"FAIL: promtool exited 0 but the run proves nothing - {reason}")
     return 0
@@ -331,10 +328,10 @@ def docker_usable() -> bool:
     try:
         return subprocess.run(
             ["docker", "info"], stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, timeout=60,
+            stderr=subprocess.DEVNULL, timeout=30,
         ).returncode == 0
     except subprocess.TimeoutExpired:
-        print("note: `docker info` timed out after 60s (daemon wedged?)", flush=True)
+        print("note: `docker info` timed out after 30s (daemon wedged?)", flush=True)
         return False
 
 
@@ -342,13 +339,20 @@ def pull_with_retry() -> bool:
     """Retry a transient registry hiccup rather than call it a broken rule."""
     import time
 
-    # Backoff widens rather than repeating a fixed 10s: a transient blip clears
-    # in seconds, but the realistic failure here is an anonymous Docker Hub rate
-    # limit, and 3x10s never outlasts one of those. This does not pretend to
-    # either - a quota window is hours - it just stops three near-simultaneous
-    # attempts being reported as a considered retry.
-    for attempt, delay in ((1, 10), (2, 30), (3, 0)):
-        rc, _ = run(["docker", "pull", "--quiet", PROMTOOL_IMAGE])
+    # THE LADDER MUST FIT INSIDE THE TIMEOUTS THAT ENCLOSE IT. An earlier
+    # version was 3 attempts x run()'s 300s default plus 10s+30s of sleeping =
+    # 940s, against a `timeout-minutes: 10` job and a meson `timeout: 600` - so
+    # a slow-but-failing registry got killed from outside and reported as "the
+    # job timed out", which is the exact diagnosis the per-call timeout was
+    # added to prevent (#2553, Gate 5). Worst case is now 2x90 + 15 = 195s here,
+    # ~30s for the daemon probe and 2x120s for the two promtool runs: ~465s,
+    # comfortably inside both.
+    #
+    # Two attempts, not three: a transient blip clears in seconds and a second
+    # try covers it. This still does not pretend to outlast an anonymous Docker
+    # Hub quota window - that is hours - and nothing here should imply it does.
+    for attempt, delay in ((1, 15), (2, 0)):
+        rc, _ = run(["docker", "pull", "--quiet", PROMTOOL_IMAGE], timeout=90)
         if rc == 0:
             return True
         if delay:
@@ -367,7 +371,10 @@ def docker_argv() -> list[str]:
 
 
 def selftest() -> int:
-    """Pure logic only: no promtool, no docker, no network, no filesystem."""
+    """No promtool, no docker, no network. It DOES read the repo tree:
+    `inspect_test_file()` opens the shipped test file and can exit on a broken
+    one. An earlier version of this line claimed "no filesystem", which is the
+    sentence a reviewer would use to conclude this is platform-independent."""
     failures = []
 
     def check(name: str, got, want):
@@ -411,54 +418,42 @@ def selftest() -> int:
     # exits 0 on a suite that loaded no rules, so these are the cases that stop
     # this gate grading itself.
     ok_check = "Checking rules\n  SUCCESS: 61 rules found\n"
-    check("real run accepted", check_gate_output(ok_check, "  SUCCESS\n", 9, True), None)
+    real = CaseFacts(cases=9, assertions=14, caseless=0)
+    check("real run accepted", check_gate_output(ok_check, "  SUCCESS\n", real), None)
     stale = check_gate_output(
-        ok_check, "  WARNING: no file match pattern /w/docs/gone.yml\n  SUCCESS\n",
-        9, True)
+        ok_check, "  WARNING: no file match pattern /w/docs/gone.yml\n  SUCCESS\n", real)
     if stale is None:
         failures.append("unresolved rule_files glob was accepted as a pass")
-    if check_gate_output("SUCCESS: 0 rules found\n", "  SUCCESS\n", 9, True) is None:
+    if check_gate_output("SUCCESS: 0 rules found\n", "  SUCCESS\n", real) is None:
         failures.append("a zero-rule check run was accepted as a pass")
-    if check_gate_output(ok_check, "  SUCCESS\n", 0, True) is None:
-        failures.append("a test file declaring no cases was accepted as a pass")
-    if check_gate_output("some other output\n", "  SUCCESS\n", 9, True) is None:
+    if check_gate_output("some other output\n", "  SUCCESS\n", real) is None:
         failures.append("a check run with no rule count was accepted as a pass")
-    # The decoy case: rule_files names a DIFFERENT existing file, so promtool
-    # emits no warning at all and only this check can see it.
-    if check_gate_output(ok_check, "  SUCCESS\n", 9, False) is None:
-        failures.append("a test file loading the WRONG rules file was accepted")
+    if check_gate_output(ok_check, "  SUCCESS\n",
+                         CaseFacts(0, 0, 0)) is None:
+        failures.append("a test file declaring no cases was accepted as a pass")
+    # THE GATE-5 CASE: cases present, every assertion block stripped. promtool
+    # exits 0 on this and the previous case-counting version accepted it.
+    if check_gate_output(ok_check, "  SUCCESS\n",
+                         CaseFacts(cases=13, assertions=0, caseless=13)) is None:
+        failures.append("a suite with ZERO assertions was accepted as a pass")
+    # One stripped case among many is the realistic edit, and must also fail.
+    if check_gate_output(ok_check, "  SUCCESS\n",
+                         CaseFacts(cases=13, assertions=20, caseless=1)) is None:
+        failures.append("a single assertion-less case was accepted as a pass")
     # Unknowable (no PyYAML) must NOT redden the gate on its own.
-    check("unknowable binding still passes",
-          check_gate_output(ok_check, "  SUCCESS\n", None, None), None)
+    check("unknowable facts still pass",
+          check_gate_output(ok_check, "  SUCCESS\n", None), None)
 
-    # The real test file must actually bind to the real rules file.
-    cases, bound = inspect_test_file()
-    if bound is False:
-        failures.append(f"{TESTS} does not load {RULES}")
-    if cases == 0:
-        failures.append(f"{TESTS} declares no cases")
-
-    # resolves_to_rules against promtool's OWN behaviour. The `**` rows are the
-    # ones that matter: Python recurses and Go does not, and getting that wrong
-    # turns a vacuous run into a pass. Expectations MEASURED against promtool
-    # 3.13.1, not reasoned - see the function docstring.
-    b = (REPO_ROOT / TESTS).parent
-    w = (REPO_ROOT / RULES).resolve()
-    for pattern, want_bound, why in [
-        ("../../docs/prometheus/yuzu-alerts.yml", True, "the literal, as shipped"),
-        ("../../docs/prometheus/*.yml", True, "single-segment glob promtool matches"),
-        ("../../docs/*/*.yml", True, "two single-segment globs promtool matches"),
-        ("../../docs/**/*.yml", True, "** is ONE segment in Go; promtool matches"),
-        ("../../**/*.yml", False, "** is ONE segment in Go; promtool does NOT match"),
-        ("../../docs/prometheus/decoy.yml", False, "names another file"),
-        ("../../../outside-the-repo.yml", False, "escapes the repo"),
-        ("", False, "empty pattern"),
-        ("[", False, "malformed pattern must not raise"),
-    ]:
-        got = resolves_to_rules(b, w, pattern)
-        if got != want_bound:
+    # The shipped test file must itself carry assertions in every case.
+    facts = inspect_test_file()
+    if facts is not None:
+        if facts.cases == 0:
+            failures.append(f"{TESTS} declares no cases")
+        if facts.assertions == 0:
+            failures.append(f"{TESTS} declares no assertions")
+        if facts.caseless:
             failures.append(
-                f"resolves_to_rules({pattern!r}) = {got}, want {want_bound} ({why})")
+                f"{TESTS} has {facts.caseless} case(s) with no assertion block")
 
     for f in failures:
         print(f"SELFTEST FAIL: {f}", flush=True)

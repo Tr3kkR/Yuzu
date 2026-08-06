@@ -314,7 +314,12 @@ tests:
         exp_samples: []
 
   # CASE 11 -- the metric is present. The absence alert must stay silent even
-  # while the liveness rule is firing, or every stopped reaper pages twice.
+  # while the liveness rule is firing.
+  #
+  # THIS IS NOT A GENERAL EXCLUSIVITY PROOF, and an earlier version of this
+  # comment claimed it was ("what makes this a real exclusivity check"). It pins
+  # one STATIC state. The two rules DO fire together on the transition, which
+  # case 13 measures.
   - interval: 1m
     name: retention metric missing - a present counter keeps the absence alert quiet
     input_series:
@@ -326,8 +331,8 @@ tests:
       - expr: 'ALERTS{alertname="YuzuAuditRetentionMetricMissing"}'
         eval_time: 50m
         exp_samples: []
-      # The liveness rule IS firing here, which is what makes this a real
-      # exclusivity check rather than two quiet rules.
+      # The liveness rule IS firing here, so this is a genuine "one fires, the
+      # other does not" check rather than two quiet rules - for THIS state.
       - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing"}'
         eval_time: 50m
         exp_samples:
@@ -378,6 +383,41 @@ tests:
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing"}'
         eval_time: 194m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 13 -- WHAT ACTUALLY HAPPENS WHEN A SERVER DIES, which is neither of the
+  # static states cases 10 and 11 pin. The target stops being scraped at t=20m:
+  # `absent()` goes true once the series ages out (~5m staleness), while
+  # `increase(passes[3h])` still sees the pre-death samples and returns 0, and
+  # the stale uptime series empties the `unless` operand. So BOTH rules fire,
+  # for roughly three hours.
+  #
+  # That is a real double-page and this case exists to state it honestly rather
+  # than let three comments keep implying the two rules partition cleanly. It is
+  # pinned so that if someone later makes them exclusive - most likely by adding
+  # the `up`-based target-down rule this family keeps pointing at, plus an
+  # Alertmanager inhibition - this case goes red and has to be re-reasoned
+  # instead of silently changing behaviour.
+  #
+  # MEASURED against promtool 3.13.1; found by Gate 5 chaos analysis and
+  # independently by the architect review (#2553).
+  - interval: 1m
+    name: total scrape loss - both retention alerts fire, and that is the current behaviour
+    input_series:
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
+        values: "20000+60x20"
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "5x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionMetricMissing", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionMetricMissing", alertstate="firing", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing"}'
+        eval_time: 45m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1

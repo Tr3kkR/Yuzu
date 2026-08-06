@@ -1006,6 +1006,18 @@ groups:
       # the sets differ, the join then matches nothing, the grace silently stops
       # applying, and every fresh boot pages. That is the inverse of the
       # `on(instance)` bug above.
+      #
+      # KNOWN LIMIT: THIS FALSE-PAGES FOR ~40 MINUTES AFTER A PROMETHEUS RESTART.
+      # It predates this rule's current form - MEASURED identically against the
+      # previous expression (#2553, Gate 5 chaos analysis). `increase()` over a
+      # PARTIAL range returns 0, and the young-server grace watches the SERVER's
+      # uptime, not Prometheus's, so it does not apply: a healthy long-lived
+      # server whose last hourly pass predates the first scrape is
+      # indistinguishable from a dead reaper until a pass lands inside the new
+      # window. A fresh TSDB, a new HA replica, or applying this file for the
+      # first time all produce it. Documented rather than fixed here because the
+      # fix is a behaviour change (a `count_over_time(...) >= n` conjunct) that
+      # wants deciding on its own evidence rather than folding into this branch.
       - alert: YuzuAuditRetentionNotRunning
         expr: |
           increase(yuzu_server_audit_retention_passes_total[3h]) == 0
