@@ -581,9 +581,15 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
     //       copies nothing. Read that precisely - it is NOT "the window never
     //       allocates": the log lines in it still format into heap buffers. It is
     //       that every remaining allocating statement sits inside a catch-all, so a
-    //       bad_alloc from one costs a log line and nothing else. Pinned by
-    //       tests/unit/test_spark_alloc_budget.cpp, which counts this window's
-    //       allocations with the logger silenced.
+    //       bad_alloc from one costs a log line and nothing else.
+    //       COVERAGE, STATED EXACTLY, because the blanket version of this sentence was
+    //       false: tests/unit/test_spark_alloc_budget.cpp counts this window with the
+    //       logger silenced for the FAILED-WATCH, DEDUP and fresh-SUCCESS shapes. The
+    //       pre-start/timer and teardown_arm_race shapes are covered by inspection
+    //       only (#2816). An adversarial reviewer disproved the earlier unqualified
+    //       "pinned by" wording by inserting an allocation on the success path and
+    //       watching the budget binary pass green - do not restore a blanket claim
+    //       here without a counted case behind every shape.
     //
     // There is deliberately NO post-commit rollback. An earlier revision had one and
     // it was a net negative: across two review rounds it shipped a wrong branch

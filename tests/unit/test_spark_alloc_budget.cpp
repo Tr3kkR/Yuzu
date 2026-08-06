@@ -167,7 +167,12 @@ public:
         ++watch_calls_;
         if (fail_)
             return std::unexpected("nope"); // SSO: no allocation
-        watched_.insert(key);
+        // The success-path budget case counts the ENGINE, so the mechanism must not
+        // allocate on success either - watched_.insert(key) is a set node plus a copy
+        // of an over-SSO key, which would land inside the counted window and read as
+        // engine cost.
+        if (record_)
+            watched_.insert(key);
         return {};
     }
     void unwatch(const std::string& key) override {
@@ -180,6 +185,13 @@ public:
         std::lock_guard lk(mu_);
         fail_ = b;
     }
+    /// Off = watch() succeeds without touching watched_, so a counted window sees only
+    /// the engine's own allocations. is_watching() is then meaningless; no budget case
+    /// uses it.
+    void set_record(bool b) {
+        std::lock_guard lk(mu_);
+        record_ = b;
+    }
     int watch_calls() {
         std::lock_guard lk(mu_);
         return watch_calls_;
@@ -190,6 +202,7 @@ private:
     SparkEmitFn emit_;
     std::set<std::string> watched_;
     bool fail_{false};
+    bool record_{true};
     int watch_calls_{0};
     int unwatch_calls_{0};
 };
@@ -353,5 +366,53 @@ TEST_CASE("arm_impl: the deduped commit publishes without allocating (#2270 rese
     REQUIRE(second.has_value());
     REQUIRE(armed_counter);
     CHECK(post_commit == 2); // the sub_keys_ emplace (node + key buffer), and nothing else
+    engine.stop();
+}
+
+TEST_CASE("arm_impl: the fresh SUCCESS path allocates nothing after the commit (#2270)",
+          "[spark][alloc]") {
+    // THE SHAPE AN ADVERSARIAL REVIEWER PROVED WAS UNPINNED. The two cases above cover
+    // the failed-watch and dedup shapes; a fresh event-driven arm whose watch SUCCEEDS
+    // traverses a different post-commit stretch - the publish tail, the contained
+    // "armed" log, the mechanism's watch(), the M1 consumer re-check, and the return of
+    // the id. Inserting `std::string x(key);` immediately after watch_guarded() returns
+    // left the whole budget binary GREEN, because nothing counted that stretch.
+    //
+    // Why it is the shape most worth pinning: it is where a future author naturally
+    // adds a success metric or a log helper. Under bad_alloc there, the caller gets no
+    // subscription id while armed_ holds the entry and the OS watcher is live - the
+    // caller-visible direction of "armed == a watcher is running".
+    SparkEngine engine;
+    CountingMechanism* mech = wire(engine);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+    warm_arena(engine, *c);
+    QuietLog quiet;
+
+    // Success must not touch watched_, or the set node plus the over-SSO key copy land
+    // inside the counted window and read as engine cost.
+    mech->set_record(false);
+
+    bool armed_counter = false;
+    engine.set_arm_fault_hook_for_test([&](int phase) {
+        if (phase == SparkEngine::kArmFaultPhaseBeforeSubKeys) {
+            g_allocs = 0;
+            g_counting = true;
+            armed_counter = true;
+        }
+    });
+    auto sub = engine.arm(*c, long_file_spec()); // fresh key, watch SUCCEEDS
+    g_counting = false;
+    const std::uint64_t post_commit = g_allocs;
+    engine.set_arm_fault_hook_for_test(nullptr);
+
+    REQUIRE(sub.has_value()); // the whole point: this is the SUCCESS path
+    REQUIRE(armed_counter);
+    REQUIRE(mech->watch_calls() == 1);
+    // Same budget as the other two shapes: the sub_keys_ emplace (map node + heap
+    // buffer for the over-SSO key) and nothing after it.
+    CHECK(post_commit == 2);
+    CHECK(engine.stats().armed_sparks == 1);
     engine.stop();
 }
