@@ -159,7 +159,8 @@ three drifts it catches and the ratchet-baseline mechanics.
 A per-PR check asserting that every surface stating what CAUSES an MCP replay-ring pin
 displacement agrees on the cause set. `scripts/ci/check-pin-displacement-claim-set.sh`
 carries the invariant and its derivation pointer; the surfaces are one array in that
-script, and every one of its checks derives from it.
+script, and every check that iterates surfaces (all but the alert-expr check, which is
+alert-specific by construction) derives from it.
 
 It exists because that claim lives as an independent paraphrase in seven files, #2740
 falsified it, and successive review passes each fixed a different subset — a convention
