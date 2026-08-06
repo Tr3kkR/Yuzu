@@ -3347,10 +3347,39 @@ McpServer::HandlerFn McpServer::build_handler(
                     // most once per ticket).
                     // H3/N2 (SOC-2 CC7.2): stamp WHO consumed the ticket — the
                     // authenticated principal recalling the tool.
-                    if (auto consumed =
-                            approval_manager->consume_ticket(supplied_id, session->username);
+                    if (auto consumed = approval_manager->consume_ticket(
+                            supplied_id, session->username, {});
                         !consumed) {
-                        mcp_audit("denied", "approval " + supplied_id + " already used");
+                        const ConsumeFailure kind = consumed.error().kind;
+                        // AUDIT names the kind. This row is server-side and is
+                        // never returned to the caller, so the anti-oracle
+                        // argument below does not reach it. Auditing every
+                        // refusal as "already used" recorded a cross-surface
+                        // forgery attempt — the event #2442 exists to detect —
+                        // identically to a benign replay, and said it about a
+                        // row whose consumed_at is still 0.
+                        mcp_audit("denied", "approval " + supplied_id +
+                                                " refused: " + consume_denial_reason(kind));
+
+                        // CLIENT message stays uniform for the two that must not
+                        // be distinguishable: a foreign-origin refusal reads
+                        // exactly like an ordinary replay, or the recall becomes
+                        // a probe for which surface minted a ticket.
+                        //
+                        // kStoreError is NOT one of those. It is transient and
+                        // leaves the ticket UNTOUCHED and still valid, so
+                        // telling the caller it was "already used" and to fetch
+                        // a fresh one would burn a live human approval on a
+                        // failure that a retry clears.
+                        if (kind == ConsumeFailure::kStoreError) {
+                            res.set_content(
+                                a4_error(kInternalError,
+                                         "approval store temporarily unavailable",
+                                         "retry this call unchanged — the approval was NOT "
+                                         "consumed and remains valid; do NOT request a fresh one"),
+                                "application/json");
+                            return;
+                        }
                         res.set_content(
                             a4_error(kPermissionDenied,
                                      "approval already used (one-time ticket)",

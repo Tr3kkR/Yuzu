@@ -122,6 +122,42 @@ enum class ConsumeFailure {
 /// a forgery attempt from a replay for the log, but the MESSAGE must not, or the
 /// recall becomes an oracle for which definition ids exist and which surface
 /// minted them. One home so the copies cannot drift apart.
+/// Stable audit token, one per failure kind. The AUDIT trail is server-side and
+/// is never returned to the caller, so the anti-oracle reasoning below does NOT
+/// reach it: suppressing the distinction there would destroy the only evidence
+/// a cross-surface redemption attempt was refused, which is the thing #2442
+/// exists to produce.
+///
+/// Closed set. Adding a `ConsumeFailure` without a token here FAILS THE BUILD —
+/// `-Wswitch` is promoted to an error locally because `meson.build` sets
+/// `werror=false`, so the warning alone would not stop it, and a new kind would
+/// otherwise inherit whatever the caller happens to say.
+[[nodiscard]] constexpr const char* consume_denial_reason(ConsumeFailure kind) {
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(error : 4062)
+#endif
+    switch (kind) {
+    case ConsumeFailure::kPrecondition:
+        return "precondition";
+    case ConsumeFailure::kNotConsumable:
+        return "not_consumable";
+    case ConsumeFailure::kStoreError:
+        return "store_error";
+    case ConsumeFailure::kForeignOrigin:
+        return "foreign_origin";
+    }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+    return "unknown"; // unreachable while the switch is exhaustive
+}
+
 inline constexpr const char* kNotConsumableMessage =
     "approval not consumable (already used, not approved, or absent)";
 
@@ -230,8 +266,6 @@ public:
     /// `consumed_by` records WHO recalled the ticket (PR #1796 H3/N2, SOC-2
     /// CC7.2) — the caller passes the authenticated principal; it is stored in
     /// the same CAS UPDATE so the who and the when can never disagree.
-    std::expected<void, std::string> consume_ticket(const std::string& id,
-                                                    const std::string& consumed_by);
 
     /// consume_ticket with a pre-consume recheck (#2443). A ticket can sit
     /// approved-but-unconsumed for up to the 7-day TTL, so the state its effect

@@ -553,16 +553,6 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
 // Consume (#289 — one-time MCP approval ticket)
 // ---------------------------------------------------------------------------
 
-std::expected<void, std::string> ApprovalManager::consume_ticket(const std::string& id,
-                                                                 const std::string& consumed_by) {
-    auto r = consume_ticket(id, consumed_by, {});
-    if (r)
-        return {};
-    // The two-argument overload is the pre-#2443 contract: one flat string, and
-    // the same strings as before so its callers keep reporting identically.
-    return std::unexpected(r.error().message);
-}
-
 std::expected<void, ConsumeError>
 ApprovalManager::consume_ticket(const std::string& id, const std::string& consumed_by,
                                 const ConsumePrecondition& precondition) {

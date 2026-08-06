@@ -345,7 +345,7 @@ TEST_CASE("ApprovalManager: consume_ticket stamps consumed_by with the recalling
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
 
-    auto consumed = mgr.consume_ticket(*id, "operator1");
+    auto consumed = mgr.consume_ticket(*id, "operator1", {});
     REQUIRE(consumed.has_value());
 
     auto row = mgr.get(*id);
@@ -365,7 +365,7 @@ TEST_CASE("ApprovalManager: consume_ticket without a principal fails closed",
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
     // An unattributable consumption would be a CC7.2 evidence hole.
-    auto consumed = mgr.consume_ticket(*id, "");
+    auto consumed = mgr.consume_ticket(*id, "", {});
     CHECK(!consumed.has_value());
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
@@ -381,9 +381,9 @@ TEST_CASE("ApprovalManager: consume_ticket replay is rejected and keeps the orig
     auto id = mgr.submit("mcp.quarantine_device", "operator1", "{}");
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*id, "operator1").has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
 
-    auto replay = mgr.consume_ticket(*id, "operator2");
+    auto replay = mgr.consume_ticket(*id, "operator2", {});
     CHECK(!replay.has_value());
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
@@ -657,7 +657,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*id, "operator1").has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
 
     bool ran = false;
     auto replay = mgr.consume_ticket(*id, "operator2",
@@ -749,7 +749,7 @@ TEST_CASE("ApprovalManager: the CAS still wins when the row is consumed during t
     auto outer =
         mgr.consume_ticket(*id, "operator1",
                            [&mgr, &id](const Approval&) -> std::expected<void, std::string> {
-                               (void)mgr.consume_ticket(*id, "operator2");
+                               (void)mgr.consume_ticket(*id, "operator2", {});
                                return {};
                            });
     REQUIRE(!outer.has_value());
@@ -995,7 +995,7 @@ TEST_CASE("ApprovalManager: approved-but-unconsumed tickets expire 7 days after 
     CHECK(row->status == "expired"); // the leaked capability token is dead
 
     // An expired ticket is no longer consumable.
-    auto consumed = mgr.consume_ticket(*id, "operator1");
+    auto consumed = mgr.consume_ticket(*id, "operator1", {});
     CHECK(!consumed.has_value());
 }
 
@@ -1008,7 +1008,7 @@ TEST_CASE("ApprovalManager: consumed tickets are history, never expired",
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    REQUIRE(mgr.consume_ticket(*id, "operator1").has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
     backdate(tdb.db, *id, "reviewed_at", k8Days);
 
     REQUIRE(mgr.submit("def-new", "operator1", "scope").has_value()); // triggers the sweep
