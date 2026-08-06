@@ -1007,10 +1007,12 @@ groups:
       # applying, and every fresh boot pages. That is the inverse of the
       # `on(instance)` bug above.
       #
-      # KNOWN LIMIT: THIS FALSE-PAGES AFTER A PROMETHEUS RESTART, for as long as
-      # it takes the next real pass to land in the new window - so up to the full
-      # cleanup interval plus `for:`, i.e. ~75 minutes worst case at the fixed
-      # 60-minute cadence, not a fixed figure.
+      # KNOWN LIMIT: THIS FALSE-PAGES AFTER A PROMETHEUS RESTART. MEASURED under
+      # promtool with the next pass landing at the 60-minute cadence: it fires
+      # from ~15m (the `for:`) and clears the moment that pass lands, so about 45
+      # MINUTES of firing - bounded by the cleanup interval, not by anything this
+      # rule controls. (An earlier revision said ~75 minutes, adding `for:` to the
+      # interval. `for:` delays the START; it does not extend the end.)
       # It predates this rule's current form - MEASURED identically against the
       # previous expression (#2553, Gate 5 chaos analysis). `increase()` over a
       # PARTIAL range returns 0, and the young-server grace watches the SERVER's
