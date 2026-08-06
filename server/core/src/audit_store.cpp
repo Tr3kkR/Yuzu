@@ -1348,9 +1348,8 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
         // COMMIT's result entirely.
         LegacyFingerprint pg_fp{};
         const bool pg_fp_ok = pool_.with_txn([&](PGconn* c) -> bool {
-            const std::string set_timeout_sql = "SET LOCAL statement_timeout = '" +
-                                                std::to_string(kBackfillTxnTimeout.count()) +
-                                                "ms'";
+            const std::string set_timeout_sql =
+                std::format("SET LOCAL statement_timeout = '{}ms'", kBackfillTxnTimeout.count());
             pg::PgResult st = pg::exec_params(c, set_timeout_sql.c_str(), std::vector<std::string>{});
             if (st.status() != PGRES_COMMAND_OK) {
                 spdlog::error("AuditStore: migrate_from_sqlite: reconciliation "
