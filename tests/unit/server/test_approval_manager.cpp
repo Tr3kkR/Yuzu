@@ -492,8 +492,8 @@ TEST_CASE("ApprovalManager: origin round-trips through its column text",
     CHECK(approval_origin_from_string("nonsense") == ApprovalOrigin::kUnrecognised);
 }
 
-TEST_CASE("ApprovalManager: migration v5 leaves pre-existing rows with no declared origin",
-          "[approval_manager][db]") {
+TEST_CASE("ApprovalManager: migration v5 back-fills pre-existing rows to a fail-closed sentinel",
+          "[approval_manager][db][security]") {
     TestDb tdb;
     // A v4-shaped store with a row already in it, schema_meta pinned at 4 so
     // create_tables() runs migration 5 alone (the shape test_nvd.cpp uses).
@@ -526,8 +526,43 @@ TEST_CASE("ApprovalManager: migration v5 leaves pre-existing rows with no declar
     REQUIRE(row.has_value());
     CHECK(row->definition_id == "inventory.audit");
     // NOT back-filled to 'instruction': the row is evidence, and its surface is
-    // genuinely unknown.
-    CHECK(row->origin == ApprovalOrigin::kUnspecified);
+    // genuinely unknown. NOT left at '' either — that is the GRANTING case, so
+    // every pre-v5 row would have stayed cross-surface redeemable, which is the
+    // defect #2442 exists to close. The sentinel claims no surface and fails
+    // closed.
+    CHECK(row->origin == ApprovalOrigin::kUnrecognised);
+    CHECK(declares_non_mcp_surface(row->origin));
+}
+
+TEST_CASE("ApprovalManager: a pre-v5 ticket cannot be redeemed at the MCP recall",
+          "[approval_manager][approval][security]") {
+    // THE POPULATION THE GUARD MISSED. A governance reviewer built this by
+    // probe: mint through the REST instruction gate under an `mcp.`-prefixed
+    // definition id, set origin to the pre-v5 back-fill value, and the recall
+    // CONSUMED it — the exact cross-surface redemption #2442 exists to refuse,
+    // still open for every row that predates the column.
+    //
+    // Driven through the store rather than the migration so it fails if the
+    // DECODE ever folds an unknown value back into the granting case, not only
+    // if the back-fill regresses. The migration half is pinned above.
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.quarantine_device", "attacker", "{\"agent_id\":\"a1\"}", "",
+                         ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
+
+    // Rewrite the column to exactly what migration v5 back-fills.
+    const std::string sql = "UPDATE approvals SET origin = 'legacy' WHERE id = '" + *id + "'";
+    REQUIRE(sqlite3_exec(tdb.db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    REQUIRE(mgr.get(*id)->origin == ApprovalOrigin::kUnrecognised);
+
+    auto denied = mgr.consume_ticket(*id, "operator1", {});
+    REQUIRE(!denied.has_value());
+    CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin);
+    CHECK(mgr.get(*id)->consumed_at == 0); // untouched — still evidence
 }
 
 // ── Pre-consume recheck (#2443) ────────────────────────────────────────────

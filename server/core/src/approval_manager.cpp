@@ -172,13 +172,29 @@ void ApprovalManager::create_tables() {
             CREATE INDEX IF NOT EXISTS idx_approvals_schedule_id
                 ON approvals(schedule_id);
         )"},
-        // v5 (#2442): WHICH surface minted the ticket. Additive, '' = no
-        // declared origin — the honest reading for both a pre-v5 row and the
-        // MCP mint that cannot yet declare itself. Deliberately NOT back-filled
-        // to 'instruction': every pre-v5 row would then claim a surface it may
-        // not have come from, and these rows are approval evidence.
+        // v5 (#2442): WHICH surface minted the ticket. Additive. '' means "no
+        // declared origin", which is the GRANTING case at redemption — the MCP
+        // mint cannot yet declare itself, so '' has to stay redeemable.
+        //
+        // A pre-v5 row must therefore NOT be left at ''. It would inherit the
+        // grant and stay cross-surface redeemable, which is the whole defect
+        // #2442 exists to close — MEASURED: a REST-minted ticket under an
+        // `mcp.`-prefixed id, back-filled to '', redeems at the MCP recall.
+        //
+        // Back-filling to 'instruction' is also wrong, and for a reason that
+        // still stands: a pre-v5 row would claim a surface it may not have come
+        // from, and these rows are approval evidence. So it is back-filled to a
+        // SENTINEL that claims nothing and is not a surface. `origin_from_string`
+        // decodes it as kUnrecognised, so it fails CLOSED at redemption while
+        // recording honestly that the minting surface is unknown.
+        //
+        // Safe to change v5 in place rather than adding a migration: the column
+        // is unreleased (no #2442 entry in CHANGELOG.md), so no deployed server
+        // has run it. A later migration could not do this job anyway — by then
+        // '' is ambiguous between a pre-v5 row and a legitimate MCP mint.
         {5, R"(
             ALTER TABLE approvals ADD COLUMN origin TEXT NOT NULL DEFAULT '';
+            UPDATE approvals SET origin = 'legacy';
         )"},
         // v6: make the two status-scoped access patterns index-covered. Neither
         // is new, but both became load-bearing when mtx_ started covering the
@@ -239,9 +255,14 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     //    already under `mcp.` with a schedule submits via kSchedule on every
     //    fire; refused at mint, that schedule can never run again, and moving a
     //    schedule between definitions is not supported (#2742).
-    //  - The redemption guard covers strictly more: a ticket minted before the
-    //    guard existed, or by a surface added later, is refused at the point of
-    //    use rather than only at the point of mint.
+    //  - The redemption guard covers more: a ticket minted before the GUARD
+    //    existed, or by a surface that declares itself later, is refused at the
+    //    point of use rather than only at the point of mint. NOT "strictly
+    //    more" — that claim was false and is why migration v5 now back-fills a
+    //    sentinel. A row minted before the COLUMN existed carries no surface at
+    //    all, and '' is the granting case; only the back-fill closes it. A
+    //    future caller that omits the defaulted `origin` argument is in the
+    //    same class.
     //  - Authoring is still refused where authoring happens —
     //    `instruction_yaml.cpp` and `instruction_store.cpp` both call
     //    `is_reserved_definition_id`, and `reserved_definition_id.hpp` warns
