@@ -207,7 +207,7 @@ def check_gate_output(check_out: str, test_out: str,
     return None
 
 
-def inspect_test_file() -> CaseFacts | None:
+def inspect_test_file(strict: bool = True) -> CaseFacts | None:
     """What the test file actually asserts, or None if it cannot be read.
 
     A MISSING PARSER AND AN UNPARSEABLE FILE ARE DIFFERENT. Without PyYAML we
@@ -238,10 +238,20 @@ def inspect_test_file() -> CaseFacts | None:
         # major-3 promtool, PyYAML blocked, a case with no assertion blocks, and
         # the harness exited 0.
         #
-        # This CANNOT redden a CI leg. `main()` returns SKIP (77) before `gate()`
-        # is ever called whenever there is no usable promtool and no opt-in, and
-        # no CI leg has a native promtool - so this line is unreachable there.
-        # Measured, because that is the regression two reviewers warned about.
+        # STRICT IS THE GATE PATH ONLY. `gate()` is about to call a promtool exit
+        # 0 evidence, so a disabled guard there must fail. `--selftest` asserts
+        # pure logic and is registered as its own meson entry that runs on all
+        # three REQUIRED legs with no toolchain at all - making THAT depend on
+        # PyYAML would break a leg, which is the policy floor. The first cut of
+        # this fix did exactly that: measured, `--selftest` exited 1 with the
+        # import blocked. All three legs happen to install PyYAML via
+        # requirements-ci.txt today, so it was not live - but the selftest is
+        # supposed to need nothing, and a fix that survives only by luck is not
+        # a fix.
+        if not strict:
+            print("note: PyYAML unavailable; skipping the shipped-file checks",
+                  flush=True)
+            return None
         sys.exit(
             "FAIL: PyYAML is unavailable, so the assertion-count checks cannot "
             "run - and those are what stop a suite that asserts nothing from "
@@ -524,7 +534,7 @@ def selftest() -> int:
             failures.append(f"count_assertions({why}) = {got}, want {want}")
 
     # And the shipped file must itself carry assertions in every case.
-    facts = inspect_test_file()
+    facts = inspect_test_file(strict=False)
     if facts is not None:
         if facts.cases == 0:
             failures.append(f"{TESTS} declares no cases")
