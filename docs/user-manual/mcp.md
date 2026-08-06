@@ -1185,13 +1185,20 @@ It is not necessarily still usable, and the difference matters: the 7-day
 approval window keeps running during an outage, so an outage that outlasts the
 ticket's remaining window ends with it expired like any other.
 
-**Fix**: Retry the same call unchanged, including the same `approval_id`. The
-response carries a `retry_after_ms`; wait at least that long first. Do **not**
-re-submit without `approval_id` while the window is still open — the approval
-was not consumed, and minting a fresh one asks a human to approve a capability
-you already hold. If retries keep failing, escalate to an operator: no
-client-side action will clear it. If the approval window has since elapsed,
-treat it as a `-32003` and request a fresh ticket.
+**Fix**: Read `retry_after_ms` — it tells you which of two situations you are in,
+and it is the machine-readable answer, not the message text.
+
+- **Present** (currently 5000): the store is reachable and the call failed.
+  Retry the identical call, including the same `approval_id`, after at least
+  that long.
+- **Absent (`null`)**: the store never opened, and no retry will clear it.
+  Escalate to an operator. Retrying is not merely useless here — each attempt
+  writes an audit row against a store already failing.
+
+In both cases, do **not** re-submit without `approval_id` while the approval
+window is still open: the ticket was not consumed, and minting a fresh one asks
+a human to approve a capability you already hold. If the window has since
+elapsed, treat it as a `-32003` and request a fresh ticket.
 
 ### -32602: Invalid params
 

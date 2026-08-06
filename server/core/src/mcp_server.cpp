@@ -3399,22 +3399,43 @@ McpServer::HandlerFn McpServer::build_handler(
                         // the ticket would leave the caller waiting on a
                         // capability that had been retired underneath them.
                         //
-                        // A concrete retry_after_ms is required, not optional:
-                        // this arm calls itself transient and tells the caller
-                        // to retry, and A5 wants a retry directive to be
-                        // machine metadata rather than prose. Omitting it emits
-                        // null, which this file's own convention reads as NOT
-                        // retryable — the opposite of what the text says.
+                        // The retry directive is CONDITIONAL, and the condition
+                        // is the point. A5 wants a retry hint to be machine
+                        // metadata rather than prose, and omitting it emits
+                        // null, which this file's convention reads as NOT
+                        // retryable — so a transient failure must carry one.
+                        //
+                        // But `kStoreError` also covers the store never having
+                        // opened, and telling a client to retry every 5s a
+                        // condition that cannot clear is an unbounded loop that
+                        // writes an audit row per attempt, on the substrate
+                        // already failing to serve it. `is_open()` separates
+                        // the two: open means the failure was in the call, so
+                        // a retry is honest; closed means only an operator can
+                        // clear it, and the absence of a hint says so.
+                        //
+                        // `is_open()` is SUFFICIENT for permanent, not
+                        // exhaustive — an open handle failing with CORRUPT,
+                        // NOTADB, READONLY or FULL still takes the retry arm.
+                        // Classifying on sqlite3_extended_errcode is the real
+                        // fix and changes what ConsumeError carries, which is
+                        // why it is not attempted here.
                         if (kind == ConsumeFailure::kStoreError) {
+                            const bool open = approval_manager->is_open();
                             res.set_content(
-                                a4_error(kInternalError,
-                                         "approval store temporarily unavailable",
-                                         "retry this call unchanged — the approval was NOT "
-                                         "consumed, so do not request a fresh one. The 7-day "
-                                         "approval window keeps running during an outage: if it "
-                                         "elapses the ticket expires and a new approval is "
-                                         "required",
-                                         5000),
+                                open ? a4_error(kInternalError,
+                                                "approval store temporarily unavailable",
+                                                "retry this call unchanged — the approval was NOT "
+                                                "consumed, so do not request a fresh one. The "
+                                                "7-day approval window keeps running during an "
+                                                "outage: if it elapses the ticket expires and a "
+                                                "new approval is required",
+                                                5000)
+                                     : a4_error(kInternalError, "approval store unavailable",
+                                                "this will NOT clear on retry — the approval was "
+                                                "NOT consumed and does not need re-requesting "
+                                                "while the 7-day window holds. Escalate to an "
+                                                "operator"),
                                 "application/json");
                             return;
                         }
