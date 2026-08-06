@@ -1,4 +1,6 @@
-- Agent: an out-of-memory condition while arming a Spark watch no longer leaves a dead
+- Agent: **landed dormant, no deployment setting to review** — Guardian does not route
+  detection through Spark in any shipped build, and this change ships no user-facing
+  behavior. An out-of-memory condition while arming a Spark watch no longer leaves a dead
   entry behind. Previously it could record a spark as armed with no watcher running, and
   a later request to watch the same target would join that dead entry and report success
   while monitoring nothing. This includes a failure while REPORTING a watch error, where
@@ -19,8 +21,7 @@
   (withdrawing), neither of which any fleet metric, dashboard or alert consumes yet, so
   neither is queryable today (#2270). Those two counts cover these two cleanup paths only —
   a third path, a consumer disconnecting outright rather than disarming one of its watches,
-  is not yet counted, so two zeros are not an assurance that no watch was orphaned. Guardian does not route detection
-  through Spark in any shipped build: `prefer_spark` (the same switch the Guardian journal
-  entries in this release refer to) is a compile-time default that cannot be changed
-  without a rebuild, so the existing detection path is unaffected and there is no
-  deployment setting to review.
+  is not yet counted, so two zeros are not an assurance that no watch was orphaned.
+  `prefer_spark` (the same switch the Guardian journal entries in this release refer to)
+  is a compile-time default that cannot be changed without a rebuild, so the existing
+  detection path is unaffected.

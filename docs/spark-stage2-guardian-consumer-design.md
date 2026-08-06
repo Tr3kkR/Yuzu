@@ -1070,9 +1070,9 @@ Each rung is an independently-governed PR on `dev`, run through the full
        7 (KV lifecycle journal), 9 (R4 telemetry + the heartbeat wiring for the
        PR-1a counters), 8 (test seams), **M1 (the transition-edge health-emission
        fix)**, and the R2 `unsupported` terminal state.
-     - **FLIP GATE — TEN items gate PR-2**, each detailed in the bullets below: M1,
+     - **FLIP GATE — ELEVEN items gate PR-2**, each detailed in the bullets below: M1,
        item 9's heartbeat wiring, #2270, the lifecycle-audit journal, #2797, #2818,
-       #2819, #2813, and two residues that own no issue, (a) and (b). **The
+       #2819, #2813, #2839, and two residues that own no issue, (a) and (b). **The
        `prefer_spark` flip must not ship while any is open.** The first four land in
        PR-1b except #2270, which ships as its own PR against `dev` ahead of it. M1 in
        particular is a fleet ingest-DoS if the flip precedes it, so it is not enough
@@ -1128,6 +1128,17 @@ Each rung is an independently-governed PR on `dev`, run through the full
        than left silent. Its sink is NOT #2819's, which is a lock wedge: #2813's
        residue is a live OS watch whose `armed_` entry is gone, so its firings are
        silently dropped.
+     - **#2839 gates PR-2 on the same dormancy profile.** A throwing
+       `push_retiring()` (`spark_file.cpp:331-336`) frees a `DirWatch` with a live,
+       uncompleted kernel I/O — not merely a leak — and separately leaves
+       `dirs_[dirkey]` half-erased (key present, `unique_ptr` null/moved-from,
+       since `dirs_.erase(di)` never runs after the throw). `SparkEngine::stop()`'s
+       later, unrelated `cancel(*w)` sweep (`spark_file.cpp:241-246`) dereferences
+       that null pointer with no check — #2270's containment is what makes this
+       survivable-but-silent rather than an immediate crash near the OOM event,
+       deferring and decontextualizing the eventual failure. File-mechanism-only
+       (Windows), OOM-triggered; found and chaos-scenario'd (CH-1/CH-2) during this
+       branch's own governance run.
      - **Two residues gate PR-2 and own no issue**, recorded here because a gate list
        that enumerates only issue-backed items reads as complete when it is not.
        (a) CLOSED by `5858844c` (`SparkEngine::disarm`'s in-lock teardown made
