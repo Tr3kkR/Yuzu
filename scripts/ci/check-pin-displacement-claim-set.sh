@@ -80,6 +80,31 @@ RUNBOOK="docs/ops-runbooks/mcp-stream-pin-displacement.md"
 MCP_SERVER_DOC="docs/mcp-server.md"
 ADR_DOC="docs/adr-1005-execution-plan.md"
 
+# A multi-line claim_region() extractor's stop condition is a FORMAT ASSUMPTION about
+# future edits (e.g. "the next decision item starts with `N. **`"), not a syntactic
+# guarantee - unlike an all-`grab`ped C++ describe() call, prose formatting can drift
+# without anyone intending to break the gate. If a future sibling item is reformatted so
+# the stop pattern never matches, grab keeps consuming lines - which can absorb a sibling's
+# unrelated mention of a residual counter into the CURRENT claim's region and silently
+# re-open the #2827 masking class this gate exists to close (reproduced against the ADR
+# extractor in governance review of this same PR - a "16)" heading instead of "16." never
+# matched the stop regex, and item 16's incidental counter mention got absorbed into
+# decision 15's region, masking a deliberately stale decision-15 claim).
+#
+# TWO DEFENSES, not one, because they close different-sized failures. The real fix for the
+# reproduced case is a STOP PATTERN broad enough to recognize a plausible reformat - the
+# ADR's now matches any `N.`/`N)` numbered item regardless of emphasis style, and
+# MCP_SERVER_DOC's now also stops at the next bold paragraph lead, not blank-line-only. A
+# hardened pattern still can't enumerate every future format, so MAX_REGION_LINES is a
+# SEPARATE backstop against the case a hardened pattern can't help: a terminator that
+# matches nothing at all and runs to EOF, or absorbs many lines rather than one. It is
+# deliberately sized well above every surface's real region (the largest today, the hpp
+# derivation block, is ~105 lines) rather than tuned to catch a small absorption - a first
+# attempt at a tight shared cap (60) both false-DRIFTed on that legitimately-long block and
+# did nothing against the 1-line exploit it was meant to catch, which is why the stop
+# patterns, not the cap, are the primary defense.
+MAX_REGION_LINES=250
+
 # THE STATING SURFACES - ONE list, and every check that iterates surfaces (checks b/c/d;
 # the alert-expr check (a) is alert-specific by construction and operates on $ALERTS
 # directly) derives from it.
@@ -124,18 +149,23 @@ claim_region() {
             # Region = the YuzuMcpStreamPinDisplaced rule block, anchor line to the next
             # `- alert:` (commented or not - a commented-out sibling must not inflate the
             # region) or EOF. Reuses check (a)'s proven anchor regex.
-            awk '
+            awk -v max="$MAX_REGION_LINES" '
                 { line = $0; sub(/\r$/, "", line) }
                 line ~ /^[[:space:]]*-[[:space:]]*alert:[[:space:]]*YuzuMcpStreamPinDisplaced([[:space:]]|#|$)/ {
                     n++
-                    if (n == 1) { grab = 1; buf = line "\n"; next }
+                    if (n == 1) { grab = 1; buf = line "\n"; cnt = 1; next }
                     grab = 0; next
                 }
                 grab && line ~ /^[[:space:]]*#?[[:space:]]*-[[:space:]]*alert:/ { grab = 0 }
-                grab { buf = buf line "\n" }
+                grab {
+                    cnt++
+                    if (cnt > max) { overrun = 1; grab = 0; next }
+                    buf = buf line "\n"
+                }
                 END {
                     if (n == 0) { print "ERR anchor-missing"; exit 1 }
                     if (n > 1)  { print "ERR anchor-ambiguous"; exit 1 }
+                    if (overrun) { print "ERR region-overrun"; exit 1 }
                     printf "%s", buf
                 }
             ' "$f"
@@ -146,14 +176,16 @@ claim_region() {
             # lost terminator (reformatted, retyped) must not let the region run into the
             # next describe() call - that would silently re-open the #2827 mask inside this
             # very mechanism, so it is fail-closed rather than falling back to EOF.
-            awk '
+            awk -v max="$MAX_REGION_LINES" '
                 { line = $0; sub(/\r$/, "", line); stripped = line; sub(/^[[:space:]]+/, "", stripped) }
                 index(stripped, "metrics_.describe(\"yuzu_mcp_stream_pin_displaced_total\",") == 1 {
                     n++
-                    if (n == 1) { grab = 1; buf = line "\n"; next }
+                    if (n == 1) { grab = 1; buf = line "\n"; cnt = 1; next }
                     grab = 0; next
                 }
                 grab {
+                    cnt++
+                    if (cnt > max) { overrun = 1; grab = 0; next }
                     buf = buf line "\n"
                     if (stripped == "\"counter\");" || stripped == "\"gauge\");") { grab = 0; terminated = 1; next }
                     if (index(stripped, "metrics_.") == 1) { grab = 0; next }
@@ -161,6 +193,7 @@ claim_region() {
                 END {
                     if (n == 0) { print "ERR anchor-missing"; exit 1 }
                     if (n > 1)  { print "ERR anchor-ambiguous"; exit 1 }
+                    if (overrun) { print "ERR region-overrun"; exit 1 }
                     if (!terminated) { print "ERR terminator-missing"; exit 1 }
                     printf "%s", buf
                 }
@@ -184,20 +217,23 @@ claim_region() {
             ;;
         "$RUNBOOK")
             # Region = the cause table: header row through the last contiguous `|`-led line.
-            awk '
+            awk -v max="$MAX_REGION_LINES" '
                 { line = $0; sub(/\r$/, "", line); stripped = line; sub(/^[[:space:]]+/, "", stripped) }
                 index(stripped, "| counter | what it means |") == 1 {
                     n++
-                    if (n == 1) { grab = 1; buf = line "\n"; next }
+                    if (n == 1) { grab = 1; buf = line "\n"; cnt = 1; next }
                     grab = 0; next
                 }
                 grab {
-                    if (index(stripped, "|") == 1) { buf = buf line "\n"; next }
-                    grab = 0
+                    if (index(stripped, "|") != 1) { grab = 0; next }
+                    cnt++
+                    if (cnt > max) { overrun = 1; grab = 0; next }
+                    buf = buf line "\n"
                 }
                 END {
                     if (n == 0) { print "ERR anchor-missing"; exit 1 }
                     if (n > 1)  { print "ERR anchor-ambiguous"; exit 1 }
+                    if (overrun) { print "ERR region-overrun"; exit 1 }
                     printf "%s", buf
                 }
             ' "$f"
@@ -208,44 +244,58 @@ claim_region() {
             # Anchored on the `###`-prefixed heading, NOT the bare phrase - the phrase alone
             # also appears in a same-file cross-reference ("see ... above"), which would
             # make a bare-phrase anchor ambiguous today.
-            awk '
+            awk -v max="$MAX_REGION_LINES" '
                 { line = $0; sub(/\r$/, "", line); stripped = line; sub(/^[[:space:]]+/, "", stripped) }
                 index(stripped, "/// ### What a FULL PIN-SLOT SET means") == 1 {
                     n++
-                    if (n == 1) { grab = 1; buf = line "\n"; next }
+                    if (n == 1) { grab = 1; buf = line "\n"; cnt = 1; next }
                     grab = 0; next
                 }
                 grab {
                     if (index(stripped, "/// ###") == 1) { grab = 0; next }
-                    if (index(stripped, "///") == 1) { buf = buf line "\n"; next }
-                    grab = 0
+                    if (index(stripped, "///") != 1) { grab = 0; next }
+                    cnt++
+                    if (cnt > max) { overrun = 1; grab = 0; next }
+                    buf = buf line "\n"
                 }
                 END {
                     if (n == 0) { print "ERR anchor-missing"; exit 1 }
                     if (n > 1)  { print "ERR anchor-ambiguous"; exit 1 }
+                    if (overrun) { print "ERR region-overrun"; exit 1 }
                     printf "%s", buf
                 }
             ' "$f"
             ;;
         "$MCP_SERVER_DOC")
             # Region = the "A pin released to admit a new call" paragraph: anchor line
-            # through the next blank line. Anchored at LINE START - the phrase also occurs
-            # mid-line in a same-file cross-reference table row, which a bare `index() > 0`
-            # anchor would count as a second occurrence and wrongly call ambiguous.
-            awk '
+            # through the next blank line OR the next bold-lead paragraph, whichever comes
+            # first. Anchored at LINE START - the phrase also occurs mid-line in a same-file
+            # cross-reference table row, which a bare `index() > 0` anchor would count as a
+            # second occurrence and wrongly call ambiguous.
+            #
+            # The bold-lead stop is defense-in-depth, not merely blank-line: every paragraph
+            # in this section follows a `**Title.**` lead-in convention (see "Monotonicity.",
+            # "Terminal durability." nearby), so a future edit that drops the blank-line
+            # separator between two paragraphs still stops correctly, rather than absorbing
+            # the next paragraph's prose into this one's claim region.
+            awk -v max="$MAX_REGION_LINES" '
                 { line = $0; sub(/\r$/, "", line); stripped = line; sub(/^[[:space:]]+/, "", stripped) }
                 index(stripped, "**A pin released to admit a new call") == 1 {
                     n++
-                    if (n == 1) { grab = 1; buf = line "\n"; next }
+                    if (n == 1) { grab = 1; buf = line "\n"; cnt = 1; next }
                     grab = 0; next
                 }
+                grab && cnt >= 1 && index(stripped, "**") == 1 { grab = 0; next }
                 grab {
                     if (stripped == "") { grab = 0; next }
+                    cnt++
+                    if (cnt > max) { overrun = 1; grab = 0; next }
                     buf = buf line "\n"
                 }
                 END {
                     if (n == 0) { print "ERR anchor-missing"; exit 1 }
                     if (n > 1)  { print "ERR anchor-ambiguous"; exit 1 }
+                    if (overrun) { print "ERR region-overrun"; exit 1 }
                     printf "%s", buf
                 }
             ' "$f"
@@ -256,18 +306,35 @@ claim_region() {
             # title, NOT a dated "AMENDED <date>" marker - a marker anchor rots the moment a
             # later amendment is appended as a new paragraph, freezing the region on the
             # OLD text while the live claim migrates past it.
-            awk '
+            #
+            # Stop pattern deliberately matches ANY markdown ordered-list item start -
+            # `[0-9]+` then `.` or `)` then whitespace - not a specific emphasis style.
+            # A stop pattern requiring `**` bold immediately after the number was defeated
+            # in governance review of this same PR: a sibling item written `16) *Title*`
+            # (paren delimiter, single-asterisk emphasis) matched neither the old regex nor
+            # `^#`, so the scan ran past it into item 17, absorbing item 16's unrelated
+            # counter mention into decision 15's claim region. The number+delimiter+space
+            # shape is markdown's own list-item syntax, not this file's style choice, so it
+            # is far less likely to drift than a specific emphasis convention - though it is
+            # still a format assumption, not a guarantee, which is what MAX_REGION_LINES is
+            # the backstop for.
+            awk -v max="$MAX_REGION_LINES" '
                 { line = $0; sub(/\r$/, "", line) }
                 line ~ /^15\.[[:space:]]+\*\*MCP Streamable HTTP transport/ {
                     n++
-                    if (n == 1) { grab = 1; buf = line "\n"; next }
+                    if (n == 1) { grab = 1; buf = line "\n"; cnt = 1; next }
                     grab = 0; next
                 }
-                grab && (line ~ /^[0-9]+\.[[:space:]]+\*\*/ || line ~ /^#/) { grab = 0 }
-                grab { buf = buf line "\n" }
+                grab && (line ~ /^[0-9]+[.)][[:space:]]/ || line ~ /^#/) { grab = 0 }
+                grab {
+                    cnt++
+                    if (cnt > max) { overrun = 1; grab = 0; next }
+                    buf = buf line "\n"
+                }
                 END {
                     if (n == 0) { print "ERR anchor-missing"; exit 1 }
                     if (n > 1)  { print "ERR anchor-ambiguous"; exit 1 }
+                    if (overrun) { print "ERR region-overrun"; exit 1 }
                     printf "%s", buf
                 }
             ' "$f"
@@ -620,8 +687,11 @@ fi
 # file - a metrics registration, a pre-seed, a sibling alert rule, a sibling table row -
 # must not be able to satisfy this check on behalf of a stale claim. claim_region() extracts
 # the bounded text that actually states the cause set; a registered surface with no
-# extractor, or whose anchor cannot be found/is ambiguous/has lost its terminator, is
-# reported as DRIFT rather than silently skipped or falling back to whole-file.
+# extractor, whose anchor cannot be found or is ambiguous, whose terminator is lost, or
+# whose region grows past MAX_REGION_LINES without ever finding its stop pattern (a sibling
+# item reformatted so the multi-line scan never terminates - the same absorption shape as
+# the original whole-file bug, reachable again through a broken terminator instead of a
+# missing region), is reported as DRIFT rather than silently skipped or trusted past EOF.
 # ---------------------------------------------------------------------------
 for f in "${STATING_SURFACES[@]}"; do
     [ -f "$f" ] || { bad "missing surface: $f"; continue; }
@@ -635,6 +705,9 @@ for f in "${STATING_SURFACES[@]}"; do
                 ;;
             "ERR terminator-missing")
                 bad "$f: claim region has no terminator (surface reformatted? update claim_region())."
+                ;;
+            "ERR region-overrun")
+                bad "$f: claim region exceeded $MAX_REGION_LINES lines without finding its stop pattern - a sibling item was likely reformatted and the extractor absorbed unrelated content. Update claim_region()."
                 ;;
             *)
                 bad "$f: registered stating surface has no claim_region() extractor - add one."
