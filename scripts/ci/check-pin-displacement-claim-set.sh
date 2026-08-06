@@ -542,6 +542,41 @@ MD
         "$tmp/t/$ADR_DOC"
     expect "MASK-ADR: Decision-15 loses raced, sibling item 14 keeps it" 1 "names one residual"
 
+    # --- Gate 4 regression: the exact shape governance review reproduced against this PR.
+    # A sibling decision item in an alternate numbering format ("16)" instead of "16.")
+    # must NOT be absorbed into decision 15's region - if it were, its incidental mention
+    # of the missing residual would mask decision 15's own stale claim, exactly as the
+    # unhardened stop pattern let happen before this fix.
+    fixture
+    printf '%s\n' \
+        '14. **Earlier decision** unrelated.' \
+        '15. **MCP Streamable HTTP transport** the release throw is counted as `yuzu_mcp_bridge_pin_release_failed_total` (#2805, the raced case cannot happen here).' \
+        '16) *Later decision, alternate numbering format* mentions yuzu_mcp_bridge_pin_release_raced_total in passing for unrelated context.' \
+        '17. **Final decision** wraps up.' \
+        > "$tmp/t/$ADR_DOC"
+    expect "ADR: alternate-format sibling item (16)) is not absorbed into decision 15's region" 1 "names one residual"
+
+    # --- Gate 4 regression: MCP_SERVER_DOC's bold-lead stop (added alongside the ADR fix)
+    # must catch a paragraph that runs directly into the next bold-lead paragraph with no
+    # blank-line separator - the same masking shape, one surface over.
+    fixture
+    printf '%s\n' \
+        '**A pin released to admit a new call.** Explains yuzu_mcp_bridge_pin_release_failed_total' \
+        'as the cause; the raced case cannot happen here.' \
+        '**Terminal durability.** Unrelated paragraph mentioning yuzu_mcp_bridge_pin_release_raced_total' \
+        'in passing, immediately following with no blank-line separator.' \
+        > "$tmp/t/$MCP_SERVER_DOC"
+    expect "MCP_SERVER_DOC: next bold-lead paragraph is not absorbed when the blank line is missing" 1 "names one residual"
+
+    # --- Gate 4 regression: MAX_REGION_LINES fires when a terminator truly never matches -
+    # not merely a reformatted-but-recognizable sibling (the two cases above), but a
+    # genuinely broken/absent boundary that would otherwise run to EOF.
+    fixture
+    { printf '15. **MCP Streamable HTTP transport** yuzu_mcp_bridge_pin_release_raced_total and yuzu_mcp_bridge_pin_release_failed_total.\n'
+      for i in $(seq 1 260); do printf 'plain prose line %d, no numbering, no heading, never a stop pattern.\n' "$i"; done
+    } > "$tmp/t/$ADR_DOC"
+    expect "REGION-OVERRUN: ADR terminator never matches, exceeds MAX_REGION_LINES" 1 "exceeded"
+
     # --- check (b): region names neither residual ---
     fixture
     perl -0777 -pi -e 's/   \| `yuzu_mcp_bridge_pin_release_raced_total`.*\n   \| `yuzu_mcp_bridge_pin_release_failed_total`.*\n//' \
