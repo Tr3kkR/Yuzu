@@ -348,6 +348,14 @@ schedule id, not through the MCP recall, so the origin check never sees it and a
 outstanding across the upgrade still fires. If nothing is awaiting an MCP recall when you upgrade,
 there is nothing to do.
 
+**Rolling BACK across this release re-opens the check, and rolling forward does not close it
+again.** The back-fill runs once, as a schema migration. An older server started against an
+already-migrated database does not re-run it and does not refuse to start; approvals it mints while
+you are rolled back record no minting surface, which is the value that stays redeemable. Rolling
+forward will not revisit them, because the migration has already run. Treat a roll-back as a window
+in which the cross-surface check is not in force for newly minted approvals, and let those
+approvals expire — the 7-day window bounds it — rather than relying on them being re-checked.
+
 **What happens.** This release records which surface minted each approval, and rows that predate the
 column carry no surface at all. Rather than assume one they may not have come from, the upgrade
 labels them with a sentinel that fails closed — so an approval granted before the upgrade is refused
