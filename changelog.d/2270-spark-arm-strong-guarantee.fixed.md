@@ -18,8 +18,8 @@
   as `yuzu.spark_arm_race_unwatch_failures` (arming) and `yuzu.spark_disarm_unwatch_failures`
   (withdrawing), neither of which any fleet metric, dashboard or alert consumes yet, so
   neither is queryable today (#2270). Those two counts cover these two cleanup paths only —
-  a third path (removing the last consumer of a shared spark) is not yet counted, so two
-  zeros are not an assurance that no watch was orphaned. Guardian does not route detection
+  a third path, a consumer disconnecting outright rather than disarming one of its watches,
+  is not yet counted, so two zeros are not an assurance that no watch was orphaned. Guardian does not route detection
   through Spark in any shipped build: `prefer_spark` (the same switch the Guardian journal
   entries in this release refer to) is a compile-time default that cannot be changed
   without a rebuild, so the existing detection path is unaffected and there is no

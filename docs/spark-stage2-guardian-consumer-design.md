@@ -273,14 +273,17 @@ fixed, not the *read* flood (UP-6); (c) the **server-side rollup/consumer** for 
 tag (the signal is agent-heartbeat-only today) - this is **pilot-trust-blocking**, not just SOC2
 evidence, because after suppression the only current-errored-state view is the no-TTL census, and
 `/status.errored_rules` is still the fail-closed placeholder. **(d) the four-artefact egress for
-`arm_race_unwatch_failures_total` (#2270)** - the heartbeat tag ships and its key is registered in
-`spark_fleet_tags.hpp`, but no rollup consumes it, there is no `docs/user-manual/metrics.md` row and
-no alert rule, and no REST route or dashboard renders raw `status_tags` - so an orphaned OS watch is
-not fleet-detectable and is not per-device queryable either; the value reaches the server and is
-read by nothing. Same class as (c) and same reason it matters:
-the residual it reports is a leaked watch in the agent's sole detection primitive, and on Windows
-it is not reclaimed by `stop()` at all (only a process restart releases it), so the cost is
-permanent and cumulative rather than self-healing. The census edge-record still depends
+`arm_race_unwatch_failures_total` AND `disarm_unwatch_failures_total` (#2270)** - both heartbeat
+tags ship and both keys are registered in `spark_fleet_tags.hpp`, but no rollup consumes either,
+there is no `docs/user-manual/metrics.md` row and no alert rule, and no REST route or dashboard
+renders raw `status_tags` - so an orphaned OS watch is not fleet-detectable and is not per-device
+queryable either; the value reaches the server and is read by nothing. Same class as (c) and same
+reason it matters: the residual either counter reports is a leaked watch in the agent's sole
+detection primitive, and reclamation is mechanism-dependent, not simply OS-dependent - a File
+watch (Windows-only mechanism) is never reclaimed short of a process restart, so for that
+mechanism the cost is permanent and cumulative rather than self-healing; a Service watch (Linux or
+Windows) is reclaimed the next time `stop()` runs; a Registry watch (Windows-only mechanism)
+cannot fail this way at all. The census edge-record still depends
 on the sole production `attach_rule` hardcoding `emit_compliant_edge=true` - do NOT sever that.
 
 ### PR-1 hardening items (commit order 1→2→3→4→7→5→6→9→8)
@@ -601,8 +604,8 @@ dashboard fragment. This section ticks every #1939 item.
   propagates UNCONTAINED, and the consequence is worse than an uncounted orphaned
   watch: escaping a void function there permanently strands the consumer's dispatch
   thread (tracked as #2814). Two zeros do not mean "no orphaned watches", and say
-  nothing about #2814 at all. The `{os}`
-  rollup, the `docs/user-manual/metrics.md` row and an alert rule are **deferred to the
+  nothing about #2814 at all. The `{os}` rollup, the `docs/user-manual/metrics.md`
+  row and an alert rule are **deferred to the
   `prefer_spark` flip** on the same grounds as `retiring`/`retiring_cap`
   (`spark_fleet_tags.hpp`): with `prefer_spark_` false nothing arms, so the gauges
   would be structurally absent fleet-wide and unfalsifiable. Tracked as item (d) of the
@@ -1135,17 +1138,18 @@ Each rung is an independently-governed PR on `dev`, run through the full
        row owed); `UP-4` deduped separately. A narrower residual remains, different in
        kind: two ops between the (now allocation-free) bookkeeping and the
        contained `unwatch()` still propagate uncontained — the two `std::lock_guard`
-       constructions at `spark_engine.cpp:1030`/`:1032` (mutex acquisition can raise
+       constructions at `spark_engine.cpp:1033`/`:1035` (mutex acquisition can raise
        `std::system_error`). `mech_ops_mu_by_type_.at(unwatch_type)` on the same
        line does NOT: the map is populated in lockstep with `mechanisms_` at
        registration and frozen after `start()`, so the lookup key is always present
-       (`spark_engine.hpp:212-219`). By this point `disarm`'s OWN bookkeeping
-       (`armed_`/`sub_keys_`) is already committed, so a throw here does not desync
-       the engine's own state the way the old defect did — the consequence is
-       narrower: the `unwatch()` is never attempted, so neither counter increments
-       and the OS watch is never even asked to release. `teardown_arm_race`
-       documents the same residual on its own declaration
-       (`spark_engine.hpp:437-438`); `disarm` now does too. (b) The `{os}` fleet
+       (`spark_engine.hpp:221-222`, implemented at `spark_engine.cpp:183-195`). By
+       this point `disarm`'s OWN bookkeeping (`armed_`/`sub_keys_`) is already
+       committed, so a throw here does not desync the engine's own state the way
+       the old defect did — the consequence is narrower: the `unwatch()` is never
+       attempted, so neither counter increments and the OS watch is never even
+       asked to release. `teardown_arm_race` documents the same residual on its
+       own declaration (`spark_engine.hpp:440-441`); `disarm` now does too
+       (`spark_engine.hpp:217-219`). (b) The `{os}` fleet
        rollup, the `metrics.md` row and the alert rule for BOTH
        `arm_race_unwatch_failures` and `disarm_unwatch_failures` —
        `spark_fleet_tags.hpp:82` defers all three to this flip IN CODE, so the flip

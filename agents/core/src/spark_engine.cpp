@@ -611,10 +611,13 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
     //   * arm_race_hook_for_test_ below, which exists to inject exactly such a throw.
     //     (The seam inside watch_guarded is contained there and cannot escape.)
     // And one that does NOT escape but is not repaired either: a throwing mechanism
-    // unwatch() during the consumer-race teardown leaves an orphaned OS watch —
-    // reclaimed by stop() on Linux, persisting for the life of the process on Windows.
-    // Contained and counted as stats().arm_race_unwatch_failures_total, and surfaced as
-    // a sparse heartbeat tag; teardown_arm_race carries the per-platform bound and the
+    // unwatch() during the consumer-race teardown leaves an orphaned OS watch.
+    // Reclamation is mechanism-dependent, not simply OS-dependent: a File watch
+    // (Windows-only mechanism) is never reclaimed short of a process restart; a
+    // Service watch (Linux or Windows) is reclaimed the next time stop() runs; a
+    // Registry watch (Windows-only mechanism) cannot fail this way at all. Contained
+    // and counted as stats().arm_race_unwatch_failures_total, and surfaced as a
+    // sparse heartbeat tag; teardown_arm_race carries the per-mechanism bound and the
     // reason repairing it is not attempted.
     ISparkMechanism* mech = nullptr;
     SparkParams watch_params;
@@ -951,8 +954,8 @@ void SparkEngine::teardown_arm_race(SubscriptionId id, const std::string& key, S
             try {
                 spdlog::error("SparkEngine: unwatch('{}') threw during consumer-race teardown - "
                               "the OS watch is not reclaimed by this call; a File watch "
-                              "(Windows) persists until a process restart, other mechanisms "
-                              "are reclaimed at the mechanism's stop()",
+                              "(Windows) persists until a process restart, while other "
+                              "mechanisms are reclaimed at the mechanism's stop()",
                               key);
             } catch (...) {
             }
@@ -1056,8 +1059,8 @@ void SparkEngine::disarm(SubscriptionId id) {
             try {
                 spdlog::error("SparkEngine: unwatch('{}') threw during disarm - the OS watch "
                               "is not reclaimed by this call; a File watch (Windows) persists "
-                              "until a process restart, other mechanisms are reclaimed at the "
-                              "mechanism's stop()",
+                              "until a process restart, while other mechanisms are reclaimed "
+                              "at the mechanism's stop()",
                               unwatch_key);
             } catch (...) {
             }
