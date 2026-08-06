@@ -135,7 +135,30 @@ jobs:
           # call-boundary discriminator. Do not use github.event_name here.
           if [[ -z "$APPROVED_SHA" ]]; then
             echo "checkout_repository=$REPOSITORY" >> "$GITHUB_OUTPUT"
-            echo "checkout_ref=${GITHUB_REF}" >> "$GITHUB_OUTPUT"
+            # PIN the checkout to the event's own commit, exactly as the trusted
+            # path below does with $head_sha. NOT ${GITHUB_REF}: on a
+            # pull_request that is the SYMBOLIC refs/pull/N/merge, which GitHub
+            # re-mints whenever mergeability is invalidated — a new SHA for
+            # identical content, because a merge commit carries a timestamp. The
+            # event payload meanwhile carries the merge SHA CACHED FROM BEFORE
+            # the triggering action, so `Verify resolved checkout` compared a
+            # stale expected against a freshly minted actual and failed on a PR
+            # that had changed nothing. Measured on #2826: the mismatch recurred
+            # across five runs, expected always equal to the PREVIOUS run's
+            # actual, with the mint timestamps 1-3 s before each run.
+            #
+            # Pinning also makes that verify mean something. Every downstream
+            # job takes its `ref` from this same output, so with a symbolic ref
+            # each one re-resolved it independently and could legally build a
+            # DIFFERENT merge commit than preflight verified — the check passed
+            # while pinning nothing. With a SHA, preflight and every consumer
+            # build the identical commit.
+            #
+            # This is stock `actions/checkout` behaviour on `pull_request` (it
+            # checks out `github.sha`, never the floating ref tip). A re-run long
+            # after the merge object is GC'd now fails loudly with "commit not
+            # found" instead of silently testing a newer tree.
+            echo "checkout_ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
             echo "checkout_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
             echo "trusted_execution=false" >> "$GITHUB_OUTPUT"
             if [[ "${{ github.event_name }}" == "pull_request" ]]; then
@@ -314,6 +337,10 @@ jobs:
           repository: ${{ needs.trusted_inputs.outputs.checkout_repository }}
           ref: ${{ needs.trusted_inputs.outputs.checkout_ref }}
           persist-credentials: false
+      # Both inputs are now the same pinned SHA on every path, so this asserts
+      # that `actions/checkout` landed where it was told rather than adjudicating
+      # a race it could not win. Keep it: it is the one place that would catch a
+      # checkout action silently resolving something else, and it costs nothing.
       - name: Verify resolved checkout
         env:
           EXPECTED_SHA: ${{ needs.trusted_inputs.outputs.checkout_sha }}
