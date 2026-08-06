@@ -154,10 +154,16 @@ jobs:
             # while pinning nothing. With a SHA, preflight and every consumer
             # build the identical commit.
             #
-            # This is stock `actions/checkout` behaviour on `pull_request` (it
-            # checks out `github.sha`, never the floating ref tip). A re-run long
-            # after the merge object is GC'd now fails loudly with "commit not
-            # found" instead of silently testing a newer tree.
+            # This is stock `actions/checkout` behaviour on `pull_request` (its
+            # refspec is `+<github.sha>:<ref>`, never the floating ref tip), so
+            # the by-SHA fetch is the globally exercised path rather than a
+            # novel one. Measured before shipping: superseded merge commits from
+            # PRs closed a week earlier still fetch by bare SHA.
+            #
+            # The one behaviour this gives up is a re-run after GitHub evicts
+            # that object, which now fails "commit not found". That failure is
+            # loud and honest, and the pre-change pipeline failed those re-runs
+            # anyway — at the verify below, against a stale expected.
             echo "checkout_ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
             echo "checkout_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
             echo "trusted_execution=false" >> "$GITHUB_OUTPUT"
@@ -337,10 +343,12 @@ jobs:
           repository: ${{ needs.trusted_inputs.outputs.checkout_repository }}
           ref: ${{ needs.trusted_inputs.outputs.checkout_ref }}
           persist-credentials: false
-      # Both inputs are now the same pinned SHA on every path, so this asserts
-      # that `actions/checkout` landed where it was told rather than adjudicating
-      # a race it could not win. Keep it: it is the one place that would catch a
-      # checkout action silently resolving something else, and it costs nothing.
+      # Assert that checkout produced the immutable revision propagated to every
+      # downstream job. Both inputs are the same pinned SHA on every path now, so
+      # this is a postcondition rather than the race adjudication it used to be —
+      # but it is not redundant: `checkout_ref` and `checkout_sha` are two
+      # separate outputs, and this is the only tripwire if a later edit desyncs
+      # them.
       - name: Verify resolved checkout
         env:
           EXPECTED_SHA: ${{ needs.trusted_inputs.outputs.checkout_sha }}
