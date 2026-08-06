@@ -190,10 +190,18 @@ void ApprovalManager::create_tables() {
         // decodes it as kUnrecognised, so it fails CLOSED at redemption while
         // recording honestly that the minting surface is unknown.
         //
-        // Safe to change v5 in place rather than adding a migration: the column
-        // is unreleased (no #2442 entry in CHANGELOG.md), so no deployed server
-        // has run it. A later migration could not do this job anyway — by then
-        // '' is ambiguous between a pre-v5 row and a legitimate MCP mint.
+        // Changed in place because no RELEASE carries the column (no #2442 entry
+        // in CHANGELOG.md). That is narrower than it first appears and does NOT
+        // mean no database has run v5: v5 has been on origin/dev since
+        // 2026-08-02, so any dev, CI or UAT database is already at >= 5 and the
+        // migration runner skips it (`if (m.version <= current) continue;`).
+        // Those rows keep '' — the granting value.
+        //
+        // An earlier version of this comment claimed a later migration "could
+        // not do this job anyway, by then '' is ambiguous between a pre-v5 row
+        // and a legitimate MCP mint". That was FALSE, and it was the sentence
+        // justifying the shortcut. `schema_meta.upgraded_at` is exactly the
+        // discriminator it said did not exist — see v7.
         {5, R"(
             ALTER TABLE approvals ADD COLUMN origin TEXT NOT NULL DEFAULT '';
             UPDATE approvals SET origin = 'legacy';
@@ -213,6 +221,32 @@ void ApprovalManager::create_tables() {
                 ON approvals(status, submitted_at);
             CREATE INDEX IF NOT EXISTS idx_approvals_status_consumed_reviewed
                 ON approvals(status, consumed_at, reviewed_at);
+        )"},
+        // v7 (#2442): reach the databases the in-place v5 edit cannot. A store
+        // already at >= 5 never re-runs v5, so its pre-column rows still carry
+        // '' — which GRANTS at redemption. No release carries the column, but
+        // every dev/CI/UAT database tracking origin/dev since 2026-08-02 does.
+        //
+        // Rewrites EVERY remaining '' row, not just the pre-column ones. A
+        // discriminator was attempted and does not exist: the obvious one is
+        // `submitted_at < schema_meta.upgraded_at`, but the runner re-stamps
+        // `upgraded_at` after EVERY migration, so by the time v7 runs the value
+        // names when v6 finished — seconds ago — not when the column appeared.
+        // A test caught this by asserting a post-column undeclared mint SURVIVES;
+        // it did not. No migration can observe v5's stamp, because every later
+        // migration overwrites it.
+        //
+        // So this is deliberately blunt, and it is the SAME outcome the release
+        // path already produces: on a server upgrading from any release, v5
+        // rewrites every row that exists. An undeclared MCP ticket outstanding
+        // at upgrade stops redeeming and must be re-requested. That is
+        // fail-closed, bounded by the 7-day approval window, and identical
+        // whether the database arrives via a release or via origin/dev.
+        //
+        // Matches nothing on a fresh install: v1..v6 run first and the table is
+        // empty. Idempotent: `origin = ''` is false once rewritten.
+        {7, R"(
+            UPDATE approvals SET origin = 'legacy' WHERE origin = '';
         )"},
     };
     if (!MigrationRunner::run(db_, "approval_manager", kMigrations)) {

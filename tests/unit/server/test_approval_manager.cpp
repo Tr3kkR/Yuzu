@@ -869,8 +869,10 @@ TEST_CASE("ApprovalManager: migration v6 applies to an existing v5 store",
     CHECK(has_index("idx_approvals_status_submitted"));
     CHECK(has_index("idx_approvals_status_consumed_reviewed"));
     // And that migration SIX is what put them there: index existence alone
-    // would also hold if v6 were folded back into an earlier migration.
-    CHECK(MigrationRunner::current_version(tdb.db, "approval_manager") == 6);
+    // would also hold if v6 were folded back into an earlier migration. Pinned
+    // to the current head rather than to 6 — folding v6 away would renumber the
+    // tail and this still catches it.
+    CHECK(MigrationRunner::current_version(tdb.db, "approval_manager") == 7);
     auto row = mgr.get("v5-row");
     REQUIRE(row.has_value());
     CHECK(row->definition_id == "inventory.audit");
@@ -1287,4 +1289,65 @@ TEST_CASE("ApprovalManager: find_pending walks past a foreign ticket to a usable
     REQUIRE(found.has_value());
     CHECK(found->id == *usable); // NOT the newer foreign one
     CHECK(found->origin == ApprovalOrigin::kUnspecified);
+}
+
+TEST_CASE("ApprovalManager: migration v7 reaches a store already at v5",
+          "[approval_manager][db][security]") {
+    // The in-place v5 edit only helps a store that has not run v5 yet. Any
+    // database tracking origin/dev since the column landed is already at >= 5,
+    // never re-runs it, and keeps its pre-column rows at '' — the GRANTING
+    // value. v7 is what reaches those. Both rows below carry origin='' and are
+    // distinguished ONLY by submitted_at against schema_meta.upgraded_at.
+    TestDb tdb;
+    const long long stamp = 1000000;
+    REQUIRE(sqlite3_exec(tdb.db,
+                         "CREATE TABLE schema_meta (store TEXT PRIMARY KEY,"
+                         " version INTEGER NOT NULL, upgraded_at INTEGER NOT NULL DEFAULT 0);"
+                         "INSERT INTO schema_meta (store, version, upgraded_at)"
+                         " VALUES ('approval_manager', 5, 1000000);"
+                         "CREATE TABLE approvals ("
+                         "id TEXT PRIMARY KEY, definition_id TEXT NOT NULL,"
+                         "status TEXT NOT NULL DEFAULT 'pending',"
+                         "submitted_by TEXT NOT NULL DEFAULT '',"
+                         "submitted_at INTEGER NOT NULL DEFAULT 0,"
+                         "reviewed_by TEXT NOT NULL DEFAULT '',"
+                         "reviewed_at INTEGER NOT NULL DEFAULT 0,"
+                         "review_comment TEXT NOT NULL DEFAULT '',"
+                         "scope_expression TEXT NOT NULL DEFAULT '',"
+                         "consumed_at INTEGER NOT NULL DEFAULT 0,"
+                         "consumed_by TEXT NOT NULL DEFAULT '',"
+                         "schedule_id TEXT NOT NULL DEFAULT '',"
+                         "origin TEXT NOT NULL DEFAULT '');"
+                         // predates the column: must fail closed
+                         "INSERT INTO approvals (id, definition_id, submitted_at, origin)"
+                         " VALUES ('pre-column', 'mcp.delete_tag', 999999, '');"
+                         // minted AFTER the column existed with no declared origin —
+                         // that is the live MCP mint, and it MUST stay redeemable
+                         "INSERT INTO approvals (id, definition_id, submitted_at, origin)"
+                         " VALUES ('mcp-mint', 'mcp.delete_tag', 1000001, '');",
+                         nullptr, nullptr, nullptr) == SQLITE_OK);
+    (void)stamp;
+
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+    REQUIRE(mgr.is_open());
+
+    auto pre = mgr.get("pre-column");
+    REQUIRE(pre.has_value());
+    CHECK(pre->origin == ApprovalOrigin::kUnrecognised);
+    CHECK(declares_non_mcp_surface(pre->origin)); // refused at redemption
+
+    // A post-column undeclared mint is rewritten TOO, and that is deliberate.
+    // This assertion started life as an over-reach check — it failed, and the
+    // failure is what proved `submitted_at < upgraded_at` is not a usable
+    // discriminator: every later migration re-stamps `upgraded_at`, so by v7 it
+    // names when v6 finished. Kept, inverted, so nobody re-attempts the
+    // discriminator without meeting the evidence that killed it.
+    //
+    // The cost is real and bounded: an undeclared MCP ticket outstanding at
+    // upgrade stops redeeming and must be re-requested. That is exactly what a
+    // release upgrade does via v5, so the two paths agree.
+    auto live = mgr.get("mcp-mint");
+    REQUIRE(live.has_value());
+    CHECK(live->origin == ApprovalOrigin::kUnrecognised);
 }
