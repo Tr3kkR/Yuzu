@@ -997,6 +997,15 @@ groups:
       # cross-metric rule in this file uses; a rule that opts out of it needs a
       # stated reason, and this one has none. Pinned by the two-target case in
       # `tests/prometheus/yuzu-alerts.test.yml`.
+      #
+      # WHAT WOULD BREAK THE ASSUMPTION, since it is an operator-side change this
+      # file cannot guard: both metrics ship UNLABELLED (`server.cpp` emits them
+      # through the no-label `gauge(name)` overload), so their label sets are
+      # whatever the scrape adds -- identically, because it is one target. A
+      # `metric_relabel_configs` that adds or drops a label on ONE of the two makes
+      # the sets differ, the join then matches nothing, the grace silently stops
+      # applying, and every fresh boot pages. That is the inverse of the
+      # `on(instance)` bug above.
       - alert: YuzuAuditRetentionNotRunning
         expr: |
           increase(yuzu_server_audit_retention_passes_total[3h]) == 0
@@ -1054,18 +1063,20 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Audit retention liveness metric is not being scraped at all"
+          summary: "Audit retention liveness metric is absent - the reaper is unmonitored"
           description: >-
-            No yuzu_server_audit_retention_passes_total series exists in this Prometheus,
-            so YuzuAuditRetentionNotRunning - the only detector for a stopped audit reaper -
-            cannot fire, and the audit retention window is unmonitored. Nothing is known to
-            be broken; what is broken is the monitoring. Usual causes: the rules file was
-            applied to a Prometheus scraping a server build that predates the metric (the
-            rules file is a copy you apply yourself and the server never upgrades it); a
-            scrape config that drops it; or no Yuzu server being scraped by this Prometheus
-            at all. Confirm with `curl -s <server>/metrics | grep audit_retention_passes`,
-            then check metric_relabel_configs. Fleet-wide only - a single quiet server among
-            many is not detected this way.
+            No yuzu_server_audit_retention_passes_total series exists in this Prometheus, so
+            YuzuAuditRetentionNotRunning cannot fire and the audit retention window is
+            unmonitored. CHECK `up` FOR THE YUZU TARGET FIRST - this rule cannot tell the two
+            cases apart. If `up` is 0 or absent the SERVER OR ITS SCRAPE IS DOWN, which is an
+            outage, not a monitoring gap, and on a single-server Prometheus this rule may be
+            the only one firing (nothing here alerts on `up` directly). If `up` is 1 the
+            metric itself is missing: a server build predating it (the rules file is a copy
+            you apply yourself and the server never upgrades it), or a scrape config dropping
+            it - confirm with `curl -s <server>/metrics | grep audit_retention_passes`, then
+            check metric_relabel_configs. Expected, and ignorable, before the first server is
+            scraped at all. Fleet-wide only - a single quiet server among many is not
+            detected this way.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # The durable clock reading is what makes anomaly detection survive a

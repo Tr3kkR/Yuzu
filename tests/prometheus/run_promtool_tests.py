@@ -5,14 +5,14 @@ THIS SCRIPT IS THE ONLY HOME for the promtool invocation and for the pinned
 image. `.github/workflows/docs-lint.yml`'s `prometheus-rules` job calls it with
 `YUZU_TEST_ENABLE_PROMTOOL_DOCKER=1` and `meson test --suite docs` calls it
 without, so CI and a local run are provably the same code. That follows the
-pattern this repo already uses for a CI-pulled image — `PROBE_IMAGE` in
+pattern this repo already uses for a CI-pulled image - `PROBE_IMAGE` in
 `scripts/ci/verify-healthcheck-invariants.sh`, `PG_IMAGE` in
 `scripts/ci/ensure-postgres.sh`: the pin lives in the script and the workflows
 carry zero copies of it.
 
 An alert rule is code that runs in production and never compiles, and
 `promtool check rules` proves only that the PromQL parses. A rule that parses
-perfectly and can never fire for the case it was written for passes it — which
+perfectly and can never fire for the case it was written for passes it - which
 is how `YuzuAuditRetentionNotRunning` shipped blind to a crash-looping server
 (#2553). `test rules` is the behaviour gate.
 
@@ -36,8 +36,8 @@ pinned image" is true rather than nearly-true: a stray 3.x binary on a
 self-hosted box cannot silently answer for it.
 
 VERSION CHECK. Prometheus 3.0 made range selectors left-open, which shifts
-`increase()` and `resets()` by a sample at window edges — exactly what these
-cases measure — so the MAJOR is load-bearing. A `promtool` that prints no
+`increase()` and `resets()` by a sample at window edges - exactly what these
+cases measure - so the MAJOR is load-bearing. A `promtool` that prints no
 parseable version is treated as unusable rather than trusted: without that, a
 stub which only `exit 0`s reports success for every rule (measured on the
 reverted first attempt). It raises the bar from any exit-0 binary named
@@ -69,7 +69,7 @@ SKIP = 77
 # `postgres:18.4-bookworm@sha256:`): the tag keeps the version readable for a
 # human and an updater, the digest is what actually gets pulled. This is
 # promtool 3.13.1, the build these cases were written and mutation-checked
-# against. Note `prom/prometheus:3.13.1` is not a tag Docker Hub publishes — the
+# against. Note `prom/prometheus:3.13.1` is not a tag Docker Hub publishes - the
 # registry uses a `v` prefix.
 PROMTOOL_IMAGE = (
     "prom/prometheus:v3.13.1@sha256:"
@@ -101,27 +101,47 @@ DOCKER_HARDENING = [
     "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
     "--pids-limit", "256",
     "--memory", "1g",
+    # Belt-and-braces: the image already runs as uid 65534 with no effective
+    # capabilities, so there is nothing here to escalate to. Cheap to state.
+    "--security-opt", "no-new-privileges",
 ]
 
 
-def run(argv: list[str]) -> tuple[int, str]:
+def gh_error(msg: str) -> None:
+    """Surface a failure as a GitHub Actions annotation when running in one."""
+    if os.environ.get("GITHUB_ACTIONS"):
+        print(f"::error::{msg}", flush=True)
+
+
+def run(argv: list[str], timeout: int = 300) -> tuple[int, str]:
     """Run promtool, echo its output, and return `(rc, combined output)`.
 
     The output is returned because promtool's exit code is not sufficient
-    evidence on its own — see `check_gate_output`.
+    evidence on its own - see `check_gate_output`.
     """
     print("+ " + " ".join(argv), flush=True)
     # errors="replace": a decode error in promtool's output must not become an
     # uncaught traceback in place of a clean pass/fail.
-    proc = subprocess.run(argv, cwd=REPO_ROOT, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace")
+    # timeout: output is captured, not streamed, so a wedged registry or
+    # container would otherwise print NOTHING until the job's own 10-minute
+    # timeout killed it -- reporting as "the gate timed out" rather than naming
+    # what hung.
+    try:
+        proc = subprocess.run(argv, cwd=REPO_ROOT, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        msg = f"timed out after {timeout}s: {' '.join(argv)}"
+        print(f"FAIL: {msg}", flush=True)
+        gh_error(msg)
+        return 1, ""
     out = proc.stdout + proc.stderr
     if out:
         print(out, end="" if out.endswith("\n") else "\n", flush=True)
     return proc.returncode, out
 
 
-def check_gate_output(check_out: str, test_out: str, declared_cases: int | None) -> str | None:
+def check_gate_output(check_out: str, test_out: str, declared_cases: int | None,
+                      rules_bound: bool | None = True) -> str | None:
     """The reason this run proves nothing, or None if it is real evidence.
 
     PROMTOOL EXITS 0 ON AN EMPTY RUN, and that is the whole reason this function
@@ -132,41 +152,63 @@ def check_gate_output(check_out: str, test_out: str, declared_cases: int | None)
       A test file whose `tests:` list is empty also prints "SUCCESS", rc 0.
 
     So a rules file renamed without updating the test file's relative
-    `rule_files:` — exactly the edit that would also carry a rule change —
+    `rule_files:` - exactly the edit that would also carry a rule change -
     turns this gate green having loaded zero rules and asserted nothing. A
     green check that proves nothing is worse than no check, because it is
     reported as evidence.
     """
     if "no file match pattern" in test_out:
-        return ("`test rules` matched NO rule file — its `rule_files:` path is "
+        return ("`test rules` matched NO rule file - its `rule_files:` path is "
                 "stale, so zero rules were loaded and every case vacuously "
                 "passed. promtool exits 0 for this; the gate must not.")
+    if rules_bound is False:
+        return (f"`test rules` did not load {RULES} - its `rule_files:` names some "
+                f"OTHER existing file, so the cases asserted nothing about the "
+                f"rules `check rules` just validated. promtool reports no warning "
+                f"for this, because from its side nothing is wrong.")
     m = re.search(r"SUCCESS:\s*(\d+)\s+rules found", check_out)
     if not m:
         return ("`check rules` did not report a rule count; cannot confirm any "
                 "rule was loaded.")
     if int(m.group(1)) == 0:
-        return "`check rules` loaded 0 rules — nothing was validated."
+        return "`check rules` loaded 0 rules - nothing was validated."
     if declared_cases is not None and declared_cases == 0:
-        return f"{TESTS} declares no test cases — nothing was asserted."
+        return f"{TESTS} declares no test cases - nothing was asserted."
     return None
 
 
-def declared_case_count() -> int | None:
-    """How many cases the test file declares, or None if it cannot be read.
+def inspect_test_file() -> tuple[int | None, bool | None]:
+    """`(declared case count, whether it loads RULES)`; None where unknowable.
 
-    PyYAML is a hard build dependency of this repo, but this stays best-effort:
-    the `no file match pattern` check above is the load-bearing one, and a
-    missing parser must not turn the gate red on its own.
+    A MISSING PARSER AND AN UNPARSEABLE FILE ARE DIFFERENT. Without PyYAML we
+    genuinely cannot answer, and must not redden the gate for it (the
+    `no file match pattern` check does not need a parser). But if the file is
+    present and does not parse, the suite promtool just ran is not the suite this
+    repo thinks it has, and that IS a failure.
+
+    The `rule_files` read exists because `check rules` validates a hardcoded path
+    while `test rules` loads whatever the test file names. Repointing that at
+    another EXISTING rules file produces no promtool warning at all, so nothing
+    else notices the cases stopped covering the rules that were validated.
     """
     try:
         import yaml  # noqa: PLC0415 - optional, see docstring
+    except ImportError:
+        print("note: PyYAML unavailable; skipping case-count and rule_files checks",
+              flush=True)
+        return None, None
+    try:
         with (REPO_ROOT / TESTS).open(encoding="utf-8") as fh:
-            doc = yaml.safe_load(fh)
-        return len(doc.get("tests") or [])
-    except Exception as ex:  # noqa: BLE001 - best-effort by design
-        print(f"note: could not count declared cases ({ex})", flush=True)
-        return None
+            doc = yaml.safe_load(fh) or {}
+    except (OSError, yaml.YAMLError) as ex:
+        sys.exit(f"FAIL: {TESTS} is present but could not be parsed ({ex}).")
+    cases = len(doc.get("tests") or [])
+    listed = doc.get("rule_files") or []
+    want = (REPO_ROOT / RULES).resolve()
+    bound = any(
+        (REPO_ROOT / TESTS).parent.joinpath(str(p)).resolve() == want for p in listed
+    )
+    return cases, bound
 
 
 def gate(promtool_argv: list[str], rules: str, tests: str) -> int:
@@ -177,9 +219,10 @@ def gate(promtool_argv: list[str], rules: str, tests: str) -> int:
     rc, test_out = run(promtool_argv + ["test", "rules", tests])
     if rc:
         return rc
-    reason = check_gate_output(check_out, test_out, declared_case_count())
+    cases, bound = inspect_test_file()
+    reason = check_gate_output(check_out, test_out, cases, bound)
     if reason:
-        sys.exit(f"FAIL: promtool exited 0 but the run proves nothing — {reason}")
+        sys.exit(f"FAIL: promtool exited 0 but the run proves nothing - {reason}")
     return 0
 
 
@@ -195,8 +238,8 @@ def parse_major(version_output: str) -> int | None:
 def native_promtool() -> tuple[str, int] | None:
     """`(path, major)` for a usable promtool on PATH, else None.
 
-    Returns the RESOLVED path, and the caller executes that same path — not the
-    bare name — so a PATH change between the check and the run cannot swap the
+    Returns the RESOLVED path, and the caller executes that same path - not the
+    bare name - so a PATH change between the check and the run cannot swap the
     binary, and Windows' application-directory search order does not apply.
     """
     exe = shutil.which("promtool")
@@ -250,7 +293,7 @@ def pull_with_retry() -> bool:
     # Backoff widens rather than repeating a fixed 10s: a transient blip clears
     # in seconds, but the realistic failure here is an anonymous Docker Hub rate
     # limit, and 3x10s never outlasts one of those. This does not pretend to
-    # either — a quota window is hours — it just stops three near-simultaneous
+    # either - a quota window is hours - it just stops three near-simultaneous
     # attempts being reported as a considered retry.
     for attempt, delay in ((1, 10), (2, 30), (3, 0)):
         rc, _ = run(["docker", "pull", "--quiet", PROMTOOL_IMAGE])
@@ -316,20 +359,32 @@ def selftest() -> int:
     # exits 0 on a suite that loaded no rules, so these are the cases that stop
     # this gate grading itself.
     ok_check = "Checking rules\n  SUCCESS: 61 rules found\n"
-    check("real run accepted", check_gate_output(ok_check, "  SUCCESS\n", 9), None)
+    check("real run accepted", check_gate_output(ok_check, "  SUCCESS\n", 9, True), None)
     stale = check_gate_output(
-        ok_check, "  WARNING: no file match pattern /w/docs/gone.yml\n  SUCCESS\n", 9)
+        ok_check, "  WARNING: no file match pattern /w/docs/gone.yml\n  SUCCESS\n",
+        9, True)
     if stale is None:
         failures.append("unresolved rule_files glob was accepted as a pass")
-    if check_gate_output("SUCCESS: 0 rules found\n", "  SUCCESS\n", 9) is None:
+    if check_gate_output("SUCCESS: 0 rules found\n", "  SUCCESS\n", 9, True) is None:
         failures.append("a zero-rule check run was accepted as a pass")
-    if check_gate_output(ok_check, "  SUCCESS\n", 0) is None:
+    if check_gate_output(ok_check, "  SUCCESS\n", 0, True) is None:
         failures.append("a test file declaring no cases was accepted as a pass")
-    if check_gate_output("some other output\n", "  SUCCESS\n", 9) is None:
+    if check_gate_output("some other output\n", "  SUCCESS\n", 9, True) is None:
         failures.append("a check run with no rule count was accepted as a pass")
-    # An unreadable test file must NOT redden the gate on its own.
-    check("uncountable cases still pass",
-          check_gate_output(ok_check, "  SUCCESS\n", None), None)
+    # The decoy case: rule_files names a DIFFERENT existing file, so promtool
+    # emits no warning at all and only this check can see it.
+    if check_gate_output(ok_check, "  SUCCESS\n", 9, False) is None:
+        failures.append("a test file loading the WRONG rules file was accepted")
+    # Unknowable (no PyYAML) must NOT redden the gate on its own.
+    check("unknowable binding still passes",
+          check_gate_output(ok_check, "  SUCCESS\n", None, None), None)
+
+    # The real test file must actually bind to the real rules file.
+    cases, bound = inspect_test_file()
+    if bound is False:
+        failures.append(f"{TESTS} does not load {RULES}")
+    if cases == 0:
+        failures.append(f"{TESTS} declares no cases")
 
     for f in failures:
         print(f"SELFTEST FAIL: {f}", flush=True)
@@ -354,7 +409,7 @@ def main(argv: list[str]) -> int:
                     f"SKIP: {exe} is major {major}; these cases are validated only "
                     f"against major {PINNED_MAJOR} (Prometheus 3.0 made range "
                     f"selectors left-open, which moves increase()/resets() at "
-                    f"window edges — the exact thing these cases measure). Install "
+                    f"window edges - the exact thing these cases measure). Install "
                     f"a {PINNED_MAJOR}.x promtool, or set {DOCKER_OPT_IN}=1 to use "
                     f"the pinned image.",
                     flush=True,
