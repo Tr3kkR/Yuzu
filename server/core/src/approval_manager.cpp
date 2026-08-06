@@ -1,4 +1,6 @@
 #include "approval_manager.hpp"
+
+#include "sqlite_raii.hpp"
 #include "migration_runner.hpp"
 #include "secure_random.hpp"
 
@@ -511,24 +513,40 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
 
     std::lock_guard lock(mtx_);
 
+    // NO `LIMIT 1`. The newest match is not necessarily a usable one: since the
+    // mint-time namespace refusal was removed, a ticket carrying a declared
+    // non-MCP surface can sit in this dedup key. Handing one back would return a
+    // ticket THIS CALLER'S OWN RECALL WILL REFUSE (`kForeignOrigin`) — so an
+    // administrator reviews and approves a request that can never complete, and
+    // a human approval is spent on a flow with no successful outcome.
+    //
+    // Filtered in C++ through the SHARED predicate rather than a second,
+    // hand-written SQL copy of the rule. A copy in a WHERE clause is a second
+    // home for `declares_non_mcp_surface`, and the two would drift the first
+    // time the enum grows.
+    //
+    // Walk newest-first and take the first REDEEMABLE candidate, rather than
+    // taking the newest and rejecting it — an older undeclared ticket under the
+    // same key is a perfectly good dedup hit, and skipping it would mint a
+    // duplicate.
     std::string sql = std::string("SELECT ") + kSelectAllCols +
                       " FROM approvals WHERE definition_id = ? AND submitted_by = ? "
                       "AND scope_expression = ? AND status = 'pending' "
-                      "ORDER BY submitted_at DESC LIMIT 1";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+                      "ORDER BY submitted_at DESC";
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, stmt.addr(), nullptr) != SQLITE_OK)
         return std::nullopt;
 
-    sqlite3_bind_text(stmt, 1, definition_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, submitted_by.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, scope_expression.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 1, definition_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, submitted_by.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, scope_expression.c_str(), -1, SQLITE_TRANSIENT);
 
-    std::optional<Approval> out;
-    if (sqlite3_step(stmt) == SQLITE_ROW)
-        out = row_to_approval(stmt);
-
-    sqlite3_finalize(stmt);
-    return out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        Approval a = row_to_approval(stmt.get());
+        if (!declares_non_mcp_surface(a.origin))
+            return a;
+    }
+    return std::nullopt;
 }
 
 // ---------------------------------------------------------------------------

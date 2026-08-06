@@ -1240,3 +1240,50 @@ TEST_CASE("ApprovalManager: an unrecognised origin column value is refused, not 
     CHECK(mgr.get(*id)->consumed_at == 0);
 }
 
+TEST_CASE("ApprovalManager: find_pending skips a ticket the recall would refuse",
+          "[approval_manager][approval][security]") {
+    // sec-F-03. The MCP mint dedups on (definition_id, submitted_by,
+    // scope_expression). Since the mint-time namespace refusal was removed, a
+    // ticket carrying a declared non-MCP surface can occupy that key — and
+    // handing it back returns a ticket the MCP recall will refuse as
+    // kForeignOrigin. The admin then reviews and approves a request that can
+    // never complete, spending a human approval on a dead flow.
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto foreign = mgr.submit("mcp.quarantine_device", "operator1", "{\"agent_id\":\"a1\"}", "",
+                              ApprovalOrigin::kInstruction);
+    REQUIRE(foreign.has_value());
+
+    // Same dedup key, and the row really is there and really is pending —
+    // otherwise this asserts nothing.
+    REQUIRE(mgr.get(*foreign)->status == "pending");
+    REQUIRE(mgr.get(*foreign)->origin == ApprovalOrigin::kInstruction);
+
+    CHECK(!mgr.find_pending("mcp.quarantine_device", "operator1", "{\"agent_id\":\"a1\"}")
+               .has_value());
+}
+
+TEST_CASE("ApprovalManager: find_pending walks past a foreign ticket to a usable one",
+          "[approval_manager][approval][security]") {
+    // The filter must WALK, not just reject the newest. An older undeclared
+    // ticket under the same key is a perfectly good dedup hit; skipping it
+    // mints a duplicate and re-opens the flooding this dedup exists to bound.
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto usable = mgr.submit("mcp.delete_tag", "operator1", "{}"); // undeclared = MCP mint today
+    REQUIRE(usable.has_value());
+    backdate(tdb.db, *usable, "submitted_at", 60); // older, so the foreign one sorts first
+
+    auto foreign = mgr.submit("mcp.delete_tag", "operator1", "{}", "",
+                              ApprovalOrigin::kInstruction);
+    REQUIRE(foreign.has_value());
+
+    auto found = mgr.find_pending("mcp.delete_tag", "operator1", "{}");
+    REQUIRE(found.has_value());
+    CHECK(found->id == *usable); // NOT the newer foreign one
+    CHECK(found->origin == ApprovalOrigin::kUnspecified);
+}
