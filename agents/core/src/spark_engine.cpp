@@ -963,13 +963,27 @@ void SparkEngine::disarm(SubscriptionId id) {
         auto ki = sub_keys_.find(id);
         if (ki == sub_keys_.end())
             return;
-        const std::string key = ki->second;
+        // Key off the LOCATED entry BY REFERENCE (#2270). The copy this replaced
+        // allocated, and an allocation throwing here escapes a void function with
+        // armed_/sub_keys_ half torn down and no watcher reclaimed — the residue
+        // teardown_arm_race was written to avoid, in the sibling that propagates.
+        // SCOPE, stated exactly because the same wording had to be corrected once
+        // in teardown_arm_race: `key` is a reference INTO sub_keys_. It is read
+        // only ABOVE the move below; past that point it names a moved-from string
+        // and must not be read, and past sub_keys_.erase(ki) it dangles outright.
+        const std::string& key = ki->second;
         auto ai = armed_.find(key);
         if (ai != armed_.end()) {
             auto& subs = ai->second.subs;
             std::erase_if(subs, [&](const Subscriber& s) { return s.id == id; });
             if (subs.empty()) {
-                spdlog::info("SparkEngine: disarmed '{}' (last subscription gone)", key);
+                // CONTAINED, matching teardown_arm_race. spdlog allocates, and the
+                // condition this whole layer exists for is the one that makes it
+                // throw; the engine's bookkeeping below must complete regardless.
+                try {
+                    spdlog::info("SparkEngine: disarmed '{}' (last subscription gone)", key);
+                } catch (...) {
+                }
                 // Only tear the OS watch down when the engine is live: the watch
                 // was armed only while running_, and stop() already unwinds every
                 // mechanism. A pre-start or post-stop disarm has no watch to drop.
@@ -977,7 +991,12 @@ void SparkEngine::disarm(SubscriptionId id) {
                     auto mit = mechanisms_.find(ai->second.spec.type);
                     if (mit != mechanisms_.end()) {
                         mech = mit->second.get();
-                        unwatch_key = key;
+                        // MOVE, not copy: sub_keys_.erase(ki) below destroys this
+                        // entry anyway, so its buffer is ours to take and the
+                        // transfer allocates nothing. Leaves `key` moved-from —
+                        // see the scope note above. armed_ holds its own key
+                        // string, so `ai` and the erase below are unaffected.
+                        unwatch_key = std::move(ki->second);
                         unwatch_type = ai->second.spec.type;
                     }
                 }

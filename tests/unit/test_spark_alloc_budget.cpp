@@ -416,3 +416,45 @@ TEST_CASE("arm_impl: the fresh SUCCESS path allocates nothing after the commit (
     CHECK(engine.stats().armed_sparks == 1);
     engine.stop();
 }
+
+TEST_CASE("disarm: the in-lock teardown allocates nothing (#2270)", "[spark][alloc]") {
+    // THE SIBLING THE FIRST FOUR CASES DID NOT COVER. arm_impl was made
+    // allocation-free past its commit and given teardown_arm_race as a contained
+    // twin, while disarm() - reached from Guardian's ordinary withdraw path -
+    // kept copying the key, logging uncounted and copying again, and PROPAGATES
+    // where the twin contains. Three governance rounds retired findings on that
+    // sink because its caller had been deleted; nothing pinned the sink itself.
+    //
+    // What a throw in that window costs, which is why zero is the budget: it
+    // escapes a void function after erase_if has already emptied `subs`, leaving
+    // an armed_ entry with no subscribers and a dangling sub_keys_ row - a dedup
+    // target that hands the next equal-spec arm a SUCCESS with no watcher.
+    SparkEngine engine;
+    CountingMechanism* mech = wire(engine);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+    warm_arena(engine, *c);
+    QuietLog quiet;
+
+    // As in the success case: recording would put a set node and an over-SSO key
+    // copy inside the counted window and read as engine cost.
+    mech->set_record(false);
+
+    auto sub = engine.arm(*c, long_file_spec()); // fresh key, over-SSO, watch succeeds
+    REQUIRE(sub.has_value());
+    REQUIRE(engine.stats().armed_sparks == 1);
+
+    g_allocs = 0;
+    g_counting = true;
+    engine.disarm(*sub); // last subscriber -> whole-key teardown + unwatch
+    g_counting = false;
+
+    // ZERO, not a small number. The key is MOVED out of the sub_keys_ entry that
+    // is erased on the next line rather than copied, both erases only free, and
+    // the log is contained. Mutation-check this by restoring `const std::string
+    // key = ki->second;` in SparkEngine::disarm - that alone reddens this.
+    CHECK(g_allocs == 0);
+    CHECK(engine.stats().armed_sparks == 0);
+    engine.stop();
+}
