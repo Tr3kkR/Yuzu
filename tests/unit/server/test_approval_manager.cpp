@@ -395,25 +395,36 @@ TEST_CASE("ApprovalManager: consume_ticket replay is rejected and keeps the orig
 // does not bind the submitter, so a ticket minted elsewhere under an `mcp.`
 // definition id is a ticket the MCP gate would accept.
 
-TEST_CASE("ApprovalManager: a declared non-MCP origin cannot mint into the mcp. namespace",
+TEST_CASE("ApprovalManager: minting into the mcp. namespace is deliberately NOT refused",
           "[approval_manager][approval][security]") {
+    // This asserts an ABSENCE on purpose, so that restoring the mint-time
+    // refusal fails here rather than silently stranding operator content.
+    //
+    // #2442 is defended at REDEMPTION (see the foreign-origin cases below), not
+    // at mint. Refusing here looks stricter and is worse: a pre-existing
+    // definition under `mcp.` with a schedule re-submits via kSchedule on every
+    // fire, so a mint-time refusal stops that schedule permanently, and moving a
+    // schedule between definitions is not supported (#2742). Authoring a NEW
+    // definition under the prefix is still refused, at the two authoring sites
+    // that call `is_reserved_definition_id`.
     TestDb tdb;
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    // The REST instruction gate: definition id caller-influenced, scope
-    // expression caller-supplied verbatim.
     auto forged = mgr.submit("mcp.quarantine_device", "attacker", "{\"agent_id\":\"a1\"}", "",
                              ApprovalOrigin::kInstruction);
-    REQUIRE(!forged.has_value());
-    CHECK(forged.error().find("reserved") != std::string::npos);
+    REQUIRE(forged.has_value());
 
-    auto from_schedule = mgr.submit("mcp.delete_tag", "attacker", "{}", "sched-1",
+    auto from_schedule = mgr.submit("mcp.delete_tag", "operator1", "{}", "sched-1",
                                     ApprovalOrigin::kSchedule);
-    CHECK(!from_schedule.has_value());
+    REQUIRE(from_schedule.has_value());
 
-    // Nothing was written.
-    CHECK(mgr.query({}).empty());
+    // Both were written, and both carry the surface they actually came from —
+    // which is what the redemption guard reads.
+    auto rows = mgr.query({});
+    REQUIRE(rows.size() == 2);
+    CHECK(mgr.get(*forged)->origin == ApprovalOrigin::kInstruction);
+    CHECK(mgr.get(*from_schedule)->origin == ApprovalOrigin::kSchedule);
 }
 
 TEST_CASE("ApprovalManager: a declared origin is recorded on the ticket",
@@ -471,12 +482,14 @@ TEST_CASE("ApprovalManager: origin round-trips through its column text",
     CHECK(approval_origin_from_string("instruction") == ApprovalOrigin::kInstruction);
     CHECK(approval_origin_from_string("schedule") == ApprovalOrigin::kSchedule);
     CHECK(approval_origin_from_string("mcp") == ApprovalOrigin::kMcp);
-    // Empty (a pre-v5 row) and anything unrecognised both fall back to "no
-    // declared origin" — an unknown string must never be promoted into a
-    // surface.
+    // Empty (a pre-v5 row) is genuinely "no declared origin". Anything
+    // unrecognised is NOT the same thing and must not decode as it.
     CHECK(approval_origin_from_string("") == ApprovalOrigin::kUnspecified);
-    CHECK(approval_origin_from_string("MCP") == ApprovalOrigin::kUnspecified);
-    CHECK(approval_origin_from_string("nonsense") == ApprovalOrigin::kUnspecified);
+    // NOT kUnspecified: that is the value that GRANTS redemption, so folding an
+    // unknown string into it would make a row written by a newer binary
+    // redeemable here. See the kUnrecognised case below.
+    CHECK(approval_origin_from_string("MCP") == ApprovalOrigin::kUnrecognised);
+    CHECK(approval_origin_from_string("nonsense") == ApprovalOrigin::kUnrecognised);
 }
 
 TEST_CASE("ApprovalManager: migration v5 leaves pre-existing rows with no declared origin",
@@ -970,3 +983,225 @@ TEST_CASE("ApprovalManager: consumed tickets are history, never expired",
     CHECK(row->status == "approved");        // untouched — it is evidence, not a capability
     CHECK(row->consumed_by == "operator1");  // trail intact
 }
+
+// ── Mint-surface origin + the redemption guard (#2442) ─────────────────────
+// The MCP recall matches a ticket on (definition_id, scope_expression) and
+// does not bind the submitter, so a ticket minted elsewhere under an `mcp.`
+// definition id is a ticket the MCP gate would otherwise accept. The refusal
+// lives at REDEMPTION, keyed on the recorded origin — minting is a legitimate
+// act, redeeming on a foreign surface is not. These cases are the tether on
+// that: they are what stops the guard being dropped or narrowed unnoticed.
+
+TEST_CASE("ApprovalManager: a ticket minted by a declared non-MCP surface cannot be redeemed",
+          "[approval_manager][approval][security]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    // The REST instruction gate: definition id caller-influenced, scope
+    // expression caller-supplied verbatim. The mint SUCCEEDS — refusing it here
+    // is what stranded pre-existing operator content, and is deliberately gone.
+    auto forged = mgr.submit("mcp.quarantine_device", "attacker", "{\"agent_id\":\"a1\"}", "",
+                             ApprovalOrigin::kInstruction);
+    REQUIRE(forged.has_value());
+    REQUIRE(mgr.approve(*forged, "admin1", "").has_value());
+
+    // The redemption is where it dies. This is the MCP recall's call shape.
+    auto redeemed = mgr.consume_ticket(*forged, "attacker", {});
+    REQUIRE(!redeemed.has_value());
+
+    // And the ticket is UNTOUCHED — a refused forgery must not burn it.
+    auto row = mgr.get(*forged);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0);
+    CHECK(row->consumed_by.empty());
+    CHECK(row->status == "approved");
+
+    // Same for the scheduler surface.
+    auto sched = mgr.submit("mcp.delete_tag", "attacker", "{}", "sched-1",
+                            ApprovalOrigin::kSchedule);
+    REQUIRE(sched.has_value());
+    REQUIRE(mgr.approve(*sched, "admin1", "").has_value());
+    CHECK(!mgr.consume_ticket(*sched, "attacker", {}).has_value());
+    CHECK(mgr.get(*sched)->consumed_at == 0);
+}
+
+TEST_CASE("ApprovalManager: the redemption refusal is a distinct kind but not a distinct message",
+          "[approval_manager][approval][security]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto forged = mgr.submit("mcp.quarantine_device", "attacker", "{}", "",
+                             ApprovalOrigin::kInstruction);
+    REQUIRE(forged.has_value());
+    REQUIRE(mgr.approve(*forged, "admin1", "").has_value());
+
+    auto denied = mgr.consume_ticket(*forged, "attacker", {});
+    REQUIRE(!denied.has_value());
+    // The KIND separates a forgery attempt from a replay, so the log and any
+    // future audit row can tell them apart.
+    CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin);
+
+    // The MESSAGE deliberately does not. A spent ordinary ticket and a refused
+    // forgery must read identically to a remote caller, or the recall becomes an
+    // oracle for which definition ids exist and which surface minted them.
+    auto spent = mgr.submit("inventory.audit", "operator1", "{}", "", ApprovalOrigin::kMcp);
+    REQUIRE(spent.has_value());
+    REQUIRE(mgr.approve(*spent, "admin1", "").has_value());
+    REQUIRE(mgr.consume_ticket(*spent, "operator1", {}).has_value()); // first use succeeds
+    auto replay = mgr.consume_ticket(*spent, "operator1", {});    // second does not
+    REQUIRE(!replay.has_value());
+    CHECK(replay.error().kind == ConsumeFailure::kNotConsumable);
+    CHECK(denied.error().message == replay.error().message);
+}
+
+TEST_CASE("ApprovalManager: an MCP-minted ticket under the reserved prefix still redeems",
+          "[approval_manager][approval][security]") {
+    // The positive control. Without it, a guard that refused EVERYTHING would
+    // pass every assertion above.
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto declared = mgr.submit("mcp.quarantine_device", "operator1", "{\"agent_id\":\"a1\"}", "",
+                               ApprovalOrigin::kMcp);
+    REQUIRE(declared.has_value());
+    REQUIRE(mgr.approve(*declared, "admin1", "").has_value());
+    CHECK(mgr.consume_ticket(*declared, "operator1", {}).has_value());
+    CHECK(mgr.get(*declared)->consumed_at != 0);
+
+    // And the undeclared mint — which is what the frozen MCP gate actually does
+    // today — must also still redeem, or the guard breaks the live MCP flow.
+    auto undeclared = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kUnspecified);
+    REQUIRE(undeclared.has_value());
+    REQUIRE(mgr.approve(*undeclared, "admin1", "").has_value());
+    CHECK(mgr.consume_ticket(*undeclared, "operator1", {}).has_value());
+}
+
+TEST_CASE("ApprovalManager: an ordinary non-MCP ticket is refused at redemption too",
+          "[approval_manager][approval][security]") {
+    // The guard is keyed on ORIGIN, not on the `mcp.` id prefix — so a REST-
+    // minted ticket for an ordinary definition is equally unredeemable through
+    // the recall. This is the property that survives the MCP mint changing how
+    // it builds its ids, which the prefix rule did not. It costs nothing: no
+    // legitimate flow redeems a REST-minted ticket here (the REST gate matches
+    // its own approvals by field comparison, it does not call consume_ticket).
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto rest = mgr.submit("inventory.audit", "operator1", "{}", "", ApprovalOrigin::kInstruction);
+    REQUIRE(rest.has_value());
+    REQUIRE(mgr.approve(*rest, "admin1", "").has_value());
+    auto denied = mgr.consume_ticket(*rest, "operator1", {});
+    REQUIRE(!denied.has_value());
+    CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin);
+    CHECK(mgr.get(*rest)->consumed_at == 0);
+}
+
+TEST_CASE("ApprovalManager: an empty precondition consumes with no precondition supplied",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kUnspecified);
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+
+    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_by == "operator1");
+}
+
+TEST_CASE("ApprovalManager: a missing principal fails closed on the recheck path too",
+          "[approval_manager][approval]") {
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kUnspecified);
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+
+    bool ran = false;
+    auto consumed = mgr.consume_ticket(*id, "",
+                                       [&ran](const Approval&) -> std::expected<void, std::string> {
+                                           ran = true;
+                                           return {};
+                                       });
+    REQUIRE(!consumed.has_value());
+    CHECK(consumed.error().kind == ConsumeFailure::kStoreError);
+    CHECK(!ran); // argument validation precedes any callback
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0);
+}
+
+TEST_CASE("ApprovalManager: a store failure is not reported as spent in the message either",
+          "[approval_manager][approval]") {
+    // The case above pins the KIND on a store failure. This pins the MESSAGE.
+    // The kind is what drives the branch: the sole production caller is the MCP
+    // recall (grep `consume_ticket(` in server/core/src — one production hit),
+    // and it reads `.kind` four times and `.message` never. The message is pinned anyway because it is the field a future
+    // caller would surface to a human, and a store failure described as a spent
+    // ticket is the wrong thing to tell them — but do not read this test as
+    // evidence that anything reads it today.
+    //
+    // This used to test a two-argument overload that returned the message alone
+    // and discarded the kind. That overload was removed (adversarial review,
+    // K3/CDX-P2-003) because a future caller picking it would have lost the
+    // cross-surface distinction #2442 added. The property it protected is kept
+    // here against the typed error.
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kUnspecified);
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+    REQUIRE(sqlite3_exec(tdb.db, "DROP TABLE approvals", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    auto flat = mgr.consume_ticket(*id, "operator1", {});
+    REQUIRE(!flat.has_value());
+    // The property that matters is the negative: it must NOT read as spent, or
+    // an operator is told to discard a live human-approved capability. (A
+    // dropped table fails at prepare, not at step, so the text is "prepare
+    // failed" rather than get_checked's "read failed" — both are kStoreError.)
+    CHECK(flat.error().message.find("not consumable") == std::string::npos);
+    CHECK(flat.error().message.find("already used") == std::string::npos);
+    CHECK(flat.error().message.find("failed") != std::string::npos);
+
+    // And the kind agrees with the message.
+    CHECK(flat.error().kind == ConsumeFailure::kStoreError);
+}
+
+TEST_CASE("ApprovalManager: an unrecognised origin column value is refused, not exempted",
+          "[approval_manager][approval][security]") {
+    // The decode used to fold anything unknown into kUnspecified. #2442 made
+    // kUnspecified the value that GRANTS redemption, so that fold would have made
+    // the composite fail OPEN even though the predicate fails closed.
+    CHECK(approval_origin_from_string("") == ApprovalOrigin::kUnspecified);
+    CHECK(approval_origin_from_string("mcp") == ApprovalOrigin::kMcp);
+    CHECK(approval_origin_from_string("MCP") == ApprovalOrigin::kUnrecognised); // case-sensitive
+    CHECK(approval_origin_from_string("nonsense") == ApprovalOrigin::kUnrecognised);
+    CHECK(declares_non_mcp_surface(ApprovalOrigin::kUnrecognised));
+
+    // End to end: a row written by a newer binary, read back by this one.
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+    REQUIRE(sqlite3_exec(tdb.db, "UPDATE approvals SET origin = 'future_surface'", nullptr, nullptr,
+                         nullptr) == SQLITE_OK);
+
+    auto denied = mgr.consume_ticket(*id, "operator1", {});
+    REQUIRE(!denied.has_value());
+    CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin);
+    CHECK(mgr.get(*id)->consumed_at == 0);
+}
+

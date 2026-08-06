@@ -37,7 +37,18 @@ enum class ApprovalOrigin {
     /// The MCP approval-ticket gate (mcp_server.cpp). Not yet passed by that
     /// caller — see kUnspecified.
     kMcp,
+    /// A stored value this build does not know — a row written by a newer
+    /// binary, or a corrupted column. DISTINCT from kUnspecified because
+    /// kUnspecified is the value that GRANTS redemption (#2442): folding an
+    /// unknown string into it would make an unrecognised surface redeemable,
+    /// which is the fail-open direction. Never written, only decoded.
+    kUnrecognised,
 };
+
+/// True when `origin` names a surface that is NOT the MCP recall — including
+/// kUnrecognised, which fails closed. False for kMcp and for kUnspecified, the
+/// undeclared case that stays redeemable until the MCP mint declares itself.
+bool declares_non_mcp_surface(ApprovalOrigin origin);
 
 /// Column text for `origin`. `kUnspecified` stores the empty string, which is
 /// also what migration v5 back-fills into pre-existing rows, so "no declared
@@ -103,7 +114,16 @@ enum class ConsumeFailure {
     kPrecondition,  ///< precondition denied — ticket UNTOUCHED, still recallable
     kNotConsumable, ///< absent / not approved / already consumed (the CAS lost)
     kStoreError,    ///< store unavailable, missing argument, or a SQLite failure
+    kForeignOrigin, ///< minted on a surface other than the MCP recall (#2442)
 };
+
+/// The one refusal message for every "this ticket cannot be redeemed" outcome.
+/// kForeignOrigin deliberately shares it with kNotConsumable: the KIND separates
+/// a forgery attempt from a replay for the log, but the MESSAGE must not, or the
+/// recall becomes an oracle for which definition ids exist and which surface
+/// minted them. One home so the copies cannot drift apart.
+inline constexpr const char* kNotConsumableMessage =
+    "approval not consumable (already used, not approved, or absent)";
 
 struct ConsumeError {
     ConsumeFailure kind{ConsumeFailure::kStoreError};

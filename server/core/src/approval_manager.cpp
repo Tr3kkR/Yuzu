@@ -55,6 +55,9 @@ const char* to_string(ApprovalOrigin origin) {
     case ApprovalOrigin::kMcp:
         return "mcp";
     case ApprovalOrigin::kUnspecified:
+    case ApprovalOrigin::kUnrecognised:
+        // Neither is written as a surface. kUnrecognised only ever comes OUT of
+        // a decode; storing it would round-trip to kUnspecified, which grants.
         break;
     }
     return "";
@@ -67,10 +70,27 @@ ApprovalOrigin approval_origin_from_string(std::string_view text) {
         return ApprovalOrigin::kSchedule;
     if (text == "mcp")
         return ApprovalOrigin::kMcp;
-    // Empty (pre-v5 row or an undeclared mint) and any unrecognised value both
-    // read as "no declared origin" — an unknown string must never be silently
-    // promoted into a surface that grants something.
-    return ApprovalOrigin::kUnspecified;
+    // Empty is the pre-v5 row or an undeclared mint: genuinely "no declared
+    // origin", and redeemable. Anything ELSE is a value this build does not
+    // know, and it must NOT fold into that case — kUnspecified is what grants
+    // (#2442), so folding would make a row written by a newer binary redeemable
+    // here. Decode it as its own value and let the predicate refuse it.
+    if (text.empty())
+        return ApprovalOrigin::kUnspecified;
+    return ApprovalOrigin::kUnrecognised;
+}
+
+bool declares_non_mcp_surface(ApprovalOrigin origin) {
+    switch (origin) {
+    case ApprovalOrigin::kInstruction:
+    case ApprovalOrigin::kSchedule:
+    case ApprovalOrigin::kUnrecognised:
+        return true;
+    case ApprovalOrigin::kMcp:
+    case ApprovalOrigin::kUnspecified:
+        return false;
+    }
+    return true; // unreachable; fail closed if the enum grows
 }
 
 namespace {
@@ -212,9 +232,20 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     // scope expression is caller-supplied verbatim — is a ticket the MCP recall
     // will accept. Undeclared mints are exempt because the MCP gate itself is
     // still one of them (ApprovalOrigin::kUnspecified).
-    if (origin != ApprovalOrigin::kMcp && origin != ApprovalOrigin::kUnspecified &&
-        is_reserved_definition_id(definition_id))
-        return std::unexpected(std::string(kReservedDefinitionIdError));
+    // NO mint-time refusal for the reserved namespace. #2442 is defended at
+    // REDEMPTION (see consume_ticket) instead, deliberately:
+    //
+    //  - Refusing here strands pre-existing operator content. A definition
+    //    already under `mcp.` with a schedule submits via kSchedule on every
+    //    fire; refused at mint, that schedule can never run again, and moving a
+    //    schedule between definitions is not supported (#2742).
+    //  - The redemption guard covers strictly more: a ticket minted before the
+    //    guard existed, or by a surface added later, is refused at the point of
+    //    use rather than only at the point of mint.
+    //  - Authoring is still refused where authoring happens —
+    //    `instruction_yaml.cpp` and `instruction_store.cpp` both call
+    //    `is_reserved_definition_id`, and `reserved_definition_id.hpp` warns
+    //    that a further call site is "a fourth chance to diverge". This was it.
 
     std::lock_guard lock(mtx_);
 
@@ -507,6 +538,29 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
         return std::unexpected(
             ConsumeError{ConsumeFailure::kStoreError, "consumed_by is required"});
 
+    // #2442 CROSS-SURFACE BINDING. Approvals are one shared store with three
+    // mint paths, and this recall matches a ticket on its definition id and
+    // scope expression — neither of which names the minting surface. So an
+    // approval raised through the REST instruction gate, where both fields are
+    // caller-influenced, could line up with an MCP tool's canonical arguments
+    // and be redeemed against it. What that buys is the HUMAN APPROVAL itself:
+    // the reviewer sees a ticket id, a submitter and a scope expression, and
+    // nothing that names the tool or the surface.
+    //
+    // get_checked, not get: a FAILED read must not decode as "no declared
+    // origin", which is the value that grants.
+    //
+    // Runs BEFORE the precondition block because that block is conditional —
+    // a caller supplying no precondition must not skip this.
+    {
+        auto row = get_checked(id); // takes mtx_ itself — must be outside any lock
+        if (!row)
+            return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, row.error()});
+        if (*row && declares_non_mcp_surface((*row)->origin))
+            return std::unexpected(
+                ConsumeError{ConsumeFailure::kForeignOrigin, kNotConsumableMessage});
+    }
+
     // Pre-consume recheck (#2443). Skipped entirely when no precondition was
     // supplied, so the two-argument path issues the exact same single statement
     // it always has.
@@ -526,7 +580,7 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
         if (!*row || (*row)->status != "approved" || (*row)->consumed_at != 0)
             return std::unexpected(ConsumeError{
                 ConsumeFailure::kNotConsumable,
-                "approval not consumable (already used, not approved, or absent)"});
+                kNotConsumableMessage});
         // The callback is caller code. If it throws, that must not escape a
         // store method as an unhandled exception on an httplib worker: the
         // ticket is untouched either way, so report it as a store error and let
@@ -591,7 +645,7 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     if (rc == SQLITE_DONE)
         return std::unexpected(
             ConsumeError{ConsumeFailure::kNotConsumable,
-                         "approval not consumable (already used, not approved, or absent)"});
+                         kNotConsumableMessage});
     return std::unexpected(ConsumeError{ConsumeFailure::kStoreError,
                                         std::string("consume failed: ") + sqlite3_errmsg(db_)});
 }
