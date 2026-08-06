@@ -6,6 +6,7 @@
  *         approve nonexistent.
  */
 
+#include <array>
 #include "approval_manager.hpp"
 #include "reserved_definition_id.hpp"
 #include "migration_runner.hpp"
@@ -1350,4 +1351,32 @@ TEST_CASE("ApprovalManager: migration v7 reaches a store already at v5",
     auto live = mgr.get("mcp-mint");
     REQUIRE(live.has_value());
     CHECK(live->origin == ApprovalOrigin::kUnrecognised);
+}
+
+TEST_CASE("consume_denial_reason: every kind maps to its own audit token",
+          "[approval_manager][approval][security]") {
+    // The audit taxonomy had NO regression barrier: a governance reviewer
+    // swapped the "foreign_origin" and "not_consumable" tokens and the entire
+    // suite stayed green. The -Wswitch pragma guards a MISSING arm; it cannot
+    // see a WRONG one, and a swap is exactly that.
+    //
+    // This matters because the tokens are the whole deliverable of the audit
+    // change: a cross-surface forgery attempt must not be recorded identically
+    // to a benign replay. Swapping them silently restores the defect.
+    CHECK(std::string(consume_denial_reason(ConsumeFailure::kForeignOrigin)) == "foreign_origin");
+    CHECK(std::string(consume_denial_reason(ConsumeFailure::kNotConsumable)) == "not_consumable");
+    CHECK(std::string(consume_denial_reason(ConsumeFailure::kStoreError)) == "store_error");
+    CHECK(std::string(consume_denial_reason(ConsumeFailure::kPrecondition)) == "precondition");
+
+    // Distinctness is the property, stated separately from the exact spellings
+    // so a rename stays cheap while a collision stays caught.
+    const std::array<const char*, 4> tokens{
+        consume_denial_reason(ConsumeFailure::kForeignOrigin),
+        consume_denial_reason(ConsumeFailure::kNotConsumable),
+        consume_denial_reason(ConsumeFailure::kStoreError),
+        consume_denial_reason(ConsumeFailure::kPrecondition),
+    };
+    for (size_t i = 0; i < tokens.size(); ++i)
+        for (size_t j = i + 1; j < tokens.size(); ++j)
+            CHECK(std::string(tokens[i]) != std::string(tokens[j]));
 }
