@@ -135,7 +135,6 @@ enum class ConsumeFailure {
 /// GCC and Clang — `-Wswitch` is promoted to an error locally because
 /// `meson.build` sets `werror=false`, so the warning alone would not stop it,
 /// and a new kind would otherwise inherit whatever the caller happens to say.
-/// Both are Tier-1 CI legs, so the guard is in force on every PR.
 ///
 /// The MSVC arm is best-effort, and the ORDER of its two pragmas is why. C4062
 /// is off by default, and `#pragma warning(error : N)` does NOT enable an

@@ -203,8 +203,9 @@ void ApprovalManager::create_tables() {
         // Unchanged from the form that shipped to origin/dev. An earlier cut of
         // this branch added `UPDATE approvals SET origin = 'legacy'` here as
         // well as in v7. That edit changed no outcome: v5 runs only on a store
-        // below v5, v7 runs immediately after it in the same loop with no write
-        // in between, and `DEFAULT ''` leaves exactly the rows v7's
+        // below v5 and v7 runs immediately after it with no write in between
+        // (`migration_runner.cpp`, `if (m.version <= current) continue;` inside
+        // the apply loop), and `DEFAULT ''` leaves exactly the rows v7's
         // `WHERE origin = ''` already matches. What it cost was real — a
         // numbered migration is the definition of a data state, so editing one
         // in place means two stores both stamped 5 can differ. The back-fill
