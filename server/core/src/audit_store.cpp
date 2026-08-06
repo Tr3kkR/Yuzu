@@ -1325,54 +1325,62 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
         // does NOT get the wider kBackfillTxnTimeout deadline that name
         // suggests; that constant only bounds the ACQUIRE wait on the three
         // with_txn_for call sites elsewhere in this file, never statement
-        // execution. #2530 G7-B4 (server.cpp's KEK metrics sampler) is the
-        // precedent for this exact mismatch in this same codebase. At the
-        // documented target scale, a persistent 30s timeout here is not a
-        // transient hiccup — it is a wall this backfill hits identically on
-        // every retry, and startup_failed_ blocks the WHOLE server, not
-        // just audit, until it clears. Explicit BEGIN + SET LOCAL, never a
-        // bare SET: SET LOCAL reverts at transaction end, so this widened
-        // deadline does not leak onto whatever unrelated query the pool
-        // hands this connection to next.
-        const std::string set_timeout_sql =
-            "SET LOCAL statement_timeout = '" + std::to_string(kBackfillTxnTimeout.count()) + "ms'";
-        pg::PgResult begin = pg::exec_params(lease.get(), "BEGIN", std::vector<std::string>{});
-        if (begin.status() != PGRES_COMMAND_OK) {
-            spdlog::error("AuditStore: migrate_from_sqlite: reconciliation BEGIN failed: {}",
-                          PQerrorMessage(lease.get()));
-            backfill_metric("failed");
-            return false;
-        }
-        pg::PgResult st = pg::exec_params(lease.get(), set_timeout_sql.c_str(),
-                                          std::vector<std::string>{});
-        if (st.status() != PGRES_COMMAND_OK) {
-            spdlog::error(
-                "AuditStore: migrate_from_sqlite: reconciliation statement_timeout set failed: {}",
-                PQerrorMessage(lease.get()));
-            pg::exec_params(lease.get(), "ROLLBACK", std::vector<std::string>{});
-            backfill_metric("failed");
-            return false;
-        }
-        pg::PgResult pc = pg::exec_params(
-            lease.get(),
-            "SELECT COUNT(*), COALESCE(SUM(id),0), COALESCE(SUM(timestamp),0), "
-            "COALESCE(MIN(timestamp),0), COALESCE(MAX(timestamp),0) FROM "
-            "audit_store.audit_events",
-            std::vector<std::string>{});
-        if (pc.status() != PGRES_TUPLES_OK) {
-            spdlog::error(
-                "AuditStore: migrate_from_sqlite: reconciliation fingerprint read failed: {}",
-                PQerrorMessage(lease.get()));
-            pg::exec_params(lease.get(), "ROLLBACK", std::vector<std::string>{});
-            backfill_metric("failed");
-            return false;
-        }
-        pg::exec_params(lease.get(), "COMMIT", std::vector<std::string>{});
-        const LegacyFingerprint pg_fp{to_i64(PQgetvalue(pc.get(), 0, 0)),
+        // execution. At the documented target scale, a persistent 30s
+        // timeout here is not a transient hiccup — it is a wall this
+        // backfill hits identically on every retry, and startup_failed_
+        // blocks the WHOLE server, not just audit, until it clears.
+        //
+        // Gate 8 architect + cpp-expert (round 3, independently converging):
+        // the first cut of this fix hand-rolled BEGIN/SET LOCAL/COMMIT/
+        // ROLLBACK via bare pg::exec_params calls instead of this
+        // substrate's own pool_.with_txn + pg::PgTxn RAII guard — already
+        // `#include`d, already used three other times in this same
+        // function (stamp_complete, the batch-insert loop, the meta-copy
+        // loop), and already the established idiom for exactly this need
+        // (SoftwareLicensingStore::count_stale_agents wraps its own SET
+        // LOCAL statement_timeout the identical way). Non-RAII manual
+        // cleanup in new C++ is a CLAUDE.md policy floor and gates
+        // regardless of blast radius. pool_.with_txn (the blocking
+        // variant, matching the original pool_.acquire()'s semantics
+        // exactly — no new acquire-timeout dimension introduced) both
+        // fixes that and gets a CHECKED commit for free via
+        // PgTxn::commit(), where the hand-rolled version discarded
+        // COMMIT's result entirely.
+        LegacyFingerprint pg_fp{};
+        const bool pg_fp_ok = pool_.with_txn([&](PGconn* c) -> bool {
+            const std::string set_timeout_sql = "SET LOCAL statement_timeout = '" +
+                                                std::to_string(kBackfillTxnTimeout.count()) +
+                                                "ms'";
+            pg::PgResult st = pg::exec_params(c, set_timeout_sql.c_str(), std::vector<std::string>{});
+            if (st.status() != PGRES_COMMAND_OK) {
+                spdlog::error("AuditStore: migrate_from_sqlite: reconciliation "
+                              "statement_timeout set failed: {}",
+                              PQerrorMessage(c));
+                return false;
+            }
+            pg::PgResult pc = pg::exec_params(
+                c,
+                "SELECT COUNT(*), COALESCE(SUM(id),0), COALESCE(SUM(timestamp),0), "
+                "COALESCE(MIN(timestamp),0), COALESCE(MAX(timestamp),0) FROM "
+                "audit_store.audit_events",
+                std::vector<std::string>{});
+            if (pc.status() != PGRES_TUPLES_OK) {
+                spdlog::error(
+                    "AuditStore: migrate_from_sqlite: reconciliation fingerprint read failed: {}",
+                    PQerrorMessage(c));
+                return false;
+            }
+            pg_fp = LegacyFingerprint{to_i64(PQgetvalue(pc.get(), 0, 0)),
                                       to_i64(PQgetvalue(pc.get(), 0, 1)),
                                       to_i64(PQgetvalue(pc.get(), 0, 2)),
                                       to_i64(PQgetvalue(pc.get(), 0, 3)),
                                       to_i64(PQgetvalue(pc.get(), 0, 4))};
+            return true;
+        });
+        if (!pg_fp_ok) {
+            backfill_metric("failed");
+            return false;
+        }
         const auto legacy_fp = legacy_fingerprint(legacy.get(), std::nullopt);
         if (!legacy_fp) {
             spdlog::error(
