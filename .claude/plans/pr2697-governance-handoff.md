@@ -502,3 +502,38 @@ assertions green; full server suite 4608 cases / 87765 assertions green.
 **Still owed:** Windows verification on DGRHP (never run since `c10fcc68`, before every
 round-2/3 fix), file the deferred issues above, then ask Dave before pushing (NOT yet
 authorized — governance was, push was not).
+
+## ROUND 3 — fully closed (2026-08-06)
+
+Windows verification done (DGRHP, MSVC 19.44): clean build, `[audit_store]` matches Linux
+exactly (66/4004), PG shard B fully green (614 cases, first time it's ever run on this
+branch), PG shard A green except 2 pre-existing SCIM-route flakes confirmed unrelated
+(network-PG-latency artifact of the verification setup, not this PR's code — investigated,
+traced to a 5s client timeout on a 5000-member seeded test, matches an established flake
+class in `feedback-green-on-bigcolin-isnt-green-on-ci.md`).
+
+Asked directly whether all governance had run — built the actual gate matrix instead of
+answering from memory and found a real gap: the first fix batch (`70ecfd3f`/`67110894`/
+`b8bb6c57`, including the HIGH-severity fingerprint-race fix) never got its own Gate 8
+domain re-review. Closed it with the full 6-agent set: no BLOCKING findings (architect gave
+a formal proof the fix is correct), 4 SHOULD-tier gaps, all fixed (`6e7f384c`). Ledger now
+80 rows across 7 passes.
+
+**Deferred issues filed** (dedupe-probed, all clean; `governance-deferred` label on all six):
+- #2820 — AuditStore read-path performance (`total_count()`, unsargable `action LIKE`, O(n²) OFFSET pagination). P2.
+- #2821 — Port holder-verification + retention-probe fixes to ManagementGroupStore/ResultSetStore (Sol's ladder-wide diagnosis + A-7). P1.
+- #2822 — 4 test-coverage gaps (fault injection, exception path, A-2 order contract, txn-failure paths). P2.
+- #2823 — CI: macOS has zero PG test coverage; one test mistagged out of shard B. P2.
+- #2824 — Audit-degrade error envelope inconsistent (REST sites + REST-vs-MCP). P2.
+- #2825 — 3 operational-hardening follow-ups (concurrent-reaper race, orphan provenance label, reconciliation-timeout margin). P2.
+
+Two originally-ledgered items were re-verified and NOT filed: `PERF-3` is already fixed
+(the LIMIT-1 rewrite landed via `0dd16d3b`/1f, after that ledger row was written); `ce-F6`
+(claimed 10 duplicate `PgTestTemplate` definitions) appears stale — the class is a single
+shared, build-once, keyed definition in `test_helpers.hpp`, not duplicated. Recorded as
+corrections rather than silently dropped (ledger pass_ordinal 7).
+
+**Final state:** 57 commits ahead of `origin/dev` (55 as of the last governance ledger
+commit, +1 for that commit, +1 for this one), full Linux suite green (4608 cases / 87768
+assertions), Windows-verified, nothing outstanding known to be blocking. Not yet pushed —
+awaiting Dave's go-ahead.
