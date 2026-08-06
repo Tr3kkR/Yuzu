@@ -193,10 +193,11 @@ Three properties worth knowing before editing it:
   `///` prefix) — each fails DRIFT if the terminator is lost, or if the scan runs past
   `MAX_REGION_LINES` without ever confirming one. MANUAL/MCP_SERVER_DOC/ADR_DOC are
   single-line captures instead: their real claims have always been one physical line, and
-  two rounds of governance review proved that for free-form prose with no external syntax
-  forcing a predictable "next item" shape, broadening a multi-line stop pattern only shrinks
-  the exploit surface rather than closing it — there is always another plausible reformat
-  one step outside any finite pattern. Single-line capture sidesteps that guessing game.
+  two rounds of governance review each defeated a broadened multi-line stop pattern with a
+  different plausible reformat the prior round hadn't anticipated (a bare-emphasis-style
+  sibling, then a lettered/decimal/em-dash sibling) — see the `claim_region()` ADR_DOC arm's
+  comment for the fuller history. Single-line capture sidesteps guessing at prose format
+  entirely rather than trying to broaden the pattern a third time.
 
 A failing check is **merge-blocking** — the job exits non-zero and the workflow has no
 `continue-on-error`. No build, no `paths:` filter (nothing expensive to skip, and no filter
