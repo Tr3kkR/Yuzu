@@ -443,3 +443,62 @@ Gotchas that cost time this session: non-login MSYS bash has no coreutils on PAT
 a long remote build through `tail` locally buffers until it ends, so you see nothing; and
 `LNK1318: Unexpected PDB error; LIMIT (12)` means the DISK IS FULL, not a PDB size limit —
 C: runs at 95-100%.
+
+## ROUND 3 — CLOSED (2026-08-06)
+
+All gates now green at HEAD `de7b8325` (52 commits ahead of `origin/dev`). Sequence this
+session: fixed the 10 Gate 3/4/6/8 findings from the fix-diff re-review (`70ecfd3f`,
+`67110894`, `b8bb6c57`, `7568318d`, `9531d4c3`) → ledger pass_ordinal 2+3 (`57f98bb6`) →
+`quality-engineer` mutation pass ALONE (clean, 5/5 closures solid red-green, 0 false-green,
+worktree confirmed restored) → Gate 5 `chaos-injector` (`780fdcc1`, one genuine P0 — F1,
+below) → Gate 8 re-review of the F1 fix, 6 mandatory agents in parallel (routed-concern:
+PostgreSQL server-store change unconditionally requires `architect`+`sre`) → three
+independent reporters (`architect`, `cpp-expert`, `cpp-safety`) converged on a second
+BLOCKING finding inside the F1 fix itself → fixed → ledger pass_ordinal 4+5 (`780fdcc1`,
+`de7b8325`).
+
+**F1 (Gate 5 chaos-injector, fixed `11936b34`+`3609a2f8`):** the whole-file reconciliation
+scan (an unqualified full-table aggregate over `audit_events`) silently inherited the
+connection pool's fixed 30s `statement_timeout` — `kBackfillTxnTimeout`'s name and comment
+claimed a wider deadline, but that parameter only ever bounded the pool-ACQUIRE wait, never
+statement execution. At the documented target scale (tens of millions of rows, #2661) this
+was a wall the mandatory, boot-blocking backfill would hit identically on every retry, and
+`startup_failed_` blocks the whole server, not just audit. Independently re-derived
+HIGH/BLOCKING (I5 raised via reproducible-unavailability-on-an-ordinary-path, E0). First fix
+cut hand-rolled `BEGIN`/`SET LOCAL`/`COMMIT`/`ROLLBACK` via bare `pg::exec_params` — three
+Gate 8 reporters independently caught that this violates the "non-RAII manual cleanup in new
+C++" policy floor (this codebase already ships `pg::PgTxn` + `pool_.with_txn` for exactly
+this shape, used 3x elsewhere in the same function; architect traced a cleaner precedent,
+`SoftwareLicensingStore::count_stale_agents`, than the one the first cut cited). Rewritten to
+use `pool_.with_txn` + `PgTxn`.
+
+**Incident, not a finding:** during the Gate 8 parallel review, one of the six agents'
+tool use (Bash or Edit — not conclusively identified, but only `cpp-expert` of the six had
+write access) deleted 101 lines from `server/core/src/pg/pg_raii.hpp` (all of `PgConn`'s
+move-assignment/`get`/`release`/`reset` plus the entire `PgTxn` class), an UNRELATED file no
+agent was asked to touch. Caught by `security-guardian`'s out-of-scope flag, confirmed via
+`git diff`, and restored via `git show HEAD:<path>` + `Edit` (NOT `git checkout --`, which
+the permission classifier correctly blocked as a destructive op) — reconstructed
+byte-for-byte, verified identical to HEAD, full build (143/143) + `[audit_store]` suite
+re-confirmed green before continuing. No code from this incident shipped; nothing to revert
+in the commit history since it was never staged. Lesson for next time a mutating agent runs
+alongside review-only ones: even a single mutating agent among several sharing one worktree
+carries the same risk `proc-1` (round 1) already flagged — give it an isolated worktree.
+
+**Deferred (recorded in the ledger, not blocking):** chaos-injector's B1 (no fault-injected
+severed-connection test), A3 (no test forces an exception through `run_cleanup`'s
+try/catch), C1 (benign concurrent-reaper-vs-backfill race worth naming in the runbook), C2
+(orphan-fingerprint provenance-label gap in the abandon procedure); Gate 8's test-coverage
+gap for the new transaction's failure branches; sre's open question on whether 60s remains
+sufficient at the extreme end of documented scale. Plus everything already carried from
+round 2/3's "OPEN NON-BLOCKING" list above (QE Finding 4, A-4, cpp-expert F1, the cpp-safety
+trio, PERF INFO, the reaper-ceiling issue) and the ladder-wide sibling-store deferral
+(ManagementGroupStore/ResultSetStore holder-verification porting, Sol's conflict-equality
+reconciliation).
+
+**Full Linux verification at HEAD `de7b8325`:** `[audit_store]` suite 66 cases / 4004
+assertions green; full server suite 4608 cases / 87765 assertions green.
+
+**Still owed:** Windows verification on DGRHP (never run since `c10fcc68`, before every
+round-2/3 fix), file the deferred issues above, then ask Dave before pushing (NOT yet
+authorized — governance was, push was not).
