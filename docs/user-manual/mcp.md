@@ -1169,7 +1169,8 @@ recall once it is approved.
 > while your original approval is still outstanding, spending a second human
 > review. If you see `-32003` for a ticket you believe is valid and recently
 > approved, prefer retrying the identical call a few times before re-minting.
-> Closing this properly is tracked separately; it is not fixed in this release.
+> Separating a store failure from a missing ticket at the lookup step is a
+> follow-up change; it is not fixed in this release.
 
 ### -32603: Approval store unavailable
 
