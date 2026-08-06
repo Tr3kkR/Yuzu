@@ -493,7 +493,7 @@ MD
     # name claims) - the token makes that a hard failure instead of a silent pass.
     expect() {
         local out rc
-        if out="$("$self" "$tmp/t" 2>&1)"; then rc=0; else rc=$?; fi
+        if out="$(bash "$self" "$tmp/t" 2>&1)"; then rc=0; else rc=$?; fi
         if [ "$rc" = "$2" ]; then
             if [ -n "${3:-}" ] && ! printf '%s' "$out" | grep -qF -- "$3"; then
                 failed=$((failed+1))
