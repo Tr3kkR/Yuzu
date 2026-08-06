@@ -122,9 +122,19 @@ The script runs `vcpkg install` then `meson setup` automatically.
 ### Manual configure
 ```bash
 vcpkg install --triplet x64-linux --x-manifest-root=.
-meson setup build-linux --buildtype=debug -Dcmake_prefix_path=$VCPKG_ROOT/installed/x64-linux -Dbuild_tests=true
+meson setup build-linux --buildtype=debug -Dbuild_tests=true \
+  -Dcmake_prefix_path=$PWD/vcpkg_installed/x64-linux \
+  -Dpkg_config_path=$PWD/vcpkg_installed/x64-linux/lib/pkgconfig,/usr/lib/x86_64-linux-gnu/pkgconfig
 meson compile -C build-linux
 ```
+**Both paths are load-bearing, and both point INTO THE TREE.** `--x-manifest-root=.` is vcpkg
+*manifest* mode, which installs to `<repo>/vcpkg_installed/<triplet>` — **not** to
+`$VCPKG_ROOT/installed/<triplet>`, which stays near-empty (measured: 7 packages vs 237) and
+makes `meson setup` fail on `Dependency PostgreSQL not found`. `pkg_config_path` is separately
+required because spdlog/fmt resolve via pkg-config, not cmake: with the prefix alone the
+headers are found and the link then fails on `undefined reference to fmt::v12::…`. An
+out-of-tree build dir (a review worktree, a scratch checkout) needs the same two flags
+pointing at a populated `vcpkg_installed`.
 
 ### Build options
 `-Dbuild_agent` / `-Dbuild_server` / `-Dbuild_examples` (default true), `-Dbuild_tests` (default false), and the Meson built-ins `-Db_lto`, `-Db_sanitize=address,undefined` (ASan+UBSan) or `-Db_sanitize=thread` (TSan).
