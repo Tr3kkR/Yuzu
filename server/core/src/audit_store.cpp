@@ -486,6 +486,22 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     // be waved through by a marker some OTHER process stamped without ever
     // reading a file (Gate 3 architect A-4 / Sol: local absence must not be
     // trusted as proof of deployment-wide absence).
+    //
+    // INVARIANT (Gate 8 architect, round 3 retroactive review): this is the
+    // SOLE runtime writer of both `backfill_complete` and
+    // `backfill_source_fingerprint`, always together, always marker-then-
+    // fingerprint, always in this one transaction. The fingerprint-race
+    // check below (`PQcmdTuples` on the fingerprint INSERT) relies on that —
+    // it proves a lost fingerprint race can never leave an independently-won
+    // marker insert behind, because `ON CONFLICT (key) DO NOTHING` blocks a
+    // second writer on the marker key until the first transaction resolves,
+    // so whichever transaction's marker insert lands uncontested is
+    // necessarily the same transaction whose fingerprint insert also lands
+    // uncontested. A second runtime call site that writes either key outside
+    // this function would break that proof silently. (The one other writer,
+    // the abandon procedure's manual SQL in
+    // docs/ops-runbooks/audit-store-backfill-recovery.md, requires the
+    // server stopped and is not a concurrent runtime writer.)
     const auto stamp_complete = [this](bool require_empty, std::string_view source_fingerprint) -> bool {
         return pool_.with_txn_for(
             kBackfillTxnTimeout, [require_empty, source_fingerprint](PGconn* c) -> bool {
@@ -571,7 +587,8 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
                         "backfill) between this pass's marker check and this commit. This host's "
                         "rows were still streamed and reconciled correctly, but the recorded trust "
                         "anchor is not this file's. Refusing to complete; retry — the next pass "
-                        "will find the marker present and verify by fingerprint instead.");
+                        "will find the marker present and verify by fingerprint instead. See "
+                        "docs/ops-runbooks/audit-store-backfill-recovery.md.");
                     return false;
                 }
                 return true;
@@ -606,8 +623,15 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     // Multi-replica first boot (Gate 6 sre): the supported cutover is single-
     // writer SQLite → shared PG with ONE legacy audit.db (the SQLite substrate
     // never permitted N concurrent servers). N new-binary replicas racing the
-    // SAME audit.db is idempotent (identical ids+content, ON CONFLICT DO NOTHING;
-    // one wins the marker stamp, the rest no-op). The only unsafe shape —
+    // SAME audit.db is idempotent (identical ids+content, ON CONFLICT DO
+    // NOTHING) — but "the rest no-op" is no longer literally true post
+    // UP-1/UP-10 (round 3 fix-round): a losing replica's stamp_complete now
+    // fails closed on the fingerprint-race check rather than silently
+    // succeeding, so it retries rather than no-ops. It self-heals on the
+    // next boot regardless (marker-present verification finds its own
+    // fingerprint matches the winner's — identical content — and proceeds),
+    // just via one extra restart instead of a same-pass no-op. The only
+    // unsafe shape —
     // DIVERGENT per-replica audit.db copies with colliding ids — cannot arise
     // from a single-writer history; operators scaling out MUST let the first
     // replica finish the backfill (marker stamped) before starting the rest

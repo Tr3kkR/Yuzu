@@ -193,6 +193,15 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
 - Holding a lease across an HTTP call, file I/O, or a second store call (deadlock / starvation).
 - Unqualified runtime table names (works in a migration, breaks on a pooled connection).
 - `sqlite3_changes()`-style mutate-then-count. Use `RETURNING`.
+- Trusting `PQresultStatus() == PGRES_COMMAND_OK` on an `INSERT ... ON CONFLICT DO NOTHING` to mean
+  YOUR value won. It only means the statement executed — true whether the row inserted or silently
+  no-opped on conflict. A "first writer wins" contract (a completion marker, a trust-anchor
+  fingerprint, an idempotency key) needs `PQcmdTuples()` (`"0"` = lost the race) or `RETURNING` +
+  `PQntuples()` to actually answer "did MY write land". `AuditStore::stamp_complete` (ADR-0040,
+  #2697) is the worked example: checking only statement status let a real backfill that lost this
+  exact race report success while a different writer's value sat at the trust anchor — the same
+  silent-discard shape as the `sqlite3_changes()` pitfall above, just on `ON CONFLICT DO NOTHING`
+  rather than a mutate-then-count.
 - A plaintext secret column. Use `SecretCodec` / verify-only hash.
 - A new server **SQLite** store (ADR-0006 forbids it without an exception ADR).
 - A `CREATE INDEX CONCURRENTLY` / `VACUUM` / `ALTER TYPE ADD VALUE` smuggled into a

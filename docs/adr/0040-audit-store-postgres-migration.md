@@ -152,6 +152,19 @@ primary new element vs the three prior migrations.
   bullet above could not: `upgrading.md`'s boot-order guidance is now an optimization (avoids a
   refusal an operator would otherwise have to resolve by hand), not the thing preventing evidence
   loss.
+  **That claim depends on `stamp_complete` itself verifying it won the write, not merely that the
+  write succeeded (Gate 4 UP-1/UP-10, round 3 fix-round).** `backfill_source_fingerprint`'s INSERT
+  is `ON CONFLICT (key) DO NOTHING`, and `PGRES_COMMAND_OK` is returned whether it inserted or
+  silently no-opped on conflict — checking only that status, a real backfill that lost this exact
+  race to a rival writer (a fileless peer's sourceless stamp, or a concurrent real backfill) would
+  have reported success and proceeded to `move_legacy_aside()`, moving its own still-unverified
+  legacy file out of the way while a DIFFERENT writer's value sat at the trust anchor — reaching
+  the identical false-assurance state this bullet describes closing, one step earlier than
+  described. `stamp_complete` now checks `PQcmdTuples` on that INSERT and fails closed (leaving
+  the legacy file in place) if a real, non-sourceless backfill loses the race; a sourceless stamp
+  losing the same race is not an error, since it carries no evidence claim to lose. See
+  `AuditStore::stamp_complete` and the test `"AuditStore: a real backfill that loses the
+  fingerprint race refuses, not silently reports someone else's value"`.
 - **The `MAX(id)` resume cursor is guarded by a prefix proof.** ADR-0009's trigger is an *empty*
   schema; resuming from `MAX(id)` relaxes that so an interrupted copy can continue, and the
   relaxation is sound only while the rows already in PG *are* that interrupted copy. Before

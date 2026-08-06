@@ -13,6 +13,15 @@ ADR-0040.
 
 ## This host's trail was never proven migrated (holder-side verification refusal)
 
+**Arrived here from a different message** — `"lost the race to record this backfill's
+own fingerprint"`, logged during a backfill ATTEMPT rather than at the boot-time check
+below? That is the same underlying condition reached one step earlier: this host's own
+rows were already streamed and reconciled correctly, but a different process (a
+fileless peer's sourceless stamp, or another real backfill) won the trust-anchor race,
+so this attempt refused rather than falsely claim credit for evidence a different
+process's value now represents. Restart; the next boot lands in the section below —
+read on.
+
 The `backfill_complete` marker is already set when this host boots — by a
 `"sourceless"` stamp (no legacy file was ever read before it was set) or by a
 DIFFERENT file's fingerprint — and this host still holds a legacy `audit.db`
