@@ -207,14 +207,25 @@ def check_gate_output(check_out: str, test_out: str,
     return None
 
 
-def inspect_test_file(strict: bool = True) -> CaseFacts | None:
-    """What the test file actually asserts, or None if it cannot be read.
+def inspect_test_file(*, strict: bool = True) -> CaseFacts | None:
+    """What the test file actually asserts. `strict` decides the no-parser case.
 
-    A MISSING PARSER AND AN UNPARSEABLE FILE ARE DIFFERENT. Without PyYAML we
-    genuinely cannot answer, and must not redden the gate for it (the
-    `no file match pattern` check does not need a parser). But if the file is
-    present and does not parse, the suite promtool just ran is not the suite this
-    repo thinks it has, and that IS a failure.
+    STRICT IS KEYWORD-ONLY ON PURPOSE. The two mistakes are not symmetric: a new
+    GATE caller that forgot the flag would ship a silent false green - the defect
+    this branch has now had four times - while a new TEST caller that forgot it
+    would break a leg loudly on its own PR. Silent-and-indefinite is the worse
+    failure, so the default is strict and the parameter cannot be passed by
+    position at all.
+
+    A MISSING PARSER AND AN UNPARSEABLE FILE ARE DIFFERENT. Without PyYAML the
+    assertion counts genuinely cannot be answered. Under `strict` that FAILS -
+    `gate()` is about to call a promtool exit 0 evidence and must not do so on a
+    disabled guard. An earlier revision said instead that a missing parser "must
+    not redden the gate", and that sentence is exactly what both external
+    reviewers blocked on; it is quoted here only so nobody restores it. Under
+    `strict=False` - `--selftest`, which must need no toolchain - it returns None
+    with a note. Either way, a file that is PRESENT and does not parse is a
+    failure: the suite promtool just ran is not the suite this repo thinks it has.
 
     The `rule_files` read exists because `check rules` validates a hardcoded path
     while `test rules` loads whatever the test file names. Repointing that at
@@ -224,7 +235,7 @@ def inspect_test_file(strict: bool = True) -> CaseFacts | None:
     try:
         import yaml  # noqa: PLC0415 - see below
     except ImportError:
-        # FAIL CLOSED, UNCONDITIONALLY. Without PyYAML the assertion-count checks
+        # FAIL CLOSED ON THE GATE PATH. Without PyYAML the assertion-count checks
         # cannot run, and those are the whole reason a green promtool exit counts
         # as evidence - promtool itself exits 0 on a suite that asserts nothing.
         #
@@ -316,7 +327,7 @@ def gate(promtool_argv: list[str], rules: str, tests: str) -> int:
     rc, test_out = run(promtool_argv + ["test", "rules", tests], timeout=120)
     if rc:
         return rc
-    reason = check_gate_output(check_out, test_out, inspect_test_file())
+    reason = check_gate_output(check_out, test_out, inspect_test_file(strict=True))
     if reason:
         sys.exit(f"FAIL: promtool exited 0 but the run proves nothing - {reason}")
     return 0
