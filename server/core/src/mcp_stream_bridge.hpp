@@ -408,12 +408,41 @@ public:
         return idx < kTeardownStageCount ? kTeardownStageNames[idx] : "unknown";
     }
 
+    /// What was actually holding this session's streamed slots when a `pin_slots`
+    /// reject was emitted (#2740). The refusal's remediation is chosen from this,
+    /// because ONE sentence cannot be true of both states. `kCharges` means calls
+    /// that reserved and have not settled a terminal - ordinarily in flight, so
+    /// "wait for one to finish" is true advice. `kPins` means every slot is a
+    /// COMMITTED final that no wire has taken delivery of AND the reclaim found
+    /// none of them takeable, which happens in three states: a final still being
+    /// WRITTEN by a live pump, a transient decline while one of this session's
+    /// records is mid-projection, or a slot genuinely stuck. The first two clear
+    /// on retry and the client cannot tell which it is in, so the `kPins` text
+    /// advises a retry FIRST and only then a resume or a fresh session - do not
+    /// reintroduce "waiting will not help" here, which was true only before the
+    /// reclaim existed.
+    /// Never asserts a fault: a healthy session passes through `kPins` during the
+    /// terminal-to-wire flush window, which is why the text points at the metric
+    /// rather than declaring one (see `count_pin_slots_reject`).
+    /// Three states, not a bool, even though no consumer distinguishes
+    /// `kNotApplicable` from `kCharges` today (the field is only read inside the
+    /// `pin_slots` arm, so "unset" is unobservable there). The third state keeps
+    /// "this reject was not about pin slots at all" explicit for every OTHER
+    /// reject reason and for success, which a bool would silently collapse into
+    /// "charges" - a wrong answer waiting for the first consumer that reads the
+    /// field outside that arm.
+    enum class PinSlotsHeld : int { kNotApplicable, kCharges, kPins };
+
     struct ReserveResult {
         bool ok = false;
         /// Static literal iff !ok - doubles as the reject_total{reason} label:
         /// "disabled" | "shutdown" | "unknown_session" | "duplicate_request_id" |
         /// "global_cap" | "pin_slots".
         const char* reject_reason = nullptr;
+        /// Set only alongside `reject_reason == "pin_slots"`. Deliberately NOT a
+        /// new reject_reason value: that string is a CLOSED metric label set, and
+        /// splitting it would silently re-partition every existing dashboard.
+        PinSlotsHeld pin_slots_held = PinSlotsHeld::kNotApplicable;
     };
 
     /// `bus` nullable ⇒ bridge disabled: reserve() rejects "disabled", nothing
@@ -438,9 +467,11 @@ public:
     /// S1: keyed kArming record insert - dup-key/cap/pin-slot admission BEFORE
     /// create_execution, so every rejection is truthfully "no execution row".
     /// Streamed admission counts LIVE PINS plus streamed records that have not
-    /// pinned yet (`pinned_count() + streamed_unpinned_[session]`) - orphan pins
-    /// left by pressure/pin-ack teardown stay counted until the ring releases
-    /// them (A5/C3; transient over-count rejects fail-closed).
+    /// pinned yet (`pinned_count() + streamed_unpinned_[session]`). Orphan pins
+    /// left by pressure/pin-ack teardown are counted the same way, but since
+    /// #2740 they are no longer permanent: an at-cap admission RECLAIMS one
+    /// rather than refusing (see `select_displaceable_pin_locked`). A transient
+    /// over-count still rejects fail-closed (A5/C3).
     ReserveResult reserve(const std::string& session_id, const std::string& principal,
                           const nlohmann::json& jsonrpc_id,
                           std::optional<nlohmann::json> progress_token, bool streamed_intent);
@@ -495,8 +526,19 @@ public:
     /// have ALREADY been committed to the session ring (for GET resume) by the
     /// time this returns - the ring is the durable copy, this is the live one.
     struct PostBatch {
-        std::vector<std::string> progress;       ///< write in order, oldest first
-        std::optional<std::string> final_frame;  ///< write LAST, then EOF
+        /// One wire frame plus the replay-ring event id it was committed under
+        /// (#2785). The id rides the SSE `id:` line so a client that only ever
+        /// saw the POST connection can hand it back as `Last-Event-ID` on a GET
+        /// resume - without it the documented resume contract is unreachable
+        /// from this surface. 0 = no ring counterpart (a poisoned or pinless
+        /// final); format_sse omits the `id:` line for 0 rather than minting a
+        /// cursor that would resume onto nothing.
+        struct PostFrame {
+            std::string data;
+            std::uint64_t event_id = 0;
+        };
+        std::vector<PostFrame> progress;        ///< write in order, oldest first
+        std::optional<PostFrame> final_frame;   ///< write LAST, then EOF
         /// Another claimant held the projection claim; nothing was taken and
         /// nothing is owed. The pump retries on its next tick.
         bool deferred = false;
@@ -831,6 +873,21 @@ private:
         /// that closes with this set is DONE (the client has its answer); one that
         /// closes without it parks for GET resume.
         bool final_written = false;
+        /// #2739: the one post-cap-expiry progress drain RAN (set when a
+        /// cap-expired take_post_batch extracts a progress batch - before the
+        /// publish loop, so a mid-pass throw leaves it set and the record still
+        /// settles). Once set, the next cap-expired pass with no pending terminal
+        /// arbitrates the cap instead of starting another progress batch, bounding
+        /// the response at cap + at most two pump ticks + one mailbox drain. A
+        /// pending terminal bypasses the suppression entirely: the terminal pass
+        /// drains intervening progress with it (progress-before-final ordering),
+        /// so nothing latched is stranded when the record settles kDone. Frames
+        /// latched after the drain pass are NOT lost on the cap path - the record
+        /// parks kRingOnly and the projector flushes them to the ring for GET
+        /// resume. Guarded by `mu`; read only on the pump (`out != nullptr`) path;
+        /// never cleared (no kRingOnly -> kStreaming edge exists, so the flag is
+        /// dead after park).
+        bool cap_progress_drained = false;
 
         // C5: record-local, listener-writable observability. Flushed by the
         // projector / teardown through the noexcept obs guard - the listener
@@ -967,6 +1024,90 @@ private:
     /// holding the slots. Called at the reject site so it cannot drift from the
     /// expression admission actually evaluates.
     void count_pin_slots_reject(std::size_t pinned, std::size_t unpinned) noexcept;  ///< never called under bridge_mu_
+    /// #2740 displacement counter. Never called under bridge_mu_ (the registry has
+    /// its own mutex; the admission lock is the global one).
+    void count_pin_displaced_for_admission() noexcept;
+    /// #2740: the reclaim's release threw and was contained (the record is already
+    /// committed by then, so the throw must not escape). The fault is LATCHED under
+    /// `bridge_mu_` and this is called after it releases - never under it, like every
+    /// other counter on the admission path.
+    void count_pin_release_failed() noexcept;
+    /// #2740 / #2795: the reclaim's release returned WITHOUT throwing and without
+    /// having cleared the slot - another route (a resume ack, or a final reaching the
+    /// wire) got there first. The admission still stands, so the session can sit
+    /// transiently one call over its cap for the lifetime of the over-admitted call.
+    ///
+    /// This exists because that residual was otherwise INVISIBLE: the branch resets
+    /// `displaced`, which suppresses the displacement counter, the audit row and the
+    /// log line together, and it does not latch `release_failed` either. Two governance
+    /// reviewers independently found that a runbook telling an operator to rule the
+    /// residual out by checking the other two counters was therefore unsound - both
+    /// read flat in exactly the case being ruled out. Deliberately a COUNTER and not an
+    /// audit row: no exemption was released by us, so there is no loss to attribute to
+    /// the admitting principal (that is why the audit is suppressed here at all).
+    /// Never called under `bridge_mu_`, like every other counter on this path.
+    void count_pin_release_raced() noexcept;
+    /// #2740. Called from the admission path with `bridge_mu_` HELD, on the pass
+    /// that would otherwise refuse `pin_slots`: NAMES a pin that may be released
+    /// so a new streamed call can take its slot. **Selection only — it mutates
+    /// nothing.** The caller unpins only after the admission has actually
+    /// committed, so a pass that ends up rejecting anyway, or that throws on the
+    /// ledger/map commit, destroys no eviction exemption and needs no rollback.
+    ///
+    /// Two candidate classes, orphans FIRST because they have no surviving releaser
+    /// at all. One caveat on that ordering, deliberately recorded: `teardown_claimed`
+    /// publishes its synthesized terminal and never stamps `pinned_event_id`, so
+    /// between that publish and the record's erase a freshly-minted pin already
+    /// classifies as an orphan. It is therefore reclaimable moments after minting -
+    /// which is correct (nothing will ever release it once the erase lands) but
+    /// means "deader" is a statement about its RELEASE ROUTES, not its age:
+    ///  - an ORPHAN pin: a pinned id no live record of this session references.
+    ///    The sweep's teardown erases a record WITHOUT unpinning, so these are
+    ///    reachable, and no record scan can ever see them — they were the one
+    ///    lockout shape that survived the first cut of this fix.
+    ///  - the OLDEST PARKED record (`kRingOnly`) whose committed final no wire
+    ///    took delivery of. Its resume window is the one most likely already past.
+    /// The rule that admits these two and would exclude a third is TWO criteria,
+    /// not one - an earlier single-sentence form ("the last path that could ever
+    /// act on it") was true of orphans but false of the parked class, since a GET
+    /// resume acking past a parked pin still acts on it, which is exactly why the
+    /// `!released` branch in reserve exists. A candidate must satisfy either:
+    ///   (i) NO SURVIVING RELEASER - no record remains that any other path could
+    ///       use to release it (the orphan case); or
+    ///  (ii) DEMAND-DRIVEN EXEMPTION TRANSFER - the reclaim is itself the act that
+    ///       un-exempts it, the frame is RETAINED in the ring, and the result stays
+    ///       durably fetchable (the parked case).
+    /// Never a pin a live path still owns and will release itself.
+    /// Returns nullopt when neither exists (every slot backs a live call), or
+    /// when ANY of this session's records is mid-projection: the admission sum
+    /// transiently counts one settling record as two slots, reserve has always
+    /// failed CLOSED on that reading, and a reclaim must inherit it rather than
+    /// act on a slot that was never really occupied. That claim flag is an exact
+    /// discriminator — it also covers the window in which the terminal ladder has
+    /// pinned a final but the bridge has not yet stamped `pinned_event_id`, which
+    /// is precisely when a LIVE call's pin would look like an orphan.
+    ///
+    /// Deliberately under the SAME `bridge_mu_` hold as the admission decision:
+    /// every sweep CLAIM takes `bridge_mu_` too, so holding it is what fences a
+    /// teardown from claiming a candidate between selection and release. Note the
+    /// fence covers the claim, NOT the publish: `teardown_claimed` goes on to
+    /// synthesize and pin a terminal without `bridge_mu_`, so a pin can still
+    /// appear underneath this scan. That is why the admission is confirmed by the
+    /// release reporting success rather than by any count taken here. Lock
+    /// order is the declared `bridge_mu_ -> BridgeRecord::mu -> McpStreamState::mu_`
+    /// (on_final_written's order). The metric and audit row for a release are
+    /// emitted by the CALLER, after the lock is dropped.
+    struct DisplacedPin {
+        std::string execution_id;  ///< empty for an orphan — no record survives to name it
+        std::uint64_t event_id = 0;
+        bool orphan = false;
+    };
+    /// `stream` comes from the CALLER (which already resolved it for the record it
+    /// is admitting), not from a record found in the scan: the orphan case can
+    /// have ZERO records left for the session, and deriving the ring from a record
+    /// would make exactly that case unreachable.
+    std::optional<DisplacedPin> select_displaceable_pin_locked(
+        const std::string& session_id, const std::shared_ptr<McpStreamState>& stream);
     void flush_record_obs(BridgeRecord& rec) noexcept;
     void flush_core_obs() noexcept;
     /// `detail` is a string_view, NOT a `const std::string&`: every caller passes a

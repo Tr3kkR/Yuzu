@@ -69,6 +69,25 @@ constexpr const char* kMetricChargeReleaseDeferred =
 //                    the rule-(a) unpin this should be rare; a sustained rate is the
 //                    wedge signature.
 constexpr const char* kMetricPinSlotsReject = "yuzu_mcp_bridge_pin_slots_reject_total";
+// #2740: a new streamed call reclaimed a slot from an already-committed final that
+// no wire took delivery of. This is the EXPECTED, healthy response to disconnecting
+// clients, so it is deliberately its own counter rather than a label on the ring's
+// yuzu_mcp_stream_pin_displaced_total - that family is the corroborate-before-filing
+// signal, and folding a routine event into it would destroy that alarm.
+constexpr const char* kMetricPinDisplacedForAdmission =
+    "yuzu_mcp_bridge_pin_displaced_for_admission_total";
+// #2740 / governance: the admission reclaim's release threw and was contained. The
+// record is already committed at that point, so letting it escape would leave a slot
+// nothing reclaims until the arming reaper. "Should never happen" - it needs a broken
+// platform mutex - so any nonzero value is a signal, not a rate.
+constexpr const char* kMetricPinReleaseFailed = "yuzu_mcp_bridge_pin_release_failed_total";
+// #2740 / #2795: the reclaim's release lost a race - it returned false without
+// throwing, so another route had already cleared the slot. Unlike the throw above this
+// is REACHABLE by an ordinary client (racing its own GET resume against a streamed
+// POST admission), and unlike the throw it moves neither of the other two counters.
+// Without this the residual is unobservable, which is what made the "check both
+// counters" rule-out unsound.
+constexpr const char* kMetricPinReleaseRaced = "yuzu_mcp_bridge_pin_release_raced_total";
 // Produced ONLY by the bridge's publish_final -> fallback -> poison ladder
 // (below); named in the yuzu_mcp_stream_* family because it describes stream-
 // terminal delivery, not because mcp_stream.cpp increments it (poison_terminal()
@@ -304,6 +323,14 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
     std::size_t active = 0;
     std::size_t pin_reject_pinned = 0;
     std::size_t pin_reject_unpinned = 0;
+    auto pin_slots_held = PinSlotsHeld::kNotApplicable;
+    std::optional<DisplacedPin> displaced;
+    bool release_failed = false;  // latched under bridge_mu_, emitted after it releases
+    bool release_raced = false;  // latched under bridge_mu_, emitted after it releases
+    // Reserved for the reclaim audit detail, filled after selection and BEFORE the
+    // commit block, so the only allocation that could throw on the reclaim path
+    // happens while a throw still costs nothing (see the audit_contained call).
+    std::string displaced_detail;
     {
         std::lock_guard<std::mutex> lk(bridge_mu_);
         if (shutdown_started_) {
@@ -314,20 +341,88 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
             reject = "global_cap";
         } else if (streamed_intent) {
             // A5: live pins + streamed records that have not pinned yet. Orphan
-            // pins (pressure/pin-ack teardown) stay counted via pinned_count()
+            // pins (pressure/pin-ack teardown) are counted via pinned_count()
             // until the ring releases them; a transient over-count between a pin
             // commit and its ledger decrement rejects fail-closed.
             auto it = streamed_unpinned_.find(session_id);
             const std::size_t unpinned = it == streamed_unpinned_.end() ? 0 : it->second;
             const std::size_t pinned = rec->stream->pinned_count();
             if (pinned + unpinned >= kMaxStreamedPostsPerSession) {
+                // #2740: before refusing, NAME a slot held by a final that no wire
+                // took delivery of. Four client disconnects before their finals
+                // landed would otherwise lock this session out of streamed POST
+                // for good - every remaining release route (a GET resume acking
+                // past the pinned id, or session death) needs a channel a
+                // POST-only client does not have, and the refusal told the client
+                // to wait for calls that had already ended.
+                //
+                // SELECTION ONLY here; the release happens after the admission
+                // COMMITS, below. Unpinning at this point would destroy an
+                // eviction exemption on any pass that still ends up rejecting, or
+                // that throws on the ledger/map commit - and an unpin has no
+                // inverse, so there would be nothing for LedgerRollback to undo.
+                displaced = select_displaceable_pin_locked(session_id, rec->stream);
+                if (displaced.has_value()) {
+                    // Built HERE - after selection, before the ledger bump and the
+                    // map insert. Selection has mutated nothing yet, so a throw
+                    // from this allocation unwinds with the session exactly as it
+                    // was. Building it at the emission site instead put a throwing
+                    // allocation after the commit AND after the release.
+                    displaced_detail =
+                        displaced->orphan
+                            ? "no record referenced it - its owning record was already torn "
+                              "down; the result stays fetchable by execution_id; released ring "
+                              "event_id=" + std::to_string(displaced->event_id)
+                            : std::string("final undelivered as far as the bridge can see; still "
+                                          "fetchable by execution_id and in the ring until "
+                                          "ordinary eviction");
+                }
+            }
+            // The reclaimed slot counts as free for THIS decision: it is released
+            // below on the same `bridge_mu_` hold, so no concurrent reserve can
+            // observe the interim state and over-admit.
+            //
+            // `pinned` is RE-READ rather than reused from above: `teardown_claimed`
+            // publishes (and so can pin) WITHOUT `bridge_mu_`, so a pin can appear
+            // between the first count and the selection snapshot. Subtracting from
+            // the stale figure would then credit a slot that was never counted and
+            // admit one call over the per-session cap. The clamp is belt-and-braces
+            // for the same reason the re-read exists - `pinned` is unsigned, and a
+            // count that reads 0 here must not wrap to SIZE_MAX and reject for the
+            // wrong reason.
+            //
+            // The re-read alone is NOT sufficient, which is why the release below
+            // is what finally decides: a count measures SLOTS, not the identity of
+            // the one selected. A resume ack or a delivered final can release the
+            // selected id (neither takes `bridge_mu_`) while an unrelated pin
+            // appears, leaving the count full. So this decision is provisional and
+            // is confirmed by `unpin` reporting that it really cleared the slot.
+            const std::size_t pinned_now = rec->stream->pinned_count();
+            const std::size_t reclaimed = displaced.has_value() && pinned_now > 0 ? 1U : 0U;
+            const std::size_t effective_pinned = pinned_now - reclaimed;
+            if (effective_pinned + unpinned >= kMaxStreamedPostsPerSession) {
                 reject = "pin_slots";
+                displaced.reset();  // rejecting: nothing is released, nothing to report
+                // Charges outstanding means calls that reserved and have not
+                // settled a terminal - ordinarily in flight, so a wait is true
+                // advice. Pins alone means every slot is a committed final
+                // awaiting delivery AND the reclaim above found none of them
+                // takeable; two of the three states that produces clear on a
+                // retry, so that arm advises retrying rather than waiting. The
+                // remediation differs by that much, so the caller is told which
+                // - see PinSlotsHeld's contract for the full state list.
+                pin_slots_held = unpinned > 0 ? PinSlotsHeld::kCharges : PinSlotsHeld::kPins;
                 // Captured, NOT emitted here: the metrics registry has its own mutex
                 // and the label map allocates, and this is inside bridge_mu_ - the
                 // global admission lock. Taking a slower shared lock under a broad
                 // one is the shape this very round removed from the pump; the
                 // sibling count_reject already defers for the same reason.
-                pin_reject_pinned = pinned;
+                // `pinned_now`, NOT the pre-selection `pinned`: the label must be
+                // derived from the same reading the refusal was decided on, or the
+                // wedge alert and the client's remediation describe different
+                // states (the counter's own comment says it lives at the reject
+                // site so it cannot drift from the admission expression).
+                pin_reject_pinned = pinned_now;
                 pin_reject_unpinned = unpinned;
             }
         }
@@ -373,6 +468,109 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
             records_.emplace(rec->key, rec);
             rollback.committed = true;
             active = records_.size();
+            // #2740: the admission is COMMITTED, so now — and only now — release
+            // the slot it was granted from. Placed after every throwing step so a
+            // failed reserve cannot cost a parked final its eviction exemption,
+            // and still inside `bridge_mu_` so no concurrent reserve can see the
+            // slot double-counted. `unpin` is id-targeted and idempotent: if a
+            // resume ack or on_final_written released the same id in between, this
+            // is a no-op and the admission stands either way. Allocation-free.
+            if (displaced.has_value()) {
+                bool released = false;
+                try {
+                    released = rec->stream->unpin(displaced->event_id);
+                } catch (...) {
+                    // CONTAINED, and the containment is the point. The record is
+                    // ALREADY committed at this line, so an escaping throw unwinds
+                    // past the handler's degrade-to-plain catch with the admission
+                    // counted and no record the caller believes in - a slot nothing
+                    // reclaims until the arming reaper fires. A mutex acquisition
+                    // is the one throw site this file's fault model treats as real
+                    // (it injects resource_deadlock_would_occur elsewhere), and
+                    // `unpin`'s first act is one. Same shape as the pump's
+                    // contained credit step at on_final_written's call site.
+                    //
+                    // LATCHED, not emitted: we are inside `bridge_mu_`, and the
+                    // metrics registry takes its own mutex and allocates for the
+                    // name. Taking a slower leaf lock under the global admission
+                    // lock is the shape this file removes everywhere else - the
+                    // sibling reject counter defers for exactly this reason.
+                    release_failed = true;
+                }
+                if (!released) {
+                    // Either another route (a resume ack, or a final that reached
+                    // the wire) released this id between selection and here, or the
+                    // release above was contained. The admission still stands: the
+                    // count it was decided on was provisional either way, and on
+                    // the raced path the slot this pin held did open - though an
+                    // unrelated pin can have taken it since, so this is not a proof
+                    // that a slot is free right now (#2795). The residual is
+                    // bounded by the 4-wide pin array. What does NOT stand is the
+                    // report: no exemption was released by US, so nothing is
+                    // counted, audited or logged as a DISPLACEMENT. Reporting one
+                    // would attribute a loss that did not happen to the admitting
+                    // principal.
+                    //
+                    // The raced arm still gets its OWN counter (#2795), because
+                    // "nothing to report" was read as "nothing to observe" and it is
+                    // not: this arm leaves the session transiently one call over its
+                    // cap while moving neither of the other two counters, so an
+                    // operator ruling the residual out by checking them found both
+                    // flat in exactly the case they were checking for.
+                    release_raced = !release_failed;
+                    displaced.reset();
+                }
+            }
+        }
+    }
+    // #2740: emitted HERE, outside bridge_mu_ - the metrics registry has its own
+    // mutex and the audit sink is caller-supplied, and neither may run under the
+    // global admission lock (the same rule the pin-slot reject counter follows).
+    if (release_failed) {
+        count_pin_release_failed();
+    }
+    if (release_raced) {
+        count_pin_release_raced();
+    }
+    if (displaced.has_value()) {
+        count_pin_displaced_for_admission();
+        // ACTOR, not "system": this runs synchronously on the admitting client's
+        // own request thread, and server.cpp's audit sink documents an EMPTY actor
+        // as meaning the bridge's own background work. Stamping that here would
+        // put a client-caused release beyond non-repudiation (Decision 15(j)) and
+        // hide it from any SIEM rule keyed on `principal != "system"`.
+        // An ORPHAN has no surviving record, so `target_id` is necessarily empty
+        // and the ring event id is the only handle the row can carry - it is what
+        // joins this row to the ring frame and to the later reap. Carried in the
+        // detail rather than leaving the row naming nothing at all.
+        // The detail is built into `disposition` BEFORE this point (above the
+        // `bridge_mu_` block), NOT inline here. Inline, the conditional's composite
+        // type is `std::string`, so BOTH arms allocate in reserve's own frame - at
+        // a point where the record is already committed and the pin already
+        // released. A bad_alloc there escaped into the handler's degrade-to-plain
+        // catch, leaving a committed kArming record and an unreleased charge until
+        // the 300s arming reaper, with the counter above already claiming a
+        // displacement no audit row would ever corroborate. That is precisely the
+        // hazard audit_contained's string_view parameter exists to avoid.
+        audit_contained("mcp.bridge.pin_displaced_for_admission", displaced->execution_id,
+                        displaced->orphan
+                            ? "orphan pin released to admit a new streamed call on this session"
+                            : "pin released to admit a new streamed call on this session",
+                        displaced_detail, AuditResult::kSuccess, principal);
+        // Evidence floor, matching this file's teardown convention: the counter
+        // and the audit row both route through swallowing guards, so a log line is
+        // the one trace that survives an obs/audit sink failure. The release
+        // itself has already committed by the time we get here.
+        // The session prefix needs no sanitising here (unlike the reject path in
+        // mcp_stream.cpp, which logs an id straight off an unvalidated header):
+        // this one is the server-minted id, already validated by the time reserve
+        // is reached.
+        try {
+            spdlog::info("MCP bridge: released {} pin (event_id={}) to admit a streamed call "
+                         "on session {}",
+                         displaced->orphan ? "an orphan" : "a parked", displaced->event_id,
+                         session_id.substr(0, 8));
+        } catch (...) {  // NOLINT(bugprone-empty-catch) - logging is best-effort
         }
     }
     if (reject != nullptr) {
@@ -380,10 +578,141 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
         if (std::string_view(reject) == "pin_slots") {
             count_pin_slots_reject(pin_reject_pinned, pin_reject_unpinned);
         }
-        return {false, reject};
+        return {false, reject, pin_slots_held};
     }
     publish_records_gauge(active);
     return {true, nullptr};
+}
+
+std::optional<McpStreamBridge::DisplacedPin>
+McpStreamBridge::select_displaceable_pin_locked(const std::string& session_id,
+                                                const std::shared_ptr<McpStreamState>& stream) {
+    if (!stream) {
+        return std::nullopt;
+    }
+    // ONE walk of records_, collecting three things at once: whether any of this
+    // session's records is mid-projection (the decline condition), which pinned
+    // ids are still REFERENCED by a record (so the rest are orphans), and the
+    // best record-backed candidate.
+    //
+    // Record-backed candidate clauses, each excluding a state that must survive:
+    //  - kRingOnly: a kStreaming record still has a live pump that may be about to
+    //    write its final.
+    //  - !final_written: excludes the stale-arm backstop case, where a record was
+    //    flipped kStreaming -> kRingOnly out from under a pump that then delivered
+    //    the final anyway (on_final_written accepts kRingOnly for exactly that).
+    //    NOTE this does NOT exclude the OPEN window of that case - a record whose
+    //    pump is still mid-write reads the same as one whose peer died. Releasing
+    //    the exemption there is safe (the final is on the wire or about to be, and
+    //    on_final_written's unpin is idempotent) but it is why the audit detail
+    //    says the final was undelivered "as far as the bridge can see", not that
+    //    delivery did not happen.
+    //  - !torn_down: a record mid-teardown is somebody else's; skip to the next.
+    // Oldest parked_seq wins: the longest-undelivered final is the one whose
+    // resume window has most likely already passed.
+    std::shared_ptr<BridgeRecord> victim;
+    std::uint64_t victim_seq = 0;
+    bool projection_in_flight = false;
+    // The pin array is the fixed side (at most kMaxStreamedPostsPerSession ids);
+    // the RECORD side is not - a session can hold more records than pins, because
+    // a record keeps `pinned_event_id` set after its pin has been released and
+    // until it is torn down. So the membership test is driven from the PINS and
+    // marked off by the records. Collecting referenced ids into a fixed array
+    // sized to the pin count instead would silently overflow and mark a live
+    // call's pin as an orphan - which is exactly the way this released a pinned
+    // final out from under a live record the first time it was written.
+    std::array<bool, kMaxStreamedPostsPerSession> pin_referenced{};
+    // ONE acquisition of the stream mutex for the whole scan, taken up front:
+    // every record of a session shares this ring, so polling per candidate would
+    // take the same mutex once per record while the global admission lock is held.
+    const auto pinned_ids = stream->pinned_ids_snapshot();
+    for (const auto& [key, rec] : records_) {
+        if (rec->session_id != session_id) {
+            continue;  // pins belong to a session's own ring; make that explicit
+        }
+        // MEASURED (this change's own regression test, 14 failures in 40 runs
+        // before this guard): the admission sum TRANSIENTLY over-counts a single
+        // record as two slots, because the terminal ladder commits the pin before
+        // the block that clears the streamed charge - and both happen inside one
+        // projection claim. reserve() has always noted that over-count and
+        // deliberately fails CLOSED on it (the client retries and the window has
+        // passed). A reclaim must inherit that: acting on a transient reading
+        // would release a live session's final for a slot that was never actually
+        // occupied. The claim flag is an exact discriminator - the whole
+        // double-count window lies inside it, AND so does the window where the
+        // ladder has pinned a final the bridge has not yet stamped, which is
+        // exactly when a live call's pin is indistinguishable from an orphan.
+        if (rec->projection_in_flight.load(std::memory_order_acquire)) {
+            projection_in_flight = true;
+            continue;
+        }
+        std::lock_guard<std::mutex> rlk(rec->mu);
+        if (rec->projection_in_flight.load(std::memory_order_acquire)) {
+            projection_in_flight = true;  // claimed between the check above and this hold
+            continue;
+        }
+        bool still_pinned = false;
+        if (rec->pinned_event_id != 0) {
+            for (std::size_t i = 0; i < pinned_ids.size(); ++i) {
+                if (pinned_ids[i] == rec->pinned_event_id) {
+                    pin_referenced[i] = true;
+                    still_pinned = true;
+                }
+            }
+        }
+        if (rec->torn_down || rec->phase.load(std::memory_order_acquire) != Phase::kRingOnly) {
+            continue;
+        }
+        if (!rec->final_published || rec->final_written || rec->pinned_event_id == 0 ||
+            !rec->stream) {
+            continue;
+        }
+        if (!still_pinned) {
+            // Its pin is already gone - acked by a resume, or released by an
+            // earlier admission. Tested HERE, against the snapshot, rather than
+            // once on the winner at the end: a record that keeps `pinned_event_id`
+            // after its pin was released is usually the OLDEST, so checking only
+            // the winner let it beat every live candidate and then abort the whole
+            // selection, which put the lockout straight back.
+            continue;
+        }
+        if (!victim || rec->parked_seq < victim_seq) {
+            victim = rec;
+            victim_seq = rec->parked_seq;
+        }
+    }
+    if (projection_in_flight) {
+        return std::nullopt;
+    }
+    // ORPHANS FIRST. A pinned id no surviving record references has no route a
+    // POST-ONLY client can reach: the pin-ack sweep needs a record, on_final_written
+    // needs a record, and the teardown that erased the record did not unpin. It is
+    // NOT unreachable in general - attach_and_replay's cursor ack walks pinned_ids_
+    // directly with no record lookup and clears every slot at or below the cursor,
+    // orphans included - but that needs a GET channel, which is exactly what the
+    // locked-out client in #2740 does not have. Left
+    // alone, four of these lock the session out of streamed POST permanently - the
+    // exact defect #2740 is about, in the one shape a record scan cannot see.
+    // Safe only because `projection_in_flight` is false above: that is what rules
+    // out a live call whose pin is committed but not yet stamped.
+    std::uint64_t orphan = 0;
+    for (std::size_t i = 0; i < pinned_ids.size(); ++i) {
+        const auto id = pinned_ids[i];
+        if (id == 0 || pin_referenced[i]) {
+            continue;
+        }
+        if (orphan == 0 || id < orphan) {
+            orphan = id;  // lowest id = oldest frame
+        }
+    }
+    if (orphan != 0) {
+        return DisplacedPin{std::string{}, orphan, /*orphan=*/true};
+    }
+    if (!victim) {
+        return std::nullopt;
+    }
+    std::lock_guard<std::mutex> rlk(victim->mu);
+    return DisplacedPin{victim->execution_id, victim->pinned_event_id, /*orphan=*/false};
 }
 
 bool McpStreamBridge::subscribe(const std::string& session_id, const nlohmann::json& jsonrpc_id,
@@ -860,7 +1189,10 @@ bool McpStreamBridge::on_final_written(const std::string& key) {
     // for a resuming client. Lock order holds - BridgeRecord::mu is above
     // McpStreamState::mu_.
     if (rec->pinned_event_id != 0 && rec->stream) {
-        rec->stream->unpin(rec->pinned_event_id);
+        // Deliberately discarded: this release is best-effort. A false here means
+        // the id was already released (a resume ack, or the admission reclaim), and
+        // nothing downstream branches on which of those happened.
+        (void)rec->stream->unpin(rec->pinned_event_id);
     }
     return true;
 }
@@ -962,9 +1294,12 @@ McpStreamBridge::PostBatch McpStreamBridge::take_post_batch(const std::string& k
 }
 
 bool McpStreamBridge::has_pending_work_locked(const BridgeRecord& rec) {
-    // The SAME predicate project_record uses to decide there is a batch worth
-    // claiming. Factored so the bind handshake and the projector's wake-forwarding
-    // cannot disagree with the consumer about what "pending" means.
+    // "Latched work worth waking the pump for". This was the SAME predicate
+    // project_record uses to decide there is a batch worth claiming until #2739
+    // made the pump path context-dependent (cap_expired + cap_progress_drained);
+    // the divergence is deliberate - a mailbox deliberately held back by the cap
+    // drain must STILL count as pending here, because that wake is what lets the
+    // settle pass run immediately instead of a tick later.
     const bool progress = rec.mb_count > 0 && !rec.pressure_requested;
     const bool terminal = rec.terminal_accepted &&
                           !rec.terminal_projected.load(std::memory_order_acquire) &&
@@ -1108,10 +1443,20 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
         }
         // E1: while a pressure sweep is waiting on this record, no NEW progress
         // batch may start - only an already-latched terminal settles.
-        const bool want_progress = rec->mb_count > 0 && !rec->pressure_requested;
         const bool want_terminal = rec->terminal_accepted &&
                                    !rec->terminal_projected.load(std::memory_order_acquire) &&
                                    rec->terminal_slot.has_value();
+        // #2739: once the one post-expiry drain pass has run, a cap-expired pump
+        // pass starts no further progress batch - otherwise a mailbox that refills
+        // every tick keeps the response open for the whole execution. A pending
+        // terminal bypasses the suppression: that pass ends the response anyway,
+        // and it must carry the intervening progress ahead of the final
+        // (progress-before-final ordering) rather than strand it in a record about
+        // to settle kDone.
+        const bool settling_cap =
+            out != nullptr && cap_expired && rec->cap_progress_drained && !want_terminal;
+        const bool want_progress =
+            rec->mb_count > 0 && !rec->pressure_requested && !settling_cap;
         if (!want_progress && !want_terminal) {
             // CAP ARBITRATION, decided INSIDE the record lock alongside the
             // terminal check rather than by the pump beforehand: a terminal that
@@ -1134,6 +1479,17 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
             batch_n = rec->mb_count;
             rec->mb_head = 0;
             rec->mb_count = 0;
+            if (out != nullptr && cap_expired) {
+                // #2739: this IS the drain pass. Marked before the publish loop
+                // (see the field comment for why a mid-pass throw must leave it
+                // set), and the sink is poked NOW so the settle pass rides an
+                // immediate wake instead of sleeping out a full pump tick when
+                // the execution happens to go quiet at cap expiry. Sink-mu under
+                // rec-mu is the sanctioned lock order (bind_post_sink does the
+                // same); a failed poke just falls back to the next tick.
+                rec->cap_progress_drained = true;
+                poke_post_sink(rec->post_sink);
+            }
         }
         if (want_terminal) {
             term = std::move(rec->terminal_slot);
@@ -1299,7 +1655,7 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
                     // can never fill - and the watermark above deliberately did
                     // not advance for it either.
                     try {
-                        out->progress.push_back(std::move(frame));
+                        out->progress.push_back(PostBatch::PostFrame{std::move(frame), id});
                     } catch (...) {  // NOLINT(bugprone-empty-catch)
                         // The ring copy is durable; losing the live copy costs
                         // this client a frame it can still fetch by resume.
@@ -1358,9 +1714,22 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
         // clears and the pump retries - nothing has been committed or delivered
         // twice. Doing it after the publish would risk a ring commit the pump
         // never learns about.
-        out->final_frame = frame;
+        out->final_frame = PostBatch::PostFrame{frame, 0};
     }
     const auto fid = publish_terminal_ladder(rec, std::move(frame)).id;
+    if (out != nullptr && out->final_frame.has_value()) {
+        // #2785: the ring id exists only now, after the ladder committed the
+        // frame - stamped in place rather than moving the copy below the
+        // publish, which would re-open the restore-safety hole the comment
+        // above closes. Stays 0 on a poisoned/pinless settle: that final has no
+        // ring counterpart to resume from, so the wire honestly carries no id.
+        // On the FALLBACK rung it is non-zero but names the FALLBACK frame the
+        // ladder committed, while the bytes on the wire are the real final built
+        // before it - the id identifies the RING entry, not the payload delivered.
+        // Nothing is published after a final, so a resume cursor built from it is
+        // still correct; it just does not round-trip to the same bytes.
+        out->final_frame->event_id = fid;
+    }
     // Settle IMMEDIATELY after the commit/poison decision (C4): no later
     // bookkeeping failure may restore + republish.
     guard.terminal_settled = true;
@@ -1545,8 +1914,14 @@ void McpStreamBridge::sweep() {
                 action = "mcp.bridge.session_dead";
             } else if (ph == Phase::kRingOnly) {
                 std::lock_guard<std::mutex> rlk(rec->mu);
-                // H4: const pin poll - the ring's unpin (resume-cursor ack) is
-                // the consumption proof; no stream→bridge callback edge.
+                // H4: const pin poll - a released pin is the reap trigger; no
+                // stream→bridge callback edge. It is NOT proof the client consumed
+                // anything: since #2740 an admission reclaim releases pins too, so
+                // a record reaped here may never have been resumed. The action
+                // name (`mcp.bridge.pin_acked`) predates that and is kept for
+                // taxonomy stability - the preceding
+                // `mcp.bridge.pin_displaced_for_admission` row is what distinguishes
+                // the two causes for anyone reading the trail.
                 if (rec->final_published && rec->pinned_event_id != 0 &&
                     !rec->projection_in_flight.load(std::memory_order_acquire) &&
                     !rec->stream->is_pinned(rec->pinned_event_id)) {
@@ -2309,6 +2684,24 @@ bool McpStreamBridge::take_step_fault(TeardownStage stage) noexcept {
 void McpStreamBridge::publish_records_gauge(std::size_t n) noexcept {
     if (metrics_ != nullptr) {
         obs_guard([&] { metrics_->gauge(kMetricRecordsActive).set(static_cast<double>(n)); });
+    }
+}
+
+void McpStreamBridge::count_pin_displaced_for_admission() noexcept {
+    if (metrics_ != nullptr) {
+        obs_guard([&] { metrics_->counter(kMetricPinDisplacedForAdmission).increment(); });
+    }
+}
+
+void McpStreamBridge::count_pin_release_failed() noexcept {
+    if (metrics_ != nullptr) {
+        obs_guard([&] { metrics_->counter(kMetricPinReleaseFailed).increment(); });
+    }
+}
+
+void McpStreamBridge::count_pin_release_raced() noexcept {
+    if (metrics_ != nullptr) {
+        obs_guard([&] { metrics_->counter(kMetricPinReleaseRaced).increment(); });
     }
 }
 
