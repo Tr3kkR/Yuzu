@@ -164,7 +164,12 @@ TEST_CASE("discover.permissions: shape + ETag revalidation", "[discovery][permis
     auto res = h.sink.Get("/api/v1/discover/permissions");
     REQUIRE(res);
     CHECK(res->status == 200);
-    CHECK(res->get_header_value("Cache-Control") == "public, max-age=300");
+    // `private`, not `public`, since #2376: this route's body varies with the
+    // caller's UserManagement:Read (the role grid), so a shared cache must never
+    // store one caller's representation and serve it to another. The dedicated
+    // cache-boundary test below covers both representations; this line is kept
+    // here so the shape test cannot silently drift back to `public`.
+    CHECK(res->get_header_value("Cache-Control") == "private, max-age=300");
     const std::string etag = res->get_header_value("ETag");
     CHECK_FALSE(etag.empty());
 
@@ -247,6 +252,61 @@ TEST_CASE("discover.permissions: role grid PRESENT for a UserManagement:Read hol
     CHECK(j.contains("roles"));
     CHECK_FALSE(j["roles"].empty());
     CHECK_FALSE(j.value("roles_omitted", false));
+}
+
+// #2376 / adversarial-review CDX-P2-002 — the cache half of the same bypass.
+// Splitting the catalogue made this route serve TWO representations under ONE
+// URL, chosen by the caller's UserManagement:Read. Left marked
+// `Cache-Control: public`, a shared cache may store the privileged
+// representation and hand the role grid to an unprivileged caller — walking the
+// protected half across the boundary the probe just enforced. The handler
+// returns the right body to each caller either way, so no per-caller assertion
+// catches this; only the header does.
+TEST_CASE("discover.permissions: permission-varying representation is never shareable",
+          "[discovery][permissions][floor][cache]") {
+    SECTION("with the grid") {
+        DiscoverHarness h;
+        auto res = h.sink.Get("/api/v1/discover/permissions");
+        REQUIRE(res);
+        CHECK(res->get_header_value("Cache-Control") == "private, max-age=300");
+        CHECK(res->get_header_value("Vary") == "Authorization, Cookie");
+    }
+    SECTION("without the grid — same URL, different body, still unshareable") {
+        DiscoverHarness h;
+        h.perm_override = [](const std::string& sec, const std::string& op) {
+            return !(sec == "UserManagement" && op == "Read");
+        };
+        auto res = h.sink.Get("/api/v1/discover/permissions");
+        REQUIRE(res);
+        CHECK(res->get_header_value("Cache-Control") == "private, max-age=300");
+    }
+}
+
+// Pre-existing instance of the same class: /discover/plugins has varied by the
+// caller's InstructionDefinition:Read since the enrichment gate landed, and was
+// publicly cacheable while doing so.
+TEST_CASE("discover.plugins: enrichment-varying representation is never shareable",
+          "[discovery][plugins][cache]") {
+    DiscoverHarness h(/*wire_rbac=*/true, /*wire_instr=*/true, /*wire_registry=*/true,
+                      /*grant_instr_read=*/true);
+    auto res = h.sink.Get("/api/v1/discover/plugins");
+    REQUIRE(res);
+    CHECK(res->get_header_value("Cache-Control") == "private, max-age=300");
+    CHECK(res->get_header_value("Vary") == "Authorization, Cookie");
+}
+
+// The caller-independent catalogues stay shareable — the fix must be narrow, or
+// it silently drops caching for the three routes that never varied.
+TEST_CASE("discover: caller-independent catalogues remain publicly cacheable",
+          "[discovery][cache]") {
+    DiscoverHarness h;
+    for (const char* path : {"/api/v1/discover/instructions", "/api/v1/discover/routes",
+                             "/api/v1/discover/scope-kinds"}) {
+        INFO("path " << path);
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->get_header_value("Cache-Control") == "public, max-age=300");
+    }
 }
 
 TEST_CASE("discover.permissions: null RbacStore -> 503", "[discovery][permissions]") {

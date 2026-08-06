@@ -280,6 +280,32 @@ UI or `RbacStore::set_permission()` directly. `Security:Read` alone no
 longer reaches `/api/v1/engine-principals*` or its MCP twins after this
 upgrade.
 
+**Direction 3 — API consumers of `GET /api/v1/discover/permissions` (and the MCP
+`discover_permissions` twin) lose the role grid unless they hold
+`UserManagement:Read`.**
+
+**Who this affects.** Anything reading the discovery catalogue's
+`roles[].permissions[]` under a principal that holds `Infrastructure:Read` but
+not `UserManagement:Read`.
+
+**What changes.** The route still returns `200` and the full
+`securable_types`/`operations` taxonomy — that half is unchanged and still needs
+only `Infrastructure:Read`. The `roles` key is replaced by `"roles_omitted": true`
+plus a `roles_omitted_reason`. A consumer that iterates `roles` must handle its
+absence; one that checks `roles_omitted` gets an unambiguous answer.
+
+**Why.** That grid is authorization topology, and strictly more of it than
+`GET /api/v1/rbac/roles` discloses — which this same change floors. Leaving it on
+the unfloored `Infrastructure:Read`, which every authenticated session holds on an
+RBAC-off install, left the floor reachable around. Flooring `Infrastructure:Read`
+itself was rejected: it gates ordinary operational reads and would have repeated
+the too-coarse mistake this change avoided with `Security:Read`.
+
+**What to do.** Grant the consuming principal `UserManagement:Read` if it
+legitimately needs the grid, or update it to read `roles_omitted`. Do not treat a
+missing `roles` key as "no roles exist" — that is precisely why the omission is
+declared.
+
 **Check your automation, not just your operators — this is the failure that
 hides.** Neither breaking direction produces a startup warning or a migration
 prompt. Both surface only as a `403` at some later moment, and that moment may

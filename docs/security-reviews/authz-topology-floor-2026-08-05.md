@@ -221,6 +221,50 @@ addressed here:
 removal, and it is one-way and version-gated precisely because `INSERT OR
 IGNORE` cannot express a deletion.
 
+### 8. The floor is keyed on the securable — so the SET must be derived from the DATA, not from the routes we happened to know about
+
+Added after the adversarial-review panel (Codex) returned BLOCK on a defect the
+14-agent governance run passed.
+
+`GET /api/v1/discover/permissions` and its MCP twin `discover_permissions` are
+gated `Infrastructure:Read` — deliberately not floored, because
+`Infrastructure:Read` gates ordinary operational reads — and returned
+`build_permissions_catalog()`'s **complete role → permission grid**. On an
+RBAC-off install the legacy fallback allows every `Read` to any authenticated
+session, so a caller the floor had just refused at `/rbac/roles` could read
+*strictly more* topology from the discovery route. The floor was advertised as a
+control it did not have.
+
+**The lesson, stated so the next person does not repeat it.** Keying the floor on
+`(securable, operation)` is correct — it is what reaches the MCP twins (decision 3).
+But the floor SET was derived by asking *"which securables gate the routes this
+change touches?"* rather than *"which routes emit authorization topology?"*. Those
+are different questions and they give different answers. The governance run
+verified coverage of the floored securables exhaustively and correctly, and never
+asked the second question.
+
+**The fix: split the catalogue, do not floor `Infrastructure:Read`.** Flooring it
+would repeat exactly the too-coarse mistake decision 4 rejected for
+`Security:Read`. Instead the response has two halves with different permissions —
+the taxonomy (`securable_types`, `operations`) at the route's own
+`Infrastructure:Read`, the role grid behind `UserManagement:Read`, probed with a
+throwaway response so a denial withholds the grid rather than 403-ing the route.
+This is not a new pattern: `discover.plugins` in the same file already probes
+`InstructionDefinition:Read` before enriching with `parameter_schema`.
+
+**Omission is declared** (`roles_omitted` + `roles_omitted_reason`), never silent —
+`roles` simply absent would read as "the fleet has no RBAC roles", the same
+absent-vs-empty trap the upgrade note warns evidence collectors about.
+
+**The audit that should have happened, now done.** Every caller of
+`get_role_permissions`, `list_roles`, `list_all_principal_roles_checked` and
+`get_principal_roles` was enumerated. The discovery pair was the only bypass; the
+rest are already floored, are the caller's own self-read, or are the
+engine-principal no-admin auditor (`AuditLog:Read`, which returns violations
+only, not the grid). A new test also pins every floored pair against the store's
+own `list_securable_types()`/`list_operations()`, so a floor entry naming a
+securable that is never seeded fails loudly instead of protecting nothing.
+
 ## Hard-invariant check
 
 - The floor set is a fixed, `constexpr` array (`kTopologyFloor`) — no

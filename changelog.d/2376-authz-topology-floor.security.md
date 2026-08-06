@@ -23,6 +23,14 @@
   migration is involved, but custom roles are not auto-updated. Floored denials carry a distinct
   audit reason (`"topology floor: …"` on `auth.permission_required` /
   `auth.scoped_permission_required`) and increment the new
-  `yuzu_auth_topology_floor_denied_total{permission}`. See
+  `yuzu_auth_topology_floor_denied_total{permission}`. **`GET /api/v1/discover/permissions` and the MCP `discover_permissions` twin
+  are split by the same rule:** the `securable_types`/`operations` taxonomy still needs only the
+  route's `Infrastructure:Read`, but the `roles[].permissions[]` grid now additionally requires
+  `UserManagement:Read`. Without it the route still returns `200` and the full taxonomy, with the
+  grid replaced by `"roles_omitted": true` and a reason — the omission is declared, never silent, so
+  a caller cannot mistake it for "the fleet has no RBAC roles". This closed a bypass: that grid is
+  strictly more than `/api/v1/rbac/roles` discloses, and `Infrastructure:Read` is held by every
+  authenticated session on an RBAC-off install, so the floor was reachable around.
+  See
   `docs/security-reviews/authz-topology-floor-2026-08-05.md` for the recorded decision and
   `docs/user-manual/server-admin.md` "Upgrade Notes" for the remediation steps.

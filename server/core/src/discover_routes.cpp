@@ -39,9 +39,37 @@ DiscoveryDoc build_discovery_doc(json body) {
 
 // Serve `doc` through the standard ETag / Cache-Control / 304 contract
 // (mirrors GET /api/v1/guaranteed-state/schemas, rest_api_v1.cpp).
-void serve_doc(const httplib::Request& req, httplib::Response& res, const DiscoveryDoc& doc) {
+/// Whether a discovery document is the SAME for every caller, or varies with the
+/// caller's own authorization.
+///
+/// This distinction is a security control, not a performance tunable (#2376,
+/// adversarial-review CDX-P2-002). A route whose body depends on the caller's
+/// permissions serves two different representations under ONE URL. Marked
+/// `public`, a shared/intermediary cache may store the privileged
+/// representation and hand it to an unprivileged caller — which walks the
+/// protected half straight across the authorization boundary that the
+/// per-request permission probe just enforced. `private` forbids shared caches
+/// from storing it at all; `Vary` additionally keeps a caller-local cache from
+/// reusing one credential's response for another.
+///
+/// Getting this wrong is invisible in every unit test — the handler returns the
+/// correct body to each caller, and the leak happens in an intermediary nobody
+/// mocks. Choose deliberately when adding a discovery route: if ANY part of the
+/// body is gated on the caller's grants, it is `PerCaller`.
+enum class DocAudience {
+    Everyone,  ///< identical for all callers — safe to share
+    PerCaller, ///< varies with the caller's grants — never shareable
+};
+
+void serve_doc(const httplib::Request& req, httplib::Response& res, const DiscoveryDoc& doc,
+               DocAudience audience) {
     res.set_header("ETag", doc.etag);
-    res.set_header("Cache-Control", "public, max-age=300");
+    if (audience == DocAudience::PerCaller) {
+        res.set_header("Cache-Control", "private, max-age=300");
+        res.set_header("Vary", "Authorization, Cookie");
+    } else {
+        res.set_header("Cache-Control", "public, max-age=300");
+    }
     if (req.get_header_value("If-None-Match") == doc.etag) {
         res.status = 304;
         return;
@@ -419,7 +447,10 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::AuthFn auth_fn,
                      const bool include_roles =
                          perm_fn(req, probe, "UserManagement", "Read");
                      serve_doc(req, res,
-                               build_permissions_catalog(*rbac_store, include_roles));
+                               build_permissions_catalog(*rbac_store, include_roles),
+                               // PerCaller: the role grid is present only for a
+                               // UserManagement:Read holder (see the probe above).
+                               DocAudience::PerCaller);
                  } catch (const std::exception&) {
                      discover_503(res, "discovery store read failed");
                  }
@@ -434,7 +465,8 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::AuthFn auth_fn,
                      return;
                  }
                  try {
-                     serve_doc(req, res, build_instructions_catalog(*instruction_store));
+                     serve_doc(req, res, build_instructions_catalog(*instruction_store),
+                               DocAudience::Everyone);
                  } catch (const std::exception&) {
                      discover_503(res, "discovery store read failed");
                  }
@@ -447,14 +479,14 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::AuthFn auth_fn,
                  // openapi_spec_json() is compiled-in — no store dependency, always
                  // answerable (matches the scope-kinds "answers even when everything
                  // else is down" property).
-                 serve_doc(req, res, build_routes_catalog(openapi_spec_json()));
+                 serve_doc(req, res, build_routes_catalog(openapi_spec_json()), DocAudience::Everyone);
              });
 
     sink.Get("/api/v1/discover/scope-kinds",
              [perm_fn](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Infrastructure", "Read"))
                      return;
-                 serve_doc(req, res, scope_kinds_catalog());
+                 serve_doc(req, res, scope_kinds_catalog(), DocAudience::Everyone);
              });
 
     sink.Get("/api/v1/discover/plugins",
@@ -481,7 +513,13 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::AuthFn auth_fn,
                          enrich = instruction_store;
                  }
                  try {
-                     serve_doc(req, res, build_plugins_catalog(*agent_registry, enrich));
+                     // PerCaller: `enrich` gates parameter_schema on the caller's
+                     // InstructionDefinition:Read. That has varied per caller since the
+                     // enrichment gate landed, so this route was publicly cacheable while
+                     // permission-varying BEFORE #2376 — a pre-existing instance of the
+                     // same class, fixed here because the fix is the shared helper.
+                     serve_doc(req, res, build_plugins_catalog(*agent_registry, enrich),
+                               DocAudience::PerCaller);
                  } catch (const std::exception&) {
                      discover_503(res, "discovery store read failed");
                  }

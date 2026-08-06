@@ -3663,9 +3663,29 @@ All five share the same caching contract: a content-derived `ETag` header + `Cac
 
 #### `GET /api/v1/discover/permissions`
 
-RBAC permission catalog: every `securable_type` × `operation` pair the RBAC store recognizes, plus the full role → allowed-operations grid.
+RBAC permission catalog. The response has **two halves with different permissions** (#2376):
 
-**Permission:** `Infrastructure:Read`
+- the **taxonomy** — `securable_types` and `operations`, i.e. what the RBAC model can express —
+  requires only the route's own `Infrastructure:Read`. It says nothing about who holds what, and an
+  agentic worker needs it to author a grant at all (A2 discovery).
+- the **role grid** — `roles[].permissions[]`, every role's actual granted securable/operation/effect
+  — additionally requires **`UserManagement:Read`**. That grid *is* authorization topology, and it is
+  strictly more than `GET /api/v1/rbac/roles` discloses, so it carries the same permission the
+  authorization-topology floor applies there.
+
+A caller holding `Infrastructure:Read` but not `UserManagement:Read` still gets `200` and the full
+taxonomy; the grid is replaced by `"roles_omitted": true` plus a `roles_omitted_reason`. **The
+omission is declared, never silent** — `roles` absent with no `roles_omitted` flag would mean
+"no roles exist", which is a different fact.
+
+**Permission:** `Infrastructure:Read` (taxonomy) · `UserManagement:Read` (role grid)
+
+**Caching:** because the body varies with the caller's grants, this route responds
+`Cache-Control: private, max-age=300` with `Vary: Authorization, Cookie` — never `public`.
+A shared cache must not store one caller's representation and serve it to another.
+`GET /api/v1/discover/plugins` is `private` for the same reason (its `parameter_schema`
+enrichment is gated on `InstructionDefinition:Read`); the caller-independent catalogues
+(`instructions`, `routes`, `scope-kinds`) remain `public, max-age=300`.
 
 **Response:**
 ```json
@@ -3684,6 +3704,14 @@ RBAC permission catalog: every `securable_type` × `operation` pair the RBAC sto
       ]
     }
   ]
+}
+```
+
+Without `UserManagement:Read` the `roles` key is replaced by:
+```json
+{
+  "roles_omitted": true,
+  "roles_omitted_reason": "requires UserManagement:Read (#2376 authorization-topology floor); the securable_types and operations taxonomy above is unaffected"
 }
 ```
 
