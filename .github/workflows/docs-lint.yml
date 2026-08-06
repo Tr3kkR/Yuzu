@@ -81,7 +81,7 @@ jobs:
   # the parse gate; `test rules` is the behaviour gate, and it is the one that
   # would have caught it.
   #
-  # ITS OWN JOB, deliberately. These steps pull a container — the only Docker Hub
+  # ITS OWN JOB, deliberately. This step pulls a container — the only Docker Hub
   # dependency in THIS workflow (other workflows have their own: pre-release.yml
   # runs distro images) — so a registry outage or an anonymous-pull rate limit
   # fails THIS check, under a name that says what actually broke, instead of
@@ -92,11 +92,15 @@ jobs:
   # documents.) Whether this job becomes a required check is a branch-protection
   # decision, not something this file can assert.
   #
-  # The meson registration of the same cases (tests/meson.build →
-  # tests/prometheus/run_promtool_tests.py) deliberately does NOT pull: it needs
-  # a native promtool or an explicit opt-in, because flake-retry runs `meson
-  # test` unfiltered on three required build legs and an earlier version of this
-  # wiring put Docker Hub on all three.
+  # IT CALLS THE SCRIPT rather than inlining the invocation, so the pinned image
+  # has exactly one home (`tests/prometheus/run_promtool_tests.py`) and CI runs
+  # provably the same code as a local run — the pattern
+  # `scripts/ci/verify-healthcheck-invariants.sh` and `scripts/ci/ensure-postgres.sh`
+  # already use. The same script is registered in `tests/meson.build`, where it
+  # deliberately does NOT pull: without the opt-in below it needs a native
+  # promtool and otherwise skips, because flake-retry runs `meson test`
+  # unfiltered on three required build legs and an earlier version of this wiring
+  # put Docker Hub on all three (#2553).
   #
   # Runs on every PR rather than only rule changes: the rules and the code that
   # feeds them drift apart from either side, and the whole run is a few seconds
@@ -112,30 +116,7 @@ jobs:
 
       - name: Validate and unit-test alert rules (promtool)
         env:
-          # Pinned by DIGEST, matching how this repo pins actions by SHA: a
-          # floating tag would mean CI runs a promtool nobody validated against.
-          # This digest is promtool 3.13.1, the build these tests were written
-          # and mutation-checked against. Prometheus 3.0 made range selectors
-          # left-open, which shifts increase()/resets() at window edges — the
-          # exact thing these cases measure — so the major version is load-bearing.
-          # tests/prometheus/run_promtool_tests.py asserts it pins this same
-          # digest, so the two copies cannot drift silently.
-          PROMTOOL_IMAGE: "prom/prometheus@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893"
-        run: |
-          set -euo pipefail
-          # Retry the pull: a transient registry hiccup should not read as a
-          # broken alert rule.
-          for attempt in 1 2 3; do
-            if docker pull --quiet "$PROMTOOL_IMAGE"; then break; fi
-            if [ "$attempt" = 3 ]; then
-              echo "::error::could not pull $PROMTOOL_IMAGE after 3 attempts"
-              exit 1
-            fi
-            sleep 10
-          done
-          docker run --rm -v "$PWD":/w:ro \
-            --entrypoint /bin/promtool "$PROMTOOL_IMAGE" \
-            check rules /w/docs/prometheus/yuzu-alerts.yml
-          docker run --rm -v "$PWD":/w:ro \
-            --entrypoint /bin/promtool "$PROMTOOL_IMAGE" \
-            test rules /w/tests/prometheus/yuzu-alerts.test.yml
+          # Makes the pinned image mandatory for this job: the script's opt-in
+          # takes precedence over any promtool that happens to be on PATH.
+          YUZU_TEST_ENABLE_PROMTOOL_DOCKER: "1"
+        run: python3 tests/prometheus/run_promtool_tests.py

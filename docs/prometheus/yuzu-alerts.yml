@@ -984,13 +984,23 @@ groups:
       # each restart starts a FRESH series with `resets == 0` and uptime under the
       # grace, so the grace applies forever and this rule is silent again. Nothing
       # in PromQL can recover from that; the fix is scrape config, not this rule
-      # (target a stable identity). `on(instance)` also ignores `job`, so a second
-      # series that happens to share an `instance` value and is young can suppress
-      # a genuinely broken server. Both are called out in the runbook.
+      # (target a stable identity). It is called out in the runbook.
+      #
+      # MATCHING IS DELIBERATELY BARE, and that is load-bearing. Both operands are
+      # scraped from the SAME server target, so their label sets are already
+      # identical and an explicit `on(...)` can only narrow them. An earlier
+      # revision used `on(instance)`, which let a young reset-free neighbour that
+      # merely SHARED an `instance` value -- a canary, an HA pair, a federated
+      # series -- suppress the alert for a genuinely broken server. `on(instance,
+      # job)` is not the fix: it moves the same hole to the next distinguishing
+      # label (`namespace`, `pod`, `cluster`). Default matching is what every other
+      # cross-metric rule in this file uses; a rule that opts out of it needs a
+      # stated reason, and this one has none. Pinned by the two-target case in
+      # `tests/prometheus/yuzu-alerts.test.yml`.
       - alert: YuzuAuditRetentionNotRunning
         expr: |
           increase(yuzu_server_audit_retention_passes_total[3h]) == 0
-          unless on(instance) (
+          unless (
             yuzu_server_uptime_seconds < 10800
             and resets(yuzu_server_uptime_seconds[3h]) <= 1
           )

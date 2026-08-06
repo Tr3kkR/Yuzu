@@ -137,3 +137,152 @@ tests:
       - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning"}'
         eval_time: 3h30m
         exp_samples: []
+
+  # CASE 5 -- the absent-uptime-series arm. The rule uses `unless` rather than
+  # `and` specifically so a server that stopped exporting uptime cannot silence
+  # it; with `and`, an absent right-hand side makes the whole expression empty
+  # and the alert vanishes exactly when a server is least healthy. Nothing pinned
+  # that until this case: it is GREEN as written and RED against `and`.
+  - interval: 1m
+    name: retention not running - an absent uptime series does not silence the rule
+    input_series:
+      # No yuzu_server_uptime_seconds at all.
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "5x239"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning"}'
+        eval_time: 3h30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 6 -- LABEL MATCHING, and it is the only case that can see it. Every
+  # other case uses ONE identical label set for both operands, which makes bare
+  # matching, `on(instance)` and `on(instance, job)` indistinguishable.
+  #
+  # The two operands are scraped from the same target, so the rule matches on the
+  # full label set. An explicit `on(...)` narrows that, and any OTHER young,
+  # reset-free uptime series agreeing on the narrowed labels is then allowed to
+  # stand in for this server's uptime and suppress the alert. Here a genuinely
+  # broken long-lived server and a young neighbour share `job` AND `instance` and
+  # differ only in `namespace` -- an ordinary Kubernetes shape. The alert must
+  # still fire.
+  #
+  # RED against `unless on(instance) (...)`, which is what this rule shipped with
+  # before, and ALSO red against `on(instance, job)`, which merely moves the hole
+  # to the next distinguishing label. The neighbour must stay INSIDE the 10800s
+  # grace at eval time or it drops out of the right-hand side and the case
+  # silently stops discriminating -- hence the 2h30m evaluation.
+  - interval: 1m
+    name: retention not running - a young neighbour sharing labels cannot suppress it
+    input_series:
+      # The broken server: long-lived, well past the grace, reaper frozen.
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1",namespace="prod"}'
+        values: "20000+60x179"
+      # The neighbour: young (9060s at 2h30m, inside the grace), no resets.
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1",namespace="canary"}'
+        values: "60+60x179"
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1",namespace="prod"}'
+        values: "5x179"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning"}'
+        eval_time: 2h30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing", instance="s1", job="yuzu", namespace="prod", severity="warning"}'
+            value: 1
+
+  # ── The load-bearing constants ────────────────────────────────────────────
+  #
+  # Cases 1-6 pin the SHAPE of the rule. Mutation testing showed every numeric
+  # constant the rule's own commentary calls load-bearing could be changed
+  # without reddening anything: `[3h]` -> `[6h]`, `<= 1` -> `<= 2`, `10800` ->
+  # `7200`, `for: 15m` -> `for: 5m` all survived. These two cases pin the
+  # magnitudes, so a future edit to a threshold has to be deliberate.
+
+  # CASE 7 -- the 3h evaluation window and the 15m `for`.
+  #
+  # A counter that is flat from t=0 does NOT pin the window: `increase()` over a
+  # partial range is also 0, so such a rule fires ~15m in regardless of whether
+  # the range is [1h], [3h] or [6h]. The window is only observable when the
+  # counter RISES and then stops. Here the reaper completes passes for the first
+  # 30 minutes and then dies, so the range boundary is what decides.
+  - interval: 1m
+    name: retention not running - the 3h window and the 15m for are pinned
+    input_series:
+      # Long-lived server, well past the grace, no restarts.
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
+        values: "20000+60x299"
+      # Passes rise until t=30m, then frozen.
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "5+1x30 35x239"
+    promql_expr_test:
+      # 3h20m: the [3h] window still reaches back past t=30m, so increase() is
+      # non-zero and the rule is quiet. RED if the window is NARROWED.
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing"}'
+        eval_time: 3h20m
+        exp_samples: []
+      # 3h40m: the window has just cleared the last increment (~3h30m), so the
+      # condition holds but `for: 15m` has not elapsed. RED if `for` is SHORTENED.
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing"}'
+        eval_time: 3h40m
+        exp_samples: []
+      # 3h55m: condition held through `for`. Firing. RED if the window is
+      # WIDENED to [6h], which would still see the t=30m increments here.
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing"}'
+        eval_time: 3h55m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 8 -- the 10800s grace boundary and the `<= 1` reset bound together. A
+  # server at ~2h30m uptime (9000s, inside the 10800 grace) with ONE reset is
+  # excused; the SAME server with TWO resets is not. Lowering 10800 to 7200
+  # reddens the first arm; loosening `<= 1` to `<= 2` reddens the second.
+  - interval: 1m
+    name: retention not running - the 10800s grace and the reset bound are pinned
+    input_series:
+      # 75m up, restart, 75m up: 150m total, one reset, final uptime 4500s.
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
+        values: "60+60x74 60+60x74"
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "0x149"
+      # Same window, but three 50m segments: two resets, final uptime 3000s --
+      # still inside the 10800 grace, so ONLY the reset bound excludes it.
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s2"}'
+        values: "60+60x49 60+60x49 60+60x49"
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s2"}'
+        values: "0x149"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing"}'
+        eval_time: 2h29m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing", instance="s2", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 9 -- the `resets()` RANGE and the 10800s grace, which case 8 cannot
+  # reach. Case 8's restarts all fall inside three hours, so widening
+  # `resets(...[3h])` to `[6h]` counts the same resets and changes nothing; and
+  # its final uptimes (4500s, 3000s) sit below BOTH 10800 and 7200, so narrowing
+  # the grace changes nothing either. Both mutations survived it.
+  #
+  # This server restarted twice, but only ONE of those is inside the last three
+  # hours: an early restart at t=30m, then a long segment, then the current
+  # segment starting at t=3h30m. Evaluated at t=6h its uptime is 9060s -- inside
+  # the 10800 grace, outside a 7200 one -- and it has exactly one reset in [3h]
+  # but two in [6h]. So it is excused, and stays quiet, ONLY under the shipped
+  # constants.
+  #
+  # RED against `resets(...[6h])` (two resets, no longer excused, fires) and RED
+  # against a 7200 grace (uptime above it, no longer excused, fires).
+  - interval: 1m
+    name: retention not running - the resets range and the grace boundary are pinned
+    input_series:
+      # 30m, then 3h, then 2h31m: resets at t=30m and t=3h30m.
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
+        values: "60+60x29 60+60x179 60+60x150"
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "0x360"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing"}'
+        eval_time: 6h
+        exp_samples: []

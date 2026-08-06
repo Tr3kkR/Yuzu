@@ -161,8 +161,6 @@ server, check whether it is actually restarting:
 > fire. That is a scrape-configuration problem, not a rule problem: target a
 > stable identity. Confirm restarts directly with `journalctl --list-boots`, or
 > the orchestrator's restart count, rather than trusting `resets()` alone.
-> Related: `on(instance)` ignores `job`, so a second series sharing an `instance`
-> value can suppress this rule for a genuinely broken server.
 
 > There is deliberately NO metric for a missing retention index. The index is
 > built best-effort outside the migration runner and its absence degrades
