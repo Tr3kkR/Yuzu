@@ -91,11 +91,11 @@ struct SparkEngineStats {
     std::uint64_t watcher_units{0};
     std::uint64_t watch_faults_total{0}; ///< mechanism fault reports (post-arm deaf edges), monotonic
     /// Mechanism unwatch() calls that THREW during the ARM-RACE teardown (#2270).
-    /// SCOPE IS IN THE NAME ON PURPOSE: this covers teardown_arm_race ONLY. The two
-    /// sibling unwatch call sites — disarm() and unregister_consumer() — propagate
-    /// instead and are NOT counted here, so a zero does NOT mean "no orphaned
-    /// watches fleet-wide". Every other counter in this struct is scope-complete;
-    /// this one is not, and an alert built on it must say so.
+    /// SCOPE IS IN THE NAME ON PURPOSE: this covers teardown_arm_race ONLY. disarm()
+    /// has its own counter below; unregister_consumer() still PROPAGATES and is counted
+    /// by NEITHER, so a zero across both does NOT mean "no orphaned watches
+    /// fleet-wide". Every other counter in this struct is scope-complete; these two are
+    /// not, and an alert built on either must say so.
     /// Non-zero means an OS watch outlived its armed_ entry: on Linux it is reclaimed
     /// by stop(), on Windows it can persist for the life of the process (see
     /// teardown_arm_race for why the bound differs per platform).
@@ -103,6 +103,12 @@ struct SparkEngineStats {
     /// the fleet rollup, metrics.md row and alert rule are deferred to the
     /// prefer_spark flip alongside `retiring`/`retiring_cap` (spark_fleet_tags.hpp).
     std::uint64_t arm_race_unwatch_failures_total{0};
+    /// Mechanism unwatch() calls that THREW during an ordinary disarm() teardown (#2270).
+    /// The sibling of the counter above, and scoped the same way on purpose: that one
+    /// covers teardown_arm_race, this one covers disarm(). Neither covers
+    /// unregister_consumer(), which still propagates, so a zero across BOTH is still not
+    /// "no orphaned watches fleet-wide". Same platform bound as its sibling.
+    std::uint64_t disarm_unwatch_failures_total{0};
     std::uint64_t consumer_threads_detached{0}; ///< handlers that blocked past the shutdown budget
     std::uint64_t events_total{0};       ///< spark fires (post-dedup, pre-fan-out)
     std::uint64_t queued_delivered_total{0};
@@ -410,10 +416,11 @@ private:
     void drop_key_locked(const std::string& key);
     /// Undo ONE subscription after arm_impl loses the M1 consumer race, allocating
     /// nothing (the caller owns `key` and `type`, so nothing has to be copied). A
-    /// specialization of disarm(), which cannot be used here: it copies the key,
-    /// formats a log line and copies the key again (disarm(), three sites) — under
-    /// the memory pressure #2270 is about, any of those can throw and strand the
-    /// subscription this call exists to remove. Keep the two in lockstep.
+    /// specialization of disarm(). SINCE disarm() WAS ALSO HARDENED the two now differ
+    /// only in that this one takes `key`/`type` from the caller and so needs no lookup
+    /// at all — but it is NOT redundant: routing arm_impl's M1 teardown through disarm()
+    /// would remove ONE subscription via a whole-key-capable path and reintroduce a
+    /// lookup on a key the caller already holds. Keep the two in lockstep.
     /// NOT noexcept: mutex acquisition can raise std::system_error (the residual
     /// stated in arm_impl); turning that into std::terminate would be worse.
     void teardown_arm_race(SubscriptionId id, const std::string& key, SparkType type,
@@ -576,6 +583,7 @@ private:
     std::atomic<std::uint64_t> consumer_threads_detached_{0};
     std::atomic<std::uint64_t> watch_faults_{0}; ///< monotonic mechanism fault-report count
     std::atomic<std::uint64_t> arm_race_unwatch_failures_{0}; ///< monotonic; teardown_arm_race ONLY (#2270)
+    std::atomic<std::uint64_t> disarm_unwatch_failures_{0};   ///< monotonic; disarm() ONLY (#2270)
 
     // Counters updated outside mu_ (delivery paths) — atomics.
     std::atomic<std::uint64_t> events_total_{0};

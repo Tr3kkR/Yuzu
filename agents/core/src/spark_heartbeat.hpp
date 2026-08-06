@@ -127,6 +127,12 @@ void emit_spark_heartbeat_tags(TagMap& tags, bool running, const SparkEngineStat
     if (ss.arm_race_unwatch_failures_total > 0)
         tags["yuzu.spark_arm_race_unwatch_failures"] =
             std::to_string(ss.arm_race_unwatch_failures_total);
+    // The same residual on the ordinary disarm() teardown, counted separately because the
+    // scope is in each name on purpose. Neither covers unregister_consumer(), which still
+    // propagates — so a zero across both is not a fleet-wide all-clear.
+    if (ss.disarm_unwatch_failures_total > 0)
+        tags["yuzu.spark_disarm_unwatch_failures"] =
+            std::to_string(ss.disarm_unwatch_failures_total);
     if (ss.queued_dropped_total > 0)
         tags["yuzu.spark_queued_dropped"] = std::to_string(ss.queued_dropped_total);
     if (ss.consumer_errors_total > 0)

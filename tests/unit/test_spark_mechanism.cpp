@@ -1164,6 +1164,44 @@ TEST_CASE("arm_impl: a THROWING unwatch during the consumer-race teardown is con
     engine.stop();
 }
 
+TEST_CASE("disarm: a THROWING unwatch is contained and counted, like its twin (#2270)",
+          "[spark][mechanism]") {
+    // THE SIBLING CASE. The one above pinned teardown_arm_race; disarm() — the path
+    // Guardian's ordinary withdraw takes — was left propagating, which is the fourth
+    // and last lockstep difference between the two.
+    //
+    // Why propagating there was worse than untidy: disarm() is void, and the throw
+    // escapes into GuardianSparkRuntime::detach_rule_locked AFTER index_->remove_rule
+    // and rules_.erase but BEFORE keys_.erase and the "disarmed" lifecycle entry. That
+    // strands a keys_ row, so a later same-key attach's keys_.emplace silently no-ops
+    // and reports success while its fresh subscription is orphaned — and the audit
+    // entry is lost with it.
+    //
+    // This case lives here rather than in the alloc-budget binary deliberately: that
+    // one is Linux-and-no-sanitizer only by construction, so it cannot pin an OUTCOME
+    // on Windows or macOS, and containment is exactly an outcome.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+
+    auto sub = engine.arm(*c, file_spec("/etc/hosts"));
+    REQUIRE(sub.has_value());
+    REQUIRE(engine.stats().armed_sparks == 1);
+
+    fake->set_throw_unwatch(true);
+    REQUIRE_NOTHROW(engine.disarm(*sub)); // last subscriber -> whole-key teardown + unwatch
+    fake->set_throw_unwatch(false);
+
+    // Bookkeeping completes despite the throw — that is the property.
+    CHECK(engine.stats().armed_sparks == 0);
+    CHECK(engine.stats().subscriptions == 0);
+    CHECK(engine.stats().disarm_unwatch_failures_total == 1); // residual observable
+    CHECK(engine.stats().arm_race_unwatch_failures_total == 0); // and scoped to its own path
+    engine.stop();
+}
+
 TEST_CASE("File spark: a mechanism that throws a NON-std exception from watch() is still contained "
           "(watch_guarded catch(...))",
           "[spark][mechanism]") {

@@ -80,10 +80,18 @@ inline constexpr const char* kSparkTagConsumerErrors = "yuzu.spark_consumer_erro
 /// the writer-reader guard case in test_spark_fleet_tags.cpp pass green against a key
 /// it could not see (governance round 4 Gate 8 — sec8-1, doc8-3, SRE8-1). The {os}
 /// rollup, the metrics.md row and an alert rule are deferred to the prefer_spark flip.
-/// SCOPE: teardown_arm_race ONLY — disarm() and unregister_consumer() propagate
-/// instead and are not counted, so a zero here is not a fleet-wide all-clear.
+/// SCOPE: teardown_arm_race ONLY — see the sibling below for disarm(). Note
+/// unregister_consumer() still propagates and is counted by NEITHER, so a zero across
+/// both is not a fleet-wide all-clear.
 inline constexpr const char* kSparkTagArmRaceUnwatchFailures =
     "yuzu.spark_arm_race_unwatch_failures";
+
+/// The same residual on the ordinary disarm() teardown (#2270). Registered here for the
+/// same reason as its sibling — key registration is what binds the agent writer to the
+/// server reader — and its {os} rollup, metrics.md row and alert rule are deferred to the
+/// prefer_spark flip in the same way. SCOPE: disarm() ONLY.
+inline constexpr const char* kSparkTagDisarmUnwatchFailures =
+    "yuzu.spark_disarm_unwatch_failures";
 
 // ── Per-mechanism-type key composition ────────────────────────────────────────
 // A per-type key is `kSparkTagPrefix + <mechanism-token> + "_" + <metric-suffix>`,

@@ -801,9 +801,11 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
     // watch, if any) and undo our subscription on a lost race — see
     // unregister_consumer()'s erase-before-scan ordering for why this
     // re-check is airtight. Inline subs have no registered consumer to check.
-    // The teardown is teardown_arm_race(), NOT disarm(): disarm copies the key,
-    // formats a log line and copies the key again, and any of those allocations
-    // throwing here would strand the very subscription it was called to remove.
+    // The teardown is teardown_arm_race(), NOT disarm(). Both are allocation-free in
+    // their locked section now, so the reason is no longer allocation: disarm() must
+    // LOOK UP a key this caller already holds, and its last-subscriber branch is
+    // whole-key-capable, while what a lost M1 race owes is the removal of exactly ONE
+    // subscription — a sibling that deduped onto this key keeps its own.
     if (tier == SparkTier::Queued) {
         bool consumer_alive = false;
         {
@@ -839,10 +841,12 @@ void SparkEngine::teardown_arm_race(SubscriptionId id, const std::string& key, S
                                     bool event_driven) {
     // disarm()'s body, specialized so no allocation failure can escape it (#2270
     // layer 2). Every difference from disarm() is deliberate; keep the two in lockstep:
-    //   * `key`/`type` come from the caller, so no copy is made (disarm copies twice).
-    //   * the log line still allocates, but is contained (disarm's is not —
-    //     pre-existing, and out of scope for this change).
-    //   * a throwing unwatch() is contained and counted rather than propagated.
+    //   * `key`/`type` come from the caller, so no lookup and no copy is needed.
+    //   * the log line is contained — as disarm()'s now is too.
+    //   * a throwing unwatch() is contained and counted — as disarm()'s now is too,
+    //     into its own separately-scoped counter.
+    // The last two were differences until disarm() was hardened; they are recorded as
+    // parity rather than deleted, so a reader diffing the pair sees why each is there.
     // Everything else is disarm() verbatim, and must stay that way: ONE subscription
     // is removed, never the key, because losing the M1 race invalidates OUR arm and
     // nobody else's. A sibling that deduped onto this key keeps its subscription AND
@@ -858,8 +862,8 @@ void SparkEngine::teardown_arm_race(SubscriptionId id, const std::string& key, S
         // monotonic and never reused — but if they ever diverged, keying off the caller
         // would make erase_if match nothing while sub_keys_.erase(ki) below still ran,
         // leaving a live subscription that keeps receiving events and can never be
-        // disarmed. Reading ki->second costs nothing (the no-copy argument for taking
-        // `key` from the caller is about disarm()'s std::string COPY, which this is not).
+        // disarmed. Reading ki->second costs nothing (the no-lookup argument for taking
+        // `key` from the caller is about disarm() having to FIND it, which this is not).
         //
         // SCOPE OF THIS HARDENING, stated exactly because an earlier revision overclaimed
         // it (Gate 8 — sec8-3, CA8-2): `located` covers the find and the erase_if it
@@ -964,9 +968,10 @@ void SparkEngine::disarm(SubscriptionId id) {
         if (ki == sub_keys_.end())
             return;
         // Key off the LOCATED entry BY REFERENCE (#2270). The copy this replaced
-        // allocated, and an allocation throwing here escapes a void function with
-        // armed_/sub_keys_ half torn down and no watcher reclaimed — the residue
-        // teardown_arm_race was written to avoid, in the sibling that propagates.
+        // allocated in a function that must not throw once erase_if below has run.
+        // PRECISELY: a throw AT THIS SITE was harmless — nothing is mutated yet and the
+        // disarm is cleanly retryable. The residue this hardening is about belongs to the
+        // two allocations BELOW erase_if; they are commented where they are, not here.
         // SCOPE, stated exactly because the same wording had to be corrected once
         // in teardown_arm_race: `key` is a reference INTO sub_keys_. It is read
         // only ABOVE the move below; past that point it names a moved-from string
@@ -991,9 +996,10 @@ void SparkEngine::disarm(SubscriptionId id) {
                     auto mit = mechanisms_.find(ai->second.spec.type);
                     if (mit != mechanisms_.end()) {
                         mech = mit->second.get();
-                        // MOVE, not copy: sub_keys_.erase(ki) below destroys this
-                        // entry anyway, so its buffer is ours to take and the
-                        // transfer allocates nothing. Leaves `key` moved-from —
+                        // MOVE, not copy. It allocates nothing on ANY implementation:
+                        // basic_string's move-assign is noexcept for std::allocator, so it
+                        // cannot allocate whatever the SSO threshold — the buffer steal is
+                        // only the over-SSO mechanism, not the reason. Leaves `key` moved-from —
                         // see the scope note above. armed_ holds its own key
                         // string, so `ai` and the erase below are unaffected.
                         unwatch_key = std::move(ki->second);
@@ -1025,7 +1031,34 @@ void SparkEngine::disarm(SubscriptionId id) {
             if (armed_.contains(unwatch_key))
                 return; // a concurrent re-arm already renewed this key
         }
-        mech->unwatch(unwatch_key);
+        // CONTAINED AND COUNTED, matching teardown_arm_race (:942-953) — the fourth and
+        // last lockstep difference between the two. unwatch() is not noexcept and the real
+        // mechanisms allocate inside it (spark_service queues a Cmd holding a key copy;
+        // spark_file grows retiring_), so under the memory pressure this layer is about it
+        // can throw.
+        //
+        // WHY CONTAIN, and it is not merely symmetry. This is a void function whose caller
+        // is Guardian's ordinary withdraw path: a throw escapes GuardianSparkBackend::disarm
+        // into GuardianSparkRuntime::detach_rule_locked AFTER index_->remove_rule and
+        // rules_.erase have run but BEFORE keys_.erase and the "disarmed" lifecycle entry.
+        // That strands a keys_ row which makes a later same-key attach's keys_.emplace
+        // silently no-op, and loses the audit entry too. The engine's own bookkeeping is
+        // complete by this point, so propagating repairs nothing and costs both.
+        //
+        // The OS watch is still NOT reclaimed. That residual is unchanged, which is why
+        // this is counted rather than swallowed silently.
+        try {
+            mech->unwatch(unwatch_key);
+        } catch (...) {
+            disarm_unwatch_failures_.fetch_add(1, std::memory_order_relaxed);
+            try {
+                spdlog::error("SparkEngine: unwatch('{}') threw during disarm - the OS watch "
+                              "is NOT reclaimed; on Windows it persists for the life of this "
+                              "process",
+                              unwatch_key);
+            } catch (...) {
+            }
+        }
     }
 }
 
@@ -1501,6 +1534,7 @@ SparkEngineStats SparkEngine::stats() const {
     s.watch_faults_total = watch_faults_.load(std::memory_order_relaxed);
     s.arm_race_unwatch_failures_total =
         arm_race_unwatch_failures_.load(std::memory_order_relaxed);
+    s.disarm_unwatch_failures_total = disarm_unwatch_failures_.load(std::memory_order_relaxed);
     s.consumer_threads_detached = consumer_threads_detached_.load(std::memory_order_relaxed);
     s.events_total = events_total_.load(std::memory_order_relaxed);
     s.queued_delivered_total = delivery_->delivered.load(std::memory_order_relaxed);
