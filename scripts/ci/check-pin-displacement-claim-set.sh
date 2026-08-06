@@ -80,7 +80,9 @@ RUNBOOK="docs/ops-runbooks/mcp-stream-pin-displacement.md"
 MCP_SERVER_DOC="docs/mcp-server.md"
 ADR_DOC="docs/adr-1005-execution-plan.md"
 
-# THE STATING SURFACES - ONE list, and every check derives from it.
+# THE STATING SURFACES - ONE list, and every check that iterates surfaces (checks b/c/d;
+# the alert-expr check (a) is alert-specific by construction and operates on $ALERTS
+# directly) derives from it.
 #
 # This is deliberately a single array because the two previous versions of this gate kept
 # two hand-maintained lists, and BOTH holes found by review were a divergence between them:
