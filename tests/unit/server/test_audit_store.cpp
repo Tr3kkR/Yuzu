@@ -900,7 +900,7 @@ TEST_CASE("AuditStore: a legacy meta KEY with an embedded NUL is refused, "
         REQUIRE(sqlite3_prepare_v2(sdb.get(),
                                    "INSERT INTO audit_retention_meta (key, value) VALUES (?, 1234)",
                                    -1, stmt.addr(), nullptr) == SQLITE_OK);
-        // 22 bytes; if libpq's NUL-truncation were the only thing standing
+        // 24 bytes; if libpq's NUL-truncation were the only thing standing
         // between this row and Postgres, it would truncate to "last_pass_now"
         // — a real, load-bearing key this same row-copy step also writes
         // (build_legacy_audit_db normally seeds it) — landing THIS row's
