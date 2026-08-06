@@ -12,6 +12,7 @@
 #include <shared_mutex>
 #include <string_view>
 
+#include "authz_topology_floor.hpp"
 #include "engine_principal_store.hpp"
 #include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
@@ -712,10 +713,31 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     // Legacy fallback: write/delete/execute/approve require admin (effective_role
     // so an elevation still satisfies it as defense-in-depth, though the
     // is_elevated short-circuit above already returned for elevated sessions).
-    if (operation != "Read" && auth::effective_role(*session) != auth::Role::admin) {
-        audit_log(req, "auth.permission_required", "denied", "", "",
-                  "non-admin role denied " + securable_type + ":" + operation +
-                      (session->mcp_tier.empty() ? "" : " (mcp_tier=" + session->mcp_tier + ")"));
+    // #2376 topology floor: a handful of Reads are authorization TOPOLOGY
+    // itself (access-review export, RBAC role graph, engine-principal grant
+    // graph) and must not fall through the generic "Read is always allowed"
+    // legacy rule below — see authz_topology_floor.hpp for the rationale and
+    // why the set is fixed, not configurable.
+    //
+    // NOTE: an MCP-tier token that reaches this point carries its CREATOR's
+    // real legacy role (see the mcp_tier branch above / require_auth) —
+    // so an admin's MCP token passes the floor here and a non-admin's does
+    // not. That is intended, not a gap to "fix".
+    const bool floored = topology_floor_applies(securable_type, operation);
+    if ((operation != "Read" || floored) && auth::effective_role(*session) != auth::Role::admin) {
+        const std::string reason =
+            (floored ? std::string("topology floor: non-admin role denied ")
+                     : std::string("non-admin role denied ")) +
+            securable_type + ":" + operation +
+            (session->mcp_tier.empty() ? "" : " (mcp_tier=" + session->mcp_tier + ")");
+        audit_log(req, "auth.permission_required", "denied", "", "", reason);
+        if (floored) {
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_topology_floor_denied_total",
+                           {{"permission", securable_type + ":" + operation}})
+                    .increment();
+            }
+        }
         res.status = 403;
         res.set_content(detail::a4_denial(res, 403, "admin role required",
                                           detail::A4ErrorOpts{.permission = securable_type + ":" +
@@ -897,10 +919,27 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // Legacy fallback: write/delete/execute/approve require admin (effective_role
     // — defense-in-depth; the is_elevated short-circuit above already returned for
     // elevated sessions).
-    if (operation != "Read" && auth::effective_role(*session) != auth::Role::admin) {
-        audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
-                  "non-admin role denied " + securable_type + ":" + operation +
-                      (session->mcp_tier.empty() ? "" : " (mcp_tier=" + session->mcp_tier + ")"));
+    // #2376 topology floor: mirrors require_permission's floor above. No
+    // floored (securable, operation) pair reaches this scoped variant today,
+    // but it is floored anyway so a FUTURE scoped topology read cannot
+    // silently bypass the floor — flooring only one of the two structurally
+    // identical legacy branches is the "second copy" defect this repo keeps
+    // re-learning. See authz_topology_floor.hpp for the rationale.
+    const bool floored = topology_floor_applies(securable_type, operation);
+    if ((operation != "Read" || floored) && auth::effective_role(*session) != auth::Role::admin) {
+        const std::string reason =
+            (floored ? std::string("topology floor: non-admin role denied ")
+                     : std::string("non-admin role denied ")) +
+            securable_type + ":" + operation +
+            (session->mcp_tier.empty() ? "" : " (mcp_tier=" + session->mcp_tier + ")");
+        audit_log(req, "auth.scoped_permission_required", "denied", agent_id, reason);
+        if (floored) {
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_topology_floor_denied_total",
+                           {{"permission", securable_type + ":" + operation}})
+                    .increment();
+            }
+        }
         res.status = 403;
         res.set_content(detail::a4_denial(res, 403, "admin role required",
                                           detail::A4ErrorOpts{.permission = securable_type + ":" +
