@@ -156,10 +156,10 @@ three drifts it catches and the ratchet-baseline mechanics.
 
 ### Pin-displacement claim gate (`pin-displacement-claim-gate.yml`, #2740)
 
-A per-PR grep asserting that every surface stating what CAUSES an MCP replay-ring pin
+A per-PR check asserting that every surface stating what CAUSES an MCP replay-ring pin
 displacement agrees on the cause set. `scripts/ci/check-pin-displacement-claim-set.sh`
 carries the invariant and its derivation pointer; the surfaces are one array in that
-script, and both of its checks derive from it.
+script, and every one of its checks derives from it.
 
 It exists because that claim lives as an independent paraphrase in seven files, #2740
 falsified it, and successive review passes each fixed a different subset — a convention
@@ -167,15 +167,25 @@ did not hold. It checks the machine-comparable part (which counters each surface
 a cause) and deliberately NOT the derivation prose, which is where the parked lexical-gate
 approach walls.
 
-Two properties worth knowing before editing it:
+Three properties worth knowing before editing it:
 
 - **It self-tests first.** The workflow runs `--selftest` (fixture cases proving each
   defect shape reddens) before the real check, on the `plugin-spawn-gate.yml` precedent —
-  a gate nobody has watched fail is an assertion, not a check. Three of those cases exist
+  a gate nobody has watched fail is an assertion, not a check. Several of those cases exist
   because a review proved the gate was false-green for surfaces its own header claimed to
-  protect; add a case whenever you add a surface.
+  protect, or false-green on a stale claim masked by a sibling occurrence; add a case
+  whenever you add a surface. Its case count is not restated here - run it.
 - **Add surfaces to `STATING_SURFACES`, not to a loop.** The two holes review found were
   both a divergence between two hand-maintained lists. There is now one.
+- **The cause-set check is region-scoped, not whole-file (#2827).** On four surfaces a
+  counter identifier legitimately occurs more than once (a metrics registration, a
+  pre-seed, a sibling alert rule, a sibling table row), so a whole-file presence grep let a
+  stale claim hide behind an unrelated sibling occurrence and stayed green on exactly the
+  drift the gate exists to catch. `claim_region()` in the script extracts each surface's
+  own bounded claim text - anchor to terminator - and tests membership only there; a
+  surface with no `claim_region()` arm, or whose anchor is missing/ambiguous/has lost its
+  terminator, is reported as DRIFT rather than silently skipped. A narrower, best-effort
+  fourth check catches a claim restated on an unregistered line elsewhere in a surface.
 
 A failing check is **merge-blocking** — the job exits non-zero and the workflow has no
 `continue-on-error`. No build, no `paths:` filter (nothing expensive to skip, and no filter
