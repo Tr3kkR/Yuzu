@@ -219,6 +219,17 @@ ongoing retention verdict is not — `ResultSetStore::gc_sweep` (the same `#2360
 was copied from) still compares against its own process clock via `now_epoch()` and carries this
 identical divergence. Deferred, ladder-wide follow-up; not fixed by this PR.
 
+**Residual risk this closes divergence but not drift (Gate 6 sre, round 3).** PG-clock-authority
+removes disagreement BETWEEN replicas' decisions, but nothing here alerts if PostgreSQL's own
+clock is itself wrong (unsynced NTP, a misconfigured container clock) in absolute terms — every
+replica would then agree, correctly by this guard's own logic, on a jointly-wrong retention
+decision. The two detectors this guard has (`clock_anomaly_skips_total` for an implausible
+jump, `retention_bootstrap_declines_total` for a missing/unusable anchor on first run) both
+require the reading to look internally inconsistent to fire; a clock that is merely offset by a
+fixed amount and otherwise monotonic satisfies neither. No alert exists for this today; it is
+not new to this migration (the SQLite predecessor had the identical exposure against each
+replica's own OS clock) and is not being fixed here.
+
 **Deliberate dedup-semantics change (multi-process correctness).** The SQLite guard had an
 `is_event` exemption: a clock *movement* (a `Step`, or a `BadState` accompanied by a clock event)
 re-reported **every** pass even against an identical prior report, because in a single process a
