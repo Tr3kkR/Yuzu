@@ -1,10 +1,31 @@
-# Unit tests for docs/prometheus/yuzu-alerts.yml, run with promtool:
+# Unit tests for docs/prometheus/yuzu-alerts.yml, run with promtool.
 #
-#   docker run --rm -v "$PWD":/w:ro --entrypoint /bin/promtool prom/prometheus:latest \
-#     test rules /w/yuzu-alerts.test.yml
+# WHERE THESE RUN. CI runs them in the `docs-lint` workflow's own
+# `prometheus-rules` job (its own job deliberately -- it is the only Docker Hub
+# dependency in that workflow, and a registry outage must report under a
+# name that says so). `meson test --suite docs` runs them too, via
+# `tests/prometheus/run_promtool_tests.py`, but ONLY where a promtool is
+# actually available: that harness needs a native promtool of the pinned major,
+# or an explicit `YUZU_TEST_ENABLE_PROMTOOL_DOCKER=1` opt-in, and skips
+# otherwise. It skips rather than pulls because `scripts/ci/flake-retry.py` runs
+# `meson test` unfiltered on three REQUIRED build legs, and an earlier version of
+# this wiring put a Docker Hub dependency on all three (#2553).
 #
-# (from docs/prometheus/. Any promtool >= 2.x works; the container is only a way
-# to get one.)
+# To run them yourself from the repo root with no promtool installed:
+#
+#   docker run --rm -v "$PWD":/w:ro \
+#     --entrypoint /bin/promtool \
+#     prom/prometheus@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893 \
+#     test rules /w/tests/prometheus/yuzu-alerts.test.yml
+#
+# That digest IS promtool 3.13.1, and it is pinned by digest rather than tag on
+# purpose: a tag is mutable, and `prom/prometheus:3.13.1` is not even a tag Docker
+# Hub publishes (the registry uses a `v` prefix). The harness asserts this digest
+# matches the workflow's, so the two cannot drift.
+#
+# Do NOT assume 2.x agrees: Prometheus 3.0 made range selectors left-open, which
+# shifts increase()/resets() by a sample at window edges -- exactly what these
+# cases measure. Run them under the pinned major, not whatever is on PATH.
 #
 # WHY THIS FILE EXISTS. An alert rule is code that runs in production and never
 # compiles. `promtool check rules` proves only that the PromQL parses -- a rule
@@ -18,7 +39,7 @@
 # form. Before trusting a change here, mutate the rule and watch the relevant
 # case go red -- a green run on an untested rule proves nothing.
 rule_files:
-  - yuzu-alerts.yml
+  - ../../docs/prometheus/yuzu-alerts.yml
 
 evaluation_interval: 1m
 
@@ -64,6 +85,27 @@ tests:
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning"}'
         eval_time: 55m
+        exp_samples: []
+
+  # CASE 2b -- the fix for case 1 must not create its own false positive. A
+  # young server that restarts ONCE (install, then a config fix) is healthy and
+  # has no pass yet, but it DOES have an uptime reset. A `resets == 0` grace
+  # would page it; `resets <= 1` excuses it. This case is red against `== 0`.
+  #
+  # Excusing one reset costs no coverage: to complete zero passes at the
+  # 60-minute default a process must restart more often than hourly, which is
+  # three-plus resets in this window -- case 1 still fires.
+  - interval: 1m
+    name: retention not running - one restart on a young server is still excused
+    input_series:
+      # Up 45m, restart, up 45m more. Two segments, one reset, 90m total.
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
+        values: "60+60x44 60+60x44"
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "0x89"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning"}'
+        eval_time: 85m
         exp_samples: []
 
   # CASE 3 -- the rule's original purpose, pinned so the case-1 fix cannot

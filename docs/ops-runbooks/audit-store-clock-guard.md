@@ -145,12 +145,24 @@ Check that the store opened at boot (a failed migration closes it, and
 `start_cleanup()` then early-returns), and look for `AuditStore: retention pass
 threw` in the log. The rule carries an uptime guard because the cleanup thread
 sleeps a full interval before its first pass, so a freshly started server
-legitimately has no pass yet. That grace excuses only a server whose uptime has
-ONE segment across the alert window - a process restarting more often than the
-window never accumulates uptime past the grace, and a crash loop is a leading
-cause of zero completed passes, so it must not be excused. If the alert is firing
-on a young server, check whether it is actually restarting: `resets(
-yuzu_server_uptime_seconds[3h])`.
+legitimately has no pass yet. That grace excuses a server only while its uptime
+has at most ONE reset across the alert window - one restart is an ordinary
+install-then-config-fix, while a process restarting more often than hourly never
+accumulates uptime past the grace, and a crash loop is a leading cause of zero
+completed passes, so it must not be excused. If the alert is firing on a young
+server, check whether it is actually restarting:
+`resets(yuzu_server_uptime_seconds[3h])`.
+
+> **If you suspect a crash loop but this alert is SILENT, check the target
+> identity first.** `resets()` needs one continuous series per server. When a
+> restart changes the `instance` label - dynamic-port or IP-based service
+> discovery, a rescheduled pod - every restart starts a fresh series with no
+> resets and a young uptime, so the grace applies forever and this rule cannot
+> fire. That is a scrape-configuration problem, not a rule problem: target a
+> stable identity. Confirm restarts directly with `journalctl --list-boots`, or
+> the orchestrator's restart count, rather than trusting `resets()` alone.
+> Related: `on(instance)` ignores `job`, so a second series sharing an `instance`
+> value can suppress this rule for a genuinely broken server.
 
 > There is deliberately NO metric for a missing retention index. The index is
 > built best-effort outside the migration runner and its absence degrades

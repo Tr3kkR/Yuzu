@@ -1042,6 +1042,19 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
 - **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
   table holding the durable clock reading - one row, instant) plus the
   best-effort index build described under Schema Migrations above.
+- **`YuzuAuditRetentionNotRunning` now fires for a crash-looping server (#2553).**
+  Its young-server grace previously keyed on uptime alone, so a process restarting
+  more often than the 3-hour alert window never accumulated enough uptime to leave
+  the grace and was excused on every evaluation - silently, and for one of the
+  leading causes of the exact condition the rule detects. The grace now also
+  requires the uptime series to have at most one reset across the window. **If you
+  deployed this rule and have a crash-looping server, expect a new-to-you firing**
+  that reflects a pre-existing condition rather than a new fault. The rules file is
+  a copy you apply yourself; the server does not upgrade it for you. One limit is
+  worth knowing before you rely on the fix: `resets()` needs a continuous series per
+  server, so if a restart changes the `instance` label (dynamic-port or IP-based
+  service discovery, a rescheduled pod) the grace still applies forever and the rule
+  stays silent - target a stable identity in scrape config.
 - **The first guarded pass now declines when it has no stored reading and rows
   are already expired (#2579).** The stored clock reading (the anchor) is new in
   schema v3, so every database starts its first guarded pass without one. An

@@ -950,9 +950,13 @@ groups:
       # grows without bound and rows are retained past the stated window. This
       # is the only rule that catches it.
       #
-      # Threshold assumes the default 60-minute cleanup interval: no pass in 3h
-      # is unambiguously broken. A deployment that lengthens cleanup_interval_min
-      # must widen this window; PromQL cannot read the server's own interval.
+      # Threshold is tied to the 60-minute cleanup interval: no pass in 3h is
+      # unambiguously broken. That interval is NOT operator-configurable today --
+      # `server.cpp` constructs `AuditStore` with only `audit_retention_days`, so
+      # the `cleanup_interval_min` ctor parameter declared in `audit_store.hpp`
+      # keeps its 60-minute default. If it is ever exposed, this window and the
+      # `resets` bound below must both be revisited; PromQL cannot read the
+      # server's own interval.
       #
       # THE YOUNG-SERVER GRACE MUST NOT EXCLUDE A CRASH LOOP. run_cleanup sleeps
       # a full interval BEFORE its first pass, so a server that has genuinely
@@ -961,15 +965,34 @@ groups:
       # bare `uptime > 10800` (equivalently `unless uptime < 10800`) excluded the
       # rule's own motivating case on every evaluation: a reaper that completes
       # zero passes because the process keeps dying. `resets()` separates the
-      # two -- a genuinely young server has ONE uptime segment in the window, a
-      # crash-looper has several, and only the first is excused. `unless` rather
-      # than `and` so a missing uptime series cannot silence the rule either.
+      # two, and `unless` rather than `and` so a missing uptime series cannot
+      # silence the rule either.
+      #
+      # WHY `<= 1` AND NOT `== 0`. A young server that restarts ONCE in the
+      # window -- install, then a config fix -- is healthy and must not page, but
+      # it has a reset. Excusing one costs nothing: to complete ZERO passes at the
+      # 60-minute default a process must restart more often than hourly, which is
+      # at least three resets across 3h. Any cadence slow enough to leave only one
+      # reset also leaves a segment long enough for a pass to complete, which
+      # fails `increase(...) == 0` on its own. Both halves are pinned in the test
+      # file -- the single-restart case must stay quiet, the 30-minute crash loop
+      # must still fire.
+      #
+      # KNOWN LIMIT, and it bites hardest where crash loops live. `resets()` needs
+      # ONE CONTINUOUS SERIES per server. If a restart changes the `instance`
+      # label -- dynamic-port or IP-based service discovery, a rescheduled pod --
+      # each restart starts a FRESH series with `resets == 0` and uptime under the
+      # grace, so the grace applies forever and this rule is silent again. Nothing
+      # in PromQL can recover from that; the fix is scrape config, not this rule
+      # (target a stable identity). `on(instance)` also ignores `job`, so a second
+      # series that happens to share an `instance` value and is young can suppress
+      # a genuinely broken server. Both are called out in the runbook.
       - alert: YuzuAuditRetentionNotRunning
         expr: |
           increase(yuzu_server_audit_retention_passes_total[3h]) == 0
           unless on(instance) (
             yuzu_server_uptime_seconds < 10800
-            and resets(yuzu_server_uptime_seconds[3h]) == 0
+            and resets(yuzu_server_uptime_seconds[3h]) <= 1
           )
         for: 15m
         labels:

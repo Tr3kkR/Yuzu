@@ -808,6 +808,25 @@ test('changelog order',
   timeout: 10,
 )
 
+# Prometheus alert-rule unit tests (#2553). Registered here as well as in the
+# docs-lint workflow so self-hosted legs and /test can exercise the same cases --
+# an alert rule never compiles, so these cases are what catch one that parses
+# perfectly and can still never fire for the case it was written for.
+#
+# DOES NOT PULL A CONTAINER unless you opt in. `scripts/ci/flake-retry.py` runs
+# `meson test` with NO --suite filter on three REQUIRED build legs, so a
+# docker-dependent test registered here puts Docker Hub on all three; an earlier
+# version of this wiring did exactly that and was reverted. The harness needs a
+# native promtool of the pinned major, or YUZU_TEST_ENABLE_PROMTOOL_DOCKER=1,
+# and skips (77) otherwise. It always asserts the pinned digest matches the
+# workflow's, which is a pure file read and runs even on legs that then skip.
+test('prometheus alert rules',
+  _python3_test,
+  args: [files('prometheus/run_promtool_tests.py')],
+  suite: 'docs',
+  timeout: 180,
+)
+
 # Tracker close-automation regression corpus (ADR-3001 A1 §11-§12): the frozen
 # parser fixtures (incl. PR #1711, the canonical negated close) + the decision
 # ladder's never-close/fail-closed/cap contracts. No network. scripts/ changes
