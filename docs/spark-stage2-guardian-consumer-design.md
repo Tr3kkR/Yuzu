@@ -1065,7 +1065,33 @@ Each rung is an independently-governed PR on `dev`, run through the full
        journal ALL land in PR-1b and **gate PR-2** — the `prefer_spark` flip must not
        ship while any is open. M1 in particular is a fleet ingest-DoS if the flip
        precedes it, so it is not enough that it is "in PR-1" — it is specifically in
-       PR-1b, after PR-1a.
+       PR-1b, after PR-1a. #2270 is the one exception to the "land in PR-1b" shape:
+       it ships as its own PR against `dev`, ahead of PR-1b.
+     - **#2797 gates PR-2 as well, and is the only gate listed here that is already
+       live pre-flip.** `apply_rules` discards `reconcile_rule_locked`'s bool
+       (`guardian_engine.cpp:634`; the surrounding catch counts a THROW only), so a
+       RETURNED arm failure leaves `reconcile_failures` at 0, the generation
+       advances, the server stops re-pushing, and the rule stays persisted-but-
+       unarmed. The flip raises the rate rather than creating the defect: a returned
+       failure is the ordinary spark-backend arm error, whereas a legacy guard arm
+       rarely throws (#2278). #2797 is the reconcile-side half split out of #2270 -
+       #2270 itself closes only the strong-guarantee half, so closing #2270 does not
+       discharge this gate.
+     - **#2818 gates PR-2 too.** The engine tears down a whole spark key
+       (`spark_engine.cpp:821-834`) while `GuardianSparkRuntime` arms one shared
+       subscription per key on the 0->1 edge (`guardian_spark_runtime.cpp:159-166`),
+       and nothing tells the consumer its subscription died: Guardian goes on
+       believing it holds a live subscription, `backend_->disarm(sub)` is a no-op,
+       and nothing is enforced for any rule on that key. It is an ENFORCEMENT gap,
+       not a false-assurance one - `GuardianEngine::get_status()` is fail-closed
+       (`guardian_engine.cpp:684-686`, every rule reported errored), so the
+       originating findings' "get_status reports N rules armed" premise is false at
+       this tip and is corrected in #2818. Dormant while `prefer_spark` is false
+       because legacy `IGuard` is the live detection path - the flip is what makes
+       it a live enforcement hole. #2797 removes the `apply_rules` self-heal that
+       otherwise bounds it, so the two gates compound and neither alone closes the
+       exposure. #2819 (blocking `unwatch()` under `GuardianEngine::mtx_`) is a
+       shutdown-availability defect from the same review; it does not gate the flip.
 
      - **PR-1 (inert hardening, `prefer_spark` stays false — zero change to
        detection/enforcement *placement*).** The shared drift-event builder;
