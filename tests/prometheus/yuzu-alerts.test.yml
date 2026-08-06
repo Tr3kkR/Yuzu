@@ -297,6 +297,14 @@ tests:
           - labels: 'ALERTS{alertname="YuzuAuditRetentionMetricMissing", alertstate="pending", severity="warning"}'
             value: 1
       - expr: 'ALERTS{alertname="YuzuAuditRetentionMetricMissing", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionMetricMissing", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionMetricMissing", alertstate="firing", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionMetricMissing", alertstate="firing"}'
         eval_time: 50m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuAuditRetentionMetricMissing", alertstate="firing", severity="warning"}'
@@ -353,3 +361,23 @@ tests:
       - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing"}'
         eval_time: 6h
         exp_samples: []
+
+  # CASE 12 -- the 10800s cutoff is EXCLUSIVE, and only a case at the crossing
+  # can see that. Uptime rises through 10800 at t=179m on a single segment with
+  # zero resets and a dead reaper. Under `< 10800` the grace lifts at the
+  # crossing and `for: 15m` then fires at 194m; under `<= 10800` the crossing
+  # sample is still excused, so firing slips to 195m. The assertion below is
+  # that one-minute window, which is the entire observable difference.
+  - interval: 1m
+    name: retention not running - the 10800s grace boundary is exclusive
+    input_series:
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
+        values: "60+60x239"
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "0x239"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing"}'
+        eval_time: 194m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1

@@ -193,8 +193,25 @@ def inspect_test_file() -> tuple[int | None, bool | None]:
     else notices the cases stopped covering the rules that were validated.
     """
     try:
-        import yaml  # noqa: PLC0415 - optional, see docstring
+        import yaml  # noqa: PLC0415 - see below
     except ImportError:
+        # FAIL CLOSED WHEN OPTED IN. Without PyYAML the case-count and
+        # rule_files-binding checks are skipped, and those are what stop a
+        # vacuous run reporting success - so degrading them silently is worst
+        # exactly where the gate is authoritative. The `docs-lint` job runs this
+        # script DIRECTLY, with no `meson setup`, so the repo's PyYAML build
+        # dependency does NOT vouch for that environment (external review,
+        # #2553: the reviewer who checked the runner image rejected the
+        # meson-implies-PyYAML argument, and was right).
+        #
+        # Unset opt-in = a developer running it by hand: skip, do not block.
+        if os.environ.get(DOCKER_OPT_IN):
+            sys.exit(
+                "FAIL: PyYAML is unavailable, so the case-count and rule_files "
+                "binding checks cannot run - and those are what stop a vacuous "
+                f"run passing. Refusing to report success from the {DOCKER_OPT_IN} "
+                "path on a weakened gate. Install PyYAML (`pip install pyyaml`)."
+            )
         print("note: PyYAML unavailable; skipping case-count and rule_files checks",
               flush=True)
         return None, None
