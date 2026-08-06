@@ -111,7 +111,10 @@ def run(argv: list[str]) -> tuple[int, str]:
     evidence on its own — see `check_gate_output`.
     """
     print("+ " + " ".join(argv), flush=True)
-    proc = subprocess.run(argv, cwd=REPO_ROOT, capture_output=True, text=True)
+    # errors="replace": a decode error in promtool's output must not become an
+    # uncaught traceback in place of a clean pass/fail.
+    proc = subprocess.run(argv, cwd=REPO_ROOT, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
     out = proc.stdout + proc.stderr
     if out:
         print(out, end="" if out.endswith("\n") else "\n", flush=True)
@@ -201,7 +204,8 @@ def native_promtool() -> tuple[str, int] | None:
         return None
     try:
         proc = subprocess.run(
-            [exe, "--version"], capture_output=True, text=True, timeout=30
+            [exe, "--version"], capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace",
         )
     except (OSError, subprocess.SubprocessError) as ex:
         print(f"note: `{exe} --version` could not be run ({ex})", flush=True)

@@ -1054,7 +1054,21 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
   worth knowing before you rely on the fix: `resets()` needs a continuous series per
   server, so if a restart changes the `instance` label (dynamic-port or IP-based
   service discovery, a rescheduled pod) the grace still applies forever and the rule
-  stays silent - target a stable identity in scrape config.
+  stays silent - target a stable identity in scrape config. The same re-apply also
+  removes an `on(instance)` join from that rule, so a server that was being
+  silenced by an unrelated young series sharing its `instance` value (a canary, an
+  HA pair, a federated series) can now correctly fire too - the same
+  new-to-you-firing shape as the crash-loop fix, for the same reason.
+- **You must ADD a new rule by hand: `YuzuAuditRetentionMetricMissing` (#2553).**
+  `YuzuAuditRetentionNotRunning` cannot detect its own input going missing -
+  `increase()` over a metric with no series is an empty vector, so the rule selects
+  nothing and never fires. A Prometheus holding these rules against a server that
+  does not export `yuzu_server_audit_retention_passes_total` therefore reports
+  healthy forever while the audit reaper is entirely unmonitored, which is exactly
+  the state you are in if you apply this rules file ahead of upgrading your
+  servers. The new rule keys on `absent(...)` and fires after 15m. It is
+  **fleet-wide by construction**: it cannot see one server among many going quiet -
+  use a `up`-based target-down alert for that.
 - **The first guarded pass now declines when it has no stored reading and rows
   are already expired (#2579).** The stored clock reading (the anchor) is new in
   schema v3, so every database starts its first guarded pass without one. An
@@ -1106,12 +1120,14 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
   but a large excess (after a long disable, or an upgrade backlog) drains over
   several 900 s rollup ticks rather than in one statement.
 
-Five new Prometheus alert rules ship in `docs/prometheus/yuzu-alerts.yml`. The
-declined-pass and failed-pass counters must be alerted on separately: both leave
-rows undeleted, so an audit table that never shrinks looks identical either way.
-One rule, `YuzuAuditRetentionNotRunning`, fires on the reaper NOT running - the
-state in which none of the other counter-driven rules can fire, because they all
-key on a counter rising.
+New Prometheus alert rules ship in `docs/prometheus/yuzu-alerts.yml` (that file is
+their one home - a count is deliberately not restated here, because the one that
+used to be was stale for three releases). The declined-pass and failed-pass
+counters must be alerted on separately: both leave rows undeleted, so an audit
+table that never shrinks looks identical either way. One rule,
+`YuzuAuditRetentionNotRunning`, fires on the reaper NOT running - the state in
+which none of the other counter-driven rules can fire, because they all key on a
+counter rising.
 
 ### SLE — the `SoftwareLicensing` securable auto-grants on upgrade (ADR-0024)
 

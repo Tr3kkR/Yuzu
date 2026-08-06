@@ -1064,8 +1064,8 @@ groups:
             rules file is a copy you apply yourself and the server never upgrades it); a
             scrape config that drops it; or no Yuzu server being scraped by this Prometheus
             at all. Confirm with `curl -s <server>/metrics | grep audit_retention_passes`,
-            then check metric_relabel_configs. Note this is fleet-wide by construction - it
-            cannot see one server among many going quiet.
+            then check metric_relabel_configs. Fleet-wide only - a single quiet server among
+            many is not detected this way.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # The durable clock reading is what makes anomaly detection survive a

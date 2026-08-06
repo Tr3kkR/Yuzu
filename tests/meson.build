@@ -809,8 +809,11 @@ test('changelog order',
 )
 
 # Prometheus alert-rule unit tests (#2553). The same script the docs-lint
-# workflow runs, so self-hosted legs and /test exercise exactly the CI code path.
-# Rationale for the tests themselves: tests/prometheus/run_promtool_tests.py.
+# workflow runs, so self-hosted legs and /test exercise the same code path CI
+# does -- WHEREVER A USABLE PROMTOOL IS PRESENT. No CI leg sets the opt-in below
+# and none is documented as carrying a 3.x promtool, so the realistic outcome on
+# all three is SKIP; the authoritative run is the workflow job. Rationale for the
+# tests themselves: tests/prometheus/run_promtool_tests.py.
 #
 # DOES NOT PULL A CONTAINER unless you opt in. `scripts/ci/flake-retry.py` runs
 # `meson test` with NO --suite filter on three REQUIRED build legs, so a

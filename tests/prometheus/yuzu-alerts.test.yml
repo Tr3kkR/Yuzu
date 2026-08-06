@@ -238,10 +238,14 @@ tests:
           - labels: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
 
-  # CASE 8 -- the 10800s grace boundary and the `<= 1` reset bound together. A
-  # server at ~2h30m uptime (9000s, inside the 10800 grace) with ONE reset is
-  # excused; the SAME server with TWO resets is not. Lowering 10800 to 7200
-  # reddens the first arm; loosening `<= 1` to `<= 2` reddens the second.
+  # CASE 8 -- the `<= 1` reset bound. Across ~2h30m of ELAPSED time (not uptime:
+  # both servers restart, so their uptime values are well below the grace and
+  # stay there), one server has ONE reset and is excused, the other has TWO and
+  # is not. Loosening `<= 1` to `<= 2` reddens it.
+  #
+  # This case does NOT pin the 10800s grace: both final uptimes (4500s, 3000s)
+  # sit below 7200 as well, so narrowing the grace changes nothing here. Case 9
+  # is what pins that boundary.
   - interval: 1m
     name: retention not running - the 10800s grace and the reset bound are pinned
     input_series:
@@ -280,6 +284,18 @@ tests:
       - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
         values: "20000+60x59"
     promql_expr_test:
+      # 10m: the condition holds from t=0 but `for: 15m` has not elapsed, so it
+      # is PENDING, not firing. RED if `for` is shortened. Case 10 and 11 both
+      # evaluated only at 50m before, which is past any plausible `for` -- so the
+      # new rule's own duration was unpinned while its siblings' were not.
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionMetricMissing", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionMetricMissing", alertstate="pending"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionMetricMissing", alertstate="pending", severity="warning"}'
+            value: 1
       - expr: 'ALERTS{alertname="YuzuAuditRetentionMetricMissing", alertstate="firing"}'
         eval_time: 50m
         exp_samples:

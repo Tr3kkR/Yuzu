@@ -140,10 +140,15 @@ documented in `docs/user-manual/audit-log.md`.
 | `yuzu_server_audit_retention_passes_total` | counter | Retention passes **attempted**, including declined and failed ones. Alert on this NOT increasing: the other six retention counters are silence-means-healthy, so a cleanup thread that never runs leaves them flat at 0 - identical to a quiet, healthy store, while `audit.db` grows without bound. |
 | `yuzu_server_audit_retention_last_pass_unixtime` | gauge | Wall-clock reading of the most recent pass; `0` if none has run in this process. Read WITH the counter above: stale here while that RISES means the reaper is alive but refusing an implausible clock -- a different fault from stopped. |
 
-**Alert on absence, not just on rising counters.** Four of the five retention alert
-rules fire on something going wrong; `..._retention_passes_total` is the only one that catches the reaper not running at
+**Alert on absence, not just on rising counters.** Most of the retention alert
+rules fire on something going wrong; `..._retention_passes_total` is what catches the reaper not running at
 all, which is the state in which none of the other *counter*-driven rules can fire. The `YuzuAuditRetentionNotRunning`
-rule covers it.
+rule covers it. **Its companion `YuzuAuditRetentionMetricMissing` covers the one case it structurally cannot:** if this
+series is absent entirely - a server predating the metric, or a scrape config dropping it - `increase()` returns an empty
+vector, so `YuzuAuditRetentionNotRunning` selects nothing and can never fire. That rule keys on `absent(...)` instead, and
+is fleet-wide by construction (it cannot see one server among many going quiet). A count of the rule family is
+deliberately not restated here - `docs/prometheus/yuzu-alerts.yml` is its one home, and the count in this sentence was
+stale for three releases.
 
 The skips and failed counters must be alerted on separately and never collapsed:
 both leave rows undeleted, so an audit table that never shrinks looks identical
