@@ -183,10 +183,20 @@ Three properties worth knowing before editing it:
   pre-seed, a sibling alert rule, a sibling table row), so a whole-file presence grep let a
   stale claim hide behind an unrelated sibling occurrence and stayed green on exactly the
   drift the gate exists to catch. `claim_region()` in the script extracts each surface's
-  own bounded claim text - anchor to terminator - and tests membership only there; a
-  surface with no `claim_region()` arm, or whose anchor is missing/ambiguous/has lost its
-  terminator, is reported as DRIFT rather than silently skipped. A narrower, best-effort
-  fourth check catches a claim restated on an unregistered line elsewhere in a surface.
+  own bounded claim text and tests membership only there; a surface with no
+  `claim_region()` arm, or whose anchor is missing or ambiguous, is reported as DRIFT
+  rather than silently skipped. A narrower, best-effort fourth check catches a claim
+  restated on an unregistered line elsewhere in a surface.
+- **Two region-boundary shapes, chosen per surface, not one.** ALERTS/HELP/RUNBOOK/HOME_HDR
+  scan multiple lines to a terminator anchored in syntax external to this gate (YAML
+  alerting-rule structure, a C++ string literal, a markdown table's leading `|`, a Doxygen
+  `///` prefix) — each fails DRIFT if the terminator is lost, or if the scan runs past
+  `MAX_REGION_LINES` without ever confirming one. MANUAL/MCP_SERVER_DOC/ADR_DOC are
+  single-line captures instead: their real claims have always been one physical line, and
+  two rounds of governance review proved that for free-form prose with no external syntax
+  forcing a predictable "next item" shape, broadening a multi-line stop pattern only shrinks
+  the exploit surface rather than closing it — there is always another plausible reformat
+  one step outside any finite pattern. Single-line capture sidesteps that guessing game.
 
 A failing check is **merge-blocking** — the job exits non-zero and the workflow has no
 `continue-on-error`. No build, no `paths:` filter (nothing expensive to skip, and no filter
