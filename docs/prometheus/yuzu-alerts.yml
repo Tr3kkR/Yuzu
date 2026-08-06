@@ -1067,10 +1067,13 @@ groups:
           description: >-
             No yuzu_server_audit_retention_passes_total series exists in this Prometheus, so
             YuzuAuditRetentionNotRunning cannot fire and the audit retention window is
-            unmonitored. CHECK `up` FOR THE YUZU TARGET FIRST - this rule cannot tell the two
-            cases apart. If `up` is 0 or absent the SERVER OR ITS SCRAPE IS DOWN, which is an
-            outage, not a monitoring gap, and on a single-server Prometheus this rule may be
-            the only one firing (nothing here alerts on `up` directly). If `up` is 1 the
+            unmonitored. CHECK `up` FOR THE YUZU TARGET FIRST - this rule cannot tell the
+            cases apart. If `up` is 0 the SERVER OR ITS SCRAPE IS DOWN, which is an outage,
+            not a monitoring gap, and on a single-server Prometheus this rule may be the only
+            one firing (nothing here alerts on `up` directly). If there is no Yuzu target at
+            all, this Prometheus is not configured to scrape one - check the targets page,
+            and note this is the expected, ignorable state before the first server is stood
+            up. If `up` is 1 the
             metric itself is missing: a server build predating it (the rules file is a copy
             you apply yourself and the server never upgrades it), or a scrape config dropping
             it - confirm with `curl -s <server>/metrics | grep audit_retention_passes`, then

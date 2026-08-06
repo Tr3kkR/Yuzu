@@ -162,10 +162,11 @@ def check_gate_output(check_out: str, test_out: str, declared_cases: int | None,
                 "stale, so zero rules were loaded and every case vacuously "
                 "passed. promtool exits 0 for this; the gate must not.")
     if rules_bound is False:
-        return (f"`test rules` did not load {RULES} - its `rule_files:` names some "
-                f"OTHER existing file, so the cases asserted nothing about the "
-                f"rules `check rules` just validated. promtool reports no warning "
-                f"for this, because from its side nothing is wrong.")
+        return (f"`test rules` did not load {RULES} - nothing in the test file's "
+                f"`rule_files:` resolves to it (it is missing, or it names some "
+                f"OTHER file), so the cases asserted nothing about the rules "
+                f"`check rules` just validated. promtool reports no warning for "
+                f"this, because from its side nothing is wrong.")
     m = re.search(r"SUCCESS:\s*(\d+)\s+rules found", check_out)
     if not m:
         return ("`check rules` did not report a rule count; cannot confirm any "
@@ -202,12 +203,29 @@ def inspect_test_file() -> tuple[int | None, bool | None]:
             doc = yaml.safe_load(fh) or {}
     except (OSError, yaml.YAMLError) as ex:
         sys.exit(f"FAIL: {TESTS} is present but could not be parsed ({ex}).")
+    if not isinstance(doc, dict):
+        sys.exit(f"FAIL: {TESTS} did not parse to a mapping (got {type(doc).__name__}).")
     cases = len(doc.get("tests") or [])
-    listed = doc.get("rule_files") or []
+    base = (REPO_ROOT / TESTS).parent
     want = (REPO_ROOT / RULES).resolve()
-    bound = any(
-        (REPO_ROOT / TESTS).parent.joinpath(str(p)).resolve() == want for p in listed
-    )
+
+    def resolves_to_rules(pattern: str) -> bool:
+        # Literal first: it handles `..` segments and plain paths, and
+        # `Path.glob` rejects some of what a literal join accepts.
+        try:
+            if base.joinpath(pattern).resolve() == want:
+                return True
+        except (OSError, ValueError):
+            pass
+        # promtool treats these entries as GLOBS, and this file's own header
+        # calls it one, so a pattern that legitimately matches the rules file
+        # must not be reported as "does not load it".
+        try:
+            return any(q.resolve() == want for q in base.glob(pattern))
+        except (OSError, ValueError, IndexError, NotImplementedError):
+            return False
+
+    bound = any(resolves_to_rules(str(p)) for p in doc.get("rule_files") or [])
     return cases, bound
 
 

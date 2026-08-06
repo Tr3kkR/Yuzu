@@ -1120,9 +1120,8 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
   but a large excess (after a long disable, or an upgrade backlog) drains over
   several 900 s rollup ticks rather than in one statement.
 
-New Prometheus alert rules ship in `docs/prometheus/yuzu-alerts.yml` (that file is
-their one home - a count is deliberately not restated here, because the one that
-used to be was stale for three releases). The declined-pass and failed-pass
+New Prometheus alert rules ship in `docs/prometheus/yuzu-alerts.yml`, which is the
+current set. The declined-pass and failed-pass
 counters must be alerted on separately: both leave rows undeleted, so an audit
 table that never shrinks looks identical either way. One rule,
 `YuzuAuditRetentionNotRunning`, fires on the reaper NOT running - the state in

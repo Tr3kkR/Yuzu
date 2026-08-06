@@ -352,16 +352,14 @@ below).
 ### The retention clock guard
 
 **Which alert sent you here?** Find it in the table below; only one of them is
-about a decline. (Deliberately not opened with a count of the alerts that route
-here: that number lives in `docs/prometheus/yuzu-alerts.yml` and this sentence
-has carried a stale copy of it three times.)
+about a decline. The current rule set is `docs/prometheus/yuzu-alerts.yml`.
 
 | Alert | What it means | Go to |
 |---|---|---|
 | `YuzuAuditRetentionClockAnomaly` | A pass declined. Nothing was deleted. | Read on. |
 | `YuzuAuditRetentionFailing` | The pass is **erroring**, not declining. | `yuzu_server_audit_cleanup_failed_total` in the metric table below. |
 | `YuzuAuditRetentionNotRunning` | The reaper is not running at all --- retention is unenforced and `audit.db` grows without bound. | `yuzu_server_audit_retention_passes_total` in the metric table below. |
-| `YuzuAuditRetentionMetricMissing` | The liveness metric is not being scraped **at all**, so `YuzuAuditRetentionNotRunning` cannot fire for anyone. Nothing is known to be broken; the monitoring is. | `yuzu_server_audit_retention_passes_total` in the metric table below, then your scrape config. |
+| `YuzuAuditRetentionMetricMissing` | The liveness metric is not being scraped **at all**, so `YuzuAuditRetentionNotRunning` cannot fire for anyone. **Check `up` for the Yuzu target first** — if it is down this is an outage, not just a monitoring gap, and on a single-server Prometheus this may be the only rule firing. | `up` for the target; then `yuzu_server_audit_retention_passes_total` in the metric table below, then your scrape config. |
 | `YuzuAuditRetentionStateNotPersisting` | The durable clock reading cannot be written, so detection will not survive a restart. | `yuzu_server_audit_retention_persist_failed_total` in the metric table below. |
 | `YuzuAuditRetentionCapBinding` | Expiry is outrunning the drain. | [Capacity](#capacity). |
 

@@ -146,9 +146,8 @@ all, which is the state in which none of the other *counter*-driven rules can fi
 rule covers it. **Its companion `YuzuAuditRetentionMetricMissing` covers the one case it structurally cannot:** if this
 series is absent entirely - a server predating the metric, or a scrape config dropping it - `increase()` returns an empty
 vector, so `YuzuAuditRetentionNotRunning` selects nothing and can never fire. That rule keys on `absent(...)` instead, and
-is fleet-wide by construction (it cannot see one server among many going quiet). A count of the rule family is
-deliberately not restated here - `docs/prometheus/yuzu-alerts.yml` is its one home, and the count in this sentence was
-stale for three releases.
+is fleet-wide by construction (it cannot see one server among many going quiet). The current rule set is
+`docs/prometheus/yuzu-alerts.yml`.
 
 The skips and failed counters must be alerted on separately and never collapsed:
 both leave rows undeleted, so an audit table that never shrinks looks identical
