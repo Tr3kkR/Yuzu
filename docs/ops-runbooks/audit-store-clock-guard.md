@@ -42,11 +42,9 @@ raises `yuzu_server_audit_retention_bootstrap_declines_total` and NOT the
 clock-anomaly series, deliberately: it makes no claim that the clock moved, so it
 must not fire an alert that says one did. Expect 0 or 1 per database, typically on
 the upgrade to schema v3. A value that keeps climbing means the anchor is not
-surviving, and `YuzuAuditRetentionAnchorNotSurviving` fires on it. Read
-`yuzu_server_audit_retention_persist_failed_total` beside it, but it is NOT
-equivalent coverage: if the reading is destroyed out of band (restore from a
-pre-v3 backup, a rehydrated replica, a disk rollback) the write succeeds every
-pass and that counter stays at zero. The
+surviving — triage for that is
+[YuzuAuditRetentionAnchorNotSurviving](#yuzuauditretentionanchornotsurviving)
+below, and it is stated there rather than here so it has one home. The
 full trigger list and the reasoning behind these signals live on the canonical
 page: [Limits](../user-manual/audit-log.md#the-retention-clock-guard).
 
@@ -230,7 +228,9 @@ Check `yuzu_server_audit_retention_persist_failed_total` FIRST. If it is rising,
 the server cannot write the row: disk, permissions, or a read-only mount. If it
 is FLAT, the row is being destroyed outside the server - a restore from a pre-v3
 backup, a replica rehydrated from a template, a disk-level rollback - which that
-counter cannot see. That second case is the one operators miss.
+counter cannot see, because the write it counts succeeded every time. A flat
+`persist_failed_total` is therefore not evidence the anchor is fine; it only
+rules out one of the two causes.
 
 ## YuzuAuditRetentionStateNotPersisting
 

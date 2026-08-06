@@ -53,8 +53,9 @@ THE PUBLISHED STATUS CHECK IS NAMED "Prometheus alert rules", not
 `prometheus-rules`. The latter is the JOB ID; branch protection matches on the
 name. CLAUDE.md points here for this fact, so it must stay.
 
-`--selftest` exercises the pure logic (version parse, argv construction) with no
-promtool, no docker and no network, matching `scripts/ci/flake-retry.py
+`--selftest` exercises the pure logic - version parsing, docker argv
+construction, the vacuity verdict, and the assertion COUNTER itself against
+synthetic docs with known answers - with no promtool, no docker and no network, matching `scripts/ci/flake-retry.py
 --selftest` and `scripts/ci/check-plugin-spawn-lexical.sh --selftest`.
 """
 
@@ -500,6 +501,18 @@ def selftest() -> int:
          CaseFacts(2, 3, 0), "both assertion kinds, mixed"),
         ({"tests": [{"promql_expr_test": [1]}, "not-a-mapping"]},
          CaseFacts(2, 1, 0), "a non-mapping entry is skipped, not crashed on"),
+        # BOTH block kinds in ONE case. The row above puts them in SEPARATE
+        # cases, which an `elif` between the two lookups still counts correctly -
+        # so without this row a mutually-exclusive counter passes silently. The
+        # shipped file happens to have no combined case either, so nothing else
+        # would catch it. Found by breaking the loop, not by reading it (#2553).
+        ({"tests": [{"promql_expr_test": [1, 1], "alert_rule_test": [1]}]},
+         CaseFacts(1, 3, 0), "both kinds in ONE case must SUM, not pick one"),
+        # An explicit YAML null block, as distinct from an absent one. `or []`
+        # already handles it; this row is what stops a future edit from deciding
+        # a null block counts for one.
+        ({"tests": [{"promql_expr_test": None}]},
+         CaseFacts(1, 0, 1), "an explicit null block is not an assertion"),
     ]:
         got = count_assertions(doc)
         if got != want:
