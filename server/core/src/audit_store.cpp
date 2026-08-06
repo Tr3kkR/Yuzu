@@ -1156,8 +1156,37 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             if (!sqlite3_column_text(ms.get(), 0))
                 continue;
             std::string key = meta_col(0);
-            // Never carry a stale marker across; it is stamped fresh below.
-            if (key == "backfill_complete")
+            // Gate 2 security (round 3): reject an embedded NUL in the KEY
+            // outright, rather than sanitize it. `pg::exec_params` binds
+            // text-format parameters with `paramLengths=nullptr`
+            // (`pg_exec.hpp`), so libpq truncates any value — including this
+            // one — at the first NUL regardless of the C++ string's real
+            // length. A key compared and excluded correctly in C++ (full
+            // bytes, post-243a6d02) can still arrive at Postgres truncated to
+            // a DIFFERENT, shorter name than the one just compared — e.g.
+            // `"backfill_source_fingerprint\0x"` is NOT equal to the reserved
+            // name below in C++, so it is not excluded there, but INSERTs as
+            // the reserved name once libpq truncates it. A legitimate legacy
+            // key is a plain identifier and never contains a NUL, so refusing
+            // the row (not migrating that one meta key) is the safe default —
+            // unlike a VALUE column, there is no free-text case to preserve.
+            if (key.find('\0') != std::string::npos) {
+                spdlog::warn("AuditStore: migrate_from_sqlite: legacy audit_retention_meta key "
+                             "contains an embedded NUL; refusing to migrate it (a legitimate key "
+                             "is never binary)");
+                continue;
+            }
+            // Never carry a stale marker across; it is stamped fresh below —
+            // and never carry ANY `backfill_`-prefixed key at all: that
+            // namespace is reserved for values THIS process establishes
+            // (`backfill_complete`, `backfill_source_fingerprint`) as its own
+            // trust anchors, never copied from an untrusted legacy source. A
+            // legacy row inserted first under `backfill_source_fingerprint`
+            // would otherwise poison it before `stamp_complete` (below) ever
+            // runs — its own INSERT is `ON CONFLICT (key) DO NOTHING`, so the
+            // REAL, freshly-computed fingerprint silently loses to whatever
+            // arrived here first (Gate 2 security HIGH finding, round 3).
+            if (key.rfind("backfill_", 0) == 0)
                 continue;
             // The legacy table is not STRICT, so this column can hold a
             // non-integer. `sqlite3_column_int64` would COERCE that to 0, and 0

@@ -18,16 +18,19 @@ The `backfill_complete` marker is already set when this host boots — by a
 DIFFERENT file's fingerprint — and this host still holds a legacy `audit.db`
 at its configured path. Rather than trust a marker it cannot vouch for, this
 host tries to verify that ITS file's content is what got migrated, and
-refuses to serve if it cannot: the log line names which of four things
+refuses to serve if it cannot: the log line names which of five things
 happened —
 
 - the fingerprints did not match (`"refusing to serve — legacy ... was NEVER
   proven migrated"`),
 - the file could not be opened,
-- the file could not be read as a valid `audit_events` table, or
-- its fingerprint could not be computed.
+- the file could not be read as a valid `audit_events` table,
+- its fingerprint could not be computed, or
+- the legacy path could not be stat'd at all (`"cannot stat legacy path ...
+  to verify a completed backfill"`) — a permissions problem or filesystem
+  error distinct from the file being genuinely absent.
 
-All four land you here. The file is untouched at its original path in every
+All five land you here. The file is untouched at its original path in every
 case — nothing has been lost, but this host refuses to serve until an
 operator resolves which of two things is true:
 

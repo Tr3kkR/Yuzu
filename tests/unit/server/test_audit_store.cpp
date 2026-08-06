@@ -861,6 +861,52 @@ TEST_CASE("AuditStore: a NUL-embedded legacy meta value is carried intact, not t
     CHECK(store.clock_anomaly_skips_count() == 1);
 }
 
+// Gate 2 security HIGH finding, round 3: the meta-copy loop excluded only the
+// literal key `backfill_complete`, not the NEW key `backfill_source_fingerprint`
+// this round's holder-verification redesign (a1dc268c) introduced as its trust
+// anchor. `stamp_complete`'s own INSERT for that key is `ON CONFLICT (key) DO
+// NOTHING` (by design), so a legacy meta row already occupying that key name
+// would silently win over the REAL, freshly-computed fingerprint, poisoning
+// the exact mechanism holder-side verification relies on. A legitimate legacy
+// audit.db (written by the retired SQLite AuditStore) never contains this
+// key — it is brand new — so this row can only arrive via a tampered or
+// attacker-controlled legacy file.
+TEST_CASE("AuditStore: a legacy meta row cannot pre-poison the fingerprint trust anchor",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bfpoison_"}};
+    auto legacy = dir.path / "audit.db";
+    build_legacy_audit_db(legacy, /*count=*/10, /*with_principal_class=*/true,
+                          /*with_meta=*/false); // hand-build a hostile meta table below
+    {
+        SqliteDb sdb;
+        REQUIRE(sqlite3_open(legacy.string().c_str(), sdb.addr()) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(sdb.get(),
+                             "CREATE TABLE audit_retention_meta (key TEXT PRIMARY KEY, value "
+                             "INTEGER NOT NULL);",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(sdb.get(),
+                             "INSERT INTO audit_retention_meta (key, value) VALUES "
+                             "('backfill_source_fingerprint', 'attacker-controlled-garbage');",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.migrate_from_sqlite(legacy)); // the backfill itself still succeeds
+
+    // The poisoned value must NOT have survived: stamp_complete's real,
+    // freshly-computed fingerprint — count:id_sum:ts_sum:ts_min:ts_max for the
+    // 10 rows build_legacy_audit_db wrote (timestamps 1000..1009, ids 1..10)
+    // — must be what actually landed, not the attacker's string.
+    auto stored = query_scalar(
+        db.dsn(),
+        "SELECT value FROM audit_store.audit_retention_meta WHERE key = "
+        "'backfill_source_fingerprint'");
+    CHECK(stored == "10:55:10045:1000:1009");
+}
+
 // Gate 3 cpp-safety. A backfill that STARTED and did not finish gates the write
 // path. `ServerImpl`'s constructor sets `startup_failed_` and then keeps
 // constructing — several of its audit hooks are guarded only on `is_open()` —
