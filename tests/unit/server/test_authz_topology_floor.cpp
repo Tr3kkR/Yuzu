@@ -397,7 +397,14 @@ TEST_CASE("RbacStore: an EXISTING pre-#2376 database gains EnginePrincipal on th
         // `sqlite3_close_v2`, so a still-outstanding statement defers the close
         // rather than leaking the handle outright.
         yuzu::test::SqliteHandleOwner<sqlite3> raw;
-        REQUIRE(sqlite3_open(rbac_db_file.path.c_str(), &raw.db) == SQLITE_OK);
+        // `.string()`, NOT `.c_str()`: TempDbFile::path is a std::filesystem::path,
+        // whose value_type is `char` on POSIX but `wchar_t` on Windows — so
+        // `.c_str()` yields `const wchar_t*` there and does not convert to
+        // sqlite3_open's `const char*` (MSVC C2664). Every other test in the repo
+        // passes ":memory:" to sqlite3_open, so this is the first site to hit it.
+        // The std::string must outlive the call, hence the named local.
+        const std::string rbac_db_path = rbac_db_file.path.string();
+        REQUIRE(sqlite3_open(rbac_db_path.c_str(), &raw.db) == SQLITE_OK);
         REQUIRE(sqlite3_exec(raw.db,
                              "DELETE FROM role_permissions WHERE securable_type='EnginePrincipal';"
                              "DELETE FROM securable_types WHERE name='EnginePrincipal';",
