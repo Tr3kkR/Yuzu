@@ -193,21 +193,25 @@ all, so `YuzuAuditRetentionNotRunning` cannot fire for anyone: `increase()` over
 metric with no series is an empty vector, and an alert that selects nothing never
 alerts. Retention is unmonitored until this is resolved.
 
-**Check `up` for the Yuzu target first — this rule cannot tell the two cases
+**Check `up` for the Yuzu target first — this rule cannot tell these three states
 apart.**
 
-- **`up` is 0, or absent.** The server or its scrape is down. This is an OUTAGE,
-  not a monitoring gap, and on a single-server Prometheus this rule may be the
-  only one firing, because nothing in the shipped rule set alerts on `up`
-  directly. Work the outage; this alert clears when scraping resumes.
+- **`up` is 0.** The server or its scrape is down. This is an OUTAGE, not a
+  monitoring gap, and on a single-server Prometheus this rule may be the only one
+  firing, because nothing in the shipped rule set alerts on `up` directly. Work
+  the outage; this alert clears when scraping resumes.
+- **`up` returns no series at all.** Two very different things look identical
+  here, so do not assume the benign one:
+  - this Prometheus was never configured to scrape a Yuzu server — **expected and
+    ignorable** before the first one is stood up. Check the targets page.
+  - the target has **left service discovery**. Under dynamic-port, IP-based or
+    scheduler-managed SD that is exactly what a dead or deleted server looks
+    like. An empty target list for a fleet you believe is running is an outage.
 - **`up` is 1.** The metric itself is missing. Either the server predates it (the
   rules file is a copy you apply yourself, so it routinely runs ahead of the
   servers it points at), or a scrape config is dropping it. Confirm with
   `curl -s <server>/metrics | grep audit_retention_passes`, then check
   `metric_relabel_configs`.
-
-**Expected, and ignorable, before the first server is scraped at all** — applying
-the rules file ahead of standing up a server produces this after 15 minutes.
 
 It is **fleet-wide by construction**: `absent()` fires only when NO series exists
 anywhere in this Prometheus, so one server going quiet among many is invisible

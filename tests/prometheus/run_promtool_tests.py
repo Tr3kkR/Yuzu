@@ -208,25 +208,42 @@ def inspect_test_file() -> tuple[int | None, bool | None]:
     cases = len(doc.get("tests") or [])
     base = (REPO_ROOT / TESTS).parent
     want = (REPO_ROOT / RULES).resolve()
-
-    def resolves_to_rules(pattern: str) -> bool:
-        # Literal first: it handles `..` segments and plain paths, and
-        # `Path.glob` rejects some of what a literal join accepts.
-        try:
-            if base.joinpath(pattern).resolve() == want:
-                return True
-        except (OSError, ValueError):
-            pass
-        # promtool treats these entries as GLOBS, and this file's own header
-        # calls it one, so a pattern that legitimately matches the rules file
-        # must not be reported as "does not load it".
-        try:
-            return any(q.resolve() == want for q in base.glob(pattern))
-        except (OSError, ValueError, IndexError, NotImplementedError):
-            return False
-
-    bound = any(resolves_to_rules(str(p)) for p in doc.get("rule_files") or [])
+    bound = any(resolves_to_rules(base, want, str(p))
+                for p in doc.get("rule_files") or [])
     return cases, bound
+
+
+def resolves_to_rules(base: Path, want: Path, pattern: str) -> bool:
+    """Does this `rule_files:` entry load `want`, by PROMTOOL's rules?
+
+    Split out and parameterised so `--selftest` can exercise it. It previously
+    could not: the shipped test file's single entry is a literal, the literal
+    branch returns True, `any()` short-circuits, and the glob branch was never
+    executed on any leg.
+
+    `**` IS NOT RECURSIVE HERE, and that is the whole subtlety. promtool uses Go's
+    `filepath.Glob`, where `**` is just two adjacent `*` inside ONE path segment;
+    Python's `Path.glob` recurses. Left alone, that gap runs the wrong way: a
+    `**` pattern promtool does NOT match would look bound to us, and the gate
+    would pass having asserted nothing about the rules it validated - the exact
+    false-green this check exists to stop. Collapsing `**` to `*` restores Go's
+    semantics. MEASURED against promtool 3.13.1, from `tests/prometheus`:
+    `../../docs/**/*.yml` matches, `../../**/*.yml` does not, and this agrees
+    with the collapsed form in both directions.
+    """
+    # Literal first: it handles `..` segments and plain paths, and `Path.glob`
+    # rejects some of what a literal join accepts.
+    try:
+        if base.joinpath(pattern).resolve() == want:
+            return True
+    except (OSError, ValueError):
+        pass
+    while "**" in pattern:
+        pattern = pattern.replace("**", "*")
+    try:
+        return any(q.resolve() == want for q in base.glob(pattern))
+    except (OSError, ValueError, IndexError, NotImplementedError, RecursionError):
+        return False
 
 
 def gate(promtool_argv: list[str], rules: str, tests: str) -> int:
@@ -403,6 +420,28 @@ def selftest() -> int:
         failures.append(f"{TESTS} does not load {RULES}")
     if cases == 0:
         failures.append(f"{TESTS} declares no cases")
+
+    # resolves_to_rules against promtool's OWN behaviour. The `**` rows are the
+    # ones that matter: Python recurses and Go does not, and getting that wrong
+    # turns a vacuous run into a pass. Expectations MEASURED against promtool
+    # 3.13.1, not reasoned - see the function docstring.
+    b = (REPO_ROOT / TESTS).parent
+    w = (REPO_ROOT / RULES).resolve()
+    for pattern, want_bound, why in [
+        ("../../docs/prometheus/yuzu-alerts.yml", True, "the literal, as shipped"),
+        ("../../docs/prometheus/*.yml", True, "single-segment glob promtool matches"),
+        ("../../docs/*/*.yml", True, "two single-segment globs promtool matches"),
+        ("../../docs/**/*.yml", True, "** is ONE segment in Go; promtool matches"),
+        ("../../**/*.yml", False, "** is ONE segment in Go; promtool does NOT match"),
+        ("../../docs/prometheus/decoy.yml", False, "names another file"),
+        ("../../../outside-the-repo.yml", False, "escapes the repo"),
+        ("", False, "empty pattern"),
+        ("[", False, "malformed pattern must not raise"),
+    ]:
+        got = resolves_to_rules(b, w, pattern)
+        if got != want_bound:
+            failures.append(
+                f"resolves_to_rules({pattern!r}) = {got}, want {want_bound} ({why})")
 
     for f in failures:
         print(f"SELFTEST FAIL: {f}", flush=True)
