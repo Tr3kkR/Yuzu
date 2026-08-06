@@ -362,7 +362,7 @@ about a decline. The current rule set is `docs/prometheus/yuzu-alerts.yml`.
 | `YuzuAuditRetentionMetricMissing` | The liveness metric is not being scraped **at all**, so `YuzuAuditRetentionNotRunning` cannot fire for anyone. **Check `up` for the Yuzu target first** — if it is down, or the target has left service discovery, this is an outage rather than just a monitoring gap, and on a single-server Prometheus this may be the only rule firing. | The three-state triage is in [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionmetricmissing) — start there; then `yuzu_server_audit_retention_passes_total` in the metric table below. |
 | `YuzuAuditRetentionStateNotPersisting` | The durable clock reading cannot be written, so detection will not survive a restart. | `yuzu_server_audit_retention_persist_failed_total` in the metric table below. |
 | `YuzuAuditRetentionCapBinding` | Expiry is outrunning the drain. | [Capacity](#capacity). |
-| `YuzuAuditRetentionAnchorNotSurviving` | The durable clock reading keeps being lost, so the guard re-bootstraps instead of comparing. Nothing was deleted by those passes. | [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md). |
+| `YuzuAuditRetentionAnchorNotSurviving` | The durable clock reading keeps being lost, so the guard re-bootstraps instead of comparing. Nothing was deleted by those passes. | [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionanchornotsurviving). |
 
 Retention is driven by the server's wall clock. A cleanup pass that looks like it
 would destroy the audit trail declines instead of deleting: it logs a warning and

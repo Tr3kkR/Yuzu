@@ -49,6 +49,10 @@ Unverified and deliberately unreached: on Windows the docker branch would mount
 `C:\...:/w:ro` under LOCAL SYSTEM, which nobody has tested. The opt-in keeps CI
 out of that path; if you enable it there, that mount is what you are testing.
 
+THE PUBLISHED STATUS CHECK IS NAMED "Prometheus alert rules", not
+`prometheus-rules`. The latter is the JOB ID; branch protection matches on the
+name. CLAUDE.md points here for this fact, so it must stay.
+
 `--selftest` exercises the pure logic (version parse, argv construction) with no
 promtool, no docker and no network, matching `scripts/ci/flake-retry.py
 --selftest` and `scripts/ci/check-plugin-spawn-lexical.sh --selftest`.
@@ -89,6 +93,10 @@ PROMTOOL_IMAGE = (
 PINNED_MAJOR = 3
 
 DOCKER_OPT_IN = "YUZU_TEST_ENABLE_PROMTOOL_DOCKER"
+
+# (attempt, sleep-after) - one home, so the failure message cannot drift from it.
+PULL_LADDER = ((1, 15), (2, 0))
+PULL_ATTEMPTS = len(PULL_LADDER)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RULES = "docs/prometheus/yuzu-alerts.yml"
@@ -171,8 +179,9 @@ def check_gate_output(check_out: str, test_out: str,
     needs no check here. It is self-detecting: the suite asserts specific
     alertnames FIRE, those alertnames do not exist in another file, and promtool
     exits non-zero on its own. An earlier revision reimplemented Go's
-    `filepath.Glob` to catch it and that seam produced three findings of its own,
-    one of them a false-PASS. Deleted rather than maintained.
+    `filepath.Glob` to catch it and that seam produced FOUR findings of its own
+    (a false-PASS, a decoy widening, a case-sensitivity bug and the boundary
+    objection itself). Deleted rather than maintained.
     """
     if "no file match pattern" in test_out:
         return ("`test rules` matched NO rule file - its `rule_files:` path is "
@@ -241,13 +250,35 @@ def inspect_test_file() -> CaseFacts | None:
         sys.exit(f"FAIL: {TESTS} is present but could not be parsed ({ex}).")
     if not isinstance(doc, dict):
         sys.exit(f"FAIL: {TESTS} did not parse to a mapping (got {type(doc).__name__}).")
+    return count_assertions(doc)
+
+
+def count_assertions(doc: dict) -> CaseFacts:
+    """COUNT ASSERTIONS, NOT CASES.
+
+    A case whose `promql_expr_test:` block is removed still counts as a case,
+    and promtool still exits 0. MEASURED (#2553, Gate 5): stripping every
+    assertion block while keeping all the cases produced `SUCCESS: 62 rules
+    found`, `test rules` SUCCESS and rc 0 - the exact false-green this guard
+    exists to stop, reached through the guard itself.
+
+    SPLIT OUT SO `--selftest` CAN EXERCISE IT, and that split is the finding
+    that forced it. The first version of this guard was tested only through
+    `check_gate_output` with HAND-BUILT `CaseFacts`, so the counting loop - the
+    half that actually broke - had no coverage at all: re-injecting the
+    count-the-cases bug left `--selftest` printing `ok`. Shape assertions
+    against the real file cannot catch it either, because the buggy counter
+    produces the same shape. Only a synthetic doc with a KNOWN answer can.
+
+    SCOPE, stated because the name overpromises: this counts the structural
+    PRESENCE of assertion blocks. It does not and will not judge their content.
+    A case asserting `exp_samples: []` against an alertname that does not exist
+    is vacuous and counts here as a real assertion. Validating content means
+    reimplementing promtool's semantics, which is the seam that produced a
+    false-PASS and was deleted; the defence against vacuous assertions is that
+    the suite carries positive FIRE assertions, which redden on a rename.
+    """
     tests = doc.get("tests") or []
-    # COUNT ASSERTIONS, NOT CASES. A case whose `promql_expr_test:` block is
-    # removed still counts as a case, and promtool still exits 0. MEASURED
-    # (#2553, Gate 5): stripping every assertion block while keeping all 13
-    # cases produced `SUCCESS: 62 rules found`, `test rules` SUCCESS and rc 0
-    # from this harness - the exact false-green this guard exists to stop,
-    # reached through the guard itself.
     assertions = 0
     caseless = 0
     for case in tests:
@@ -345,14 +376,22 @@ def pull_with_retry() -> bool:
     # a slow-but-failing registry got killed from outside and reported as "the
     # job timed out", which is the exact diagnosis the per-call timeout was
     # added to prevent (#2553, Gate 5). Worst case is now 2x90 + 15 = 195s here,
-    # ~30s for the daemon probe and 2x120s for the two promtool runs: ~465s,
-    # comfortably inside both.
+    # ~30s for the daemon probe and 2x120s for the two promtool runs: ~465s.
+    # That is comfortable against meson's 600s, which starts at script launch.
+    # It is NOT comfortable against the workflow's `timeout-minutes: 10`, which
+    # is a JOB budget covering checkout too - ~495-555s of 600. Size any
+    # addition against the job budget, not this number.
     #
     # Two attempts, not three: a transient blip clears in seconds and a second
     # try covers it. This still does not pretend to outlast an anonymous Docker
     # Hub quota window - that is hours - and nothing here should imply it does.
-    for attempt, delay in ((1, 15), (2, 0)):
+    for attempt, delay in PULL_LADDER:
+        t0 = time.monotonic()
         rc, _ = run(["docker", "pull", "--quiet", PROMTOOL_IMAGE], timeout=90)
+        # Print the elapsed time so the 90s ceiling is MEASURABLE rather than
+        # argued: nobody can currently say how close a real pull runs to it.
+        print(f"pull attempt {attempt} took {time.monotonic() - t0:.1f}s (ceiling 90s)",
+              flush=True)
         if rc == 0:
             return True
         if delay:
@@ -444,7 +483,29 @@ def selftest() -> int:
     check("unknowable facts still pass",
           check_gate_output(ok_check, "  SUCCESS\n", None), None)
 
-    # The shipped test file must itself carry assertions in every case.
+    # THE COUNTING LOOP ITSELF, against synthetic docs with KNOWN answers.
+    # Shape assertions against the real file cannot catch a broken counter - the
+    # bug that shipped (one per case instead of counting entries) produces the
+    # same shape on a file whose cases all have exactly one block. These rows
+    # are the ones that redden when it is reintroduced.
+    for doc, want, why in [
+        ({"tests": []}, CaseFacts(0, 0, 0), "no cases"),
+        ({}, CaseFacts(0, 0, 0), "no tests key at all"),
+        ({"tests": [{"promql_expr_test": [1, 2, 3]}]}, CaseFacts(1, 3, 0),
+         "THREE assertions in ONE case - a per-case counter reports 1 here"),
+        ({"tests": [{"promql_expr_test": []}]}, CaseFacts(1, 0, 1),
+         "the chaos-B2 shape: a case with its block emptied"),
+        ({"tests": [{"name": "x"}]}, CaseFacts(1, 0, 1), "no block at all"),
+        ({"tests": [{"alert_rule_test": [1]}, {"promql_expr_test": [1, 1]}]},
+         CaseFacts(2, 3, 0), "both assertion kinds, mixed"),
+        ({"tests": [{"promql_expr_test": [1]}, "not-a-mapping"]},
+         CaseFacts(2, 1, 0), "a non-mapping entry is skipped, not crashed on"),
+    ]:
+        got = count_assertions(doc)
+        if got != want:
+            failures.append(f"count_assertions({why}) = {got}, want {want}")
+
+    # And the shipped file must itself carry assertions in every case.
     facts = inspect_test_file()
     if facts is not None:
         if facts.cases == 0:
@@ -505,7 +566,7 @@ def main(argv: list[str]) -> int:
         )
 
     if not pull_with_retry():
-        sys.exit(f"FAIL: could not pull {PROMTOOL_IMAGE} after 3 attempts.")
+        sys.exit(f"FAIL: could not pull {PROMTOOL_IMAGE} after {PULL_ATTEMPTS} attempts.")
 
     return gate(docker_argv(), f"/w/{RULES}", f"/w/{TESTS}")
 

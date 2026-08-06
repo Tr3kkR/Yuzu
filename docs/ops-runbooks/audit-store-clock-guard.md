@@ -217,6 +217,21 @@ It is **fleet-wide by construction**: `absent()` fires only when NO series exist
 anywhere in this Prometheus, so one server going quiet among many is invisible
 here. Use a `up`-based target-down alert for per-target coverage.
 
+## YuzuAuditRetentionAnchorNotSurviving
+
+The guard has declined more than once in a day for having NO stored clock
+reading. Expect that AT MOST ONCE per database, on the upgrade that adds the
+reading. Repeating means the anchor is being lost between passes, so the
+restart-surviving half of the clock guard is not working and every pass starts
+blind. **Nothing was deleted by those passes** - this is lost detection, not lost
+evidence.
+
+Check `yuzu_server_audit_retention_persist_failed_total` FIRST. If it is rising,
+the server cannot write the row: disk, permissions, or a read-only mount. If it
+is FLAT, the row is being destroyed outside the server - a restore from a pre-v3
+backup, a replica rehydrated from a template, a disk-level rollback - which that
+counter cannot see. That second case is the one operators miss.
+
 ## YuzuAuditRetentionStateNotPersisting
 
 The durable clock reading is not being written. The elapsed-time detector is the

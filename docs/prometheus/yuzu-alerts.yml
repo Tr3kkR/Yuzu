@@ -1007,7 +1007,10 @@ groups:
       # applying, and every fresh boot pages. That is the inverse of the
       # `on(instance)` bug above.
       #
-      # KNOWN LIMIT: THIS FALSE-PAGES FOR ~40 MINUTES AFTER A PROMETHEUS RESTART.
+      # KNOWN LIMIT: THIS FALSE-PAGES AFTER A PROMETHEUS RESTART, for as long as
+      # it takes the next real pass to land in the new window - so up to the full
+      # cleanup interval plus `for:`, i.e. ~75 minutes worst case at the fixed
+      # 60-minute cadence, not a fixed figure.
       # It predates this rule's current form - MEASURED identically against the
       # previous expression (#2553, Gate 5 chaos analysis). `increase()` over a
       # PARTIAL range returns 0, and the young-server grace watches the SERVER's
