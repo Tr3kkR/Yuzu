@@ -907,6 +907,55 @@ TEST_CASE("AuditStore: a legacy meta row cannot pre-poison the fingerprint trust
     CHECK(stored == "10:55:10045:1000:1009");
 }
 
+// Gate 4 unhappy-path UP-1/UP-10, round 3: `stamp_complete`'s fingerprint INSERT
+// is `ON CONFLICT (key) DO NOTHING`, and PGRES_COMMAND_OK is returned whether it
+// inserted or silently no-opped — the same class of question the batch-insert
+// loop above already answers with `PQcmdTuples`, not the statement status. A
+// REAL backfill (this file has actual rows) that loses that race must not
+// report success while a DIFFERENT value sits at the trust anchor: that is
+// exactly the false-assurance shape the whole holder-verification redesign
+// exists to prevent, just reached by an ordinary race between two writers
+// instead of a crafted legacy file. Simulated here the same way as a genuine
+// race would leave PG — `backfill_source_fingerprint` already present,
+// `backfill_complete` still absent (so step 1's marker check does not divert
+// into the marker-present branch and this call proceeds down the real,
+// streaming path as designed) — without needing an actual second thread.
+TEST_CASE("AuditStore: a real backfill that loses the fingerprint race refuses, "
+          "not silently reports someone else's value",
+          "[pg][audit_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_bfrace_"}};
+    auto legacy = dir.path / "audit.db";
+    build_legacy_audit_db(legacy, /*count=*/10);
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool); // constructs and migrates the schema into existence
+    REQUIRE(store.is_open());
+
+    exec_sql(db.dsn(), "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES "
+                       "('backfill_source_fingerprint', 'racing-writer-got-here-first')");
+
+    CHECK_FALSE(store.migrate_from_sqlite(legacy));
+
+    // Fail-closed all the way: no marker (a later boot retries, rather than
+    // skipping the backfill on a marker this run never legitimately earned),
+    // and the pre-existing value is untouched — not overwritten with this
+    // run's real fingerprint, and not reported as this run's own.
+    CHECK(query_scalar(db.dsn(),
+                       "SELECT COUNT(*) FROM audit_store.audit_retention_meta WHERE key = "
+                       "'backfill_complete'") == "0");
+    CHECK(query_scalar(db.dsn(),
+                       "SELECT value FROM audit_store.audit_retention_meta WHERE key = "
+                       "'backfill_source_fingerprint'") == "racing-writer-got-here-first");
+    // The 10 rows DO remain — the batch-insert loop commits its own
+    // transaction per batch, separately from `stamp_complete`'s (setval +
+    // marker + fingerprint), and that batch already landed before this race
+    // was ever hit. Not a leftover to clean up: a retry's resume cursor
+    // starts past MAX(id), so it inserts nothing new and just re-reconciles
+    // against these same 10 rows.
+    CHECK(row_count(db.dsn()) == 10);
+}
+
 // Gate 3 cpp-safety. A backfill that STARTED and did not finish gates the write
 // path. `ServerImpl`'s constructor sets `startup_failed_` and then keeps
 // constructing — several of its audit hooks are guarded only on `is_open()` —

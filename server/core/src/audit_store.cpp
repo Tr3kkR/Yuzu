@@ -524,6 +524,40 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
                         PQerrorMessage(c));
                     return false;
                 }
+                // Gate 4 unhappy-path UP-1/UP-10 (round 3): `ON CONFLICT DO
+                // NOTHING` returning PGRES_COMMAND_OK does NOT mean this call's
+                // value won — it means the STATEMENT succeeded, which is true
+                // whether it inserted or silently no-opped. `PQcmdTuples` is
+                // what the batch-insert loop above already uses for the
+                // identical class of question ("did my write actually land, or
+                // did something else already claim this?"). For a REAL backfill
+                // (`source_fingerprint` is not the sourceless placeholder), a
+                // conflict here means some OTHER writer — a fileless replica's
+                // sourceless stamp, most likely — committed marker+fingerprint
+                // together in the window between this call's marker-absent
+                // read (step 1, above `migrate_from_sqlite`) and this INSERT.
+                // Silently succeeding would report this backfill as verified
+                // while the STORED fingerprint is not this file's — exactly
+                // the false-assurance shape the whole holder-verification
+                // redesign exists to prevent, just reached via an ordinary
+                // race between two legitimate writers instead of a crafted
+                // input. Fail closed: the file stays in place (no
+                // `move_legacy_aside`), and a retry goes through the
+                // marker-present verification path instead, which correctly
+                // refuses on the mismatch it will find there. A sourceless
+                // stamp losing this same race is NOT an error — sourceless
+                // carries no evidence claim to lose.
+                if (to_i64(PQcmdTuples(fp.get())) == 0 && source_fingerprint != "sourceless") {
+                    spdlog::error(
+                        "AuditStore: migrate_from_sqlite: lost the race to record this backfill's "
+                        "own fingerprint — another process already stamped "
+                        "backfill_source_fingerprint (fleet-wide sourceless stamp, or a concurrent "
+                        "backfill) between this pass's marker check and this commit. This host's "
+                        "rows were still streamed and reconciled correctly, but the recorded trust "
+                        "anchor is not this file's. Refusing to complete; retry — the next pass "
+                        "will find the marker present and verify by fingerprint instead.");
+                    return false;
+                }
                 return true;
             });
     };
