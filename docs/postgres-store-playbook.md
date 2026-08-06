@@ -216,6 +216,22 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   accounted for). Document BOTH cadences wherever a "ceiling" figure is quoted — the quiet-
   operation rate and the backlog-recovery rate are different numbers with different meanings,
   and quoting only the first as a hard limit understates real capacity.
+- Assuming a per-operation `timeout` parameter (a `with_txn_for(kFooTimeout, ...)` call, or any
+  similarly-named constant) bounds **statement execution**. It only bounds the pool-ACQUIRE wait
+  (see "Pool connection setup†" below) — every connection the pool hands out carries the same
+  fixed, pool-wide `statement_timeout` GUC for actual query execution regardless of what the
+  caller's own timeout constant is named or documented to mean. An unqualified long-running query
+  (a full-table scan, an unindexed aggregate) needs its OWN explicit `SET LOCAL statement_timeout
+  = '<ms>'` as the first statement inside a `pool.with_txn`/`with_txn_for` callback — never a bare
+  `SET`, which leaks the widened deadline onto the connection's next, unrelated caller once it's
+  returned to the pool. This mismatch has recurred twice in this codebase without ever being
+  written down here: #2530 (a metrics sampler assuming a bounded-`acquire()` deadline also bounded
+  its query) and `AuditStore::migrate_from_sqlite`'s whole-file reconciliation scan (ADR-0040,
+  #2697 round 3) — the second one initially repeated the first's mistake even while citing it as
+  precedent, and initially hand-rolled `BEGIN`/`SET LOCAL`/`COMMIT`/`ROLLBACK` instead of using the
+  already-available `pool.with_txn` + `pg::PgTxn` RAII guard before a second review round caught
+  it. `SoftwareLicensingStore::count_stale_agents` is the clean reference implementation of the
+  correct shape.
 
 ## Non-transactional migrations (the deferred kind)
 

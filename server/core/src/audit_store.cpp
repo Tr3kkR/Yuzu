@@ -1354,7 +1354,8 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             pg::PgResult st = pg::exec_params(c, set_timeout_sql.c_str(), std::vector<std::string>{});
             if (st.status() != PGRES_COMMAND_OK) {
                 spdlog::error("AuditStore: migrate_from_sqlite: reconciliation "
-                              "statement_timeout set failed: {}",
+                              "statement_timeout set failed: {}. See "
+                              "docs/ops-runbooks/audit-store-backfill-recovery.md.",
                               PQerrorMessage(c));
                 return false;
             }
@@ -1366,7 +1367,9 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
                 std::vector<std::string>{});
             if (pc.status() != PGRES_TUPLES_OK) {
                 spdlog::error(
-                    "AuditStore: migrate_from_sqlite: reconciliation fingerprint read failed: {}",
+                    "AuditStore: migrate_from_sqlite: reconciliation fingerprint read failed: {}. "
+                    "If this names a statement timeout (SQLSTATE 57014), see "
+                    "docs/ops-runbooks/audit-store-backfill-recovery.md.",
                     PQerrorMessage(c));
                 return false;
             }

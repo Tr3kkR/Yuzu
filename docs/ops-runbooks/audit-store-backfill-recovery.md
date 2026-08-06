@@ -57,6 +57,32 @@ If you cannot tell which is true from deployment history alone, treat it as
 the second case — engineering can restore the file from the operator-managed
 backup either way.
 
+## The completeness check itself timed out
+
+Distinct from every refusal above (which say the migration is DONE but
+unproven): this one means the migration was still IN PROGRESS and its final
+verification step didn't finish in time. Two log lines cover it —
+`"reconciliation statement_timeout set failed"` and `"reconciliation
+fingerprint read failed"` — and both are followed by `backfill_metric("failed")`
+and a retry on the next boot, exactly like any other backfill failure.
+
+The final step streams every legacy row, then runs one full-table scan over
+`audit_store.audit_events` to prove nothing was lost or duplicated. That scan
+gets its own execution deadline (currently 60 seconds) separate from the
+connection pool's ordinary per-statement default, specifically so it isn't
+truncated by a setting meant for everyday queries — but on a legacy `audit.db`
+large enough (this deployment's own history — tens of millions of rows is the
+scale this was sized against), even that widened deadline can still be
+exceeded, especially on slower storage or a cold page cache after a restart.
+If `PQerrorMessage` in the log names `"canceling statement due to statement
+timeout"` (Postgres SQLSTATE `57014`), that is exactly this: not corruption,
+not a connectivity problem, just this one query needing longer than budgeted.
+It retries identically on the next boot — the batch-insert step it follows is
+resumable, but the reconciliation scan itself always re-runs in full, so a
+retry costs the same again rather than picking up partway through. If this
+recurs, engage engineering: the deadline is a compile-time constant today,
+not an operator-facing flag.
+
 ## Abandoning an unrecoverable legacy trail
 
 If the legacy `audit.db` is genuinely lost or corrupt and the server is

@@ -86,9 +86,28 @@ primary new element vs the three prior migrations.
   cf. #2661). `audit_retention_meta` (the clock-guard reading) is copied too.
 - **Idempotent + resumable:** a one-time `backfill_complete` marker row in `audit_retention_meta`
   gates re-runs; a crash mid-backfill re-streams from `MAX(id)` already in PG (id-ordered,
-  ON CONFLICT DO NOTHING) so no duplication and no loss. Row-count reconciliation
-  (legacy count vs migrated count) is logged and asserted, as **equality** — an unexplained
-  surplus is as much an unaccounted-for state as a shortfall.
+  ON CONFLICT DO NOTHING) so no duplication and no loss. Reconciliation is a **whole-file
+  5-aggregate fingerprint** (`COUNT`/`SUM(id)`/`SUM(timestamp)`/`MIN(timestamp)`/`MAX(timestamp)`),
+  not a bare row count (Gate 3 architect F2, round 3, sharpened by Sol's diagnosis): a bare count
+  is defeated by a foreign writer occupying an id this legacy file also claims — `ON CONFLICT (id)
+  DO NOTHING` silently drops the legacy row, and if a native row already held that id, the total
+  count comes out unchanged (one row lost, one gained, same id). `SUM(id)` doesn't catch it either
+  — the id is still there, just holding different content. The timestamp components do: a native
+  write's timestamp is "now", a legacy event's timestamp is historical. Logged and asserted as
+  **equality** — an unexplained surplus is as much an unaccounted-for state as a shortfall. This
+  fingerprint is also what gets stamped as `backfill_source_fingerprint` (below) — the value a
+  later boot compares a still-present legacy file against.
+  **The reconciliation query's own statement-execution deadline is explicit, not inherited (Gate 5
+  chaos-injector F1, round 3).** It is an unqualified full-table aggregate scan — no `WHERE`,
+  cannot use the partial retention index — on a table that can reach tens of millions of rows.
+  `PgPool`'s per-operation `timeout` parameter (e.g. `kBackfillTxnTimeout`) only bounds the
+  pool-ACQUIRE wait; every connection the pool hands out otherwise carries the same fixed,
+  pool-wide default `statement_timeout` (30s) for actual execution, regardless. The reconciliation
+  query now runs inside `pool.with_txn` with an explicit `SET LOCAL statement_timeout = '60000ms'`
+  as its first statement (never a bare `SET`, which would leak the widened deadline onto the
+  connection's next, unrelated caller) — closing risk of a persistent backfill failure loop at the
+  documented target scale. See `docs/postgres-store-playbook.md`'s anti-patterns list for the
+  general lesson (this mismatch has now recurred twice in this codebase).
 - **No native audit row may be written before the marker exists.** The resume cursor and its
   prefix proof (next bullet) both assume every row in PG came from the legacy stream. A row
   this build wrote itself is not in that stream, so the proof mismatches and the backfill is
