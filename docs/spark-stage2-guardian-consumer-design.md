@@ -1061,15 +1061,15 @@ Each rung is an independently-governed PR on `dev`, run through the full
        7 (KV lifecycle journal), 9 (R4 telemetry + the heartbeat wiring for the
        PR-1a counters), 8 (test seams), **M1 (the transition-edge health-emission
        fix)**, and the R2 `unsupported` terminal state.
-     - **FLIP GATE:** M1, item 9's heartbeat wiring, #2270, and the lifecycle-audit
-       journal ALL **gate PR-2** — the `prefer_spark` flip must not ship while any is
-       open. All but #2270 land in PR-1b; #2270 ships as its own PR against `dev`,
-       ahead of PR-1b. M1 in particular is a fleet ingest-DoS if the flip
-       precedes it, so it is not enough that it is "in PR-1" — it is specifically in
-       PR-1b, after PR-1a.
-     - **#2797 gates PR-2 as well, and is the only gate whose HEADLINE defect is
-       already live pre-flip** (#2819 carries a related `service_win.cpp` instance
-       that is also live today - see its Related section). `apply_rules` discards
+     - **FLIP GATE — TEN items gate PR-2**, each detailed in the bullets below: M1,
+       item 9's heartbeat wiring, #2270, the lifecycle-audit journal, #2797, #2818,
+       #2819, #2813, and two residues that own no issue, (a) and (b). **The
+       `prefer_spark` flip must not ship while any is open.** The first four land in
+       PR-1b except #2270, which ships as its own PR against `dev` ahead of it. M1 in
+       particular is a fleet ingest-DoS if the flip precedes it, so it is not enough
+       that it is "in PR-1" — it is specifically in PR-1b, after PR-1a.
+     - **#2797 gates PR-2 as well, and is the only gate whose headline defect is
+       already live pre-flip.** `apply_rules` discards
        `reconcile_rule_locked`'s bool
        (`guardian_engine.cpp:634`; the surrounding catch counts a THROW only), so a
        RETURNED arm failure leaves `reconcile_failures` at 0, the generation
@@ -1093,29 +1093,32 @@ Each rung is an independently-governed PR on `dev`, run through the full
        it a live enforcement hole. #2797 removes the `apply_rules` self-heal that
        otherwise bounds it, so the two gates compound and neither alone closes the
        exposure.
-     - **#2819 and #2813 gate PR-2 as well — same dormancy test as #2818, applied
-       consistently.** An earlier revision of this block dismissed #2819 as "a
-       shutdown-availability defect ... does not gate the flip". That was wrong and
-       is corrected here: availability-vs-enforcement is not the criterion this list
-       uses, dormancy is, and both satisfy it. #2819 reaches a blocking `unwatch()`
+     - **#2819 gates PR-2 as well — same dormancy test as #2818, applied
+       consistently.** An earlier revision of this block dismissed it as "a
+       shutdown-availability defect ... does not gate the flip". That was wrong:
+       availability-vs-enforcement is not the criterion this list uses, dormancy is,
+       and #2819 satisfies it. #2819 reaches a blocking `unwatch()`
        by TWO routes — `arm_impl`'s `teardown_arm_race`, and the ordinary withdraw
-       path through `SparkEngine::disarm` — so state the dormancy for BOTH, not for
-       `arm_impl` alone: that narrowing is exactly what #2819's own CORRECTION block
-       retracts. `attach_rule` runs only at `guardian_engine.cpp:1153`, inside
+       path through `SparkEngine::disarm` — and both are dormant, for the same
+       reason. `attach_rule` runs only at `guardian_engine.cpp:1153`, inside
        `try_spark = prefer_spark_ && spark_availability_ == SparkAvailability::Available`
        (`guardian_engine.cpp:1139`), and Guardian is the sole registered consumer
        (`guardian_engine.cpp:1244` is the only PRODUCTION `register_consumer`
-       caller). `detach_rule` itself IS reached pre-flip — four of its five sites sit
-       outside the `try_spark` branch — but it reaches `backend_->disarm` only when
-       `index_->remove_rule` returns a key (`guardian_spark_runtime.cpp:251-256`),
+       caller). `detach_rule` itself IS reached pre-flip — three of its five sites
+       (`:1095`, `:1124`, `:1182`) sit outside the `try_spark` block, which spans
+       `:1140-1179` — but it reaches `backend_->disarm` only when
+       `index_->remove_rule` returns a key (`guardian_spark_runtime.cpp:253-258`),
        and pre-flip nothing was ever attached, so `keys_` is empty. Both routes are
        therefore dormant TRANSITIVELY, on the absence of a prior arm, and the wedge
        is created by the flip exactly as #2818's hole is. Its terminal outcome is a
        stalled agent shutdown whose F3 backstop is structurally unreachable, on a
-       trigger that correlates fleet-wide during an OTA wave. #2813 shares the
-       dormancy profile — NOT #2819's sink, which is a lock wedge; #2813's own
+       trigger that correlates fleet-wide during an OTA wave. #2819 also carries a
+       related `service_win.cpp` instance that is live TODAY and needs no spark
+       involvement — see its Related section.
+     - **#2813 gates PR-2 on the same dormancy profile**, and is listed here rather
+       than left silent. Its sink is NOT #2819's, which is a lock wedge: #2813's
        residue is a live OS watch whose `armed_` entry is gone, so its firings are
-       silently dropped — and is listed here rather than left silent.
+       silently dropped.
      - **Two residues gate PR-2 and own no issue**, recorded here because a gate list
        that enumerates only issue-backed items reads as complete when it is not.
        (a) `SparkEngine::disarm`'s allocating prologue

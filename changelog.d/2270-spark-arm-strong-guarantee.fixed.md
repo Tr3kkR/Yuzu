@@ -8,10 +8,10 @@
   watching a target fails during this cleanup, the watch is not reclaimed — on Windows it
   can persist for the life of the agent process, so only restarting the agent releases it.
   The agent counts it and ships the count in its heartbeat as
-  `yuzu.spark_arm_race_unwatch_failures`; that count covers this one cleanup path, so a
-  zero does not mean no watches were orphaned by any other path, and no fleet metric,
-  dashboard or alert consumes it yet, so it is not queryable today (#2270). Guardian does
-  not route detection through Spark in any shipped build: the switch is a compile-time
-  default that is not exposed as a command-line flag or an environment variable, so legacy
-  detection is unaffected and there is no deployment setting that changes this. (The
-  separate `--spark-disable` flag controls the Spark engine itself, not this routing.)
+  `yuzu.spark_arm_race_unwatch_failures`, which no fleet metric, dashboard or alert
+  consumes yet, so it is not queryable today (#2270). That count covers this one cleanup
+  path — a zero is not an assurance that no watch was orphaned by another path. Guardian
+  does not route detection through Spark in any shipped build: `prefer_spark` (the same
+  switch the Guardian journal entries in this release refer to) is a compile-time default
+  that cannot be changed without a rebuild, so the existing detection path is unaffected
+  and there is no deployment setting to review.
