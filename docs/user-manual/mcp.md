@@ -774,8 +774,10 @@ proposes.
    tool + arguments, not yet consumed, and minted through the MCP surface rather
    than another one — #2442) and **atomically consumes** the ticket (one-time —
    a replay, a mismatched tool/args, or a ticket from another surface, returns
-   `-32003` `PermissionDenied`), then executes. A `-32603` here means the store
-   failed, not that the ticket is spent; see the error-code reference.
+   `-32003` `PermissionDenied`), then executes. A `-32603` means the store
+   failed while consuming, not that the ticket is spent. Note that a store
+   failure during the earlier lookup is *not* separated out and also returns
+   `-32003`; the error-code reference explains why that matters.
 
 ### What requires approval
 
@@ -1157,25 +1159,38 @@ principal, or use an account with the required permissions. For a ticket recall 
 submit the call **without** `approval_id` to obtain a fresh approval ticket, then
 recall once it is approved.
 
-> **Do not apply that fix to a `-32603`.** A store failure on this same path
-> returns `-32603`, not `-32003`, and its remediation is the opposite — the
-> approval has *not* been consumed and requesting a fresh one spends a second
-> human review on a capability you still hold. See below.
+> **Do not apply that fix to a `-32603`.** A store failure at the CONSUME step
+> returns `-32603`, and its remediation is the opposite of this one's. See below.
+>
+> **Known gap, and it points the wrong way.** A store failure at the earlier
+> TICKET-LOOKUP step is not distinguished: it reads as "no such ticket" and
+> surfaces here, as `-32003`, whose fix above tells you to re-submit without
+> `approval_id`. Following it during a transient store failure mints a duplicate
+> while your original approval is still outstanding, spending a second human
+> review. If you see `-32003` for a ticket you believe is valid and recently
+> approved, prefer retrying the identical call a few times before re-minting.
+> Closing this properly is tracked separately; it is not fixed in this release.
 
 ### -32603: Approval store unavailable
 
 **Symptom**: An approval-ticket recall returns error code `-32603` rather than
-`-32003`.
+`-32003`. This comes from the CONSUME step — see the gap noted above for the
+lookup step, which does not produce this code.
 
-**Cause**: The approval store could not be read or written. The ticket was **not**
-consumed and remains valid.
+**Cause**: The approval store could not be read or written while consuming the
+ticket. The ticket was **not** consumed.
 
-**Fix**: Retry the same call unchanged, including the same `approval_id`. If the
-response carries `retry_after_ms`, wait at least that long first. Do **not**
-re-submit without `approval_id`: the approval is still live, and minting a fresh
-one asks a human to approve a capability you already have. If retries keep
-failing, escalate to an operator — the store needs attention, and no client-side
-action will clear it.
+It is not necessarily still usable, and the difference matters: the 7-day
+approval window keeps running during an outage, so an outage that outlasts the
+ticket's remaining window ends with it expired like any other.
+
+**Fix**: Retry the same call unchanged, including the same `approval_id`. The
+response carries a `retry_after_ms`; wait at least that long first. Do **not**
+re-submit without `approval_id` while the window is still open — the approval
+was not consumed, and minting a fresh one asks a human to approve a capability
+you already hold. If retries keep failing, escalate to an operator: no
+client-side action will clear it. If the approval window has since elapsed,
+treat it as a `-32003` and request a fresh ticket.
 
 ### -32602: Invalid params
 

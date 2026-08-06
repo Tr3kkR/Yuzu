@@ -136,15 +136,16 @@ enum class ConsumeFailure {
 /// `meson.build` sets `werror=false`, so the warning alone would not stop it,
 /// and a new kind would otherwise inherit whatever the caller happens to say.
 ///
-/// The MSVC arm is best-effort, and the ORDER of its two pragmas is why. C4062
-/// is off by default, and `#pragma warning(error : N)` does NOT enable an
-/// off-by-default warning — Microsoft documents that behaviour only for the
-/// `1|2|3|4` and `default` specifiers — so promoting it alone sets an as-error
-/// flag on a diagnostic that is never emitted. The explicit level enable has to
-/// come first. It is still best-effort rather than guaranteed: MSVC also
-/// documents that the last `warning` pragma in a function body applies to the
-/// whole function, which may defeat the `pop` below. Do not restate this as an
-/// unconditional "fails the build".
+/// The ORDER of the MSVC pragmas is load-bearing. C4062 is off by default, and
+/// `#pragma warning(error : N)` does NOT enable an off-by-default warning —
+/// Microsoft documents that behaviour only for the `1|2|3|4` and `default`
+/// specifiers — so promoting it alone sets an as-error flag on a diagnostic
+/// that is never emitted. The explicit level enable has to come first.
+///
+/// Unverified on MSVC: no Windows leg has built this. That is the only reason
+/// the claim is hedged. (An earlier version of this comment blamed the
+/// whole-function pragma rule instead; that rule is scoped to warnings
+/// 4700-4999, and C4062 is parse-time, so it does not reach the `pop` below.)
 [[nodiscard]] constexpr const char* consume_denial_reason(ConsumeFailure kind) {
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push

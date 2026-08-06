@@ -582,6 +582,14 @@ public:
                           "spike on one tool means a supervised worker is submitting "
                           "malformed arguments or probing",
                           "counter");
+        metrics_.describe("yuzu_mcp_approval_refused_total",
+                          "MCP approval-ticket recalls refused at the consume step "
+                          "(#2442): a replay, a ticket minted on another surface, or a "
+                          "store failure. Deliberately carries NO reason label — the "
+                          "denial kind is exactly the distinction the client response "
+                          "withholds, and /metrics is not a stronger reader than the "
+                          "caller. Read the audit trail for the kind",
+                          "counter");
         // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
         // degrade reason is a static literal inside the bridge, never derived
         // from caller input.
@@ -851,6 +859,11 @@ public:
         // alerts stay meaningful (observability-conventions.md).
         for (const auto& tool : mcp::approval_gated_tool_names()) {
             metrics_.counter("yuzu_mcp_tool_args_invalid_total", {{"tool", tool}});
+            // Same closed set reaches the #2442 refusal counter — a recall can
+            // only be refused for a tool that is approval-gated in the first
+            // place — so pre-seed it here too, or an absent() alert on a fleet
+            // that has never had a refusal cannot fire.
+            metrics_.counter("yuzu_mcp_approval_refused_total", {{"tool", tool}});
         }
         // #2437 handler-side bound denials. The label set is closed on BOTH
         // axes: `tool` is execute_instruction alone (the only tool that EMITS

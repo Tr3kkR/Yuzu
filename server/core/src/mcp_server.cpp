@@ -3333,7 +3333,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     if (appr->status != "approved") {
                         // rejected / expired.
-                        mcp_audit("denied", "approval " + supplied_id + " status=" + appr->status);
+                        mcp_audit("denied",
+                                  "approval_id=" + supplied_id + " status=" + appr->status);
                         res.set_content(
                             a4_error(kPermissionDenied, "approval was " + appr->status,
                                      "submit a new request without approval_id to obtain a fresh "
@@ -3359,18 +3360,24 @@ McpServer::HandlerFn McpServer::build_handler(
                         // identically to a benign replay, and said it about a
                         // row whose consumed_at is still 0.
                         //
-                        // The METRIC is a separate instrument and both are
-                        // required. The audit row is the forensic record: one
-                        // row per event, its write unchecked, nothing to alert
-                        // on. The counter is the SIEM signal — `foreign_origin`
-                        // is the event #2442 exists to DETECT, and without a
-                        // series there is no rate or absence alert to build.
-                        // Same split the platform already uses for other
-                        // security-relevant refusals. The reason label carries
-                        // the stable denial token, so a forgery attempt stays
-                        // separable from an ordinary replay.
-                        count_denial("yuzu_mcp_approval_refused_total",
-                                     consume_denial_reason(kind));
+                        // The METRIC is a separate instrument from the audit
+                        // row: the row is the forensic record, one per event
+                        // and its write unchecked, so nothing can alert on it.
+                        // The counter gives an operator a refusal RATE.
+                        //
+                        // It deliberately carries NO reason label. The denial
+                        // token is exactly the distinction the client response
+                        // below refuses to make, and `/metrics` is not a
+                        // stronger reader than the caller: it is exempt for
+                        // localhost and otherwise needs only a resolved
+                        // session — the same credential the MCP caller already
+                        // holds. A `reason` label would therefore let a token
+                        // holder recall a suspect ticket, read the series
+                        // either side, and recover which surface minted it,
+                        // reopening the oracle this handler exists to close.
+                        // The kind stays in the audit trail, which is genuinely
+                        // server-side.
+                        count_denial("yuzu_mcp_approval_refused_total", nullptr);
                         mcp_audit("denied", "approval_id=" + supplied_id +
                                                 " refused: " + consume_denial_reason(kind));
 
@@ -3391,6 +3398,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         // with it expired. Promising validity and then refusing
                         // the ticket would leave the caller waiting on a
                         // capability that had been retired underneath them.
+                        //
+                        // A concrete retry_after_ms is required, not optional:
+                        // this arm calls itself transient and tells the caller
+                        // to retry, and A5 wants a retry directive to be
+                        // machine metadata rather than prose. Omitting it emits
+                        // null, which this file's own convention reads as NOT
+                        // retryable — the opposite of what the text says.
                         if (kind == ConsumeFailure::kStoreError) {
                             res.set_content(
                                 a4_error(kInternalError,
@@ -3399,7 +3413,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                          "consumed, so do not request a fresh one. The 7-day "
                                          "approval window keeps running during an outage: if it "
                                          "elapses the ticket expires and a new approval is "
-                                         "required"),
+                                         "required",
+                                         5000),
                                 "application/json");
                             return;
                         }

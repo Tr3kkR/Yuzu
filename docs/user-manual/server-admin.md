@@ -337,11 +337,16 @@ instead, both of which survive a restart.
 
 ### vNEXT — approval tickets outstanding at the upgrade must be re-requested (#2442) (breaking)
 
-**Who this affects.** Every deployment holding an approval that was granted but not yet redeemed at
-the moment of upgrade. This is independent of the `mcp.` prefix entry below: it does not matter
-whether you author any `mcp.`-prefixed definitions, and a deployment running only Yuzu-supplied
-content **is** affected if it has an approval in flight. If nothing is awaiting redemption when you
-upgrade, there is nothing to do.
+**Who this affects.** Any deployment holding an **MCP** approval that was granted but not yet
+redeemed at the moment of upgrade — that is, one an agentic worker will present back to an MCP tool
+call. This is independent of the `mcp.` prefix entry below: it does not matter whether you author any
+`mcp.`-prefixed definitions, and a deployment running only Yuzu-supplied content **is** affected if
+it has an MCP approval in flight.
+
+**Scheduled approvals are not affected.** A schedule redeems its own approval by matching the
+schedule id, not through the MCP recall, so the origin check never sees it and a scheduled run
+outstanding across the upgrade still fires. If nothing is awaiting an MCP recall when you upgrade,
+there is nothing to do.
 
 **What happens.** This release records which surface minted each approval, and rows that predate the
 column carry no surface at all. Rather than assume one they may not have come from, the upgrade

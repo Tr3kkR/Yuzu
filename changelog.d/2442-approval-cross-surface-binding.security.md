@@ -18,9 +18,10 @@
   may not have come from, the upgrade labels them with a sentinel that fails closed. The refusal
   reports as an ordinary spent ticket, because that message is uniform by design, so the upgrade note
   in `docs/user-manual/server-admin.md` is where the real cause is recorded. Recover by calling the
-  tool again without `approval_id`. This reaches any deployment holding an approval in flight,
-  independent of whether it uses `mcp.`-prefixed definitions, and the affected population does not
-  grow after the upgrade.
+  tool again without `approval_id`. This reaches any deployment holding an **MCP** approval in
+  flight, independent of whether it uses `mcp.`-prefixed definitions. Scheduled approvals are not
+  affected — a schedule redeems by matching its own schedule id rather than through the MCP recall,
+  so the origin check never sees one. The affected population does not grow after the upgrade.
 
 - **This binds the surface, not the submitter.** The recall still does not compare who obtained the
   approval against who presents it, so a valid `approval_id` remains redeemable by any principal
