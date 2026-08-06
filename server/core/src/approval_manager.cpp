@@ -242,14 +242,6 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
         return std::unexpected("definition_id is required");
     if (submitted_by.empty())
         return std::unexpected("submitted_by is required");
-    // Namespace reservation (#2442): a surface that has declared itself as
-    // something other than MCP may not mint into the MCP ticket namespace. The
-    // MCP recall matches on (definition_id, scope_expression) and does not bind
-    // the submitter, so without this a ticket minted through the REST
-    // instruction gate — where the definition id is caller-influenced and the
-    // scope expression is caller-supplied verbatim — is a ticket the MCP recall
-    // will accept. Undeclared mints are exempt because the MCP gate itself is
-    // still one of them (ApprovalOrigin::kUnspecified).
     // NO mint-time refusal for the reserved namespace. #2442 is defended at
     // REDEMPTION (see consume_ticket) instead, deliberately:
     //
@@ -574,7 +566,9 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     // caller-influenced, could line up with an MCP tool's canonical arguments
     // and be redeemed against it. What that buys is the HUMAN APPROVAL itself:
     // the reviewer sees a ticket id, a submitter and a scope expression, and
-    // nothing that names the tool or the surface.
+    // nothing that names the SURFACE it was raised on. (The tool is named:
+    // `definition_id` is on the row, and must be exactly `mcp.<tool>` for the
+    // confusion to work at all — that is the premise of the reserved prefix.)
     //
     // get_checked, not get: a FAILED read must not decode as "no declared
     // origin", which is the value that grants.

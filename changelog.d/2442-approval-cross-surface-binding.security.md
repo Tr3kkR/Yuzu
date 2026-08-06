@@ -5,11 +5,11 @@
   fields are caller-influenced, could line up with an MCP tool's canonical arguments and be redeemed
   against it. What that bought was **the human approval itself**, not a new permission: an
   administrator reviewing that ticket sees a ticket id, a submitter and a scope expression, and
-  nothing that names the tool or the surface, so they would have been authorising an MCP tool
-  invocation with no way to tell. Every approval already records its minting surface; the recall now
+  nothing that names the surface it was raised on, so they would have been authorising an MCP tool
+  invocation with no way to tell. Two of the three mint paths already record their surface; the recall now
   refuses any ticket whose **recorded** surface is something other than MCP. The refusal is
   deliberately indistinguishable from an ordinary spent-ticket response, so the recall cannot be
-  used to probe which definition ids exist. A ticket with no recorded surface stays redeemable — the
+  used to probe which surface minted a ticket. A ticket with no recorded surface stays redeemable — the
   MCP mint is itself undeclared until its own follow-up lands, so that exemption is what keeps the
   gate working; it closes when the MCP mint declares itself.
 

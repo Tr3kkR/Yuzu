@@ -1,7 +1,5 @@
 #pragma once
 
-#include "reserved_definition_id.hpp" // is_reserved_definition_id (#2442)
-
 #include <sqlite3.h>
 
 #include <cstdint>
@@ -120,8 +118,9 @@ enum class ConsumeFailure {
 /// The one refusal message for every "this ticket cannot be redeemed" outcome.
 /// kForeignOrigin deliberately shares it with kNotConsumable: the KIND separates
 /// a forgery attempt from a replay for the log, but the MESSAGE must not, or the
-/// recall becomes an oracle for which definition ids exist and which surface
-/// minted them. One home so the copies cannot drift apart.
+/// recall becomes an oracle for which SURFACE minted a ticket. (Not for which
+/// definition ids exist: a mismatched id is refused earlier, and with a
+/// different message, before this is reached.) One home so the copies cannot drift apart.
 /// Stable audit token, one per failure kind. The AUDIT trail is server-side and
 /// is never returned to the caller, so the anti-oracle reasoning below does NOT
 /// reach it: suppressing the distinction there would destroy the only evidence
@@ -155,7 +154,11 @@ enum class ConsumeFailure {
 #elif defined(_MSC_VER)
 #pragma warning(pop)
 #endif
-    return "unknown"; // unreachable while the switch is exhaustive
+    // Not reachable today: the switch above has an arm per ConsumeFailure
+    // value, and the pragma makes a missing arm a compile ERROR rather than a
+    // warning. Present so the function still returns on a compiler that does
+    // not honour the pragma.
+    return "unknown";
 }
 
 inline constexpr const char* kNotConsumableMessage =
@@ -194,14 +197,15 @@ public:
     /// the owning schedule's id for a scheduled-fire submission — see the
     /// `Approval::schedule_id` doc comment for why this matters.
     ///
-    /// `origin` (#2442) declares the minting surface. A caller that declares a
-    /// non-MCP origin may NOT mint a `mcp.`-prefixed definition_id: that is the
-    /// forgeable half of the cross-surface confusion, since the REST
-    /// instruction gate mints with a caller-influenced definition id and a
-    /// fully caller-controlled scope expression, which the MCP recall matches
-    /// on. Declaring no origin still permits the prefix, because the MCP mint
-    /// itself is the one caller that cannot yet declare — see
-    /// ApprovalOrigin::kUnspecified.
+    /// `origin` (#2442) RECORDS the minting surface. It is not enforced here:
+    /// this store does not refuse a `mcp.`-prefixed definition_id from any
+    /// surface. The binding is applied at REDEMPTION, in `consume_ticket`,
+    /// which refuses a ticket whose recorded surface is not MCP — see the
+    /// rationale in `submit()`'s body for why the check moved.
+    ///
+    /// Pick the value deliberately. `kUnspecified` is what GRANTS at
+    /// redemption, and it is the correct choice only for the MCP mint, which
+    /// cannot yet declare `kMcp`.
     std::expected<std::string, std::string>
     submit(const std::string& definition_id, const std::string& submitted_by,
            const std::string& scope_expression, const std::string& schedule_id = "",

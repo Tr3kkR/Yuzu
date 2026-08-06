@@ -7,6 +7,7 @@
  */
 
 #include "approval_manager.hpp"
+#include "reserved_definition_id.hpp"
 #include "migration_runner.hpp"
 #include "sqlite_raii.hpp"
 
