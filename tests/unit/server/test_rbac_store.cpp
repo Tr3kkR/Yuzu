@@ -55,7 +55,8 @@ TEST_CASE("RbacStore: seed data — system roles exist", "[rbac_store]") {
 TEST_CASE("RbacStore: seed data — securable types", "[rbac_store]") {
     RbacStore store(":memory:");
     auto types = store.list_securable_types();
-    REQUIRE(types.size() == 22); // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2)
+    REQUIRE(types.size() == 23); // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2)
+                                 // +EnginePrincipal (#2376, cut away from Security:Read)
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -76,6 +77,8 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store]") {
     CHECK(has("Inventory"));
     CHECK(has("SoftwareLicensing")); // SLE securable (ADR-0024 Decision 9) — NOT `License`
     CHECK(has("AccessReview")); // Periodic Access Reviews (SOC 2 CC6.2), dedicated + narrow
+    CHECK(has("EnginePrincipal")); // Engine-principal inventory + grant-graph reads (#2376),
+                                   // cut away from the over-broad Security:Read
 }
 
 TEST_CASE("RbacStore: seed data — operations", "[rbac_store]") {
@@ -108,13 +111,13 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store]") {
     RbacStore store(":memory:");
     auto perms = store.get_role_permissions("Administrator");
-    // 22 types * 5 CRUD ops = 110 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 111), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2) = 112 permissions total. Push and Attest
+    // 23 types * 5 CRUD ops = 115 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 116), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2) = 117 permissions total. Push and Attest
     // are deliberately NOT cross-seeded on other securables — see the rationale
-    // in rbac_store.cpp seed_defaults(). (22nd type: AccessReview, SOC 2 CC6.2;
-    // 21st: SoftwareLicensing, ADR-0024.)
-    CHECK(perms.size() == 112);
+    // in rbac_store.cpp seed_defaults(). (23rd type: EnginePrincipal, #2376;
+    // 22nd: AccessReview, SOC 2 CC6.2; 21st: SoftwareLicensing, ADR-0024.)
+    CHECK(perms.size() == 117);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
@@ -132,9 +135,9 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
 TEST_CASE("RbacStore: seed data — Viewer has read-only", "[rbac_store]") {
     RbacStore store(":memory:");
     auto perms = store.get_role_permissions("Viewer");
-    // 20 types * Read only (everything except Infrastructure; incl. Inventory +
-    // SoftwareLicensing, ADR-0024)
-    CHECK(perms.size() == 20);
+    // 21 types * Read only (everything except Infrastructure; incl. Inventory +
+    // SoftwareLicensing, ADR-0024, + EnginePrincipal, #2376)
+    CHECK(perms.size() == 21);
     for (auto& p : perms) {
         CHECK(p.operation == "Read");
         CHECK(p.effect == "allow");
