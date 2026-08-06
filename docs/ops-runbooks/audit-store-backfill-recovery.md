@@ -66,27 +66,48 @@ can declare the migration finished by hand. **This is an explicit acceptance
 that the pre-cutover trail is incomplete — record it in change management.**
 With the server stopped:
 
+**Before running the SQL below, move aside every legacy `audit.db` this
+deployment still holds** (see the recovery section above for the move-aside
+step) — this procedure records only that PostgreSQL's rows are being accepted
+as the complete trail; it does not, and cannot, record a fingerprint for
+content that is being declared lost. A host that still holds a legacy file at
+its configured path evaluates that file against `backfill_complete` on its
+next boot regardless of who set the marker or how — it will find the marker
+set, find no `backfill_source_fingerprint` to check it against, and land on
+the holder-side verification refusal above, not on the "already migrated"
+success this procedure is meant to produce.
+
 ```sql
 BEGIN;
--- Both statements are required. The identity sequence MUST be advanced past the
--- backfilled ids, or the first live write collides with one and fails.
+-- All three statements are required. The identity sequence MUST be advanced
+-- past the backfilled ids, or the first live write collides with one and
+-- fails.
 SELECT setval(pg_get_serial_sequence('audit_store.audit_events','id'),
               GREATEST((SELECT COALESCE(MAX(id),0) FROM audit_store.audit_events), 1),
               (SELECT COUNT(*) FROM audit_store.audit_events) > 0);
 INSERT INTO audit_store.audit_retention_meta (key, value)
 VALUES ('backfill_complete', EXTRACT(EPOCH FROM now())::bigint::text)
 ON CONFLICT (key) DO NOTHING;
+INSERT INTO audit_store.audit_retention_meta (key, value)
+VALUES ('backfill_source_fingerprint', 'abandoned')
+ON CONFLICT (key) DO NOTHING;
 COMMIT;
 ```
 
-(That is the same pair the server itself runs on a successful backfill —
-`stamp_complete` in `server/core/src/audit_store.cpp`.) Start the server
-afterwards; it will see a completed migration and serve.
+The third statement matters even though no host is meant to still hold a
+legacy file after the move-aside above: it is what makes the state visibly
+distinct from a genuine content-backed backfill (`count:id_sum:ts_sum:ts_min:
+ts_max`, never the literal string `abandoned`) to anyone reading
+`audit_retention_meta` later — a DBA diagnosing a future issue can tell at a
+glance that this deployment's pre-cutover trail was declared incomplete by
+hand, not migrated. Start the server afterwards; it will see a completed
+migration and serve.
 
 **This procedure does NOT apply to the holder-side verification refusal
-above** — that refusal happens with the marker ALREADY set, so the `INSERT
-... ON CONFLICT (key) DO NOTHING` above is a no-op for it. See that section
-for the correct recovery instead.
+above** — that refusal happens with the marker ALREADY set, so the first
+`INSERT ... ON CONFLICT (key) DO NOTHING` above is a no-op for it, and the
+second only reinforces a mismatch that section's fingerprint comparison would
+already have refused on. See that section for the correct recovery instead.
 
 **Not affected:** the audit event vocabulary and REST/MCP query surface are
 unchanged; SIEM export recipes keep working. One deliberate behaviour change: on

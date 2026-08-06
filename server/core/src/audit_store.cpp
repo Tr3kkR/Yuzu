@@ -639,7 +639,8 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             if (exists_ec) {
                 spdlog::error(
                     "AuditStore: migrate_from_sqlite: cannot stat legacy path {} to verify a "
-                    "completed backfill: {}; refusing rather than assuming the file is gone.",
+                    "completed backfill: {}; refusing rather than assuming the file is gone. See "
+                    "docs/ops-runbooks/audit-store-backfill-recovery.md.",
                     legacy_db_path.string(), exists_ec.message());
                 backfill_metric("failed");
                 return false;
@@ -712,7 +713,8 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             if (!legacy_fp) {
                 spdlog::error("AuditStore: migrate_from_sqlite: marker present but legacy {} "
                               "fingerprint read failed; refusing to serve without proof this "
-                              "host's trail was migrated.",
+                              "host's trail was migrated. See "
+                              "docs/ops-runbooks/audit-store-backfill-recovery.md.",
                               legacy_db_path.string());
                 backfill_metric("failed");
                 return false;
@@ -1220,7 +1222,7 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             // runs — its own INSERT is `ON CONFLICT (key) DO NOTHING`, so the
             // REAL, freshly-computed fingerprint silently loses to whatever
             // arrived here first (Gate 2 security HIGH finding, round 3).
-            if (key.rfind("backfill_", 0) == 0)
+            if (key.starts_with("backfill_"))
                 continue;
             // The legacy table is not STRICT, so this column can hold a
             // non-integer. `sqlite3_column_int64` would COERCE that to 0, and 0
