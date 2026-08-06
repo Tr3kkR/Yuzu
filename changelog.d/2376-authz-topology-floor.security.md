@@ -33,4 +33,4 @@
   authenticated session on an RBAC-off install, so the floor was reachable around.
   See
   `docs/security-reviews/authz-topology-floor-2026-08-05.md` for the recorded decision and
-  `docs/user-manual/server-admin.md` "Upgrade Notes" for the remediation steps.
+  `docs/user-manual/server-admin.md` "Upgrade Notes" for the remediation steps. **`GET /api/v1/management-groups/{id}/roles` now additionally requires `UserManagement:Read`:** its whole body is the scoped principal→role assignment graph, and `ManagementGroup:Read` alone is not floored, so on an RBAC-off install any authenticated session could enumerate every scoped role assignment. There is no non-topology half here, so this is a second required permission rather than a split.

@@ -1962,6 +1962,26 @@ void RestApiV1::register_routes(
              [perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "ManagementGroup", "Read"))
                      return;
+                 // #2376 — this response is ENTIRELY authorization topology: every row
+                 // is {principal_type, principal_id, role_name}, i.e. who holds what
+                 // role in this group. `ManagementGroup:Read` is deliberately NOT in
+                 // the topology floor (it gates ordinary group metadata and member
+                 // lists, and flooring it would be the too-coarse mistake the floor
+                 // avoids with Security:Read), so on an RBAC-off install the legacy
+                 // Read-allow handed this graph to any authenticated session.
+                 //
+                 // Unlike /discover/permissions there is no non-topology half to
+                 // preserve, so this is a second REQUIRED permission rather than a
+                 // probe-and-withhold: the caller must be allowed to see the group AND
+                 // allowed to see role assignments. `UserManagement:Read` is the floored
+                 // securable that already gates the equivalent /api/v1/rbac/roles.
+                 //
+                 // Third instance of this shape found in this change (after
+                 // /discover/permissions and its MCP twin) — the floor SET is derived
+                 // from the DATA a route emits, never from the securable it happens to
+                 // be gated on. See the routed-concerns row.
+                 if (!perm_fn(req, res, "UserManagement", "Read"))
+                     return;
                  if (!mgmt_store) {
                      res.status = 503;
                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");

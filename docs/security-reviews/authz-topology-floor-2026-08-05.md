@@ -265,6 +265,45 @@ only, not the grid). A new test also pins every floored pair against the store's
 own `list_securable_types()`/`list_operations()`, so a floor entry naming a
 securable that is never seeded fails loudly instead of protecting nothing.
 
+### 9. Third instance, same shape — and the enumeration that should have been decision 1
+
+Hermes (pre-submission security pass) found
+`GET /api/v1/management-groups/{id}/roles` emitting the scoped principal→role
+assignment graph (`{group_id, principal_type, principal_id, role_name}`) on
+`ManagementGroup:Read`, which is deliberately **not** floored. Third instance of
+the shape decision 8 names, found after a 14-agent governance run **and** a
+two-model adversarial panel had both passed the change.
+
+Fixed by requiring the floored `UserManagement:Read` **in addition to** the
+route's own `ManagementGroup:Read`. Note this is a different remedy from decision
+8's split, and deliberately so: `/discover/permissions` has a non-topology half
+worth preserving, this route's body is topology end to end, so there is nothing
+to withhold — the correct answer is a second required permission, not a
+probe.
+
+**The enumeration, now done and recorded so the next change does not re-derive
+it.** Surfaces that emit authorization topology, and the securable each is gated
+on today:
+
+| Surface | Gate | Floored? |
+|---|---|---|
+| `GET /api/v1/access-reviews/export`, `/{id}`, list | `AccessReview:Read` | yes |
+| `GET /api/v1/rbac/roles`, `/{role}/permissions` | `UserManagement:Read` | yes |
+| `GET /api/v1/engine-principals`, `/{id}`, `/{id}/roles` + MCP twins | `EnginePrincipal:Read` | yes (cut by this change) |
+| `GET /api/v1/discover/permissions` + MCP twin — role grid half | `Infrastructure:Read` **+ probed** `UserManagement:Read` | yes, for the grid |
+| `GET /api/v1/management-groups/{id}/roles` | `ManagementGroup:Read` **+** `UserManagement:Read` | yes, via the second gate |
+| `GET /api/v1/engine-principals/audit/no-admin` + MCP twin | `AuditLog:Read` | **no — deliberate** |
+
+The last row is deliberate and should not be "fixed" without a decision: it is an
+evidentiary auditor surface that returns **violations only** (principals holding
+admin), not the grant graph, and it exists so an auditor without grant-graph
+access can still prove the no-admin invariant.
+
+Internal readers of the same data that do **not** emit it — `rest_api_v1.cpp`'s
+three `get_group_roles` call sites that test whether the *caller* is an
+`ITServiceOwner`, and the self-read of one's own roles — are correctly outside
+this table.
+
 ## Hard-invariant check
 
 - The floor set is a fixed, `constexpr` array (`kTopologyFloor`) — no
