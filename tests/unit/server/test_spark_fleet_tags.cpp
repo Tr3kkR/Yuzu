@@ -96,8 +96,9 @@ TEST_CASE("agent emit keys bind exactly to the server tag constants", "[spark][f
     using yuzu::agent::SparkEngineStats;
     using yuzu::agent::SparkMechanismStats;
 
-    // The set of keys the server READER recognises: the six fixed keys + every
-    // composed per-{mechanism,metric} key.
+    // The set of keys the server READER recognises: the fixed keys + every composed
+    // per-{mechanism,metric} key. Deliberately uncounted - the count was stale at
+    // seven before #2270 added an eighth (Gate 9, doc9-4).
     std::set<std::string> reader_keys = {
         detail::kSparkTagRunning,        detail::kSparkTagDisabled,
         detail::kSparkTagMechs,          detail::kSparkTagArmedFaulted,

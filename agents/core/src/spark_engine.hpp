@@ -278,7 +278,8 @@ public:
     /// (#1994). Same set-then-use contract. No locks are held when it fires.
     void set_disarm_race_hook_for_test(std::function<void()> hook);
     /// Test seam (#2270): if set, invoked at each labelled allocation point inside
-    /// arm_impl() AND inside start()'s pre-start replay (phase 2 fires from both —
+    /// arm_impl() AND inside start()'s pre-start replay (kArmFaultPhaseWatchErrorBuild
+    /// fires from both — named, not numbered, so a future renumber cannot strand this —
     /// watch_guarded is shared by the two arm paths, and a replay case depends on it).
     /// A test throws from the phase it wants to simulate an allocation failure at,
     /// which is the only way to exercise the strong-guarantee path deterministically —
@@ -305,8 +306,10 @@ public:
     /// ORDINAL 3, NOT 2, DELIBERATELY. Ordinal 2 was `kArmFaultPhaseAfterCommit` until
     /// 6c1d6942 deleted it with the post-commit rollback. Round 4 first reintroduced 2
     /// under this new meaning, which meant a pre-round-4 test or ledger row citing
-    /// "phase 2" resolved to something else entirely — and seven ledger rows across the
-    /// two #2270 fragments do cite it. Renumbered to 3 so retired ordinals stay retired
+    /// "phase 2" resolved to something else entirely — and ledger rows in both #2270
+    /// fragments do cite it (CA8-1 owns the count; a count quoted here would decay with
+    /// every appended row, which governance.d/README.md forbids). Renumbered to 3 so
+    /// retired ordinals stay retired
     /// (Gate 8 — CA8-1, doc8-2). Retired so far: 2. Add the next phase as 4, and
     /// document its lock contract as both live phases do.
     static constexpr int kArmFaultPhaseWatchErrorBuild = 3;

@@ -627,10 +627,10 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
     // disarm(), emit_event dispatch and every other arm(), on the ordinary success
     // path, to save work only a failing arm needs (governance round 4, happy-path
     // HP-1 + sre). `event_driven` is known here, so the shape test that matters is
-    // available without the lock. Four shapes now build carriers they will not use -
-    // a deduped event-driven arm, a PRE-START event-driven arm (which previously built
-    // nothing, since the build sat inside `if (running_)`), and an arm rejected inside
-    // the lock for `stopped_` or an unsupported type. All are bounded, per-call, and off
+    // available without the lock. Four shapes now build carriers they will not use:
+    // a deduped event-driven arm; a PRE-START event-driven arm (which previously built
+    // nothing, since the build sat inside `if (running_)`); and an arm rejected inside
+    // the lock, either for `stopped_` or for an unsupported type - two shapes. All are bounded, per-call, and off
     // the mutex, which is the cheaper side of the trade (Gate 8 - SRE8-4).
     std::string consumer_race_msg;
     std::string disarmed_mid_arm_msg;
@@ -858,9 +858,11 @@ void SparkEngine::teardown_arm_race(SubscriptionId id, const std::string& key, S
         // SCOPE OF THIS HARDENING, stated exactly because an earlier revision overclaimed
         // it (Gate 8 — sec8-3, CA8-2): `located` covers the find and the erase_if it
         // guards, and NOTHING further. It is a reference INTO sub_keys_, so it dangles
-        // the moment sub_keys_.erase(ki) runs below — the log, the M2 re-check and the
-        // unwatch necessarily keep using the caller's `key`, which is sound because the
-        // two are provably equal (one insert site, ids never reused). Copying it out to
+        // the moment sub_keys_.erase(ki) runs below. The M2 re-check and the unwatch are
+        // both AFTER that erase, so they can only use the caller's `key` — sound because
+        // the two are provably equal (one insert site, ids never reused). The log below
+        // is before the erase and could use either; it uses `key` for consistency, not
+        // necessity (Gate 9 — CA9-3/sec9-4 caught the earlier wording lumping all three). Copying it out to
         // use later would reintroduce exactly the allocation this teardown exists to
         // avoid. Do not "finish the job" by binding it wider without reading this.
         const std::string& located = ki->second;
@@ -921,8 +923,8 @@ void SparkEngine::teardown_arm_race(SubscriptionId id, const std::string& key, S
         //   * Linux/sd-bus: the OS watch outlives its armed_ entry and IS reclaimed by
         //     stop() (and by unregister_consumer, and re-adopted by a later equal-spec
         //     arm, since watch() is idempotent per key).
-        //   * WINDOWS/spark_file: worse. push_retiring() takes the OWNING unique_ptr BY
-        //     VALUE,
+        //   * WINDOWS/spark_file: worse. push_retiring() takes the OWNING unique_ptr by
+        //     value,
         //     so a throwing push_back destroys it with an IOCP completion still
         //     pending, and stop()'s UAF quarantine walks dirs_/ancestors_/retiring_ —
         //     none of which now hold it. The completion dangles for the REMAINING

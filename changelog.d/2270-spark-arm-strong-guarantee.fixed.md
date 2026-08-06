@@ -8,7 +8,6 @@
   watching a target fails during this cleanup, the watch is not reclaimed — on Windows it
   can persist for the life of the agent process, so only restarting the agent releases it.
   The agent counts it and ships the count in its heartbeat as
-  `yuzu.spark_arm_race_unwatch_failures`; a fleet-wide metric, a dashboard view and an
-  alert are not built yet and arrive when Spark detection is enabled, so today this is not
-  something an operator can query. Spark detection is not yet the active path in a default
-  install, so this affects deployments only once it is enabled.
+  `yuzu.spark_arm_race_unwatch_failures`; no fleet metric, dashboard or alert consumes it
+  yet, so it is not queryable today (#2270). Spark detection is not the active detection
+  path in a default install, so this affects deployments only where that has been turned on.
