@@ -92,22 +92,32 @@ struct SparkEngineStats {
     std::uint64_t watch_faults_total{0}; ///< mechanism fault reports (post-arm deaf edges), monotonic
     /// Mechanism unwatch() calls that THREW during the ARM-RACE teardown (#2270).
     /// SCOPE IS IN THE NAME ON PURPOSE: this covers teardown_arm_race ONLY. disarm()
-    /// has its own counter below; unregister_consumer() still PROPAGATES and is counted
-    /// by NEITHER, so a zero across both does NOT mean "no orphaned watches
-    /// fleet-wide". Every other counter in this struct is scope-complete; these two are
-    /// not, and an alert built on either must say so.
-    /// Non-zero means an OS watch outlived its armed_ entry: on Linux it is reclaimed
-    /// by stop(), on Windows it can persist for the life of the process (see
-    /// teardown_arm_race for why the bound differs per platform).
+    /// has its own counter below. unregister_consumer() is NOT a peer of these two —
+    /// its unwatch() still propagates UNCONTAINED, and the consequence is worse than
+    /// an uncounted orphaned watch: escaping a void function there permanently
+    /// strands the consumer's dispatch thread (#2814). A zero across both counters
+    /// below does NOT mean "no orphaned watches fleet-wide", and does not speak to
+    /// #2814 at all. Every other counter in this struct is scope-complete; these two
+    /// are not, and an alert built on either must say so.
+    /// Non-zero means an OS watch outlived its armed_ entry. Reclamation is
+    /// mechanism-dependent, not simply OS-dependent: a File watch (Windows-only
+    /// mechanism) is never reclaimed short of a process restart; a Service watch
+    /// (Linux or Windows) is reclaimed the next time stop() runs; a Registry watch
+    /// (Windows-only mechanism) cannot fail this way at all — its unwatch()
+    /// allocates nothing (see teardown_arm_race for the per-mechanism detail).
+    /// macOS is out of scope for all of the above: every mechanism factory returns
+    /// nullptr there (`spark_mechanism.hpp`), so `mech` is always null and this
+    /// counter is structurally unreachable on that platform.
     /// Monotonic. Surfaced as the sparse heartbeat tag `yuzu.spark_arm_race_unwatch_failures`;
     /// the fleet rollup, metrics.md row and alert rule are deferred to the
     /// prefer_spark flip alongside `retiring`/`retiring_cap` (spark_fleet_tags.hpp).
     std::uint64_t arm_race_unwatch_failures_total{0};
     /// Mechanism unwatch() calls that THREW during an ordinary disarm() teardown (#2270).
-    /// The sibling of the counter above, and scoped the same way on purpose: that one
+    /// The counterpart of the counter above, scoped the same way on purpose: that one
     /// covers teardown_arm_race, this one covers disarm(). Neither covers
-    /// unregister_consumer(), which still propagates, so a zero across BOTH is still not
-    /// "no orphaned watches fleet-wide". Same platform bound as its sibling.
+    /// unregister_consumer() (#2814, worse in kind — see above), so a zero across
+    /// BOTH is still not "no orphaned watches fleet-wide". Same per-mechanism
+    /// reclamation bound as its counterpart.
     std::uint64_t disarm_unwatch_failures_total{0};
     std::uint64_t consumer_threads_detached{0}; ///< handlers that blocked past the shutdown budget
     std::uint64_t events_total{0};       ///< spark fires (post-dedup, pre-fan-out)

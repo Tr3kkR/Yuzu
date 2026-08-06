@@ -950,8 +950,9 @@ void SparkEngine::teardown_arm_race(SubscriptionId id, const std::string& key, S
             arm_race_unwatch_failures_.fetch_add(1, std::memory_order_relaxed);
             try {
                 spdlog::error("SparkEngine: unwatch('{}') threw during consumer-race teardown - "
-                              "the OS watch is NOT reclaimed; on Windows it persists for the "
-                              "life of this process",
+                              "the OS watch is not reclaimed by this call; a File watch "
+                              "(Windows) persists until a process restart, other mechanisms "
+                              "are reclaimed at the mechanism's stop()",
                               key);
             } catch (...) {
             }
@@ -1054,8 +1055,9 @@ void SparkEngine::disarm(SubscriptionId id) {
             disarm_unwatch_failures_.fetch_add(1, std::memory_order_relaxed);
             try {
                 spdlog::error("SparkEngine: unwatch('{}') threw during disarm - the OS watch "
-                              "is NOT reclaimed; on Windows it persists for the life of this "
-                              "process",
+                              "is not reclaimed by this call; a File watch (Windows) persists "
+                              "until a process restart, other mechanisms are reclaimed at the "
+                              "mechanism's stop()",
                               unwatch_key);
             } catch (...) {
             }

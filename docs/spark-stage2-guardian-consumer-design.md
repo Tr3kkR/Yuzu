@@ -589,18 +589,24 @@ and MCP `tools/list`), and enforces RBAC + audit at the API layer — not a
 dashboard fragment. This section ticks every #1939 item.
 
 ### Fleet metrics (agent heartbeat → Prometheus)
-- **`arm_race_unwatch_failures_total` (#2270 — agent side SHIPPED, fleet rollup
-  DEFERRED):** counts mechanism `unwatch()` calls that THREW during `arm_impl`'s
-  consumer-race teardown, where the throw is contained rather than propagated. Emitted
-  as the sparse heartbeat tag `yuzu.spark_arm_race_unwatch_failures`. **Scope is in the
-  name and is deliberately not fleet-wide:** it covers `teardown_arm_race` only — the
-  sibling `disarm()` and `unregister_consumer()` unwatch sites propagate and are NOT
-  counted, so a zero does not mean "no orphaned watches". The `{os}` rollup, the
-  `docs/user-manual/metrics.md` row and an alert rule are **deferred to the
+- **`arm_race_unwatch_failures_total` / `disarm_unwatch_failures_total` (#2270 — agent
+  side SHIPPED, fleet rollup DEFERRED):** two counters, both counting mechanism
+  `unwatch()` calls that THREW, where the throw is contained rather than propagated —
+  `arm_race_unwatch_failures_` during `arm_impl`'s consumer-race teardown
+  (`teardown_arm_race`), `disarm_unwatch_failures_` during `disarm()`. Emitted as the
+  sparse heartbeat tags `yuzu.spark_arm_race_unwatch_failures` and
+  `yuzu.spark_disarm_unwatch_failures`. **Scope is in the names and is deliberately not
+  fleet-wide:** the two together cover `teardown_arm_race` and `disarm()` only.
+  `unregister_consumer()`'s unwatch site is not a peer of these two — it still
+  propagates UNCONTAINED, and the consequence is worse than an uncounted orphaned
+  watch: escaping a void function there permanently strands the consumer's dispatch
+  thread (tracked as #2814). Two zeros do not mean "no orphaned watches", and say
+  nothing about #2814 at all. The `{os}`
+  rollup, the `docs/user-manual/metrics.md` row and an alert rule are **deferred to the
   `prefer_spark` flip** on the same grounds as `retiring`/`retiring_cap`
-  (`spark_fleet_tags.hpp`): with `prefer_spark_` false nothing arms, so the gauge would
-  be structurally absent fleet-wide and unfalsifiable. Tracked as item (d) of the flip
-  gate above.
+  (`spark_fleet_tags.hpp`): with `prefer_spark_` false nothing arms, so the gauges
+  would be structurally absent fleet-wide and unfalsifiable. Tracked as item (d) of the
+  flip gate above.
 - **Agent:** emit `SparkEngineStats` as `yuzu.spark_*` heartbeat `status_tags`.
   `SparkEngineStats` (`spark_engine.hpp`, the `SparkEngineStats` struct) carries `armed_faulted`,
   `watch_faults_total`, `mech_watch_rejected_total`, `mech_quarantined_total`,
@@ -1121,19 +1127,30 @@ Each rung is an independently-governed PR on `dev`, run through the full
        silently dropped.
      - **Two residues gate PR-2 and own no issue**, recorded here because a gate list
        that enumerates only issue-backed items reads as complete when it is not.
-       (a) `SparkEngine::disarm`'s allocating prologue
-       (`spark_engine.cpp:966`/`:972`/`:980`) PROPAGATES where `teardown_arm_race`
-       contains (`spark_engine.cpp:912`). A throw there abandons
-       `detach_rule_locked` after `index_->remove_rule` but before `keys_.erase`, so
-       the next push's `keys_.emplace` silently no-ops on the stale entry and the
-       fresh subscription is discarded — a permanently leaked subscription plus a
-       `keys_`/`index_` desync, on a rule the server counts as applied. Ledger
-       `CH8-2`/`UP8-1`/`UP-4`. #2818's incarnation-token fix shape would close the
-       `keys_.emplace` half. (b) The `{os}` fleet rollup, the `metrics.md` row and
-       the alert rule for `arm_race_unwatch_failures` — `spark_fleet_tags.hpp:82`
-       defers all three to this flip IN CODE, so the flip makes an agent-side
-       resource leak measurable at the endpoint and invisible at the fleet. Ledger
-       `arch8-2`.
+       (a) CLOSED by `5858844c` (`SparkEngine::disarm`'s in-lock teardown made
+       allocation-free) and `444c2458` (disarm's trailing `unwatch()` contained and
+       counted, matching `teardown_arm_race`) — the allocating prologue this residue
+       used to describe no longer allocates. Ledger `CH8-2`/`UP8-1` were adjudged
+       discharged on the merits by security-guardian after the fix (pass-10 evidence
+       row owed); `UP-4` deduped separately. A narrower residual remains, different in
+       kind: two ops between the (now allocation-free) bookkeeping and the
+       contained `unwatch()` still propagate uncontained — the two `std::lock_guard`
+       constructions at `spark_engine.cpp:1030`/`:1032` (mutex acquisition can raise
+       `std::system_error`). `mech_ops_mu_by_type_.at(unwatch_type)` on the same
+       line does NOT: the map is populated in lockstep with `mechanisms_` at
+       registration and frozen after `start()`, so the lookup key is always present
+       (`spark_engine.hpp:212-219`). By this point `disarm`'s OWN bookkeeping
+       (`armed_`/`sub_keys_`) is already committed, so a throw here does not desync
+       the engine's own state the way the old defect did — the consequence is
+       narrower: the `unwatch()` is never attempted, so neither counter increments
+       and the OS watch is never even asked to release. `teardown_arm_race`
+       documents the same residual on its own declaration
+       (`spark_engine.hpp:437-438`); `disarm` now does too. (b) The `{os}` fleet
+       rollup, the `metrics.md` row and the alert rule for BOTH
+       `arm_race_unwatch_failures` and `disarm_unwatch_failures` —
+       `spark_fleet_tags.hpp:82` defers all three to this flip IN CODE, so the flip
+       makes an agent-side resource leak measurable at the endpoint and invisible at
+       the fleet. Ledger `arch8-2`.
 
      - **PR-1 (inert hardening, `prefer_spark` stays false — zero change to
        detection/enforcement *placement*).** The shared drift-event builder;
