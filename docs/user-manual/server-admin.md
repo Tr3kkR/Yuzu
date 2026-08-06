@@ -76,7 +76,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
 | `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
 | `--mcp-no-streaming` | off | Disable the MCP **Streamable HTTP** transport (ADR-1005 Decision 15): no `Mcp-Session-Id` minting, `GET`/`DELETE /mcp/v1/` return `405`, and only plain JSON-RPC POST is served. The spec-required `202` status on notification POSTs still applies. Use where a buffering reverse proxy interferes with streaming. Env: `YUZU_MCP_NO_STREAMING`. |
-| `--mcp-enable-streamed-post` | off | Enable **SSE-on-POST** (streamed POST) for `execute_instruction` callers that supply a `progressToken`. **Ships OFF.** The transport machinery is complete and reviewed, but two bounds defects are open against it: #2739 (the 120 s response cap does not fire while progress keeps arriving, so a response can stay open for the whole execution) and #2740 (a committed-but-undelivered final holds one of the session's four streamed slots, and four dropped connections lock that session out of streaming until it is deleted, restarted, resumed past, or left idle). Both are fixed in the follow-up PR, which turns this on by default. Enabling it today is supported but you own the two defects — size shutdown grace against your longest execution, not against the cap. Distinct from `--mcp-no-streaming`, which disables the whole transport including the session lifecycle and GET channel. |
+| `--mcp-enable-streamed-post` | off | Enable **SSE-on-POST** (streamed POST) for `execute_instruction` callers that supply a `progressToken`. **Ships OFF** — turning it on by default is a separate rung. The transport machinery is complete and reviewed, and the four defects that gated that flip are fixed: #2739 (the 120 s response cap is now enforced on a busy execution — after it expires the bridge delivers one final drain of already-latched progress and then settles, bounding the response at the cap plus at most two ~3 s pump ticks plus one mailbox drain), #2740 (a committed-but-undelivered final no longer locks a session out of streaming — admission reclaims the slot and audits it), #2785 (streamed-POST frames now carry the replay-ring event id, so a POST-only client can build a `Last-Event-ID` resume cursor) and #2789 (end-to-end coverage of the per-principal admission reject). Distinct from `--mcp-no-streaming`, which disables the whole transport including the session lifecycle and GET channel. |
 | `--mcp-allowed-origin` | *(none)* | **Repeatable.** An allowed `Origin` header value (`scheme://host:port`, exact match) for `/mcp/v1/` DNS-rebinding defence. An **absent** `Origin` is always allowed (the endpoint requires a credential); an **empty allowlist rejects any *present* Origin** (secure default) — browser-based MCP clients must be listed explicitly, non-browser clients need no configuration. Env: `YUZU_MCP_ALLOWED_ORIGINS`. |
 | `--max-sse-streams` | `128` | **Concurrent held-open SSE responses this server is sized for, across EVERY streaming surface** — `GET /mcp/v1/`, MCP streamed POST, `GET /api/v1/events`, the dashboard executions drawer, and the legacy `/events` stream. The HTTP worker pool is derived *from* this number: cpp-httplib is thread-per-connection, so each held-open response pins one worker for its whole life. That thread burns no CPU, and its resident cost is a fraction of a stack reservation that is virtual and platform-dependent (8 MB on Linux/glibc, 1 MB on Windows, 512 KB for macOS secondary threads). The resident fraction itself is **not yet measured** on our platforms (ADR-0034), so treat the default as a starting point rather than a sizing guarantee until a per-platform baseline exists. Utilisation is `yuzu_http_held_open_responses / yuzu_http_held_open_capacity`. The ceiling is thread-count; see ADR-0034. Env: `YUZU_MAX_SSE_STREAMS`. |
 | `--mcp-max-streams-per-principal` | `4` | Max concurrent MCP SSE streams for one principal. An **anti-monopoly policy, not a capacity limit** — capacity is `--max-sse-streams`. Stops a single agentic token taking the channel; does not ration the fleet. Env: `YUZU_MCP_MAX_STREAMS_PER_PRINCIPAL`. |
@@ -193,6 +193,147 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 ---
 
 ## Upgrade Notes
+
+### vNEXT — an authorization-topology floor now applies regardless of RBAC, and engine-principal reads move off `Security:Read` (#2376) (breaking)
+
+This note has **two independent breaking directions** — read both, they
+affect different deployments.
+
+**Direction 1 — RBAC-disabled installs lose three non-admin reads.**
+
+**Who this affects.** Any deployment running with `[rbac] enabled = false`
+(the shipped default) where a non-admin, authenticated session was relying
+on reading one of: the fleet-wide access-review export
+(`/api/v1/access-reviews*`), `GET /api/v1/rbac/roles`, or the
+engine-principal inventory/roles (`/api/v1/engine-principals*` and the
+`list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP
+tools). RBAC-enabled deployments are unaffected by this direction (see
+"Why" below).
+
+**Why.** RBAC ships disabled by default. With RBAC disabled, the legacy
+authorization fallback previously allowed **every** authenticated
+non-engine session to perform **every** `Read` — including reads of the
+authorization topology itself. A plain non-admin `user` on a default,
+just-installed server could read who holds what role and pull the complete
+access-review grant population that exists to be SOC 2 CC6.2 evidence. As
+of this release, `AccessReview:Read`, `UserManagement:Read`, and
+`EnginePrincipal:Read` (see Direction 2) require the `admin` session role
+**regardless of the RBAC toggle**. This is not configurable — there is no
+setting that reopens it. Full design rationale:
+`docs/security-reviews/authz-topology-floor-2026-08-05.md`.
+
+**What does NOT change.** A live RBAC grant is unaffected — under
+RBAC-**enabled** enforcement, a non-admin holding the seeded `Reviewer`
+role still reaches the access-review export exactly as before; a non-admin
+holding `UserManagement:Read`/`EnginePrincipal:Read` (e.g. the built-in
+`Viewer` role holds both) still reaches the other two reads. The floor only
+engages inside the RBAC-off legacy fallback.
+
+**What to do.** If a non-admin session needs one of these three reads,
+enable RBAC and grant the matching role:
+
+```cfg
+[rbac]
+enabled = true
+```
+
+- Access-review export → assign the built-in `Reviewer` role.
+- `/rbac/roles` → the built-in `Viewer` role already holds
+  `UserManagement:Read`, or grant it directly.
+- Engine-principal reads → the built-in `Viewer` role already holds
+  `EnginePrincipal:Read` (see Direction 2), or grant it directly.
+
+See [`rbac.md`](rbac.md) "The authorization topology floor" and "Before
+enabling RBAC in production" before flipping the toggle on a live fleet —
+turning RBAC on also applies management-group-scoped device visibility
+immediately.
+
+**Direction 2 — RBAC-enabled deployments with a custom role granted
+`Security:Read` for engine-principal access must re-grant.**
+
+**Who this affects.** Any RBAC-**enabled** deployment with a **custom**
+role (not `Administrator`/`Viewer`, which are updated automatically — see
+below) that was granted `Security:Read` specifically so its holders could
+reach `GET /api/v1/engine-principals*` or the
+`list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP
+tools.
+
+**Why.** Those reads moved off `Security:Read` onto a new, narrower
+`EnginePrincipal:Read` securable (the same move #2324 made cutting
+`AccessReview` away from `AuditLog:*`) — `Security:Read` also gates
+unrelated operational reads (quarantine visibility, CA issued-certs,
+`/ca/root-csr`, KEK status) that stay on `Security:Read` unchanged and
+un-floored.
+
+**What changes automatically.** No schema migration is required — the new
+`EnginePrincipal` securable and its `Administrator` (full CRUD) and
+`Viewer` (`Read`) grants are seeded idempotently on every server boot
+(`RbacStore::seed_defaults()`'s `INSERT OR IGNORE` loops), so the two
+built-in roles pick it up on the next boot automatically, with no operator
+action, matching exactly the access they held via `Security:Read` before
+this change.
+
+**What to do.** A custom role does **not** get this automatic re-seed.
+Check whether any custom role was granted `Security:Read` for this
+purpose, and if so, grant it `EnginePrincipal:Read` too — via the Settings
+UI or `RbacStore::set_permission()` directly. `Security:Read` alone no
+longer reaches `/api/v1/engine-principals*` or its MCP twins after this
+upgrade.
+
+**Direction 3 — API consumers of `GET /api/v1/discover/permissions` (and the MCP
+`discover_permissions` twin) lose the role grid unless they hold
+`UserManagement:Read`.**
+
+**Who this affects.** Anything reading the discovery catalogue's
+`roles[].permissions[]` under a principal that holds `Infrastructure:Read` but
+not `UserManagement:Read`.
+
+**What changes.** The route still returns `200` and the full
+`securable_types`/`operations` taxonomy — that half is unchanged and still needs
+only `Infrastructure:Read`. The `roles` key is replaced by `"roles_omitted": true`
+plus a `roles_omitted_reason`. A consumer that iterates `roles` must handle its
+absence; one that checks `roles_omitted` gets an unambiguous answer.
+
+**Why.** That grid is authorization topology, and strictly more of it than
+`GET /api/v1/rbac/roles` discloses — which this same change floors. Leaving it on
+the unfloored `Infrastructure:Read`, which every authenticated session holds on an
+RBAC-off install, left the floor reachable around. Flooring `Infrastructure:Read`
+itself was rejected: it gates ordinary operational reads and would have repeated
+the too-coarse mistake this change avoided with `Security:Read`.
+
+**What to do.** Grant the consuming principal `UserManagement:Read` if it
+legitimately needs the grid, or update it to read `roles_omitted`. Do not treat a
+missing `roles` key as "no roles exist" — that is precisely why the omission is
+declared.
+
+**Check your automation, not just your operators — this is the failure that
+hides.** Neither breaking direction produces a startup warning or a migration
+prompt. Both surface only as a `403` at some later moment, and that moment may
+be inside a script rather than in front of a person. Audit anything
+non-interactive that reads the three floored surfaces
+(`/api/v1/access-reviews/export`, `/api/v1/rbac/roles`,
+`/api/v1/engine-principals*` and their MCP twins) under a **non-admin** token:
+
+- A **compliance evidence collector** is the dangerous case. If it pulls the
+  access-review export on a schedule and treats a non-`2xx` as "no grants to
+  report" rather than as a hard failure, it will keep succeeding while
+  silently collecting nothing — potentially for a whole audit period. Confirm
+  yours fails loudly on `403`, and re-check the first collection after upgrade.
+- A **monitoring or inventory job** on a non-admin token will start logging
+  `403`s rather than breaking visibly.
+
+Either enable RBAC and grant the job's principal the appropriate role
+(`Reviewer` for access reviews, `UserManagement:Read` for `/rbac/roles`,
+`EnginePrincipal:Read` for engine-principal reads), or move the job to an admin credential.
+
+**One caveat on revoking a built-in role's grant.** Because the seed loops
+above run on *every* boot, a grant you deliberately remove from a built-in
+role — for example revoking `Viewer`'s `EnginePrincipal:Read` — is re-inserted
+on the next restart, with no audit line distinguishing it from an
+operator-set grant. This is long-standing behaviour for every seeded
+securable, not new here, but it is worth knowing before you narrow a built-in
+role: express the narrowing as a **custom role** or an explicit `deny` row
+instead, both of which survive a restart.
 
 ### vNEXT — the `mcp.` instruction-definition id prefix is reserved (#2442) (breaking)
 
@@ -448,15 +589,15 @@ the wire. Plain POST clients (mcp-remote, Claude Desktop) are unaffected.
 Three operator-visible consequences:
 
 - **Sizing.** A streamed POST holds an HTTP worker for up to its response cap
-  (120 s) — **but see #2739: that bound is not enforced on a busy execution, so size
-  against the execution's own duration until the follow-up PR lands.** Streamed POST
-  ships OFF by default for this reason (`--mcp-enable-streamed-post`). It leases from the same held-open budget as the GET channel, so total
+  (120 s), enforced on a busy execution too (#2739): after the cap expires the
+  bridge delivers one final drain of already-latched progress and then settles,
+  so the bound is the cap plus at most two ~3 s pump ticks plus one bounded
+  mailbox drain and its socket-write time — not the execution's duration. It
+  leases from the same held-open budget as the GET channel, so total
   concurrency is unchanged — but `TimeoutStopSec` and any container termination
-  grace period must be sized against your longest expected execution while #2739 is
-  open, not against the cap. (Once the follow-up PR lands and the cap is enforced,
-  120 s becomes the true bound and 30 s — which suited GET alone — is the figure to
-  move away from.) Under-sizing SIGKILLs mid-drain and silently drops in-flight
-  streams on deploy.
+  grace period should be sized above **120 s** with that margin in mind; 30 s —
+  which suited GET alone — is the figure to move away from. Under-sizing
+  SIGKILLs mid-drain and silently drops in-flight streams on deploy.
 - **Per-principal ceiling.** `--mcp-max-streams-per-principal` governs the GET
   channel. The streamed-POST allowance is a separate, fixed 4 per session (twinned
   to the replay ring's pin slots), so the real per-principal held-open ceiling is

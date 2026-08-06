@@ -502,7 +502,7 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_MCP_NO_STREAMING");
     app.add_flag("--mcp-enable-streamed-post", cfg.mcp_streamed_post_enable,
                  "Enable SSE-on-POST for execute_instruction callers that send a "
-                 "progressToken (OFF by default: #2739/#2740 are open against it)")
+                 "progressToken (OFF by default; turning it on is a separate rung)")
         ->envname("YUZU_MCP_ENABLE_STREAMED_POST");
     app.add_option("--mcp-allowed-origin", cfg.mcp_allowed_origins,
                    "Allowed Origin header value for /mcp/v1/ (scheme+host+port, exact match; "

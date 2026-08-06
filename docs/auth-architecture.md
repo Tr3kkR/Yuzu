@@ -1543,9 +1543,107 @@ Tests: `tests/unit/server/test_scim_store.cpp`,
 
 ## Granular RBAC (Phase 3)
 
-- 6 roles, 21 securable types, per-operation permissions, deny-override logic.
+- 6 roles, 23 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
+
+## The authorization topology floor (#2376)
+
+**The defect.** `RbacStore::rbac_enabled_` defaults `false`, so a fresh
+install runs with RBAC off — the default posture, not an edge case. With
+RBAC off, `AuthRoutes::require_permission`/`require_scoped_permission` fall
+through to a legacy branch (`server/core/src/auth_routes.cpp`, both
+functions, ~:713/~:919) that allows every `Read` to any authenticated
+non-engine session (see the `rbac_enforcement_in_effect` gate at ~:699,
+which is the branch above the legacy fallback — a live RBAC grant is always
+consulted first and returns before the legacy branch is ever reached; the
+legacy branch is reachable only when RBAC is disabled or the store is
+unwired). On a default install that gave a plain `user` session read access
+to the authorization TOPOLOGY itself: the fleet-wide access-review export
+(the surface that exists to **be** SOC 2 CC6.2 evidence — see "Periodic
+access reviews" below), `GET /api/v1/rbac/roles` (the RBAC role graph), and
+the engine-principal grant graph (`GET /api/v1/engine-principals*` and its
+MCP twins).
+
+**The fix has three parts**, all keyed off the single
+`server/core/src/authz_topology_floor.hpp` chokepoint:
+
+1. **A new `EnginePrincipal` securable** (`Read` only, so far), cut away
+   from the over-broad `Security:Read`. The engine-principal inventory and
+   grant-graph reads moved onto it: REST `GET /api/v1/engine-principals`,
+   `GET /api/v1/engine-principals/{id}`, `GET
+   /api/v1/engine-principals/{id}/roles`, and the MCP twins
+   `list_engine_principals`, `get_engine_principal`, `list_engine_roles`.
+   This is the same move #2324 made cutting `AccessReview` away from
+   `AuditLog:*` (see "Periodic access reviews" → "#2225 round 2" below) —
+   the same shape of over-broad-securable defect, closed the same way.
+   Seeded (`RbacStore::seed_defaults()`) to `Administrator` (full CRUD via
+   the existing cross-type loop) and `Viewer` (`Read`) — exactly the two
+   built-in roles that reached these routes via `Security:Read` before the
+   cut, so no built-in role's authority widens or narrows under
+   RBAC-enabled enforcement; only the RBAC-off legacy posture changes (see
+   below).
+2. **The topology floor itself**: `{AccessReview:Read, UserManagement:Read,
+   EnginePrincipal:Read}` require the `admin` session role regardless of
+   the RBAC on/off toggle, via `authz_topology_floor.hpp`'s
+   `topology_floor_applies()`. It is consulted **only** inside the legacy
+   (RBAC-off) fallback of `require_permission`/`require_scoped_permission`
+   — never ahead of, or instead of, the live-RBAC branch. That ordering is
+   load-bearing, not incidental: #2324 cut the dedicated `AccessReview`
+   securable specifically so a non-admin `Reviewer` role could be seeded
+   `AccessReview:Read` and reach the export without being `admin`. If the
+   floor ran ahead of the live-RBAC branch (or replaced it), it would deny
+   that seeded `Reviewer` grant and destroy the entire reason the
+   `AccessReview` securable exists. Because the live-RBAC branch in both
+   functions always `return`s (true or false) before the legacy branch's
+   code is reached, "floor only in the legacy branch" is structural, not a
+   convention that could silently drift — there is only one path into the
+   floor check.
+3. **Observability.** A floored denial gets a distinct audit reason —
+   `"topology floor: non-admin role denied <securable>:<operation>"` on the
+   `auth.permission_required`/`auth.scoped_permission_required` audit
+   actions, `result=denied` — instead of the generic `"non-admin role
+   denied ..."` an ordinary legacy write/delete/execute/approve denial
+   gets. It is also counted separately in
+   `yuzu_auth_topology_floor_denied_total{permission}`, so an operator can
+   alert on floored denials specifically rather than parsing audit-log
+   text.
+
+**Deliberately NOT floored, on purpose:**
+
+- **`Security:Read`** — considered and excluded because it is too coarse
+  for this purpose. It also gates quarantine visibility, CA issued-certs
+  (`GET /api/v1/ca/issued` and its `list_issued_certs` MCP twin),
+  `/ca/root-csr`, and KEK status — all operational reads, not authorization
+  topology. Flooring `Security:Read` wholesale would have swept those four
+  in too, denying them to non-admins on RBAC-off installs where they
+  currently work. This is exactly why the engine-principal reads were cut
+  to their own `EnginePrincipal` securable rather than floored on
+  `Security:Read` directly — a floor can only be as narrow as the
+  securable it keys on.
+- **`ApiToken:Read`** and **`ManagementGroup:Read`** — considered and
+  excluded for the same reason: they are operational data, not
+  authorization topology.
+
+The floor is **not configurable** — there is no toggle that widens it back
+open; a footgun that can re-open a security floor is not a feature. See
+`docs/security-reviews/authz-topology-floor-2026-08-05.md` for the full
+recorded decision, including why the floor is keyed on `(securable,
+operation)` rather than route path (an MCP tool call and an unrelated MCP
+tool call share the same `/mcp/v1/` wire path, so a route-keyed floor
+cannot distinguish `list_engine_roles` from `list_issued_certs`), and why
+`Viewer` keeps `EnginePrincipal:Read` under RBAC-enabled enforcement (a
+narrower RBAC-on role model is a separate decision from closing the
+RBAC-off gap, not taken here).
+
+**No schema migration.** `seed_defaults()` runs unconditionally on every
+`RbacStore` construction and its seed loops are `INSERT OR IGNORE`, so an
+existing deployment picks up the `EnginePrincipal` securable and its grants
+on the next boot with no migration required — the same mechanism that
+introduced `AccessReview` and `SoftwareLicensing`. A migration is needed
+only when a change cannot be expressed as an idempotent additive re-seed
+(`rbac_store.cpp`'s v4 migration *deletes* rows, which is why it needed
+one).
 
 ## On-behalf-of assertions rejected (ADR-1005 Interim rules)
 
@@ -1712,8 +1810,10 @@ walkthrough.
   behind a one-time secret-reveal panel, revoked rows showing `superseded_by` +
   revoke detail).
 - **REST gating:** every *mutating* route is human-admin + MFA-step-up gated;
-  the three read routes (list, get, `audit/no-admin`) are human-admin + RBAC
-  gated (`Security:Read`/`AuditLog:Read`) but not step-up gated. Every route —
+  the three read routes are human-admin + RBAC gated but not step-up gated —
+  list and get on `EnginePrincipal:Read` (moved off the over-broad
+  `Security:Read` by #2376, see "The authorization topology floor" above), and
+  `audit/no-admin` on `AuditLog:Read`. Every route —
   reads included — structurally denies a caller whose own session is
   engine-classed (`principal_kind="engine"` / `auth_source="engine_token"`, the
   §9 belt): an engine principal can never read or mutate its own or another

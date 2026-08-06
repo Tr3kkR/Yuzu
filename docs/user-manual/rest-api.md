@@ -755,7 +755,7 @@ The same ownership constraint applies to the HTMX dashboard path `DELETE /api/se
 
 Engine principals are the durable identities behind autonomous use-case-engine modules (ADR-1005 item 2b) — a distinct principal class from human users and human-created API tokens, with a named responsible human owner, a grant justification captured at creation, and a required `internal`/`external` classification. Design reference: `docs/auth-engine-principals-design.md`. Every credential minted against an engine principal is hard-locked to MCP tier `readonly` and can never be granted the admin/wildcard role ("no admin, ever" — independently provable via the auditor route below).
 
-**Every *mutating* route is admin + MFA-step-up gated.** The read routes (`GET`/list, `GET /{id}`, and `GET /audit/no-admin`) are admin + RBAC gated (`Security:Read` / `AuditLog:Read`) but do **not** require a fresh MFA step-up. Beyond that, every route — reads included — structurally denies a caller whose *own* session is engine-classed (`principal_kind="engine"` or `auth_source="engine_token"`): an engine principal can never enumerate, read, or mutate any entry on this surface, not even itself. A denied engine-classed caller gets `403`; the corresponding audit verb is recorded with `result=denied`.
+**Every *mutating* route is admin + MFA-step-up gated.** The read routes (`GET`/list, `GET /{id}`, and `GET /audit/no-admin`) are admin + RBAC gated (`EnginePrincipal:Read` for the two engine-principal reads, `AuditLog:Read` for `/audit/no-admin`) but do **not** require a fresh MFA step-up. Beyond that, every route — reads included — structurally denies a caller whose *own* session is engine-classed (`principal_kind="engine"` or `auth_source="engine_token"`): an engine principal can never enumerate, read, or mutate any entry on this surface, not even itself. A denied engine-classed caller gets `403`; the corresponding audit verb is recorded with `result=denied`.
 
 **Storage failure:** if the engine-principal store failed to open at startup (no PostgreSQL configured, or a migration failure), every route on this surface returns `503 service unavailable`.
 
@@ -815,7 +815,7 @@ Create a new engine-principal identity. `principal_id` is derived server-side as
 
 List every engine principal (all lifecycle states), with each principal's active-credential count.
 
-**Permission:** `Security:Read`
+**Permission:** `EnginePrincipal:Read`
 
 **Response:**
 
@@ -845,7 +845,7 @@ List every engine principal (all lifecycle states), with each principal's active
 
 Get one engine principal's full identity row plus its active credentials (token id, name, timestamps, rotation group, overlap-expiry — never the raw secret; `token_hash` stays masked). `active_credentials` here is an **array** of credential objects — contrast with the list route above (`active_credential_count`, an integer) and with the MCP `get_engine_principal` twin, whose `active_credentials` field is an integer count under the same field name (see `docs/user-manual/mcp.md`).
 
-**Permission:** `Security:Read`
+**Permission:** `EnginePrincipal:Read`
 
 **Errors:** `404` — engine principal not found. `503` — engine-principal store unavailable (not open, or the read itself failed).
 
@@ -1720,7 +1720,7 @@ role, or a wildcard role. `POST .../roles` **rejects** such a request outright
 
 List the fleet-wide roles currently assigned to an engine principal.
 
-**Permission:** `Security:Read`
+**Permission:** `EnginePrincipal:Read`
 
 **Response:**
 
@@ -1735,7 +1735,7 @@ List the fleet-wide roles currently assigned to an engine principal.
 
 An unknown or revoked `{id}` is not distinguished here — it simply returns an
 empty `data` array (no RBAC row can exist for a principal that was never
-granted one). Errors: `403` (missing `Security:Read`), `503` (RBAC store
+granted one). Errors: `403` (missing `EnginePrincipal:Read`), `503` (RBAC store
 unavailable).
 
 ---
@@ -2421,9 +2421,10 @@ flag it for revocation. Covers all three RBAC principal types: **user**,
 > earlier round of this feature gated it on `AuditLog:Read`/`AuditLog:Attest`
 > instead, which over-disclosed the full grant population to the `Operator`
 > and `PlatformEngineer` roles (both seeded `AuditLog:Read` for unrelated
-> reasons, neither seeded `UserManagement:Read`/`Security:Read`, the
+> reasons, neither seeded `UserManagement:Read`/`EnginePrincipal:Read`, the
 > permissions gating the equivalent-sensitivity `/rbac/roles` and
-> `/engine-principals/{id}/roles` routes). See
+> `/engine-principals/{id}/roles` routes — the latter moved off the
+> over-broad `Security:Read` in #2376). See
 > `docs/security-reviews/access-reviews-2026-07-21.md` "#2225 round 2" for
 > the finding and fix.
 
@@ -3677,9 +3678,32 @@ All five share the same caching contract: a content-derived `ETag` header + `Cac
 
 #### `GET /api/v1/discover/permissions`
 
-RBAC permission catalog: every `securable_type` × `operation` pair the RBAC store recognizes, plus the full role → allowed-operations grid.
+RBAC permission catalog. The response has **two halves with different permissions** (#2376):
 
-**Permission:** `Infrastructure:Read`
+- the **taxonomy** — `securable_types` and `operations`, i.e. what the RBAC model can express —
+  requires only the route's own `Infrastructure:Read`. It says nothing about who holds what, and an
+  agentic worker needs it to author a grant at all (A2 discovery).
+- the **role grid** — `roles[].permissions[]`, every role's actual granted securable/operation/effect
+  — additionally requires **`UserManagement:Read`**. That grid *is* authorization topology, and it is
+  strictly more than `GET /api/v1/rbac/roles` discloses, so it carries the same permission the
+  authorization-topology floor applies there.
+
+A caller holding `Infrastructure:Read` but not `UserManagement:Read` still gets `200` and the full
+taxonomy; the grid is replaced by `"roles_omitted": true` plus a `roles_omitted_reason`. **The
+omission is declared, never silent** — `roles` absent with no `roles_omitted` flag would mean
+"no roles exist", which is a different fact.
+
+**Permission:** `Infrastructure:Read` (taxonomy) · `UserManagement:Read` (role grid)
+
+**Caching:** because the body varies with the caller's grants, this route responds
+`Cache-Control: private, max-age=300` with `Vary: Authorization, Cookie` — never `public`.
+A shared cache must not store one caller's representation and serve it to another.
+`GET /api/v1/discover/plugins` is `private` for the same reason (its `parameter_schema`
+enrichment is gated on `InstructionDefinition:Read`); the caller-independent catalogues
+(`instructions`, `routes`, `scope-kinds`) remain `public, max-age=300`. `Vary` names all
+three credential channels this server accepts — `Cookie`, `Authorization` and
+`X-Yuzu-Token` — because a caller-local cache keyed on only some of them can serve one
+API-token caller's representation to another.
 
 **Response:**
 ```json
@@ -3698,6 +3722,14 @@ RBAC permission catalog: every `securable_type` × `operation` pair the RBAC sto
       ]
     }
   ]
+}
+```
+
+Without `UserManagement:Read` the `roles` key is replaced by:
+```json
+{
+  "roles_omitted": true,
+  "roles_omitted_reason": "requires UserManagement:Read (#2376 authorization-topology floor); the securable_types and operations taxonomy above is unaffected"
 }
 ```
 

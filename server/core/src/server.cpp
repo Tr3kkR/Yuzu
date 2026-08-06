@@ -523,7 +523,10 @@ public:
                           "gauge");
         metrics_.describe("yuzu_mcp_streamed_post_enabled",
                           "1 if SSE-on-POST is enabled (--mcp-enable-streamed-post), else 0. "
-                          "Ships 0: #2739 and #2740 are open against that surface",
+                          "Ships 0; the four defects that gated the on-by-default flip "
+                          "(#2739, #2740, #2785, #2789) are fixed, but the flip itself is a "
+                          "separate rung. If this reads 1, size shutdown grace per the Sizing "
+                          "bullet in docs/user-manual/server-admin.md",
                           "gauge");
         metrics_.describe("yuzu_mcp_stream_closes_total", "MCP SSE streams closed, by reason",
                           "counter");
@@ -629,14 +632,58 @@ public:
                           "charge was outstanding; held=\"pins\" means finals already committed "
                           "whose pins were not yet released. After the rule-(a) unpin a "
                           "pins refusal should not PERSIST, so a sustained rate there is the "
-                          "wedged-session signature - the case where the 429's own remediation "
-                          "(\"wait for one to finish\") is untrue because they already did. A "
+                          "wedged-session signature. Since #2740 admission reclaims such a "
+                          "slot rather than refusing, and the pins refusal that survives that "
+                          "is answered with its own remediation (retry, since a final still "
+                          "being written frees its slot as it lands) - \"wait for one to "
+                          "finish\" is now the CHARGES branch only, where it is true. A "
                           "single pins sample is NOT a wedge: the charge-to-pin handover happens "
                           "at terminal projection but the unpin only once the final reaches the "
                           "wire, so every healthy session passes through that shape during the "
                           "flush window - which is why its alert carries a load-bearing `for`. "
                           "And \"charges\" is not purely benign: it is emitted whenever ANY "
                           "charge is outstanding, so a PARTIAL wedge is bucketed there unseen",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_pin_displaced_for_admission_total",
+                          "Streamed admissions that reclaimed a session slot from an "
+                          "already-committed final no wire took delivery of (#2740) - either a "
+                          "parked record's, or an ORPHAN pin whose record a teardown erased "
+                          "without unpinning. EXPECTED, not a fault: it is the healthy response "
+                          "to clients that drop before their results land, and without it four "
+                          "such calls locked a session out of streamed POST permanently. "
+                          "Deliberately NOT a label on yuzu_mcp_stream_pin_displaced_total, "
+                          "which is the corroborate-before-filing signal - folding a "
+                          "routine event in would destroy that alarm. Do not page on it; a "
+                          "sustained rate has two causes worth telling apart: clients dropping "
+                          "before collection, and server-side ring pressure tearing parked "
+                          "records down (which is separately visible as "
+                          "mcp.bridge.forced_expire). Each event also emits an audit row "
+                          "(mcp.bridge.pin_displaced_for_admission) naming the principal that "
+                          "caused it. That row's target is the execution whose result lost its "
+                          "exemption EXCEPT for an orphan, where no record survives to name one "
+                          "and the detail carries the ring event id instead",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_pin_release_failed_total",
+                          "The streamed-admission reclaim (#2740) tried to release the pin "
+                          "it had selected and the release THREW; the throw was contained "
+                          "because the record is already committed at that point and an "
+                          "escaping exception would leave a session slot nothing reclaims "
+                          "until the arming reaper fires. Needs a genuinely broken platform "
+                          "mutex, so ANY nonzero value is a signal, not a rate: the "
+                          "admission stood but no exemption was released, so that session "
+                          "is one slot tighter than the cap implies until the pin clears by "
+                          "another route",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_pin_release_raced_total",
+                          "The #2740 admission reclaim tried to release a pin and found "
+                          "another route had already cleared it (a resume ack, or a final "
+                          "reaching the wire). The admission still stands, so the session "
+                          "sits one call over its cap for the lifetime of the over-admitted call "
+                          "(#2795). EXPECTED at a low rate - a client racing its own GET "
+                          "resume against a streamed POST reaches it. Its purpose is to make "
+                          "that residual RULE-OUTABLE: it previously moved no counter at "
+                          "all, so an operator checking whether a full pin-slot set was real "
+                          "drift saw every signal flat in exactly this case.",
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_charge_release_deferred_total",
                           "Streamed admission charges that could not be released at their natural "
@@ -718,15 +765,18 @@ public:
                           "bypassed. Alert on > 0",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_pin_displaced_total",
-                          "An older pinned terminal yielded its eviction-exemption slot to a newer "
-                          "one. NOT expected: the bridge admits streamed records against "
-                          "pinned_count() + unpinned and the pin array is sized to exactly that "
-                          "cap, so a full slot set means ADMISSION ACCOUNTING HAS DRIFTED - this "
-                          "counter inherits the drift reading the unpinned counter used to carry. "
-                          "The displacement itself is the graceful degradation (the oldest "
-                          "terminal, likeliest already consumed, yields instead of the newest "
-                          "going unprotected); the displaced final becomes evictable from the "
-                          "replay ring, still recoverable by execution_id. Alert on > 0",
+                          "A committed streamed-POST final was denied a replay-ring pin slot, "
+                          "so the OLDEST pinned final yielded its eviction exemption to it. A "
+                          "SUCCESSFUL #2740 admission reclaim CANNOT cause this - it releases "
+                          "one pin and adds one charge, so the session stays AT cap and a slot "
+                          "is always free. Only two paths can: a release that lost a race "
+                          "(yuzu_mcp_bridge_pin_release_raced_total, #2795) and a contained "
+                          "release throw (yuzu_mcp_bridge_pin_release_failed_total, #2805). "
+                          "Rule THOSE TWO out against their counters before treating this as "
+                          "drift - do NOT rule out against the reclaim counter, which explains "
+                          "zero slots. The runbook owns the procedure. The displaced final "
+                          "stays in the ring until ordinary eviction and remains fetchable by "
+                          "execution_id.",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_final_credit_failed_total",
                           "A streamed-POST final was written to the wire (the client has it), but "
@@ -753,6 +803,9 @@ public:
             metrics_.counter("yuzu_mcp_bridge_pin_slots_reject_total", {{"held", held}});
         }
         metrics_.counter("yuzu_mcp_bridge_charge_release_deferred_total");
+        metrics_.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total");
+        metrics_.counter("yuzu_mcp_bridge_pin_release_failed_total");
+        metrics_.counter("yuzu_mcp_bridge_pin_release_raced_total");
         metrics_.counter("yuzu_mcp_bridge_streaming_backstop_total");
         metrics_.counter("yuzu_mcp_stream_terminal_publish_failures_total");
         metrics_.counter("yuzu_mcp_stream_final_unpinned_total");
@@ -7189,10 +7242,9 @@ private:
         spdlog::info("MCP streamed POST (SSE-on-POST): {}{}",
                      cfg_.mcp_streamed_post_enable ? "ENABLED" : "disabled (default)",
                      cfg_.mcp_streamed_post_enable
-                         ? " - #2739 (response cap not enforced on a busy execution) and "
-                           "#2740 (an undelivered final holds a session streamed slot) are "
-                           "open against it; size shutdown grace against your longest "
-                           "execution, not the 120s cap"
+                         ? " - size shutdown grace above the 120s response cap plus a "
+                           "drain margin (see the Sizing bullet in "
+                           "docs/user-manual/server-admin.md)"
                          : " - enable with --mcp-enable-streamed-post");
         spdlog::info("HTTP worker pool: {} threads, sized for {} concurrent held-open responses "
                      "(plain-REST reserve {}). EVERY streaming surface leases from one budget: "
