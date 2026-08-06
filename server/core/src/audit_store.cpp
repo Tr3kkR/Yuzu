@@ -44,6 +44,22 @@ constexpr std::chrono::milliseconds kWriteTimeout{4000};
 constexpr std::chrono::milliseconds kReapTimeout{8000};
 // Backfill runs at construction, single-threaded, before serving — a wide
 // deadline so a large batch on slow storage does not spuriously abort boot.
+// NOTE what this actually bounds (Gate 5 chaos-injector F1, round 3): on its
+// three with_txn_for(kBackfillTxnTimeout, ...) call sites (stamp_complete,
+// the batch-insert loop, the meta-copy loop) it is only the pool-ACQUIRE
+// wait — PgPool::with_txn_for's `timeout` parameter never reaches PostgreSQL
+// as a per-statement bound. Every connection this pool hands out is capped
+// at the fixed, pool-wide PgPool::Options::statement_timeout_ms (30s
+// default) for STATEMENT EXECUTION, baked in at connect time and identical
+// regardless of this constant. Those three sites are all small, bounded
+// operations (a handful of INSERT/UPDATE statements, or one
+// kBackfillBatchRows-sized batch) that have not been measured to approach
+// that ceiling. The whole-file reconciliation query below this function IS
+// measured to be at genuine risk at this file's own documented target scale
+// (tens of millions of rows, #2661) and is given this constant's actual
+// deadline explicitly via SET LOCAL statement_timeout, rather than silently
+// inheriting the fixed 30s default the way the three with_txn_for sites
+// still do.
 constexpr std::chrono::milliseconds kBackfillTxnTimeout{60000};
 
 // Read-degrade reason labels (ADR-0037 convention).
@@ -1299,6 +1315,44 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             backfill_metric("failed");
             return false;
         }
+        // Gate 5 chaos-injector F1 (round 3): this is an unqualified full-
+        // table aggregate scan over audit_events — no WHERE, cannot use the
+        // partial ttl index — and kBackfillBatchRows' own comment documents
+        // the legacy table can reach tens of millions of rows (#2661). Every
+        // connection this pool hands out carries the SAME fixed
+        // statement_timeout (PgPool::Options::statement_timeout_ms, 30s
+        // default) baked in at connect time — a plain pool_.acquire() here
+        // does NOT get the wider kBackfillTxnTimeout deadline that name
+        // suggests; that constant only bounds the ACQUIRE wait on the three
+        // with_txn_for call sites elsewhere in this file, never statement
+        // execution. #2530 G7-B4 (server.cpp's KEK metrics sampler) is the
+        // precedent for this exact mismatch in this same codebase. At the
+        // documented target scale, a persistent 30s timeout here is not a
+        // transient hiccup — it is a wall this backfill hits identically on
+        // every retry, and startup_failed_ blocks the WHOLE server, not
+        // just audit, until it clears. Explicit BEGIN + SET LOCAL, never a
+        // bare SET: SET LOCAL reverts at transaction end, so this widened
+        // deadline does not leak onto whatever unrelated query the pool
+        // hands this connection to next.
+        const std::string set_timeout_sql =
+            "SET LOCAL statement_timeout = '" + std::to_string(kBackfillTxnTimeout.count()) + "ms'";
+        pg::PgResult begin = pg::exec_params(lease.get(), "BEGIN", std::vector<std::string>{});
+        if (begin.status() != PGRES_COMMAND_OK) {
+            spdlog::error("AuditStore: migrate_from_sqlite: reconciliation BEGIN failed: {}",
+                          PQerrorMessage(lease.get()));
+            backfill_metric("failed");
+            return false;
+        }
+        pg::PgResult st = pg::exec_params(lease.get(), set_timeout_sql.c_str(),
+                                          std::vector<std::string>{});
+        if (st.status() != PGRES_COMMAND_OK) {
+            spdlog::error(
+                "AuditStore: migrate_from_sqlite: reconciliation statement_timeout set failed: {}",
+                PQerrorMessage(lease.get()));
+            pg::exec_params(lease.get(), "ROLLBACK", std::vector<std::string>{});
+            backfill_metric("failed");
+            return false;
+        }
         pg::PgResult pc = pg::exec_params(
             lease.get(),
             "SELECT COUNT(*), COALESCE(SUM(id),0), COALESCE(SUM(timestamp),0), "
@@ -1309,9 +1363,11 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
             spdlog::error(
                 "AuditStore: migrate_from_sqlite: reconciliation fingerprint read failed: {}",
                 PQerrorMessage(lease.get()));
+            pg::exec_params(lease.get(), "ROLLBACK", std::vector<std::string>{});
             backfill_metric("failed");
             return false;
         }
+        pg::exec_params(lease.get(), "COMMIT", std::vector<std::string>{});
         const LegacyFingerprint pg_fp{to_i64(PQgetvalue(pc.get(), 0, 0)),
                                       to_i64(PQgetvalue(pc.get(), 0, 1)),
                                       to_i64(PQgetvalue(pc.get(), 0, 2)),
