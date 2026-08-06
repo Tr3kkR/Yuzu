@@ -1324,7 +1324,12 @@ TEST_CASE("ApprovalManager: migration v7 reaches a store already at v5",
                          // minted AFTER the column existed with no declared origin —
                          // that is the live MCP mint, and it MUST stay redeemable
                          "INSERT INTO approvals (id, definition_id, submitted_at, origin)"
-                         " VALUES ('mcp-mint', 'mcp.delete_tag', 1000001, '');",
+                         " VALUES ('mcp-mint', 'mcp.delete_tag', 1000001, '');"
+                         // a DECLARED origin: v7's `WHERE origin = ''` must not
+                         // touch it. Without that guard every surface's tickets
+                         // are clobbered to the sentinel and refused.
+                         "INSERT INTO approvals (id, definition_id, submitted_at, origin)"
+                         " VALUES ('declared', 'inventory.audit', 1000002, 'schedule');",
                          nullptr, nullptr, nullptr) == SQLITE_OK);
 
     ApprovalManager mgr(tdb.db);
@@ -1340,8 +1345,13 @@ TEST_CASE("ApprovalManager: migration v7 reaches a store already at v5",
     // This assertion started life as an over-reach check — it failed, and the
     // failure is what proved `submitted_at < upgraded_at` is not a usable
     // discriminator: every later migration re-stamps `upgraded_at`, so by v7 it
-    // names when v6 finished. Kept, inverted, so nobody re-attempts the
-    // discriminator without meeting the evidence that killed it.
+    // names when v6 finished. Kept, inverted, as a RECORD of why the
+    // discriminator was abandoned — NOT as a barrier against re-attempting it.
+    // A reviewer re-applied the predicate and this suite stayed GREEN: v6
+    // re-stamps `upgraded_at` to now, both fixture rows are stamped in 1970, so
+    // the predicate holds for both and the end state is identical. That is the
+    // same fact that kills the discriminator in production, which is exactly
+    // why no assertion here can catch its return.
     //
     // The cost is real and bounded: an undeclared MCP ticket outstanding at
     // upgrade stops redeeming and must be re-requested. That is exactly what a
@@ -1349,6 +1359,12 @@ TEST_CASE("ApprovalManager: migration v7 reaches a store already at v5",
     auto live = mgr.get("mcp-mint");
     REQUIRE(live.has_value());
     CHECK(live->origin == ApprovalOrigin::kUnrecognised);
+
+    // The WHERE guard. v7 is blunt about '' and must be surgical about
+    // everything else — a declared surface is evidence, not a gap.
+    auto declared = mgr.get("declared");
+    REQUIRE(declared.has_value());
+    CHECK(declared->origin == ApprovalOrigin::kSchedule);
 }
 
 TEST_CASE("consume_denial_reason: every kind maps to its own audit token",
