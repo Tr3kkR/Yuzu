@@ -1959,28 +1959,8 @@ void RestApiV1::register_routes(
     // ── Management Group Roles (/api/v1/management-groups/:id/roles) ────
 
     sink.Get(R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
-             [perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
+             [auth_fn, perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "ManagementGroup", "Read"))
-                     return;
-                 // #2376 — this response is ENTIRELY authorization topology: every row
-                 // is {principal_type, principal_id, role_name}, i.e. who holds what
-                 // role in this group. `ManagementGroup:Read` is deliberately NOT in
-                 // the topology floor (it gates ordinary group metadata and member
-                 // lists, and flooring it would be the too-coarse mistake the floor
-                 // avoids with Security:Read), so on an RBAC-off install the legacy
-                 // Read-allow handed this graph to any authenticated session.
-                 //
-                 // Unlike /discover/permissions there is no non-topology half to
-                 // preserve, so this is a second REQUIRED permission rather than a
-                 // probe-and-withhold: the caller must be allowed to see the group AND
-                 // allowed to see role assignments. `UserManagement:Read` is the floored
-                 // securable that already gates the equivalent /api/v1/rbac/roles.
-                 //
-                 // Third instance of this shape found in this change (after
-                 // /discover/permissions and its MCP twin) — the floor SET is derived
-                 // from the DATA a route emits, never from the securable it happens to
-                 // be gated on. See the routed-concerns row.
-                 if (!perm_fn(req, res, "UserManagement", "Read"))
                      return;
                  if (!mgmt_store) {
                      res.status = 503;
@@ -1989,6 +1969,46 @@ void RestApiV1::register_routes(
                  }
 
                  auto group_id = req.matches[1].str();
+
+                 // #2376 — this response is ENTIRELY authorization topology: every row
+                 // is {principal_type, principal_id, role_name}, i.e. who holds what
+                 // role in this group. `ManagementGroup:Read` is deliberately NOT in the
+                 // topology floor (it gates ordinary group metadata and member lists, and
+                 // flooring it would be the too-coarse mistake the floor avoids with
+                 // Security:Read), so on an RBAC-off install the legacy Read-allow handed
+                 // this graph to any authenticated session. Third instance of that shape
+                 // in this change — the floor SET is derived from the DATA a route emits,
+                 // never from the securable it happens to be gated on.
+                 //
+                 // Authorized by EITHER the floored `UserManagement:Read` (the fleet-wide
+                 // right, which already gates /api/v1/rbac/roles) OR being an
+                 // `ITServiceOwner` OF THIS GROUP — the group-scoped admin. The second arm
+                 // is not a weakening: it mirrors the ITServiceOwner fallback the POST and
+                 // DELETE handlers on this same path already use, and without it a group
+                 // admin could WRITE role assignments it may not READ, which is both a
+                 // broken workflow and an incoherent posture. It is a DATA check
+                 // (assignment rows), so it holds with RBAC off, and it is scoped to the
+                 // one group rather than the fleet.
+                 httplib::Response probe; // throwaway: the fleet-wide arm, never sent
+                 bool authorized = perm_fn(req, probe, "UserManagement", "Read");
+                 if (!authorized) {
+                     auto session = auth_fn(req, res);
+                     if (!session)
+                         return;
+                     for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
+                         if (gr.principal_type == "user" && gr.principal_id == session->username &&
+                             gr.role_name == "ITServiceOwner") {
+                             authorized = true;
+                             break;
+                         }
+                     }
+                 }
+                 if (!authorized) {
+                     res.status = 403;
+                     res.set_content(detail::a4_error(res, "forbidden"), "application/json");
+                     return;
+                 }
+
                  auto roles = mgmt_store->get_group_roles(group_id);
                  JArr arr;
                  for (const auto& r : roles) {

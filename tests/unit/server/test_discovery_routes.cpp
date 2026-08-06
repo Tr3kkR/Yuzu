@@ -269,7 +269,7 @@ TEST_CASE("discover.permissions: permission-varying representation is never shar
         auto res = h.sink.Get("/api/v1/discover/permissions");
         REQUIRE(res);
         CHECK(res->get_header_value("Cache-Control") == "private, max-age=300");
-        CHECK(res->get_header_value("Vary") == "Authorization, Cookie");
+        CHECK(res->get_header_value("Vary") == "Authorization, Cookie, X-Yuzu-Token");
     }
     SECTION("without the grid — same URL, different body, still unshareable") {
         DiscoverHarness h;
@@ -292,7 +292,7 @@ TEST_CASE("discover.plugins: enrichment-varying representation is never shareabl
     auto res = h.sink.Get("/api/v1/discover/plugins");
     REQUIRE(res);
     CHECK(res->get_header_value("Cache-Control") == "private, max-age=300");
-    CHECK(res->get_header_value("Vary") == "Authorization, Cookie");
+    CHECK(res->get_header_value("Vary") == "Authorization, Cookie, X-Yuzu-Token");
 }
 
 // The caller-independent catalogues stay shareable — the fix must be narrow, or

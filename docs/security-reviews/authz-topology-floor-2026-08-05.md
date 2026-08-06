@@ -274,8 +274,19 @@ assignment graph (`{group_id, principal_type, principal_id, role_name}`) on
 the shape decision 8 names, found after a 14-agent governance run **and** a
 two-model adversarial panel had both passed the change.
 
-Fixed by requiring the floored `UserManagement:Read` **in addition to** the
-route's own `ManagementGroup:Read`. Note this is a different remedy from decision
+Fixed by requiring, in addition to the route's own `ManagementGroup:Read`,
+**either** the floored `UserManagement:Read` **or** being an `ITServiceOwner` of
+that group.
+
+The second arm is not a weakening, and the first attempt at this fix omitted it —
+Hermes pass 2 caught that as a regression. `ITServiceOwner` is the group-scoped
+admin: it holds `ManagementGroup:Read` and no `UserManagement` grant at all, while
+the POST and DELETE handlers on this same path already let it MUTATE assignments
+through exactly this fallback. Requiring `UserManagement:Read` alone left a group
+admin able to write role assignments it could not read — a broken workflow and an
+incoherent posture. The arm is a DATA check against the group's own assignment
+rows, so it holds with RBAC off, and it is scoped to the CALLER in that ONE group;
+a test pins that a non-owner is still refused when someone else owns the group. Note this is a different remedy from decision
 8's split, and deliberately so: `/discover/permissions` has a non-topology half
 worth preserving, this route's body is topology end to end, so there is nothing
 to withhold — the correct answer is a second required permission, not a

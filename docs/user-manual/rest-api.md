@@ -3685,7 +3685,10 @@ omission is declared, never silent** — `roles` absent with no `roles_omitted` 
 A shared cache must not store one caller's representation and serve it to another.
 `GET /api/v1/discover/plugins` is `private` for the same reason (its `parameter_schema`
 enrichment is gated on `InstructionDefinition:Read`); the caller-independent catalogues
-(`instructions`, `routes`, `scope-kinds`) remain `public, max-age=300`.
+(`instructions`, `routes`, `scope-kinds`) remain `public, max-age=300`. `Vary` names all
+three credential channels this server accepts — `Cookie`, `Authorization` and
+`X-Yuzu-Token` — because a caller-local cache keyed on only some of them can serve one
+API-token caller's representation to another.
 
 **Response:**
 ```json

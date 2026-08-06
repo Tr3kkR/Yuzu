@@ -157,6 +157,39 @@ TEST_CASE("GET /management-groups/{id}/roles requires the floored UserManagement
         CHECK(res->status == 200);
     }
 
+    SECTION("ITServiceOwner OF THIS GROUP is allowed without UserManagement:Read") {
+        // Hermes pass 2 caught this as a regression the first fix introduced:
+        // ITServiceOwner is the GROUP-SCOPED admin and holds ManagementGroup:Read but
+        // no UserManagement grant at all, while the POST/DELETE handlers on this same
+        // path already let it MUTATE assignments via an ITServiceOwner fallback. A
+        // read-denied/write-allowed posture is both a broken workflow and incoherent.
+        auto assigned = h.mgmt_bundle->assign_role(
+            GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
+        REQUIRE(assigned.has_value());
+
+        h.perm_override = [](const std::string& securable, const std::string& op) {
+            return !(securable == "UserManagement" && op == "Read");
+        };
+        auto res = h.sink.Get("/api/v1/management-groups/" + gid + "/roles");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+
+    SECTION("a non-owner is still denied even when someone ELSE owns the group") {
+        // The fallback must be scoped to the CALLER, not merely to the group having
+        // an owner — otherwise any group with an ITServiceOwner would be world-readable.
+        auto assigned = h.mgmt_bundle->assign_role(
+            GroupRoleAssignment{gid, "user", "someone-else", "ITServiceOwner"});
+        REQUIRE(assigned.has_value());
+
+        h.perm_override = [](const std::string& securable, const std::string& op) {
+            return !(securable == "UserManagement" && op == "Read");
+        };
+        auto res = h.sink.Get("/api/v1/management-groups/" + gid + "/roles");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+
     SECTION("still denied when the route's OWN gate fails — the first gate is unchanged") {
         h.perm_override = [](const std::string& securable, const std::string& op) {
             return !(securable == "ManagementGroup" && op == "Read");

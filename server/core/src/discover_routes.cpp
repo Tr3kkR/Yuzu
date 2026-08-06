@@ -66,7 +66,12 @@ void serve_doc(const httplib::Request& req, httplib::Response& res, const Discov
     res.set_header("ETag", doc.etag);
     if (audience == DocAudience::PerCaller) {
         res.set_header("Cache-Control", "private, max-age=300");
-        res.set_header("Vary", "Authorization, Cookie");
+        // All THREE credential channels this server accepts must be named, or a
+        // caller-local cache keyed on the named ones alone can serve caller A's
+        // representation to caller B. `X-Yuzu-Token` was missing (Hermes pass 2):
+        // two API-token callers send neither Cookie nor Authorization, so their
+        // cache keys were identical. See auth_routes.cpp's credential resolution.
+        res.set_header("Vary", "Authorization, Cookie, X-Yuzu-Token");
     } else {
         res.set_header("Cache-Control", "public, max-age=300");
     }
