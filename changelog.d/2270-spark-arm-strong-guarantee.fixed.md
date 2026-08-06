@@ -1,4 +1,4 @@
-- Agent: **landed dormant, no deployment setting to review** — Guardian does not route
+- Agent: **Lands dormant — no deployment setting to review.** Guardian does not route
   detection through Spark in any shipped build, and this change ships no user-facing
   behavior. An out-of-memory condition while arming a Spark watch no longer leaves a dead
   entry behind. Previously it could record a spark as armed with no watcher running, and

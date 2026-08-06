@@ -1137,8 +1137,15 @@ Each rung is an independently-governed PR on `dev`, run through the full
        that null pointer with no check — #2270's containment is what makes this
        survivable-but-silent rather than an immediate crash near the OOM event,
        deferring and decontextualizing the eventual failure. File-mechanism-only
-       (Windows), OOM-triggered; found and chaos-scenario'd (CH-1/CH-2) during this
-       branch's own governance run.
+       (Windows), OOM-triggered. First found by round-4's own `xp-1`/`UP-1`
+       (`governance.d/2270-arm-window-round4.4c0PeP.jsonl`, pass 1); the
+       stop()-time null-deref consequence specifically was surfaced later, by
+       this branch's own final `/governance` run's Gate 4 unhappy-path pass, and
+       Gate 5 chaos-injector then synthesized two test scenarios for it — do
+       NOT cite those scenarios as `CH-1`/`CH-2`, which are already distinct,
+       unrelated finding_ids in the round-4 ledger file (the stranded
+       consumer-dispatch-thread finding and the stop()-does-not-drain finding,
+       both deferred to #2814/#2815).
      - **Two residues gate PR-2 and own no issue**, recorded here because a gate list
        that enumerates only issue-backed items reads as complete when it is not.
        (a) CLOSED by `5858844c` (`SparkEngine::disarm`'s in-lock teardown made
