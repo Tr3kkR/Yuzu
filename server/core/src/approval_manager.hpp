@@ -52,10 +52,14 @@ enum class ApprovalOrigin {
 /// undeclared case that stays redeemable until the MCP mint declares itself.
 bool declares_non_mcp_surface(ApprovalOrigin origin);
 
-/// Column text for `origin`. `kUnspecified` stores the empty string, which is
-/// also what migration v5 back-fills into pre-existing rows, so "no declared
-/// origin" reads identically whether the row predates the column or the caller
-/// stayed silent.
+/// Column text for `origin`. `kUnspecified` stores the empty string.
+///
+/// A row that predates the column does NOT read back as `kUnspecified`, and the
+/// difference is the whole point: migration v7 rewrites every `''` row to a
+/// sentinel that decodes to `kUnrecognised` and is REFUSED at redemption, while
+/// a caller that simply stayed silent writes `''` and is GRANTED. "No declared
+/// origin" and "declared nothing because the column did not exist yet" are
+/// deliberately not the same value.
 const char* to_string(ApprovalOrigin origin);
 ApprovalOrigin approval_origin_from_string(std::string_view text);
 
@@ -88,7 +92,8 @@ struct Approval {
     /// tuple. Additive column (migration v4).
     std::string schedule_id;
     /// Which surface minted this ticket (#2442). Additive column (migration
-    /// v5); pre-existing rows read back as kUnspecified.
+    /// v5); rows that predate it are rewritten by v7 and read back as
+    /// kUnrecognised, NOT kUnspecified — see `to_string`'s comment.
     ApprovalOrigin origin{ApprovalOrigin::kUnspecified};
 };
 

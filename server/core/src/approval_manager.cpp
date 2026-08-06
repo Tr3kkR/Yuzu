@@ -306,7 +306,7 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     //  - The redemption guard covers more: a ticket minted before the GUARD
     //    existed, or by a surface that declares itself later, is refused at the
     //    point of use rather than only at the point of mint. NOT "strictly
-    //    more" — that claim was false and is why migration v5 now back-fills a
+    //    more" — that claim was false and is why migration v7 back-fills a
     //    sentinel. A row minted before the COLUMN existed carries no surface at
     //    all, and '' is the granting case; only the back-fill closes it. A
     //    future caller that omits the defaulted `origin` argument is in the

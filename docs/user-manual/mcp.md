@@ -1151,8 +1151,10 @@ minted through a different Yuzu surface than the one recalling it (#2442).
 The last of those is deliberately indistinguishable from a replay in this
 response: reporting it separately would turn the recall into a probe for which
 surface minted a ticket. Server-side it is distinguishable — the audit row
-records `refused: foreign_origin`, and the `yuzu_mcp_approval_refused_total`
-counter carries the same value as its `reason` label.
+records `refused: foreign_origin`. The `yuzu_mcp_approval_refused_total` counter
+does **not** break the refusals down by reason — that breakdown is exactly what
+this response withholds, and `/metrics` is not a stronger reader than the caller
+— so alert on the refusal rate and read the audit trail for the kind.
 
 **Fix**: For an RBAC denial — grant the permission to the token creator's
 principal, or use an account with the required permissions. For a ticket recall —
@@ -1185,17 +1187,17 @@ It is not necessarily still usable, and the difference matters: the 7-day
 approval window keeps running during an outage, so an outage that outlasts the
 ticket's remaining window ends with it expired like any other.
 
-**Fix**: Read `retry_after_ms` — it tells you which of two situations you are in,
-and it is the machine-readable answer, not the message text.
+**Fix**: Retry the identical call, including the same `approval_id`, after at
+least the `retry_after_ms` the response carries (currently 5000).
 
-- **Present** (currently 5000): the store is reachable and the call failed.
-  Retry the identical call, including the same `approval_id`, after at least
-  that long.
-- **Absent (`null`)**: the store never opened, and no retry will clear it.
-  Escalate to an operator. Retrying is not merely useless here — each attempt
-  writes an audit row against a store already failing.
+Retrying indefinitely is not safe, and the response cannot currently tell you
+when to stop: a store that is failing permanently rather than transiently
+returns this same body, so a client that honours the hint forever will retry
+forever while each attempt writes an audit row against a store already failing.
+Bound your own retries — a handful of attempts, then escalate to an operator.
+Distinguishing permanent from transient here is a follow-up change.
 
-In both cases, do **not** re-submit without `approval_id` while the approval
+Do **not** re-submit without `approval_id` while the approval
 window is still open: the ticket was not consumed, and minting a fresh one asks
 a human to approve a capability you already hold. If the window has since
 elapsed, treat it as a `-32003` and request a fresh ticket.

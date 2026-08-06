@@ -41,3 +41,9 @@
   the guard shipped is refused at the point of use. That is the one-directional part of the claim —
   a mint-time check applied to every caller of `submit()`, so it is not the case that redemption
   covers strictly more in every respect.
+
+- **New counter `yuzu_mcp_approval_refused_total{tool}`** records recall refusals at the consume
+  step — a replay, a cross-surface ticket, or a store failure — pre-seeded for every approval-gated
+  tool so an `absent()` alert stays meaningful. It deliberately carries **no `reason` label**: the
+  denial kind is precisely what the client response withholds, and `/metrics` is not a stronger
+  reader than the caller. Alert on the rate; the kind is in the audit row.

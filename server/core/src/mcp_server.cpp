@@ -3405,21 +3405,26 @@ McpServer::HandlerFn McpServer::build_handler(
                         // null, which this file's convention reads as NOT
                         // retryable — so a transient failure must carry one.
                         //
-                        // But `kStoreError` also covers the store never having
+                        // `kStoreError` also covers the store never having
                         // opened, and telling a client to retry every 5s a
                         // condition that cannot clear is an unbounded loop that
-                        // writes an audit row per attempt, on the substrate
-                        // already failing to serve it. `is_open()` separates
-                        // the two: open means the failure was in the call, so
-                        // a retry is honest; closed means only an operator can
-                        // clear it, and the absence of a hint says so.
+                        // writes an audit row per attempt.
                         //
-                        // `is_open()` is SUFFICIENT for permanent, not
-                        // exhaustive — an open handle failing with CORRUPT,
-                        // NOTADB, READONLY or FULL still takes the retry arm.
-                        // Classifying on sqlite3_extended_errcode is the real
-                        // fix and changes what ConsumeError carries, which is
-                        // why it is not attempted here.
+                        // The `!is_open()` arm below is DEFENCE IN DEPTH, not a
+                        // live discriminator, and saying otherwise was wrong:
+                        // a closed store cannot reach this line today. The
+                        // lookup above uses `get()`, which collapses a failed
+                        // read to "no row", so a closed store returns -32003
+                        // there and consume is never called. The arm is kept
+                        // because it costs one branch and stops this site
+                        // becoming the fail-open one if that lookup changes.
+                        //
+                        // What is NOT covered either way: an OPEN handle whose
+                        // reads fail permanently — CORRUPT, NOTADB, READONLY,
+                        // FULL — takes the retry arm and is told to retry
+                        // forever. That is the real gap, it needs
+                        // sqlite3_extended_errcode carried on ConsumeError,
+                        // and it is not closed here.
                         if (kind == ConsumeFailure::kStoreError) {
                             const bool open = approval_manager->is_open();
                             res.set_content(
