@@ -53,6 +53,12 @@ decode_b2_use_case_request(std::string_view wire_json);
 [[nodiscard]] std::expected<std::string, ContractError>
 canonical_b2_input_bytes(const B2UseCaseRequest& request);
 
+/// SHA-256 binding of canonical_b2_input_bytes(), encoded as `sha256:` plus
+/// lowercase hexadecimal. Core binds this value into the opaque invocation
+/// grant; the engine recomputes it from the B2 request it actually received.
+[[nodiscard]] std::expected<std::string, ContractError>
+canonical_b2_input_hash(const B2UseCaseRequest& request);
+
 [[nodiscard]] std::expected<std::string, ContractError>
 encode_b2_use_case_result(const B2UseCaseResult& result);
 

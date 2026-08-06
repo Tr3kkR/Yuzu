@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -20,7 +21,7 @@
 namespace yuzu::contracts::adr31::detail {
 namespace {
 
-constexpr std::array<std::string_view, 48> kForbiddenAuthorityNames{
+constexpr std::array<std::string_view, 49> kForbiddenAuthorityNames{
     "accesstoken",
     "apitoken",
     "actor",
@@ -41,6 +42,7 @@ constexpr std::array<std::string_view, 48> kForbiddenAuthorityNames{
     "credentials",
     "delegatedoperator",
     "delegationartifact",
+    "enginecredential",
     "engineprincipal",
     "engineprincipalid",
     "grant",
@@ -70,6 +72,91 @@ constexpr std::array<std::string_view, 48> kForbiddenAuthorityNames{
     "xyuzudelegationartifact",
     "xyuzuonbehalfof",
 };
+
+constexpr auto kForbiddenTransportAuthorityNames = std::to_array<std::string_view>({
+    "accesstoken",
+    "apitoken",
+    "actingprincipal",
+    "actingprincipalid",
+    "audience",
+    "auth",
+    "authenticatedactor",
+    "authenticatedprincipal",
+    "authentication",
+    "authorization",
+    "bearertoken",
+    "caller",
+    "callerid",
+    "credential",
+    "credentialid",
+    "credentials",
+    "delegatedoperator",
+    "delegationartifact",
+    "enginecredential",
+    "engineprincipal",
+    "engineprincipalid",
+    "grant",
+    "invocationgrant",
+    "onbehalfof",
+    "operator",
+    "operatorid",
+    "principal",
+    "principalcredential",
+    "principalid",
+    "releaseauthorization",
+    "representedoperator",
+    "representedoperatorid",
+    "resultgrant",
+    "resultscopedgrant",
+    "scopeceiling",
+    "sessiontoken",
+    "token",
+    "xonbehalfof",
+    "xyuzudelegatedoperator",
+    "xyuzudelegationartifact",
+    "xyuzuonbehalfof",
+});
+
+// These security namespaces remain reserved as identifier components and when
+// callers compose them with explicit qualifiers such as `_context`, `_claim`,
+// or `_id`. They are never raw substring matches: `fact_assertion`, `tokenizer`,
+// and `migrant` remain valid domain fields.
+constexpr auto kForbiddenTransportAuthorityNamespaces = std::to_array<std::string_view>({
+    "accesstoken",
+    "actas",
+    "actingprincipal",
+    "apitoken",
+    "audience",
+    "auth",
+    "authn",
+    "authentication",
+    "authorization",
+    "authz",
+    "bearertoken",
+    "caller",
+    "credential",
+    "delegatedprincipal",
+    "delegationartifact",
+    "enginecredential",
+    "engineprincipal",
+    "idtoken",
+    "invocationgrant",
+    "oauth",
+    "oauthtoken",
+    "obo",
+    "onbehalfof",
+    "operator",
+    "principalcredential",
+    "releaseauthorization",
+    "representedprincipal",
+    "refreshtoken",
+    "resultgrant",
+    "resultscopedgrant",
+    "scopeceiling",
+    "sessiontoken",
+});
+
+constexpr std::array<std::string_view, 0> kNoForbiddenNamespaces{};
 
 [[nodiscard]] ContractError error(ContractErrorCode code, std::string path,
                                   std::string message) {
@@ -200,6 +287,189 @@ class StructuralSax final : public nlohmann::json_sax<nlohmann::json> {
         }
     }
     return result;
+}
+
+[[nodiscard]] bool is_ascii_upper(unsigned char byte) noexcept {
+    return byte >= 'A' && byte <= 'Z';
+}
+
+[[nodiscard]] bool is_ascii_lower(unsigned char byte) noexcept {
+    return byte >= 'a' && byte <= 'z';
+}
+
+[[nodiscard]] bool is_ascii_digit(unsigned char byte) noexcept {
+    return byte >= '0' && byte <= '9';
+}
+
+[[nodiscard]] std::vector<std::string> authority_name_components(std::string_view name) {
+    std::vector<std::string> components;
+    std::string component;
+
+    const auto flush = [&components, &component] {
+        if (!component.empty()) {
+            components.push_back(std::move(component));
+            component.clear();
+        }
+    };
+
+    for (std::size_t index = 0; index < name.size(); ++index) {
+        const auto byte = static_cast<unsigned char>(name[index]);
+        if (!is_ascii_upper(byte) && !is_ascii_lower(byte) && !is_ascii_digit(byte)) {
+            flush();
+            continue;
+        }
+
+        if (is_ascii_upper(byte) && !component.empty()) {
+            const auto previous = static_cast<unsigned char>(name[index - 1]);
+            const auto next = index + 1 < name.size() ? static_cast<unsigned char>(name[index + 1])
+                                                      : static_cast<unsigned char>(0);
+            if (is_ascii_lower(previous) || is_ascii_digit(previous) ||
+                (is_ascii_upper(previous) && is_ascii_lower(next))) {
+                flush();
+            }
+        }
+        component.push_back(is_ascii_upper(byte) ? static_cast<char>(byte - 'A' + 'a')
+                                                 : static_cast<char>(byte));
+    }
+    flush();
+    return components;
+}
+
+[[nodiscard]] bool is_explicit_qualified_alias(std::string_view normalised,
+                                               std::string_view authority_namespace) {
+    if (!normalised.starts_with(authority_namespace))
+        return false;
+
+    constexpr auto qualifiers = std::to_array<std::string_view>(
+        {"actor", "artifact", "blob", "claim", "claims", "context", "credential", "data", "hash",
+         "header", "id", "info", "metadata", "principal", "scope", "secret", "subject", "token",
+         "value"});
+    const auto remainder = normalised.substr(authority_namespace.size());
+    if (remainder.empty())
+        return true;
+
+    std::vector<bool> reachable(remainder.size() + 1);
+    reachable.front() = true;
+    for (std::size_t offset = 0; offset < remainder.size(); ++offset) {
+        if (!reachable[offset])
+            continue;
+        const auto suffix = remainder.substr(offset);
+        for (const auto qualifier : qualifiers) {
+            if (suffix.starts_with(qualifier))
+                reachable[offset + qualifier.size()] = true;
+        }
+    }
+    return reachable.back();
+}
+
+template <std::size_t NamespaceSize>
+[[nodiscard]] bool has_forbidden_authority_namespace(
+    std::string_view name, std::string_view normalised,
+    const std::array<std::string_view, NamespaceSize>& forbidden_namespaces) {
+    constexpr auto token_prefixes = std::to_array<std::string_view>(
+        {"access", "api", "auth", "bearer", "id", "identity", "oauth", "refresh", "session"});
+    constexpr auto token_suffixes = std::to_array<std::string_view>(
+        {"claim", "context", "credential", "hash", "header", "id", "secret", "value"});
+
+    const auto components = authority_name_components(name);
+    std::size_t max_namespace_size = 0;
+    for (const auto authority_namespace : forbidden_namespaces)
+        max_namespace_size = std::max(max_namespace_size, authority_namespace.size());
+
+    std::string candidate;
+    candidate.reserve(max_namespace_size);
+    for (std::size_t start = 0; start < components.size(); ++start) {
+        candidate.clear();
+        for (std::size_t end = start; end < components.size(); ++end) {
+            if (components[end].size() > max_namespace_size - candidate.size())
+                break;
+            candidate += components[end];
+            for (const auto authority_namespace : forbidden_namespaces) {
+                if (candidate == authority_namespace)
+                    return true;
+            }
+        }
+
+        const auto component = std::string_view{components[start]};
+        if (component != "token")
+            continue;
+
+        if (start > 0) {
+            for (const auto prefix : token_prefixes) {
+                if (components[start - 1] == prefix)
+                    return true;
+            }
+        }
+        if (start + 1 < components.size()) {
+            for (const auto suffix : token_suffixes) {
+                if (components[start + 1] == suffix)
+                    return true;
+            }
+        }
+    }
+
+    for (const auto authority_namespace : forbidden_namespaces) {
+        if (is_explicit_qualified_alias(normalised, authority_namespace))
+            return true;
+    }
+    return false;
+}
+
+template <std::size_t Size, std::size_t NamespaceSize>
+std::expected<void, ContractError> reject_forbidden_fields_recursive(
+    const nlohmann::json& value, std::string_view parent_path,
+    const std::array<std::string_view, Size>& forbidden_names,
+    const std::array<std::string_view, NamespaceSize>& forbidden_namespaces) {
+    struct Pending {
+        const nlohmann::json* value;
+        std::string path;
+    };
+
+    std::vector<Pending> pending{{&value, std::string{parent_path}}};
+    while (!pending.empty()) {
+        auto current = std::move(pending.back());
+        pending.pop_back();
+
+        if (current.value->is_object()) {
+            for (auto it = current.value->begin(); it != current.value->end(); ++it) {
+                const auto path = current.path + "/" + escape_json_pointer(it.key());
+                const auto normalised = normalise_name(it.key());
+                bool forbidden_field = false;
+                for (const auto forbidden : forbidden_names) {
+                    if (normalised == forbidden) {
+                        forbidden_field = true;
+                        break;
+                    }
+                }
+                if (!forbidden_field) {
+                    for (const auto forbidden : forbidden_names) {
+                        if (is_explicit_qualified_alias(normalised, forbidden)) {
+                            forbidden_field = true;
+                            break;
+                        }
+                    }
+                }
+                if (!forbidden_field && !forbidden_namespaces.empty()) {
+                    forbidden_field = has_forbidden_authority_namespace(it.key(), normalised,
+                                                                        forbidden_namespaces);
+                }
+                if (forbidden_field) {
+                    return std::unexpected(ContractError{
+                        ContractErrorCode::ForbiddenAuthorityField,
+                        path,
+                        "caller-authored identity or authentication context is forbidden",
+                    });
+                }
+                pending.push_back(Pending{&*it, path});
+            }
+        } else if (current.value->is_array()) {
+            for (std::size_t index = 0; index < current.value->size(); ++index) {
+                pending.push_back(
+                    Pending{&(*current.value)[index], current.path + "/" + std::to_string(index)});
+            }
+        }
+    }
+    return {};
 }
 
 } // namespace
@@ -425,39 +695,15 @@ reject_forbidden_authority_fields(const nlohmann::json& root) {
 std::expected<void, ContractError>
 reject_forbidden_authority_fields_recursive(const nlohmann::json& value,
                                              std::string_view parent_path) {
-    struct Pending {
-        const nlohmann::json* value;
-        std::string path;
-    };
+    return reject_forbidden_fields_recursive(value, parent_path, kForbiddenAuthorityNames,
+                                             kNoForbiddenNamespaces);
+}
 
-    std::vector<Pending> pending{{&value, std::string{parent_path}}};
-    while (!pending.empty()) {
-        auto current = std::move(pending.back());
-        pending.pop_back();
-
-        if (current.value->is_object()) {
-            for (auto it = current.value->begin(); it != current.value->end(); ++it) {
-                const auto path = current.path + "/" + escape_json_pointer(it.key());
-                const auto normalised = normalise_name(it.key());
-                for (const auto forbidden : kForbiddenAuthorityNames) {
-                    if (normalised == forbidden) {
-                        return std::unexpected(ContractError{
-                            ContractErrorCode::ForbiddenAuthorityField,
-                            path,
-                            "caller-authored identity or authentication context is forbidden",
-                        });
-                    }
-                }
-                pending.push_back(Pending{&*it, path});
-            }
-        } else if (current.value->is_array()) {
-            for (std::size_t index = 0; index < current.value->size(); ++index) {
-                pending.push_back(Pending{&(*current.value)[index],
-                                          current.path + "/" + std::to_string(index)});
-            }
-        }
-    }
-    return {};
+std::expected<void, ContractError>
+reject_forbidden_transport_authority_fields_recursive(const nlohmann::json& value,
+                                                      std::string_view parent_path) {
+    return reject_forbidden_fields_recursive(value, parent_path, kForbiddenTransportAuthorityNames,
+                                             kForbiddenTransportAuthorityNamespaces);
 }
 
 } // namespace yuzu::contracts::adr31::detail

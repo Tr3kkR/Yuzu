@@ -6,6 +6,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <openssl/evp.h>
+
 #include <array>
 #include <cstdint>
 #include <expected>
@@ -125,7 +127,23 @@ decode_versioned_identity(const nlohmann::json& root, std::string_view name) {
         return std::unexpected(error(ContractErrorCode::WrongType, "/normalised_inputs",
                                      "normalised_inputs must be an object"));
     }
+    if (const auto authority = detail::reject_forbidden_transport_authority_fields_recursive(
+            request.normalised_inputs, "/normalised_inputs");
+        !authority) {
+        return std::unexpected(authority.error());
+    }
     return {};
+}
+
+[[nodiscard]] std::expected<void, ContractError>
+reject_request_control_authority(const nlohmann::json& root) {
+    auto control = root;
+    control.erase("normalised_inputs");
+    if (const auto authority = detail::reject_forbidden_authority_fields_recursive(control);
+        !authority) {
+        return std::unexpected(authority.error());
+    }
+    return detail::reject_forbidden_transport_authority_fields_recursive(control);
 }
 
 [[nodiscard]] constexpr std::string_view to_string(ScopeBasis value) noexcept {
@@ -590,6 +608,9 @@ decode_b2_use_case_request(std::string_view wire_json) {
     if (const auto header = detail::decode_contract_header(*root, kB2UseCaseRequest); !header) {
         return std::unexpected(header.error());
     }
+    if (const auto authority = reject_request_control_authority(*root); !authority) {
+        return std::unexpected(authority.error());
+    }
 
     auto request_id = detail::required_string(*root, "request_id");
     if (!request_id) return std::unexpected(request_id.error());
@@ -618,13 +639,17 @@ decode_b2_use_case_request(std::string_view wire_json) {
                                      "normalised_inputs must be an object"));
     }
 
-    return B2UseCaseRequest{
+    B2UseCaseRequest request{
         .request_id = std::move(*request_id),
         .use_case_run_id = std::move(*run_id),
         .use_case = std::move(*use_case),
         .module = std::move(*module),
         .normalised_inputs = *inputs_it,
     };
+    if (const auto valid = validate_request(request); !valid) {
+        return std::unexpected(valid.error());
+    }
+    return request;
 }
 
 std::expected<std::string, ContractError>
@@ -633,7 +658,36 @@ canonical_b2_input_bytes(const B2UseCaseRequest& request) {
         return std::unexpected(error(ContractErrorCode::WrongType, "/normalised_inputs",
                                      "normalised_inputs must be an object"));
     }
+    if (const auto authority = detail::reject_forbidden_transport_authority_fields_recursive(
+            request.normalised_inputs, "/normalised_inputs");
+        !authority) {
+        return std::unexpected(authority.error());
+    }
     return detail::encode_contract_json(request.normalised_inputs);
+}
+
+std::expected<std::string, ContractError> canonical_b2_input_hash(const B2UseCaseRequest& request) {
+    auto canonical = canonical_b2_input_bytes(request);
+    if (!canonical)
+        return std::unexpected(canonical.error());
+
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+    unsigned int digest_size = 0;
+    if (EVP_Digest(canonical->data(), canonical->size(), digest.data(), &digest_size, EVP_sha256(),
+                   nullptr) != 1 ||
+        digest_size != 32) {
+        return std::unexpected(error(ContractErrorCode::InvalidValue, "/normalised_inputs",
+                                     "canonical input hash could not be computed"));
+    }
+
+    constexpr std::string_view hex = "0123456789abcdef";
+    std::string encoded{"sha256:"};
+    encoded.reserve(7 + digest_size * 2);
+    for (unsigned int index = 0; index < digest_size; ++index) {
+        encoded.push_back(hex[digest[index] >> 4]);
+        encoded.push_back(hex[digest[index] & 0x0f]);
+    }
+    return encoded;
 }
 
 std::expected<std::string, ContractError> encode_b2_use_case_result(const B2UseCaseResult& result) {

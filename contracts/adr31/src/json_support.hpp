@@ -37,4 +37,11 @@ reject_forbidden_authority_fields(const nlohmann::json& root);
 reject_forbidden_authority_fields_recursive(const nlohmann::json& value,
                                              std::string_view parent_path = {});
 
+/// Reject authentication and represented-operator metadata inside an opaque
+/// domain payload without reserving ordinary domain words such as `subject`,
+/// `identity`, or `user`.
+[[nodiscard]] std::expected<void, ContractError>
+reject_forbidden_transport_authority_fields_recursive(const nlohmann::json& value,
+                                                      std::string_view parent_path = {});
+
 } // namespace yuzu::contracts::adr31::detail

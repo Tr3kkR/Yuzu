@@ -103,6 +103,13 @@ TEST_CASE("ADR-0031 B2 canonical input bytes are stable", "[adr31][contract][b2]
     REQUIRE(second_bytes.has_value());
     CHECK(*first_bytes == R"({"include_suppressed":false,"severity":"high"})");
     CHECK(*first_bytes == *second_bytes);
+
+    const auto first_hash = contracts::canonical_b2_input_hash(first);
+    const auto second_hash = contracts::canonical_b2_input_hash(second);
+    REQUIRE(first_hash.has_value());
+    REQUIRE(second_hash.has_value());
+    CHECK(*first_hash == "sha256:193eb606cbfb424f8e95c0ed09a5a17c03ff5ea2a9591cda5b2581b553d371e8");
+    CHECK(*first_hash == *second_hash);
 }
 
 TEST_CASE("ADR-0031 B2 request rejects asserted authority and weak run selectors",
@@ -122,6 +129,36 @@ TEST_CASE("ADR-0031 B2 request rejects asserted authority and weak run selectors
         }
     }
 
+    SECTION("nested authority field in domain inputs") {
+        for (const std::string_view field :
+             {"on_behalf_of", "operator_context", "acting_operator_id", "act_as",
+              "engine_credential", "invocation_grant", "obo_context", "auth_context",
+              "access_token_value", "oboContext", "authContext", "accessTokenValue",
+              "representedoperatorclaim", "delegatedoperatorcontext", "grantcontext",
+              "tokenvalue"}) {
+            auto unsafe = wire;
+            unsafe["normalised_inputs"]["nested"][field] = "attacker-authored";
+            const auto decoded = contracts::decode_b2_use_case_request(unsafe.dump());
+            CAPTURE(field);
+            REQUIRE_FALSE(decoded.has_value());
+            CHECK(decoded.error().code == contracts::ContractErrorCode::ForbiddenAuthorityField);
+            CHECK(decoded.error().path == "/normalised_inputs/nested/" + std::string{field});
+        }
+    }
+
+    SECTION("nested authority field in an additive control extension") {
+        for (const std::string_view field :
+             {"represented_operator_claim", "obo_context", "auth_context", "access_token_value"}) {
+            auto unsafe = wire;
+            unsafe["future"][field] = "attacker-authored";
+            const auto decoded = contracts::decode_b2_use_case_request(unsafe.dump());
+            CAPTURE(field);
+            REQUIRE_FALSE(decoded.has_value());
+            CHECK(decoded.error().code == contracts::ContractErrorCode::ForbiddenAuthorityField);
+            CHECK(decoded.error().path == "/future/" + std::string{field});
+        }
+    }
+
     SECTION("weak run selector") {
         wire["use_case_run_id"] = "42";
         const auto decoded = contracts::decode_b2_use_case_request(wire.dump());
@@ -135,6 +172,20 @@ TEST_CASE("ADR-0031 B2 request rejects asserted authority and weak run selectors
         const auto decoded = contracts::decode_b2_use_case_request(wire.dump());
         REQUIRE(decoded.has_value());
         CHECK(decoded->normalised_inputs["actor"] == "domain-input");
+    }
+
+    SECTION("ordinary domain identity words remain inputs, not authority") {
+        wire["normalised_inputs"]["subject"] = "certificate";
+        wire["normalised_inputs"]["identity"] = "package";
+        wire["normalised_inputs"]["user"] = "local-account";
+        wire["normalised_inputs"]["author"] = "package-maintainer";
+        wire["normalised_inputs"]["fact_assertion"] = true;
+        wire["normalised_inputs"]["id_tokenizer"] = "domain-parser";
+        wire["normalised_inputs"]["tokenizer"] = "domain-parser";
+        wire["normalised_inputs"]["token_count"] = 12;
+        const auto decoded = contracts::decode_b2_use_case_request(wire.dump());
+        REQUIRE(decoded.has_value());
+        CHECK(decoded->normalised_inputs == wire["normalised_inputs"]);
     }
 }
 
