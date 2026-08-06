@@ -335,11 +335,34 @@ securable, not new here, but it is worth knowing before you narrow a built-in
 role: express the narrowing as a **custom role** or an explicit `deny` row
 instead, both of which survive a restart.
 
+### vNEXT — approval tickets outstanding at the upgrade must be re-requested (#2442) (breaking)
+
+**Who this affects.** Every deployment holding an approval that was granted but not yet redeemed at
+the moment of upgrade. This is independent of the `mcp.` prefix entry below: it does not matter
+whether you author any `mcp.`-prefixed definitions, and a deployment running only Yuzu-supplied
+content **is** affected if it has an approval in flight. If nothing is awaiting redemption when you
+upgrade, there is nothing to do.
+
+**What happens.** This release records which surface minted each approval, and rows that predate the
+column carry no surface at all. Rather than assume one they may not have come from, the upgrade
+labels them with a sentinel that fails closed — so an approval granted before the upgrade is refused
+at recall. It is reported as `approval already used (one-time ticket)` even though it was never
+consumed: that message is deliberately identical for every refusal so the recall cannot be used to
+probe which surface minted a ticket, and that is why this note exists rather than the error
+explaining itself.
+
+**Recover** by calling the tool again without `approval_id` to mint a fresh ticket and have it
+re-approved. Nothing is lost but the review. The affected population is only what is outstanding at
+upgrade time, it does not grow afterwards, and approvals expire after 7 days regardless. On the
+server side the refusal is distinguishable: the audit row records `refused: foreign_origin`, not the
+uniform client message.
+
 ### vNEXT — the `mcp.` instruction-definition id prefix is reserved (#2442) (breaking)
 
 **Who this affects.** Anyone whose instruction definitions include an id beginning `mcp.`. No
 shipped or bundled content uses that prefix, so a deployment running only Yuzu-supplied content
-is unaffected and needs no action.
+needs no action *for this item* — but the outstanding-approval entry above applies regardless of
+what content you run.
 
 **Why.** `mcp.<tool>` names an MCP approval ticket. The MCP recall matches a ticket on its
 definition id and scope expression and does not bind the submitter, so a definition authored
@@ -347,20 +370,6 @@ under that prefix could line up with an MCP tool's canonical arguments — a tic
 surface being redeemable on another. Consuming it still required the schema check, the tier
 gate, per-handler RBAC and a human approval, so this closes a namespace confusion rather than an
 open escalation.
-
-**Approval tickets outstanding at the upgrade must be re-requested.** This release records which
-surface minted each approval, and rows that predate the column carry no surface at all. Rather than
-assume one they may not have come from, the upgrade labels them with a sentinel that fails closed —
-so an approval ticket approved before the upgrade is refused at recall. It is reported as `approval
-already used (one-time ticket)` even though it was never consumed: that message is deliberately
-identical for every refusal so the recall cannot be used to probe which surface minted a ticket, and
-that is why this note exists rather than the error explaining itself.
-
-Recover by calling the tool again without `approval_id` to mint a fresh ticket and have it
-re-approved. Nothing is lost but the review. The affected population is only what is outstanding at
-upgrade time, it does not grow afterwards, and approvals expire after 7 days regardless. On the
-server side the refusal is distinguishable: the audit row records `refused: foreign_origin`, not the
-uniform client message.
 
 **What changes.** Creating a definition whose id starts `mcp.` is refused with a 400 on every
 authoring route that accepts an explicit id — `POST /api/instructions`, `POST

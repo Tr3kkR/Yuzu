@@ -3358,7 +3358,20 @@ McpServer::HandlerFn McpServer::build_handler(
                         // forgery attempt — the event #2442 exists to detect —
                         // identically to a benign replay, and said it about a
                         // row whose consumed_at is still 0.
-                        mcp_audit("denied", "approval " + supplied_id +
+                        //
+                        // The METRIC is a separate instrument and both are
+                        // required. The audit row is the forensic record: one
+                        // row per event, its write unchecked, nothing to alert
+                        // on. The counter is the SIEM signal — `foreign_origin`
+                        // is the event #2442 exists to DETECT, and without a
+                        // series there is no rate or absence alert to build.
+                        // Same split the platform already uses for other
+                        // security-relevant refusals. The reason label carries
+                        // the stable denial token, so a forgery attempt stays
+                        // separable from an ordinary replay.
+                        count_denial("yuzu_mcp_approval_refused_total",
+                                     consume_denial_reason(kind));
+                        mcp_audit("denied", "approval_id=" + supplied_id +
                                                 " refused: " + consume_denial_reason(kind));
 
                         // CLIENT message stays uniform for the two that must not
@@ -3366,17 +3379,27 @@ McpServer::HandlerFn McpServer::build_handler(
                         // exactly like an ordinary replay, or the recall becomes
                         // a probe for which surface minted a ticket.
                         //
-                        // kStoreError is NOT one of those. It is transient and
-                        // leaves the ticket UNTOUCHED and still valid, so
-                        // telling the caller it was "already used" and to fetch
-                        // a fresh one would burn a live human approval on a
-                        // failure that a retry clears.
+                        // kStoreError is NOT one of those. It leaves the ticket
+                        // UNTOUCHED, so telling the caller it was "already used"
+                        // and to fetch a fresh one would burn a live human
+                        // approval on a failure a retry may clear.
+                        //
+                        // The remediation says "not consumed", which is always
+                        // true, rather than "still valid", which is not: the
+                        // 7-day TTL keeps running through an outage, so an
+                        // outage outlasting the ticket's remaining window ends
+                        // with it expired. Promising validity and then refusing
+                        // the ticket would leave the caller waiting on a
+                        // capability that had been retired underneath them.
                         if (kind == ConsumeFailure::kStoreError) {
                             res.set_content(
                                 a4_error(kInternalError,
                                          "approval store temporarily unavailable",
                                          "retry this call unchanged — the approval was NOT "
-                                         "consumed and remains valid; do NOT request a fresh one"),
+                                         "consumed, so do not request a fresh one. The 7-day "
+                                         "approval window keeps running during an outage: if it "
+                                         "elapses the ticket expires and a new approval is "
+                                         "required"),
                                 "application/json");
                             return;
                         }

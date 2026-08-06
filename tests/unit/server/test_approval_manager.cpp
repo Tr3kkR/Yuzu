@@ -494,11 +494,15 @@ TEST_CASE("ApprovalManager: origin round-trips through its column text",
     CHECK(approval_origin_from_string("nonsense") == ApprovalOrigin::kUnrecognised);
 }
 
-TEST_CASE("ApprovalManager: migration v5 back-fills pre-existing rows to a fail-closed sentinel",
+TEST_CASE("ApprovalManager: a pre-column row is back-filled to a fail-closed sentinel",
           "[approval_manager][db][security]") {
     TestDb tdb;
-    // A v4-shaped store with a row already in it, schema_meta pinned at 4 so
-    // create_tables() runs migration 5 alone (the shape test_nvd.cpp uses).
+    // A v4-shaped store with a row already in it: create_tables() runs v5, v6
+    // AND v7 in one call. v5 adds the column ('' for the existing row); v7 is
+    // what moves it off '', and is the ONLY back-fill — so deleting v7's UPDATE
+    // fails this test. An earlier cut of this branch put the same UPDATE in v5
+    // as well, which made this assertion unable to observe its own subject:
+    // removing either one left the other to produce an identical outcome.
     REQUIRE(sqlite3_exec(tdb.db,
                          "CREATE TABLE schema_meta (store TEXT PRIMARY KEY,"
                          " version INTEGER NOT NULL, upgraded_at INTEGER NOT NULL DEFAULT 0);"
@@ -521,7 +525,7 @@ TEST_CASE("ApprovalManager: migration v5 back-fills pre-existing rows to a fail-
                          nullptr, nullptr, nullptr) == SQLITE_OK);
 
     ApprovalManager mgr(tdb.db);
-    mgr.create_tables(); // migrates v1..v5 over the existing table
+    mgr.create_tables(); // runs v5, v6 and v7 over the existing table
     REQUIRE(mgr.is_open());
 
     auto row = mgr.get("legacy-1");

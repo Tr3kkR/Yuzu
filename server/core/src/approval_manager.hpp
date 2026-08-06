@@ -22,10 +22,14 @@ namespace yuzu::server {
 /// split.
 enum class ApprovalOrigin {
     /// A mint that predates this enum, or one that has not declared itself:
-    /// today ONLY the MCP gate, which cannot be updated to declare `kMcp` while
-    /// mcp_server.cpp is frozen for a parallel rebase. Kept honest rather than
-    /// mislabelled — a ticket recorded `instruction` when MCP minted it would be
-    /// false evidence. Tighten to `kMcp` when the MCP mint declares itself.
+    /// today ONLY the MCP gate. It is left undeclared deliberately, not for want
+    /// of an opportunity — `kUnspecified` is the value that GRANTS at
+    /// redemption, so it is the only correct choice for the one surface the
+    /// binding must not refuse. Kept honest rather than mislabelled: a ticket
+    /// recorded `instruction` when MCP minted it would be false evidence.
+    /// Declaring `kMcp` here is a behaviour change, not a relabelling — it makes
+    /// `kUnspecified` non-granting and every undeclared row unredeemable — so it
+    /// belongs with that change, not with this one.
     kUnspecified,
     /// The interactive REST/dashboard instruction-approval gate
     /// (workflow_routes.cpp).
@@ -127,16 +131,28 @@ enum class ConsumeFailure {
 /// a cross-surface redemption attempt was refused, which is the thing #2442
 /// exists to produce.
 ///
-/// Closed set. Adding a `ConsumeFailure` without a token here FAILS THE BUILD —
-/// `-Wswitch` is promoted to an error locally because `meson.build` sets
-/// `werror=false`, so the warning alone would not stop it, and a new kind would
-/// otherwise inherit whatever the caller happens to say.
+/// Closed set. Adding a `ConsumeFailure` without a token here fails the build on
+/// GCC and Clang — `-Wswitch` is promoted to an error locally because
+/// `meson.build` sets `werror=false`, so the warning alone would not stop it,
+/// and a new kind would otherwise inherit whatever the caller happens to say.
+/// Both are Tier-1 CI legs, so the guard is in force on every PR.
+///
+/// The MSVC arm is best-effort, and the ORDER of its two pragmas is why. C4062
+/// is off by default, and `#pragma warning(error : N)` does NOT enable an
+/// off-by-default warning — Microsoft documents that behaviour only for the
+/// `1|2|3|4` and `default` specifiers — so promoting it alone sets an as-error
+/// flag on a diagnostic that is never emitted. The explicit level enable has to
+/// come first. It is still best-effort rather than guaranteed: MSVC also
+/// documents that the last `warning` pragma in a function body applies to the
+/// whole function, which may defeat the `pop` below. Do not restate this as an
+/// unconditional "fails the build".
 [[nodiscard]] constexpr const char* consume_denial_reason(ConsumeFailure kind) {
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic error "-Wswitch"
 #elif defined(_MSC_VER)
 #pragma warning(push)
+#pragma warning(1 : 4062) // off by default; `error:` alone does NOT enable it
 #pragma warning(error : 4062)
 #endif
     switch (kind) {

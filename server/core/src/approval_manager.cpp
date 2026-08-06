@@ -48,7 +48,22 @@ std::string col_text(sqlite3_stmt* stmt, int col) {
 
 } // namespace
 
+// Guarded the same way as `consume_denial_reason`, and this is the one that
+// needed it more: a missing arm here falls through to `return ""`, which
+// `approval_origin_from_string` decodes as kUnspecified — the value that GRANTS
+// at redemption. So the failure direction of an unhandled enumerator is
+// fail-OPEN, where the denial-reason table's is merely a wrong log token. See
+// that function's header comment for why the MSVC arm is ordered as it is and
+// why it is best-effort.
 const char* to_string(ApprovalOrigin origin) {
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(1 : 4062) // off by default; `error:` alone does NOT enable it
+#pragma warning(error : 4062)
+#endif
     switch (origin) {
     case ApprovalOrigin::kInstruction:
         return "instruction";
@@ -62,6 +77,11 @@ const char* to_string(ApprovalOrigin origin) {
         // a decode; storing it would round-trip to kUnspecified, which grants.
         break;
     }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
     return "";
 }
 
@@ -174,37 +194,23 @@ void ApprovalManager::create_tables() {
             CREATE INDEX IF NOT EXISTS idx_approvals_schedule_id
                 ON approvals(schedule_id);
         )"},
-        // v5 (#2442): WHICH surface minted the ticket. Additive. '' means "no
-        // declared origin", which is the GRANTING case at redemption — the MCP
-        // mint cannot yet declare itself, so '' has to stay redeemable.
+        // v5 (#2442): WHICH surface minted the ticket. Additive, '' = no
+        // declared origin — the honest reading for both a pre-v5 row and the
+        // MCP mint that cannot yet declare itself. Deliberately NOT back-filled
+        // to 'instruction': every pre-v5 row would then claim a surface it may
+        // not have come from, and these rows are approval evidence.
         //
-        // A pre-v5 row must therefore NOT be left at ''. It would inherit the
-        // grant and stay cross-surface redeemable, which is the whole defect
-        // #2442 exists to close — MEASURED: a REST-minted ticket under an
-        // `mcp.`-prefixed id, back-filled to '', redeems at the MCP recall.
-        //
-        // Back-filling to 'instruction' is also wrong, and for a reason that
-        // still stands: a pre-v5 row would claim a surface it may not have come
-        // from, and these rows are approval evidence. So it is back-filled to a
-        // SENTINEL that claims nothing and is not a surface. `origin_from_string`
-        // decodes it as kUnrecognised, so it fails CLOSED at redemption while
-        // recording honestly that the minting surface is unknown.
-        //
-        // Changed in place because no RELEASE carries the column (no #2442 entry
-        // in CHANGELOG.md). That is narrower than it first appears and does NOT
-        // mean no database has run v5: v5 has been on origin/dev since
-        // 2026-08-02, so any dev, CI or UAT database is already at >= 5 and the
-        // migration runner skips it (`if (m.version <= current) continue;`).
-        // Those rows keep '' — the granting value.
-        //
-        // An earlier version of this comment claimed a later migration "could
-        // not do this job anyway, by then '' is ambiguous between a pre-v5 row
-        // and a legitimate MCP mint". That was FALSE, and it was the sentence
-        // justifying the shortcut. `schema_meta.upgraded_at` is exactly the
-        // discriminator it said did not exist — see v7.
+        // Unchanged from the form that shipped to origin/dev. An earlier cut of
+        // this branch added `UPDATE approvals SET origin = 'legacy'` here as
+        // well as in v7. That edit changed no outcome: v5 runs only on a store
+        // below v5, v7 runs immediately after it in the same loop with no write
+        // in between, and `DEFAULT ''` leaves exactly the rows v7's
+        // `WHERE origin = ''` already matches. What it cost was real — a
+        // numbered migration is the definition of a data state, so editing one
+        // in place means two stores both stamped 5 can differ. The back-fill
+        // lives in v7 alone.
         {5, R"(
             ALTER TABLE approvals ADD COLUMN origin TEXT NOT NULL DEFAULT '';
-            UPDATE approvals SET origin = 'legacy';
         )"},
         // v6: make the two status-scoped access patterns index-covered. Neither
         // is new, but both became load-bearing when mtx_ started covering the
@@ -222,10 +228,14 @@ void ApprovalManager::create_tables() {
             CREATE INDEX IF NOT EXISTS idx_approvals_status_consumed_reviewed
                 ON approvals(status, consumed_at, reviewed_at);
         )"},
-        // v7 (#2442): reach the databases the in-place v5 edit cannot. A store
-        // already at >= 5 never re-runs v5, so its pre-column rows still carry
-        // '' — which GRANTS at redemption. No release carries the column, but
-        // every dev/CI/UAT database tracking origin/dev since 2026-08-02 does.
+        // v7 (#2442): the ONLY back-fill. '' is the GRANTING case at redemption,
+        // so every row carrying it — whether it predates the column or predates
+        // this migration — has to be moved off it. This reaches both populations
+        // in one step: a store below v5 gets the column from v5 (all rows '')
+        // and is rewritten here in the same loop, and a store already at >= 5,
+        // which never re-runs v5, is rewritten here too. No release carries the
+        // column, but every dev/CI/UAT database tracking origin/dev since
+        // 2026-08-02 does.
         //
         // Rewrites EVERY remaining '' row, not just the pre-column ones. A
         // discriminator was attempted and does not exist: the obvious one is
@@ -243,12 +253,14 @@ void ApprovalManager::create_tables() {
         // the real lesson is that a migration carrying a back-fill must be
         // written in the same step as the column.
         //
-        // So this is deliberately blunt, and it is the SAME outcome the release
-        // path already produces: on a server upgrading from any release, v5
-        // rewrites every row that exists. An undeclared MCP ticket outstanding
-        // at upgrade stops redeeming and must be re-requested. That is
-        // fail-closed, bounded by the 7-day approval window, and identical
-        // whether the database arrives via a release or via origin/dev.
+        // So this is deliberately blunt: an undeclared MCP ticket outstanding at
+        // upgrade stops redeeming and must be re-requested. That is fail-closed,
+        // bounded by the 7-day approval window, and identical whether the
+        // database arrives via a release or via origin/dev.
+        //
+        // Surgical about everything else, though: `WHERE origin = ''` is what
+        // keeps a DECLARED surface intact. Drop the predicate and every row from
+        // every surface is clobbered to the sentinel and refused. Pinned.
         //
         // Matches nothing on a fresh install: v1..v6 run first and the table is
         // empty. Idempotent: `origin = ''` is false once rewritten.

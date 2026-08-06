@@ -13,6 +13,15 @@
   MCP mint is itself undeclared until its own follow-up lands, so that exemption is what keeps the
   gate working; it closes when the MCP mint declares itself.
 
+- **Breaking — an approval granted but not yet redeemed when you upgrade is refused, and must be
+  re-requested.** Rows predating the new column record no surface, and rather than assume one they
+  may not have come from, the upgrade labels them with a sentinel that fails closed. The refusal
+  reports as an ordinary spent ticket, because that message is uniform by design, so the upgrade note
+  in `docs/user-manual/server-admin.md` is where the real cause is recorded. Recover by calling the
+  tool again without `approval_id`. This reaches any deployment holding an approval in flight,
+  independent of whether it uses `mcp.`-prefixed definitions, and the affected population does not
+  grow after the upgrade.
+
 - **This binds the surface, not the submitter.** The recall still does not compare who obtained the
   approval against who presents it, so a valid `approval_id` remains redeemable by any principal
   that also passes the tier gate and the tool's own RBAC. Treat an `approval_id` as a secret. Both
@@ -27,5 +36,7 @@
   re-submits on every fire, so refusing at mint stopped that schedule permanently, and moving a
   schedule between definitions is not supported (#2742). Creating or importing a *new* definition
   under the prefix is still refused, at the authoring routes where authoring happens. Defending at
-  redemption also covers strictly more: a ticket minted before this change, or by a surface added
-  later, is refused at the point of use rather than only at the point of mint.
+  redemption also reaches something a mint-time check cannot: a ticket that already existed before
+  the guard shipped is refused at the point of use. That is the one-directional part of the claim —
+  a mint-time check applied to every caller of `submit()`, so it is not the case that redemption
+  covers strictly more in every respect.
