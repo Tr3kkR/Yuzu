@@ -848,10 +848,10 @@ for f in "${STATING_SURFACES[@]}"; do
         }
     ' "$f")"
     if [ -n "$hit" ]; then
-        bad "$f:$hit names the displacement counter and exactly one residual counter on the same line."
-        note "This looks like an unregistered claim restatement. If it is inside the"
-        note "surface's registered claim region, claim_region() is mis-scoped - fix the"
-        note "extractor. If it is a NEW paraphrase, register it or state both/neither."
+        bad "$f:$hit names the displacement counter and exactly one residual counter on the same line - looks like an unregistered claim restatement."
+        note "If it is inside the surface's registered claim region, claim_region() is"
+        note "mis-scoped - fix the extractor. If it is a NEW paraphrase, register it or"
+        note "state both/neither."
     fi
 done
 
