@@ -2286,6 +2286,15 @@ Query audit events.
 }
 ```
 
+**Errors:** `403` — caller lacks `AuditLog:Read`; `400` — `limit` parses to
+less than 1 (a negative or zero limit; caught explicitly rather than reaching
+PostgreSQL as an invalid `LIMIT`); `503` — the audit store is unavailable or
+the query degraded (ADR-0040 deny-on-degrade — see the note above this
+section; never a false-empty `200`). A non-numeric `limit` (e.g. `abc`) is
+NOT a 400 here — it is silently caught and the request proceeds with the
+default `limit` (100); the sibling `auth-sample` route below is stricter and
+400s on the same input.
+
 #### `GET /api/v1/audit/auth-sample`
 
 Pseudo-random **sample** of authentication-surface audit events over an optional
@@ -2338,10 +2347,14 @@ curl -s -G \
 `target_type`, `target_id`, `detail`); the sample deliberately does **not**
 widen what `AuditLog:Read` discloses (no `session_id` / `source_ip`). The
 envelope additionally carries a `sampling` object (`candidates_considered`,
-`scan_cap`, `recency_capped`). `400` if `from`/`to` are not non-negative
-digits, `from > to`, or `limit` is non-integer; `503` if the audit store is
-unavailable. If the export's own audit row fails to persist, the response
-carries a `Sec-Audit-Failed: true` header (the export still returns).
+`scan_cap`, `recency_capped`). **Errors:** `403` — caller lacks
+`AuditLog:Read`; `400` — `from`/`to` are not non-negative digits, `from >
+to`, or `limit` is non-integer (unlike the sibling `GET /api/v1/audit`, a
+non-numeric `limit` here IS a 400, not a silent fallback); `503` — the audit
+store is closed (checked up front, before any query parameter is even
+parsed) or the query itself degraded mid-request. If the export's own audit
+row fails to persist, the response carries a `Sec-Audit-Failed: true` header
+(the export still returns).
 
 **Audit action names:**
 
@@ -6081,7 +6094,22 @@ Reject a pending instruction execution.
 
 #### `GET /api/audit`
 
-Query audit events. Accepts `limit`, `principal`, and `action` as query parameters. Functionally equivalent to `GET /api/v1/audit` but without the v1 envelope.
+Query audit events. Legacy route — **not** merely `GET /api/v1/audit` without
+the v1 envelope; the response shape and accepted parameters both genuinely
+differ. Accepts `principal`, `action`, `target_type`, `target_id`, `since`,
+`until`, `limit`, and `offset` (more than the v1 route's `limit`/`principal`/
+`action`). Response is `{"events": [...], "count": N, "total": <number-or-
+null>}` (field names `events`/`count`/`total`, not v1's `data`/`pagination`/
+`meta`), and each event row additionally carries `id`, `principal_role`, and
+`source_ip`, which v1's row shape omits. `total` is a best-effort second read
+taken after the page itself succeeds — it is `null`, not `0` or the page
+size, when that second read degrades; do not treat `null` as "unknown but
+probably zero".
+
+**Errors:** `403` — caller lacks `AuditLog:Read`; `400` — a `since`/`until`/
+`limit`/`offset` query parameter is not a valid integer, or `limit < 1` /
+`offset < 0`; `503` — the audit store is closed, or the page-rows query
+degraded (ADR-0040 deny-on-degrade; never a false-empty `200`).
 
 ---
 
