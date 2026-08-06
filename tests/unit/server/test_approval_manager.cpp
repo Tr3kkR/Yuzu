@@ -484,7 +484,8 @@ TEST_CASE("ApprovalManager: origin round-trips through its column text",
     CHECK(approval_origin_from_string("instruction") == ApprovalOrigin::kInstruction);
     CHECK(approval_origin_from_string("schedule") == ApprovalOrigin::kSchedule);
     CHECK(approval_origin_from_string("mcp") == ApprovalOrigin::kMcp);
-    // Empty (a pre-v5 row) is genuinely "no declared origin". Anything
+    // Empty is an undeclared mint — genuinely "no declared origin". It is not
+    // the pre-column row: v7 rewrote those to the sentinel. Anything
     // unrecognised is NOT the same thing and must not decode as it.
     CHECK(approval_origin_from_string("") == ApprovalOrigin::kUnspecified);
     // NOT kUnspecified: that is the value that GRANTS redemption, so folding an
@@ -544,7 +545,7 @@ TEST_CASE("ApprovalManager: a pre-v5 ticket cannot be redeemed at the MCP recall
           "[approval_manager][approval][security]") {
     // THE POPULATION THE GUARD MISSED. A governance reviewer built this by
     // probe: mint through the REST instruction gate under an `mcp.`-prefixed
-    // definition id, set origin to the pre-v5 back-fill value, and the recall
+    // definition id, set origin to the sentinel v7 back-fills, and the recall
     // CONSUMED it — the exact cross-surface redemption #2442 exists to refuse,
     // still open for every row that predates the column.
     //
@@ -560,7 +561,7 @@ TEST_CASE("ApprovalManager: a pre-v5 ticket cannot be redeemed at the MCP recall
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
 
-    // Rewrite the column to exactly what migration v5 back-fills.
+    // Rewrite the column to exactly what migration v7 back-fills.
     const std::string sql = "UPDATE approvals SET origin = 'legacy' WHERE id = '" + *id + "'";
     REQUIRE(sqlite3_exec(tdb.db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
     REQUIRE(mgr.get(*id)->origin == ApprovalOrigin::kUnrecognised);

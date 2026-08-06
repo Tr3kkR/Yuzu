@@ -1193,7 +1193,7 @@ least the `retry_after_ms` the response carries (currently 5000).
 Retrying indefinitely is not safe, and the response cannot currently tell you
 when to stop: a store that is failing permanently rather than transiently
 returns this same body, so a client that honours the hint forever will retry
-forever while each attempt writes an audit row against a store already failing.
+forever, and each attempt writes an audit row.
 Bound your own retries — a handful of attempts, then escalate to an operator.
 Distinguishing permanent from transient here is a follow-up change.
 

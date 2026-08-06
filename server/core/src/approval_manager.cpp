@@ -92,8 +92,10 @@ ApprovalOrigin approval_origin_from_string(std::string_view text) {
         return ApprovalOrigin::kSchedule;
     if (text == "mcp")
         return ApprovalOrigin::kMcp;
-    // Empty is the pre-v5 row or an undeclared mint: genuinely "no declared
-    // origin", and redeemable. Anything ELSE is a value this build does not
+    // Empty is an UNDECLARED MINT — today only the MCP gate — and it is
+    // redeemable. It is NOT the pre-column row: migration v7 rewrote every ''
+    // it found to the sentinel, so a row that predates the column decodes
+    // below as kUnrecognised and is refused. Anything ELSE is a value this build does not
     // know, and it must NOT fold into that case — kUnspecified is what grants
     // (#2442), so folding would make a row written by a newer binary redeemable
     // here. Decode it as its own value and let the predicate refuse it.

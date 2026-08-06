@@ -354,7 +354,10 @@ already-migrated database does not re-run it and does not refuse to start; appro
 you are rolled back record no minting surface, which is the value that stays redeemable. Rolling
 forward will not revisit them, because the migration has already run. Treat a roll-back as a window
 in which the cross-surface check is not in force for newly minted approvals, and let those
-approvals expire — the 7-day window bounds it — rather than relying on them being re-checked.
+approvals expire rather than relying on them being re-checked. Expiry bounds the window, but note it
+runs from two different points: a pending approval expires 7 days after submission, and an approved
+but unredeemed one 7 days after its review — so an approval minted during a roll-back can remain
+redeemable for up to around a fortnight from the mint, not one week.
 
 **What happens.** This release records which surface minted each approval, and rows that predate the
 column carry no surface at all. Rather than assume one they may not have come from, the upgrade
