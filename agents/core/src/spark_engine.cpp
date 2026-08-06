@@ -913,7 +913,8 @@ void SparkEngine::teardown_arm_race(SubscriptionId id, const std::string& key, S
             if (armed_.contains(key))
                 return; // a concurrent equal-spec re-arm already renewed this key (M2)
         }
-        // CONTAINED, unlike disarm(), which propagates. unwatch() is not noexcept and
+        // CONTAINED, as disarm() now is too (see its own unwatch, which was brought into
+        // lockstep on this point later). unwatch() is not noexcept and
         // the real mechanisms allocate inside it (spark_service queues a Cmd holding a
         // key copy; spark_file grows retiring_), so under the memory pressure this
         // whole layer is about it can throw.

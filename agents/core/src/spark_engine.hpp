@@ -204,6 +204,12 @@ public:
 
     /// Remove one subscription; the watcher itself disarms when its last
     /// subscription goes. Unknown ids are ignored (idempotent).
+    /// NOT noexcept, and the surviving sources are exactly what
+    /// GuardianSparkRuntime::detach_rule_locked needs to know: the two lock_guard
+    /// acquisitions can raise std::system_error. Everything else on the path is
+    /// contained as of #2270 — the allocations, the log, and the mechanism unwatch.
+    /// (`mech_ops_mu_by_type_.at()` cannot throw: it is populated in lockstep with
+    /// mechanisms_ and frozen after start().)
     void disarm(SubscriptionId id);
 
     /// Start the mechanism threads. Interval/poll deadlines are (re)based on

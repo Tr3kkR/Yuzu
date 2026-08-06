@@ -42,6 +42,8 @@ static_assert(std::string_view(detail::kSparkTagQueuedDropped) == "yuzu.spark_qu
 static_assert(std::string_view(detail::kSparkTagConsumerErrors) == "yuzu.spark_consumer_errors");
 static_assert(std::string_view(detail::kSparkTagArmRaceUnwatchFailures) ==
               "yuzu.spark_arm_race_unwatch_failures");
+static_assert(std::string_view(detail::kSparkTagDisarmUnwatchFailures) ==
+              "yuzu.spark_disarm_unwatch_failures");
 static_assert(std::string_view(detail::kSparkTagPrefix) == "yuzu.spark_");
 
 // MECHANISM-TOKEN BIND: the fleet `mechanism` label values MUST equal the agent's
@@ -103,7 +105,8 @@ TEST_CASE("agent emit keys bind exactly to the server tag constants", "[spark][f
         detail::kSparkTagRunning,        detail::kSparkTagDisabled,
         detail::kSparkTagMechs,          detail::kSparkTagArmedFaulted,
         detail::kSparkTagWatchFaults,    detail::kSparkTagQueuedDropped,
-        detail::kSparkTagConsumerErrors, detail::kSparkTagArmRaceUnwatchFailures};
+        detail::kSparkTagConsumerErrors, detail::kSparkTagArmRaceUnwatchFailures,
+        detail::kSparkTagDisarmUnwatchFailures};
     for (const char* mech : detail::kSparkMechTokens)
         for (const char* metric : detail::kSparkMetricTokens)
             reader_keys.insert(detail::spark_type_metric_tag(mech, metric));
@@ -120,6 +123,11 @@ TEST_CASE("agent emit keys bind exactly to the server tag constants", "[spark][f
     ss.queued_dropped_total = 3;
     ss.consumer_errors_total = 4;
     ss.arm_race_unwatch_failures_total = 8;
+    // The SECOND sparse counter. Left at zero this key is never emitted and this case
+    // goes green without ever seeing it - which is exactly what happened to its sibling
+    // and is recorded in the comment above. The trap caught #2270 twice; setting it is
+    // the only thing that makes the bind real.
+    ss.disarm_unwatch_failures_total = 9;
     std::map<SparkType, SparkMechanismStats> by_type;
     for (SparkType t : {SparkType::File, SparkType::Registry, SparkType::Service}) {
         SparkMechanismStats ms;
