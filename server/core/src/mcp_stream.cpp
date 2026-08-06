@@ -20,6 +20,7 @@
 #include <random>
 #include <functional>
 #include <string_view>
+#include <stdexcept>  // std::runtime_error - the unpin() fault-injection seam throws it
 #include <system_error>
 #include <utility>
 
@@ -68,13 +69,14 @@ constexpr const char* kMetricFramesTruncated = "yuzu_mcp_stream_frames_too_large
 constexpr const char* kMetricPublishFailures = "yuzu_mcp_stream_publish_failures_total";
 // A committed final response was published with NO pin at all. Structurally unreachable
 // while the pin array is non-empty - a full slot set displaces its oldest pin instead
-// (kMetricPinDisplaced below, which now carries the admission-drift reading). Kept as
+// (kMetricPinDisplaced below). Kept as
 // defence in depth: non-zero means the array was resized to zero or the displacement
 // path was bypassed.
 constexpr const char* kMetricFinalUnpinned = "yuzu_mcp_stream_final_unpinned_total";
-/// An older pinned terminal yielded its eviction-exemption slot to a newer one. NOT expected:
-/// the bridge admits streamed records against `pinned_count() + unpinned`, and the pin array is
-/// sized to exactly that cap, so a full slot set means admission accounting has drifted. This
+/// An older pinned terminal yielded its eviction-exemption slot to a newer one.
+/// The bridge admits streamed records against `pinned_count() + unpinned` and the pin array
+/// is sized to exactly that cap. What a full set MEANS since #2740 is defined once -
+/// see McpStreamState's "What a FULL PIN-SLOT SET means" block in mcp_stream.hpp. This
 /// counter carries that reading (the LRU is the graceful degradation, not a licence).
 constexpr const char* kMetricPinDisplaced = "yuzu_mcp_stream_pin_displaced_total";
 /// The final was written to the wire (the client has it), but the bridge's own
@@ -338,7 +340,7 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
     std::uint64_t evicted = 0;
     bool oversized = false;
     bool sink_enqueue_failed = false;
-    bool pin_displaced = false; ///< an older pin yielded its slot (admission drift)
+    bool pin_displaced = false; ///< an older pin yielded its slot (corroborate, not a verdict)
     bool pin_unslotted = false; ///< no slot at all (only if the array is size 0)
     bool post_commit_obs_fault = false;  // test seam; tripped inside the post-commit try
     {
@@ -431,12 +433,11 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
         // eviction never touches). Writing the id only now means a pre-commit push_back throw
         // leaves no ghost pin.
         if (pinned) {
-            // WHAT HAPPENS WHEN THE SLOTS ARE FULL. Reaching this state means admission
-            // accounting has already drifted: `publish_final` runs only for a kRingOnly
-            // record (`publish_terminal_ladder`), the bridge admits streamed records against
-            // `pinned_count() + unpinned >= kMaxStreamedPostsPerSession`, and the array is
-            // sized to exactly that cap - so a full set should be unreachable. It is a
-            // DRIFT SIGNAL, not an ordinary event, and `pin_displaced_total` is alertable.
+            // WHAT HAPPENS WHEN THE SLOTS ARE FULL. What a full set MEANS is defined
+            // once - see McpStreamState's "What a FULL PIN-SLOT SET means" block in
+            // mcp_stream.hpp - and is deliberately not restated here. Since #2740 it is
+            // a signal to CORROBORATE, not a verdict: the state is reachable, so this
+            // branch is a real degradation path rather than an impossible one.
             //
             // But the old fallback made the drift worse than it needed to be: it committed
             // the newest terminal UNPINNED, which is the wrong one to sacrifice. A pin
@@ -841,17 +842,45 @@ bool McpStreamState::is_pinned(std::uint64_t id) const {
     return is_pinned_locked(id);
 }
 
-void McpStreamState::unpin(std::uint64_t id) {
+void McpStreamState::inject_unpin_fault_for_test(UnpinFault fault, int times) {
+    std::lock_guard<std::mutex> lk(mu_);
+    unpin_fault_ = fault;
+    unpin_fault_remaining_ = fault == UnpinFault::kNone ? 0 : times;
+}
+
+bool McpStreamState::unpin(std::uint64_t id) {
     if (id == 0) {
-        return;
+        return false;
     }
     std::lock_guard<std::mutex> lk(mu_);
-    for (auto& slot : pinned_ids_) {
-        if (slot == id) {
-            slot = 0; // now evictable; a later publish may reclaim its ring space
-            return;   // ids are unique - at most one slot holds it
+    // TEST SEAM (see UnpinFault). Consumed BEFORE the scan so an armed fault models the
+    // failure regardless of whether the id is still pinned - which is the point for
+    // kRaceLost, whose whole premise is that another route already cleared it.
+    if (unpin_fault_remaining_ > 0) {
+        const UnpinFault fault = unpin_fault_;
+        if (--unpin_fault_remaining_ == 0) {
+            unpin_fault_ = UnpinFault::kNone;
+        }
+        if (fault == UnpinFault::kThrow) {
+            throw std::runtime_error("injected unpin fault");
+        }
+        if (fault == UnpinFault::kRaceLost) {
+            return false;
         }
     }
+    for (auto& slot : pinned_ids_) {
+        if (slot == id) {
+            slot = 0;    // now evictable; a later publish may reclaim its ring space
+            return true; // ids are unique - at most one slot holds it
+        }
+    }
+    return false; // already released by another route, or never pinned
+}
+
+std::array<std::uint64_t, kMaxStreamedPostsPerSession> McpStreamState::pinned_ids_snapshot()
+    const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return pinned_ids_;
 }
 
 std::size_t McpStreamState::pinned_count() const {
@@ -1500,7 +1529,11 @@ bool McpPostPump::pump_once_impl(const WriteFn& write) {
     }
 
     for (const auto& frame : batch.progress) {
-        if (!write_all(write, sse_bus::format_sse(sse_bus::SseEvent{"message", frame}))) {
+        // #2785: the replay-ring event id rides the SSE `id:` line (3-arg
+        // SseEvent; format_sse omits the line for 0) so a POST-only client can
+        // build a `Last-Event-ID` resume cursor from the frames it actually saw.
+        if (!write_all(write, sse_bus::format_sse(
+                                  sse_bus::SseEvent{"message", frame.data, frame.event_id}))) {
             return finish(write, McpStreamClose::kClientGone);
         }
     }
@@ -1509,8 +1542,9 @@ bool McpPostPump::pump_once_impl(const WriteFn& write) {
         // The final goes LAST and is followed by EOF - the spec's
         // progress-before-response ordering, which the 3a GET-after-response
         // shape could not provide.
-        if (!write_all(write, sse_bus::format_sse(
-                                  sse_bus::SseEvent{"message", *batch.final_frame}))) {
+        if (!write_all(write,
+                       sse_bus::format_sse(sse_bus::SseEvent{"message", batch.final_frame->data,
+                                                             batch.final_frame->event_id}))) {
             return finish(write, McpStreamClose::kClientGone);
         }
         if (on_final_written_) {

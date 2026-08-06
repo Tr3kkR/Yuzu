@@ -180,20 +180,25 @@ groups:
             this is an allocation-pressure or stream-state signal worth paging.
       - alert: YuzuMcpStreamPinDisplaced
         expr: |
-          rate(yuzu_mcp_stream_pin_displaced_total[15m]) > 0
+          increase(yuzu_mcp_stream_pin_displaced_total[15m]) > 0
         labels:
           severity: warning
         annotations:
-          summary: "MCP replay-ring pin slots exhausted (admission accounting drift)"
+          summary: "MCP replay-ring pin slots exhausted (corroborate before treating as drift)"
           description: >-
-            yuzu_mcp_stream_pin_displaced_total is moving - a session filled every
-            replay-ring pin slot, which the bridge's admission cap should make
-            unreachable, so admission accounting has drifted. The server degraded
-            gracefully (the oldest pinned terminal yielded its eviction exemption
-            to the newest; the displaced final stays committed and remains
-            fetchable by execution_id). No restart needed - this is a diagnostic
-            signal, not an outage: file a bug with the session's stream metrics.
-          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement"
+            A session filled every replay-ring pin slot and the oldest pin was
+            displaced. A SUCCESSFUL #2740 admission reclaim cannot cause this - it
+            releases one pin and adds one charge, so the session stays AT cap and a
+            slot is always free. Only two paths reach a full set: a release that lost
+            a race (yuzu_mcp_bridge_pin_release_raced_total, #2795) and a contained
+            release throw (yuzu_mcp_bridge_pin_release_failed_total, #2805). Rule
+            those two out; what remains is genuine admission-accounting drift. The
+            server degraded gracefully - the oldest pinned terminal yielded its
+            eviction exemption to the newest, the displaced final stays committed, and
+            results remain fetchable by execution_id. No restart; this is diagnostic,
+            not an outage. Follow docs/ops-runbooks/mcp-stream-pin-displacement.md - it
+            owns the procedure and this annotation only points at it.
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement#what-to-do"
       - alert: YuzuMcpStreamFinalUnpinned
         expr: |
           rate(yuzu_mcp_stream_final_unpinned_total[15m]) > 0
@@ -208,7 +213,7 @@ groups:
             resized to zero or the displacement path was bypassed. The affected
             terminal is evictable from the replay ring but remains fetchable by
             execution_id. File a bug; no restart needed.
-          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement"
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement#what-to-do"
       - alert: YuzuMcpBridgeForcedExpireUnavailable
         expr: |
           rate(yuzu_mcp_bridge_forced_expire_total{disposition="synthesize_unavailable"}[15m]) > 0
@@ -268,10 +273,14 @@ groups:
             A streamed request was refused for want of a session slot, and every
             slot was held by a final the bridge had already committed rather than by
             a call still in flight. After the rule-(a) unpin those pins are released
-            when the final reaches the wire, so a SUSTAINED rate means slots are not
-            coming back and the affected client stays locked out of streaming until
-            it re-initializes, while the 429 it receives tells it to "wait for one to
-            finish" when they already did. The `for` is load-bearing, not tuning: the
+            when the final reaches the wire, and since #2740 admission RECLAIMS such a
+            slot rather than refusing - including an orphan pin no record references.
+            A SUSTAINED rate therefore no longer means the client is locked out; it
+            means the reclaim kept finding nothing to take, which narrows the cause to
+            a final still being written, a transient mid-projection decline, or a
+            genuinely stuck slot. The 429 the client receives says so (it advises a
+            retry, not a wait); "wait for one to finish" is now the charges branch
+            only. The `for` is load-bearing, not tuning: the
             charge-to-pin handover happens at terminal projection but the unpin only
             once the final reaches the wire, so every HEALTHY session passes through
             pinned>0/unpinned==0 during that flush window, and a lone refusal landing
@@ -279,8 +288,32 @@ groups:
             that held="charges" is NOT purely benign: it is emitted whenever ANY
             charge is outstanding, so a partial wedge (some pins stuck, one call
             genuinely in flight) is bucketed there and this alert cannot see it.
-            Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
-          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
+            Runbook: docs/ops-runbooks/mcp-stream-pin-displacement.md
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement#yuzumcpstreamedpinslotswedged--a-session-is-being-refused-not-merely-degraded"
+      - alert: YuzuMcpBridgePinReleaseFailed
+        expr: |
+          yuzu_mcp_bridge_pin_release_failed_total > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP streamed admission's pin release THREW and was contained"
+          description: >-
+            The streamed-admission reclaim (#2740) selected a pin to release and the
+            release itself THREW. This counts ONLY that throw - it does not count a
+            release that merely lost a race to another release route, which is the
+            ordinary residual (#2795), counted separately as
+            yuzu_mcp_bridge_pin_release_raced_total. So a zero HERE does not mean no
+            session ever sat over its cap - check that counter too. It is contained deliberately: the new admission is
+            already committed at that point, so letting the throw escape would leave a
+            session slot nothing reclaims until the arming reaper fires. Like its
+            sibling YuzuMcpBridgeChargeReleaseDeferred this needs a genuinely broken
+            platform mutex, so any non-zero value is a signal about the host rather
+            than a rate to tune. The admission itself stands; that session is one slot
+            tighter than its nominal cap implies until the pin clears by another route
+            (a GET resume acking past it, or session death). Distinct from
+            yuzu_mcp_bridge_pin_displaced_for_admission_total, which counts the
+            SUCCESSFUL reclaims and is expected traffic.
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement#what-to-do"
       - alert: YuzuMcpBridgeChargeReleaseDeferred
         expr: |
           yuzu_mcp_bridge_charge_release_deferred_total > 0
