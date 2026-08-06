@@ -53,31 +53,65 @@ void serve_doc(const httplib::Request& req, httplib::Response& res, const Discov
 
 // ── /discover/permissions ──────────────────────────────────────────────────
 
-DiscoveryDoc build_permissions_catalog(RbacStore& rbac_store) {
-    json roles_arr = json::array();
-    for (const auto& role : rbac_store.list_roles()) {
-        json perms_arr = json::array();
-        for (const auto& p : rbac_store.get_role_permissions(role.name)) {
-            perms_arr.push_back({{"securable_type", p.securable_type},
-                                 {"operation", p.operation},
-                                 {"effect", p.effect}});
-        }
-        roles_arr.push_back({{"name", role.name},
-                             {"description", role.description},
-                             {"is_system", role.is_system},
-                             {"permissions", std::move(perms_arr)}});
-    }
-
+DiscoveryDoc build_permissions_catalog(RbacStore& rbac_store, bool include_roles) {
+    // #2376: the catalogue is TWO things with different sensitivities, and the
+    // split is the whole point of this parameter.
+    //
+    //   * the TAXONOMY (`securable_types`, `operations`) — a static list of what
+    //     the RBAC model can express. Not authorization topology: it says nothing
+    //     about who holds what, and an agentic worker needs it to author a grant
+    //     at all (A2 discovery). Stays readable at the route's `Infrastructure:Read`.
+    //
+    //   * the ROLE GRID (`roles[].permissions[]`) — every role's actual granted
+    //     securable/operation/effect. That IS the authorization topology the
+    //     #2376 floor exists to protect, and it is strictly MORE than
+    //     `GET /api/v1/rbac/roles` discloses, which the floor already gates on
+    //     `UserManagement:Read`. Serving it here on the route's broader
+    //     `Infrastructure:Read` made this an alternate transport around the
+    //     floor: on an RBAC-off install (the default) the legacy fallback allows
+    //     every `Read` to any authenticated session, so a plain `user` refused at
+    //     /rbac/roles could read the entire grid here instead.
+    //
+    // Found by the adversarial-review panel (Codex) AFTER a 14-agent governance
+    // run passed the change — that run verified coverage of the floored
+    // SECURABLES and never asked which OTHER securable reaches the same DATA.
+    // Do not re-merge these two halves under one gate.
     json body = {
         {"version", 1},
         {"description",
          "RBAC permission catalog: every securable_type x operation pair the RBAC "
-         "store recognizes, plus the full role -> allowed-operations grid. "
-         "Agentic-first (A1/A2) discovery — docs/agentic-first-principle.md."},
+         "store recognizes. The full role -> allowed-operations grid is included "
+         "only for callers holding UserManagement:Read (#2376 authorization-topology "
+         "floor). Agentic-first (A1/A2) discovery — docs/agentic-first-principle.md."},
         {"securable_types", rbac_store.list_securable_types()},
         {"operations", rbac_store.list_operations()},
-        {"roles", std::move(roles_arr)},
     };
+
+    if (include_roles) {
+        json roles_arr = json::array();
+        for (const auto& role : rbac_store.list_roles()) {
+            json perms_arr = json::array();
+            for (const auto& p : rbac_store.get_role_permissions(role.name)) {
+                perms_arr.push_back({{"securable_type", p.securable_type},
+                                     {"operation", p.operation},
+                                     {"effect", p.effect}});
+            }
+            roles_arr.push_back({{"name", role.name},
+                                 {"description", role.description},
+                                 {"is_system", role.is_system},
+                                 {"permissions", std::move(perms_arr)}});
+        }
+        body["roles"] = std::move(roles_arr);
+    } else {
+        // Say so EXPLICITLY rather than omitting silently. An agentic worker that
+        // cannot tell "no roles exist" from "you may not see them" will report the
+        // fleet has no RBAC roles — the same absent-vs-empty trap the upgrade note
+        // warns evidence collectors about.
+        body["roles_omitted"] = true;
+        body["roles_omitted_reason"] =
+            "requires UserManagement:Read (#2376 authorization-topology floor); "
+            "the securable_types and operations taxonomy above is unaffected";
+    }
     return build_discovery_doc(std::move(body));
 }
 
@@ -377,7 +411,15 @@ void register_on_sink(HttpRouteSink& sink, DiscoverRoutes::AuthFn auth_fn,
                  // A corrupt/locked store row can throw mid-scan — a raw 500 would
                  // break the A4 contract this surface teaches (governance UP-11).
                  try {
-                     serve_doc(req, res, build_permissions_catalog(*rbac_store));
+                     // Probe for the grid permission with a throwaway response
+                     // (the established idiom — see the quarantine per-record
+                     // admit probe in rest_api_v1.cpp). A denial here must NOT
+                     // 403 the route: the taxonomy is still served.
+                     httplib::Response probe;
+                     const bool include_roles =
+                         perm_fn(req, probe, "UserManagement", "Read");
+                     serve_doc(req, res,
+                               build_permissions_catalog(*rbac_store, include_roles));
                  } catch (const std::exception&) {
                      discover_503(res, "discovery store read failed");
                  }

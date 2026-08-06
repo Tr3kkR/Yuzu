@@ -40,6 +40,7 @@
 #include "agent.pb.h"
 
 #include <algorithm>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -63,7 +64,18 @@ struct DiscoverHarness {
     AgentRegistry registry{bus, metrics};
 
     bool grant_perms{true};
+    /// Per-(securable, operation) denial, for routes that probe a SECOND
+    /// permission beyond their own gate. Returning false denies just that pair
+    /// and leaves the route's own gate intact — `grant_perms` is all-or-nothing
+    /// and cannot express that. Mirrors McpTestServer::perm_override_for_test.
+    std::function<bool(const std::string&, const std::string&)> perm_override{};
     std::string last_securable_type, last_operation;
+    /// The route's OWN gate, i.e. the first permission it checks. A route that
+    /// PROBES a second permission (#2376: /discover/permissions probes
+    /// UserManagement:Read for the role grid) would otherwise leave only the
+    /// probe in last_*, and a test asserting "this route is gated on X" would
+    /// silently start asserting the probe instead.
+    std::string first_securable_type, first_operation;
 
     DiscoverRoutes routes;
 
@@ -95,8 +107,16 @@ struct DiscoverHarness {
 
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
                               const std::string& type, const std::string& op) -> bool {
+            if (first_securable_type.empty()) {
+                first_securable_type = type;
+                first_operation = op;
+            }
             last_securable_type = type;
             last_operation = op;
+            if (perm_override && !perm_override(type, op)) {
+                res.status = 403;
+                return false;
+            }
             if (grant_perms)
                 return true;
             res.status = 403;
@@ -172,13 +192,61 @@ TEST_CASE("discover.permissions: shape + ETag revalidation", "[discovery][permis
         }
     }
 
-    // Gated on Infrastructure:Read.
-    CHECK(h.last_securable_type == "Infrastructure");
+    // Gated on Infrastructure:Read — the route's OWN gate, which is the FIRST
+    // permission checked. Since #2376 the handler then PROBES UserManagement:Read
+    // to decide whether the role grid is included, so last_* holds the probe.
+    CHECK(h.first_securable_type == "Infrastructure");
+    CHECK(h.first_operation == "Read");
+    CHECK(h.last_securable_type == "UserManagement"); // the grid probe ran
+    CHECK(h.last_operation == "Read");
     CHECK(h.last_operation == "Read");
 
     auto cached = h.sink.Get("/api/v1/discover/permissions", {{"If-None-Match", etag}});
     REQUIRE(cached);
     CHECK(cached->status == 304);
+}
+
+// #2376 — the floor bypass this split closes, REST side (the MCP twin has the
+// mirror of this test). /discover/permissions is gated Infrastructure:Read, which
+// is NOT in the topology floor and which every authenticated session holds on an
+// RBAC-off install via the legacy Read-allow. Before the split it served the
+// complete role -> permission grid to a caller the floor had just refused at
+// /rbac/roles — a strictly LARGER disclosure than the floored route, reached
+// through an alternate transport. This is the same shape as the
+// discover.plugins enrichment gate below: probe a second permission, withhold
+// the richer half, keep the route itself working.
+TEST_CASE("discover.permissions: role grid withheld when caller lacks UserManagement:Read",
+          "[discovery][permissions][floor]") {
+    DiscoverHarness h;
+    h.perm_override = [](const std::string& securable, const std::string& op) {
+        return !(securable == "UserManagement" && op == "Read");
+    };
+
+    auto res = h.sink.Get("/api/v1/discover/permissions");
+    REQUIRE(res);
+    // The ROUTE still succeeds on its own Infrastructure:Read gate...
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    // ...the grid is gone — the assertion that closes the bypass...
+    CHECK_FALSE(j.contains("roles"));
+    // ...its absence is declared, so a caller cannot read it as "no roles exist"...
+    CHECK(j.value("roles_omitted", false));
+    CHECK_FALSE(j.value("roles_omitted_reason", std::string{}).empty());
+    // ...and the taxonomy an agentic worker needs for A2 discovery survives.
+    CHECK_FALSE(j["securable_types"].empty());
+    CHECK_FALSE(j["operations"].empty());
+}
+
+TEST_CASE("discover.permissions: role grid PRESENT for a UserManagement:Read holder",
+          "[discovery][permissions][floor]") {
+    DiscoverHarness h; // default perm_fn grants everything
+    auto res = h.sink.Get("/api/v1/discover/permissions");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j.contains("roles"));
+    CHECK_FALSE(j["roles"].empty());
+    CHECK_FALSE(j.value("roles_omitted", false));
 }
 
 TEST_CASE("discover.permissions: null RbacStore -> 503", "[discovery][permissions]") {

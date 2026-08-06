@@ -9347,7 +9347,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto doc = yuzu::server::build_permissions_catalog(*rbac_store);
+                // #2376: same split as the REST twin — probe for the grid
+                // permission, never deny the whole tool over it.
+                httplib::Response perm_probe;
+                const bool include_roles =
+                    perm_fn(req, perm_probe, "UserManagement", "Read");
+                auto doc =
+                    yuzu::server::build_permissions_catalog(*rbac_store, include_roles);
                 auto result = tool_result(doc.json, kObjectOutputSchema);
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");

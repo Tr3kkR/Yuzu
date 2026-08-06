@@ -151,6 +151,38 @@ TEST_CASE("topology_floor_applies: exactly the three documented pairs are floore
     CHECK(std::size(kTopologyFloor) == 3);
 }
 
+// ── 1b. Every floored securable must actually EXIST in the catalogue ─────
+//
+// The floor matches by STRING and has no compile-time tie to the securable
+// names `seed_defaults()` registers (adversarial-review finding F5, Kimi).
+// The membership test above pins kTopologyFloor against a hand-copied literal
+// list, which catches a typo in ONE of them — but if a securable were renamed
+// in rbac_store.cpp and the floor entry updated to match a name that is never
+// seeded, both would agree and the floor would silently protect nothing:
+// `check_permission` would be asked about a securable the store does not
+// recognise, and on an RBAC-off install the legacy branch is what actually
+// answers anyway.
+//
+// This closes that by asserting against the STORE's own registry rather than
+// another copy of the same literals.
+TEST_CASE("kTopologyFloor: every floored securable is a real, seeded securable type",
+          "[authz][floor]") {
+    yuzu::test::TempDbFile rbac_db_file{"yuzu_test_authz_floor_catalogue_"};
+    RbacStore store{rbac_db_file.path};
+    REQUIRE(store.is_open());
+
+    const auto types = store.list_securable_types();
+    const auto ops = store.list_operations();
+
+    for (const auto& entry : kTopologyFloor) {
+        const std::string securable{entry.securable};
+        const std::string operation{entry.operation};
+        INFO("floored pair " << securable << ":" << operation);
+        CHECK(std::find(types.begin(), types.end(), securable) != types.end());
+        CHECK(std::find(ops.begin(), ops.end(), operation) != ops.end());
+    }
+}
+
 // ── 2. RBAC OFF + non-admin → 403 on every floored pair ─────────────────
 
 TEST_CASE("require_permission: RBAC off, non-admin is denied on every floored pair",

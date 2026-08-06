@@ -1807,7 +1807,12 @@ TEST_CASE("MCP Integration: discover_permissions wired vs unwired", "[mcp][integ
     ts.rbac_store_for_test = &rbac;
     ts.start("readonly");
 
-    const auto expected = nlohmann::json::parse(yuzu::server::build_permissions_catalog(rbac).json);
+    // include_roles=true: the harness's perm_fn allows every permission unless a
+    // test installs perm_override_for_test, so this caller holds UserManagement:Read
+    // and gets the full grid. The DENIED case is the next test — #2376 split the
+    // catalogue so the role grid needs UserManagement:Read while the taxonomy does not.
+    const auto expected =
+        nlohmann::json::parse(yuzu::server::build_permissions_catalog(rbac, true).json);
 
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":22,"params":{"name":"discover_permissions"}})");
@@ -1818,6 +1823,49 @@ TEST_CASE("MCP Integration: discover_permissions wired vs unwired", "[mcp][integ
         nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
     CHECK(got == expected);
     CHECK_FALSE(got["securable_types"].empty());
+    CHECK(got.contains("roles")); // the grid IS present for a UserManagement:Read holder
+
+    // #2376 — the floor bypass this split closes. discover_permissions is gated
+    // Infrastructure:Read, which is NOT floored and which every authenticated
+    // session holds on an RBAC-off install via the legacy Read-allow. Before the
+    // split it therefore served the complete role -> permission grid to a caller
+    // the floor had just refused at /rbac/roles: a strictly larger disclosure than
+    // the floored route, through an alternate transport. Found by the adversarial
+    // panel AFTER a 14-agent governance run passed the change.
+    //
+    // Deny ONLY UserManagement:Read: the tool itself must still succeed on its own
+    // Infrastructure:Read gate, and the taxonomy must still be served — the split
+    // exists so A2 discovery of the permission MODEL survives.
+    {
+        yuzu::server::RbacStore rbac_denied(":memory:");
+        REQUIRE(rbac_denied.is_open());
+        McpTestServer ts_denied;
+        ts_denied.rbac_store_for_test = &rbac_denied;
+        ts_denied.perm_override_for_test = [](const std::string& securable,
+                                              const std::string& operation) {
+            return !(securable == "UserManagement" && operation == "Read");
+        };
+        ts_denied.start("readonly");
+
+        auto res_d = ts_denied.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":24,"params":{"name":"discover_permissions"}})");
+        REQUIRE(res_d);
+        CHECK(res_d->status == 200);
+        auto body_d = nlohmann::json::parse(res_d->body);
+        REQUIRE(body_d.contains("result")); // the TOOL still succeeds
+        auto got_d =
+            nlohmann::json::parse(body_d["result"]["content"][0]["text"].get<std::string>());
+
+        // The grid is gone — this is the assertion that closes the bypass.
+        CHECK_FALSE(got_d.contains("roles"));
+        // ...and its absence is stated, not silent: an agentic worker must not read
+        // this as "the fleet has no RBAC roles" (the absent-vs-empty trap).
+        CHECK(got_d.value("roles_omitted", false));
+        CHECK_FALSE(got_d.value("roles_omitted_reason", std::string{}).empty());
+        // The taxonomy survives — the split is narrow, not a blanket denial.
+        CHECK_FALSE(got_d["securable_types"].empty());
+        CHECK_FALSE(got_d["operations"].empty());
+    }
 
     // Unwired (RbacStore left null, the McpTestServer default) — a JSON-RPC
     // tool error, not a 5xx: MCP has no HTTP-status channel for a store-503
