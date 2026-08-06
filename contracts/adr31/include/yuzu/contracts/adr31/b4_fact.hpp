@@ -2,6 +2,7 @@
 
 #include "b2_use_case.hpp"
 #include "contract_error.hpp"
+#include "rest_a4_error.hpp"
 #include "transport_auth_slot.hpp"
 #include "use_case_types.hpp"
 
@@ -17,6 +18,7 @@
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace yuzu::contracts::adr31 {
 
@@ -184,10 +186,50 @@ private:
     make_b4_fact_call(B4FactRequest request, B4FactTransportAuth authentication);
 };
 
+struct B4FactResult {
+    std::string correlation_id;
+    std::string use_case_run_id;
+    VersionedIdentity module;
+    std::string module_manifest_hash;
+    VersionedIdentity capability;
+    /// Opaque domain facts. Ordinary actor/user/subject/identity fields remain
+    /// data; transport-authentication namespaces remain forbidden.
+    nlohmann::json facts;
+    /// Core-issued evidence identifiers for the persisted fact read. These
+    /// are never bearer capabilities and cannot be redeemed for data.
+    std::vector<std::string> fact_refs;
+    /// Core-computed confinement status, never inferred from returned rows.
+    ScopeBasis scope_basis;
+    /// Present for distributed capabilities. The DTO cannot infer capability
+    /// mode; Core's ratified registry enforces presence at the provider edge.
+    std::optional<CoverageEnvelope> coverage = std::nullopt;
+    nlohmann::json provenance;
+    nlohmann::json extensions = nlohmann::json::object();
+
+    friend bool operator==(const B4FactResult&, const B4FactResult&) = default;
+};
+
+using B4FactResponse = std::variant<B4FactResult, A4ErrorEnvelope>;
+
 [[nodiscard]] std::expected<B4FactRequest, ContractError>
 decode_b4_fact_request(std::string_view wire_json);
 
 [[nodiscard]] std::expected<B4FactCall, B4FactCallError>
 make_b4_fact_call(B4FactRequest request, B4FactTransportAuth authentication);
+
+/// Success uses the B4 contract header. The failure arm preserves the public
+/// A4 REST error shape and therefore carries no B4 contract header.
+[[nodiscard]] std::expected<std::string, ContractError>
+encode_b4_fact_response(const B4FactResponse& response);
+
+[[nodiscard]] std::expected<B4FactResponse, ContractError>
+decode_b4_fact_response(std::string_view wire_json);
+
+/// Correlates and echo-binds a typed response; it does not authenticate the
+/// response or prove Core's confinement calculation. Transport authentication
+/// and provider conformance remain authoritative. A4 errors bind correlation
+/// only and cannot themselves transition or terminalise a run.
+[[nodiscard]] std::expected<void, ContractError>
+validate_b4_fact_exchange(const B4FactRequest& request, const B4FactResponse& response);
 
 } // namespace yuzu::contracts::adr31
