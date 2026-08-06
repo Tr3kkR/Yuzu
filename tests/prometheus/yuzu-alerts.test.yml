@@ -11,21 +11,25 @@
 # `meson test` unfiltered on three REQUIRED build legs, and an earlier version of
 # this wiring put a Docker Hub dependency on all three (#2553).
 #
-# To run them yourself from the repo root with no promtool installed:
+# To run them yourself from the repo root:
 #
-#   docker run --rm -v "$PWD":/w:ro \
-#     --entrypoint /bin/promtool \
-#     prom/prometheus@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893 \
-#     test rules /w/tests/prometheus/yuzu-alerts.test.yml
+#   YUZU_TEST_ENABLE_PROMTOOL_DOCKER=1 python3 tests/prometheus/run_promtool_tests.py
 #
-# That digest IS promtool 3.13.1, and it is pinned by digest rather than tag on
-# purpose: a tag is mutable, and `prom/prometheus:3.13.1` is not even a tag Docker
-# Hub publishes (the registry uses a `v` prefix). The harness asserts this digest
-# matches the workflow's, so the two cannot drift.
+# Go through the harness rather than calling promtool directly: it is what pins
+# the image, and it fails a run that promtool would exit 0 on (see below). The
+# pinned image has exactly ONE home, that script's `PROMTOOL_IMAGE` -- the
+# workflow carries no copy of it, so there is nothing here to keep in step.
 #
 # Do NOT assume 2.x agrees: Prometheus 3.0 made range selectors left-open, which
 # shifts increase()/resets() by a sample at window edges -- exactly what these
 # cases measure. Run them under the pinned major, not whatever is on PATH.
+#
+# A GREEN RUN IS NOT AUTOMATICALLY EVIDENCE. `promtool test rules` exits 0 when
+# the `rule_files:` glob below matches NOTHING (it prints "WARNING: no file
+# match pattern" and then "SUCCESS"), and also when `tests:` is empty. So a
+# rules-file rename that misses this file would turn the gate green having
+# loaded zero rules. The harness checks for both and fails; if you invoke
+# promtool by hand, that check is not running.
 #
 # WHY THIS FILE EXISTS. An alert rule is code that runs in production and never
 # compiles. `promtool check rules` proves only that the PromQL parses -- a rule
@@ -257,6 +261,53 @@ tests:
         eval_time: 2h29m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing", instance="s2", job="yuzu", severity="warning"}'
+            value: 1
+
+  # ── YuzuAuditRetentionMetricMissing ───────────────────────────────────────
+  #
+  # The companion to the rule above, which cannot detect its own input going
+  # missing: `increase()` over a metric with no series is an empty vector, and
+  # an alert that selects nothing never fires.
+
+  # CASE 10 -- the metric is absent entirely. The absence alert must fire, and
+  # the liveness rule must stay quiet (it has nothing to reason about, and two
+  # alerts for one cause would be worse than one). This is the state a
+  # Prometheus lands in when the rules file is applied ahead of the servers.
+  - interval: 1m
+    name: retention metric missing - an absent counter fires the absence alert, not the liveness one
+    input_series:
+      # Only uptime. No yuzu_server_audit_retention_passes_total anywhere.
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
+        values: "20000+60x59"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionMetricMissing", alertstate="firing"}'
+        eval_time: 50m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionMetricMissing", alertstate="firing", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing"}'
+        eval_time: 50m
+        exp_samples: []
+
+  # CASE 11 -- the metric is present. The absence alert must stay silent even
+  # while the liveness rule is firing, or every stopped reaper pages twice.
+  - interval: 1m
+    name: retention metric missing - a present counter keeps the absence alert quiet
+    input_series:
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
+        values: "20000+60x59"
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "5x59"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionMetricMissing"}'
+        eval_time: 50m
+        exp_samples: []
+      # The liveness rule IS firing here, which is what makes this a real
+      # exclusivity check rather than two quiet rules.
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing"}'
+        eval_time: 50m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
 
   # CASE 9 -- the `resets()` RANGE and the 10800s grace, which case 8 cannot

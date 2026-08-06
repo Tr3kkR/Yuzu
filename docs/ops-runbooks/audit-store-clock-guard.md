@@ -162,6 +162,15 @@ server, check whether it is actually restarting:
 > stable identity. Confirm restarts directly with `journalctl --list-boots`, or
 > the orchestrator's restart count, rather than trusting `resets()` alone.
 
+**Before assuming a crash loop, check the uptime series exists.** If
+`yuzu_server_uptime_seconds` returns nothing for this instance, the rule fired
+on its absent-series arm (deliberate — a server that stops exporting uptime must
+not be able to silence its own liveness alert), and the fault is in the scrape
+path, not the reaper: check the target is up and that a `metric_relabel_configs`
+rule is not dropping it. The separate `YuzuAuditRetentionMetricMissing` alert
+covers the other half of this — the retention *counter* not being scraped at
+all, which leaves this rule unable to fire for anyone.
+
 > There is deliberately NO metric for a missing retention index. The index is
 > built best-effort outside the migration runner and its absence degrades
 > retention to full scans rather than taking the audit trail offline; it is

@@ -104,9 +104,80 @@ DOCKER_HARDENING = [
 ]
 
 
-def run(argv: list[str]) -> int:
+def run(argv: list[str]) -> tuple[int, str]:
+    """Run promtool, echo its output, and return `(rc, combined output)`.
+
+    The output is returned because promtool's exit code is not sufficient
+    evidence on its own — see `check_gate_output`.
+    """
     print("+ " + " ".join(argv), flush=True)
-    return subprocess.run(argv, cwd=REPO_ROOT).returncode
+    proc = subprocess.run(argv, cwd=REPO_ROOT, capture_output=True, text=True)
+    out = proc.stdout + proc.stderr
+    if out:
+        print(out, end="" if out.endswith("\n") else "\n", flush=True)
+    return proc.returncode, out
+
+
+def check_gate_output(check_out: str, test_out: str, declared_cases: int | None) -> str | None:
+    """The reason this run proves nothing, or None if it is real evidence.
+
+    PROMTOOL EXITS 0 ON AN EMPTY RUN, and that is the whole reason this function
+    exists. Measured on 3.13.1:
+
+      `test rules` against a `rule_files:` glob matching no file prints
+      "WARNING: no file match pattern <path>" and then "SUCCESS", rc 0.
+      A test file whose `tests:` list is empty also prints "SUCCESS", rc 0.
+
+    So a rules file renamed without updating the test file's relative
+    `rule_files:` — exactly the edit that would also carry a rule change —
+    turns this gate green having loaded zero rules and asserted nothing. A
+    green check that proves nothing is worse than no check, because it is
+    reported as evidence.
+    """
+    if "no file match pattern" in test_out:
+        return ("`test rules` matched NO rule file — its `rule_files:` path is "
+                "stale, so zero rules were loaded and every case vacuously "
+                "passed. promtool exits 0 for this; the gate must not.")
+    m = re.search(r"SUCCESS:\s*(\d+)\s+rules found", check_out)
+    if not m:
+        return ("`check rules` did not report a rule count; cannot confirm any "
+                "rule was loaded.")
+    if int(m.group(1)) == 0:
+        return "`check rules` loaded 0 rules — nothing was validated."
+    if declared_cases is not None and declared_cases == 0:
+        return f"{TESTS} declares no test cases — nothing was asserted."
+    return None
+
+
+def declared_case_count() -> int | None:
+    """How many cases the test file declares, or None if it cannot be read.
+
+    PyYAML is a hard build dependency of this repo, but this stays best-effort:
+    the `no file match pattern` check above is the load-bearing one, and a
+    missing parser must not turn the gate red on its own.
+    """
+    try:
+        import yaml  # noqa: PLC0415 - optional, see docstring
+        with (REPO_ROOT / TESTS).open(encoding="utf-8") as fh:
+            doc = yaml.safe_load(fh)
+        return len(doc.get("tests") or [])
+    except Exception as ex:  # noqa: BLE001 - best-effort by design
+        print(f"note: could not count declared cases ({ex})", flush=True)
+        return None
+
+
+def gate(promtool_argv: list[str], rules: str, tests: str) -> int:
+    """`check rules` then `test rules`, then prove the run was not vacuous."""
+    rc, check_out = run(promtool_argv + ["check", "rules", rules])
+    if rc:
+        return rc
+    rc, test_out = run(promtool_argv + ["test", "rules", tests])
+    if rc:
+        return rc
+    reason = check_gate_output(check_out, test_out, declared_case_count())
+    if reason:
+        sys.exit(f"FAIL: promtool exited 0 but the run proves nothing — {reason}")
+    return 0
 
 
 def parse_major(version_output: str) -> int | None:
@@ -155,21 +226,35 @@ def docker_usable() -> bool:
     """
     if not shutil.which("docker"):
         return False
-    return subprocess.run(
-        ["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    ).returncode == 0
+    # Bounded: a wedged dockerd is a routine self-hosted failure, and without a
+    # timeout `docker info` blocks until meson's own 600s timeout kills the run,
+    # which reports as "the gate timed out" rather than "docker is wedged".
+    try:
+        return subprocess.run(
+            ["docker", "info"], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=60,
+        ).returncode == 0
+    except subprocess.TimeoutExpired:
+        print("note: `docker info` timed out after 60s (daemon wedged?)", flush=True)
+        return False
 
 
 def pull_with_retry() -> bool:
     """Retry a transient registry hiccup rather than call it a broken rule."""
     import time
 
-    for attempt in (1, 2, 3):
-        if run(["docker", "pull", "--quiet", PROMTOOL_IMAGE]) == 0:
+    # Backoff widens rather than repeating a fixed 10s: a transient blip clears
+    # in seconds, but the realistic failure here is an anonymous Docker Hub rate
+    # limit, and 3x10s never outlasts one of those. This does not pretend to
+    # either — a quota window is hours — it just stops three near-simultaneous
+    # attempts being reported as a considered retry.
+    for attempt, delay in ((1, 10), (2, 30), (3, 0)):
+        rc, _ = run(["docker", "pull", "--quiet", PROMTOOL_IMAGE])
+        if rc == 0:
             return True
-        if attempt < 3:
-            print(f"pull attempt {attempt} failed, retrying in 10s", flush=True)
-            time.sleep(10)
+        if delay:
+            print(f"pull attempt {attempt} failed, retrying in {delay}s", flush=True)
+            time.sleep(delay)
     return False
 
 
@@ -223,6 +308,25 @@ def selftest() -> int:
             f"pinned image {PROMTOOL_IMAGE} disagrees with PINNED_MAJOR={PINNED_MAJOR}"
         )
 
+    # The vacuity check is the reason a green run is evidence at all. promtool
+    # exits 0 on a suite that loaded no rules, so these are the cases that stop
+    # this gate grading itself.
+    ok_check = "Checking rules\n  SUCCESS: 61 rules found\n"
+    check("real run accepted", check_gate_output(ok_check, "  SUCCESS\n", 9), None)
+    stale = check_gate_output(
+        ok_check, "  WARNING: no file match pattern /w/docs/gone.yml\n  SUCCESS\n", 9)
+    if stale is None:
+        failures.append("unresolved rule_files glob was accepted as a pass")
+    if check_gate_output("SUCCESS: 0 rules found\n", "  SUCCESS\n", 9) is None:
+        failures.append("a zero-rule check run was accepted as a pass")
+    if check_gate_output(ok_check, "  SUCCESS\n", 0) is None:
+        failures.append("a test file declaring no cases was accepted as a pass")
+    if check_gate_output("some other output\n", "  SUCCESS\n", 9) is None:
+        failures.append("a check run with no rule count was accepted as a pass")
+    # An unreadable test file must NOT redden the gate on its own.
+    check("uncountable cases still pass",
+          check_gate_output(ok_check, "  SUCCESS\n", None), None)
+
     for f in failures:
         print(f"SELFTEST FAIL: {f}", flush=True)
     print(f"selftest: {'FAIL' if failures else 'ok'}", flush=True)
@@ -253,8 +357,7 @@ def main(argv: list[str]) -> int:
                 )
                 return SKIP
             print(f"using native promtool: {exe} (major {major})", flush=True)
-            return run([exe, "check", "rules", RULES]) or \
-                run([exe, "test", "rules", TESTS])
+            return gate([exe], RULES, TESTS)
 
         print(
             f"SKIP: no usable promtool on PATH and {DOCKER_OPT_IN} is unset. Set "
@@ -276,9 +379,7 @@ def main(argv: list[str]) -> int:
     if not pull_with_retry():
         sys.exit(f"FAIL: could not pull {PROMTOOL_IMAGE} after 3 attempts.")
 
-    base = docker_argv()
-    return run(base + ["check", "rules", f"/w/{RULES}"]) or \
-        run(base + ["test", "rules", f"/w/{TESTS}"])
+    return gate(docker_argv(), f"/w/{RULES}", f"/w/{TESTS}")
 
 
 if __name__ == "__main__":

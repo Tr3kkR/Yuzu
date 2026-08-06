@@ -1025,6 +1025,49 @@ groups:
             check yuzu_server_audit_retention_last_pass_unixtime for when it last ran.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
+      # THE RULE ABOVE CANNOT DETECT ITS OWN INPUT GOING MISSING, which is why
+      # this exists. `increase()` over a metric with NO series returns an empty
+      # vector, `== 0` on an empty vector is empty, and an alert that selects
+      # nothing never fires -- so a Prometheus carrying these rules against a
+      # server that does not export `yuzu_server_audit_retention_passes_total`
+      # reports healthy forever, while the reaper is entirely unmonitored. That
+      # is the shape an operator lands in by following upgrading.md's own advice:
+      # the rules file is a copy you apply yourself, so it routinely runs ahead
+      # of the servers it points at.
+      #
+      # `absent()` is deliberately a SEPARATE rule rather than an `or` folded
+      # into the one above: the young-server grace must not apply to it (a
+      # missing metric is not excused by a recent boot), and the two states want
+      # different remediation -- one is "the reaper stopped", this one is "you
+      # are not watching the reaper at all".
+      #
+      # NOTE it is fleet-wide, not per-server: `absent()` fires only when NO
+      # series exists anywhere in this Prometheus. A single server that stops
+      # exporting while others still do is invisible here (nothing in PromQL
+      # expresses "absent for a target I can no longer see"); use a `up`-based
+      # target-down alert for that. Scoped this way on purpose -- the alternative
+      # fires on every Prometheus that scrapes anything other than Yuzu.
+      - alert: YuzuAuditRetentionMetricMissing
+        expr: |
+          absent(yuzu_server_audit_retention_passes_total)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit retention liveness metric is not being scraped at all"
+          description: >-
+            No yuzu_server_audit_retention_passes_total series exists in this Prometheus,
+            so YuzuAuditRetentionNotRunning - the only detector for a stopped audit reaper -
+            cannot fire, and the audit retention window is unmonitored. Nothing is known to
+            be broken; what is broken is the monitoring. Usual causes: the rules file was
+            applied to a Prometheus scraping a server build that predates the metric (the
+            rules file is a copy you apply yourself and the server never upgrades it); a
+            scrape config that drops it; or no Yuzu server being scraped by this Prometheus
+            at all. Confirm with `curl -s <server>/metrics | grep audit_retention_passes`,
+            then check metric_relabel_configs. Note this is fleet-wide by construction - it
+            cannot see one server among many going quiet.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
+
       # The durable clock reading is what makes anomaly detection survive a
       # restart. If it cannot be written, that half of the guard silently
       # degrades to nothing on the next boot.
