@@ -1062,11 +1062,11 @@ Each rung is an independently-governed PR on `dev`, run through the full
        PR-1a counters), 8 (test seams), **M1 (the transition-edge health-emission
        fix)**, and the R2 `unsupported` terminal state.
      - **FLIP GATE:** M1, item 9's heartbeat wiring, #2270, and the lifecycle-audit
-       journal ALL land in PR-1b and **gate PR-2** — the `prefer_spark` flip must not
-       ship while any is open. M1 in particular is a fleet ingest-DoS if the flip
+       journal ALL **gate PR-2** — the `prefer_spark` flip must not ship while any is
+       open. All but #2270 land in PR-1b; #2270 ships as its own PR against `dev`,
+       ahead of PR-1b. M1 in particular is a fleet ingest-DoS if the flip
        precedes it, so it is not enough that it is "in PR-1" — it is specifically in
-       PR-1b, after PR-1a. #2270 is the one exception to the "land in PR-1b" shape:
-       it ships as its own PR against `dev`, ahead of PR-1b.
+       PR-1b, after PR-1a.
      - **#2797 gates PR-2 as well, and is the only gate listed here that is already
        live pre-flip.** `apply_rules` discards `reconcile_rule_locked`'s bool
        (`guardian_engine.cpp:634`; the surrounding catch counts a THROW only), so a
@@ -1078,7 +1078,7 @@ Each rung is an independently-governed PR on `dev`, run through the full
        #2270 itself closes only the strong-guarantee half, so closing #2270 does not
        discharge this gate.
      - **#2818 gates PR-2 too.** The engine tears down a whole spark key
-       (`spark_engine.cpp:821-834`) while `GuardianSparkRuntime` arms one shared
+       (`spark_engine.cpp:821-836`) while `GuardianSparkRuntime` arms one shared
        subscription per key on the 0->1 edge (`guardian_spark_runtime.cpp:159-166`),
        and nothing tells the consumer its subscription died: Guardian goes on
        believing it holds a live subscription, `backend_->disarm(sub)` is a no-op,
@@ -1090,8 +1090,22 @@ Each rung is an independently-governed PR on `dev`, run through the full
        because legacy `IGuard` is the live detection path - the flip is what makes
        it a live enforcement hole. #2797 removes the `apply_rules` self-heal that
        otherwise bounds it, so the two gates compound and neither alone closes the
-       exposure. #2819 (blocking `unwatch()` under `GuardianEngine::mtx_`) is a
-       shutdown-availability defect from the same review; it does not gate the flip.
+       exposure.
+     - **#2819 and #2813 gate PR-2 as well — same dormancy test as #2818, applied
+       consistently.** An earlier revision of this block dismissed #2819 as "a
+       shutdown-availability defect ... does not gate the flip". That was wrong and
+       is corrected here: availability-vs-enforcement is not the criterion this list
+       uses, dormancy is, and both satisfy it. #2819's only production route into
+       `arm_impl` is `guardian_engine.cpp:1153`, inside
+       `try_spark = prefer_spark_ && spark_availability_ == Available`
+       (`guardian_engine.cpp:1139`), and Guardian is the sole registered consumer
+       (`guardian_engine.cpp:1244` is the only `register_consumer` caller) — so
+       there is no production caller pre-flip and the wedge is created by the flip,
+       exactly as #2818's hole is. Its terminal outcome is a stalled agent shutdown
+       whose F3 backstop is structurally unreachable, on a trigger that correlates
+       fleet-wide during an OTA wave. #2813 has the same profile and the same sink
+       class (a live OS watch whose `armed_` entry is gone, so its firings are
+       dropped), and is listed here rather than left silent.
 
      - **PR-1 (inert hardening, `prefer_spark` stays false — zero change to
        detection/enforcement *placement*).** The shared drift-event builder;
