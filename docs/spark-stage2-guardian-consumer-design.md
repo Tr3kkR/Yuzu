@@ -1067,8 +1067,10 @@ Each rung is an independently-governed PR on `dev`, run through the full
        ahead of PR-1b. M1 in particular is a fleet ingest-DoS if the flip
        precedes it, so it is not enough that it is "in PR-1" — it is specifically in
        PR-1b, after PR-1a.
-     - **#2797 gates PR-2 as well, and is the only gate listed here that is already
-       live pre-flip.** `apply_rules` discards `reconcile_rule_locked`'s bool
+     - **#2797 gates PR-2 as well, and is the only gate whose HEADLINE defect is
+       already live pre-flip** (#2819 carries a related `service_win.cpp` instance
+       that is also live today - see its Related section). `apply_rules` discards
+       `reconcile_rule_locked`'s bool
        (`guardian_engine.cpp:634`; the surrounding catch counts a THROW only), so a
        RETURNED arm failure leaves `reconcile_failures` at 0, the generation
        advances, the server stops re-pushing, and the rule stays persisted-but-
@@ -1095,17 +1097,40 @@ Each rung is an independently-governed PR on `dev`, run through the full
        consistently.** An earlier revision of this block dismissed #2819 as "a
        shutdown-availability defect ... does not gate the flip". That was wrong and
        is corrected here: availability-vs-enforcement is not the criterion this list
-       uses, dormancy is, and both satisfy it. #2819's only production route into
-       `arm_impl` is `guardian_engine.cpp:1153`, inside
-       `try_spark = prefer_spark_ && spark_availability_ == Available`
+       uses, dormancy is, and both satisfy it. #2819 reaches a blocking `unwatch()`
+       by TWO routes — `arm_impl`'s `teardown_arm_race`, and the ordinary withdraw
+       path through `SparkEngine::disarm` — so state the dormancy for BOTH, not for
+       `arm_impl` alone: that narrowing is exactly what #2819's own CORRECTION block
+       retracts. `attach_rule` runs only at `guardian_engine.cpp:1153`, inside
+       `try_spark = prefer_spark_ && spark_availability_ == SparkAvailability::Available`
        (`guardian_engine.cpp:1139`), and Guardian is the sole registered consumer
-       (`guardian_engine.cpp:1244` is the only `register_consumer` caller) — so
-       there is no production caller pre-flip and the wedge is created by the flip,
-       exactly as #2818's hole is. Its terminal outcome is a stalled agent shutdown
-       whose F3 backstop is structurally unreachable, on a trigger that correlates
-       fleet-wide during an OTA wave. #2813 has the same profile and the same sink
-       class (a live OS watch whose `armed_` entry is gone, so its firings are
-       dropped), and is listed here rather than left silent.
+       (`guardian_engine.cpp:1244` is the only PRODUCTION `register_consumer`
+       caller). `detach_rule` itself IS reached pre-flip — four of its five sites sit
+       outside the `try_spark` branch — but it reaches `backend_->disarm` only when
+       `index_->remove_rule` returns a key (`guardian_spark_runtime.cpp:251-256`),
+       and pre-flip nothing was ever attached, so `keys_` is empty. Both routes are
+       therefore dormant TRANSITIVELY, on the absence of a prior arm, and the wedge
+       is created by the flip exactly as #2818's hole is. Its terminal outcome is a
+       stalled agent shutdown whose F3 backstop is structurally unreachable, on a
+       trigger that correlates fleet-wide during an OTA wave. #2813 shares the
+       dormancy profile — NOT #2819's sink, which is a lock wedge; #2813's own
+       residue is a live OS watch whose `armed_` entry is gone, so its firings are
+       silently dropped — and is listed here rather than left silent.
+     - **Two residues gate PR-2 and own no issue**, recorded here because a gate list
+       that enumerates only issue-backed items reads as complete when it is not.
+       (a) `SparkEngine::disarm`'s allocating prologue
+       (`spark_engine.cpp:966`/`:972`/`:980`) PROPAGATES where `teardown_arm_race`
+       contains (`spark_engine.cpp:912`). A throw there abandons
+       `detach_rule_locked` after `index_->remove_rule` but before `keys_.erase`, so
+       the next push's `keys_.emplace` silently no-ops on the stale entry and the
+       fresh subscription is discarded — a permanently leaked subscription plus a
+       `keys_`/`index_` desync, on a rule the server counts as applied. Ledger
+       `CH8-2`/`UP8-1`/`UP-4`. #2818's incarnation-token fix shape would close the
+       `keys_.emplace` half. (b) The `{os}` fleet rollup, the `metrics.md` row and
+       the alert rule for `arm_race_unwatch_failures` — `spark_fleet_tags.hpp:82`
+       defers all three to this flip IN CODE, so the flip makes an agent-side
+       resource leak measurable at the endpoint and invisible at the fleet. Ledger
+       `arch8-2`.
 
      - **PR-1 (inert hardening, `prefer_spark` stays false — zero change to
        detection/enforcement *placement*).** The shared drift-event builder;
