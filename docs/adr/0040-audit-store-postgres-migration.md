@@ -240,8 +240,12 @@ called out here for the consistency/security gates.
 agent-supplied free text. Following `management_group_store.cpp` (ADR-0042), they are scrubbed with
 `sanitize_pg_text` (UTF-8-invalid → U+FFFD **and** embedded NUL → U+FFFD) before the `INSERT`,
 so a hostile or mis-encoded value can never fail the fail-hard write (SQLSTATE 22021 / NUL
-truncation) and take an audit event down. `result`/`principal_class` are enum-controlled and not
-sanitized. This closes the same class #1593 guards, on the evidence path.
+truncation) and take an audit event down. `result`/`principal_class` are sanitized too — an
+earlier revision of this line called them "enum-controlled and not sanitized", which stopped
+being true when `AuditStore::log` was corrected to sanitize every text column, live path
+included, not just the backfill copy (Gate 3 cpp-expert F4: every current call site does pass a
+literal, but the write path itself has no way to enforce that, so treating the column as trusted
+was the defect). This closes the same class #1593 guards, on the evidence path.
 
 ### Lifecycle
 

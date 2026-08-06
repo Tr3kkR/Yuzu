@@ -167,6 +167,24 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   config/reference/audit data survives previous-release-SQLite → new-release-Postgres.
 - **Port the transaction owner**: `SqliteTxn`/`SqliteStmt` → `pool.with_txn` (multi-statement
   invariants) or a single autocommit statement (single-statement mutate-and-return).
+- **Local source absence never creates terminal migration state on its own** (ADR-0040 round 3,
+  Sol's diagnosis, #2697). A process that finds no legacy SQLite file at its configured path
+  cannot distinguish "this is a genuine fresh install" from "this replica just doesn't hold the
+  file — a sibling does." Marking a migration COMPLETE from that observation alone is silently
+  unsound: it forecloses the real migration for whichever host does hold the file, and no
+  amount of guarding on the sourceless side closes the gap, because the sourceless process is
+  telling the truth about what IT knows, not about the fleet. The fix has two parts, and the
+  first alone is insufficient: (1) restrict *which* callers may declare "no source, nothing to
+  migrate" — a one-shot CLI is never trusted to, only a full boot; (2) **on the HOLDER side**, a
+  process that finds the completion marker already set but still holds its own legacy file must
+  not trust that marker blindly — verify the file's content was actually what got migrated
+  (`AuditStore` does this by fingerprint: a durable hash-shaped value written in the SAME
+  transaction as the completion marker, re-derived from the file and compared at every later
+  boot that still finds it) and refuse to serve on a mismatch, rather than silently reporting
+  success over a trail nobody streamed. `ManagementGroupStore` and `ResultSetStore` share the
+  first-generation `if (!legacy_exists) → mark complete` shape this closes; porting the
+  holder-side check to them is tracked, not yet done (#2697 deferred this ladder-wide — the fix
+  landed for AuditStore only, as the mandatory-evidence case).
 
 ## Anti-patterns reviewers reject
 
@@ -179,6 +197,25 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
 - A new server **SQLite** store (ADR-0006 forbids it without an exception ADR).
 - A `CREATE INDEX CONCURRENTLY` / `VACUUM` / `ALTER TYPE ADD VALUE` smuggled into a
   `PgMigration` — it cannot run in the runner's transaction (see below).
+- A **counting aggregate** (`count(*)`, `count(*) FILTER (...)`) where the question is only
+  "does at least one row exist?" (`AuditStore`'s retention probe, ADR-0040). A count with no
+  statement-level `WHERE` visits every row before either count is known, including rows that sit
+  outside a partial index built for the "any?" question — full-scanning the one table designed
+  to grow without bound, on every pass. Use `EXISTS(SELECT 1 FROM t WHERE cond)` (or, when the
+  predicate is a range and the planner's selectivity estimate for that range cannot be trusted —
+  a wide window with real matches sparse and clustered at one end — `ORDER BY <indexed column>
+  LIMIT 1 ... IS NOT NULL`, which is plan-independent: a Seq Scan would need a full sort before
+  applying the `LIMIT`, so the index-ordered path wins regardless of the estimate).
+- A **fixed re-arm interval** on a capped, paced background pass (a retention sweep, a rollup, a
+  reconciliation loop) that never shortens when the cap keeps binding. If a pass hits its cap AND
+  a genuine backlog remains, the NEXT pass should re-arm on a short floor (seconds, not the full
+  interval) and keep doing so until a pass clears the backlog — otherwise the cap silently
+  becomes a permanent drain ceiling far below what the pass could actually sustain (`AuditStore`
+  measured this at ~700x: a docs section that quoted only the full-interval cadence as "the"
+  sustained ceiling was off by roughly three orders of magnitude once the re-arm floor was
+  accounted for). Document BOTH cadences wherever a "ceiling" figure is quoted — the quiet-
+  operation rate and the backlog-recovery rate are different numbers with different meanings,
+  and quoting only the first as a hard limit understates real capacity.
 
 ## Non-transactional migrations (the deferred kind)
 
