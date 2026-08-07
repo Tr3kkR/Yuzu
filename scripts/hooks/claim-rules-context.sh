@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 #
-# SessionStart hook: inject docs/claim-discipline.md into every session in this repo.
+# SessionStart hook: inject docs/claim-discipline.md into every Claude Code session
+# in this repo. (Codex sessions don't run Claude Code SessionStart hooks — they get
+# Gate 0 review-time coverage only, via .codex/skills/governance/SKILL.md's pointer
+# to this doc, not this ambient injection.)
 #
 # This script carries no copy of the rules text — docs/claim-discipline.md is their
 # single home (see that file's rule 1). Changing the rules means editing that file;

@@ -495,13 +495,29 @@ into batches and say so; do not let batch coverage go unstated (an unstated samp
 reads as a sweep, which is exactly the rule 5 defect this gate is built to catch in
 everyone else's prose).
 
+**Gates 2-6 get a forced checkpoint for free: a subagent's returned report is a
+separate artifact you can cross-check against the ledger afterward.** Gate 0 has no
+subagent call, so nothing is nudging you to remember to record what you found unless
+you build the checkpoint in deliberately. Do it explicitly: **before deciding
+zero-or-halt, write out a visible list in your own response** — one line per site
+reviewed under rules 2/5/6/7, one line per fact checked under rule 1, each ending in
+a verdict (clean / finding, with the finding's rule tag). This list is what you
+report as the zero-findings site count (below) or transcribe into ledger rows (any
+findings) — it is not optional narration, it is the artifact that makes "0 findings"
+and "didn't actually check" distinguishable from each other, and makes an unstated
+partial sample visible as a short list rather than a silent one.
+
 ### Severity — the same derivation, not a new one
 
-A Gate 0 finding gets `severity_native` set to the rule that caught it (e.g.
-`claim-rule-2c`, `claim-rule-6`) and derives IMPACT/EXPOSURE/band exactly per the
-shared severity system above — there is no separate claim-discipline severity scale.
-Recurring mappings, for calibration (derive from the actual facts every time; these
-are anchors, not a lookup table):
+A Gate 0 finding derives IMPACT/EXPOSURE/band exactly per the shared severity system
+above — there is no separate claim-discipline severity scale, and there is no
+reporter vocabulary for Gate 0 to put in `severity_native` either. Per that field's
+own definition (Gate 8 below), `severity_native` holds the REPORTER's own severity
+WORD, unmodified, or `null` if they gave none — a claim-discipline rule identifier
+(`claim-rule-2c`) is not a severity word, so it does not belong in that field.
+**Record `severity_native: null` and put the triggering rule in `summary` or the
+`classification` rationale instead.** Recurring mappings, for calibration (derive
+from the actual facts every time; these are anchors, not a lookup table):
 
 - a stale-but-plausible fact left after an edit (rule 1), or a claim your diff
   falsified (rule 2b) → usually **I3**, wrong result presented as correct
@@ -509,10 +525,13 @@ are anchors, not a lookup table):
   shared rule
 - a documented route/field/flag that is not actually registered or read (rule 7), or
   a capability the prose claims is reachable and is not (rule 2c) → **I6** or **I7**
-- a test or check whose prose claims more than it demonstrates (rule 5), **when
-  offered as closure evidence for an otherwise-blocking finding**, is not a derived
-  band at all — it is the existing **false-green policy floor** (see Policy floors
-  above) and gates regardless of band
+- a **test** offered as closure evidence for an otherwise-blocking finding, that
+  **cannot observe what it asserts** (rule 5's sharpest case) is not a derived band
+  at all — it is the existing **false-green policy floor**, worded exactly as that
+  floor is worded above, and gates regardless of band. A rule-5 defect that falls
+  short of that — a check that merely claims more than it demonstrates without being
+  offered as closure evidence for a blocking finding — derives a band normally like
+  any other rule-5 finding; do not widen the floor's closed wording to cover it
 - a rule-4 defect in a ledger row or issue disposition is reviewed against the
   ledger-schema rules already stated in Gate 8 below, not derived fresh
 
@@ -524,12 +543,13 @@ unchecked, not that it shipped wrong.
 
 ### The halt
 
-If Gate 0 raises **zero findings**, say so in Gate 1's Change Summary (site count,
-rule set applied, any batching) and proceed straight to Gate 1 — no operator
-interaction. An unstated "0 findings" is indistinguishable from "Gate 0 did not run,"
-which is the same known gap the ledger schema already names for every gate (see
-Gate 8's "known gap, unsolved") — Gate 0 does not close it, it just doesn't make it
-worse by staying silent on the count.
+If Gate 0 raises **zero findings**, carry the site list from Mechanics into Gate 1's
+Change Summary as a single line: the count of sites reviewed, the rule set applied,
+and the batch count if you split (e.g. "Gate 0: 14 sites (rules 2/5/6/7) + 3 changed
+facts (rule 1), 1 batch, 0 findings"). That count is what makes "0 findings" and
+"Gate 0 did not run" distinguishable — which is the same known gap the ledger schema
+already names for every gate (see Gate 8's "known gap, unsolved"); Gate 0 does not
+close that gap, it just doesn't make it worse by staying silent on the count.
 
 If Gate 0 raises **any** findings, stop before launching Gate 1 and put them to the
 operator: fix each now (then re-run Gate 0 against the fix before proceeding), or
@@ -1473,10 +1493,13 @@ for whoever owns that runner.
 
    Concretely, against the **fix diff** (not the original):
    - **Gate 0** — re-apply `docs/claim-discipline.md` to the fix diff whenever the
-     fix adds, changes, or deletes prose — which is nearly every fix, since a fix is
-     itself new prose (the commit, at minimum, and usually a comment or doc
-     explaining it). This is the gate most likely to be skipped by habit, because it
-     ran once already before Gate 1 and feels "done" — it isn't; the fix diff is a
+     fix adds, changes, or deletes prose — which is **every** fix, since the commit
+     message is itself prose, and "mostly code" is not an exemption: a one-line
+     comment tweak riding a larger code fix still needs its own rule-1/2 check, and
+     judging a fix "code-only" is the same silent-classification failure rule 2f's
+     own sweep exists to catch elsewhere. This is the gate most likely to be skipped
+     by habit, because it ran once already before Gate 1 and feels "done" — it isn't;
+     the fix diff is a
      new artifact Gate 0 has not seen.
    - **Gate 3** — re-run the decision matrix, including the routed-concern table.
    - **Gate 2** — `security-guardian` always; `docs-writer` whenever the fix touches
