@@ -70,7 +70,7 @@ Context is the scarce resource. Keep this thread lean; spend file-reading budget
 
 Specialized agents live in `.codex/agents/` (each file declares its own role, triggers, and reference docs). The `workflow-orchestrator` agent owns the gate sequence; the `/governance` skill (`.codex/skills/governance/SKILL.md`) is the entry point for running the full pipeline on a commit range.
 
-Pipeline (8 gates, convention-enforced — no git hook): Change Summary + Resource Ledger (C++ resource changes) → security-guardian + docs-writer deep-dive → domain-triggered review (`cpp-expert` + `cpp-safety` on any C++ change; `cpp-safety` on raw resource/process/cast) → happy-path + unhappy-path + consistency-auditor (parallel) → chaos-injector (skipped if no findings) → compliance-officer + sre + enterprise-readiness (parallel) → findings addressed (CRITICAL/HIGH block merge) → iterate. Use `/governance <range>`, not hand-running — waves 1–4 shipped 4 CRITICAL command-injection vulns without it.
+Pipeline (Gate 0 + 8 gates, convention-enforced — no git hook): claim discipline (`docs/claim-discipline.md`, unconditional, halts on any finding) → Change Summary + Resource Ledger (C++ resource changes) → security-guardian + docs-writer deep-dive → domain-triggered review (`cpp-expert` + `cpp-safety` on any C++ change; `cpp-safety` on raw resource/process/cast) → happy-path + unhappy-path + consistency-auditor (parallel) → chaos-injector (skipped if no findings) → compliance-officer + sre + enterprise-readiness (parallel) → findings addressed (CRITICAL/HIGH block merge) → iterate. Use `/governance <range>`, not hand-running — waves 1–4 shipped 4 CRITICAL command-injection vulns without it.
 
 ## Darwin Compatibility
 

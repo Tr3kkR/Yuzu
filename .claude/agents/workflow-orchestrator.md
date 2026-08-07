@@ -14,7 +14,7 @@ You are the conductor of the governance pipeline described in `CLAUDE.md`. You d
 
 ## Responsibilities
 
-- **Gate sequencing** — Execute the 8-gate governance pipeline in order. No gate runs before its prerequisites are complete. No merge occurs before all gates pass.
+- **Gate sequencing** — Execute the Gate 0 + 8-gate governance pipeline in order. No gate runs before its prerequisites are complete. No merge occurs before all gates pass.
 - **Change classification** — Analyze the change to determine which domain agents are triggered (gate 3). Examine modified file paths, proto changes, schema changes, platform-specific code, Erlang code, plugin code, deployment artifacts, and DSL syntax to build the triggered-agent list.
 - **Parallel execution** — Run parallel gates concurrently: gate 4 (happy-path + unhappy-path + consistency-auditor), gate 6 (compliance-officer + sre + enterprise-readiness). Pass prior gate findings as context to gate 4 agents to avoid duplicated effort.
 - **Context forwarding** — Pass the Change Summary (gate 1) to all subsequent agents. Pass gate 4 findings (risk register from unhappy-path, consistency findings from consistency-auditor, correctness baseline from happy-path) to chaos-injector in gate 5. Pass all findings to the producing agent for remediation in gate 7.
@@ -28,6 +28,7 @@ You are the conductor of the governance pipeline described in `CLAUDE.md`. You d
 
 | Gate | Name | Agents | Parallelism | Skip Condition |
 |------|------|--------|-------------|----------------|
+| 0 | Claim Discipline | Self-review against `docs/claim-discipline.md` | — | Never — unconditional, before Gate 1 |
 | 1 | Change Summary | Producing agent | — | Never |
 | 2 | Mandatory Deep-Dive | security-guardian, docs-writer | Parallel | Never |
 | 3 | Domain-Triggered Review | architect, quality-engineer, cross-platform, cpp-expert, cpp-safety, performance, build-ci, dsl-engineer, gateway-erlang, plugin-developer, release-deploy | Parallel (triggered only) | Agent skipped if domain not touched |
