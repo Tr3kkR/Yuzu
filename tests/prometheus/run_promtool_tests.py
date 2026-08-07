@@ -399,24 +399,46 @@ def gate(promtool_argv: list[str], rules: str, tests: str, canary_for=None) -> i
     shutil.rmtree(tmp, ignore_errors=True)
     try:
         build_canary_tree(tmp)
-        canary_argv, canary_tests = canary_for(tmp)
+        canary_argv, canary_tests, canary_rules = canary_for(tmp)
         # Quiet on purpose: a PASSING canary means promtool printed a wall of
         # `FAILED:` detail, which above the reassuring line reads as a broken
-        # build. The output is still captured and is printed on both failure
-        # arms below.
+        # build. The output is still captured and is printed on every failure
+        # arm below.
         canary_rc, canary_out = run(canary_argv + ["test", "rules", canary_tests],
                                     timeout=120, quiet=True)
+        canary_check_rc, canary_check_out = run(
+            canary_argv + ["check", "rules", canary_rules], timeout=120, quiet=True)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    # THREE-WAY, NOT TWO. A non-zero exit is not by itself evidence the suite
-    # reddened - promtool exits non-zero for "I could not read that file" too,
-    # and reading THAT as success makes this whole check a false green, which is
-    # the exact defect it was added to close. Measured: under `umask 077` the
-    # mounted tree is unreadable to uid 65534 and promtool exits on a permission
-    # error; the two-way version printed "suite reddens against broken rules".
-    # The sweep instrument (blind_band_sweep.py) had the identical bug and its
-    # `silent()` documents the same rule: an instrument that cannot run must say
-    # so, never return a value.
+    # PROVE THE MUTATED COPY WAS ACTUALLY READ, before trusting any redden.
+    #
+    # An exit code alone is not evidence: promtool exits non-zero for "I could
+    # not read that file" too, and reading THAT as success is a false green -
+    # measured under `umask 077`, where the mounted tree is unreadable to uid
+    # 65534 and an earlier revision printed "suite reddens against broken rules".
+    #
+    # BUT NEITHER IS THE `FAILED` TOKEN, which is where the first fix for that
+    # stopped. promtool prints the same `FAILED:` banner with every assertion
+    # `got: nil` when it cannot OPEN the rules file, and again when the glob
+    # matched nothing - measured with `chmod 000` on the copied rules file and
+    # on its directory. Both are indistinguishable from a genuine redden by
+    # substring. So the only sound premise is a positive rule count read back
+    # off the mutated copy itself: if promtool can parse it and load rules from
+    # it, a `FAILED` from the suite is about the mutation rather than about I/O.
+    #
+    # The sweep instrument (blind_band_sweep.py) had the root form of this bug
+    # and its `silent()` states the rule this keeps re-learning: an instrument
+    # that cannot run must say so, never return a value.
+    loaded = re.search(r"SUCCESS:\s*(\d+)\s+rules found", canary_check_out)
+    if canary_check_rc != 0 or not loaded or int(loaded.group(1)) == 0:
+        sys.exit(
+            f"FAIL: the canary's mutated copy of {RULES} could not be read back "
+            f"(rc {canary_check_rc}, "
+            f"{'no rule count reported' if not loaded else loaded.group(1) + ' rules'}), "
+            f"so a `FAILED` from the suite would prove only that promtool could "
+            f"not open a file. This is not a pass.\n"
+            f"{canary_check_out.strip()[:500]}"
+        )
     if canary_rc != 0 and "FAILED" not in canary_out:
         sys.exit(
             f"FAIL: the canary could not be MEASURED - promtool exited "
@@ -699,7 +721,8 @@ def main(argv: list[str]) -> int:
             # Native resolves the canary tree by absolute path; `run()`'s cwd is
             # REPO_ROOT, which is the wrong root for the mirror.
             return gate([exe], RULES, TESTS,
-                        canary_for=lambda root: ([exe], str(root / TESTS)))
+                        canary_for=lambda root: ([exe], str(root / TESTS),
+                                                       str(root / RULES)))
 
         print(
             f"SKIP: no usable promtool on PATH and {DOCKER_OPT_IN} is unset. Set "
@@ -722,7 +745,8 @@ def main(argv: list[str]) -> int:
         sys.exit(f"FAIL: could not pull {PROMTOOL_IMAGE} after {PULL_ATTEMPTS} attempts.")
 
     return gate(docker_argv(), f"/w/{RULES}", f"/w/{TESTS}",
-                canary_for=lambda root: (docker_argv(root), f"/w/{TESTS}"))
+                canary_for=lambda root: (docker_argv(root), f"/w/{TESTS}",
+                                                 f"/w/{RULES}"))
 
 
 if __name__ == "__main__":
