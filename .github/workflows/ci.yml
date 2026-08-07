@@ -164,7 +164,27 @@ jobs:
             # that object, which now fails "commit not found". That failure is
             # loud and honest, and the pre-change pipeline failed those re-runs
             # anyway — at the verify below, against a stale expected.
-            echo "checkout_ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            # SCOPED TO `pull_request`, and that scoping is load-bearing (review
+            # of this PR, blocker). This branch runs for EVERY non-workflow_call
+            # trigger, `push` included. On `push`, GITHUB_REF is a stable
+            # `refs/heads/<branch>` with no re-minting problem — and checking a
+            # self-hosted workspace out by BARE SHA leaves it in detached HEAD.
+            # The pre-checkout branch-switch sentinel (this file, the
+            # "Wipe build-<os>/ on branch switch" steps) reads
+            # `git rev-parse --abbrev-ref HEAD`, which prints the literal string
+            # "HEAD" when detached. Its guard is `current != "HEAD"`, so one
+            # push-triggered job by SHA makes that permanently false and the
+            # build-dir wipe NEVER FIRES AGAIN on that runner — for push or PR —
+            # until someone runs scripts/ci/runner-reset.sh by hand. Silent, no
+            # adversary needed, and it would reuse one branch's meson/ninja state
+            # for another branch's build. Reproduced against a temp repo before
+            # this fix landed. Contract: docs/ci-architecture.md "Persistence and
+            # recovery".
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              echo "checkout_ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            else
+              echo "checkout_ref=${GITHUB_REF}" >> "$GITHUB_OUTPUT"
+            fi
             echo "checkout_sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
             echo "trusted_execution=false" >> "$GITHUB_OUTPUT"
             if [[ "${{ github.event_name }}" == "pull_request" ]]; then
@@ -368,6 +388,7 @@ jobs:
           bash tests/shell/test_detect_code_change.sh   # docs-only gate classifier (#1978)
           python3 scripts/ci/test_runner_health_check.py
           bash tests/shell/test_review_driver_substitution.sh  # patsub_replacement prompt corruption (#2644)
+          bash tests/shell/test_trusted_inputs_validate.sh    # the step that picks the BUILD COMMIT (#2832)
 
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──
   # lint:
