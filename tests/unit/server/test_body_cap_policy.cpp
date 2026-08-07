@@ -328,9 +328,13 @@ TEST_CASE("resolve_body_cap: requires_measurable is ON only for /mcp/", "[body_c
 // test_mcp_body_cap.cpp's own fixture — only the STATUS the decision reaches.
 //
 // D3 is additionally modelled by placing a probe-style early return (Get
-// "/health" answers 200 unconditionally) AFTER this cap check, exactly as
-// server.cpp now orders it, so a fixture bug that put the cap check back
-// BELOW a probe exemption would show up as a false-negative here too.
+// "/health" answers 200 unconditionally) AFTER this cap check, so a fixture
+// bug that put the cap check back BELOW a probe exemption would show up as a
+// false-negative here too. This models ONE of production's two call sites —
+// `enforce_pre_auth_body_cap` is invoked inside server.cpp's probe branch
+// (the shape mirrored here) and again after the on-behalf-of guard and rate
+// limiter for every other route. The second call site is not modelled: those
+// two guards are out of this fixture's scope.
 #ifndef YUZU_TSAN_BUILD
 
 namespace {
