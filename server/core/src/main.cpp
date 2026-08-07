@@ -40,6 +40,7 @@
 #endif
 #include <sqlite3.h>
 
+#include <filesystem>
 #include <format>
 #include <iostream>
 #include <memory>
@@ -123,6 +124,58 @@ static bool break_glass_user_valid(yuzu::server::AuthDB& db, const std::string& 
         return false;
     }
     return true;
+}
+
+// Open the Postgres audit store for a one-shot break-glass CLI path, and bring
+// it to a state where writing an evidence row is SAFE.
+//
+// ADR-0040 order contract: a native audit row must never be written before the
+// `backfill_complete` marker exists. The server honours that at boot by running
+// the legacy backfill before anything can log (server.cpp). A one-shot never
+// reaches boot, so it runs the same idempotent, resumable backfill itself — on
+// an upgraded host, skipping it leaves a native row + no marker + a legacy
+// audit.db, and the prefix proof then refuses EVERY later boot, with a
+// remediation that would destroy the very break-glass row this path exists to
+// write. On a fresh install the backfill is the cheap no-legacy stamp.
+//
+// No MetricsRegistry is wired here (there is no /metrics in a one-shot), so
+// yuzu_server_audit_backfill_total does not move on this path — the boot log is
+// the record. Returns nullptr, having logged and printed, when the store is
+// unusable; `refuse_action` names the mutation being refused.
+static std::unique_ptr<yuzu::server::AuditStore>
+open_one_shot_audit(yuzu::server::pg::PgPool& pool, const std::filesystem::path& legacy_audit_db,
+                    int retention_days, std::string_view flag, std::string_view refuse_action,
+                    std::string_view extra_remediation = {}) {
+    // Retention comes from config, NOT the constructor default: a site running
+    // --audit-retention-days=90 would otherwise get break-glass evidence rows on
+    // a 365-day horizon — the highest-stakes rows outliving the policy that
+    // governs the rest of the trail (adversarial review, Kimi L1).
+    auto audit = std::make_unique<yuzu::server::AuditStore>(pool, retention_days);
+    if (!audit->is_open()) {
+        spdlog::error("{}: Postgres audit store (schema audit_store) is not writable; refusing to "
+                      "{} without an audit record. Check --postgres-dsn reachability and retry.{}",
+                      flag, refuse_action, extra_remediation);
+        std::cerr << "error: audit store unavailable; refusing to " << refuse_action
+                  << " without an audit record\n";
+        return nullptr;
+    }
+    // Sourceless::Refuse — a one-shot may COMPLETE a real backfill, but it must
+    // never declare the migration complete merely because THIS host holds no
+    // legacy audit.db. That stamps the marker over an empty table, and the host
+    // that DOES hold the trail then skips the mandatory backfill on that marker
+    // and reports success (Gate 3 architect A-4).
+    if (!audit->migrate_from_sqlite(legacy_audit_db,
+                                    yuzu::server::AuditStore::Sourceless::Refuse)) {
+        spdlog::error("{}: the one-time legacy audit backfill from {} did not complete (see prior "
+                      "log lines); refusing to {}. Writing an audit row ahead of the backfill "
+                      "marker would block every later server boot (ADR-0040). Resolve the backfill "
+                      "first — the diagnostic above carries the remediation — then retry.",
+                      flag, legacy_audit_db.string(), refuse_action);
+        std::cerr << "error: legacy audit backfill incomplete; refusing to " << refuse_action
+                  << "\n";
+        return nullptr;
+    }
+    return audit;
 }
 
 int main(int argc, char* argv[]) {
@@ -1273,17 +1326,19 @@ int main(int argc, char* argv[]) {
         // it isn't, refuse to proceed rather than silently clear a second factor
         // with no record (H-1). This also gives the operator an actionable error
         // instead of a buried warning during a stressful recovery.
-        yuzu::server::AuditStore audit(cfg.data_dir / "audit.db");
-        if (!audit.is_open()) {
-            spdlog::error("--mfa-reset: audit store (audit.db in '{}') is not writable; refusing "
-                          "to clear MFA without an audit record. Fix audit.db permissions/disk and "
-                          "retry, or perform the reset via your documented break-glass SQL path "
-                          "(which you must then record in change management).",
-                          cfg.data_dir.string());
-            std::cerr << "error: audit store unavailable; refusing to clear MFA without an audit "
-                         "record\n";
+        // ADR-0040: AuditStore is Postgres-backed now. Reuse the already-open,
+        // validated break-glass PgPool (auth_pg_pool is non-null here — this
+        // block is guarded by `if (!auth_db)` above, and auth_db only exists
+        // when auth_pg_pool is valid). The helper also runs the legacy backfill:
+        // this one-shot writes a NATIVE row, and doing that ahead of the marker
+        // is what blocks every later boot (see open_one_shot_audit).
+        auto audit = open_one_shot_audit(
+            *auth_pg_pool, cfg.db_dir() / "audit.db", cfg.audit_retention_days, "--mfa-reset",
+            "clear MFA",
+            " Or perform the reset via your documented break-glass SQL path (which you must then "
+            "record in change management).");
+        if (!audit)
             return EXIT_FAILURE;
-        }
         if (auto r = auth_db->mfa_disable(mfa_reset_user); !r) {
             spdlog::error("--mfa-reset: failed to clear MFA for '{}'", mfa_reset_user);
             return EXIT_FAILURE;
@@ -1305,7 +1360,7 @@ int main(int argc, char* argv[]) {
         ev.result = "success";
         ev.detail = std::format("MFA enrollment cleared via --mfa-reset CLI (os_identity={})",
                                 os_user);
-        if (!audit.log(ev)) {
+        if (!audit->log(ev)) {
             // The pre-check passed but the write failed (e.g. disk filled mid-op).
             // MFA is already cleared; fail loudly and non-zero so automation and
             // the operator know the evidence row is missing and must be recorded.
@@ -1356,14 +1411,14 @@ int main(int argc, char* argv[]) {
         }
         // Audit is MANDATORY (CC6.6): verify the audit store is WRITABLE before
         // arming, so the exemption is never granted without a record.
-        yuzu::server::AuditStore audit(cfg.data_dir / "audit.db");
-        if (!audit.is_open()) {
-            spdlog::error("--break-glass-arm: audit store (audit.db in '{}') is not writable; "
-                          "refusing to arm break-glass without an audit record.",
-                          cfg.data_dir.string());
-            std::cerr << "error: audit store unavailable; refusing to arm without an audit record\n";
+        // ADR-0040: Postgres-backed AuditStore; reuse the validated PgPool
+        // (auth_pg_pool non-null — guarded by `if (!auth_db)` above). The helper
+        // also completes the legacy backfill first (order contract).
+        auto audit = open_one_shot_audit(*auth_pg_pool, cfg.db_dir() / "audit.db",
+                                         cfg.audit_retention_days, "--break-glass-arm",
+                                         "arm break-glass");
+        if (!audit)
             return EXIT_FAILURE;
-        }
         auto armed = auth_db->arm_break_glass(cfg.break_glass_user, cfg.break_glass_window_secs);
         if (!armed) {
             spdlog::error("--break-glass-arm: failed to arm '{}' (auth store error {})",
@@ -1383,14 +1438,15 @@ int main(int argc, char* argv[]) {
             std::cerr << "error: window too large; account not armed\n";
             return EXIT_FAILURE;
         }
-        // Non-atomic across two databases: the arm mutated auth.db; the audit
-        // row goes to audit.db, so they cannot share a transaction. The order is
-        // arm-then-audit (a false audit row for an arm that didn't happen would
-        // be worse), but a HANDLED audit-write failure is COMPENSATED below by
-        // un-arming, so the "never granted without a record" guarantee holds
-        // (review #1735 HIGH-2). The only residual window is a SIGKILL / power
-        // loss in the ~microseconds between the UPDATE and the INSERT — genuinely
-        // unavoidable without cross-DB atomicity, and the next break-glass login
+        // Non-atomic across two stores: the arm mutated schema `auth`, the audit
+        // row lands in schema `audit_store`. Same Postgres database since
+        // ADR-0040, but each store takes its OWN pool lease, so the two writes
+        // are still separate transactions. The order is arm-then-audit (a false
+        // audit row for an arm that didn't happen would be worse), but a HANDLED
+        // audit-write failure is COMPENSATED below by un-arming, so the "never
+        // granted without a record" guarantee holds (review #1735 HIGH-2). The
+        // only residual window is a SIGKILL / power loss in the ~microseconds
+        // between the UPDATE and the INSERT — and the next break-glass login
         // still emits auth.breakglass.login as a backstop signal.
         const std::string os_user = resolve_os_principal();
         yuzu::server::AuditEvent ev;
@@ -1406,7 +1462,7 @@ int main(int argc, char* argv[]) {
         ev.detail = std::format("break-glass armed until {} ({}s window) via --break-glass-arm "
                                 "CLI (os_identity={})",
                                 armed->armed_until, cfg.break_glass_window_secs, os_user);
-        if (!audit.log(ev)) {
+        if (!audit->log(ev)) {
             // COMPENSATING UN-ARM (review #1735 HIGH-2): the mandatory evidence
             // row didn't persist, so roll the arm back — the exemption must never
             // stand without a record (docs/ops-runbooks/auth-db-recovery.md).
@@ -1424,8 +1480,8 @@ int main(int argc, char* argv[]) {
                 return EXIT_FAILURE;
             }
             spdlog::error("--break-glass-arm: audit row for '{}' failed to persist; the arm was "
-                          "ROLLED BACK (account NOT armed). Fix audit.db (disk/permissions) and "
-                          "retry.",
+                          "ROLLED BACK (account NOT armed). Fix the Postgres audit_store schema "
+                          "(reachability/permissions/disk) and retry.",
                           cfg.break_glass_user);
             std::cerr << "error: audit row failed to persist; arm rolled back (account not armed)\n";
             return EXIT_FAILURE;
