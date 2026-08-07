@@ -91,6 +91,37 @@ std::int64_t to_i64(const char* s) {
 }
 bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
 
+// Overflow guard shared by every consumer of a persisted or caller-supplied
+// clock reading: `now + window + slack` (cleanup_once, below) is signed-
+// overflow UB near INT64_MAX. UPPER bound only — a NEGATIVE reading is the
+// legitimate dead-CMOS case this file's clock guard exists for and must never
+// be rejected on sign alone.
+constexpr std::int64_t kMaxPlausibleNow = std::numeric_limits<std::int64_t>::max() / 4;
+
+// Strict integer parse for a durable meta-table TEXT value — no partial
+// parse, no leading/trailing junk, no locale surprises. Shared by the
+// retention decision (`cleanup_once`'s `last_pass_now` read) and the
+// liveness-gauge seed (`seed_last_pass_from_anchor`, #2854) so both treat
+// "not a clean integer" as the same anomaly rather than two independently
+// maintained `strtoll` call sites drifting apart.
+std::optional<std::int64_t> parse_meta_i64(const std::string& val) {
+    errno = 0;
+    char* end = nullptr;
+    const long long v = std::strtoll(val.c_str(), &end, 10);
+    if (val.empty() || errno != 0 || end == val.c_str() || *end != '\0')
+        return std::nullopt;
+    return static_cast<std::int64_t>(v);
+}
+
+// Nonzero and deliberately outside any range a real clock reading — caller's
+// or PostgreSQL's — could plausibly produce, so it can never be confused with
+// a genuine (even wildly wrong) dead-CMOS timestamp on a dashboard. Seeded by
+// `seed_last_pass_from_anchor` when the durable anchor exists but cannot be
+// trusted as an integer: distinct from `0` ("no pass has ever run on this
+// database"), because laundering corruption into `0` would silently hand it
+// the liveness family's "never ran" grace instead of surfacing it (#2854).
+constexpr std::int64_t kLivenessAnomalySeed = std::numeric_limits<std::int64_t>::min();
+
 // sanitize_utf8_strict scrubs invalid UTF-8 to U+FFFD but keeps embedded NUL
 // (a valid ASCII byte). PostgreSQL TEXT cannot store a NUL and libpq's
 // text-format bind C-string-truncates at the first one, silently dropping the
@@ -343,19 +374,97 @@ std::optional<LegacyFingerprint> parse_fingerprint(std::string_view s) {
 
 AuditStore::AuditStore(pg::PgPool& pool, int retention_days, int cleanup_interval_min)
     : pool_(pool), retention_days_(retention_days), cleanup_interval_min_(cleanup_interval_min) {
-    auto lease = pool_.acquire();
-    if (!lease) {
-        spdlog::error("AuditStore: no database connection at construction ({}) — audit "
-                      "persistence disabled",
-                      pool_.last_error());
-        return;
-    }
-    if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
-        spdlog::error("AuditStore: schema migration failed — audit persistence disabled");
-        return;
+    {
+        // Scoped: `seed_last_pass_from_anchor()` below acquires its OWN lease
+        // (#2854), and this one must be released first — held open, it
+        // self-deadlocks a size-1 pool (`pg_pool.hpp`'s own warning against a
+        // nested acquire, and exactly the fixture every PG-gated AuditStore
+        // test uses).
+        auto lease = pool_.acquire();
+        if (!lease) {
+            spdlog::error("AuditStore: no database connection at construction ({}) — audit "
+                          "persistence disabled",
+                          pool_.last_error());
+            return;
+        }
+        if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
+            spdlog::error("AuditStore: schema migration failed — audit persistence disabled");
+            return;
+        }
     }
     open_ = true;
-    spdlog::info("AuditStore initialized (schema {}, retention={}d)", kStoreName, retention_days_);
+    // Restores the liveness gauge across a restart on an ALREADY-migrated
+    // database — the anchor from a previous `cleanup_once` pass already
+    // exists. It does NOT cover the first-ever Postgres boot: on that boot
+    // the anchor is only copied by `migrate_from_sqlite`'s legacy-meta step,
+    // which runs after this constructor returns, so `backfill_ok` (below)
+    // seeds again once that copy has actually happened (#2854).
+    seed_last_pass_from_anchor();
+    spdlog::info("AuditStore initialized (schema {}, retention={}d, liveness anchor {})",
+                 kStoreName, retention_days_, last_pass_unixtime_.load(std::memory_order_relaxed));
+}
+
+void AuditStore::seed_last_pass_from_anchor() {
+    // Restores `last_pass_unixtime_` (the EXPORTED liveness gauge) from the
+    // durable `audit_retention_meta['last_pass_now']` anchor `cleanup_once`
+    // writes — PostgreSQL's OWN clock (see the long note above that
+    // function), not the caller's. Read-only and NOT a decision: no advisory
+    // lock, no `pg_now()` read, just restoring a value this same store
+    // already persisted. #2854.
+    //
+    // NEVER FATAL, deliberately asymmetric with this store's OTHER
+    // construction-time checks (lease-acquire, schema migration, and
+    // `migrate_from_sqlite`'s mandatory backfill all fail closed). Those fail
+    // closed because failure there means audit events genuinely cannot be
+    // written or read correctly — the SOC 2-critical path. A failed or
+    // unreadable read HERE does not touch that: audit ingestion is
+    // unaffected either way, and the anomaly sentinel below already makes
+    // both the liveness alert and the never-ran alert behave safely without
+    // refusing to boot the whole evidence pipeline over one metrics-gauge
+    // read. Do not "fix" this toward fail-closed for consistency with the
+    // neighbouring checks — it was considered and rejected.
+    auto lease = pool_.acquire();
+    if (!lease) {
+        spdlog::warn("AuditStore: could not acquire a connection to seed the retention "
+                     "liveness gauge ({}); it starts at the anomaly sentinel and "
+                     "self-corrects at the next retention pass",
+                     pool_.last_error());
+        last_pass_unixtime_.store(kLivenessAnomalySeed, std::memory_order_relaxed);
+        return;
+    }
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT value FROM audit_store.audit_retention_meta WHERE key = 'last_pass_now'",
+        std::vector<std::string>{});
+    if (r.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("AuditStore: could not read the retention liveness anchor ({}); the "
+                     "liveness gauge starts at the anomaly sentinel and self-corrects at "
+                     "the next retention pass",
+                     PQerrorMessage(lease.get()));
+        last_pass_unixtime_.store(kLivenessAnomalySeed, std::memory_order_relaxed);
+        return;
+    }
+    if (PQntuples(r.get()) == 0)
+        return; // no row yet — 0 is correct: "no pass has ever run on this database"
+    const std::string val = text_col(r.get(), 0, 0);
+    const auto parsed = parse_meta_i64(val);
+    if (!parsed) {
+        spdlog::warn("AuditStore: the retention liveness anchor is not an integer ({:.64}); "
+                     "seeding the anomaly sentinel rather than laundering it into 0",
+                     val);
+        last_pass_unixtime_.store(kLivenessAnomalySeed, std::memory_order_relaxed);
+        return;
+    }
+    if (*parsed > kMaxPlausibleNow) {
+        spdlog::warn("AuditStore: the retention liveness anchor is implausible ({}); seeding "
+                     "the anomaly sentinel rather than laundering it into 0",
+                     *parsed);
+        last_pass_unixtime_.store(kLivenessAnomalySeed, std::memory_order_relaxed);
+        return;
+    }
+    // Any sign accepted, unclamped: a negative reading is a legitimate
+    // dead-CMOS anchor and must stay distinguishable from `0` ("never ran").
+    last_pass_unixtime_.store(*parsed, std::memory_order_relaxed);
 }
 
 AuditStore::~AuditStore() {
@@ -1472,6 +1581,17 @@ bool AuditStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path
     move_legacy_aside();
 
     backfill_metric("completed");
+    // Re-seed the liveness gauge: this is the ONE path through this function
+    // that just copied a legacy `last_pass_now` into `audit_retention_meta`
+    // (step 5, above) — the constructor's own seed attempt ran before this
+    // call and found no row yet. Deliberately NOT done from inside
+    // `backfill_ok` itself: every OTHER success path above returns from
+    // inside the marker-lookup block, which still holds its own lease at
+    // that point — self-acquiring a second one there deadlocks a size-1 pool
+    // (measured; see the constructor's identical fix). Those other paths
+    // don't need it anyway: none of them writes a new anchor, so whatever
+    // the constructor already seeded is still correct (#2854).
+    seed_last_pass_from_anchor();
     return backfill_ok();
 }
 
@@ -1785,8 +1905,8 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
 
     // Sanitise the CALLER's clock: `now + window + slack` below is signed-
     // overflow UB near INT64_MAX. UPPER bound only — a NEGATIVE `now` is the
-    // legitimate dead-CMOS case this guard exists for.
-    constexpr std::int64_t kMaxPlausibleNow = std::numeric_limits<std::int64_t>::max() / 4;
+    // legitimate dead-CMOS case this guard exists for. `kMaxPlausibleNow` is
+    // file-scope (shared with the liveness-gauge seed, #2854).
     if (now > kMaxPlausibleNow) {
         cleanup_failed_.fetch_add(1, std::memory_order_relaxed);
         spdlog::warn("AuditStore: retention pass called with an implausible clock reading ({}); "
@@ -1903,13 +2023,10 @@ std::size_t AuditStore::cleanup_once(std::int64_t now) {
             if (key == "last_pass_now") {
                 // A stored reading that is not an integer is corrupted/hand-
                 // edited durable state — an anomaly, not a clean slate.
-                errno = 0;
-                char* end = nullptr;
-                const long long v = std::strtoll(val.c_str(), &end, 10);
-                if (val.empty() || errno != 0 || end == val.c_str() || *end != '\0')
-                    prev_unusable = true;
+                if (const auto parsed = parse_meta_i64(val))
+                    prev = *parsed;
                 else
-                    prev = static_cast<std::int64_t>(v);
+                    prev_unusable = true;
             } else if (key == "last_anomaly_facts") {
                 last_facts = val;
             } else if (key == "bootstrap_settled") {

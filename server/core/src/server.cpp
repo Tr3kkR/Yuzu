@@ -1540,7 +1540,9 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_audit_retention_last_pass_unixtime",
                           "Wall-clock reading of the most recent audit retention pass WHOSE CLOCK "
-                          "WAS USABLE; 0 if none has run in this process. Read WITH "
+                          "WAS USABLE; 0 if no pass has ever run on this DATABASE (seeded from "
+                          "the durable retention-meta anchor at startup, #2854 — survives a "
+                          "restart, including the first Postgres boot). Read WITH "
                           "retention_passes_total: stale here while that RISES means the reaper "
                           "is alive but refusing an implausible clock, which is a different fault "
                           "from stopped",

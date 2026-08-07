@@ -430,13 +430,45 @@ public:
         return cap_reached_.load(std::memory_order_relaxed);
     }
 
-    /// Cumulative retention passes ATTEMPTED, and the wall-clock reading of the
-    /// most recent pass WHOSE CLOCK WAS USABLE (0 if none yet). Every other
-    /// counter here is silence-means-healthy; an operator alerts on ABSENCE of
-    /// movement here.
+    /// Cumulative retention passes ATTEMPTED. Every other counter here is
+    /// silence-means-healthy; an operator alerts on ABSENCE of movement here.
     std::uint64_t retention_passes_count() const noexcept {
         return retention_passes_.load(std::memory_order_relaxed);
     }
+
+    /// The wall-clock reading of the most recent retention pass WHOSE CLOCK
+    /// WAS USABLE.
+    ///
+    /// TWO CLOCKS FEED THIS GAUGE, and the difference is deliberate (#2854).
+    ///   * AT CONSTRUCTION, and again after a successful `migrate_from_sqlite`,
+    ///     it is SEEDED from the durable `audit_retention_meta` anchor
+    ///     (`last_pass_now`), which holds POSTGRESQL's clock — the one
+    ///     authority every replica serialises through (see the long note at
+    ///     `cleanup_once`'s advisory-lock transaction). That is what makes it
+    ///     survive a restart, including the FIRST Postgres boot, where the
+    ///     anchor is only copied by the legacy backfill.
+    ///   * ON EVERY SUBSEQUENT PASS it is overwritten with the CALLER's
+    ///     process clock (`cleanup_once`), which is a liveness signal only and
+    ///     drives no decision.
+    /// Both are epoch seconds and on a time-synced fleet they agree within NTP
+    /// slop, so the mixing is safe for the only question asked of this value:
+    /// "has a pass been attempted, and how long ago". It is NOT safe to derive
+    /// an elapsed-time verdict from it — nothing in `docs/prometheus/yuzu-alerts.yml`
+    /// does, and the reason is recorded there.
+    ///
+    /// THREE SENTINELS ARE LOAD-BEARING:
+    ///   * `0` means "no pass has ever run on this DATABASE" — not "not yet in
+    ///     this process", which is what it meant before #2854.
+    ///   * A NEGATIVE value (other than the anomaly sentinel below) means a
+    ///     pass ran and the stamping clock was nonsense (dead CMOS). Stamped
+    ///     and seeded unclamped on purpose — a `> 0` filter anywhere would
+    ///     silently re-merge it with the `0` "never ran" state.
+    ///   * `std::numeric_limits<std::int64_t>::min()` means the durable anchor
+    ///     exists but could not be trusted as an integer (corrupt/hand-edited
+    ///     state, or the seed read itself failed) — seeded rather than
+    ///     laundered into `0`, so corruption cannot silently earn the
+    ///     liveness family's "never ran" grace. Self-corrects at the next
+    ///     `cleanup_once` pass.
     std::int64_t last_pass_unixtime() const noexcept {
         return last_pass_unixtime_.load(std::memory_order_relaxed);
     }
@@ -479,6 +511,12 @@ private:
     /// disable audit for a caller that has no legacy trail to worry about.
     /// Atomic because serving threads read it while boot writes it.
     std::atomic<bool> backfill_pending_{false};
+
+    /// Restores `last_pass_unixtime_` from the durable `audit_retention_meta`
+    /// anchor. Called at construction and again after a successful
+    /// `migrate_from_sqlite` (#2854) — see `last_pass_unixtime()`'s doc for
+    /// the two-clock / three-sentinel contract this maintains.
+    void seed_last_pass_from_anchor();
 
     // Cumulative event write counters bucketed by `result`. Lock-free.
     std::atomic<uint64_t> events_success_{0};
