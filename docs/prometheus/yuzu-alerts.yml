@@ -1123,9 +1123,10 @@ groups:
             metric itself is missing: a server build predating it (the rules file is a copy
             you apply yourself and the server never upgrades it), or a scrape config dropping
             it - confirm with `curl -s <server>/metrics | grep audit_retention_passes`, then
-            check metric_relabel_configs. Expected, and ignorable, before the first server is
-            scraped at all. Fleet-wide only - a single quiet server among many is not
-            detected this way.
+            check metric_relabel_configs. THAT STATE IS NOT BENIGN: the server is alive and
+            scraped and its reaper is unmonitored. Fleet-wide only - a single quiet server
+            among many is not detected this way, and an `up`-based target-down alert does not
+            cover it either, because that server's `up` is 1.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # The durable clock reading is what makes anomaly detection survive a

@@ -139,6 +139,32 @@ nothing is running to raise one, so the store looks identical to a quiet healthy
 one while `audit.db` grows without bound and the configured window stops being
 enforced.
 
+**First: was this expected?** Three routine, self-clearing causes account for a
+firing that needs no action. All three share one shape — Prometheus, not the
+server, lost the history.
+
+- **Prometheus was restarted, or its TSDB is fresh.** `increase()` over a
+  PARTIAL range returns 0, and the young-server grace watches the SERVER's
+  uptime, not Prometheus's, so it does not apply. A healthy long-lived server
+  whose last hourly pass predates the first scrape is indistinguishable from a
+  dead reaper until a pass lands inside the new window.
+- **A new HA replica joined**, which is the same thing from the replica's side.
+- **You applied this rules file for the first time.**
+
+In all three the alert clears the moment the next pass lands. **Measured: about
+45 minutes** — `for: 15m` plus the remainder of the 60-minute cleanup interval —
+bounded by the cleanup interval, not by anything this rule controls. If the
+firing began within an hour of a Prometheus restart and clears on its own inside
+that window, it was this. **If it does NOT clear, it was never this** — carry on
+below.
+
+**A resolution is not by itself evidence of recovery.** On a still-dead reaper
+this rule can resolve and re-fire (measured: as little as 2 minutes firing per
+162-minute restart cycle), so a fired-then-resolved sequence in Alertmanager
+history reads like a transient blip when the control is still down. Confirm
+recovery by seeing `yuzu_server_audit_retention_passes_total` actually RISE, not
+by seeing the alert go away.
+
 Check that the store opened at boot (a failed migration closes it, and
 `start_cleanup()` then early-returns), and look for `AuditStore: retention pass
 threw` in the log. The rule carries an uptime guard because the cleanup thread
@@ -151,23 +177,53 @@ completed passes, so it must not be excused. If the alert is firing on a young
 server, check whether it is actually restarting:
 `resets(yuzu_server_uptime_seconds[3h])`.
 
-> **If you suspect a crash loop but this alert is SILENT, check the target
-> identity first.** `resets()` needs one continuous series per server. When a
-> restart changes the `instance` label - dynamic-port or IP-based service
+> **If you suspect a crash loop but this alert is SILENT, there are TWO causes
+> and one of them is this rule.**
+>
+> *Unstable target identity.* `resets()` needs one continuous series per server.
+> When a restart changes the `instance` label - dynamic-port or IP-based service
 > discovery, a rescheduled pod - every restart starts a fresh series with no
 > resets and a young uptime, so the grace applies forever and this rule cannot
-> fire. That is a scrape-configuration problem, not a rule problem: target a
-> stable identity. Confirm restarts directly with `journalctl --list-boots`, or
-> the orchestrator's restart count, rather than trusting `resets()` alone.
+> fire. That one IS a scrape-configuration problem: target a stable identity.
+>
+> *Or the cadence is inside this rule's blind band, with perfectly stable
+> labels.* Measured (#2553): a genuinely dead reaper is undetected at restart
+> cadences of roughly **160-195 minutes**, and the band moves with the Prometheus
+> evaluation interval. Uptime never reaches the 3-hour grace, and the window
+> holds two resets for too little time to satisfy `for: 15m`. Nothing is
+> misconfigured; there is nothing to fix in scrape config. Narrower than what it
+> replaced - which was blind below about 195 minutes outright - but not closed.
+>
+> Either way, **do not read this rule's silence as a healthy reaper.** Confirm
+> restarts with `journalctl --list-boots` or the orchestrator's restart count
+> rather than trusting `resets()`, and read
+> `yuzu_server_audit_retention_passes_total` directly - a counter flat while the
+> process is up IS the dead-reaper condition, whatever this rule says.
 
 **Before assuming a crash loop, check the uptime series exists.** If
 `yuzu_server_uptime_seconds` returns nothing for this instance, the rule fired
-on its absent-series arm (deliberate — a server that stops exporting uptime must
-not be able to silence its own liveness alert), and the fault is in the scrape
-path, not the reaper: check the target is up and that a `metric_relabel_configs`
-rule is not dropping it. The separate `YuzuAuditRetentionMetricMissing` alert
-covers the other half of this — the retention *counter* not being scraped at
-all, which leaves this rule unable to fire for anyone.
+on its absent-series arm — deliberate, because a server that stops exporting
+uptime must not be able to silence its own liveness alert. **What that tells you
+is that the GRACE is gone, not that the SIGNAL is spurious.** The alert's other
+arm, `increase(yuzu_server_audit_retention_passes_total[3h]) == 0`, is what
+actually fired, and `cleanup_once` bumps that counter unconditionally before
+every return — so a flat counter is the dead-reaper condition itself. With the
+uptime series missing, this rule can no longer tell a legitimately young server
+from a stopped reaper, and BOTH need checking:
+
+- Fix the scrape path — confirm the target is up and that a
+  `metric_relabel_configs` rule is not dropping `yuzu_server_uptime_seconds`.
+- **And** establish process age out of band (`journalctl --list-boots`, the
+  orchestrator's restart count) and read
+  `yuzu_server_audit_retention_passes_total` yourself. A process up for more than
+  a couple of cleanup intervals with a flat counter is a stopped reaper, and the
+  checks earlier in this section — `AuditStore: retention pass threw`, whether
+  the store opened at boot, `..._retention_last_pass_unixtime` — are the work.
+
+Treating this as scrape-only leaves audit retention unenforced while `audit.db`
+grows. The separate `YuzuAuditRetentionMetricMissing` alert covers the other half
+— the retention *counter* not being scraped at all, which leaves this rule unable
+to fire for anyone.
 
 > There is deliberately NO metric for a missing retention index. The index is
 > built best-effort outside the migration runner and its absence degrades
