@@ -21,6 +21,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "sqlite_raii.hpp"
 #include "store_errors.hpp"
 #include "../test_helpers.hpp"
 
@@ -246,8 +247,8 @@ void write_legacy_gsstore_db(const std::filesystem::path& path) {
 // copy BOTH rows, never decide expiry itself.
 void write_legacy_gsstore_db_with_expired_event(const std::filesystem::path& path,
                                                 int64_t live_ttl) {
-    sqlite3* db = nullptr;
-    open_legacy_gsstore_db(path, &db);
+    yuzu::server::SqliteDb db;
+    open_legacy_gsstore_db(path, db.addr());
     const std::string seed =
         "INSERT INTO guaranteed_state_rules (rule_id, name, yaml_source, version, enabled, "
         " enforcement_mode, severity, os_target, scope_expr, created_at, updated_at, created_by, "
@@ -266,8 +267,7 @@ void write_legacy_gsstore_db_with_expired_event(const std::filesystem::path& pat
         "('legacy-evt-expired', 'agent-A', '2026-01-01T00:00:00Z', 'process.crashed', 1),"
         "('legacy-evt-live', 'agent-A', '2026-04-19T12:00:00Z', 'process.crashed', " +
         std::to_string(live_ttl) + ");";
-    REQUIRE(sqlite3_exec(db, seed.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
-    sqlite3_close(db);
+    REQUIRE(sqlite3_exec(db.get(), seed.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
 }
 
 // #2663 security-guardian: migrate_from_sqlite() used to skip TTL-expired
