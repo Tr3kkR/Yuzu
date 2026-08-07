@@ -168,12 +168,12 @@ STATING_SURFACES=(
 # DIFFERENT-line masking (a sibling paragraph or table row) - that was its actual purpose,
 # sidestepping the free-form-prose boundary-guessing problem documented above - but it was
 # never a defense against a same-line decoy, and no arm here is immune to this class by
-# construction. This NARROWS the surface #2827 closed (the four multi-line arms' most
-# obvious sibling-row/comment shape); it does not close the class a second time. Left as a
-# follow-up rather than folded into this fix because every prior attempt at tightening this
-# mechanism (region-scoping itself, then single-line capture for free-form prose) shipped in
-# its own governance round and each still left a gap the next review found - the fix earns
-# its own review pass, not a rider on this one.
+# construction. This FIX narrows the class #2827 reported - closing the four multi-line
+# arms' most obvious sibling-row/comment shape - it does not close the class outright. Left
+# as a follow-up (#2862) rather than folded into this fix because every prior attempt at
+# tightening this mechanism (region-scoping itself, then single-line capture for free-form
+# prose) shipped in its own governance round and each still left a gap the next review
+# found - the fix earns its own review pass, not a rider on this one.
 # ---------------------------------------------------------------------------
 claim_region() {
     local f="$1"
