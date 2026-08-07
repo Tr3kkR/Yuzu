@@ -319,8 +319,57 @@ def count_assertions(doc: dict) -> CaseFacts:
     return CaseFacts(cases=len(tests), assertions=assertions, caseless=caseless)
 
 
-def gate(promtool_argv: list[str], rules: str, tests: str) -> int:
-    """`check rules` then `test rules`, then prove the run was not vacuous."""
+# The canary mutation. `unless` is what makes the young-server grace an
+# EXCLUSION; `and` inverts it, so every case asserting the alert FIRES must go
+# red. Measured against this suite (#2553 pass 13, quality-engineer's M3).
+CANARY_FROM = "unless ("
+CANARY_TO = "and ("
+
+
+def build_canary_tree(dest: Path) -> None:
+    """Mirror RULES + TESTS under `dest`, with RULES deliberately broken.
+
+    The layout MIRRORS the repo because promtool resolves a test file's
+    `rule_files:` relative to THE TEST FILE, not to cwd. Copying the test file
+    byte-unchanged is the whole point: its own glob is the thing under test.
+    """
+    for rel in (RULES, TESTS):
+        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(REPO_ROOT / TESTS, dest / TESTS)
+    text = (REPO_ROOT / RULES).read_text(encoding="utf-8")
+    if CANARY_FROM not in text:
+        sys.exit(
+            f"FAIL: canary anchor {CANARY_FROM!r} is no longer in {RULES}, so the "
+            f"canary would pass without proving anything - silently inert, which "
+            f"is the exact failure it exists to catch. Choose a new anchor whose "
+            f"removal MUST redden this suite, and update CANARY_FROM/CANARY_TO."
+        )
+    (dest / RULES).write_text(text.replace(CANARY_FROM, CANARY_TO, 1),
+                              encoding="utf-8")
+
+
+def gate(promtool_argv: list[str], rules: str, tests: str, canary_for=None) -> int:
+    """`check rules`, `test rules`, prove the run was not vacuous, then prove
+    the behaviour suite is testing THE SHIPPED RULES.
+
+    THAT LAST STEP EXISTS BECAUSE THE FIRST TWO VALIDATE DIFFERENT FILES.
+    `check rules` is handed `RULES` by this script. `test rules` is handed the
+    TEST file, and promtool then loads whatever THAT file's own `rule_files:`
+    glob names. Nothing tied the two together. MEASURED on 3.13.1 (#2553 pass
+    13): point the glob at a real-but-wrong rules file and make the assertions
+    negative-only, and the whole gate exits 0 while printing "SUCCESS: 62 rules
+    found" - a count that came from a file the behaviour run never opened.
+
+    The vacuity guard above cannot see it: there ARE cases, there ARE
+    assertions, and not one of them is empty. So instead we break a COPY of the
+    shipped rules and require the suite to notice. A suite that stays green
+    against deliberately broken rules is not testing them.
+
+    Note what this deliberately does NOT do: parse the glob or canonicalise
+    paths. An earlier revision reimplemented Go's `filepath.Glob` in Python to
+    answer this same question and produced FOUR findings doing it - Python's
+    `**` recurses and Go's does not. Ask promtool instead of modelling it.
+    """
     rc, check_out = run(promtool_argv + ["check", "rules", rules], timeout=120)
     if rc:
         return rc
@@ -330,6 +379,31 @@ def gate(promtool_argv: list[str], rules: str, tests: str) -> int:
     reason = check_gate_output(check_out, test_out, inspect_test_file(strict=True))
     if reason:
         sys.exit(f"FAIL: promtool exited 0 but the run proves nothing - {reason}")
+    if canary_for is None:
+        return 0
+    tmp = REPO_ROOT / ".promtool-canary"
+    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        build_canary_tree(tmp)
+        canary_argv, canary_tests = canary_for(tmp)
+        canary_rc, _ = run(canary_argv + ["test", "rules", canary_tests], timeout=120)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if canary_rc == 0:
+        sys.exit(
+            f"FAIL: the suite stayed GREEN against a deliberately broken copy of "
+            f"{RULES} ({CANARY_FROM!r} -> {CANARY_TO!r}), so it is not testing "
+            f"the shipped rules. TWO causes produce this, both measured:\n"
+            f"  1. `rule_files:` in {TESTS} names a different file. That is what "
+            f"the behaviour run loads; `check rules` above validated {RULES}, so "
+            f"the two halves can disagree silently.\n"
+            f"  2. Every assertion is negative (`exp_samples: []`). Those pass "
+            f"whatever the rules say - including against no rules at all - so the "
+            f"suite has cases and assertions but proves nothing. At least one "
+            f"assertion must expect a sample to EXIST."
+        )
+    print("canary: suite reddens against broken rules - it is testing them",
+          flush=True)
     return 0
 
 
@@ -427,10 +501,12 @@ def pull_with_retry() -> bool:
     return False
 
 
-def docker_argv() -> list[str]:
+def docker_argv(root: Path = REPO_ROOT) -> list[str]:
+    """`root` is the tree mounted at /w. It is a parameter ONLY so the canary
+    can mount its own mirror tree; every other caller wants the repo."""
     return [
         "docker", "run", "--rm",
-        "-v", f"{REPO_ROOT}:/w:ro",
+        "-v", f"{root}:/w:ro",
         *DOCKER_HARDENING,
         "--entrypoint", "/bin/promtool", PROMTOOL_IMAGE,
     ]
@@ -585,7 +661,10 @@ def main(argv: list[str]) -> int:
                 )
                 return SKIP
             print(f"using native promtool: {exe} (major {major})", flush=True)
-            return gate([exe], RULES, TESTS)
+            # Native resolves the canary tree by absolute path; `run()`'s cwd is
+            # REPO_ROOT, which is the wrong root for the mirror.
+            return gate([exe], RULES, TESTS,
+                        canary_for=lambda root: ([exe], str(root / TESTS)))
 
         print(
             f"SKIP: no usable promtool on PATH and {DOCKER_OPT_IN} is unset. Set "
@@ -607,7 +686,8 @@ def main(argv: list[str]) -> int:
     if not pull_with_retry():
         sys.exit(f"FAIL: could not pull {PROMTOOL_IMAGE} after {PULL_ATTEMPTS} attempts.")
 
-    return gate(docker_argv(), f"/w/{RULES}", f"/w/{TESTS}")
+    return gate(docker_argv(), f"/w/{RULES}", f"/w/{TESTS}",
+                canary_for=lambda root: (docker_argv(root), f"/w/{TESTS}"))
 
 
 if __name__ == "__main__":
