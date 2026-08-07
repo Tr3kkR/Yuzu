@@ -431,12 +431,15 @@ private:
     /// Allocates nothing — map/node erases and string compares only.
     void drop_key_locked(const std::string& key);
     /// Undo ONE subscription after arm_impl loses the M1 consumer race, allocating
-    /// nothing (the caller owns `key` and `type`, so nothing has to be copied). A
-    /// specialization of disarm(). SINCE disarm() WAS ALSO HARDENED the two now differ
-    /// only in that this one takes `key`/`type` from the caller and so needs no lookup
-    /// at all — but it is NOT redundant: routing arm_impl's M1 teardown through disarm()
+    /// nothing (the caller owns `key`/`type`/`event_driven`, so nothing has to be
+    /// copied or recomputed). A specialization of disarm() — lockstep siblings, NOT
+    /// exact duplicates. The full, authoritative enumeration of every difference
+    /// lives at the DEFINITION, not here: restating a count in two places is
+    /// exactly what let this comment and the definition disagree once already
+    /// (fjarvis, PR #2863 review) — do not reintroduce a second copy. It is NOT
+    /// redundant with disarm(): routing arm_impl's M1 teardown through disarm()
     /// would remove ONE subscription via a whole-key-capable path and reintroduce a
-    /// lookup on a key the caller already holds. Keep the two in lockstep.
+    /// lookup on values the caller already holds. Keep the two in lockstep.
     /// NOT noexcept: mutex acquisition can raise std::system_error (the residual
     /// stated in arm_impl); turning that into std::terminate would be worse.
     void teardown_arm_race(SubscriptionId id, const std::string& key, SparkType type,
