@@ -110,6 +110,14 @@ CLOSED and pre-seeded at boot, so `absent()` alerting stays meaningful.
 |---|---|---|
 | `yuzu_mcp_body_too_large_total{reason}` | counter | `/mcp/v1/` requests rejected at the transport before the body was read (#2437). `reason=over_cap` is a declared `Content-Length` above 4 MiB (`413`); `reason=unmeasurable` is a body this server will not admit because it cannot size it in advance — any `Transfer-Encoding`, any non-`identity` `Content-Encoding` (httplib decompresses before its size check), or a POST/PUT/PATCH with no `Content-Length` (`411`). Pre-auth, so there is no principal and no audit row: the throttled `[#2437]` warn in the journal carries the sanitized method/path/source address. |
 
+## Pre-auth body-cap metrics (#2407)
+
+Request-body rejections at the general pre-routing chokepoint, every non-`GET`/`HEAD` route (not just `/mcp/`, which keeps emitting the metric above too, for compatibility). Seeded per table entry at boot from `body_cap_policy.hpp`'s `kBodyCapTable`, so the label set is CLOSED and `absent()` alerting stays meaningful.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_body_cap_rejected_total{path_class,reason}` | counter | A request rejected before its body was read because it failed the resolved route class's cap policy (#2407). `path_class` is always one of `body_cap_policy.hpp`'s fixed table labels (e.g. `mcp`, `bundles`, `scim`, `default`) — **never the raw request path**, which is attacker-controlled and would be an unbounded-cardinality label on a pre-auth metric. `reason=over_cap` is a declared `Content-Length` above the class's cap (`413`); `reason=unmeasurable` is a chunked/undeclared body refused outright for a class whose policy entry sets `requires_measurable` (`411`) — only `mcp` sets that bit today, so `reason="unmeasurable"` is seeded only for `path_class="mcp"` and is not yet reachable for any other class. Pre-auth, so there is no principal and no audit row: the throttled `[#2407]` warn in the journal carries the sanitized method/path/source address. See `docs/user-manual/rest-api.md` "Pre-Auth Request Body Caps" for the per-class cap table. |
+
 ## MCP input-bounds metrics
 
 Argument rejections on the MCP surface (#2405, #2437). Label sets are CLOSED

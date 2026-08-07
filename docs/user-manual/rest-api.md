@@ -55,6 +55,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
 - [API Versioning](#api-versioning)
 - [Authentication](#authentication)
 - [JSON Envelope](#json-envelope)
+- [Pre-Auth Request Body Caps](#pre-auth-request-body-caps-2407)
 - [REST API v1 Endpoints](#rest-api-v1-endpoints)
   - [Current User](#current-user)
   - [Management Groups](#management-groups)
@@ -218,6 +219,51 @@ The R2 A4 completion (2026-07) routed the RBAC/tier denial gates (`require_admin
 `retry_after_ms` is honest per dimension: a rate rejection carries the token bucket's actual refill time, a concurrency rejection carries a fixed short backoff (250ms) since there is no natural "when will a slot free up" estimate. Streaming/SSE endpoints (`GET /api/v1/events`, `GET /events`, `GET /sse/executions/{id}`) take a concurrency slot held for the stream's lifetime (released when the stream ends), plus the rate debit — the same two caps as any other engine request (UP-1; an earlier revision of this primitive released the slot early at routing hand-off and treated streaming as rate-only, which left an engine principal able to open an unbounded number of concurrent streams — that gap is closed). This gate applies **only** to engine-principal sessions; human, device-agent, and anonymous traffic is unaffected. It is enforced **per server process** — a multi-replica deployment's effective ceiling is `configured_cap x replica_count`, not the configured cap alone (each replica enforces independently; not a fleet-wide cap). A quota rejection is metric-only (`yuzu_server_principal_quota_exhausted_total{side,limit}`, see `docs/user-manual/metrics.md`) — it does not write an audit row (see `docs/user-manual/audit-log.md`); every admitted request also increments the companion `yuzu_server_principal_quota_admits_total{side}` counter.
 
 > **⚠ Breaking wire-shape change (upgrade note).** Many of those legacy `/api/v1` errors were previously emitted as **`{"error":"<string>"}`** (the single-arg `error_json`) or the older nested `{"error":{"code","message"}}`. They are now uniformly the nested A4 object above. A client that read `error` as a *string* (`String(body.error)`, `body.error.startsWith(...)`) will break — `error` is always an **object** on these paths now. Migrate to `body.error.code` / `body.error.message`. See `docs/user-manual/upgrading.md`.
+
+---
+
+## Pre-Auth Request Body Caps (#2407)
+
+Every request except `GET`/`HEAD` is checked against a per-route body-size cap **before authentication runs and before the body is read** — a single pre-routing chokepoint (`server.cpp`) resolves the caller's `(method, path)` against the policy table in `body_cap_policy.hpp` and rejects an oversized or unmeasurable body without buffering it. Two status codes:
+
+| Status | Meaning |
+|---|---|
+| `413` | The body's **declared `Content-Length`** exceeds the resolved cap for this route's class. |
+| `411` | The body cannot be **measured** in advance (chunked `Transfer-Encoding`, a non-`identity` `Content-Encoding`, or a POST/PUT/PATCH with no `Content-Length` at all) and this route's class refuses that. **Today only `/mcp/` refuses an unmeasurable body** — every other class below falls through and is admitted up to httplib's own 100 MiB backstop, because chunked request bodies are legal HTTP and this repo does not control every client population talking to public REST/SCIM/upload routes. This is a deliberate per-class opt-in (`requires_measurable`), not a blanket rule — **the non-`/mcp/` 411 path is consequently unreachable today**; it activates automatically the day a table entry opts in.
+
+Both responses use the standard [A4 error envelope](#json-envelope) with a `remediation` hint (no `permission` field — the request is rejected before any principal is resolved). This gate is separate from, and runs *before*, any route-local body check a handler may also carry (e.g. the SCIM/response-template 64 KiB checks below) — those still exist for defense-in-depth if a future edit widens this table's entry, but on the current table this pre-routing gate rejects first.
+
+**Why not one global cap?** httplib's own `Server::set_payload_max_length` is a single server-wide knob shared by every route on the same listener, including the ~70 MiB live-query bundle route and the OTA agent-binary upload — a single small value would break those outright, and a single large value (httplib's 100 MiB default) leaves every small JSON/form route able to buffer up to 100 MiB from an unauthenticated caller. The table below exists so each route class gets a cap sized to what it actually needs.
+
+### Per-class caps
+
+Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (longest matching `{method, path prefix}` wins; do not hand-copy these numbers elsewhere — that header is the source of truth):
+
+| Method | Path prefix | Cap | `path_class` | Notes |
+|---|---|---|---|---|
+| any | `/mcp/` | 4 MiB | `mcp` | Only class with `requires_measurable=true` — see the 411 row above. |
+| POST | `/api/v1/bundles` | 70 MiB | `bundles` | Sized to the live-query bundle route's own computed 64 MiB parameter-byte floor plus JSON overhead headroom. |
+| POST | `/api/settings/updates/upload` | 100 MiB | `ota_upload` | Kept at httplib's own backstop deliberately, not squeezed — OTA agent binaries are legitimately multi-ten-MB. |
+| POST | `/api/v1/ca/import-chain` | 256 KiB | `ca_import_chain` | Mirrors the handler's own 256 KiB bound exactly. |
+| POST | `/api/settings/ca/import-chain` | 512 KiB | `ca_import_chain_dashboard` | † 2× the REST JSON twin's cap — reasoned headroom for form-encoding overhead, not a measured worst case. |
+| POST | `/api/settings/plugin-signing/upload` | 512 KiB | `plugin_trust_bundle` | † 2× the handler's 256 KiB parsed-content check — same reasoned multipart-framing headroom, not measured. |
+| POST | `/scim/v2/` | 64 KiB | `scim` | Matches the handler's own `kMaxBodyBytes`; moves an existing after-buffer check to before it. |
+| PUT | `/scim/v2/` | 64 KiB | `scim` | Same. |
+| PATCH | `/scim/v2/` | 64 KiB | `scim` | Same. |
+| POST | `/saml/acs` | 1 MiB | `saml_acs` | A legitimate signed `SAMLResponse` is well under 64 KiB; headroom against amplification, not judgment. |
+| POST | `/api/v1/definitions/` | 64 KiB | `response_templates` | Widest literal prefix the segment-boundary matcher can key on for the regex-captured `{id}`/`{template_id}` routes underneath; a future mutation route added elsewhere under this prefix inherits it unless it gets its own, more specific entry. |
+| PUT | `/api/v1/definitions/` | 64 KiB | `response_templates` | Same. |
+| POST | `/api/dashboard/tar-execute` | 4 KiB | `tar_dashboard_sql` | Matches the handler's own `sql.size() > 4096` check exactly; no extra encoding margin added. |
+| POST | `/api/v1/result-sets/from-tar-query` | 100 KiB | `tar_result_set_sql` | A few hundred bytes above the handler's own `sql.size() > 100000` check. |
+| POST | `/api/v1/guaranteed-state/rules` | 16 MiB | `guardian_rule_authoring` | ‡ **Judgment call, not a measurement** — no aggregate Guardian-rule-size contract exists yet anywhere in the codebase. Scoped to the creation route only; the sibling `PUT .../rules/{id}` update route falls through to the 4 MiB catch-all below until it gets its own reviewed entry. |
+| POST | `/api/workflows` | 16 MiB | `workflow_yaml` | ‡ Judgment call, same reasoning — arbitrary YAML/legacy `yaml_source` bodies with no size contract yet. |
+| POST | `/api/product-packs` | 16 MiB | `product_pack_yaml` | ‡ Judgment call, same reasoning — a pack can hold multiple YAML documents, so it needs at least the same headroom as workflow authoring. |
+| any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
+
+† = a 2× multiplier for form/multipart encoding overhead — reasoned headroom, not a measured worst case.
+‡ = a generous, explicit, judgment-call bound (still three orders of magnitude below httplib's 100 MiB backstop) because no aggregate size contract exists for that class yet. Do not read either footnote as license to invent a number for a different route — see the header block of `body_cap_policy.hpp`.
+
+**Raising a cap.** Edit the table in `body_cap_policy.hpp` (with review) and update this table to match — never reach for `Server::set_payload_max_length`, which is global across every route on the listener (see "Why not one global cap?" above). See also `docs/user-manual/server-admin.md`'s upgrade note for this change and `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for observing rejections.
 
 ---
 

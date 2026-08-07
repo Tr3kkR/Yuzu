@@ -194,6 +194,19 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — pre-auth request-body caps now apply to (almost) every route, not just `/mcp/` (#2407) (breaking)
+
+**What changed.** Before this release, only the `/mcp/` ingress was capped ahead of authentication (4 MiB, #2437) — every other route was bounded only by httplib's own 100 MiB server-wide default, so an unauthenticated caller could make the server buffer up to 100 MiB per connection on any route. The server now resolves a per-route-class cap from a single table (`body_cap_policy.hpp`) at the same pre-routing chokepoint, before the body is read at all. Full per-class numbers and the error contract: [`docs/user-manual/rest-api.md` "Pre-Auth Request Body Caps"](rest-api.md#pre-auth-request-body-caps-2407).
+
+**What a client sees.**
+
+- **`413`** — the declared `Content-Length` exceeds the resolved class's cap.
+- **`411`** — the body cannot be sized in advance (chunked, or no `Content-Length`) and this route's class requires one it can size. Today that is `/mcp/` only; every other class still admits an unmeasurable body up to httplib's 100 MiB backstop, unchanged from before this release.
+
+**Who this affects.** Any integration that was sending a body larger than its route's new class cap and relying on httplib's 100 MiB backstop to accept it. The most likely surface to notice: a very large `POST /api/v1/guaranteed-state/rules`, `/api/workflows`, or `/api/product-packs` body — those three classes are capped at a generous but explicit 16 MiB (a judgment call, not a measured contract, because no aggregate size limit for that content exists yet) rather than the previous 100 MiB backstop. Most other routes had a smaller handler-level check already (SCIM, response templates, CA import, TAR queries) — those clients see no behavior change, only an earlier rejection (before the body is buffered rather than after).
+
+**How to raise a cap.** Edit the table in `server/core/src/body_cap_policy.hpp` (with review) and the matching row in `docs/user-manual/rest-api.md`. Do **not** reach for httplib's global `Server::set_payload_max_length` — that knob is shared by every route on the listener, including the ~70 MiB live-query bundle route and the OTA agent-binary upload, so a single global value can't fit every route class at once. Rejections are visible per class via `yuzu_body_cap_rejected_total{path_class,reason}` — see `docs/user-manual/metrics.md`.
+
 ### vNEXT — an authorization-topology floor now applies regardless of RBAC, and engine-principal reads move off `Security:Read` (#2376) (breaking)
 
 This note has **two independent breaking directions** — read both, they
