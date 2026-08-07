@@ -775,9 +775,9 @@ proposes.
    than another one — #2442) and **atomically consumes** the ticket (one-time —
    a replay, a mismatched tool/args, or a ticket from another surface, returns
    `-32003` `PermissionDenied`), then executes. A `-32603` means the store
-   failed while consuming, not that the ticket is spent. Note that a store
-   failure during the earlier lookup is *not* separated out and also returns
-   `-32003`; the error-code reference explains why that matters.
+   failed at either the lookup or the consume step, not that the ticket is
+   spent — see the error-code reference below for the fix, which is the
+   opposite of `-32003`'s.
 
 ### What requires approval
 
@@ -1161,41 +1161,37 @@ principal, or use an account with the required permissions. For a ticket recall 
 submit the call **without** `approval_id` to obtain a fresh approval ticket, then
 recall once it is approved.
 
-> **Do not apply that fix to a `-32603`.** A store failure at the CONSUME step
-> returns `-32603`, and its remediation is the opposite of this one's. See below.
->
-> **Known gap, and it points the wrong way.** A store failure at the earlier
-> TICKET-LOOKUP step is not distinguished: it reads as "no such ticket" and
-> surfaces here, as `-32003`, whose fix above tells you to re-submit without
-> `approval_id`. Following it during a transient store failure mints a duplicate
-> while your original approval is still outstanding, spending a second human
-> review. If you see `-32003` for a ticket you believe is valid and recently
-> approved, prefer retrying the identical call a few times before re-minting.
-> Separating a store failure from a missing ticket at the lookup step is a
-> follow-up change; it is not fixed in this release.
+> **Do not apply that fix to a `-32603`.** A store failure at the lookup or the
+> consume step returns `-32603`, and its remediation is the opposite of this
+> one's. See below.
 
 ### -32603: Approval store unavailable
 
 **Symptom**: An approval-ticket recall returns error code `-32603` rather than
-`-32003`. This comes from the CONSUME step — see the gap noted above for the
-lookup step, which does not produce this code.
+`-32003`. This can come from either step of a recall: the ticket lookup or the
+consume.
 
-**Cause**: The approval store could not be read or written while consuming the
-ticket. The ticket was **not** consumed.
+**Cause**: The approval store could not be read (or, at the consume step,
+written) while handling the ticket. The ticket was **not** consumed.
 
 It is not necessarily still usable, and the difference matters: the 7-day
 approval window keeps running during an outage, so an outage that outlasts the
 ticket's remaining window ends with it expired like any other.
 
 **Fix**: Retry the identical call, including the same `approval_id`, after at
-least the `retry_after_ms` the response carries (currently 5000).
+least the `retry_after_ms` the response carries. Two distinct bodies share
+this code:
 
-Retrying indefinitely is not safe, and the response cannot currently tell you
-when to stop: a store that is failing permanently rather than transiently
-returns this same body, so a client that honours the hint forever will retry
-forever, and each attempt writes an audit row.
-Bound your own retries — a handful of attempts, then escalate to an operator.
-Distinguishing permanent from transient here is a follow-up change.
+- **`retry_after_ms` is a number (currently 5000)**: the store is open but the
+  read or write failed, most likely transiently. Retry after the hint.
+  Retrying indefinitely is not safe, and this body alone cannot tell you when
+  to stop: a store connection that never fully closed but is failing
+  permanently (corruption, read-only, disk full) still takes this arm and
+  will honour a client that retries forever. Bound your own retries — a
+  handful of attempts, then escalate to an operator. Distinguishing that case
+  from a genuinely transient one is a follow-up change.
+- **`retry_after_ms` is `null`**: the store never opened. This will not clear
+  on retry; escalate to an operator immediately.
 
 Do **not** re-submit without `approval_id` while the approval
 window is still open: the ticket was not consumed, and minting a fresh one asks
