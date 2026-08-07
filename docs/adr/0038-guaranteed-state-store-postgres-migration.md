@@ -106,9 +106,15 @@ The SQLite store's background cleanup thread issues **bare wall-clock TTL delete
 store schema, one sweeping replica per pass via
 `pg_try_advisory_xact_lock('guaranteed_state_store:reap',0)`, outcome probe excluding
 implausibly-ahead rows — the horizon is derived from this store's own `retention_days_`
-(`now + retention_window_secs + kReapTtlFutureSlackSec`, matching `audit_store.cpp`'s
+(`pg_now + retention_window_secs + kReapTtlFutureSlackSec`, matching `audit_store.cpp`'s
 `datable_horizon` shape, own constant), not a fixed guess, so no accepted
-`--guardian-event-retention-days` value can falsify it (#2663 review) —
+`--guardian-event-retention-days` value can falsify it (#2663 review) — every DECISION
+(the probe, the `gc_meta` stamp, `big_step`) reads PostgreSQL's OWN clock inside the
+advisory-lock transaction, not this replica's process clock (`AuditStore::cleanup_once`'s
+`#2360/1d` shape; fixed #2663, fjarvis review — the original process-clock read let a
+fast/skewed replica's own reading win the shared `gc_meta` anchor and silently sweep a
+row still live by every other clock, with `classify()`'s existing detectors unable to
+catch a moderately-fast clock on their own) —
 `audit_retention_rules::classify` + fact-set decline-once,
 **unconditional per-pass cap** (substrate-tuned constant; events and observations reaped
 in the same guarded pass so the PII projection never outlives its parent event — the
