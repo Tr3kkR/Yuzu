@@ -915,7 +915,7 @@ Decision 11's "never ship interleaved" protected. Because Yuzu is still greenfie
 posture once a pilot customer is deployed — from the first customer, protocol and
 cutover changes must support rolling upgrade. The wire protocol staying unchanged
 (§Scope) keeps a mixed-version fleet safe across the multi-week ladder. **Each rung
-runs the full 8-gate `/governance` pipeline** (not an abbreviated review); each
+runs the full `/governance` pipeline** (Gate 0 + Gates 1-8, not an abbreviated review); each
 rung's report is retained as change-management evidence (SOC 2 Workstream F) by
 posting it as a **GitHub PR review (`gh pr review`) on that rung's PR** — a durable
 artifact mapping onto Workstream F's "PR review records" category, never a bare git

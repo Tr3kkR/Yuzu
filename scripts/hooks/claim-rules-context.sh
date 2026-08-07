@@ -22,4 +22,5 @@ RULES="$(cat "$DOC")" || exit 0
 [ -n "$RULES" ] || exit 0
 
 jq -n --arg ctx "$RULES" \
-  '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $ctx}}'
+  '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $ctx}}' \
+  || exit 0

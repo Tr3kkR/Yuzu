@@ -42,9 +42,9 @@ Per CLAUDE.md standing rule 2: a finding BLOCKS when its **derived** band is CRI
 **Gate 0 does not get its own severity system, ledger record kind, or waiver path.**
 Its findings are ordinary findings — same TRIGGER/IMPACT/EXPOSURE derivation, same
 ledger schema, same BLOCKING rule as every other gate. What is different is WHEN it
-runs (before Gate 1, so a self-inflicted claim defect gets a chance to be fixed
-before seven more gates each separately trip over it) and WHOSE taxonomy names the
-finding (`docs/claim-discipline.md`'s seven rules, not a security/docs/architecture
+runs (before Gates 1-8, so a self-inflicted claim defect gets a chance to be fixed
+before each of them separately trips over it) and WHOSE taxonomy names the
+finding (`docs/claim-discipline.md`'s six rules, not a security/docs/architecture
 domain). See the Gate 0 section below for the exact mechanics.
 
 ---
@@ -456,7 +456,7 @@ section tells you how to apply them inside `/governance`; it does not restate th
 A defect fix followed by a prose explanation that asserts unverified facts is what
 drives most governance fold rounds: a reviewer checks one of those facts in Gate 2-6,
 finds it wrong, a new round opens, and the correction adds more unverified prose on
-top of the last. Gate 0 catches the same class of defect **before** the other seven
+top of the last. Gate 0 catches the same class of defect **before** the other eight
 gates each separately stumble over it — cheaper than Gate 8 discovering it as a
 side-effect finding in gate N of a fold round that need not have happened.
 
