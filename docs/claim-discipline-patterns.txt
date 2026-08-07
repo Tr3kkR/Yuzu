@@ -1,0 +1,110 @@
+# Unqualified universals and sufficiency claims in prose. THE SWEEP LIST FOR
+# docs/claim-discipline.md RULES 2f AND 6.
+#
+# Grep these over ADDED lines only, never a whole file — a whole-file run matches
+# pre-existing tables (enumerations, permission matrices, capability lists) and
+# produces noise that gets a check switched off:
+#
+#   git diff -U0 <base>...<tip> -- '*.md' '*.cpp' '*.hpp' '*.h' \
+#     | grep '^+' \
+#     | grep -Ei -f <(grep -v '^#' docs/claim-discipline-patterns.txt | grep .)
+#
+# Swap <base>...<tip> for HEAD to sweep uncommitted work instead.
+#
+# EXPECT A DESIGN-DOC FALSE POSITIVE FIRST. The absence block below carries a
+# `#!skip-files` directive a human must honor by reading it — grep cannot enforce it.
+# On a branch carrying a design doc, the first hit is often an absence claim that is a
+# REQUIREMENT for code that does not exist yet, not an observation about code that
+# does. Add `| grep -v <path-fragment>` when that is what you are sweeping, or read
+# past it knowingly. Do not conclude the list is noisy and stop sweeping — the
+# enumeration and sufficiency blocks below have no such exemption and fire everywhere.
+#
+# Two exemptions are yours to honor by reading, not by encoding into the grep: the
+# citation-within-6-lines exemption (a nearby file:line makes an enumeration claim
+# checkable, so it is not this defect), and the `#!skip-files` line before the
+# absence block.
+#
+# WHY THESE PATTERNS AND NOT "always"/"never"/"must"
+# ----------------------------------------------------
+# This repo uses MUST / NEVER / ALWAYS deliberately, as normative invariants, in
+# CLAUDE.md, .claude/routed-concerns.md, and accepted ADRs. Flagging those would bury
+# the signal and get the sweep abandoned. The patterns below are DESCRIPTIVE
+# universals: prose that claims to have enumerated a set ("the only," "none of,"
+# "every case") while describing runtime behavior. That claim is only as good as the
+# enumeration behind it, and an uncited one has no enumeration behind it at all.
+#
+# WORKED EXAMPLES
+# ----------------
+# Each pattern below is justified by a real, closed governance finding it would have
+# caught — added when the finding was found, not invented after the fact. All four
+# came from one governance run (gov-20260803-redact-fold-adversarial, 8 gates, 6 fold
+# rounds), swept over the added lines of that branch's three fold commits: 4 hits, all
+# real blocking or multi-reporter findings, 0 false positives on that run.
+#
+#   "None of this route's error bodies use the A4 envelope"   -- BLOCKING
+#       -> the shared authorization gate DOES emit A4 401/403/503.
+#   "the only surface that emits it"  (two sites)              -- 3 independent reporters
+#       -> the config.update audit detail emits it too.
+#   "the same procedure"                                       -- 2 independent reporters
+#       -> the doc it pointed at carried a materially weaker one.
+#   "Either way SSO fails"                                     -- BLOCKING
+#       -> an empty secret degrades to public-client PKCE; the IdP decides, not "either way."
+#   "the remediation, and it is complete on its own"            -- BLOCKING
+#       -> deleting an OAuth client secret does not revoke tokens already minted with
+#          it. The sentence told the operator to stop one step early. Added after this
+#          check FAILED to catch it the first time: sufficiency claims ("complete,"
+#          "all you need," "nothing further") are the same defect as enumeration
+#          claims, and the earlier pattern set only covered the latter.
+#
+# ADDING A PATTERN
+# -----------------
+# Add one only when you can name a real finding it would have caught, and record it
+# above in the same shape: the sentence, the severity/reporter count, and what was
+# actually true. A pattern justified by taste rather than a real finding is how this
+# file grows into a style checker, which it is deliberately not.
+#
+# A line is exempt when a file:line citation appears within 6 lines of it — an
+# enumeration you can check is not the defect this targets.
+#
+# <extended-regex, matched case-insensitively against added lines>
+the only (surface|source|path|way|place|caller|emitter|thing) that
+none of (this|these|the) [a-z]+ (use|uses|carry|carries|are|is)
+in every case
+every case (is|has|carries|behaves)
+either way [a-z]+ (fails|succeeds|works|breaks)
+the same procedure
+not [a-z]+ by any of
+is exhaustive
+cannot occur in production
+# Sufficiency claims: "you are done here." Same defect as an enumeration claim -- it
+# asserts a boundary on required work that the author has not established.
+(is|are) complete on (its|their) own
+(is|are) all (you|that) (need|is needed|it takes)
+nothing (further|else) is (needed|required)
+no further action is (needed|required)
+
+# Absence claims: "the thing you want does not exist." The most dangerous class and
+# the hardest to self-check, because you cannot verify a negative by re-reading what
+# you wrote -- it takes a search for the counterexample, which is exactly the step
+# that gets skipped. One closed finding read "There is no offline recovery path once
+# you are locked out," written with three such paths shipped, two of them documented
+# in the very file being edited. An operator acting on it would have escalated to a
+# rebuild.
+#
+# NOTE THE NARROWNESS. An early draft included a bare `there (is|are) nothing`, which
+# matched rhetorical prose ("an EMPTY secret is left empty: there is nothing to
+# protect") with no business being flagged. Patterns here must name a RECOVERY or
+# ACCESS affordance an operator might go looking for -- that is the claim whose
+# falsity strands someone.
+#
+# NOT IN DESIGN DOCS OR ADRs. In a runbook, "there is no X path" is an OBSERVATION
+# about shipped code, and its falsity strands an operator. In a design doc it is a
+# REQUIREMENT for code that does not exist yet -- the same normative use the header
+# above already exempts for MUST / NEVER / ALWAYS, reached without the word MUST. The
+# exemption is for THIS block only -- an enumeration or a sufficiency claim in a
+# design doc is still descriptive and still checkable, so those keep firing
+# everywhere.
+#!skip-files ^docs/adr/|^docs/adr-|-design(-v[0-9.]+)?\.md$
+there (is|are) no [a-z ]*(path|way|route|option|mechanism|method|means)
+no (offline|manual|alternative|other) (path|way|route|recovery)
+(cannot|can not|can't) be (recovered|restored|undone|reversed)

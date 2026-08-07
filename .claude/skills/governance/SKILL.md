@@ -25,6 +25,7 @@ If no range is provided, default to `dev..HEAD`. Yuzu's main working branch is `
 ## Workflow summary
 
 ```
+Gate 0 — Claim discipline (YOU apply docs/claim-discipline.md; unconditional; halts on any finding)
 Gate 1 — Change Summary (YOU write this from git diff/log)
 Gate 2 — security-guardian + docs-writer           (parallel, mandatory)
 Gate 3 — domain-triggered agents                   (parallel, decision matrix below)
@@ -37,6 +38,14 @@ Gate 8 — re-review gates whose DOMAIN THE FIX TOUCHED, ledger, final decision
 ```
 
 Per CLAUDE.md standing rule 2: a finding BLOCKS when its **derived** band is CRITICAL or HIGH (see the shared preamble below), plus the policy floors listed there. Iterate until the team gives a clean bill. No commit until governance passes.
+
+**Gate 0 does not get its own severity system, ledger record kind, or waiver path.**
+Its findings are ordinary findings — same TRIGGER/IMPACT/EXPOSURE derivation, same
+ledger schema, same BLOCKING rule as every other gate. What is different is WHEN it
+runs (before Gate 1, so a self-inflicted claim defect gets a chance to be fixed
+before seven more gates each separately trip over it) and WHOSE taxonomy names the
+finding (`docs/claim-discipline.md`'s seven rules, not a security/docs/architecture
+domain). See the Gate 0 section below for the exact mechanics.
 
 ---
 
@@ -432,6 +441,114 @@ against a live Postgres rather than reasoning about the SQL.
 READ-ONLY, against disposable state only. Never mutate a live store, and never run a
 destructive statement to raise a finding's standing.
 ```
+
+---
+
+## Gate 0 — Claim Discipline
+
+Runs **unconditionally, every run, before Gate 1** — not routed by changed paths
+like Gate 3, not conditional like Gate 5. Its rules live in exactly one place,
+`docs/claim-discipline.md` (single-home per that document's own rule 1) — this
+section tells you how to apply them inside `/governance`; it does not restate them.
+
+### Why this runs first, and what it actually buys
+
+A defect fix followed by a prose explanation that asserts unverified facts is what
+drives most governance fold rounds: a reviewer checks one of those facts in Gate 2-6,
+finds it wrong, a new round opens, and the correction adds more unverified prose on
+top of the last. Gate 0 catches the same class of defect **before** the other seven
+gates each separately stumble over it — cheaper than Gate 8 discovering it as a
+side-effect finding in gate N of a fold round that need not have happened.
+
+**Do not claim this closes that loop.** It only reaches prose that has already been
+committed to the range under review; a claim made in chat, in a still-unwritten PR
+body, or in a live handoff is outside its scope by construction (see below). That is
+a real gap, not a rounding error, and the honest framing is "durable merge-artifact
+coverage," not "the fix."
+
+### Scope
+
+Apply `docs/claim-discipline.md`'s rules against the commit range under review:
+
+- **Rule 1** (one fact, one home): every fact-asserting sentence the diff **changed
+  or deleted**. This is the one rule that cannot be scoped to added lines — a stale
+  sibling left behind by an edit is, by definition, untouched by the diff. Recover
+  each changed/deleted sentence's pre-change wording and grep it tree-wide per the
+  rule's REVIEW CHECK.
+- **Rules 2 (2a-2f), 5, 6, 7**: every fact-asserting sentence the diff **added**, in
+  docs, code comments, log/error/API strings, and changelog fragments.
+- **Rule 4**: any governance ledger row or issue disposition the diff adds or
+  changes.
+- **Commit messages** in the range, treated as added prose against rules 2/5/6/7.
+
+**Explicitly out of scope, stated so nobody claims coverage this gate does not
+have:** the live session's chat prose, agent handoffs, and the PR body (it does not
+exist yet at Gate 0 time — nothing prevents a later `/adversarial-review` or a
+human reviewer from applying these same rules to it, but Gate 0 itself does not).
+
+### Mechanics
+
+Apply the rules yourself, the same way you write Gate 1's Change Summary — this is a
+self-review pass, not an agent fan-out, so it does not spend the cost it exists to
+avoid. For a diff large enough that a single pass risks silent sampling, split it
+into batches and say so; do not let batch coverage go unstated (an unstated sample
+reads as a sweep, which is exactly the rule 5 defect this gate is built to catch in
+everyone else's prose).
+
+### Severity — the same derivation, not a new one
+
+A Gate 0 finding gets `severity_native` set to the rule that caught it (e.g.
+`claim-rule-2c`, `claim-rule-6`) and derives IMPACT/EXPOSURE/band exactly per the
+shared severity system above — there is no separate claim-discipline severity scale.
+Recurring mappings, for calibration (derive from the actual facts every time; these
+are anchors, not a lookup table):
+
+- a stale-but-plausible fact left after an edit (rule 1), or a claim your diff
+  falsified (rule 2b) → usually **I3**, wrong result presented as correct
+- harmful or inert operator guidance (rules 2d, 6) → **I4**, capped at HIGH per the
+  shared rule
+- a documented route/field/flag that is not actually registered or read (rule 7), or
+  a capability the prose claims is reachable and is not (rule 2c) → **I6** or **I7**
+- a test or check whose prose claims more than it demonstrates (rule 5), **when
+  offered as closure evidence for an otherwise-blocking finding**, is not a derived
+  band at all — it is the existing **false-green policy floor** (see Policy floors
+  above) and gates regardless of band
+- a rule-4 defect in a ledger row or issue disposition is reviewed against the
+  ledger-schema rules already stated in Gate 8 below, not derived fresh
+
+A rule-2 "unverifiable" finding where the underlying fact turns out to be TRUE on
+investigation is not zero — it is `speculative` epistemic status on a finding that
+still derives its band from IMPACT/EXPOSURE, per the shared Absences rule. Do not
+downgrade IMPACT because the claim happened to be true; the defect is that it shipped
+unchecked, not that it shipped wrong.
+
+### The halt
+
+If Gate 0 raises **zero findings**, say so in Gate 1's Change Summary (site count,
+rule set applied, any batching) and proceed straight to Gate 1 — no operator
+interaction. An unstated "0 findings" is indistinguishable from "Gate 0 did not run,"
+which is the same known gap the ledger schema already names for every gate (see
+Gate 8's "known gap, unsolved") — Gate 0 does not close it, it just doesn't make it
+worse by staying silent on the count.
+
+If Gate 0 raises **any** findings, stop before launching Gate 1 and put them to the
+operator: fix each now (then re-run Gate 0 against the fix before proceeding), or
+proceed without fixing.
+
+**"Proceed without fixing" does not waive anything.** It means Gates 1-8 run without
+first stopping to fix the prose issue — nothing more. A finding that derives
+CRITICAL/HIGH, or hits a policy floor, is recorded and **remains gating** under the
+exact same rule Gate 7 already states for every other gate: *"A gating finding is
+never deferred and never dropped... nothing is a waiver and no ledger row makes a
+blocker optional."* It must still be fixed, or rejected/refuted with the standard
+non-author `adjudicated_by` bar, before the final PASS decision. For a finding that
+derives MEDIUM/LOW/INFO, "proceed without fixing" is exactly Gate 7's ordinary
+fold/split/file/park path for a non-blocking finding — nothing Gate-0-specific about
+it.
+
+Record every Gate 0 finding as an ordinary row in the same run ledger, same schema,
+same fields as any Gate 2-6 finding. There is no separate record kind and no new
+`disposition` value for this gate.
 
 ---
 
@@ -1355,6 +1472,12 @@ for whoever owns that runner.
    that agent raised nothing in round 1**.
 
    Concretely, against the **fix diff** (not the original):
+   - **Gate 0** — re-apply `docs/claim-discipline.md` to the fix diff whenever the
+     fix adds, changes, or deletes prose — which is nearly every fix, since a fix is
+     itself new prose (the commit, at minimum, and usually a comment or doc
+     explaining it). This is the gate most likely to be skipped by habit, because it
+     ran once already before Gate 1 and feels "done" — it isn't; the fix diff is a
+     new artifact Gate 0 has not seen.
    - **Gate 3** — re-run the decision matrix, including the routed-concern table.
    - **Gate 2** — `security-guardian` always; `docs-writer` whenever the fix touches
      a doc, a changelog fragment, a user-facing string, or in-code prose.

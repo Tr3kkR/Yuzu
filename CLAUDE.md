@@ -53,7 +53,7 @@ Context is the scarce resource. Keep this thread lean; spend file-reading budget
 
 Specialized agents live in `.claude/agents/` (each declares its role, triggers, reference docs). `workflow-orchestrator` owns the gate sequence; `/governance` is the entry point for the full pipeline on a commit range.
 
-Pipeline (8 gates, convention-enforced): Change Summary + Resource Ledger → security-guardian + docs-writer → domain-triggered (`cpp-expert` + `cpp-safety` on any C++) → happy-path + unhappy-path + consistency-auditor → chaos-injector (skipped if no findings) → compliance-officer + sre + enterprise-readiness → findings addressed → iterate. Use `/governance <range>`, not hand-running - waves 1–4 shipped 4 CRITICAL command-injection vulns without it.
+Pipeline (Gate 0 + 8 gates, convention-enforced): claim discipline (`docs/claim-discipline.md`, unconditional, halts on any finding) → Change Summary + Resource Ledger → security-guardian + docs-writer → domain-triggered (`cpp-expert` + `cpp-safety` on any C++) → happy-path + unhappy-path + consistency-auditor → chaos-injector (skipped if no findings) → compliance-officer + sre + enterprise-readiness → findings addressed → iterate. Use `/governance <range>`, not hand-running - waves 1–4 shipped 4 CRITICAL command-injection vulns without it.
 
 Four standing rules the skill enforces (#2604), all catastrophic-if-violated:
 1. **Routed-concern triggers are UNCONDITIONAL.** Step 0 and Gate 8 must *open* `.claude/routed-concerns.md` and match it row by row against the changed paths - never work from recall. **Diff size never gates a routed concern**: the matrix decides WHICH agents, never WHETHER.

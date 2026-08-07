@@ -15,6 +15,7 @@ Run Yuzu governance as a Codex-native review fanout. This skill may use Codex su
 
 ## Gates
 
+0. Claim discipline: apply `docs/claim-discipline.md` to the commit range, unconditionally, before Gate 1. **Identical to the Claude runner — load the "Gate 0" section of `.claude/skills/governance/SKILL.md` and apply it verbatim; do not restate its scope, severity mapping, or halt mechanics here.** In short: Gate 0 findings derive through the same severity block as every other gate (no separate scale, no separate ledger record kind); on any finding, stop and offer fix-now-and-re-run-Gate-0 vs. proceed-without-fixing; proceeding never waives a CRITICAL/HIGH or policy-floor finding, which still must resolve before the final decision like any other blocking finding. Zero findings gets one line in the Gate 1 output (site count, rule set applied) so a clean pass is distinguishable from a skipped one.
 1. Change Summary: write this locally from `git log`, `git diff --stat`, and targeted diffs.
 2. Mandatory review: launch `security-guardian` and `docs-writer` in parallel.
 3. Domain review: select roles by changed files and launch them in parallel.
@@ -22,7 +23,7 @@ Run Yuzu governance as a Codex-native review fanout. This skill may use Codex su
 5. Chaos analysis: run only if Gate 4 produced unhappy-path or consistency findings.
 6. Operational review: launch `compliance-officer`, `sre`, and `enterprise-readiness` in parallel.
 7. Findings resolution: consolidate findings and fix blocking items.
-8. Iteration and ledger: re-run affected gates, record deferrals, and make the blocking decision.
+8. Iteration and ledger: re-run affected gates (including Gate 0, whenever the fix diff touches prose — which is nearly every fix), record deferrals, and make the blocking decision.
 
 Blocking contract: **identical to the Claude runner — load it, do not restate it.** Read the "Shared preamble" severity block in `.claude/skills/governance/SKILL.md` and apply it verbatim: severity is DERIVED from TRIGGER + IMPACT (`I1`-`I9`) + EXPOSURE (all applicable `E0`-`E6`, including `E0` = no actor required; strongest raise first, then any cap — `E6` applies last and dominates) + EPISTEMIC STATUS, `BLOCKING` = a derived band of CRITICAL or HIGH, and the policy floors gate independently of the derivation. MEDIUM/SHOULD findings need either a fix or an explicit deferral with an issue.
 
