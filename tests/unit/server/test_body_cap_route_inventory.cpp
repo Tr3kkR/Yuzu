@@ -17,27 +17,34 @@
  * ROUTE TABLE — this file — can catch that.
  *
  * MECHANISM — no hand-copied route list. A hand-copied list goes stale
- * exactly like the thing it's testing. This test opens every `*.cpp` file
- * under `server/core/src` (recursively, via `YUZU_SERVER_SRC_DIR`, injected
- * by tests/meson.build from `meson.project_source_root()`) AT TEST RUN TIME
- * and regex-scans the raw source text for every:
- *   - `sink.Post(...)` / `sink.Put(...)` / `sink.Patch(...)` — the
- *     `HttpRouteSink` seam (http_route_sink.hpp) that most route owners now
- *     register through, OR
- *   - `svr.Post(...)` / `svr.Put(...)` / `svr.Patch(...)` — the small set of
- *     route owners not yet migrated onto that seam (as of this writing:
- *     compliance_routes.cpp, deployment_routes.cpp, discovery_routes.cpp,
- *     mcp_server.cpp, notification_routes.cpp, preflight_routes.cpp,
- *     webhook_routes.cpp — verified: `HttpRouteSink&` is the sole receiver
- *     parameter name used across every OTHER route file's register_routes()).
- * A route added anywhere — a new file, or a new call in an existing file —
- * is picked up automatically on the next test run. Nothing here needs
- * updating when a route is ADDED; something here needs updating only when a
- * route's RESOLVED CLASS is new and needs a considered decision (see
- * `kDefaultIsCorrectFor` below).
+ * exactly like the thing it's testing. This test opens every `*.cpp` AND
+ * `*.inc` file under `server/core/src` (recursively, via
+ * `YUZU_SERVER_SRC_DIR`, injected by tests/meson.build from
+ * `meson.project_source_root()`) AT TEST RUN TIME and regex-scans the raw
+ * source text for every `Post`/`Put`/`Patch`/`Delete` call on one of THREE
+ * receiver spellings actually used in this codebase (verified against the
+ * full source tree, not recalled):
+ *   - `sink.Post(...)` / `sink.Put(...)` / ... — the `HttpRouteSink` seam
+ *     (http_route_sink.hpp) that most route owners now register through;
+ *   - `svr.Post(...)` / `svr.Put(...)` / ... — the small set of route
+ *     owners not yet migrated onto that seam; or
+ *   - `web_server_->Post(...)` / `web_server_->Put(...)` / ... — routes
+ *     registered directly on the underlying `httplib::Server` member
+ *     (server.cpp itself, plus any `.inc` file it textually `#include`s).
+ *     A prior version of this scan matched only `sink.`/`svr.` and missed
+ *     this receiver ENTIRELY — 39 of 176 POST/PUT/PATCH registrations (22%)
+ *     were invisible to it, concentrated in server.cpp, the very file a
+ *     route-inventory guard most needs to see. Do not narrow this back to
+ *     two receivers without re-measuring that count is still zero.
+ * A route added anywhere — a new file, a new `.inc`, or a new call on any of
+ * the three receivers in an existing file — is picked up automatically on
+ * the next test run. Nothing here needs updating when a route is ADDED;
+ * something here needs updating only when a route's RESOLVED CLASS is new
+ * and needs a considered decision (see `kDefaultIsCorrectFor` below).
  *
  * REGENERATING: nothing to regenerate by hand — the scan runs fresh every
- * test invocation. If you add a route and this test fails, it is telling
+ * test invocation (see the CACHING note below for what "fresh" actually
+ * means per process). If you add a route and this test fails, it is telling
  * you the route resolves to the catch-all default and has not yet had a
  * decision recorded for it. Fix it one of two ways:
  *   (a) it genuinely needs its own cap — add an entry to `kBodyCapTable` in
@@ -66,12 +73,36 @@
  * none in `kBodyCapTable` today, but nothing stops one being added) would be
  * missed by a naive prefix-only probe.
  *
- * SCOPE. DELETE and GET registrations carry no meaningful pre-auth body
- * surface in this codebase and are out of the brief's ask, except for the
- * best-effort "GET reads req.body" shape-trap check below — a substring
+ * SCOPE. GET registrations carry no meaningful pre-auth body surface in
+ * this codebase and stay out of the main inventory check, covered only by
+ * the best-effort "GET reads req.body" shape-trap check below — a substring
  * heuristic over the handler's approximate source span, not a real parse.
  * It found zero hits when this file was written; a hit is a signal to go
- * read the route by hand, not an automatic verdict.
+ * read the route by hand, not an automatic verdict. DELETE is IN scope
+ * (unlike an earlier version of this comment claimed): `resolve_body_cap`'s
+ * catch-all default entry is `kBodyCapAnyMethod`-scoped, so it already caps
+ * every DELETE registration at 4 MiB whether or not this test extracts
+ * them — and at least one DELETE handler parses `req.body`
+ * (`rest_api_v1.cpp`'s `DELETE /api/v1/management-groups/{id}/roles`,
+ * `req.body` read at line 2112, and `DELETE /api/v1/engine-principals/{id}`
+ * reads an optional `superseded_by` field). A route-inventory guard that
+ * cannot see DELETE registrations cannot confirm either of those bodies
+ * stays within the default it silently inherits, so DELETE is extracted
+ * and checked exactly like POST/PUT/PATCH below.
+ *
+ * CACHING. The file corpus (`read_all_cpp_files`) and the extracted
+ * mutating-route list (`discover_mutating_routes`) are each memoized behind
+ * a function-local `static const`, computed once per test PROCESS rather
+ * than once per `TEST_CASE` — this file has four `TEST_CASE`s and three of
+ * them call `discover_mutating_routes()`, so the un-cached scan (a full
+ * `std::regex` pass over every server source file) used to run 3-4x per
+ * process for no reason: measured 8.2-8.5 s wall on Linux at `-O2` before
+ * caching (worse under MSVC's slower `std::regex`, and worse again as the
+ * source tree grows — this cost is O(tree size) and was unbounded). Both
+ * caches assume every call in this TU passes the same `YUZU_SERVER_SRC_DIR`
+ * directory, which is true today (there is exactly one call site for each
+ * with a hard-coded argument) — do not reuse either helper with a different
+ * directory without splitting the cache key.
  */
 
 #include "body_cap_policy.hpp"
@@ -110,45 +141,79 @@ struct RegisteredRoute {
     std::string raw_path; // exactly as it appears in source — may be an httplib regex pattern
 };
 
-/// Read every `.cpp` file under `dir` (recursively — server/core/src has a
-/// `pg/` subdirectory today; nothing forbids a route file landing under a
-/// future one) and return `{basename, contents}` pairs.
+/// Read every `.cpp` AND `.inc` file under `dir` (recursively — server/core/src
+/// has a `pg/` subdirectory today; nothing forbids a route file landing
+/// under a future one) and return `{basename, contents}` pairs. `.inc` is
+/// scanned alongside `.cpp` because a route registration living in a
+/// textually-`#include`d fragment (as of this writing: two dead/orphaned
+/// files, `deployment_discovery_routes.inc` and `directory_patch_routes.inc`
+/// — both superseded by discovery_routes.cpp per that file's own header
+/// comment, and neither is `#include`d or listed in meson.build today) is
+/// still source text this scan must not silently skip; a `.inc` file that
+/// IS live in a future refactor must not regress this guard back to
+/// invisible. No other extension under server/core/src carries a route
+/// registration (verified: `.cpp`/`.hpp`/`.inc` are the only three
+/// extensions present, and no `.hpp` matches the route-registration regex).
+///
+/// Memoized (see the file header's CACHING note) — computed once per test
+/// process, on the assumption every call site in this TU passes the same
+/// `dir`.
 std::vector<std::pair<std::string, std::string>> read_all_cpp_files(const fs::path& dir) {
-    std::vector<std::pair<std::string, std::string>> out;
-    for (const auto& entry : fs::recursive_directory_iterator(dir)) {
-        if (!entry.is_regular_file())
-            continue;
-        if (entry.path().extension() != ".cpp")
-            continue;
-        std::ifstream in(entry.path(), std::ios::binary);
-        REQUIRE(in.is_open());
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        out.emplace_back(entry.path().filename().string(), ss.str());
-    }
-    return out;
+    static const std::vector<std::pair<std::string, std::string>> cached = [&dir] {
+        // F7: fs::recursive_directory_iterator throws filesystem_error on a
+        // missing directory, which would otherwise surface as an opaque
+        // Catch2 "unexpected exception" abort before the REQUIRE_FALSE
+        // below ever runs — fail with an actionable message instead.
+        REQUIRE(fs::is_directory(dir));
+
+        std::vector<std::pair<std::string, std::string>> out;
+        for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+            if (!entry.is_regular_file())
+                continue;
+            const auto ext = entry.path().extension();
+            if (ext != ".cpp" && ext != ".inc")
+                continue;
+            std::ifstream in(entry.path(), std::ios::binary);
+            REQUIRE(in.is_open());
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            out.emplace_back(entry.path().filename().string(), ss.str());
+        }
+        return out;
+    }();
+    return cached;
 }
 
-/// Extract every body-bearing route registration (`sink.`/`svr.` receiver,
-/// Post/Put/Patch method) from one file's raw source text. Matches either a
-/// plain `"..."` string literal or an `R"(...)"` raw string literal as the
-/// first argument — the path/pattern is always a literal in this codebase
-/// (never a computed std::string), which is exactly the assumption a
-/// `REQUIRE(routes.size() > 50)` sanity floor below exists to catch if it
-/// ever stops being true.
+/// Extract every body-bearing route registration (`sink.`/`svr.`/
+/// `web_server_->` receiver — see the file header's MECHANISM note —
+/// Post/Put/Patch/Delete method) from one file's raw source text. Matches
+/// either a plain `"..."` string literal or an `R"(...)"` raw string
+/// literal as the first argument — the path/pattern is always a literal in
+/// this codebase (never a computed std::string), which is exactly the
+/// assumption the sanity floor in `discover_mutating_routes` exists to
+/// catch if it ever stops being true.
 std::vector<RegisteredRoute> extract_routes(const std::string& file, const std::string& text) {
     std::vector<RegisteredRoute> out;
-    // Group 1: receiver (sink|svr). Group 2: method. Group 3: raw-string
-    // body (R"(...)"). Group 4: quoted-string body ("...", escapes intact).
+    // The receiver alternation is non-capturing — `sink.`/`svr.` use `.`,
+    // `web_server_` uses `->`, and neither spelling's IDENTITY is needed by
+    // any caller, only which method/path it registered. Group 1: method.
+    // Group 2: raw-string body (R"(...)"). Group 3: quoted-string body
+    // ("...", escapes intact). A leading `\b` on each receiver alternative
+    // keeps this from matching a CLIENT-side call sharing a method name on
+    // an unrelated receiver (`cli.Post(...)`/`client.Post(...)` in
+    // analytics_sinks.cpp/directory_sync.cpp/offload_target_store.cpp/
+    // webhook_store.cpp — verified excluded: neither "cli" nor "client" ends
+    // in "sink"/"svr", and "web_server_->" requires the literal receiver
+    // name, not just any `->Post(`).
     static const std::regex re(
-        R"regex(\b(sink|svr)\.(Post|Put|Patch)\(\s*(?:R"\(([\s\S]*?)\)"|"((?:[^"\\]|\\.)*)"))regex");
+        R"regex((?:\b(?:sink|svr)\.|\bweb_server_->)(Post|Put|Patch|Delete)\(\s*(?:R"\(([\s\S]*?)\)"|"((?:[^"\\]|\\.)*)"))regex");
     for (auto it = std::sregex_iterator(text.begin(), text.end(), re); it != std::sregex_iterator();
          ++it) {
         const auto& m = *it;
-        std::string method = m[2].str();
+        std::string method = m[1].str();
         std::transform(method.begin(), method.end(), method.begin(),
                         [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-        std::string path = m[3].matched ? m[3].str() : m[4].str();
+        std::string path = m[2].matched ? m[2].str() : m[3].str();
         int line =
             static_cast<int>(std::count(text.begin(), text.begin() + m.position(0), '\n')) + 1;
         out.push_back({file, line, std::move(method), std::move(path)});
@@ -165,26 +230,37 @@ std::string probe_path(const std::string& raw_path) {
     return std::regex_replace(raw_path, group_re, "X");
 }
 
-/// Scan every `.cpp` under `YUZU_SERVER_SRC_DIR` and return every
-/// POST/PUT/PATCH route registration found. Shared by every TEST_CASE below
-/// so the extraction logic — and its sanity floor — lives in exactly one
-/// place.
+/// Scan every `.cpp`/`.inc` under `YUZU_SERVER_SRC_DIR` and return every
+/// POST/PUT/PATCH/DELETE route registration found. Shared by every
+/// TEST_CASE below so the extraction logic — and its sanity floor — lives
+/// in exactly one place. Memoized (see the file header's CACHING note).
 std::vector<RegisteredRoute> discover_mutating_routes() {
-    auto files = read_all_cpp_files(fs::path(YUZU_SERVER_SRC_DIR));
-    REQUIRE_FALSE(files.empty());
+    static const std::vector<RegisteredRoute> cached = [] {
+        auto files = read_all_cpp_files(fs::path(YUZU_SERVER_SRC_DIR));
+        REQUIRE_FALSE(files.empty());
 
-    std::vector<RegisteredRoute> routes;
-    for (const auto& [file, text] : files) {
-        auto found = extract_routes(file, text);
-        routes.insert(routes.end(), found.begin(), found.end());
-    }
-    // Sanity floor: this repo has O(100) mutating route registrations today.
-    // A near-zero count means the SCAN is broken (wrong directory, or the
-    // receiver-naming convention drifted from "sink"/"svr"), not that the
-    // route surface shrank to nothing — fail loud rather than pass
-    // vacuously on an empty inventory.
-    REQUIRE(routes.size() > 50);
-    return routes;
+        std::vector<RegisteredRoute> routes;
+        for (const auto& [file, text] : files) {
+            auto found = extract_routes(file, text);
+            routes.insert(routes.end(), found.begin(), found.end());
+        }
+        // Sanity floor: this repo has 215 mutating route registrations as
+        // measured against server/core/src at the time this floor was set
+        // (137 pre-existing sink./svr. POST/PUT/PATCH + 39 web_server_->
+        // POST/PUT/PATCH the F1 receiver fix newly sees + 39 DELETE the F3
+        // method-widening newly sees, across both receiver families). Set
+        // to 200 — comfortably above ordinary churn (a handful of routes
+        // added/removed/renamed between runs) but close enough to 215 that
+        // losing a whole receiver family or method again (as this scan
+        // previously did, silently, for 22% of the surface) still trips it.
+        // A near-zero count means the SCAN is broken (wrong directory, or a
+        // receiver/method spelling drifted), not that the route surface
+        // shrank to nothing — fail loud rather than pass vacuously on an
+        // empty or badly-undercounted inventory.
+        REQUIRE(routes.size() >= 200);
+        return routes;
+    }();
+    return cached;
 }
 
 /// `{method, EXACT raw registered path text (as it appears in source —
@@ -219,8 +295,9 @@ constexpr DefaultAllow kDefaultIsCorrectFor[] = {
     {"POST", R"body_cap_path(/api/v1/elevate)body_cap_path", "Auth flow control body: small JSON credential/token/session payload (login, MFA challenge, session revoke); no bulk content."},
     {"POST", R"body_cap_path(/api/v1/elevate/revoke)body_cap_path", "Auth flow control body: small JSON credential/token/session payload (login, MFA challenge, session revoke); no bulk content."},
 
-    // ca_routes.cpp (2)
-    {"POST", R"body_cap_path(/api/v1/ca/revoke)body_cap_path", "Revoke request: serial-scoped small JSON body, no certificate material (import carries its own dedicated ca_import_chain* entries)."},
+    // ca_routes.cpp (1) -- the /api/v1/ twin now has its own ca_revoke
+    // kBodyCapTable entry (governance fix round, C4); only the dashboard
+    // variant still resolves to the catch-all default.
     {"POST", R"body_cap_path(/api/settings/ca/revoke)body_cap_path", "Revoke request: serial-scoped small JSON body, no certificate material (import carries its own dedicated ca_import_chain* entries)."},
 
     // compliance_routes.cpp (8)
@@ -262,9 +339,9 @@ constexpr DefaultAllow kDefaultIsCorrectFor[] = {
     {"POST", R"body_cap_path(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/delete)body_cap_path", "Guardian dashboard HTMX fragment: small form/JSON body (guard/baseline id + toggle) -- distinct from the REST /api/v1/guaranteed-state/rules authoring route, which already has its own guardian_rule_authoring entry."},
     {"POST", R"body_cap_path(/fragments/guardian/baseline/([A-Za-z0-9._\-]+))body_cap_path", "Guardian dashboard HTMX fragment: small form/JSON body (guard/baseline id + toggle) -- distinct from the REST /api/v1/guaranteed-state/rules authoring route, which already has its own guardian_rule_authoring entry."},
 
-    // kek_routes.cpp (2)
-    {"POST", R"body_cap_path(/api/v1/secrets/kek/rotate)body_cap_path", "KEK rotate/rewrap control trigger: small JSON body; the KEK material itself is never client-supplied on this route."},
-    {"POST", R"body_cap_path(/api/v1/secrets/kek/rewrap)body_cap_path", "KEK rotate/rewrap control trigger: small JSON body; the KEK material itself is never client-supplied on this route."},
+    // kek_routes.cpp (0) -- both /rotate and /rewrap are now covered by the
+    // shared kek_ops kBodyCapTable entry on the /api/v1/secrets/kek/ prefix
+    // (governance fix round, C4), so neither takes the catch-all default.
 
     // notification_routes.cpp (2)
     {"POST", R"body_cap_path(/api/notifications/(\d+)/read)body_cap_path", "Notification read/dismiss toggle: no meaningful body content."},
@@ -313,7 +390,6 @@ constexpr DefaultAllow kDefaultIsCorrectFor[] = {
     {"POST", R"body_cap_path(/api/v1/software-deployments/([a-f0-9]+)/cancel)body_cap_path", "REST management/config JSON body: ids, flags, small structured payloads (management groups, engine principals, tokens, tags, access reviews, inventory queries, result-set derivation, device tokens, software packages/deployments, license, guaranteed-state push, DEX live-snapshot trigger)."},
     {"POST", R"body_cap_path(/api/v1/license)body_cap_path", "REST management/config JSON body: ids, flags, small structured payloads (management groups, engine principals, tokens, tags, access reviews, inventory queries, result-set derivation, device tokens, software packages/deployments, license, guaranteed-state push, DEX live-snapshot trigger)."},
     {"POST", R"body_cap_path(/api/v1/file-retrieval)body_cap_path", "Metadata-only today: the handler parses agent_id/original_path/sha256/size JSON fields and never writes raw file bytes (rest_api_v1.cpp:7643-7672) -- revisit this entry if/when it starts accepting the actual retrieved file content."},
-    {"PUT", R"body_cap_path(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))body_cap_path", R"reason(Documented in body_cap_policy.hpp's own guardian_rule_authoring comment: that entry is deliberately scoped to POST only -- "the sibling regex PUT update route at :7904 falls through to the catch-all default until it gets its own reviewed entry.")reason"},
     {"POST", R"body_cap_path(/api/v1/guaranteed-state/push)body_cap_path", "REST management/config JSON body: ids, flags, small structured payloads (management groups, engine principals, tokens, tags, access reviews, inventory queries, result-set derivation, device tokens, software packages/deployments, license, guaranteed-state push, DEX live-snapshot trigger)."},
     {"POST", R"body_cap_path(/api/v1/dex/devices/([^/]+)/live)body_cap_path", "REST management/config JSON body: ids, flags, small structured payloads (management groups, engine principals, tokens, tags, access reviews, inventory queries, result-set derivation, device tokens, software packages/deployments, license, guaranteed-state push, DEX live-snapshot trigger)."},
 
@@ -359,6 +435,84 @@ constexpr DefaultAllow kDefaultIsCorrectFor[] = {
     // own workflow_yaml/product_pack_yaml kBodyCapTable entries.
     {"POST", R"body_cap_path(/api/scope/estimate)body_cap_path", "Trigger body: small JSON (scope estimate params) -- not a YAML-authoring route."},
     {"POST", R"body_cap_path(/api/instructions/([^/]+)/execute)body_cap_path", "Trigger body: small JSON (instruction execution args) -- not a YAML-authoring route."},
+
+    // ── Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up,
+    // 2026-08-07): 68 routes went from invisible to this scan to resolving
+    // to the catch-all default. 62 are recorded here as a deliberate,
+    // reviewed default-is-correct choice (mostly server.cpp's web_server_->
+    // receiver: single-id-segment DELETEs with no body, and small
+    // JSON/form control bodies of the same shape already recorded above
+    // for the sink./svr. routes). The remaining 6 are deliberately NOT
+    // recorded here -- they plausibly need their own kBodyCapTable entry
+    // (large/aggregate content: a multi-definition import bundle, three
+    // single-YAML-authoring routes whose direct peers /api/workflows and
+    // /api/product-packs already got 16 MiB, a whole-dataset JSON-to-CSV
+    // export, and an inventory-array match endpoint) -- see the change
+    // report for the full list; that decision belongs to whoever owns
+    // body_cap_policy.hpp, not this allowlist. This test is EXPECTED to
+    // fail by name for those 6 until they get a real entry there. ──
+    {"DELETE", R"body_cap_path(/api/agents/([^/]+)/properties/([a-zA-Z0-9_.:-]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/deployment-jobs/([a-f0-9]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/instruction-sets/([^/]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/instructions/([^/]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/policies/([^/]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/policy-fragments/([^/]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/product-packs/([^/]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/schedules/([^/]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/settings/api-tokens/(.+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/settings/auto-approve/(\d+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/settings/enrollment-tokens/(.+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/settings/management-groups/([a-f0-9]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/settings/pending-agents/(.+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/settings/updates/([^/]+)/([^/]+)/([^/]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/settings/users/(.+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/v1/device-tokens/([a-f0-9]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/v1/engine-principals/([^/]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: DELETE /api/v1/engine-principals/{id} reads one optional 'superseded_by' string field (rest_api_v1.cpp:2922) -- small, well under the 4 MiB default."},
+    {"DELETE", R"body_cap_path(/api/v1/engine-principals/([a-z0-9._-]+)/roles/([^/]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/v1/license/([a-f0-9]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/v1/management-groups/([a-f0-9]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/v1/management-groups/([a-f0-9]+)/members/(.+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/v1/management-groups/([a-f0-9]+)/roles)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: DELETE /api/v1/management-groups/{id}/roles reads a small JSON body (principal_type/principal_id/role_name -- rest_api_v1.cpp:2112), same shape as its sibling POST .../roles entry above."},
+    {"DELETE", R"body_cap_path(/api/v1/offload-targets/(\d+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/v1/quarantine/(.+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/v1/result-sets/(rs_[0-9a-f]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/v1/sessions)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/v1/sessions/me)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/v1/sle/agents/([^/]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/v1/tags/([^/]+)/([^/]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/v1/tokens/(.+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/webhooks/(\d+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/api/workflows/([^/]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/scim/v2/Groups/([0-9a-fA-F]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"DELETE", R"body_cap_path(/scim/v2/Users/([0-9a-fA-F]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up): DELETE by id/path-segment. Mechanically verified (grep for req.body across the handler's source span) the handler never reads a request body -- matches this file's own header SCOPE note for DELETE registrations."},
+    {"POST", R"body_cap_path(/api/approvals/([^/]+)/approve)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: approval decision -- a single 'comment' string field."},
+    {"POST", R"body_cap_path(/api/approvals/([^/]+)/reject)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: approval decision -- a single 'comment' string field."},
+    {"POST", R"body_cap_path(/api/chargen/start)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: forwarded legacy command trigger (forward_legacy_command) -- small JSON body, same shape as the dashboard/settings trigger routes above."},
+    {"POST", R"body_cap_path(/api/chargen/stop)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: forwarded legacy command trigger (forward_legacy_command) -- small JSON body, same shape as the dashboard/settings trigger routes above."},
+    {"POST", R"body_cap_path(/api/command)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: generic command dispatch -- plugin/action identifiers (128-byte bound, validated) plus an agent_ids array; bounded well under 4 MiB even for a full-fleet target list, and fan-out is confined separately via dispatch_confined_arms."},
+    {"POST", R"body_cap_path(/api/executions/([^/]+)/cancel)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: execution id from the URL only -- no meaningful body."},
+    {"POST", R"body_cap_path(/api/executions/([^/]+)/rerun)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: a single 'scope' string field ('failed_only' or empty)."},
+    {"POST", R"body_cap_path(/api/instruction-sets)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: InstructionSet JSON body -- name + description only."},
+    {"POST", R"body_cap_path(/api/instructions)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: single InstructionDefinition JSON body (id/name/version/type/plugin/action/description + a handful of flags) -- not the bulk-import route (see the report accompanying this change for /api/instructions/import, which is NOT in this allowlist)."},
+    {"POST", R"body_cap_path(/api/inventory/query)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: small JSON filter body (agent_id/plugin/since/until/limit) -- same shape as the already-recorded /api/v1/inventory/query entry above."},
+    {"POST", R"body_cap_path(/api/nvd/sync)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: trigger-only, no body read (background NVD sync request)."},
+    {"POST", R"body_cap_path(/api/procfetch/fetch)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: forwarded legacy command trigger (forward_legacy_command) -- small JSON body, same shape as the dashboard/settings trigger routes above."},
+    {"POST", R"body_cap_path(/api/property-schemas)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: CustomPropertySchema JSON body (key/display_name/type/description/validation_regex) -- small structured fields."},
+    {"POST", R"body_cap_path(/api/schedules)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: Schedule JSON body (cron expression, scope, instruction reference) -- small structured payload; dispatch at execute time is a separate, already-gated surface."},
+    {"POST", R"body_cap_path(/api/schedules/([^/]+)/enable)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: schedule id from the URL only -- no meaningful body."},
+    {"POST", R"body_cap_path(/api/scope/validate)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: single scope-expression string JSON body."},
+    {"POST", R"body_cap_path(/api/tags/delete)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: single agent_id/key tag operation -- small JSON body."},
+    {"POST", R"body_cap_path(/api/tags/query)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: single key/value tag lookup -- small JSON body."},
+    {"POST", R"body_cap_path(/api/tags/set)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: single agent_id/key/value tag operation -- small JSON body."},
+    {"POST", R"body_cap_path(/fragments/result-sets/(rs_[0-9a-f]+)/delete)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: result-set id from the URL only -- handler never reads req.body."},
+    {"POST", R"body_cap_path(/fragments/result-sets/(rs_[0-9a-f]+)/pin)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: result-set id from the URL only -- handler never reads req.body."},
+    {"POST", R"body_cap_path(/fragments/result-sets/(rs_[0-9a-f]+)/unpin)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: result-set id from the URL only -- handler never reads req.body."},
+    {"POST", R"body_cap_path(/fragments/result-sets/create)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: dashboard CSV-paste-of-device-IDs form field -- bounded by ResultSetStore's own kMaxMembersPerSet member cap (create_materialized), not by this pre-routing gate."},
+    {"PUT", R"body_cap_path(/api/agents/([^/]+)/properties/([a-zA-Z0-9_.:-]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: single custom-property value JSON body ({\"value\":..., \"type\":...})."},
+    {"PUT", R"body_cap_path(/api/config/([a-z_]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: single runtime-config scalar value JSON body ({\"value\":...})."},
+    {"PUT", R"body_cap_path(/api/instructions/([^/]+))body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: same single-InstructionDefinition JSON body shape as the sibling POST /api/instructions entry above (partial-update variant)."},
 };
 // clang-format on
 
@@ -431,16 +585,26 @@ TEST_CASE("body-cap route inventory: kDefaultIsCorrectFor has no stale entries",
 
 // ── 3. The documented same-prefix/different-method shape trap ────────────
 
-TEST_CASE("body-cap route inventory: same literal prefix, different method, "
-          "different deliberate outcome",
+TEST_CASE("body-cap route inventory: create and edit of one resource resolve "
+          "to the same class",
           "[body_cap][inventory]") {
-    // The architect-named trap, and the exact motivating case from
-    // body_cap_policy.hpp's own header: rest_api_v1.cpp:7759's POST
-    // /api/v1/guaranteed-state/rules (its own guardian_rule_authoring
-    // entry) versus :7904's regex PUT on a path sharing that same literal
-    // prefix (documented-deliberate default). Read from the MECHANICAL
-    // inventory, not hand-picked, so this stays true if either registration
-    // moves.
+    // CREATE/EDIT PARITY. rest_api_v1.cpp:7759's POST
+    // /api/v1/guaranteed-state/rules and :7904's regex PUT on a path sharing
+    // that literal prefix must resolve to the SAME class, or an operator can
+    // author a rule they are then permanently unable to edit: the POST admits
+    // 16 MiB, and if the PUT falls to the 4 MiB catch-all every rule between
+    // those two sizes is create-once, edit-never.
+    //
+    // This case previously asserted the OPPOSITE — that the two deliberately
+    // resolved to different classes — citing body_cap_policy.hpp's own comment
+    // that the PUT "falls through to the catch-all default until it gets its
+    // own reviewed entry". That comment described a PENDING gap; the test
+    // froze it as intent. Governance found the wedge, the PUT got its reviewed
+    // entry, and the assertion inverted. Kept as a regression guard so removing
+    // the PUT entry re-breaks loudly rather than silently.
+    //
+    // Read from the MECHANICAL inventory, not hand-picked, so this stays true
+    // if either registration moves.
     const auto routes = discover_mutating_routes();
 
     auto find = [&](std::string_view method, std::string_view raw_path) -> const RegisteredRoute* {
@@ -460,12 +624,14 @@ TEST_CASE("body-cap route inventory: same literal prefix, different method, "
     const auto put_class =
         resolve_body_cap("PUT", probe_path(put_rules->raw_path)).path_class;
     CHECK(post_class == "guardian_rule_authoring");
-    CHECK(put_class == "default");
-    CHECK(post_class != put_class); // the actual trap: NOT sharing a class despite sharing a prefix
+    CHECK(put_class == "guardian_rule_authoring");
+    // The invariant: whatever class create resolves to, edit resolves to the
+    // same one. Asserted as an equality rather than against a literal so it
+    // still holds if the class is ever renamed or re-sized.
+    CHECK(post_class == put_class);
 
-    // SCIM: all three of POST/PUT/PATCH on the shared "/scim/v2/" prefix DO
-    // deliberately share one class (unlike the guaranteed-state case) — the
-    // inventory should reflect that too, not just the "different" case.
+    // SCIM: all three of POST/PUT/PATCH on the shared "/scim/v2/" prefix also
+    // share one class — the inventory should reflect that too.
     const auto* scim_post = find("POST", "/scim/v2/Users");
     const auto* scim_put = find("PUT", R"(/scim/v2/Users/([0-9a-fA-F]+))");
     const auto* scim_patch = find("PATCH", R"(/scim/v2/Users/([0-9a-fA-F]+))");

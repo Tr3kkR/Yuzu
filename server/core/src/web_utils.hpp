@@ -527,8 +527,40 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
     return is_mcp_path(path) && content_length > cap;
 }
 
-/// True when an MCP request carries a body this server cannot size before
-/// reading it, and must therefore refuse (411) rather than admit.
+/// True when `content_encoding` is present and is anything other than
+/// `identity` (case-insensitive value match, matching how every library that
+/// reads the header compares it, including httplib's own). This build
+/// compiles with `CPPHTTPLIB_BROTLI_SUPPORT`, and httplib transparently
+/// decompresses and then enforces only its GLOBAL limit on the DECOMPRESSED
+/// size — so a sub-cap compressed body can expand to ~100 MB before anything
+/// downstream sees it. `Content-Length` measures the compressed bytes and is
+/// therefore not a bound on what gets buffered. Split out from
+/// `body_unmeasurable` below (#2407-D4) because a non-identity encoding is
+/// refused unconditionally on EVERY route class, unlike chunked/undeclared
+/// framing, which is refused only for a class that opts into
+/// `requires_measurable`.
+[[nodiscard]] inline bool
+has_non_identity_content_encoding(std::string_view content_encoding) noexcept {
+    if (content_encoding.empty())
+        return false;
+    const bool identity =
+        content_encoding.size() == 8 &&
+        std::equal(content_encoding.begin(), content_encoding.end(), "identity",
+                   [](char a, char b) {
+                       return (a | 0x20) == (b | 0x20);
+                   });
+    return !identity;
+}
+
+/// True when a request body's SIZE cannot be measured before reading it:
+/// chunked (or any other non-empty) `Transfer-Encoding`, or a POST/PUT/PATCH
+/// with no declared `Content-Length`. `Content-Encoding` is judged separately
+/// by `has_non_identity_content_encoding` above — a caller deciding whether
+/// to refuse an MCP body historically OR'd the two together (see
+/// `mcp_body_unmeasurable` below); #2407-D4 needs to apply the encoding rule
+/// to every class unconditionally while keeping this framing rule scoped to
+/// classes that opt into `requires_measurable`, so the two are no longer one
+/// predicate.
 ///
 /// THE DESIGN RULE, learned the hard way: do NOT re-implement httplib's
 /// header parsing and hope the two agree. The first attempt tested
@@ -538,67 +570,55 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
 /// then read as chunked, bounded only by the 100 MB global default. One
 /// capital letter defeated the whole cap. The substring test was also wrong in
 /// the other direction: httplib compares the value for EQUALITY, so
-/// `identity, chunked` is not chunked to httplib while `find` matched it.
+/// `identity, chunked` is not chunked to httplib while `find` matched it. So
+/// this refuses ANY non-empty `Transfer-Encoding`, on ANY method — not just
+/// chunked and not just POST/PUT/PATCH, since httplib's `expect_content`
+/// treats chunking independently of the method, so a chunked
+/// GET/DELETE/OPTIONS reaches the same reader.
 ///
-/// So the rule is now "refuse anything whose framing or encoding we are not
-/// the sole interpreter of", which needs no agreement with the library:
-///
-///   * ANY non-empty `Transfer-Encoding`, on ANY method. Not just chunked and
-///     not just POST/PUT/PATCH — httplib's `expect_content` treats chunking
-///     independently of the method, so a chunked GET/DELETE/OPTIONS reaches
-///     the same reader.
-///   * ANY `Content-Encoding` other than `identity`. This build compiles with
-///     `CPPHTTPLIB_BROTLI_SUPPORT`, and httplib transparently decompresses and
-///     then enforces only its GLOBAL limit on the decompressed size — so a
-///     sub-cap compressed body expands to ~100 MB before the JSON parser sees
-///     it. `Content-Length` measures the compressed bytes and is therefore not
-///     a bound on what gets buffered.
-///   * a POST/PUT/PATCH with no `Content-Length` — `expect_content` is true for
-///     those regardless, so httplib reads to EOF.
-///
-/// DELETE is DELIBERATELY EXCLUDED from that last rule, and the reasoning is
-/// worth keeping because two reviewers disagreed on it. `expect_content`
-/// (httplib.h:8330) is true for DELETE too, so a DELETE carrying an UNDECLARED
-/// body is admitted here — today harmlessly, because with
-/// `CPPHTTPLIB_SSL_ENABLED` that path returns without reading, which is an
-/// accidental dependency on a build flag rather than a bound. Closing it by
-/// requiring `Content-Length` on DELETE would break MCP session teardown:
+/// DELETE is DELIBERATELY EXCLUDED from the no-`Content-Length` rule, and the
+/// reasoning is worth keeping because two reviewers disagreed on it.
+/// `expect_content` (httplib.h:8330) is true for DELETE too, so a DELETE
+/// carrying an UNDECLARED body is admitted here — today harmlessly, because
+/// with `CPPHTTPLIB_SSL_ENABLED` that path returns without reading, which is
+/// an accidental dependency on a build flag rather than a bound. Closing it
+/// by requiring `Content-Length` on DELETE would break MCP session teardown:
 /// `DELETE /mcp/v1/` carries no body and many clients (cpp-httplib's own
 /// included) omit `Content-Length: 0` entirely. A live compatibility break on
 /// a shipped route is the worse trade against a hazard that is presently
 /// unreachable and bounded at 100 MB if it were not. Tracked as a follow-up;
-/// a DELETE that carries actual framing (Transfer-Encoding / Content-Encoding)
-/// IS refused by the two rules above, which apply to every method.
+/// a DELETE that carries actual chunked framing IS refused by the rule above,
+/// which applies to every method.
 ///
 /// JSON-RPC clients send an identity-encoded body with a Content-Length, so
 /// none of this costs a conforming client anything. It is NOT free in general:
 /// HTTP permits chunked request bodies, and a proxy or streaming stack that
 /// re-frames requests will now be refused. That is a deliberate trade.
+[[nodiscard]] inline bool body_unmeasurable(std::string_view method, bool has_content_length,
+                                            std::string_view transfer_encoding) noexcept {
+    if (!transfer_encoding.empty())
+        return true;
+    if ((method == "POST" || method == "PUT" || method == "PATCH") && !has_content_length)
+        return true;
+    return false;
+}
+
+/// True when an MCP request carries a body this server cannot size before
+/// reading it, and must therefore refuse (411) rather than admit. Composed
+/// from `has_non_identity_content_encoding` + `body_unmeasurable` above —
+/// MCP opts every one of those reasons into a hard refusal (its `Content-
+/// Length` client contract already requires a measurable body, see
+/// `body_cap_policy.hpp`'s `requires_measurable` rationale), so the
+/// distinction the two split predicates exist for collapses back to one
+/// question for this caller specifically.
 [[nodiscard]] inline bool mcp_body_unmeasurable(std::string_view path, std::string_view method,
                                                 bool has_content_length,
                                                 std::string_view transfer_encoding,
                                                 std::string_view content_encoding) noexcept {
     if (!is_mcp_path(path))
         return false;
-    // Any framing we do not solely control.
-    if (!transfer_encoding.empty())
-        return true;
-    // Any encoding that makes Content-Length measure something other than what
-    // gets buffered. Case-insensitive, because header VALUES are compared
-    // case-insensitively by every library that reads them, including ours now.
-    if (!content_encoding.empty()) {
-        const bool identity =
-            content_encoding.size() == 8 &&
-            std::equal(content_encoding.begin(), content_encoding.end(), "identity",
-                       [](char a, char b) {
-                           return (a | 0x20) == (b | 0x20);
-                       });
-        if (!identity)
-            return true;
-    }
-    if ((method == "POST" || method == "PUT" || method == "PATCH") && !has_content_length)
-        return true;
-    return false;
+    return has_non_identity_content_encoding(content_encoding) ||
+           body_unmeasurable(method, has_content_length, transfer_encoding);
 }
 
 /// The unauthenticated-allowlist decision for the server's pre-routing

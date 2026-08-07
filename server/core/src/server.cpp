@@ -32,6 +32,7 @@
 #include "kek_routes.hpp"
 #include "key_provider.hpp"
 #include "scim_routes.hpp"
+#include <yuzu/server/scim_json.hpp> // D7 (#2407 hardening): scim::error() for the pre-routing body-cap 4xx
 #include "x509_ca.hpp"
 #include "compliance_eval.hpp"
 #include "custom_properties_store.hpp"
@@ -325,44 +326,14 @@ using yuzu::server::audit_token;
 // -- General pre-auth body-cap chokepoint (#2407) -----------------------------
 //
 // `resolve_body_cap` (body_cap_policy.hpp) generalizes the #2437 /mcp/-only
-// gate below to every request. The "can this server size the body before
-// reading it" test is the SAME rule `mcp_body_unmeasurable` (web_utils.hpp)
-// encodes for /mcp/, deliberately re-expressed here WITHOUT that function's
-// internal `is_mcp_path()` gate: the general chokepoint needs the raw fact
-// ("is this body unmeasurable") for EVERY path, then applies
-// body_cap_policy.hpp's `requires_measurable` bit to decide whether an
-// unmeasurable body is REFUSED for THIS class, or admitted up to httplib's
-// own 100 MiB backstop (every class today except /mcp/ — see
-// body_cap_policy.hpp's file header). Both implementations derive from the
-// same three httplib framing facts documented at web_utils.hpp:530-576 (the
-// case-insensitive Content-Encoding "identity" equality test is copied
-// verbatim to match httplib's own header comparison, not re-derived) — do
-// not let the two drift.
-[[nodiscard]] inline bool request_body_unmeasurable(std::string_view method,
-                                                     bool has_content_length,
-                                                     std::string_view transfer_encoding,
-                                                     std::string_view content_encoding) noexcept {
-    // Any framing we do not solely control.
-    if (!transfer_encoding.empty())
-        return true;
-    // Any encoding that makes Content-Length measure something other than
-    // what gets buffered. Case-insensitive: header VALUES compare
-    // case-insensitively everywhere, including httplib.
-    if (!content_encoding.empty()) {
-        const bool identity =
-            content_encoding.size() == 8 &&
-            std::equal(content_encoding.begin(), content_encoding.end(), "identity",
-                       [](char a, char b) {
-                           return (a | 0x20) == (b | 0x20);
-                       });
-        if (!identity)
-            return true;
-    }
-    if ((method == "POST" || method == "PUT" || method == "PATCH") && !has_content_length)
-        return true;
-    return false;
-}
-
+// gate to every request, every method, every path (D1/D2/D3 hardening —
+// governance run 2026-08). The "can this server size the body before reading
+// it" test now lives in ONE place, `body_unmeasurable` /
+// `has_non_identity_content_encoding` (web_utils.hpp) — `mcp_body_unmeasurable`
+// is a thin composition of the same two functions, so there is no longer a
+// second, hand-re-expressed copy of the rule in this file to drift against
+// it. See the pre-routing handler below for the chokepoint itself.
+//
 // -- KEK rotation seam helpers (#2395) -----------------------------------------
 //
 // The three KekOps lambdas (register_routes call site below) all need to
@@ -993,27 +964,36 @@ public:
         for (auto reason : {"over_cap", "unmeasurable"}) {
             metrics_.counter("yuzu_mcp_body_too_large_total", {{"reason", reason}});
         }
-        // #2407 general pre-auth body-cap rejection, EVERY route class (not
-        // just /mcp/, which also keeps emitting the metric above for
-        // compatibility). `path_class` is one of `kBodyCapTable`'s fixed
-        // labels — NEVER the raw request path, which is attacker-controlled
-        // and would be an unbounded-cardinality label on a pre-auth metric.
-        // Seeded PER CLASS from the table itself (not a hand-copied list) so
-        // a new table entry is pre-seeded automatically; `reason=unmeasurable`
-        // is seeded only for a class whose `requires_measurable` bit is set —
-        // seeding it for every class would publish series no code path can
-        // reach today (same reasoning as the dispatch-target-shape seeding
-        // above), and only /mcp/ opts in currently.
-        metrics_.describe("yuzu_body_cap_rejected_total",
-                          "Pre-auth request-body cap rejections by route class and reason "
-                          "(over_cap: measured and over the class's cap; unmeasurable: a "
-                          "chunked/undeclared body refused outright for a class that "
-                          "requires one it can size)",
-                          "counter");
+        // #2407 general pre-auth body-cap rejection, EVERY route class
+        // (including /mcp/, which also keeps emitting the metric above for
+        // compatibility — see the pre-routing handler). `path_class` is one
+        // of `kBodyCapTable`'s fixed labels — NEVER the raw request path,
+        // which is attacker-controlled and would be an unbounded-cardinality
+        // label on a pre-auth metric. Seeded PER CLASS from the table itself
+        // (not a hand-copied list) so a new table entry is pre-seeded
+        // automatically. `reason=unmeasurable` is seeded only for a class
+        // whose `requires_measurable` bit is set — seeding it for every class
+        // would publish series no code path can reach today (same reasoning
+        // as the dispatch-target-shape seeding above), and only /mcp/ opts in
+        // currently. `reason=unsupported_encoding` (D4 hardening) is seeded
+        // for EVERY class, unconditionally: a non-identity Content-Encoding
+        // is refused regardless of `requires_measurable`, so every class can
+        // reach it.
+        metrics_.describe(
+            "yuzu_body_cap_rejected_total",
+            "Pre-auth request-body cap rejections by route class and reason "
+            "(over_cap: measured and over the class's cap; unmeasurable: a "
+            "chunked/undeclared body refused outright for a class that "
+            "requires one it can size; unsupported_encoding: a non-identity "
+            "Content-Encoding, refused on every class)",
+            "counter");
         for (const auto& entry : yuzu::server::kBodyCapTable) {
             metrics_.counter("yuzu_body_cap_rejected_total",
                              {{"path_class", std::string(entry.path_class)},
                               {"reason", "over_cap"}});
+            metrics_.counter("yuzu_body_cap_rejected_total",
+                             {{"path_class", std::string(entry.path_class)},
+                              {"reason", "unsupported_encoding"}});
             if (entry.requires_measurable) {
                 metrics_.counter("yuzu_body_cap_rejected_total",
                                  {{"path_class", std::string(entry.path_class)},
@@ -7468,6 +7448,317 @@ private:
             // contract.
             detail::tls_engine_principal() = false;
 
+            // -- Pre-auth request-body cap (#2407, hardened 2026-08) -------------
+            // ONE check, every method, every path — INCLUDING the four
+            // unauthenticated health-probe paths just below, which is why this
+            // sits ABOVE that early return rather than after it (D3, governance
+            // finding: those four paths also skip the 401 gate further down, so
+            // before this move they were the last unauthenticated 100 MiB
+            // buffer on the server; the probe EXEMPTION itself — skipping
+            // on-behalf-of and the rate limiter — is unchanged, only the body
+            // cap now also reaches them). Ahead of on-behalf-of and the rate
+            // limiter for the same reason: an oversized/malformed-framing body
+            // is refused for free (a header read, no allocation, no lock)
+            // before spending a rate-limit token or a header scan on it.
+            //
+            // Formerly two authorities for one property: an `/mcp/`-only
+            // branch (#2437, `mcp_body_exceeds_cap`/`mcp_body_unmeasurable`)
+            // and a separate `else if (method != GET/HEAD)` branch for
+            // everyone else driven by `resolve_body_cap` (#2407) — editing the
+            // `/mcp/` row in `kBodyCapTable` was a silent no-op because that
+            // branch never consulted it. Folded into one (D1): every path,
+            // including /mcp/, now resolves through `resolve_body_cap`; the
+            // `yuzu_mcp_body_too_large_total{reason}` counter is preserved
+            // (not retired) by also incrementing it whenever
+            // `cap_match.path_class == "mcp"`.
+            //
+            // GET/HEAD are no longer excluded (D2): the exclusion used to be
+            // justified in-code by "they never carry a body" — FALSE, and this
+            // file's own web_utils.hpp already documented the opposite.
+            // Verified empirically against this vcpkg baseline: httplib's
+            // `expect_content()` is true for ANY method with `Content-Length >
+            // 0` or chunked framing (httplib.h:8330), so a GET declaring
+            // `Content-Length: 20971520` buffers 20 MiB regardless of method.
+            // A legitimate GET/HEAD body is 0 bytes, which resolves under the
+            // (4 MiB, by default) cap trivially.
+            //
+            // Content-Encoding (D4): a non-identity value is refused
+            // UNCONDITIONALLY, on every class, regardless of that class's
+            // `requires_measurable` bit — checked first, and separately from
+            // the framing check below. `requires_measurable` defaults OFF for
+            // every class but /mcp/ specifically so a chunked/undeclared body
+            // stays admitted up to httplib's 100 MiB backstop for clients this
+            // repo does not control (body_cap_policy.hpp's file header) — that
+            // reasoning does NOT extend to compression, which has zero
+            // compatibility cost (verified: no Yuzu route file references
+            // `Content-Encoding` at all, so none accepts a compressed request
+            // body) and a ~1000x amplification cost: this build compiles with
+            // `CPPHTTPLIB_BROTLI_SUPPORT` (ZLIB/ZSTD off — vcpkg_installed/
+            // x64-linux/share/httplib/httplibTargets.cmake), and httplib
+            // enforces its global payload limit against the DECOMPRESSED
+            // size, so a sub-cap `Content-Encoding: br` body can expand to
+            // ~100 MiB before anything downstream sees it. `Transfer-Encoding`
+            // (chunked) is UNCHANGED — still gated by `requires_measurable`
+            // per class, per the file-header reasoning above; chunked is
+            // legal HTTP this repo does not control every client's use of.
+            //
+            // KEEP-ALIVE / SMUGGLING CAVEAT (D5 — investigated, NOT fixed
+            // here — see the report for the full writeup). Returning Handled
+            // means the body is never read off the socket — the whole point,
+            // so a rejection never buffers the oversized payload.
+            // write_response_core stamps `Connection: close` on any status
+            // >= 400 (httplib.h:10789), but that header is ADVISORY TO THE
+            // CLIENT ONLY. httplib's OWN decision to close the socket is a
+            // separate `bool& connection_closed` out-parameter
+            // (`process_server_socket_core`, httplib.h:5514-5530) that this
+            // handler has NO ACCESS TO: `pre_routing_handler_`'s type is
+            // `std::function<HandlerResponse(const Request&, Response&)>`
+            // (httplib.h:1569) — no `Stream&`, no socket, no reference to
+            // `connection_closed`. That flag is set at exactly four sites
+            // inside `Server::process_request` (httplib.h:11628-11906), none
+            // reachable from here: the CLIENT's own `Connection: close`
+            // header (:11673), an HTTP/1.0 request without `Connection:
+            // Keep-Alive` (:11679), a non-2xx/417 `Expect: 100-continue`
+            // handler result (:11725), or a successful WebSocket upgrade
+            // (:11792). So a client that already transmitted the declared
+            // body (which it always has under `Expect: 100-continue`, since
+            // `process_request` auto-answers 100 BEFORE routing) leaves those
+            // bytes to be parsed as subsequent request lines on the SAME
+            // socket, bounded by `keep_alive_max_count_` (100) reads or the
+            // idle timeout before teardown — a Content-Length desync/
+            // smuggling primitive against a reverse proxy that reuses this
+            // connection. CONFIRMED NOT FIXABLE from this chokepoint under
+            // the vendored httplib 0.37.1's public API: `Request`/`Response`
+            // expose no Stream/socket handle either, so draining the body
+            // here is equally unreachable, and `set_payload_max_length` /
+            // `set_keep_alive_max_count` are both server-GLOBAL knobs (the
+            // former already rejected elsewhere in this file for squeezing
+            // the multipart cert upload and content-distribution staging; the
+            // latter would break legitimate keep-alive fleet-wide to fix one
+            // pre-auth reject path). The shipped rigs expose the server
+            // directly — no reverse proxy in front — so this stays a
+            // documented constraint, not a live bug; re-evaluate if that
+            // topology ever changes, or if a future httplib version exposes
+            // the stream/close-flag to `pre_routing_handler_`.
+            {
+                const auto cap_match = resolve_body_cap(req.method, req.path);
+                bool unmeasurable_cause = false;
+                // CONTAIN THE WHOLE BLOCK, not just the metric (governance
+                // Gate 8, security + cpp-safety). httplib invokes this
+                // handler from TWO sites: routing() (inside process_request's
+                // try/catch) and the WebSocket-upgrade path at
+                // httplib.h:11741, which is NOT — and ThreadPool::worker runs
+                // tasks bare. Every throwing expression below (header reads,
+                // the log, the sanitizers, the counters, the envelope build)
+                // must stay inside this try, or a crafted request reaches an
+                // unguarded call site and takes the whole process down.
+                try {
+                    const std::string content_encoding =
+                        req.get_header_value("Content-Encoding");
+                    if (has_non_identity_content_encoding(content_encoding)) {
+                        static std::atomic<std::uint64_t> encoding_hits{0};
+                        constexpr std::uint64_t kBodyLogEvery = 100;
+                        if (encoding_hits.fetch_add(1, std::memory_order_relaxed) %
+                                kBodyLogEvery ==
+                            0) {
+                            spdlog::warn(
+                                "[#2407] rejected {} {} from {}: unsupported "
+                                "Content-Encoding (class={}, 1 log per {} "
+                                "rejections; the counter records all)",
+                                onbehalf::sanitize_for_log(req.method, 16),
+                                onbehalf::sanitize_for_log(req.path),
+                                onbehalf::sanitize_for_log(req.remote_addr, 64),
+                                cap_match.path_class, kBodyLogEvery);
+                        }
+                        try {
+                            metrics_
+                                .counter("yuzu_body_cap_rejected_total",
+                                         {{"path_class", std::string(cap_match.path_class)},
+                                          {"reason", "unsupported_encoding"}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                            // Observability must never kill the process from
+                            // the unguarded WebSocket-upgrade path.
+                        }
+                        res.status = 415;
+                        // D7: the SCIM class publishes RFC 7644 §3.12's own
+                        // error envelope (application/scim+json) instead of
+                        // the generic A4 shape — an in-scope oversize/refusal
+                        // used to fall through silently to the generic
+                        // envelope once the pre-routing check started
+                        // winning ahead of the (now-dead) handler-level 64
+                        // KiB check, and IdP connectors validate conformance.
+                        if (cap_match.path_class == "scim") {
+                            res.set_content(
+                                scim::error(415, "Content-Encoding is not supported on this "
+                                                 "request")
+                                    .dump(),
+                                "application/scim+json");
+                        } else {
+                            res.set_content(
+                                detail::a4_denial(
+                                    res, 415,
+                                    "this request's Content-Encoding is not accepted",
+                                    detail::A4ErrorOpts{
+                                        .remediation =
+                                            "send the body identity-encoded (omit "
+                                            "Content-Encoding, or set it to 'identity'); no "
+                                            "Yuzu route accepts a compressed request body"}),
+                                "application/json");
+                        }
+                        return httplib::Server::HandlerResponse::Handled;
+                    }
+
+                    // One header lookup answers both "is Content-Length
+                    // present" and "what is its value" — httplib's
+                    // has_header() + get_header_value_u64() each separately
+                    // walk the header multimap for the same key (~24 ns of
+                    // duplicate lookup per request on the admit path,
+                    // measured). Presence is the iterator; a non-numeric
+                    // value reads as 0, matching httplib's own
+                    // get_header_value_u64 (httplib.h:2769-2790).
+                    // std::from_chars, not strtoull: no c_str()/null-
+                    // terminator dependency on a std::string_view-shaped
+                    // source, and no errno to reset.
+                    const auto cl_range = req.headers.equal_range("Content-Length");
+                    const bool has_content_length = cl_range.first != cl_range.second;
+                    std::uint64_t content_length = 0;
+                    if (has_content_length) {
+                        const std::string& raw = cl_range.first->second;
+                        const auto [ptr, ec] =
+                            std::from_chars(raw.data(), raw.data() + raw.size(), content_length);
+                        if (ec != std::errc{} || ptr != raw.data() + raw.size())
+                            content_length = 0;
+                    }
+
+                    const bool unmeasurable =
+                        body_unmeasurable(req.method, has_content_length,
+                                          req.get_header_value("Transfer-Encoding"));
+                    const bool refuse_unmeasurable =
+                        unmeasurable && cap_match.requires_measurable;
+                    unmeasurable_cause = refuse_unmeasurable;
+                    // Only consult Content-Length as a size when it is
+                    // trustworthy — i.e. NOT unmeasurable. An unmeasurable-
+                    // but-not-refused body has no policy cap to check against
+                    // here; httplib's own 100 MiB backstop is what bounds it.
+                    const bool oversize =
+                        !unmeasurable && content_length > cap_match.max_body_bytes;
+                    if (refuse_unmeasurable || oversize) {
+                        // Own throttle per reason: a cheap over_cap flood
+                        // (huge Content-Length, no body sent) must not
+                        // suppress the rarer unmeasurable signal.
+                        static std::atomic<std::uint64_t> over_cap_hits{0};
+                        static std::atomic<std::uint64_t> unmeasurable_hits{0};
+                        constexpr std::uint64_t kBodyLogEvery = 100;
+                        auto& hits = refuse_unmeasurable ? unmeasurable_hits : over_cap_hits;
+                        if (hits.fetch_add(1, std::memory_order_relaxed) % kBodyLogEvery ==
+                            0) {
+                            spdlog::warn(
+                                "[#2407] rejected {} {} from {}: {} (class={}, 1 log per {} "
+                                "rejections; the counter records all)",
+                                onbehalf::sanitize_for_log(req.method, 16),
+                                onbehalf::sanitize_for_log(req.path),
+                                onbehalf::sanitize_for_log(req.remote_addr, 64),
+                                refuse_unmeasurable ? "unmeasurable body" : "body over cap",
+                                cap_match.path_class, kBodyLogEvery);
+                        }
+                        try {
+                            metrics_
+                                .counter("yuzu_body_cap_rejected_total",
+                                         {{"path_class", std::string(cap_match.path_class)},
+                                          {"reason",
+                                           refuse_unmeasurable ? "unmeasurable" : "over_cap"}})
+                                .increment();
+                            if (cap_match.path_class == "mcp") {
+                                // #2437 compatibility series, PRESERVED (D1):
+                                // dashboards/alerts still key off this one.
+                                metrics_
+                                    .counter("yuzu_mcp_body_too_large_total",
+                                             {{"reason", refuse_unmeasurable
+                                                             ? "unmeasurable"
+                                                             : "over_cap"}})
+                                    .increment();
+                            }
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                            // Observability must never kill the process from
+                            // the unguarded WebSocket-upgrade path.
+                        }
+                        res.status = refuse_unmeasurable ? 411 : 413;
+                        if (cap_match.path_class == "scim") {
+                            // D7: match scim_routes.cpp's own now-superseded
+                            // handler-level check's wording, so an IdP
+                            // connector sees the identical envelope whether
+                            // the 4xx comes from here or there.
+                            res.set_content(
+                                scim::error(res.status,
+                                            refuse_unmeasurable
+                                                ? "this request must carry a body this "
+                                                  "server can size in advance"
+                                                : "request body too large")
+                                    .dump(),
+                                "application/scim+json");
+                        } else if (cap_match.path_class == "mcp") {
+                            res.set_content(
+                                refuse_unmeasurable
+                                    ? detail::a4_denial(
+                                          res, 411,
+                                          "MCP requests must carry a body this server can "
+                                          "size in advance",
+                                          detail::A4ErrorOpts{
+                                              .remediation =
+                                                  "send the JSON-RPC body with a "
+                                                  "Content-Length header, no "
+                                                  "Transfer-Encoding, and no "
+                                                  "Content-Encoding other than identity; a "
+                                                  "body whose size cannot be checked before "
+                                                  "reading it cannot be admitted under the "
+                                                  "4 MiB MCP cap (see docs/mcp-server.md)"})
+                                    : detail::a4_denial(
+                                          res, 413,
+                                          "request body exceeds the MCP transport limit",
+                                          detail::A4ErrorOpts{
+                                              .remediation =
+                                                  "the largest accepted MCP request body is "
+                                                  "4 MiB; reduce the arguments, or for a "
+                                                  "large execute_bundle use the REST twin "
+                                                  "POST /api/v1/bundles (see "
+                                                  "docs/mcp-server.md)"}),
+                                "application/json");
+                        } else {
+                            res.set_content(
+                                refuse_unmeasurable
+                                    ? detail::a4_denial(
+                                          res, 411,
+                                          "this request must carry a body this server can "
+                                          "size in advance",
+                                          detail::A4ErrorOpts{
+                                              .remediation =
+                                                  "send the body with a Content-Length "
+                                                  "header, no Transfer-Encoding, and no "
+                                                  "Content-Encoding other than identity"})
+                                    : detail::a4_denial(
+                                          res, 413,
+                                          "request body exceeds this route's size cap",
+                                          detail::A4ErrorOpts{
+                                              .remediation =
+                                                  "reduce the request body size; see "
+                                                  "docs/user-manual/rest-api.md for the "
+                                                  "per-route limit"}),
+                                "application/json");
+                        }
+                        return httplib::Server::HandlerResponse::Handled;
+                    }
+                } catch (...) { // NOLINT(bugprone-empty-catch)
+                    // Last-resort containment for the WHOLE block, including
+                    // the header reads that decide it. We cannot build an
+                    // envelope if we got here, but we can still refuse rather
+                    // than let the throw reach httplib's UNGUARDED WebSocket-
+                    // upgrade call site and take the process down.
+                    res.status = unmeasurable_cause ? 411 : 413;
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+            }
+
             // Lightweight probes — always allowed, no auth, no rate limit.
             // /health and /api/health are included here (governance Gate 7,
             // unhappy-path UP-1) so monitoring integrations behind a NAT or
@@ -7567,283 +7858,6 @@ private:
                     R"({"error":{"code":429,"message":"rate limit exceeded"},"meta":{"api_version":"v1"}})",
                     "application/json");
                 return httplib::Server::HandlerResponse::Handled;
-            }
-
-            // MCP request-body bound (#2437). Placed HERE, after the rate
-            // limiter and before auth, for two reasons that are easy to get
-            // wrong:
-            //   * httplib calls this pre-routing handler BEFORE it reads the
-            //     request body (httplib.h: pre_routing_handler_ in routing(),
-            //     read_content later in the same function), so returning
-            //     Handled costs a header parse and never buffers the payload.
-            //     Enforcing the same bound inside the MCP handler would be too
-            //     late — the body is already in memory by then.
-            //   * it is per-path, NOT the server-global
-            //     `set_payload_max_length` knob, which would also cap the
-            //     multipart certificate upload and content distribution on
-            //     this same httplib instance. httplib's 100 MB default stays
-            //     as the outer backstop for every other route.
-            // Unlike the on-behalf-of guard above, this sits AFTER the rate
-            // limiter: there is no diagnostic reason to let an oversized-body
-            // flood bypass the limiter, and no misconfiguration it would mask.
-            // A chunked or Content-Length-less POST/PUT/PATCH is REFUSED 411,
-            // not admitted: httplib consults Transfer-Encoding before
-            // Content-Length and reads a header-less POST to EOF, so either
-            // shape would revert to the 100 MB default and evade this cap
-            // entirely. A bound removable by deleting a header is not a bound.
-            // ON THE UNREAD BODY (checked at primary source against the
-            // vendored httplib 0.37.1 — don't re-derive, and re-check on a
-            // vcpkg baseline bump). Returning Handled means the body is never
-            // read off the socket. What ACTUALLY happens next:
-            //   * write_response_core stamps `Connection: close` on any status
-            //     >= 400 (httplib.h:10789, "Don't leave connections open after
-            //     errors"), so a conforming client closes.
-            //   * but NOTHING sets httplib's `connection_closed` flag for an
-            //     error response, so process_server_socket_core loops again
-            //     (httplib.h:5516-5531). A client that already transmitted the
-            //     declared body — which it always has under
-            //     `Expect: 100-continue`, since process_request auto-answers
-            //     100 BEFORE routing — leaves those bytes to be parsed as
-            //     subsequent request lines on this same socket.
-            //   * bounded: <= keep_alive_max_count_ (100) parses and the idle
-            //     timeout, then teardown. Malformed lines 400 before
-            //     pre-routing runs (so they skip the rate limiter); a
-            //     well-formed smuggled request goes through the FULL middleware
-            //     chain including auth, so there is no auth bypass.
-            // Same shape as the two early returns above (on-behalf-of 403,
-            // rate-limit 429), which have always returned Handled on POSTs
-            // carrying bodies — this adds an instance of an existing pattern,
-            // not a new one.
-            // CAVEAT IF A REVERSE PROXY IS EVER PUT IN FRONT: an unread
-            // Content-Length body is a textbook request-smuggling primitive
-            // between proxy and origin. The shipped rigs expose the server
-            // directly, so this is a documented constraint, not a live bug.
-            // The DECISION lives in web_utils.hpp so it has direct unit
-            // coverage (same reason is_login_exempt_path was extracted from
-            // this lambda); only this call site is review-only.
-            // The path test is hoisted to the CALL SITE, not left inside the
-            // predicate: get_header_value_u64 is a function ARGUMENT and is
-            // therefore evaluated unconditionally, so the predicate's internal
-            // && cannot short-circuit it. Measured at 14.22 ns/request
-            // unguarded vs 0.84 ns guarded, on EVERY request server-wide
-            // (governance perf-S1).
-            if (is_mcp_path(req.path)) {
-              // Hoisted ABOVE the try so the catch below can answer with the
-              // right status: collapsing an unmeasurable-body refusal into a
-              // 413 would tell the client to shrink a body whose size was
-              // never the problem.
-              bool unmeasurable_cause = false;
-              // CONTAIN THE WHOLE BRANCH, not just the metric (governance Gate 8,
-              // security + cpp-safety). httplib invokes this handler from TWO
-              // sites: routing() (inside process_request's try/catch) and the
-              // WebSocket-upgrade path at httplib.h:11741, which is NOT — and
-              // ThreadPool::worker runs tasks bare. A GET /mcp/v1/ carrying
-              // `Upgrade: websocket` and an oversized Content-Length reaches
-              // here via that second site, so a bad_alloc from the header read,
-              // the log, the sanitizers, the counter OR the envelope build is
-              // std::terminate. The first attempt guarded only the one operation
-              // it had been told about; the hazard is the path.
-              try {
-                const bool oversize = mcp_body_exceeds_cap(
-                    req.path, req.get_header_value_u64("Content-Length", 0),
-                    mcp::kMcpMaxRequestBodyBytes);
-                // Header VALUES passed through, not a re-implementation of
-                // httplib's parsing — matching its decision by hand is what
-                // let `Transfer-Encoding: Chunked` through last round.
-                const bool unmeasurable = mcp_body_unmeasurable(
-                    req.path, req.method, req.has_header("Content-Length"),
-                    req.get_header_value("Transfer-Encoding"),
-                    req.get_header_value("Content-Encoding"));
-                unmeasurable_cause = unmeasurable;
-                if (oversize || unmeasurable) {
-                    // Throttled log: this is a pre-auth ingress rejection with
-                    // NO principal to audit, and observability-conventions.md
-                    // requires metric + sampled log for exactly that shape.
-                    // Mirrors the on-behalf-of guard above, whose sanitizer
-                    // this reuses (httplib percent-decodes req.path, so raw
-                    // control bytes would otherwise forge log lines).
-                    // OWN throttle, NOT onbehalf::note_rejection (governance
-                    // Gate 8 security HIGH-1). Reusing it fed
-                    // yuzu_onbehalf_rejected_total, which carries a CRITICAL
-                    // alert reading "likely a header-injecting proxy" — so an
-                    // unauthenticated chunked-POST flood would have paged
-                    // someone about an ADR-1005 breach that never happened,
-                    // and would have consumed the shared 1-in-100 log slot
-                    // that the genuine on-behalf-of warnings need. Never
-                    // borrow a security control's counter for a transport
-                    // bound.
-                    // ONE COUNTER PER REASON. A shared counter lets a cheap
-                    // over_cap flood (huge Content-Length, no body sent)
-                    // suppress ~99% of the unmeasurable lines, hiding the
-                    // rarer signal behind the noisier one.
-                    static std::atomic<std::uint64_t> over_cap_hits{0};
-                    static std::atomic<std::uint64_t> unmeasurable_hits{0};
-                    constexpr std::uint64_t kBodyLogEvery = 100;
-                    auto& hits = unmeasurable ? unmeasurable_hits : over_cap_hits;
-                    if (hits.fetch_add(1, std::memory_order_relaxed) % kBodyLogEvery == 0) {
-                        spdlog::warn("[#2437] rejected {} {} from {}: {} (1 log per {} "
-                                     "rejections; the counter records all)",
-                                     onbehalf::sanitize_for_log(req.method, 16),
-                                     onbehalf::sanitize_for_log(req.path),
-                                     onbehalf::sanitize_for_log(req.remote_addr, 64),
-                                     unmeasurable ? "unmeasurable body" : "body over cap",
-                                     kBodyLogEvery);
-                    }
-                    try {
-                        metrics_
-                            .counter("yuzu_mcp_body_too_large_total",
-                                     {{"reason", unmeasurable ? "unmeasurable" : "over_cap"}})
-                            .increment();
-                        // #2407: ALSO record on the general per-class counter
-                        // (path_class is the fixed table literal "mcp", never
-                        // derived from req.path) so /mcp/ shows up in the
-                        // fleet-wide body-cap view alongside every other
-                        // route class, without dropping the MCP-specific
-                        // series above (kept for dashboard/alert compat —
-                        // docs/prometheus/yuzu-alerts.yml still keys off it).
-                        metrics_
-                            .counter("yuzu_body_cap_rejected_total",
-                                     {{"path_class", "mcp"},
-                                      {"reason", unmeasurable ? "unmeasurable" : "over_cap"}})
-                            .increment();
-                    } catch (...) { // NOLINT(bugprone-empty-catch)
-                        // Guarded because this call site is NOT inside
-                        // httplib's try/catch on the WebSocket-upgrade path
-                        // (httplib.h:11741 vs routing()'s at :11811), and
-                        // ThreadPool::worker invokes tasks bare — an escaped
-                        // throw here is std::terminate (cpp-safety S1 / UP-9).
-                        // The sibling handler-side increment is guarded the
-                        // same way; observability must never kill the process.
-                    }
-                    res.status = unmeasurable ? 411 : 413;
-                    res.set_content(
-                        unmeasurable
-                            ? detail::a4_denial(
-                                  res, 411,
-                                  "MCP requests must carry a body this server can size "
-                                  "in advance",
-                                  detail::A4ErrorOpts{
-                                      .remediation =
-                                          "send the JSON-RPC body with a Content-Length "
-                                          "header, no Transfer-Encoding, and no "
-                                          "Content-Encoding other than identity; a body "
-                                          "whose size cannot be checked before reading it "
-                                          "cannot be admitted under the 4 MiB MCP cap "
-                                          "(see docs/mcp-server.md)"})
-                            : detail::a4_denial(
-                                  res, 413, "request body exceeds the MCP transport limit",
-                                  detail::A4ErrorOpts{
-                                      .remediation =
-                                          "the largest accepted MCP request body is 4 MiB; "
-                                          "reduce the arguments, or for a large "
-                                          "execute_bundle use the REST twin POST "
-                                          "/api/v1/bundles (see docs/mcp-server.md)"}),
-                        "application/json");
-                  return httplib::Server::HandlerResponse::Handled;
-                }
-              } catch (...) { // NOLINT(bugprone-empty-catch)
-                  // Last-resort containment for the WHOLE branch, including the
-                  // header read that decides it. We cannot build an envelope if
-                  // we got here, but we can still refuse rather than let the
-                  // throw reach httplib's UNGUARDED WebSocket-upgrade call site
-                  // and take the process down.
-                  res.status = unmeasurable_cause ? 411 : 413;
-                  return httplib::Server::HandlerResponse::Handled;
-              }
-            } else if (req.method != "GET" && req.method != "HEAD") {
-              // General pre-auth body cap (#2407) — every non-MCP route,
-              // driven by body_cap_policy.hpp's table instead of a hardcoded
-              // check. GET/HEAD are excluded here (not above, where MCP's own
-              // GET SSE stream must still be checked — see is_mcp_path's
-              // ANY-method scope): they never carry a body, so there is
-              // nothing to measure or cap.
-              //
-              // UNLIKE the MCP branch above, an unmeasurable body here is
-              // refused (411) ONLY when the resolved policy entry's
-              // `requires_measurable` is set — today that is nobody but
-              // /mcp/, so a chunked/undeclared body on every other class
-              // falls through UNHANDLED and is admitted up to httplib's own
-              // 100 MiB backstop. This is a DELIBERATE scoping decision
-              // (body_cap_policy.hpp file header), not an oversight: chunked
-              // request bodies are legal HTTP and this repo does not control
-              // every client that talks to public REST/SCIM/upload routes.
-              const auto cap_match = resolve_body_cap(req.method, req.path);
-              bool unmeasurable_cause = false;
-              // Same containment shape as the MCP branch above: httplib
-              // invokes this handler from the unguarded WebSocket-upgrade
-              // call site too, and ThreadPool::worker runs tasks bare.
-              try {
-                const bool unmeasurable = detail::request_body_unmeasurable(
-                    req.method, req.has_header("Content-Length"),
-                    req.get_header_value("Transfer-Encoding"),
-                    req.get_header_value("Content-Encoding"));
-                const bool refuse_unmeasurable = unmeasurable && cap_match.requires_measurable;
-                unmeasurable_cause = refuse_unmeasurable;
-                // Only consult Content-Length as a size when it is trustworthy
-                // — i.e. NOT unmeasurable (no Transfer-Encoding, identity
-                // Content-Encoding). An unmeasurable-but-not-refused body has
-                // no policy cap to check against here; httplib's own backstop
-                // is what bounds it.
-                const bool oversize = !unmeasurable &&
-                    req.get_header_value_u64("Content-Length", 0) > cap_match.max_body_bytes;
-                if (refuse_unmeasurable || oversize) {
-                    // Own throttle, mirroring the MCP branch's reasoning:
-                    // this is a pre-auth ingress rejection with no principal
-                    // to audit, and a shared counter would let a cheap
-                    // over_cap flood suppress the rarer unmeasurable signal.
-                    static std::atomic<std::uint64_t> over_cap_hits{0};
-                    static std::atomic<std::uint64_t> unmeasurable_hits{0};
-                    constexpr std::uint64_t kBodyLogEvery = 100;
-                    auto& hits = refuse_unmeasurable ? unmeasurable_hits : over_cap_hits;
-                    if (hits.fetch_add(1, std::memory_order_relaxed) % kBodyLogEvery == 0) {
-                        spdlog::warn("[#2407] rejected {} {} from {}: {} (class={}, 1 log "
-                                     "per {} rejections; the counter records all)",
-                                     onbehalf::sanitize_for_log(req.method, 16),
-                                     onbehalf::sanitize_for_log(req.path),
-                                     onbehalf::sanitize_for_log(req.remote_addr, 64),
-                                     refuse_unmeasurable ? "unmeasurable body" : "body over cap",
-                                     cap_match.path_class, kBodyLogEvery);
-                    }
-                    try {
-                        metrics_
-                            .counter("yuzu_body_cap_rejected_total",
-                                     {{"path_class", std::string(cap_match.path_class)},
-                                      {"reason",
-                                       refuse_unmeasurable ? "unmeasurable" : "over_cap"}})
-                            .increment();
-                    } catch (...) { // NOLINT(bugprone-empty-catch)
-                        // Same reasoning as the MCP branch's guarded
-                        // increment — observability must never kill the
-                        // process from the unguarded WebSocket-upgrade path.
-                    }
-                    res.status = refuse_unmeasurable ? 411 : 413;
-                    res.set_content(
-                        refuse_unmeasurable
-                            ? detail::a4_denial(
-                                  res, 411,
-                                  "this request must carry a body this server can size "
-                                  "in advance",
-                                  detail::A4ErrorOpts{
-                                      .remediation =
-                                          "send the body with a Content-Length header, no "
-                                          "Transfer-Encoding, and no Content-Encoding other "
-                                          "than identity"})
-                            : detail::a4_denial(
-                                  res, 413, "request body exceeds this route's size cap",
-                                  detail::A4ErrorOpts{
-                                      .remediation =
-                                          "reduce the request body size; see "
-                                          "docs/user-manual/rest-api.md for the per-route "
-                                          "limit"}),
-                        "application/json");
-                    return httplib::Server::HandlerResponse::Handled;
-                }
-              } catch (...) { // NOLINT(bugprone-empty-catch)
-                  // Last-resort containment for the WHOLE branch — mirrors
-                  // the MCP branch's catch above.
-                  res.status = unmeasurable_cause ? 411 : 413;
-                  return httplib::Server::HandlerResponse::Handled;
-              }
             }
 
             // Allow unauthenticated access to login pages, health, OIDC flow, and OpenAPI spec.

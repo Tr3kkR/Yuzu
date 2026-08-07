@@ -67,16 +67,48 @@
 /// client population is tested against it. That is a scoping decision for
 /// THIS change, not a claim those routes are safe unmeasured forever.
 ///
-/// The numbers below are MEASURED against the cited call sites, not
-/// invented — each entry's comment names the exact source. Three classes
-/// (`guardian_rule_authoring`, `workflow_yaml`, `product_pack_yaml`) are the
-/// documented exception: they accept arbitrary YAML/legacy `yaml_source`
-/// bodies with no aggregate size contract defined yet anywhere in the
-/// codebase, so their cap is an explicit, generous, ADMITTEDLY-JUDGMENT-CALL
-/// bound (still three orders of magnitude below httplib's 100 MiB backstop)
-/// rather than a squeeze — do not tighten them without a real contract to
-/// measure against, and do not read their presence as license to guess a
-/// number for any OTHER class.
+/// KNOWN LIMITATION, recorded deliberately, not implied away: because of the
+/// default above, a chunked or Content-Length-less body is NOT refused on
+/// any class but `/mcp/` — it falls through this entire gate uncapped to
+/// httplib's own 100 MiB backstop. A comment or doc that says chunked bodies
+/// are "refused" without naming `/mcp/` as the sole exception is wrong. This
+/// is a recorded adjudication, not an oversight — see the paragraph above
+/// for why — kept in sync with `docs/user-manual/rest-api.md` "Pre-Auth
+/// Request Body Caps" and the Pre-auth body caps row in
+/// `.claude/routed-concerns.md`.
+///
+/// The numbers below are grounded in the cited call sites, not invented —
+/// but "grounded" is not "measured byte-for-byte": two different kinds of
+/// reasoning appear beside the exact matches, and BOTH are reasoned rather
+/// than measured. (1) MEASURED-PLUS-MARGIN (`ca_import_chain_dashboard`,
+/// `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`,
+/// `instruction_yaml`): a real handler-level check exists and is cited, but
+/// the pre-routing gate checks the RAW body while the handler checks a
+/// DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-
+/// extracted), so the cap adds an explicit margin over the handler's own
+/// number instead of mirroring it — getting this wrong rejects legitimate
+/// traffic, which is exactly what happened to the two TAR entries before
+/// this fix (see their comments). (2) JUDGMENT CALL, NO CONTRACT
+/// (`guardian_rule_authoring`, `workflow_yaml`, `product_pack_yaml`,
+/// `instruction_import`, `nvd_match`): no aggregate size contract is defined
+/// anywhere in the codebase for what these accept — arbitrary YAML/legacy
+/// `yaml_source` bodies for the first three, an unbounded `responseTemplates`
+/// array for `instruction_import`, an unbounded software-inventory array for
+/// `nvd_match` — so each cap is an explicit, ADMITTEDLY-JUDGMENT-CALL bound
+/// reasoned against that class's OWN realistic scale (not copy-pasted from a
+/// sibling), rather than a squeeze. That is TEN of the table's entries
+/// reasoned rather than exactly measured — do not tighten any of them
+/// without a real contract to measure against, and do not read their
+/// presence as license to guess a number for any OTHER class; every other
+/// entry below mirrors a cited, decoded-equals-raw byte count exactly. A
+/// THIRD, distinct category — `ota_upload` and `json_to_csv_export` — is
+/// pinned at httplib's own 100 MiB backstop rather than squeezed OR given a
+/// judgment-call MiB number: both carry content whose legitimate size is a
+/// direct function of something this table cannot bound (an installer
+/// binary's real size; an export's size following directly from the
+/// operator's own prior query), so there is no smaller number to reason
+/// toward — the entry's only job is making that an explicit, reviewed
+/// decision instead of an accidental fallthrough to the catch-all.
 namespace yuzu::server {
 
 /// Sentinel method value meaning "matches every HTTP method". Used ONLY
@@ -137,11 +169,64 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // decision rather than an accidental fallthrough to the catch-all.
     {"POST", "/api/settings/updates/upload", 100u * 1024 * 1024, false, "ota_upload"},
 
+    // POST /api/export/json-to-csv — generic JSON-array-to-CSV export
+    // (server.cpp:10809; the entire raw body is handed to
+    // `data_export::json_array_to_csv` verbatim). Unbounded BY DESIGN: this
+    // converts a full exported dataset (responses, audit rows, inventory —
+    // whatever REST query the caller ran) to CSV, and there is no natural
+    // "this export is too big" line to draw; a large legitimate export is
+    // the expected case, not an abuse case. Choice made here: an EXPLICIT
+    // entry pinned at httplib's own 100 MiB backstop, mirroring the
+    // ota_upload treatment immediately above — NOT squeezed to a judgment-
+    // call MiB number, because unlike guardian_rule_authoring/workflow_yaml/
+    // product_pack_yaml (arbitrary but SINGLE-DOCUMENT content, where a
+    // generous MiB-scale cap is a defensible judgment call) an export's
+    // size is a direct, unbounded function of how much data the operator's
+    // own prior query returned — there is no analogous "one document" scale
+    // to be generous relative to. This entry's only job is to make that a
+    // reviewed decision instead of an accidental fallthrough to the 4 MiB
+    // catch-all, which would break real exports outright.
+    {"POST", "/api/export/json-to-csv", 100u * 1024 * 1024, false, "json_to_csv_export"},
+
+    // POST /api/nvd/match — software-inventory vulnerability match
+    // (server.cpp:9258; parses a JSON body's `inventory` array of
+    // {name, version} pairs, no size check anywhere in the handler or
+    // `NvdDatabase::match_inventory`). No aggregate contract exists, but
+    // unlike json_to_csv_export above this content IS naturally bounded in
+    // scale — one call carries one device's installed-software census.
+    // Sized to that: even a maximal per-item JSON encoding (long name +
+    // version strings, keys, braces, comma) is well under 200 bytes/item,
+    // so 8 MiB admits roughly 40000+ inventory items — an order of
+    // magnitude above any real single-device software census (a heavily
+    // packaged Linux workstation or a Windows box with a large registry
+    // Programs list runs to a few thousand entries at most). Reasoned to
+    // this specific content's realistic scale, not borrowed from the
+    // arbitrary-YAML judgment-call classes below; still two orders of
+    // magnitude below httplib's 100 MiB backstop.
+    {"POST", "/api/nvd/match", 8u * 1024 * 1024, false, "nvd_match"},
+
     // POST /api/v1/ca/import-chain — subordinate CA chain import, JSON body
     // (ca_routes.cpp:24 kMaxImportBody, enforced at :516). Mirrors the
     // handler's own 256 KiB bound exactly, so this pre-routing gate never
     // rejects anything the handler itself would still admit.
     {"POST", "/api/v1/ca/import-chain", 256u * 1024, false, "ca_import_chain"},
+
+    // POST /api/v1/ca/revoke — serial-scoped cert revocation, JSON body
+    // (ca_routes.cpp:24 kMaxRevokeBody, enforced at ca_routes.cpp:394 before
+    // the body reaches nlohmann::json::parse). Mirrors that bound exactly —
+    // same reasoning as the import-chain entry above. Without this entry the
+    // route silently fell through to the 4 MiB catch-all, two authorities
+    // (this table and the handler) disagreeing on the same route.
+    {"POST", "/api/v1/ca/revoke", 64u * 1024, false, "ca_revoke"},
+
+    // POST /api/v1/secrets/kek/rotate|rewrap — both take zero body fields
+    // (kek_routes.cpp:46 kMaxKekBody, enforced at :54 in validate_empty_body,
+    // shared by both handlers before either parses JSON). One entry covers
+    // both routes: they share the literal prefix "/api/v1/secrets/kek/" and
+    // the segment-boundary matcher treats a prefix already ending in '/' as
+    // matching every child segment (see body_cap_prefix_matches). Mirrors
+    // kMaxKekBody exactly — same two-authority-split fix as ca_revoke above.
+    {"POST", "/api/v1/secrets/kek/", 64u * 1024, false, "kek_ops"},
 
     // POST /api/settings/ca/import-chain — the dashboard (HTMX,
     // application/x-www-form-urlencoded) twin of the above
@@ -197,18 +282,49 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     {"PUT", "/api/v1/definitions/", 64u * 1024, false, "response_templates"},
 
     // POST /api/dashboard/tar-execute — TAR warehouse SQL query, HTMX form
-    // field (dashboard_routes.cpp: `sql.size() > 4096` check). Bound on the
-    // literal cited value; unlike the CA/plugin-trust dashboard classes
-    // above, no extra form-encoding margin is added here — the brief this
-    // table implements pins this class at a flat 4 KiB.
-    {"POST", "/api/dashboard/tar-execute", 4u * 1024, false, "tar_dashboard_sql"},
+    // fields `sql` + `scope` (dashboard_routes.cpp:866 `sql.size() > 4096`
+    // check on the FORM-DECODED value). The #2407-as-shipped 4096-byte cap
+    // capped the RAW body at the SAME number the handler checks against the
+    // DECODED field — a unit mismatch, not a margin. The raw body is
+    // `"sql=" + percent-encoded(sql) + "&scope=" + percent-encoded(scope)`,
+    // so a 4093-4096 character query was unconditionally rejected before the
+    // handler ever ran, and any query containing a `'`, `(`, `)`, `=`, `,`,
+    // or a newline was rejected far earlier (percent-encoding is up to 3x
+    // per character worst case). Measured case: a 4085-character realistic
+    // query produced a 5078-byte raw body, 24% over the old 4096-byte cap —
+    // legitimate traffic, rejected. Fix: 3 x 4096 (worst-case percent-
+    // encoding of the full 4096-char decoded `sql` value the handler still
+    // admits) + 4 KiB flat headroom for the "sql="/"&scope=" field-name
+    // framing and the `scope` field's own percent-encoded value (which has
+    // no size contract of its own — `scope` is normally an agent id or
+    // "group:<name>", short, but nothing bounds it today) = 12288 + 4096 =
+    // 16384 bytes exactly. Reasoned margin, not a byte-for-byte measurement
+    // — same category as the CA/plugin-trust dashboard classes below.
+    {"POST", "/api/dashboard/tar-execute", 16u * 1024, false, "tar_dashboard_sql"},
 
     // POST /api/v1/result-sets/from-tar-query — TAR result-set SQL, JSON
-    // body (rest_api_v1.cpp:6797, `sql.size() > 100000` check). 100 KiB
-    // (102400 bytes) is a few hundred bytes above that literal 100000-byte
-    // handler check, so this pre-routing gate never rejects a body the
-    // handler would still admit.
-    {"POST", "/api/v1/result-sets/from-tar-query", 100u * 1024, false,
+    // body (rest_api_v1.cpp:6802, `sql.size() > 100000` check on the JSON-
+    // PARSED `sql` field). Same unit mismatch as tar_dashboard_sql above,
+    // with almost no headroom to hide it: the old 102400-byte cap left only
+    // 2400 bytes over the handler's 100000-character check to absorb JSON
+    // string-escaping (quotes, backslashes, and control characters expand
+    // under JSON escaping — a raw control byte with no named escape costs 6
+    // bytes as `\u00XX`) plus the request's other keys (`include_empty`,
+    // `parent_id`, object braces). The old comment claimed "this pre-routing
+    // gate never rejects a body the handler would still admit" — false; a
+    // legitimate 99000+-character query containing a modest amount of
+    // escaping could exceed 102400 raw bytes and be rejected here while the
+    // handler would have admitted it. Fix: double the handler's 100000-byte
+    // check for escaping headroom (200000 bytes), which also covers the
+    // other JSON keys — 200 KiB (204800 bytes) exactly. NOTE the asymmetry
+    // this table cannot erase: the handler answers `400 RESULT_SET_BAD_
+    // REQUEST` for an over-100000-character `sql` field; this pre-routing
+    // gate answers `413` for an over-200-KiB raw body. They are not the same
+    // check re-run twice — a raw body between 100000 and 204800 bytes whose
+    // decoded `sql` value is still <=100000 characters passes here and is
+    // then decided by the handler's own check, as intended; a raw body over
+    // 204800 bytes never reaches the handler at all.
+    {"POST", "/api/v1/result-sets/from-tar-query", 200u * 1024, false,
      "tar_result_set_sql"},
 
     // POST /api/v1/guaranteed-state/rules — Guardian rule authoring
@@ -217,10 +333,22 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // rule-size contract exists yet anywhere in the codebase, so this is a
     // deliberate, generous EXPLICIT entry rather than a squeeze — see the
     // file header. Do NOT tighten this without a real contract to measure
-    // against. Scoped to POST only (the creation route this brief measured);
-    // the sibling regex PUT update route at :7904 falls through to the
-    // catch-all default until it gets its own reviewed entry.
+    // against.
     {"POST", "/api/v1/guaranteed-state/rules", 16u * 1024 * 1024, false,
+     "guardian_rule_authoring"},
+
+    // PUT /api/v1/guaranteed-state/rules/{id} — the sibling regex UPDATE
+    // route (rest_api_v1.cpp:7904). #2407-as-shipped scoped the entry above
+    // to POST only, so a PUT fell through to the 4 MiB catch-all default —
+    // a rule created at up to 16 MiB (the entry above) could then never be
+    // edited back through the same-sized route. Same class, same "no
+    // contract yet" reasoning as the POST entry, so the same 16 MiB bound.
+    // Path prefix ends in '/' so the segment-boundary matcher
+    // (body_cap_prefix_matches) covers the regex-captured `{id}` suffix —
+    // see the file header's MATCHING section for why path-only matching
+    // could not otherwise tell this apart from the POST create route on the
+    // identical literal prefix.
+    {"PUT", "/api/v1/guaranteed-state/rules/", 16u * 1024 * 1024, false,
      "guardian_rule_authoring"},
 
     // POST /api/workflows — workflow authoring from a YAML bundle
@@ -234,6 +362,46 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // this needs the same generous headroom as workflow authoring, not the
     // single-document default.
     {"POST", "/api/product-packs", 16u * 1024 * 1024, false, "product_pack_yaml"},
+
+    // POST /api/instructions/import — JSON instruction-definition import,
+    // whole raw body forwarded verbatim to `import_definition_json`
+    // (server.cpp:11130 -> instruction_store.cpp:954 -> create_definition_
+    // impl:434, which DOES hard-reject an oversized `yaml_source` field at
+    // 1048576 bytes via validate_definition_scope, instruction_store.cpp:
+    // 411). That real check does NOT bound the whole request, though: an
+    // imported definition also carries an optional `responseTemplates`
+    // field, and when it is supplied as a native JSON array/object (not a
+    // pre-serialized string) `normalise_templates_array` applies NO size
+    // limit at all (the 256 KiB `kMaxImportTemplateStringBytes` guard,
+    // instruction_store.cpp:904, only fires on the string-form branch) — so
+    // a well-formed request with a huge templates array is not rejected by
+    // anything downstream. No genuine aggregate contract, therefore: same
+    // "no contract yet" judgment-call category as guardian_rule_authoring/
+    // workflow_yaml/product_pack_yaml above, and the same peer bound.
+    {"POST", "/api/instructions/import", 16u * 1024 * 1024, false, "instruction_import"},
+
+    // POST /api/instructions/yaml (save), POST /api/instructions/validate-
+    // yaml, POST /fragments/instructions/yaml-preview — three FORM-encoded
+    // (application/x-www-form-urlencoded) twins of one shape: a single
+    // `yaml_source` field (save also carries a small `id` field), all three
+    // routed through the SAME check — server.cpp:6493 `validate_yaml_source`
+    // -> `instruction_yaml::validate_definition_yaml`, which hard-rejects
+    // `yaml_source.size() > 1048576` at instruction_yaml.cpp:165 (the exact
+    // 1 MiB decoded-value contract create/update also enforce). This is the
+    // SAME raw-vs-decoded shape as tar_dashboard_sql (C1) — the pre-routing
+    // gate sees the percent-encoded RAW body, the handler checks the
+    // DECODED `yaml_source` value — so the cap must NOT mirror 1048576
+    // directly (the #2407-as-shipped defect this table already paid for
+    // once). Fix, same method as C1: 3x1048576 (worst-case percent-encoding
+    // of the full 1 MiB decoded value the handler still admits) + 4 KiB
+    // flat headroom for the "yaml_source="/"&id=" field-name framing (the
+    // `id` field itself has no length contract anywhere in the codebase) =
+    // 3145728 + 4096 = 3149824 bytes exactly. One shared cap+label across
+    // all three routes — same size-defense reasoning, same check, distinct
+    // literal paths (no common prefix to key one table entry on).
+    {"POST", "/api/instructions/yaml", 3149824u, false, "instruction_yaml"},
+    {"POST", "/api/instructions/validate-yaml", 3149824u, false, "instruction_yaml"},
+    {"POST", "/fragments/instructions/yaml-preview", 3149824u, false, "instruction_yaml"},
 
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.
@@ -287,6 +455,15 @@ struct BodyCapMatch {
     // set. Guarded rather than dereferenced blindly so a future edit that
     // accidentally removes or mis-scopes the default entry fails LOUD (a
     // zero-byte cap that rejects everything) instead of invoking UB.
+    //
+    // UNDOCUMENTED-METRIC GAP (recorded, not yet closed): `path_class=
+    // "unmatched"` is a real value this function can emit, but it is not a
+    // row in `kBodyCapTable`, so `server.cpp`'s boot-time pre-seed loop
+    // (which iterates `kBodyCapTable` to pre-seed `yuzu_body_cap_rejected_
+    // total`'s closed label set to 0) never seeds it — the series would
+    // appear unannounced the first time this sentinel is ever reached.
+    // `server.cpp` owns that seeding loop; this header only owns documenting
+    // the gap so it is not silently assumed closed.
     if (best == nullptr)
         return {0, true, "unmatched"};
     return {best->max_body_bytes, best->requires_measurable, best->path_class};
