@@ -1592,12 +1592,12 @@ for whoever owns that runner.
    key is what "not restated" means.** (Found in PR #2870 review, while validating a
    fix to this same section: a first attempt at implementing this merge treated an
    explicit `null` as "leave the earlier value alone," which is wrong and would have
-   silently kept a stale value live after a row explicitly cleared it.) Every writer
-   in this repo's own practice emits every field on every row, nullable ones
-   included — so a superseding row that means to CLEAR a nullable field to null must
-   still include that key with an explicit `null`, not omit it; omitting a key is
-   indistinguishable from "did not touch this field" only if the writer's convention
-   never emits absent keys in the first place, which is the convention here.
+   silently kept a stale value live after a row explicitly cleared it.) This is why
+   the distinction exists at all: a nullable field's UNSET state and its
+   EXPLICITLY-CLEARED-BY-SUPERSESSION state would otherwise be indistinguishable. A
+   superseding row that means to clear a nullable field to null MUST include that
+   key with an explicit `null` — omitting the key instead restates nothing, and the
+   live view keeps whatever the field already was.
 
    **List fields REPLACE wholesale, they do not union.** `impact` and `exposure` are
    the two. A supersession restating `impact: ["I8"]` over `["I2","I5"]` yields
