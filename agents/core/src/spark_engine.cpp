@@ -845,15 +845,26 @@ void SparkEngine::teardown_arm_race(SubscriptionId id, const std::string& key, S
     // disarm()'s body, specialized so no allocation failure can escape it (#2270
     // layer 2). Every difference from disarm() is deliberate; keep the two in lockstep:
     //   * `key`/`type` come from the caller, so no lookup and no copy is needed.
+    //   * `event_driven` is likewise the caller's already-computed value (arm_impl's
+    //     own `const bool event_driven = is_event_driven(spec.type);`), not
+    //     recomputed from the stored Armed::spec.type the way disarm()'s
+    //     `is_event_driven(ai->second.spec.type)` is — same "the caller already
+    //     holds it" rationale as `key`/`type` above. Identical value today (both
+    //     derive from the same spec.type), found and confirmed equivalent-but-
+    //     undocumented by an external adversarial review (PR #2843) — kept as its
+    //     own bullet rather than folded into the first, since it is a PASSED value,
+    //     not merely an unlooked-up one, and a future edit that lets the two diverge
+    //     needs this spelled out to catch.
     //   * the log line is contained — as disarm()'s now is too.
     //   * a throwing unwatch() is contained and counted — as disarm()'s now is too,
     //     into its own separately-scoped counter.
     // The last two were differences until disarm() was hardened; they are recorded as
     // parity rather than deleted, so a reader diffing the pair sees why each is there.
-    // Everything else is disarm() verbatim, and must stay that way: ONE subscription
-    // is removed, never the key, because losing the M1 race invalidates OUR arm and
-    // nobody else's. A sibling that deduped onto this key keeps its subscription AND
-    // its watcher — deleting those is precisely the defect that failed review twice.
+    // Everything else is disarm() verbatim in effect (four documented differences,
+    // not zero), and must stay that way: ONE subscription is removed, never the key,
+    // because losing the M1 race invalidates OUR arm and nobody else's. A sibling
+    // that deduped onto this key keeps its subscription AND its watcher — deleting
+    // those is precisely the defect that failed review twice.
     ISparkMechanism* mech = nullptr;
     {
         std::lock_guard lk(mu_);
