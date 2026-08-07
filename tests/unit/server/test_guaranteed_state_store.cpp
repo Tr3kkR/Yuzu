@@ -129,6 +129,26 @@ std::string query_scalar(const std::string& dsn, const std::string& sql) {
     return PQgetvalue(r.get(), 0, 0);
 }
 
+// Pass `reap_expired()` over an EMPTY table BEFORE seeding, so the #2579
+// missing-anchor trigger's bootstrap decline is consumed on nothing — mirrors
+// test_audit_store.cpp's `anchor_guard`. Needed because the trigger makes "no
+// stored reading, and rows already expired" a decline in its own right;
+// almost every reap test here is about something else (the cap, the dedup
+// rule, one specific detector) and would otherwise spend its first pass
+// absorbing a bootstrap decline it never meant to exercise.
+//
+// Exact rather than approximate: with nothing expired, `classify()`
+// short-circuits to `None` on `!has_expired` before it ever tests
+// `no_anchor`, so no counter moves and no anomaly is recorded — but the pass
+// still reaches a verdict and settles `bootstrap_settled` (see
+// `guaranteed_state_store.cpp`'s `reap_expired`), which is the effect this
+// helper exists for. Call it immediately after construction, before seeding.
+void anchor_guard(GuaranteedStateStore& store) {
+    store.reap_expired();
+    REQUIRE(store.events_reaped_total() == 0);
+    REQUIRE(store.observations_reaped_total() == 0);
+}
+
 // ── Backfill legacy-SQLite fixtures (ADR-0038's 5-table shape) ─────────────
 // The pre-migration SQLite schema `migrate_from_sqlite` reads: rules / meta /
 // status / events / observations. Raw sqlite3 C API — these target the
@@ -2030,6 +2050,7 @@ TEST_CASE("GuaranteedStateStore: reap_expired reaps observations in lockstep wit
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool, /*retention_days=*/30);
+    anchor_guard(store); // consume the #2579 bootstrap decline before seeding
     auto obs = [&](const std::string& id) {
         GuaranteedStateEventRow e;
         e.event_id = id;
@@ -2105,6 +2126,7 @@ TEST_CASE("GuaranteedStateStore: reap_expired deletes rows past ttl_expires_at, 
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool, /*retention_days=*/30);
+    anchor_guard(store); // consume the #2579 bootstrap decline before seeding
 
     for (int i = 0; i < 3; ++i)
         REQUIRE(store.insert_event(make_event("fresh-" + std::to_string(i), "r", "a")));
@@ -2147,6 +2169,13 @@ TEST_CASE("GuaranteedStateStore: reap_expired declines once on an all-expired "
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool, /*retention_days=*/30);
     REQUIRE(store.is_open());
+    // Anchored first: without this, pass 1's fact set carries no_anchor=true
+    // (#2579 — a decline in its own right, would_wipe outranks it so the
+    // decline reason is unaffected) but SETTLES the bootstrap marker, so pass
+    // 2's fact set differs from pass 1's in that one field alone and is no
+    // longer a suppressed repeat — it declines a second time instead of
+    // draining. Anchoring first keeps this test's decline-once contract intact.
+    anchor_guard(store);
 
     for (int i = 0; i < 3; ++i)
         REQUIRE(store.insert_event(make_event("wipe-" + std::to_string(i), "r", "a")));
@@ -2196,6 +2225,58 @@ TEST_CASE("GuaranteedStateStore: reap_expired declines once on an all-expired "
     CHECK(gc_meta_anomaly_count() == "0");   // consumed/cleared
 }
 
+// #2579's missing-anchor trigger, ported: the disclosed shape, end to end. A
+// fresh PG deploy — no `gc_meta` row exists yet — whose host clock is
+// forward-skewed at the very first guarded pass. Some rows are already
+// expired (written before the skew), one is still inside the window (written
+// after it), so `0 < expiring < datable`: neither `would_wipe` nor `big_step`
+// (no prior reading to compare against) trips. Before this fix, every
+// detector was false, so the pass classified `Anomaly::None` and deleted with
+// no decline, no anomaly record, and no counter — this is the review's own
+// falsifier for the #2663 blocking finding. Deliberately NOT anchored first:
+// the absence of a stored reading IS the input under test.
+TEST_CASE("GuaranteedStateStore #2579: no stored reading + partial expiry declines, once",
+          "[pg][guaranteed_state_store][retention][clock-guard]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool, /*retention_days=*/30);
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.insert_event(make_event("anchor-expired", "r", "a")));
+    REQUIRE(store.insert_event(make_event("anchor-live", "r", "a"))); // 30d-ahead ttl, survives
+    // Only one of the two rows is aged into the past — expiring (1) < datable
+    // (2), so would_wipe does NOT trip. That is the shape #2579 closes: before
+    // it, nothing else would have declined either.
+    exec_sql(db.dsn(), "UPDATE guaranteed_state_store.guaranteed_state_events SET "
+                       "ttl_expires_at = 1 WHERE event_id = 'anchor-expired'");
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store.gc_meta WHERE key "
+                                 "= 'last_pass_now'") == "0"); // fresh deploy: no anchor yet
+
+    // First pass: declines (NoAnchor) — nothing reaped, the anomaly recorded,
+    // the bootstrap marker settled (so the trigger cannot be spent twice).
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 0);
+    CHECK(store.event_count() == 2); // both rows still present — the decline held
+    CHECK(query_scalar(db.dsn(), "SELECT value FROM guaranteed_state_store.gc_meta WHERE key = "
+                                 "'last_anomaly_facts'") == "e---b");
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store.gc_meta WHERE key "
+                                 "= 'bootstrap_settled'") == "1");
+
+    // Second pass: re-anchored (bootstrap_settled from pass 1), so this is a
+    // genuinely CLEAN pass (Anomaly::None) — drains the one expired row,
+    // capped as always, and clears the dedup row.
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 1);
+    CHECK(store.event_count() == 1); // only "anchor-live" survives
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store.gc_meta WHERE key "
+                                 "= 'last_anomaly_facts'") == "0"); // consumed/cleared
+
+    // Once, not forever: a third pass against an already-settled bootstrap
+    // marker does not decline again — nothing left to reap, clean no-op.
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 1); // unchanged
+}
+
 TEST_CASE("GuaranteedStateStore: reap_expired is a no-op on a closed store",
           "[guaranteed_state_store][retention]") {
     // ADR-0038: reap_expired() replaces the old background-thread start_cleanup()/
@@ -2216,20 +2297,23 @@ TEST_CASE("GuaranteedStateStore: reap_expired is a no-op on a closed store",
 // the slow part of the whole suite. A `cap-live` (unexpired) row seeded
 // alongside keeps datable (10002) strictly greater than expiring (10001) so
 // part 1's would_wipe classifier (expiring >= datable) does NOT trip — that
-// shape is covered separately below. With no prior gc_meta row in a fresh
-// template clone (so big_step can't trip either), this pass classifies clean
-// (Anomaly::None) and the unconditional per-pass cap is the only thing
-// bounding the delete on EACH of the two lockstep DELETEs — exactly what
-// this test pins. Contract note: reap_expired() returns void — the cap is
-// observed via the cumulative events_reaped_total()/observations_reaped_total()
-// counters, not a return value (unlike ResultSetStore::gc_sweep(), which
-// returns the per-call count directly).
+// shape is covered separately below. Anchored first (`anchor_guard`) so the
+// #2579 missing-anchor trigger doesn't decline this pass instead — with the
+// bootstrap marker already settled and no prior gc_meta reading to trip
+// big_step, this pass classifies clean (Anomaly::None) and the unconditional
+// per-pass cap is the only thing bounding the delete on EACH of the two
+// lockstep DELETEs — exactly what this test pins. Contract note:
+// reap_expired() returns void — the cap is observed via the cumulative
+// events_reaped_total()/observations_reaped_total() counters, not a return
+// value (unlike ResultSetStore::gc_sweep(), which returns the per-call count
+// directly).
 TEST_CASE("GuaranteedStateStore: reap_expired caps a large expired batch at kReapCapPerPass",
           "[pg][guaranteed_state_store][retention]") {
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool, /*retention_days=*/30);
     REQUIRE(store.is_open());
+    anchor_guard(store); // consume the #2579 bootstrap decline before seeding
 
     {
         pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
@@ -2372,6 +2456,7 @@ TEST_CASE("GuaranteedStateStore: reap_expired reaps a tied-ttl cohort of events 
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool, /*retention_days=*/30);
     REQUIRE(store.is_open());
+    anchor_guard(store); // consume the #2579 bootstrap decline before seeding
 
     {
         pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
