@@ -525,13 +525,14 @@ from the actual facts every time; these are anchors, not a lookup table):
   shared rule
 - a documented route/field/flag that is not actually registered or read (rule 7), or
   a capability the prose claims is reachable and is not (rule 2c) → **I6** or **I7**
-- a **test** offered as closure evidence for an otherwise-blocking finding, that
-  **cannot observe what it asserts** (rule 5's sharpest case) is not a derived band
-  at all — it is the existing **false-green policy floor**, worded exactly as that
-  floor is worded above, and gates regardless of band. A rule-5 defect that falls
-  short of that — a check that merely claims more than it demonstrates without being
-  offered as closure evidence for a blocking finding — derives a band normally like
-  any other rule-5 finding; do not widen the floor's closed wording to cover it
+- a **test** offered as closure evidence for a **blocking** finding, that **cannot
+  observe what it asserts** (rule 5's sharpest case, same subject and predicate as
+  the floor's own definition above) is not a derived band at all — it is the
+  existing **false-green policy floor**, and gates regardless of band. A rule-5
+  defect that falls short of that — a check that merely claims more than it
+  demonstrates without being offered as closure evidence for a blocking finding —
+  derives a band normally like any other rule-5 finding; do not widen the floor's
+  closed wording to cover it
 - a rule-4 defect in a ledger row or issue disposition is reviewed against the
   ledger-schema rules already stated in Gate 8 below, not derived fresh
 
@@ -545,8 +546,9 @@ unchecked, not that it shipped wrong.
 
 If Gate 0 raises **zero findings**, carry the site list from Mechanics into Gate 1's
 Change Summary as a single line: the count of sites reviewed, the rule set applied,
-and the batch count if you split (e.g. "Gate 0: 14 sites (rules 2/5/6/7) + 3 changed
-facts (rule 1), 1 batch, 0 findings"). That count is what makes "0 findings" and
+and the batch count if you split (e.g. no split: "Gate 0: 14 sites (rules 2/5/6/7) +
+3 changed facts (rule 1), 0 findings"; split: "...2 batches, 0 findings"). That count
+is what makes "0 findings" and
 "Gate 0 did not run" distinguishable — which is the same known gap the ledger schema
 already names for every gate (see Gate 8's "known gap, unsolved"); Gate 0 does not
 close that gap, it just doesn't make it worse by staying silent on the count.
