@@ -102,15 +102,25 @@ The SQLite store's background cleanup thread issues **bare wall-clock TTL delete
 `guaranteed_state_events` + `guardian_observations` — on the routed-concern
 "Clock-guarded retention" non-compliance list (#2508). The port adopts the **#2496
 `gc_sweep` reference shape** (first PG implementation of the guard): shared
-`gc_meta`-style rows (`last_pass_now` + `last_anomaly_facts`) in the store schema, one
-sweeping replica per pass via `pg_try_advisory_xact_lock('guaranteed_state_store:reap',0)`,
-outcome probe excluding implausibly-ahead rows, `audit_retention_rules::classify` +
-fact-set decline-once, **unconditional per-pass cap** (substrate-tuned constant; events
-and observations reaped in the same guarded pass so the PII projection never outlives its
-parent event — the lockstep invariant survives). The `events_reaped_`/
-`observations_reaped_` counters (compliance WS-E disposal evidence on `/metrics`) are
-kept and now also exported with a `result` label per the #2634 direction, so this store
-does not reproduce the observability gap #2634 tracks on ResultSetStore.
+`gc_meta`-style rows (`last_pass_now`, `last_anomaly_facts`, `bootstrap_settled`) in the
+store schema, one sweeping replica per pass via
+`pg_try_advisory_xact_lock('guaranteed_state_store:reap',0)`, outcome probe excluding
+implausibly-ahead rows, `audit_retention_rules::classify` + fact-set decline-once,
+**unconditional per-pass cap** (substrate-tuned constant; events and observations reaped
+in the same guarded pass so the PII projection never outlives its parent event — the
+lockstep invariant survives). The `events_reaped_`/`observations_reaped_` counters
+(compliance WS-E disposal evidence on `/metrics`) are kept as-is, unlabelled; the
+`result` label lives on the separate `yuzu_server_guardian_reap_passes_total` pass
+counter, per the #2634 direction, so this store does not reproduce the observability gap
+#2634 tracks on ResultSetStore.
+
+Adopts the routed-concern's part-6 missing-anchor trigger (#2579): a pass that has not
+yet reached a verdict on this database, with rows already expired, declines once and
+anchors rather than deleting (`result=declined_no_anchor` on the pass counter). Recorded
+answer, at the `Facts` construction site: **decline**, `AuditStore`'s answer, not
+`ResultSetStore`'s — a mis-timed pass here would destroy Guardian drift/remediation
+events and their DEX observation projection, the non-regenerable compliance evidence this
+migration exists to bring into #2508 compliance.
 
 ### Lifecycle
 
