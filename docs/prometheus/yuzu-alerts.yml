@@ -1017,12 +1017,16 @@ groups:
       # upper edge, and the old rule was blind above 195 too. This is strictly
       # and substantially better, and still has a hole.
       #
-      # Closing it needs a SERVER change, not a PromQL one. The natural signal,
-      # `..._retention_last_pass_unixtime`, is seeded 0 and never reloaded from
-      # the persisted `audit_retention_meta` anchor, so it zeroes on every restart
-      # and a freshness rule built on it REGRESSES the 30-minute crash loop this
-      # rule already catches. Tracked separately; do not rewrite this expression
-      # in place without a cadence x evaluation-interval sweep.
+      # Closing it needs a SERVER change, not a PromQL one -- and as of #2854 the
+      # server half exists: `..._retention_last_pass_unixtime` is now seeded from
+      # the persisted `audit_retention_meta` anchor at startup, surviving a
+      # restart (including the first PostgreSQL boot). What's still open is the
+      # RULE that uses it -- a freshness expression built naively on this gauge
+      # still needs the min/max-over-time treatment #2854's design worked out (a
+      # bare instant-vector freshness check regresses the 30-minute crash loop
+      # this rule already catches), and that redesign is tracked separately.
+      # Do not rewrite this expression in place without a cadence x
+      # evaluation-interval sweep.
       #
       # KNOWN LIMIT, and it bites hardest where crash loops live. `resets()` needs
       # ONE CONTINUOUS SERIES per server. If a restart changes the `instance`
