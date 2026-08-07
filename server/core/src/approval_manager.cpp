@@ -104,7 +104,20 @@ ApprovalOrigin approval_origin_from_string(std::string_view text) {
     return ApprovalOrigin::kUnrecognised;
 }
 
+// Guarded like the other two closed-set switches over this enum in this file.
+// The trailing `return true` already fails closed, so a missing arm cannot grant
+// — but it would silently pick the REFUSE side for a surface that may have been
+// added precisely to be redeemable, and the author would never be told. Adding
+// the guard to two of the three was an inconsistency, not a judgement.
 bool declares_non_mcp_surface(ApprovalOrigin origin) {
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(1 : 4062) // off by default; `error:` alone does NOT enable it
+#pragma warning(error : 4062)
+#endif
     switch (origin) {
     case ApprovalOrigin::kInstruction:
     case ApprovalOrigin::kSchedule:
@@ -114,6 +127,11 @@ bool declares_non_mcp_surface(ApprovalOrigin origin) {
     case ApprovalOrigin::kUnspecified:
         return false;
     }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
     return true; // unreachable; fail closed if the enum grows
 }
 

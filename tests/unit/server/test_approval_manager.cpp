@@ -1327,7 +1327,9 @@ TEST_CASE("ApprovalManager: migration v7 reaches a store already at v5",
                          "INSERT INTO approvals (id, definition_id, submitted_at, origin)"
                          " VALUES ('pre-column', 'mcp.delete_tag', 999999, '');"
                          // minted AFTER the column existed with no declared origin —
-                         // that is the live MCP mint, and it MUST stay redeemable
+                         // the live MCP mint. v7 rewrites this row TOO, so it is
+                         // refused after the upgrade. That is the deliberate cost,
+                         // asserted below; do not "fix" the sweep to spare it.
                          "INSERT INTO approvals (id, definition_id, submitted_at, origin)"
                          " VALUES ('mcp-mint', 'mcp.delete_tag', 1000001, '');"
                          // a DECLARED origin: v7's `WHERE origin = ''` must not
@@ -1359,8 +1361,10 @@ TEST_CASE("ApprovalManager: migration v7 reaches a store already at v5",
     // why no assertion here can catch its return.
     //
     // The cost is real and bounded: an undeclared MCP ticket outstanding at
-    // upgrade stops redeeming and must be re-requested. That is exactly what a
-    // release upgrade does via v5, so the two paths agree.
+    // upgrade stops redeeming and must be re-requested. v7 is the sole back-fill
+    // and reaches both populations — a store below v5 (v5 adds the column, v7
+    // rewrites in the same run) and one already at v5 or v6 — so every upgrade
+    // path produces this same outcome.
     auto live = mgr.get("mcp-mint");
     REQUIRE(live.has_value());
     CHECK(live->origin == ApprovalOrigin::kUnrecognised);
