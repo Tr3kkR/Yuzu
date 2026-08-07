@@ -38,6 +38,7 @@
 #include <yuzu/server/scim_store.hpp>
 #include <yuzu/server/server.hpp>
 
+#include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "test_auth_db_pg_helper.hpp"
 
@@ -49,8 +50,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -72,14 +73,17 @@ struct Fixture {
     yuzu::test::AuthDbPg auth_db;
     auth::AuthManager auth_mgr;
     std::unique_ptr<ScimStore> scim_store;
-    yuzu::test::TempDbFile audit_db_file{std::string_view{"yuzu-scim-routes-audit-"}};
+    // AuditStore ported to Postgres (ADR-0006): shares auth_db's PgPool/
+    // database (same "one PgPool" pattern as ScimStore above) in the normal
+    // case; `broken_audit` instead points it at an unroutable pool so
+    // is_open() reads false without needing mid-test fault injection.
+    std::optional<yuzu::server::pg::PgPool> audit_bad_pool;
     std::unique_ptr<AuditStore> audit_store;
     test::TestRouteSink sink;
     std::unique_ptr<ScimRoutes> routes;
     const std::string token{"unit-test-scim-bearer-token-0123456789"};
 
-    /// `broken_audit=true` points AuditStore at a path whose parent
-    /// directory does not exist, so `sqlite3_open_v2` fails and every
+    /// `broken_audit=true` points AuditStore at an unroutable pool so every
     /// `AuditStore::log()` call returns false thereafter — used to exercise
     /// the set-and-proceed vs. fail-closed audit contract
     /// (M-AUDIT-FAILCLOSED) without needing mid-test fault injection.
@@ -94,11 +98,12 @@ struct Fixture {
         REQUIRE(scim_store->set_token(token, "test"));
 
         if (broken_audit) {
-            audit_store = std::make_unique<AuditStore>(
-                std::filesystem::path("/nonexistent-yuzu-scim-test-dir-0123") / "audit.db");
+            audit_bad_pool.emplace(yuzu::server::pg::PgPool::Options{
+                .conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1});
+            audit_store = std::make_unique<AuditStore>(*audit_bad_pool);
             REQUIRE_FALSE(audit_store->is_open());
         } else {
-            audit_store = std::make_unique<AuditStore>(audit_db_file.path);
+            audit_store = std::make_unique<AuditStore>(auth_db.pool());
             REQUIRE(audit_store->is_open());
         }
 
@@ -380,7 +385,9 @@ TEST_CASE("ScimRoutes: PATCH active=false re-runs deactivation when the mirror i
     AuditQuery q;
     q.action = "scim.user.deactivated";
     q.target_id = id;
-    CHECK(f.audit_store->query(q).size() == 1);
+    auto deactivated_rows = f.audit_store->query(q);
+    REQUIRE(deactivated_rows.has_value());
+    CHECK(deactivated_rows->size() == 1);
 }
 
 TEST_CASE("ScimRoutes: PATCH active=false stays a clean no-op when the account is genuinely "
@@ -407,7 +414,9 @@ TEST_CASE("ScimRoutes: PATCH active=false stays a clean no-op when the account i
     AuditQuery q;
     q.action = "scim.user.deactivated";
     q.target_id = id;
-    CHECK(f.audit_store->query(q).size() == 1);
+    auto deactivated_rows = f.audit_store->query(q);
+    REQUIRE(deactivated_rows.has_value());
+    CHECK(deactivated_rows->size() == 1);
 }
 
 // ── DELETE ──────────────────────────────────────────────────────────────────
@@ -847,8 +856,9 @@ TEST_CASE("ScimRoutes: two concurrent identical Group-add PATCHes promoting the 
     q.action = "scim.user.role_changed";
     q.target_id = user_id;
     auto rows = f.audit_store->query(q);
+    REQUIRE(rows.has_value());
     int success_to_admin = 0;
-    for (const auto& row : rows) {
+    for (const auto& row : *rows) {
         if (row.result == "success" && row.detail.find("new_role=admin") != std::string::npos)
             ++success_to_admin;
     }
@@ -1649,7 +1659,8 @@ struct ScimIntegrationServer {
     yuzu::test::AuthDbPg auth_db;
     auth::AuthManager auth_mgr;
     std::unique_ptr<ScimStore> scim_store;
-    yuzu::test::TempDbFile audit_db_file{std::string_view{"yuzu-scim-integration-audit-"}};
+    // AuditStore ported to Postgres (ADR-0006): shares auth_db's PgPool/
+    // database (same "one PgPool" pattern as ScimStore above).
     std::unique_ptr<AuditStore> audit_store;
     std::unique_ptr<ScimRoutes> routes;
     RateLimiter rate_limiter;
@@ -1667,7 +1678,7 @@ struct ScimIntegrationServer {
         REQUIRE(scim_store->is_open());
         REQUIRE(scim_store->set_token(token, "test"));
 
-        audit_store = std::make_unique<AuditStore>(audit_db_file.path);
+        audit_store = std::make_unique<AuditStore>(auth_db.pool());
         REQUIRE(audit_store->is_open());
 
         // Mirrors server.cpp's pre-routing lambda ordering (server.cpp
@@ -2025,7 +2036,8 @@ TEST_CASE("Groups integration: PROVENANCE — a group member value mapping to a 
     q.action = "scim.user.role_changed";
     q.target_id = local_admin_mapping->scim_id;
     auto rows = ts.audit_store->query(q);
-    CHECK(rows.empty());
+    REQUIRE(rows.has_value());
+    CHECK(rows->empty());
 
     // The membership ITSELF is a valid store operation (the local admin's
     // scim_id IS a live scim_resource row — the routes layer's
@@ -2186,9 +2198,10 @@ TEST_CASE("Groups integration: DELETE demotes every member and audits the demoti
     q.action = "scim.user.role_changed";
     q.target_id = user_id;
     auto rows = ts.audit_store->query(q);
-    REQUIRE_FALSE(rows.empty());
+    REQUIRE(rows.has_value());
+    REQUIRE_FALSE(rows->empty());
     bool found_demotion = false;
-    for (const auto& row : rows) {
+    for (const auto& row : *rows) {
         if (row.result == "success" && row.detail.find("new_role=user") != std::string::npos)
             found_demotion = true;
     }
@@ -2324,8 +2337,9 @@ TEST_CASE("Groups integration: PUT rename onto an existing group's displayName 4
     q.action = "scim.group.updated";
     q.target_id = b_id;
     auto rows = ts.audit_store->query(q);
+    REQUIRE(rows.has_value());
     bool found_denied = false;
-    for (const auto& row : rows)
+    for (const auto& row : *rows)
         if (row.result == "denied")
             found_denied = true;
     CHECK(found_denied);
@@ -2370,8 +2384,9 @@ TEST_CASE("Groups integration: PATCH rename onto an existing group's displayName
     q.action = "scim.group.updated";
     q.target_id = b_id;
     auto rows = ts.audit_store->query(q);
+    REQUIRE(rows.has_value());
     bool found_denied = false;
-    for (const auto& row : rows)
+    for (const auto& row : *rows)
         if (row.result == "denied")
             found_denied = true;
     CHECK(found_denied);
@@ -2501,8 +2516,9 @@ TEST_CASE("Groups integration: sec-L3/#7 member cap over HTTP — >5000 members 
     AuditQuery q;
     q.action = "scim.group.created";
     auto rows = ts.audit_store->query(q);
+    REQUIRE(rows.has_value());
     bool found_denied = false;
-    for (const auto& row : rows)
+    for (const auto& row : *rows)
         if (row.result == "denied" && row.detail.find("member count exceeds cap") != std::string::npos)
             found_denied = true;
     CHECK(found_denied);
@@ -2597,9 +2613,10 @@ TEST_CASE("Groups integration: a genuine update_role failure during recompute au
     q.action = "scim.user.role_changed";
     q.target_id = user_id;
     auto rows = ts.audit_store->query(q);
-    REQUIRE_FALSE(rows.empty());
+    REQUIRE(rows.has_value());
+    REQUIRE_FALSE(rows->empty());
     bool found_failure = false;
-    for (const auto& row : rows) {
+    for (const auto& row : *rows) {
         if (row.result == "failure" &&
             row.detail.find("intended_new_role=admin") != std::string::npos)
             found_failure = true;
@@ -2677,10 +2694,11 @@ TEST_CASE("Groups integration: PATCH rename OFF the admin group demotes every cu
     q.action = "scim.user.role_changed";
     q.target_id = member_id;
     auto rows = ts.audit_store->query(q);
-    REQUIRE_FALSE(rows.empty());
+    REQUIRE(rows.has_value());
+    REQUIRE_FALSE(rows->empty());
     bool found_demotion = false;
     bool found_trigger_detail = false;
-    for (const auto& row : rows) {
+    for (const auto& row : *rows) {
         if (row.result == "success" && row.detail.find("new_role=user") != std::string::npos)
             found_demotion = true;
         if (row.detail.find("via_group=\"Former-Admins") != std::string::npos)
@@ -2776,8 +2794,9 @@ TEST_CASE("Groups integration: PATCH mixing a rename with a member add recompute
     oscar_q.action = "scim.user.role_changed";
     oscar_q.target_id = pre_existing_member;
     auto oscar_rows = ts.audit_store->query(oscar_q);
+    REQUIRE(oscar_rows.has_value());
     int oscar_demotions = 0;
-    for (const auto& row : oscar_rows)
+    for (const auto& row : *oscar_rows)
         if (row.result == "success" && row.detail.find("new_role=user") != std::string::npos)
             ++oscar_demotions;
     CHECK(oscar_demotions == 1);
@@ -3292,8 +3311,9 @@ TEST_CASE("Groups integration: PATCH persist failure leaves displayName, members
     q.action = "scim.group.updated";
     q.target_id = group_id;
     auto rows = ts.audit_store->query(q);
+    REQUIRE(rows.has_value());
     bool found_failure = false;
-    for (const auto& row : rows)
+    for (const auto& row : *rows)
         if (row.result == "failure")
             found_failure = true;
     CHECK(found_failure);
@@ -3371,8 +3391,9 @@ TEST_CASE("Groups integration: PUT persist failure leaves displayName, membershi
     q.action = "scim.group.updated";
     q.target_id = group_id;
     auto rows = ts.audit_store->query(q);
+    REQUIRE(rows.has_value());
     bool found_failure = false;
-    for (const auto& row : rows)
+    for (const auto& row : *rows)
         if (row.result == "failure")
             found_failure = true;
     CHECK(found_failure);

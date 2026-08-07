@@ -30,6 +30,7 @@
 #include "api_token_store.hpp"
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "test_route_sink.hpp"
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
@@ -44,7 +45,9 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -52,6 +55,18 @@ namespace fs = std::filesystem;
 using namespace yuzu::server;
 
 namespace {
+
+// AuditStore migrated to Postgres (ADR-0006) — the harness below clones this
+// pre-migrated template instead of opening a SQLite path. Self-contained
+// (mirrors yuzu::test::AuthDbPg, already embedded in the harness): SKIPs the
+// enclosing TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset (via auth_db's own
+// ctor, constructed first), FAILs when set but broken.
+yuzu::test::PgTestTemplate auth_routes_hardened_audit_tpl{"hardaudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("hardaudit template: store failed to migrate");
+}};
 
 struct TmpDirGuard {
     fs::path path;
@@ -78,6 +93,12 @@ struct HardenedHarness {
     // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
     // store method, and AuthRoutes null-guards the pointer, so it gets nullptr
     // below — embedding the PG fixture only made every case skip without a DSN.
+    // AuditStore ported to Postgres (ADR-0006): a template-cloned ephemeral
+    // database + pool, mirroring auth_db's own self-contained skip/fail
+    // posture above (auth_db constructs first, so an unset DSN never reaches
+    // this member at all).
+    std::optional<yuzu::test::PostgresTestDb> audit_db;
+    std::optional<yuzu::server::pg::PgPool> audit_pool;
     std::unique_ptr<AuditStore> audit_store;
     std::unique_ptr<AnalyticsEventStore> analytics_store;
     std::shared_mutex oidc_mu;
@@ -99,7 +120,11 @@ struct HardenedHarness {
         auth_mgr.set_auth_db(auth_db.get());
         auth_mgr.set_metrics_registry(&metrics);
 
-        audit_store = std::make_unique<AuditStore>(tmp.path / "audit.db");
+        audit_db.emplace(auth_routes_hardened_audit_tpl);
+        INFO("[HardenedHarness] audit db status (blank == ok): " << audit_db->error());
+        REQUIRE(audit_db->available());
+        audit_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = audit_db->dsn(), .size = 4});
+        audit_store = std::make_unique<AuditStore>(*audit_pool);
         analytics_store = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
 
         auth_routes = std::make_unique<AuthRoutes>(
@@ -144,7 +169,9 @@ struct HardenedHarness {
         q.action = action;
         if (!principal.empty())
             q.principal = principal;
-        return static_cast<int>(audit_store->query(q).size());
+        auto res = audit_store->query(q);
+        REQUIRE(res.has_value());
+        return static_cast<int>(res->size());
     }
 
     // Read a metric counter value (review #1735 LOW). The label set must match
