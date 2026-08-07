@@ -538,9 +538,9 @@ from the actual facts every time; these are anchors, not a lookup table):
 
 A rule-2 "unverifiable" finding where the underlying fact turns out to be TRUE on
 investigation is not zero. **Record it `verified`, not `speculative`** (found in PR
-#2870 review): CLAUDE.md's standing rule reserves `speculative` for when you can name
-"neither the code path nor a candidate trigger" — the opposite of this case, where
-you investigated and found both. `speculative` is also the one status that exempts a
+#2870 review): CLAUDE.md's standing rule reserves `speculative` for "neither code
+path nor candidate trigger nameable" — the opposite of this case, where you
+investigated and found both. `speculative` is also the one status that exempts a
 finding from the gate, so mislabeling it here would hand a gate exemption to a defect
 you directly confirmed. What the finding is ABOUT is the process failure — an
 unverified claim shipped — and that failure is itself directly observed, hence
@@ -1587,6 +1587,17 @@ for whoever owns that runner.
    ungated and unclassified the moment a `fixed` row omitted `severity_mapped` and
    `policy_floor`. Merge; do not replace. Ties, which should not occur, break on the
    higher `pass_ordinal`.
+
+   **A KEY PRESENT IN THE JSON, even set to `null`, is a restatement — an ABSENT
+   key is what "not restated" means.** (Found in PR #2870 review, while validating a
+   fix to this same section: a first attempt at implementing this merge treated an
+   explicit `null` as "leave the earlier value alone," which is wrong and would have
+   silently kept a stale value live after a row explicitly cleared it.) Every writer
+   in this repo's own practice emits every field on every row, nullable ones
+   included — so a superseding row that means to CLEAR a nullable field to null must
+   still include that key with an explicit `null`, not omit it; omitting a key is
+   indistinguishable from "did not touch this field" only if the writer's convention
+   never emits absent keys in the first place, which is the convention here.
 
    **List fields REPLACE wholesale, they do not union.** `impact` and `exposure` are
    the two. A supersession restating `impact: ["I8"]` over `["I2","I5"]` yields
