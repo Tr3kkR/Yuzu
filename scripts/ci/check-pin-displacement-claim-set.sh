@@ -33,8 +33,12 @@
 # THE INVARIANT, in two halves:
 #   (a) `yuzu_mcp_bridge_pin_displaced_for_admission_total` is NOT a cause. A successful
 #       reclaim releases one pin and adds one charge, so the session stays AT cap and a slot
-#       is always free. It must never appear in the alert expression, and must never be
-#       presented as something to rule out against.
+#       is always free. It must never appear in the alert expression - check (a) enforces
+#       this structurally, by construction of the expression it parses. Prose telling the
+#       reader to rule it out is a narrower, best-effort catch: check (c) scans for the two
+#       specific phrasings that have actually shipped ("rule all three out", a netted-
+#       expression description) and does not otherwise guarantee no such prose exists - a
+#       new paraphrase of the same bad advice is not guaranteed to be caught.
 #   (b) The two residual counters ARE the cause set. Every surface in STATING_SURFACES must
 #       name BOTH, in its own CLAIM REGION — see #2827 below. changelog.d fragments are held
 #       to both-or-neither instead: a release note need not enumerate counters, but naming
@@ -151,6 +155,25 @@ STATING_SURFACES=(
 # one), or a terminator that goes missing (surface reformatted) is reported, never guessed
 # past. Anchor/terminator matching uses index()/fixed strings, never a data-derived regex -
 # several anchors below contain `|` and backticks, which are regex metacharacters.
+#
+# RESIDUAL LIMITATION (external review on #2838, reproduced and then extended). check (b)
+# tests a returned region with a plain substring test, not "does the CLAIM SENTENCE name
+# this counter" - and that gap is not confined to the multi-line arms. Reproduced on
+# HOME_HDR: staling the raced mention in the derivation block while adding an in-region
+# cross-reference comment naming it elsewhere in the same block passes (b) silently. Then
+# reproduced again on MCP_SERVER_DOC, a SINGLE-line arm: the real claim there is one very
+# long physical line, long enough to hold an unrelated same-line aside (e.g. a trailing
+# `(cf. ...)` clause) after the true claim clause naming that counter is deleted - the
+# region is one line, but "one line" does not mean "one clause". Single-line capture closes
+# DIFFERENT-line masking (a sibling paragraph or table row) - that was its actual purpose,
+# sidestepping the free-form-prose boundary-guessing problem documented above - but it was
+# never a defense against a same-line decoy, and no arm here is immune to this class by
+# construction. This NARROWS the surface #2827 closed (the four multi-line arms' most
+# obvious sibling-row/comment shape); it does not close the class a second time. Left as a
+# follow-up rather than folded into this fix because every prior attempt at tightening this
+# mechanism (region-scoping itself, then single-line capture for free-form prose) shipped in
+# its own governance round and each still left a gap the next review found - the fix earns
+# its own review pass, not a rider on this one.
 # ---------------------------------------------------------------------------
 claim_region() {
     local f="$1"
@@ -158,7 +181,10 @@ claim_region() {
         "$ALERTS")
             # Region = the YuzuMcpStreamPinDisplaced rule block, anchor line to the next
             # `- alert:` (commented or not - a commented-out sibling must not inflate the
-            # region) or EOF. Reuses check (a)'s proven anchor regex.
+            # region). Reuses check (a)'s proven anchor regex. Fail-closed like HELP below:
+            # running off the end of the file without ever matching that stop line is
+            # `terminated=0`, reported as ERR terminator-missing, never silently accepted as
+            # an implicit EOF boundary.
             awk -v max="$MAX_REGION_LINES" '
                 { line = $0; sub(/\r$/, "", line) }
                 line ~ /^[[:space:]]*-[[:space:]]*alert:[[:space:]]*YuzuMcpStreamPinDisplaced([[:space:]]|#|$)/ {
