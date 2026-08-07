@@ -7548,44 +7548,30 @@ private:
             // per class, per the file-header reasoning above; chunked is
             // legal HTTP this repo does not control every client's use of.
             //
-            // KEEP-ALIVE / SMUGGLING CAVEAT (D5 — investigated, NOT fixed
-            // here — see the report for the full writeup). Returning Handled
-            // means the body is never read off the socket — the whole point,
-            // so a rejection never buffers the oversized payload.
-            // write_response_core stamps `Connection: close` on any status
-            // >= 400 (httplib.h:10789), but that header is ADVISORY TO THE
-            // CLIENT ONLY. httplib's OWN decision to close the socket is a
-            // separate `bool& connection_closed` out-parameter
-            // (`process_server_socket_core`, httplib.h:5514-5530) that this
-            // handler has NO ACCESS TO: `pre_routing_handler_`'s type is
-            // `std::function<HandlerResponse(const Request&, Response&)>`
-            // (httplib.h:1569) — no `Stream&`, no socket, no reference to
-            // `connection_closed`. That flag is set at exactly four sites
-            // inside `Server::process_request` (httplib.h:11628-11906), none
-            // reachable from here: the CLIENT's own `Connection: close`
-            // header (:11673), an HTTP/1.0 request without `Connection:
-            // Keep-Alive` (:11679), a non-2xx/417 `Expect: 100-continue`
-            // handler result (:11725), or a successful WebSocket upgrade
-            // (:11792). So a client that already transmitted the declared
-            // body (which it always has under `Expect: 100-continue`, since
-            // `process_request` auto-answers 100 BEFORE routing) leaves those
-            // bytes to be parsed as subsequent request lines on the SAME
-            // socket, bounded by `keep_alive_max_count_` (100) reads or the
-            // idle timeout before teardown — a Content-Length desync/
-            // smuggling primitive against a reverse proxy that reuses this
-            // connection. CONFIRMED NOT FIXABLE from this chokepoint under
-            // the vendored httplib 0.37.1's public API: `Request`/`Response`
-            // expose no Stream/socket handle either, so draining the body
-            // here is equally unreachable, and `set_payload_max_length` /
-            // `set_keep_alive_max_count` are both server-GLOBAL knobs (the
-            // former already rejected elsewhere in this file for squeezing
-            // the multipart cert upload and content-distribution staging; the
-            // latter would break legitimate keep-alive fleet-wide to fix one
-            // pre-auth reject path). The shipped rigs expose the server
-            // directly — no reverse proxy in front — so this stays a
-            // documented constraint, not a live bug; re-evaluate if that
-            // topology ever changes, or if a future httplib version exposes
-            // the stream/close-flag to `pre_routing_handler_`.
+            // CONNECTION-REUSE CONSTRAINT (D5 — investigated, NOT fixable
+            // here). Returning Handled means the body is never read off the
+            // socket, which is the whole point: a rejection never buffers the
+            // oversized payload.
+            //
+            // The consequence is that this handler cannot also close the
+            // connection. httplib stamps an ADVISORY `Connection: close`
+            // response header on a 4xx, but its own close decision is
+            // internal state that `pre_routing_handler_` is given no access
+            // to — its signature carries only `(const Request&, Response&)`,
+            // no stream and no socket — so neither closing nor draining is
+            // reachable from here. The two server-GLOBAL knobs that could
+            // force it are both rejected: one is already rejected elsewhere
+            // in this file for squeezing the multipart cert upload and
+            // content-distribution staging, and the other would break
+            // legitimate keep-alive fleet-wide to fix one pre-auth path.
+            //
+            // DO NOT spend time re-deriving this — it has been investigated
+            // against the vendored httplib and confirmed unfixable at this
+            // layer. The residual risk, its deployment preconditions and the
+            // candidate remediations are tracked through private security
+            // reporting per SECURITY.md, deliberately not restated here.
+            // Re-evaluate if a future httplib exposes the stream or the
+            // close flag to a pre-routing handler.
             //
             // Returns true (and has already populated `res`) when the
             // request was refused; false means "not this gate's business,
