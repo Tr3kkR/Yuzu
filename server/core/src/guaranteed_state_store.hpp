@@ -344,8 +344,10 @@ public:
     /// lifetime). Per-row SAVEPOINT + SQLSTATE discrimination exactly as
     /// ADR-0037 settled it (22xxx/23xxx/54xxx = skip + counted in
     /// `skipped_bad`; anything else aborts UNSTAMPED — the next boot
-    /// retries). TTL-expired legacy event/observation rows are skipped AT
-    /// SCAN TIME (never migrated-then-reaped). FAILS CLOSED on any
+    /// retries). Event/observation rows are copied UNCONDITIONALLY, including
+    /// already-TTL-expired ones (#2663, security-guardian review) — the
+    /// guarded `reap_expired()` is the sole authority on what has expired;
+    /// migration never makes that decision. FAILS CLOSED on any
     /// infrastructure error (initial connection, the backfill transaction's
     /// own BEGIN/SAVEPOINT/COMMIT, a non-row-data SQLSTATE, or a failed
     /// ROLLBACK TO SAVEPOINT) — the caller MUST treat `false` as fatal
