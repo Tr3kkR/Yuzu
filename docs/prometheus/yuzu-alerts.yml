@@ -1112,10 +1112,16 @@ groups:
       # its `up` is 1. Measured: with one server exporting the counter and one
       # not, NEITHER retention rule fires, for EITHER server, indefinitely.
       # Closing it needs a per-target rule
-      # (`up{job=<yuzu>} == 1 unless on(instance, job) <counter>`), which would be
-      # a documented exception to this file's bare-matching contract because `up`
-      # is Prometheus-synthesised. Tracked separately. Until then, confirm
-      # coverage directly: `count(<counter>)` against your expected server count.
+      # (`up{job=<yuzu>} == 1 unless on(instance, job) <counter>`), which would
+      # need to be a DOCUMENTED EXCEPTION to this file's bare-matching contract:
+      # `up` is Prometheus-synthesised, so metric_relabel_configs never touches
+      # it and its label set genuinely can diverge from an exported metric's.
+      # Note that exception does NOT escape the objection recorded above against
+      # `on(instance)` and `on(instance, job)` -- an HA pair or a federated copy
+      # agreeing on the narrowed labels can still stand in for the target you
+      # meant. It is a different trade, not a refutation, and whoever implements
+      # it owes that argument. Tracked separately. Until then, confirm coverage
+      # directly: `count(<counter>)` against your expected server count.
       - alert: YuzuAuditRetentionMetricMissing
         expr: |
           absent(yuzu_server_audit_retention_passes_total)

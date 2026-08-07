@@ -404,7 +404,8 @@ tests:
   # That is a real double-page and this case exists to state it honestly rather
   # than let three comments keep implying the two rules partition cleanly. It is
   # pinned so that if someone later makes them exclusive - most likely by adding
-  # the `up`-based target-down rule this family keeps pointing at, plus an
+  # an `up`-based target-down rule (which WOULD fire here, `up == 0`, unlike the
+  # mixed-version gap it does not cover), plus an
   # Alertmanager inhibition - this case goes red and has to be re-reasoned
   # instead of silently changing behaviour.
   #
