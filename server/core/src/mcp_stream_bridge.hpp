@@ -741,9 +741,10 @@ public:
     /// runs. BRIDGE-GLOBAL, not per-record: the arm applies to whichever record's
     /// project_record call reaches the window next, on whichever thread reaches
     /// it (the single projector thread, or a live POST pump's take_post_batch).
-    /// Every caller in this file arms it only when it can prove no OTHER record
-    /// is concurrently projectable, which is what makes "the next call" mean
-    /// "the intended one" - do not reuse this seam with concurrent multi-record
+    /// Every caller of this seam (in test_mcp_stream_bridge.cpp) arms it only
+    /// when it can prove no OTHER record is concurrently projectable, which is
+    /// what makes "the next call" mean "the intended one" - do not reuse this
+    /// seam with concurrent multi-record
     /// streamed activity in flight without first scoping it to a specific `rec`.
     /// This is exactly the window `select_displaceable_pin_locked`'s
     /// `projection_in_flight` guard exists to mask (see its header contract

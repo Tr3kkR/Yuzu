@@ -2541,15 +2541,22 @@ TEST_CASE("bridge reserve races a GET resume ack clearing every pin at or below 
     const std::uint64_t cursor = s.stream->next_event_id() - 1;
 
     std::atomic<bool> stop{false};
-    std::atomic<std::uint64_t> racer_iterations{0};
+    // Counts kAttached OUTCOMES, not raw loop passes: a raw pass counter would stay
+    // nonzero even if the cursor regressed back to always-kGap (the loop still spins
+    // and yields regardless of attach outcome), silently defeating this diagnostic's
+    // whole purpose - the exact bug this test exists to catch. Gate 8 happy-path
+    // finding (#2791): the instrumentation that proved the original fix (a temporary
+    // counter showing 1124 successful attaches) was removed after verification instead
+    // of being kept as a permanent, low-cost regression guard - this IS that guard.
+    std::atomic<std::uint64_t> attached_count{0};
     auto acker = std::async(std::launch::async, [&] {
         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (!stop.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < until) {
             auto att = s.stream->attach_and_replay(cursor, nullptr, "alice");
             if (att.status == mcp::McpStreamState::AttachStatus::kAttached) {
+                attached_count.fetch_add(1, std::memory_order_relaxed);
                 s.stream->detach(att.sink);
             }
-            racer_iterations.fetch_add(1, std::memory_order_relaxed);
             std::this_thread::yield();
         }
     });
@@ -2563,9 +2570,10 @@ TEST_CASE("bridge reserve races a GET resume ack clearing every pin at or below 
     }
     stop.store(true, std::memory_order_release);
     acker.get();
-    if (racer_iterations.load(std::memory_order_relaxed) == 0) {
-        WARN("attach_and_replay racer thread never ran an iteration - this pass exercised "
-             "no actual concurrency, only the deterministic admitted==4 outcome");
+    if (attached_count.load(std::memory_order_relaxed) == 0) {
+        WARN("attach_and_replay racer thread never successfully attached - either a starved "
+             "thread gave this pass zero actual concurrency, or the cursor is wrong again and "
+             "rule-(b) never ran (the exact #2791 regression this counter exists to catch)");
     }
 
     CHECK(admitted == 4);
@@ -4477,6 +4485,9 @@ TEST_CASE("bridge admission declines rather than reclaiming while a candidate is
     // REQUIREs below").
     struct StallGuard {
         Bridge& bridge;
+        explicit StallGuard(Bridge& b) : bridge(b) {}
+        StallGuard(const StallGuard&) = delete;
+        StallGuard& operator=(const StallGuard&) = delete;
         ~StallGuard() { bridge.release_projection_stall_for_test(); }
     };
     fx.bridge->arm_projection_stall_for_test();
