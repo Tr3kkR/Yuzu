@@ -430,16 +430,19 @@ private:
     /// (The post-commit rollback this doc used to name was deleted in 6c1d6942.)
     /// Allocates nothing — map/node erases and string compares only.
     void drop_key_locked(const std::string& key);
-    /// Undo ONE subscription after arm_impl loses the M1 consumer race, allocating
-    /// nothing (the caller owns `key`/`type`/`event_driven`, so nothing has to be
-    /// copied or recomputed). A specialization of disarm() — lockstep siblings, NOT
-    /// exact duplicates. The full, authoritative enumeration of every difference
-    /// lives at the DEFINITION, not here: this comment previously carried its own
-    /// completeness claim ("differ only in that this one takes key/type from the
-    /// caller") with no number attached, and THAT drifted out of sync with the
-    /// definition just the same as a restated count would have (fjarvis's
-    /// adversarial review, PR #2863) — do not reintroduce EITHER form, a count or
-    /// an "only differs in..." claim, here. It is NOT redundant with disarm():
+    /// Undo ONE subscription after arm_impl loses the M1 consumer race. This
+    /// declaration states the interface contract; the DEFINITION owns implementation
+    /// claims — allocation posture, and the exact count/enumeration of differences
+    /// from disarm() — so this comment does not restate either. Both drifted out of
+    /// sync when restated here before, each caught by fjarvis's adversarial review
+    /// of the PR then open: a completeness claim with no number attached ("differ
+    /// only in that this one takes key/type from the caller"), found reviewing PR
+    /// #2863; and an "allocating nothing" claim, made false by the log calls this
+    /// function contains, found reviewing PR #2868. Do not reintroduce either at
+    /// THIS declaration — see the definition for both. The caller owns `key`/`type`/
+    /// `event_driven`, so nothing has to be copied or recomputed for THOSE
+    /// specifically. A specialization of disarm() — lockstep siblings, NOT exact
+    /// duplicates. It is NOT redundant with disarm():
     /// routing arm_impl's M1 teardown through disarm() would remove ONE subscription
     /// via a whole-key-capable path and reintroduce a lookup on values the caller
     /// already holds. Keep the two in lockstep.
