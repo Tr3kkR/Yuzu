@@ -12,6 +12,15 @@
 #
 # Fails OPEN: a missing `jq`, a missing doc, or any other error means no context is
 # injected and the session starts normally. This hook must never block a session.
+# That silence is permanent and per-contributor if `jq` itself is missing — 3
+# independent Gate 6/4 reviewers flagged this on the PR that added this script
+# (nothing signals "skipped" vs "ran and found nothing"; unverified whether Claude
+# Code surfaces SessionStart hook stderr/exit codes anywhere a contributor would
+# see). Mitigating, not fixing: `jq` is already a silent hard dependency of this
+# repo's OWN governance ledger mechanics (`.claude/skills/governance/SKILL.md`
+# Gate 8's `jq -e` checks) — a contributor missing it has a bigger, pre-existing gap
+# than losing this hook's injection. Not solved here; noted so a future fix knows
+# the actual blast radius before building one.
 set -uo pipefail
 
 command -v jq >/dev/null 2>&1 || exit 0
