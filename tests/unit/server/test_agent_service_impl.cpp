@@ -52,6 +52,7 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -66,6 +67,15 @@ using yuzu::server::detail::EventBus;
 namespace {
 
 namespace apb = ::yuzu::agent::v1;
+
+// AuditStore migrated to Postgres (ADR-0006) — GatewayResponseHarness below
+// clones this pre-migrated template instead of opening a SQLite path.
+yuzu::test::PgTestTemplate agent_svc_audit_tpl{"agentaudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("agentaudit template: store failed to migrate");
+}};
 
 /// Minimal harness: real AgentServiceImpl wired against in-memory
 /// ResponseStore. analytics/notification/webhook stores stay null so
@@ -87,7 +97,14 @@ struct GatewayResponseHarness {
     yuzu::server::auth::AuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     ResponseStore responses{":memory:"};
-    AuditStore audit{":memory:"};
+    // AuditStore ported to Postgres (ADR-0006): a template-cloned ephemeral
+    // database + pool. This harness has no other PG-backed member, so it
+    // self-skips explicitly (mirrors yuzu::test::AuthDbPg's own posture) —
+    // SKIPs the enclosing TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset,
+    // FAILs when set but broken.
+    std::optional<yuzu::test::PostgresTestDb> audit_db;
+    std::optional<yuzu::server::pg::PgPool> audit_pool;
+    std::unique_ptr<AuditStore> audit;
     AgentServiceImpl svc{registry,
                          bus,
                          /*require_client_identity=*/false,
@@ -98,9 +115,18 @@ struct GatewayResponseHarness {
 
     GatewayResponseHarness() {
         REQUIRE(responses.is_open());
-        REQUIRE(audit.is_open());
+
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
+        audit_db.emplace(agent_svc_audit_tpl);
+        INFO("[GatewayResponseHarness] audit db status (blank == ok): " << audit_db->error());
+        REQUIRE(audit_db->available());
+        audit_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = audit_db->dsn(), .size = 4});
+        audit = std::make_unique<AuditStore>(*audit_pool);
+        REQUIRE(audit->is_open());
         svc.set_response_store(&responses);
-        svc.set_audit_store(&audit);
+        svc.set_audit_store(audit.get());
     }
 
     static apb::CommandResponse make_response(const std::string& command_id,
@@ -120,7 +146,7 @@ struct GatewayResponseHarness {
 // ── record_execution_id ────────────────────────────────────────────────────
 
 TEST_CASE("record_execution_id: terminal response stamps mapped execution_id",
-          "[agent_service][executions][pr2]") {
+          "[pg][agent_service][executions][pr2]") {
     GatewayResponseHarness h;
     h.svc.record_execution_id("cmd-A", "exec-42");
 
@@ -137,7 +163,7 @@ TEST_CASE("record_execution_id: terminal response stamps mapped execution_id",
 }
 
 TEST_CASE("record_execution_id: empty execution_id removes the mapping",
-          "[agent_service][executions][pr2]") {
+          "[pg][agent_service][executions][pr2]") {
     GatewayResponseHarness h;
     h.svc.record_execution_id("cmd-A", "exec-42");
     h.svc.record_execution_id("cmd-A", ""); // documented clear semantics
@@ -155,7 +181,7 @@ TEST_CASE("record_execution_id: empty execution_id removes the mapping",
 // ── process_gateway_response: per-status branches ──────────────────────────
 
 TEST_CASE("process_gateway_response: RUNNING streaming row carries execution_id",
-          "[agent_service][executions][pr2]") {
+          "[pg][agent_service][executions][pr2]") {
     // The RUNNING branch lives at agent_service_impl.cpp:597-655 — it both
     // stores a streaming row and stamps execution_id from the same map.
     // Pin both halves: the row exists AND it carries the tag.
@@ -174,7 +200,7 @@ TEST_CASE("process_gateway_response: RUNNING streaming row carries execution_id"
 }
 
 TEST_CASE("process_gateway_response: FAILURE preserves error_detail and execution_id",
-          "[agent_service][executions][pr2]") {
+          "[pg][agent_service][executions][pr2]") {
     GatewayResponseHarness h;
     h.svc.record_execution_id("cmd-fail", "exec-fail");
 
@@ -192,7 +218,7 @@ TEST_CASE("process_gateway_response: FAILURE preserves error_detail and executio
 }
 
 TEST_CASE("process_gateway_response: unmapped command_id stamps empty execution_id",
-          "[agent_service][executions][pr2]") {
+          "[pg][agent_service][executions][pr2]") {
     // Out-of-band dispatch (CLI / direct gRPC) bypasses the dispatch path
     // that calls record_execution_id. The receipt path must degrade to an
     // empty execution_id rather than crashing or inventing a value.
@@ -209,7 +235,7 @@ TEST_CASE("process_gateway_response: unmapped command_id stamps empty execution_
 
 TEST_CASE("process_gateway_response: terminal branch does NOT erase mapping "
           "(HF-1 multi-agent fan-out invariant)",
-          "[agent_service][executions][pr2][hardening]") {
+          "[pg][agent_service][executions][pr2][hardening]") {
     // PR-2 ladder regression. Pre-fix, the terminal branch erased
     // cmd_execution_ids_ on the FIRST agent's response so agents 2..N
     // stamped empty execution_id and the executions drawer dropped them.
@@ -254,7 +280,7 @@ TEST_CASE("process_gateway_response: terminal branch does NOT erase mapping "
 
 TEST_CASE("process_gateway_response: __timing__ sentinel takes the early-return "
           "branch and does NOT store",
-          "[agent_service][executions][pr2]") {
+          "[pg][agent_service][executions][pr2]") {
     // The RUNNING branch at agent_service_impl.cpp:599-606 short-circuits
     // for output starting with "__timing__|" — these are out-of-band
     // dashboard-stat payloads, not command output. They must NOT appear
@@ -274,7 +300,7 @@ TEST_CASE("process_gateway_response: __timing__ sentinel takes the early-return 
 }
 
 TEST_CASE("process_gateway_response: terminal SUCCESS folds into existing RUNNING rows",
-          "[agent_service][executions][pr2]") {
+          "[pg][agent_service][executions][pr2]") {
     // Post-UAT 2026-05-06: an empty-output terminal frame is folded into
     // the existing RUNNING rows in place via
     // ResponseStore::finalize_terminal_status, instead of inserting a
@@ -303,7 +329,7 @@ TEST_CASE("process_gateway_response: terminal SUCCESS folds into existing RUNNIN
 }
 
 TEST_CASE("process_gateway_response: terminal frame WITH output still inserts",
-          "[agent_service][executions][pr2]") {
+          "[pg][agent_service][executions][pr2]") {
     // Edge case: a plugin whose terminal frame carries the result data
     // (rather than streaming via RUNNING + sentinel terminal) should
     // still produce a row, since finalize_terminal_status only fires
@@ -321,7 +347,7 @@ TEST_CASE("process_gateway_response: terminal frame WITH output still inserts",
 }
 
 TEST_CASE("process_gateway_response: re-mapping a command_id updates the stamp",
-          "[agent_service][executions][pr2]") {
+          "[pg][agent_service][executions][pr2]") {
     // Defensive contract: if the dispatch path overwrites a command_id's
     // mapping (e.g. retry under a new execution row), responses arriving
     // after the overwrite stamp the new execution_id. Old execution_id
@@ -552,7 +578,7 @@ TEST_CASE("evaluate_peer_binding: shared trusted CIDR downgrades to advisory (#1
 }
 
 TEST_CASE("AgentRegistry::note_trusted_gateway_peer round-trips, refuses empty",
-          "[agent_service][peer_mismatch][issue826]") {
+          "[pg][agent_service][peer_mismatch][issue826]") {
     // The trusted-gateway set is the second leg of the #826 fix —
     // gateway-mode Subscribe is allowed if the peer IP was previously
     // noted via ProxyRegister. Empty IP must NEVER round-trip (would
@@ -572,7 +598,7 @@ TEST_CASE("AgentRegistry::note_trusted_gateway_peer round-trips, refuses empty",
 }
 
 TEST_CASE("AgentRegistry::is_trusted_gateway_peer holds multiple gateways",
-          "[agent_service][peer_mismatch][issue826]") {
+          "[pg][agent_service][peer_mismatch][issue826]") {
     // A fleet may have multiple gateway nodes (load-balanced cluster).
     // Each gateway noted via ProxyRegister joins the trusted set; none
     // of them displaces another.
@@ -590,7 +616,7 @@ TEST_CASE("AgentRegistry::is_trusted_gateway_peer holds multiple gateways",
 
 TEST_CASE("AgentRegistry::is_trusted_gateway_peer evicts entries past TTL "
           "(W1.3 R2 / UP-3)",
-          "[agent_service][peer_mismatch][issue826][w1_3_r2]") {
+          "[pg][agent_service][peer_mismatch][issue826][w1_3_r2]") {
     // UP-3: a stale entry (TTL elapsed) is no longer trusted. The lookup
     // returns false; the next note_trusted_gateway_peer sweeps it out of
     // the map.
@@ -617,7 +643,7 @@ TEST_CASE("AgentRegistry::is_trusted_gateway_peer evicts entries past TTL "
 
 TEST_CASE("AgentRegistry::note_trusted_gateway_peer refreshes last_seen on repeat "
           "(W1.3 R2)",
-          "[agent_service][peer_mismatch][issue826][w1_3_r2]") {
+          "[pg][agent_service][peer_mismatch][issue826][w1_3_r2]") {
     // A gateway that re-ProxyRegisters before TTL elapses keeps its trust
     // entry alive indefinitely. Test: insert → age to JUST shy of TTL →
     // re-insert → age another half-TTL → still trusted (would have
@@ -641,7 +667,7 @@ TEST_CASE("AgentRegistry::note_trusted_gateway_peer refreshes last_seen on repea
 
 TEST_CASE("AgentRegistry::note_trusted_gateway_peer caps map at kTrustedGatewayCap, "
           "evicts oldest first (W1.3 R2 / UP-2)",
-          "[agent_service][peer_mismatch][issue826][w1_3_r2]") {
+          "[pg][agent_service][peer_mismatch][issue826][w1_3_r2]") {
     // UP-2: in a churn-heavy NAT environment the trusted set used to
     // grow unboundedly. The cap (1024) prevents memory DoS; oldest-first
     // eviction preserves trust for the most recent gateways.
@@ -668,7 +694,7 @@ TEST_CASE("AgentRegistry::note_trusted_gateway_peer caps map at kTrustedGatewayC
 
 TEST_CASE("AgentRegistry::note_trusted_gateway_peer updates the Prometheus gauge "
           "(W1.3 R2)",
-          "[agent_service][peer_mismatch][issue826][w1_3_r2][metrics]") {
+          "[pg][agent_service][peer_mismatch][issue826][w1_3_r2][metrics]") {
     // The yuzu_trusted_gateway_peer_set_size gauge reflects current map
     // size on every note + every sweep, so dashboards see real-time
     // health (rising under churn, falling as entries expire).
@@ -702,7 +728,7 @@ TEST_CASE("AgentRegistry::note_trusted_gateway_peer updates the Prometheus gauge
 
 TEST_CASE("ProxyRegister: failed enrollment (no token, no auto-approve) does NOT "
           "add the peer to the trusted set (W1.3 R2 / UP-7)",
-          "[agent_service][peer_mismatch][issue826][w1_3_r2][gateway]") {
+          "[pg][agent_service][peer_mismatch][issue826][w1_3_r2][gateway]") {
     // UP-7 / sec-G MEDIUM-1: the trusted-peer noting used to fire BEFORE
     // the enrollment branches, with the rationale that even denied
     // proxies should contribute to gateway-trust discovery. That inverted
@@ -745,7 +771,7 @@ TEST_CASE("ProxyRegister: failed enrollment (no token, no auto-approve) does NOT
 
 TEST_CASE("ProxyRegister: invalid enrollment token does NOT add the peer to the "
           "trusted set (W1.3 R2 / UP-7)",
-          "[agent_service][peer_mismatch][issue826][w1_3_r2][gateway]") {
+          "[pg][agent_service][peer_mismatch][issue826][w1_3_r2][gateway]") {
     // Companion to the pending-branch test above — the denied-token
     // branch in ProxyRegister also returns early without crossing into
     // the trust-noting code. Pre-fix this branch would have already
@@ -801,7 +827,7 @@ TEST_CASE("peer_ip.hpp::extract_peer_ip matches AgentServiceImpl::extract_peer_i
 // ── W1.4 R2 / UP-H1 — agent_id length cap at handler entry ─────────────────
 
 TEST_CASE("Register: rejects oversize agent_id with INVALID_ARGUMENT (W1.4 R2 / UP-H1)",
-          "[agent_service][register][w1_4_r2][up_h1]") {
+          "[pg][agent_service][register][w1_4_r2][up_h1]") {
     // The protobuf places no length constraint on agent_id and W1.4 PR1
     // audits the value verbatim. Without this cap, a presenter can supply
     // a 1 MiB agent_id and every downstream audit row carries it. Cap is
@@ -826,7 +852,7 @@ TEST_CASE("Register: rejects oversize agent_id with INVALID_ARGUMENT (W1.4 R2 / 
 }
 
 TEST_CASE("Register: rejects empty agent_id with INVALID_ARGUMENT (W1.4 R2 / UP-H1)",
-          "[agent_service][register][w1_4_r2][up_h1]") {
+          "[pg][agent_service][register][w1_4_r2][up_h1]") {
     // Empty agent_id is structurally invalid — every downstream code path
     // assumes a non-empty key (registry, audit principal, pending lookup).
     // Same metric / status as the oversize case.
@@ -847,7 +873,7 @@ TEST_CASE("Register: rejects empty agent_id with INVALID_ARGUMENT (W1.4 R2 / UP-
 }
 
 TEST_CASE("ProxyRegister: rejects oversize agent_id with INVALID_ARGUMENT (W1.4 R2 / UP-H1)",
-          "[agent_service][register][gateway][w1_4_r2][up_h1]") {
+          "[pg][agent_service][register][gateway][w1_4_r2][up_h1]") {
     // Mirror of the direct-Register path. ProxyRegister carries the same
     // attack surface — the gateway proxies the agent's RegisterRequest
     // unmodified, so an attacker who controls the agent payload can
@@ -902,7 +928,7 @@ apb::RegisterRequest make_gw_register(yuzu::server::auth::AuthManager& auth_mgr,
 } // namespace
 
 TEST_CASE("ProxyRegister: a wired signer issues a per-agent cert for a gateway-enrolled agent",
-          "[agent_service][register][gateway][pki][pr5d]") {
+          "[pg][agent_service][register][gateway][pki][pr5d]") {
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
     GatewayResponseHarness h;
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
@@ -1081,7 +1107,7 @@ TEST_CASE("ProxyInventory: over-cap source maps are rejected before generic writ
 }
 
 TEST_CASE("ProxyRegister: no signer wired → enrolls but issues no cert (graceful degrade)",
-          "[agent_service][register][gateway][pki][pr5d]") {
+          "[pg][agent_service][register][gateway][pki][pr5d]") {
     // The pre-PR5d behavior, now the explicit fallback: a CSR with no signer
     // (CA inactive) must still enroll the agent, just without a cert.
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
@@ -1100,7 +1126,7 @@ TEST_CASE("ProxyRegister: no signer wired → enrolls but issues no cert (gracef
 }
 
 TEST_CASE("ProxyRegister: signer wired but no CSR → signer not called, no cert",
-          "[agent_service][register][gateway][pki][pr5d]") {
+          "[pg][agent_service][register][gateway][pki][pr5d]") {
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
     GatewayResponseHarness h;
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
@@ -1125,7 +1151,7 @@ TEST_CASE("ProxyRegister: signer wired but no CSR → signer not called, no cert
 }
 
 TEST_CASE("ProxyRegister: signing failure is non-fatal (agent still enrolled)",
-          "[agent_service][register][gateway][pki][pr5d]") {
+          "[pg][agent_service][register][gateway][pki][pr5d]") {
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
     GatewayResponseHarness h;
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
@@ -1146,7 +1172,7 @@ TEST_CASE("ProxyRegister: signing failure is non-fatal (agent still enrolled)",
 }
 
 TEST_CASE("Register (direct): a wired signer issues a per-agent cert — parity with ProxyRegister",
-          "[agent_service][register][pki][pr5d]") {
+          "[pg][agent_service][register][pki][pr5d]") {
     // Locks the direct-path issuance block (agent_service_impl.cpp:539) that
     // ProxyRegister mirrors. Without this, a future edit to the direct block
     // would silently break the parity PR5d depends on (consistency Gate-4 SHOULD).
@@ -1189,7 +1215,7 @@ TEST_CASE("Register (direct): a wired signer issues a per-agent cert — parity 
 
 TEST_CASE("ProxyRegister: the signer is called with the RELAYED agent_id, never the CSR subject "
           "(confused-deputy identity-binding defense, #1273 B-2)",
-          "[agent_service][register][gateway][pki][pr5d][security]") {
+          "[pg][agent_service][register][gateway][pki][pr5d][security]") {
     // The confused-deputy defense: identity is set from the authenticated
     // enrollment (`info.agent_id()`), NOT from anything in the attacker-relayed
     // CSR. A CSR whose bytes "claim" a different agent must still cause the signer
@@ -1221,7 +1247,7 @@ TEST_CASE("ProxyRegister: the signer is called with the RELAYED agent_id, never 
 }
 
 TEST_CASE("ProxyRegister: a THROWING signer cannot crash the gateway handler (#1273 B-2)",
-          "[agent_service][register][gateway][pki][pr5d][security]") {
+          "[pg][agent_service][register][gateway][pki][pr5d][security]") {
     // The signer runs inside the sync gRPC handler; an exception out of it would
     // otherwise propagate and `terminate` the now-gateway-reachable service. The
     // shared signer is wrapped in try/catch — this pins that a throwing signer
@@ -1247,7 +1273,7 @@ TEST_CASE("ProxyRegister: a THROWING signer cannot crash the gateway handler (#1
 
 TEST_CASE("Register (direct): a THROWING signer cannot crash the handler either "
           "(parity with ProxyRegister, #1273 B-2)",
-          "[agent_service][register][pki][pr5d][security]") {
+          "[pg][agent_service][register][pki][pr5d][security]") {
     // Parity: the direct Register path shares the same try/catch crash-safety as
     // ProxyRegister (both signer sites are now exception-contained).
     GatewayResponseHarness h;
@@ -1338,7 +1364,7 @@ struct TrackerScope {
 
 TEST_CASE("notify_exec_tracker: RUNNING maps to status='running' with "
           "completed_at=0",
-          "[agent_service][executions][issue872]") {
+          "[pg][agent_service][executions][issue872]") {
     // RUNNING is the only non-terminal mapping in the switch — it stamps
     // first_response_at but leaves completed_at zero. A regression that
     // unifies the RUNNING and terminal branches (treating RUNNING as
@@ -1362,7 +1388,7 @@ TEST_CASE("notify_exec_tracker: RUNNING maps to status='running' with "
 
 TEST_CASE("notify_exec_tracker: SUCCESS maps to status='success' and stamps "
           "completed_at",
-          "[agent_service][executions][issue872]") {
+          "[pg][agent_service][executions][issue872]") {
     GatewayResponseHarness h;
     TrackerScope ts{h.svc};
     auto exec_id = ts.make_exec();
@@ -1381,7 +1407,7 @@ TEST_CASE("notify_exec_tracker: SUCCESS maps to status='success' and stamps "
 }
 
 TEST_CASE("notify_exec_tracker: FAILURE preserves error_detail and exit_code",
-          "[agent_service][executions][issue872]") {
+          "[pg][agent_service][executions][issue872]") {
     GatewayResponseHarness h;
     TrackerScope ts{h.svc};
     auto exec_id = ts.make_exec();
@@ -1401,7 +1427,7 @@ TEST_CASE("notify_exec_tracker: FAILURE preserves error_detail and exit_code",
 }
 
 TEST_CASE("notify_exec_tracker: TIMEOUT maps to status='timeout'",
-          "[agent_service][executions][issue872]") {
+          "[pg][agent_service][executions][issue872]") {
     GatewayResponseHarness h;
     TrackerScope ts{h.svc};
     auto exec_id = ts.make_exec();
@@ -1425,7 +1451,7 @@ TEST_CASE("notify_exec_tracker: TIMEOUT maps to status='timeout'",
 }
 
 TEST_CASE("notify_exec_tracker: REJECTED maps to status='rejected'",
-          "[agent_service][executions][issue872]") {
+          "[pg][agent_service][executions][issue872]") {
     // notify_exec_tracker sets s.first_response_at=0 for REJECTED (the agent
     // rejected the command at dispatch, never began executing — "first
     // response" is conceptually undefined). The DB column still ends up
@@ -1459,7 +1485,7 @@ TEST_CASE("notify_exec_tracker: REJECTED maps to status='rejected'",
 }
 
 TEST_CASE("notify_exec_tracker: unmapped command_id is a no-op",
-          "[agent_service][executions][issue872]") {
+          "[pg][agent_service][executions][issue872]") {
     // Out-of-band dispatch (CLI / direct gRPC) never calls record_execution_id.
     // notify_exec_tracker must early-return on empty execution_id rather than
     // upserting under a fabricated id — those rows would be invisible to every
@@ -1478,7 +1504,7 @@ TEST_CASE("notify_exec_tracker: unmapped command_id is a no-op",
 }
 
 TEST_CASE("notify_exec_tracker: null tracker pointer is a no-op (shutdown contract)",
-          "[agent_service][executions][issue872]") {
+          "[pg][agent_service][executions][issue872]") {
     // The atomic-load-acquire in notify_exec_tracker is the read half of the
     // shutdown contract — ServerImpl drains gRPC, calls
     // set_execution_tracker(nullptr) with release ordering, then resets the
@@ -1502,7 +1528,7 @@ TEST_CASE("notify_exec_tracker: null tracker pointer is a no-op (shutdown contra
 // ── #1067 — admin-denied agent must NOT consume an enrollment token ─────────
 
 TEST_CASE("Register: admin-denied agent does not consume the enrollment token (#1067)",
-          "[agent_service][register][enrollment][issue1067]") {
+          "[pg][agent_service][register][enrollment][issue1067]") {
     // W1.4 UP-M3: the consume happened BEFORE the admin-deny check, so a denied
     // attacker burned a use of the token on every attempt — depleting a
     // max_uses=1 token until the legitimate agent could no longer enroll. The
@@ -1550,7 +1576,7 @@ TEST_CASE("Register: admin-denied agent does not consume the enrollment token (#
 // ── #1065 — success-path enrollment audit is emitted (was fire-and-forget) ──
 
 TEST_CASE("Register: successful token enrollment emits a success audit row (#1065)",
-          "[agent_service][register][enrollment][audit][issue1065]") {
+          "[pg][agent_service][register][enrollment][audit][issue1065]") {
     GatewayResponseHarness h;
     auto raw =
         h.auth_mgr.create_enrollment_token("ok-test", /*max_uses=*/1, std::chrono::hours(1));
@@ -1569,9 +1595,10 @@ TEST_CASE("Register: successful token enrollment emits a success audit row (#106
 
     // The success-path audit row is now captured + persisted (#1065). Find it
     // by its stable fields rather than the action constant.
-    auto rows = h.audit.query({});
+    auto rows = h.audit->query({});
+    REQUIRE(rows.has_value());
     bool found = false;
-    for (const auto& ev : rows) {
+    for (const auto& ev : *rows) {
         if (ev.action == "enrollment.token_consumed" && ev.result == "success" &&
             ev.principal == "agent:enroll-ok" && ev.target_type == "enrollment_token") {
             found = true;
@@ -1582,7 +1609,7 @@ TEST_CASE("Register: successful token enrollment emits a success audit row (#106
 }
 
 TEST_CASE("ProxyRegister: admin-denied agent does not consume the enrollment token (#1067)",
-          "[agent_service][register][enrollment][gateway][issue1067]") {
+          "[pg][agent_service][register][enrollment][gateway][issue1067]") {
     // Sibling of the direct-Register #1067 test. The gateway ProxyRegister path
     // proxies the agent's RegisterRequest unmodified and had the same
     // consume-before-deny ordering — so the token-depletion DoS was equally
@@ -1591,7 +1618,7 @@ TEST_CASE("ProxyRegister: admin-denied agent does not consume the enrollment tok
     GatewayResponseHarness h;
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
-    gateway_svc.set_audit_store(&h.audit);
+    gateway_svc.set_audit_store(h.audit.get());
     auto raw =
         h.auth_mgr.create_enrollment_token("gw-dos-test", /*max_uses=*/1, std::chrono::hours(1));
     h.auth_mgr.add_pending_agent("gw-denied", "evil-host", "linux", "x86_64", "0.0.0-test");
@@ -1627,12 +1654,12 @@ TEST_CASE("ProxyRegister: admin-denied agent does not consume the enrollment tok
 // ── #1064 — ProxyRegister origin-IP attribution ─────────────────────────────
 
 TEST_CASE("ProxyRegister: audit attributes the agent origin IP, not the gateway IP (#1064)",
-          "[agent_service][register][enrollment][gateway][issue1064]") {
+          "[pg][agent_service][register][enrollment][gateway][issue1064]") {
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
     GatewayResponseHarness h;
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
-    gateway_svc.set_audit_store(&h.audit);
+    gateway_svc.set_audit_store(h.audit.get());
 
     // An INVALID enrollment token drives the denied/failure audit site — where
     // the #1064 attribution records source_ip=agent origin + gateway_ip in
@@ -1648,7 +1675,9 @@ TEST_CASE("ProxyRegister: audit attributes the agent origin IP, not the gateway 
     apb::RegisterResponse resp;
 
     auto failure_row = [&]() -> yuzu::server::AuditEvent {
-        for (const auto& ev : h.audit.query({})) {
+        auto rows = h.audit->query({});
+        REQUIRE(rows.has_value());
+        for (const auto& ev : *rows) {
             if (ev.result == "failure")
                 return ev;
         }
@@ -1697,7 +1726,9 @@ TEST_CASE("ProxyRegister: audit attributes the agent origin IP, not the gateway 
         REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
         CHECK(resp.accepted());
         yuzu::server::AuditEvent success_row;
-        for (const auto& ev : h.audit.query({})) {
+        auto success_rows = h.audit->query({});
+        REQUIRE(success_rows.has_value());
+        for (const auto& ev : *success_rows) {
             if (ev.result == "success")
                 success_row = ev;
         }
@@ -1744,7 +1775,7 @@ void install_match_all_auto_approve(GatewayResponseHarness& h) {
 } // namespace
 
 TEST_CASE("Register: approved CSR reaches the signer with the authenticated agent_id (B-2)",
-          "[agent_service][pki][pr3]") {
+          "[pg][agent_service][pki][pr3]") {
     GatewayResponseHarness h;
     install_match_all_auto_approve(h);
 
@@ -1777,7 +1808,7 @@ TEST_CASE("Register: approved CSR reaches the signer with the authenticated agen
 }
 
 TEST_CASE("Register: signer returning nullopt leaves the agent accepted but cert-less (B-2)",
-          "[agent_service][pki][pr3]") {
+          "[pg][agent_service][pki][pr3]") {
     GatewayResponseHarness h;
     install_match_all_auto_approve(h);
     int signer_calls = 0;
@@ -1801,7 +1832,7 @@ TEST_CASE("Register: signer returning nullopt leaves the agent accepted but cert
 }
 
 TEST_CASE("Register: a pending (unapproved) enrollment never reaches the CSR signer (B-2)",
-          "[agent_service][pki][pr3][security]") {
+          "[pg][agent_service][pki][pr3][security]") {
     GatewayResponseHarness h;
     // No auto-approve rule + no token → the agent lands in the pending queue and
     // Register returns BEFORE the signing block. A CSR must NOT be signed for an
@@ -1827,7 +1858,7 @@ TEST_CASE("Register: a pending (unapproved) enrollment never reaches the CSR sig
 }
 
 TEST_CASE("Register: no CSR → signer is not invoked even when wired (B-2)",
-          "[agent_service][pki][pr3]") {
+          "[pg][agent_service][pki][pr3]") {
     GatewayResponseHarness h;
     install_match_all_auto_approve(h);
     bool signer_called = false;

@@ -304,7 +304,7 @@ static const ToolDef kTools[] = {
 
     {"query_audit_log",
      "Query the audit log with filters. Returns timestamped entries showing who did what, when.",
-     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"maximum":500}}})"},
+     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500}}})"},
 
     {"list_definitions",
      "List available instruction definitions (commands that can be dispatched to agents).",
@@ -719,7 +719,7 @@ static const ToolDef kTools[] = {
 
     {"list_engine_principals",
      "List engine principals with each principal's active-credential count (admin/auditor "
-     "surface). Mirrors GET /api/v1/engine-principals. Requires Security:Read.",
+     "surface). Mirrors GET /api/v1/engine-principals. Requires EnginePrincipal:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("include_revoked":{"type":"boolean","default":true,"description":"false restricts to lifecycle_state=active only"})j"
      R"j(}})j",
@@ -727,7 +727,7 @@ static const ToolDef kTools[] = {
 
     {"get_engine_principal",
      "Get one engine principal's identity row plus its active-credential count. Mirrors GET "
-     "/api/v1/engine-principals/{id}. Requires Security:Read.",
+     "/api/v1/engine-principals/{id}. Requires EnginePrincipal:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"})j"
      R"j(},"required":["principal_id"]})j",
@@ -930,7 +930,7 @@ static const ToolDef kTools[] = {
      "List the fleet-wide RBAC roles currently assigned to one engine principal — the "
      "read-only discovery step before assign_engine_role/unassign_engine_role, and the way "
      "to audit what an autonomous module can actually do right now. Mirrors GET "
-     "/api/v1/engine-principals/{id}/roles. Requires Security:Read.",
+     "/api/v1/engine-principals/{id}/roles. Requires EnginePrincipal:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix"})j"
      R"j(},"required":["principal_id"]})j",
@@ -1281,8 +1281,8 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"mint_engine_credential", {"Security", "Write"}},
     {"rotate_engine_credential", {"Security", "Write"}},
     {"confirm_engine_rotation", {"Security", "Write"}},
-    {"list_engine_principals", {"Security", "Read"}},
-    {"get_engine_principal", {"Security", "Read"}},
+    {"list_engine_principals", {"EnginePrincipal", "Read"}},
+    {"get_engine_principal", {"EnginePrincipal", "Read"}},
     {"audit_engine_no_admin", {"AuditLog", "Read"}},
     // PR 4.2 (design §4.1) — engine-principal role-assignment MCP twins of
     // /api/v1/engine-principals/{id}/roles. Mutations map to Security:Write
@@ -1292,7 +1292,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // note above on why this invariant matters).
     {"assign_engine_role", {"Security", "Write"}},
     {"unassign_engine_role", {"Security", "Write"}},
-    {"list_engine_roles", {"Security", "Read"}},
+    {"list_engine_roles", {"EnginePrincipal", "Read"}},
     // Agentic demo/read helpers.
     {"get_fleet_posture_fast", {"Infrastructure", "Read"}},
     {"classify_operational_question", {"Infrastructure", "Read"}},
@@ -1427,7 +1427,7 @@ constexpr std::string_view kRbacSecurables[] = {
     "AuditLog",       "Response",           "ManagementGroup",       "ApiToken",
     "Security",       "Policy",             "DeviceToken",           "SoftwareDeployment",
     "License",        "FileRetrieval",      "GuaranteedState",       "Inventory",
-    "AccessReview",   "SoftwareLicensing"};
+    "AccessReview",   "SoftwareLicensing",  "EnginePrincipal"};
 
 // Borrowed (name, input_schema_json) row for the registration validator's
 // 4th sequence (#2405). Views are valid only for the duration of the call.
@@ -2708,9 +2708,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 AuditQuery aq;
                 aq.limit = 50;
+                // ADR-0040: degrade-distinguishable read — nullopt on a
+                // store/pool failure. Surface an error, never a false-empty
+                // resource (an audit blip must not read as "no activity").
                 auto events = audit_store->query(aq);
+                if (!events) {
+                    res.set_content(error_response(id, kInternalError, "Audit store degraded"),
+                                    "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& e : events) {
+                for (const auto& e : *events) {
                     arr.add(JObj()
                                 .add("timestamp", e.timestamp)
                                 .add("principal", e.principal)
@@ -3477,10 +3485,29 @@ McpServer::HandlerFn McpServer::build_handler(
                 aq.target_type = param_str(args, "target_type");
                 aq.since = param_int(args, "since");
                 aq.until = param_int(args, "until");
-                aq.limit = std::min(param_int32(args, "limit", 50), 500);
+                // Clamp BOTH bounds, in 64-bit BEFORE narrowing — the
+                // query_responses idiom (`:3660`). Upper alone left a
+                // negative or zero `limit` reaching `AuditStore::query`,
+                // which clamps a non-positive limit to `LIMIT 0` at its own
+                // sink (`std::max(q.limit, 0)`) — a caller-supplied bad
+                // limit therefore came back as an EMPTY page, not an error,
+                // for the one query this store's ADR explicitly promises
+                // never reads false-empty. `param_int32`'s int64->int32 cast
+                // also wraps a limit above INT_MAX negative before `std::min`
+                // ever saw it; clamping the raw int64 first avoids that.
+                aq.limit = static_cast<int>(
+                    std::clamp<std::int64_t>(param_int(args, "limit", 50), 1, 500));
+                // ADR-0040: degrade-distinguishable read — nullopt on a
+                // store/pool failure. Surface an error, never a false-empty
+                // result (an audit blip must not read as "no activity").
                 auto events = audit_store->query(aq);
+                if (!events) {
+                    res.set_content(error_response(id, kInternalError, "Audit store degraded"),
+                                    "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& e : events) {
+                for (const auto& e : *events) {
                     arr.add(JObj()
                                 .add("id", e.id)
                                 .add("timestamp", e.timestamp)
@@ -8072,13 +8099,13 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "list_engine_roles") {
-                if (!tier_allows(tier, "Security", "Read")) {
+                if (!tier_allows(tier, "EnginePrincipal", "Read")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Security", "Read"))
+                if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                     return;
                 if (!rbac_store || !rbac_store->is_open()) {
                     res.set_content(error_response(id, kInternalError, "RBAC store not available"),
@@ -8238,13 +8265,13 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "list_engine_principals") {
-                if (!tier_allows(tier, "Security", "Read")) {
+                if (!tier_allows(tier, "EnginePrincipal", "Read")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Security", "Read"))
+                if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                     return;
                 if (deny_if_engine_session())
                     return;
@@ -8285,13 +8312,13 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "get_engine_principal") {
-                if (!tier_allows(tier, "Security", "Read")) {
+                if (!tier_allows(tier, "EnginePrincipal", "Read")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Security", "Read"))
+                if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                     return;
                 if (deny_if_engine_session())
                     return;
@@ -9383,7 +9410,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto doc = yuzu::server::build_permissions_catalog(*rbac_store);
+                // #2376: same split as the REST twin — probe for the grid
+                // permission, never deny the whole tool over it.
+                httplib::Response perm_probe;
+                const bool include_roles =
+                    perm_fn(req, perm_probe, "UserManagement", "Read");
+                auto doc =
+                    yuzu::server::build_permissions_catalog(*rbac_store, include_roles);
                 auto result = tool_result(doc.json, kObjectOutputSchema);
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");

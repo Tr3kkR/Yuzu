@@ -755,7 +755,7 @@ The same ownership constraint applies to the HTMX dashboard path `DELETE /api/se
 
 Engine principals are the durable identities behind autonomous use-case-engine modules (ADR-1005 item 2b) — a distinct principal class from human users and human-created API tokens, with a named responsible human owner, a grant justification captured at creation, and a required `internal`/`external` classification. Design reference: `docs/auth-engine-principals-design.md`. Every credential minted against an engine principal is hard-locked to MCP tier `readonly` and can never be granted the admin/wildcard role ("no admin, ever" — independently provable via the auditor route below).
 
-**Every *mutating* route is admin + MFA-step-up gated.** The read routes (`GET`/list, `GET /{id}`, and `GET /audit/no-admin`) are admin + RBAC gated (`Security:Read` / `AuditLog:Read`) but do **not** require a fresh MFA step-up. Beyond that, every route — reads included — structurally denies a caller whose *own* session is engine-classed (`principal_kind="engine"` or `auth_source="engine_token"`): an engine principal can never enumerate, read, or mutate any entry on this surface, not even itself. A denied engine-classed caller gets `403`; the corresponding audit verb is recorded with `result=denied`.
+**Every *mutating* route is admin + MFA-step-up gated.** The read routes (`GET`/list, `GET /{id}`, and `GET /audit/no-admin`) are admin + RBAC gated (`EnginePrincipal:Read` for the two engine-principal reads, `AuditLog:Read` for `/audit/no-admin`) but do **not** require a fresh MFA step-up. Beyond that, every route — reads included — structurally denies a caller whose *own* session is engine-classed (`principal_kind="engine"` or `auth_source="engine_token"`): an engine principal can never enumerate, read, or mutate any entry on this surface, not even itself. A denied engine-classed caller gets `403`; the corresponding audit verb is recorded with `result=denied`.
 
 **Storage failure:** if the engine-principal store failed to open at startup (no PostgreSQL configured, or a migration failure), every route on this surface returns `503 service unavailable`.
 
@@ -815,7 +815,7 @@ Create a new engine-principal identity. `principal_id` is derived server-side as
 
 List every engine principal (all lifecycle states), with each principal's active-credential count.
 
-**Permission:** `Security:Read`
+**Permission:** `EnginePrincipal:Read`
 
 **Response:**
 
@@ -845,7 +845,7 @@ List every engine principal (all lifecycle states), with each principal's active
 
 Get one engine principal's full identity row plus its active credentials (token id, name, timestamps, rotation group, overlap-expiry — never the raw secret; `token_hash` stays masked). `active_credentials` here is an **array** of credential objects — contrast with the list route above (`active_credential_count`, an integer) and with the MCP `get_engine_principal` twin, whose `active_credentials` field is an integer count under the same field name (see `docs/user-manual/mcp.md`).
 
-**Permission:** `Security:Read`
+**Permission:** `EnginePrincipal:Read`
 
 **Errors:** `404` — engine principal not found. `503` — engine-principal store unavailable (not open, or the read itself failed).
 
@@ -1720,7 +1720,7 @@ role, or a wildcard role. `POST .../roles` **rejects** such a request outright
 
 List the fleet-wide roles currently assigned to an engine principal.
 
-**Permission:** `Security:Read`
+**Permission:** `EnginePrincipal:Read`
 
 **Response:**
 
@@ -1735,7 +1735,7 @@ List the fleet-wide roles currently assigned to an engine principal.
 
 An unknown or revoked `{id}` is not distinguished here — it simply returns an
 empty `data` array (no RBAC row can exist for a principal that was never
-granted one). Errors: `403` (missing `Security:Read`), `503` (RBAC store
+granted one). Errors: `403` (missing `EnginePrincipal:Read`), `503` (RBAC store
 unavailable).
 
 ---
@@ -2232,6 +2232,8 @@ Remove a template. Returns 400 when `template_id` is `__default__`.
 
 Query the server audit trail. All state-changing operations are recorded with the acting principal, action, target, and result.
 
+> **Reads deny on store degrade (ADR-0040).** The audit trail is the SOC 2 evidence chain, so the audit query endpoints (`GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, and the legacy `GET /api/audit`) **return `503` when the underlying store or connection pool is unavailable — never an empty `200`.** A reviewer, SIEM, or CMDB integration can therefore never mistake an infrastructure blip for "no audit activity"; treat a `503` here as a transient, retryable evidence-availability gap, not as an empty result set. This is the read-side counterpart to the fail-hard write posture (`503` + `Sec-Audit-Failed` on the behavioural-PII routes).
+
 #### `GET /api/v1/audit`
 
 Query audit events.
@@ -2283,6 +2285,15 @@ Query audit events.
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Errors:** `403` — caller lacks `AuditLog:Read`; `400` — `limit` parses to
+less than 1 (a negative or zero limit; caught explicitly rather than reaching
+PostgreSQL as an invalid `LIMIT`); `503` — the audit store is unavailable or
+the query degraded (ADR-0040 deny-on-degrade — see the note above this
+section; never a false-empty `200`). A non-numeric `limit` (e.g. `abc`) is
+NOT a 400 here — it is silently caught and the request proceeds with the
+default `limit` (100); the sibling `auth-sample` route below is stricter and
+400s on the same input.
 
 #### `GET /api/v1/audit/auth-sample`
 
@@ -2336,10 +2347,14 @@ curl -s -G \
 `target_type`, `target_id`, `detail`); the sample deliberately does **not**
 widen what `AuditLog:Read` discloses (no `session_id` / `source_ip`). The
 envelope additionally carries a `sampling` object (`candidates_considered`,
-`scan_cap`, `recency_capped`). `400` if `from`/`to` are not non-negative
-digits, `from > to`, or `limit` is non-integer; `503` if the audit store is
-unavailable. If the export's own audit row fails to persist, the response
-carries a `Sec-Audit-Failed: true` header (the export still returns).
+`scan_cap`, `recency_capped`). **Errors:** `403` — caller lacks
+`AuditLog:Read`; `400` — `from`/`to` are not non-negative digits, `from >
+to`, or `limit` is non-integer (unlike the sibling `GET /api/v1/audit`, a
+non-numeric `limit` here IS a 400, not a silent fallback); `503` — the audit
+store is closed (checked up front, before any query parameter is even
+parsed) or the query itself degraded mid-request. If the export's own audit
+row fails to persist, the response carries a `Sec-Audit-Failed: true` header
+(the export still returns).
 
 **Audit action names:**
 
@@ -2406,9 +2421,10 @@ flag it for revocation. Covers all three RBAC principal types: **user**,
 > earlier round of this feature gated it on `AuditLog:Read`/`AuditLog:Attest`
 > instead, which over-disclosed the full grant population to the `Operator`
 > and `PlatformEngineer` roles (both seeded `AuditLog:Read` for unrelated
-> reasons, neither seeded `UserManagement:Read`/`Security:Read`, the
+> reasons, neither seeded `UserManagement:Read`/`EnginePrincipal:Read`, the
 > permissions gating the equivalent-sensitivity `/rbac/roles` and
-> `/engine-principals/{id}/roles` routes). See
+> `/engine-principals/{id}/roles` routes — the latter moved off the
+> over-broad `Security:Read` in #2376). See
 > `docs/security-reviews/access-reviews-2026-07-21.md` "#2225 round 2" for
 > the finding and fix.
 
@@ -3662,9 +3678,32 @@ All five share the same caching contract: a content-derived `ETag` header + `Cac
 
 #### `GET /api/v1/discover/permissions`
 
-RBAC permission catalog: every `securable_type` × `operation` pair the RBAC store recognizes, plus the full role → allowed-operations grid.
+RBAC permission catalog. The response has **two halves with different permissions** (#2376):
 
-**Permission:** `Infrastructure:Read`
+- the **taxonomy** — `securable_types` and `operations`, i.e. what the RBAC model can express —
+  requires only the route's own `Infrastructure:Read`. It says nothing about who holds what, and an
+  agentic worker needs it to author a grant at all (A2 discovery).
+- the **role grid** — `roles[].permissions[]`, every role's actual granted securable/operation/effect
+  — additionally requires **`UserManagement:Read`**. That grid *is* authorization topology, and it is
+  strictly more than `GET /api/v1/rbac/roles` discloses, so it carries the same permission the
+  authorization-topology floor applies there.
+
+A caller holding `Infrastructure:Read` but not `UserManagement:Read` still gets `200` and the full
+taxonomy; the grid is replaced by `"roles_omitted": true` plus a `roles_omitted_reason`. **The
+omission is declared, never silent** — `roles` absent with no `roles_omitted` flag would mean
+"no roles exist", which is a different fact.
+
+**Permission:** `Infrastructure:Read` (taxonomy) · `UserManagement:Read` (role grid)
+
+**Caching:** because the body varies with the caller's grants, this route responds
+`Cache-Control: private, max-age=300` with `Vary: Authorization, Cookie` — never `public`.
+A shared cache must not store one caller's representation and serve it to another.
+`GET /api/v1/discover/plugins` is `private` for the same reason (its `parameter_schema`
+enrichment is gated on `InstructionDefinition:Read`); the caller-independent catalogues
+(`instructions`, `routes`, `scope-kinds`) remain `public, max-age=300`. `Vary` names all
+three credential channels this server accepts — `Cookie`, `Authorization` and
+`X-Yuzu-Token` — because a caller-local cache keyed on only some of them can serve one
+API-token caller's representation to another.
 
 **Response:**
 ```json
@@ -3683,6 +3722,14 @@ RBAC permission catalog: every `securable_type` × `operation` pair the RBAC sto
       ]
     }
   ]
+}
+```
+
+Without `UserManagement:Read` the `roles` key is replaced by:
+```json
+{
+  "roles_omitted": true,
+  "roles_omitted_reason": "requires UserManagement:Read (#2376 authorization-topology floor); the securable_types and operations taxonomy above is unaffected"
 }
 ```
 
@@ -6079,7 +6126,22 @@ Reject a pending instruction execution.
 
 #### `GET /api/audit`
 
-Query audit events. Accepts `limit`, `principal`, and `action` as query parameters. Functionally equivalent to `GET /api/v1/audit` but without the v1 envelope.
+Query audit events. Legacy route — **not** merely `GET /api/v1/audit` without
+the v1 envelope; the response shape and accepted parameters both genuinely
+differ. Accepts `principal`, `action`, `target_type`, `target_id`, `since`,
+`until`, `limit`, and `offset` (more than the v1 route's `limit`/`principal`/
+`action`). Response is `{"events": [...], "count": N, "total": <number-or-
+null>}` (field names `events`/`count`/`total`, not v1's `data`/`pagination`/
+`meta`), and each event row additionally carries `id`, `principal_role`, and
+`source_ip`, which v1's row shape omits. `total` is a best-effort second read
+taken after the page itself succeeds — it is `null`, not `0` or the page
+size, when that second read degrades; do not treat `null` as "unknown but
+probably zero".
+
+**Errors:** `403` — caller lacks `AuditLog:Read`; `400` — a `since`/`until`/
+`limit`/`offset` query parameter is not a valid integer, or `limit < 1` /
+`offset < 0`; `503` — the audit store is closed, or the page-rows query
+degraded (ADR-0040 deny-on-degrade; never a false-empty `200`).
 
 ---
 

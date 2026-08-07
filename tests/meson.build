@@ -562,7 +562,9 @@ if build_server
       'unit/server/test_kek_rotate_control.cpp', # #2530 B3/B4 — rotate control-flow ordering + half-commit classification
       'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
+      'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
       'unit/server/test_authz_model.cpp', # PR1.4: registry-independent authz model + #1788 per-device visibility (all four arms)
+      'unit/server/test_authz_topology_floor.cpp', # #2376: the RBAC-off legacy-fallback topology floor (AccessReview/UserManagement/EnginePrincipal Read)
       'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',
@@ -783,10 +785,19 @@ if build_server
        args: ['~[pg][auth],~[pg][mcp]'], suite: 'server', timeout: 600)
   test('server unit tests shard B', server_test_exe,
        args: ['~[pg]~[auth]~[mcp]'], suite: 'server', timeout: 600)
+  # [audit_store] is in shard A's OR-list because ADR-0040 moved that whole file
+  # onto PG in one change: without it, every one of its cases lands in B, which
+  # is the heavier half already. MEASURED on Linux at that change's head, same
+  # box, live PG: A 89.7s -> 95.8s, B 116.0s -> 113.4s. That is a ~3% shift, not
+  # a rescue — the ~1.9x case-count drift between these two halves PREDATES this
+  # change and is not addressed here. The partition is preserved
+  # (N([pg]) == N(A) + N(B)); if you add a tag to one side, exclude it on the
+  # other in the same edit.
   test('server pg unit tests shard A', server_test_exe,
-       args: ['[pg][routes],[pg][store],[pg][token]'], suite: 'server', timeout: 600)
+       args: ['[pg][routes],[pg][store],[pg][token],[pg][audit_store]'],
+       suite: 'server', timeout: 600)
   test('server pg unit tests shard B', server_test_exe,
-       args: ['[pg]~[routes]~[store]~[token]'], suite: 'server', timeout: 600)
+       args: ['[pg]~[routes]~[store]~[token]~[audit_store]'], suite: 'server', timeout: 600)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────

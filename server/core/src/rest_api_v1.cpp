@@ -674,7 +674,7 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Unassign a role from a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}}}
     },
     "/engine-principals/{id}/roles": {
-      "get": {"summary": "List fleet-wide RBAC roles assigned to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "responses": {"200": {"description": "List of role assignments"}, "403": {"description": "Requires Security:Read"}, "503": {"description": "RBAC store unavailable"}}},
+      "get": {"summary": "List fleet-wide RBAC roles assigned to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "responses": {"200": {"description": "List of role assignments"}, "403": {"description": "Requires EnginePrincipal:Read"}, "503": {"description": "RBAC store unavailable"}}},
       "post": {"summary": "Assign a fleet-wide RBAC role to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["role"], "properties": {"role": {"type": "string"}}}}}}, "responses": {"201": {"description": "Role assigned"}, "400": {"description": "Bad JSON / missing role / unknown role / admin-or-built-in role rejected (design §4.2)"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No active engine principal with that id"}, "503": {"description": "RBAC or engine-principal store unavailable"}}}
     },
     "/engine-principals/{id}/roles/{role}": {
@@ -686,10 +686,10 @@ const std::string& openapi_spec() {
         R"json(,
     "/engine-principals": {
       "post": {"summary": "Create a new engine-principal identity", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["slug", "display_name", "owner_username", "justification", "classification"], "properties": {"slug": {"type": "string", "description": "Reserved 'engine:<slug>' namespace suffix — lowercase letters, digits, '.', '_', '-' only, max 128 chars"}, "display_name": {"type": "string"}, "owner_username": {"type": "string", "description": "Must reference an existing user (owner-FK)"}, "justification": {"type": "string"}, "classification": {"type": "string", "enum": ["internal", "external"]}}}}}}, "responses": {"201": {"description": "Created; {principal_id}"}, "400": {"description": "Bad JSON, invalid/duplicate slug, missing justification, unknown owner_username, or invalid classification"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "503": {"description": "Engine-principal store, or owner-lookup, unavailable"}}},
-      "get": {"summary": "List every engine principal", "tags": ["Security"], "responses": {"200": {"description": "List of engine principals with active_credential_count"}, "403": {"description": "Requires Security:Read"}, "503": {"description": "Engine-principal store unavailable"}}}
+      "get": {"summary": "List every engine principal", "tags": ["Security"], "responses": {"200": {"description": "List of engine principals with active_credential_count"}, "403": {"description": "Requires EnginePrincipal:Read"}, "503": {"description": "Engine-principal store unavailable"}}}
     },
     "/engine-principals/{id}": {
-      "get": {"summary": "Get one engine principal and its active credentials", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "responses": {"200": {"description": "Engine principal detail + active_credentials[] (secrets masked)"}, "403": {"description": "Requires Security:Read"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal store unavailable"}}},
+      "get": {"summary": "Get one engine principal and its active credentials", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "responses": {"200": {"description": "Engine principal detail + active_credentials[] (secrets masked)"}, "403": {"description": "Requires EnginePrincipal:Read"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal store unavailable"}}},
       "delete": {"summary": "Revoke an engine principal (terminal) and its active credentials", "tags": ["Security"], "description": "Cross-store ordering invariant: credentials are revoked FIRST (ApiTokenStore::revoke_for_principal), the identity SECOND — never the reverse.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"superseded_by": {"type": "string"}}}}}}, "responses": {"200": {"description": "Revoked (idempotent — success even if already revoked); {revoked, credentials_revoked}"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal or credential store unavailable"}}}
     },
     "/engine-principals/{id}/credentials": {
@@ -789,7 +789,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "List instruction definitions", "tags": ["Instructions"], "responses": {"200": {"description": "List of instruction definitions"}}}
     },
     "/audit": {
-      "get": {"summary": "Query audit log", "tags": ["Audit"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100}}, {"name": "principal", "in": "query", "schema": {"type": "string"}}, {"name": "action", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "List of audit events"}}}
+      "get": {"summary": "Query audit log", "tags": ["Audit"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000}}, {"name": "principal", "in": "query", "schema": {"type": "string"}}, {"name": "action", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "List of audit events"}, "400": {"description": "limit below 1 (a client error, deliberately NOT reported as a store degrade)"}, "503": {"description": "Audit store or connection pool unavailable — deny-on-degrade, never a false-empty 200"}}}
     },
     "/audit/auth-sample": {
       "get": {"summary": "Sampled authentication-log evidence export (SOC 2 CC7.2)", "tags": ["Audit"], "description": "Pseudo-random sample of authentication-surface audit events (action prefixes auth./mfa./session.) over an optional [from,to] window. Requires AuditLog:Read. The export is itself audited as audit.auth_sample.exported. SAMPLING NOTE: the sample is drawn from at most the 10000 most-recent matching events in the window; when the window holds more than that, the sample is recency-biased (NOT uniform over the full window). The response `sampling` object reports `candidates_considered`, `scan_cap`, and `recency_capped` so evidence consumers can detect this. Samples are non-reproducible (no seed); the audited `audit.auth_sample.exported` row is the chain-of-custody record.", "parameters": [{"name": "from", "in": "query", "schema": {"type": "integer"}, "description": "Window start, epoch seconds (optional, digits only)"}, {"name": "to", "in": "query", "schema": {"type": "integer"}, "description": "Window end, epoch seconds (optional, digits only)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Sampled list of auth audit events; envelope adds a `sampling` object (candidates_considered, scan_cap, recency_capped)"}, "400": {"description": "from/to not non-negative digits, from>to, or non-integer limit"}, "503": {"description": "Audit store unavailable"}}}
@@ -1959,7 +1959,7 @@ void RestApiV1::register_routes(
     // ── Management Group Roles (/api/v1/management-groups/:id/roles) ────
 
     sink.Get(R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
-             [perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
+             [auth_fn, perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "ManagementGroup", "Read"))
                      return;
                  if (!mgmt_store) {
@@ -1969,6 +1969,46 @@ void RestApiV1::register_routes(
                  }
 
                  auto group_id = req.matches[1].str();
+
+                 // #2376 — this response is ENTIRELY authorization topology: every row
+                 // is {principal_type, principal_id, role_name}, i.e. who holds what
+                 // role in this group. `ManagementGroup:Read` is deliberately NOT in the
+                 // topology floor (it gates ordinary group metadata and member lists, and
+                 // flooring it would be the too-coarse mistake the floor avoids with
+                 // Security:Read), so on an RBAC-off install the legacy Read-allow handed
+                 // this graph to any authenticated session. Third instance of that shape
+                 // in this change — the floor SET is derived from the DATA a route emits,
+                 // never from the securable it happens to be gated on.
+                 //
+                 // Authorized by EITHER the floored `UserManagement:Read` (the fleet-wide
+                 // right, which already gates /api/v1/rbac/roles) OR being an
+                 // `ITServiceOwner` OF THIS GROUP — the group-scoped admin. The second arm
+                 // is not a weakening: it mirrors the ITServiceOwner fallback the POST and
+                 // DELETE handlers on this same path already use, and without it a group
+                 // admin could WRITE role assignments it may not READ, which is both a
+                 // broken workflow and an incoherent posture. It is a DATA check
+                 // (assignment rows), so it holds with RBAC off, and it is scoped to the
+                 // one group rather than the fleet.
+                 httplib::Response probe; // throwaway: the fleet-wide arm, never sent
+                 bool authorized = perm_fn(req, probe, "UserManagement", "Read");
+                 if (!authorized) {
+                     auto session = auth_fn(req, res);
+                     if (!session)
+                         return;
+                     for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
+                         if (gr.principal_type == "user" && gr.principal_id == session->username &&
+                             gr.role_name == "ITServiceOwner") {
+                             authorized = true;
+                             break;
+                         }
+                     }
+                 }
+                 if (!authorized) {
+                     res.status = 403;
+                     res.set_content(detail::a4_error(res, "forbidden"), "application/json");
+                     return;
+                 }
+
                  auto roles = mgmt_store->get_group_roles(group_id);
                  JArr arr;
                  for (const auto& r : roles) {
@@ -2120,7 +2160,7 @@ void RestApiV1::register_routes(
     // in the current global model).
     sink.Get(R"(/api/v1/engine-principals/([a-z0-9._-]+)/roles)",
              [perm_fn, audit_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn(req, res, "Security", "Read"))
+                 if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                      return;
                  // is_open() distinguishes "no roles" from "rbac.db down": a
                  // closed store must 503, never return [] implying the
@@ -2724,7 +2764,7 @@ void RestApiV1::register_routes(
     sink.Get("/api/v1/engine-principals",
              [perm_fn, auth_fn, audit_fn, eps, token_store](
                  const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn(req, res, "Security", "Read"))
+                 if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                      return;
                  if (!eps || !eps->is_open()) {
                      res.status = 503;
@@ -2769,7 +2809,7 @@ void RestApiV1::register_routes(
     sink.Get(R"(/api/v1/engine-principals/([^/]+))",
              [perm_fn, auth_fn, audit_fn, eps, token_store](
                  const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn(req, res, "Security", "Read"))
+                 if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                      return;
                  if (!eps || !eps->is_open()) {
                      res.status = 503;
@@ -4580,13 +4620,31 @@ void RestApiV1::register_routes(
                  }
                  if (q.limit > 1000)
                      q.limit = 1000;
+                 // A negative limit is a client error, not a store degrade: left
+                 // alone it reaches PG as `LIMIT -1`, errors, and reports as an
+                 // audit-availability incident (Gate 2 security).
+                 if (q.limit < 1) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "limit must be >= 1"),
+                                     "application/json");
+                     return;
+                 }
                  q.principal = req.get_param_value("principal");
                  q.action = req.get_param_value("action");
 
+                 // ADR-0040: degrade-distinguishable read — nullopt on a
+                 // store/pool failure. Surface 503, never a false-empty 200 (an
+                 // audit blip must not read as "no activity" — evidence integrity).
                  auto events = audit_store->query(q);
+                 if (!events) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "audit store degraded"),
+                                     "application/json");
+                     return;
+                 }
                  JArr arr;
-                 for (size_t i = 0; i < events.size(); ++i) {
-                     const auto& e = events[i];
+                 for (size_t i = 0; i < events->size(); ++i) {
+                     const auto& e = (*events)[i];
                      arr.add(JObj()
                                  .add("timestamp", e.timestamp)
                                  .add("principal", e.principal)
@@ -4596,7 +4654,7 @@ void RestApiV1::register_routes(
                                  .add("target_id", e.target_id)
                                  .add("detail", e.detail));
                  }
-                 res.set_content(list_json(arr.str(), static_cast<int64_t>(events.size())),
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(events->size())),
                                  "application/json");
              });
 
@@ -4710,7 +4768,20 @@ void RestApiV1::register_routes(
                 q.limit = 1;
 
             std::size_t pool_size = 0;
-            auto events = audit_store->query(q, &pool_size);
+            // ADR-0040: degrade-distinguishable read — nullopt on a store/pool
+            // failure. 503, never a false-empty sample (evidence integrity; the
+            // is_open() guard above only catches a closed store, not a runtime blip).
+            auto events_opt = audit_store->query(q, &pool_size);
+            if (!events_opt) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "audit store degraded", cid,
+                                                      /*retry_after_ms=*/5000,
+                                                      "the audit store is temporarily unavailable; "
+                                                      "retry shortly"),
+                                "application/json");
+                return;
+            }
+            const auto& events = *events_opt;
             // recency_capped: the window held at least the scan cap, so the sample
             // was drawn only from the most-recent kAuditSampleScanCap events and is
             // NOT a uniform sample of the full window. Surfaced in the response so an
