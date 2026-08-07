@@ -730,10 +730,14 @@ def _selftest():
     # non-PG '~[pg]' entry the same way, after it reached 603/600s (101%) on
     # Windows; the partition is [auth]+[mcp] vs the rest, balanced by measured
     # time rather than case count ([auth] alone is ~40% of the non-PG runtime).
+    # #2697 (ADR-0040) added [audit_store] explicitly to both PG specs: measured
+    # (not projected) at ~3% of shard B's runtime, moving it to shard A instead
+    # of leaving every newly `[pg]`-tagged audit case to land there by default
+    # (tests/meson.build's own comment on this pair has the measurement).
     check(("~[pg][auth],~[pg][mcp]",) in _shard_specs
           and ("~[pg]~[auth]~[mcp]",) in _shard_specs
-          and ("[pg][routes],[pg][store],[pg][token]",) in _shard_specs
-          and ("[pg]~[routes]~[store]~[token]",) in _shard_specs,
+          and ("[pg][routes],[pg][store],[pg][token],[pg][audit_store]",) in _shard_specs
+          and ("[pg]~[routes]~[store]~[token]~[audit_store]",) in _shard_specs,
           "meson.build: all four shard tag filters extracted verbatim")
 
     if failures:

@@ -304,7 +304,7 @@ static const ToolDef kTools[] = {
 
     {"query_audit_log",
      "Query the audit log with filters. Returns timestamped entries showing who did what, when.",
-     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"maximum":500}}})"},
+     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500}}})"},
 
     {"list_definitions",
      "List available instruction definitions (commands that can be dispatched to agents).",
@@ -2708,9 +2708,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 AuditQuery aq;
                 aq.limit = 50;
+                // ADR-0040: degrade-distinguishable read — nullopt on a
+                // store/pool failure. Surface an error, never a false-empty
+                // resource (an audit blip must not read as "no activity").
                 auto events = audit_store->query(aq);
+                if (!events) {
+                    res.set_content(error_response(id, kInternalError, "Audit store degraded"),
+                                    "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& e : events) {
+                for (const auto& e : *events) {
                     arr.add(JObj()
                                 .add("timestamp", e.timestamp)
                                 .add("principal", e.principal)
@@ -3570,10 +3578,29 @@ McpServer::HandlerFn McpServer::build_handler(
                 aq.target_type = param_str(args, "target_type");
                 aq.since = param_int(args, "since");
                 aq.until = param_int(args, "until");
-                aq.limit = std::min(param_int32(args, "limit", 50), 500);
+                // Clamp BOTH bounds, in 64-bit BEFORE narrowing — the
+                // query_responses idiom (`:3660`). Upper alone left a
+                // negative or zero `limit` reaching `AuditStore::query`,
+                // which clamps a non-positive limit to `LIMIT 0` at its own
+                // sink (`std::max(q.limit, 0)`) — a caller-supplied bad
+                // limit therefore came back as an EMPTY page, not an error,
+                // for the one query this store's ADR explicitly promises
+                // never reads false-empty. `param_int32`'s int64->int32 cast
+                // also wraps a limit above INT_MAX negative before `std::min`
+                // ever saw it; clamping the raw int64 first avoids that.
+                aq.limit = static_cast<int>(
+                    std::clamp<std::int64_t>(param_int(args, "limit", 50), 1, 500));
+                // ADR-0040: degrade-distinguishable read — nullopt on a
+                // store/pool failure. Surface an error, never a false-empty
+                // result (an audit blip must not read as "no activity").
                 auto events = audit_store->query(aq);
+                if (!events) {
+                    res.set_content(error_response(id, kInternalError, "Audit store degraded"),
+                                    "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& e : events) {
+                for (const auto& e : *events) {
                     arr.add(JObj()
                                 .add("id", e.id)
                                 .add("timestamp", e.timestamp)
