@@ -24,13 +24,27 @@ Elastic.
 
 ## Storage
 
-Audit events are persisted in a dedicated SQLite database using WAL
-(Write-Ahead Logging) mode for high write throughput without blocking readers.
+Audit events are persisted in the server's PostgreSQL substrate under the
+dedicated schema `audit_store` (ADR-0006/0040) — the same database that backs the
+rest of the server's stores, not a separate file. There is **no SQLite
+fallback**: if the substrate is unreachable at boot the server fails closed and
+refuses to start.
+
+Because the audit log is the SOC 2 evidence chain, its write and read paths have
+deliberately asymmetric failure postures:
+
+- **Writes fail hard.** A persistence failure is never silently dropped — the
+  write returns an error to the caller. Behavioural-PII REST routes turn that
+  into `503` + `Sec-Audit-Failed: true` and serve **no** data, so evidence-less
+  PII is never recorded as audited.
+- **Reads degrade to DENY.** A store or connection-pool failure on a query
+  returns `503`, never a false-empty `200`. A reviewer or SIEM can never mistake
+  an infrastructure blip for "no audit activity."
 
 | Setting | Default | Description |
 |---|---|---|
 | Retention period | 365 days | Events older than this are deleted by background cleanup |
-| Cleanup interval | 1 hour | How often the background thread prunes expired events |
+| Cleanup interval | 1 hour | How often the sweeper prunes expired events (fleet-wide, single-sweeper — see [The retention clock guard](#the-retention-clock-guard)) |
 
 ## Event structure
 
@@ -78,7 +92,7 @@ required.
 > high-frequency, pre-handler operational event — an engine principal running
 > hot against its own cap, expected under normal steady-state load — not a
 > forensically interesting action against a resource. Auditing every
-> rejection would flood `audit.db` under a busy or misconfigured engine
+> rejection would flood the audit store under a busy or misconfigured engine
 > principal with no compliance benefit; the counter (SIEM-routable,
 > `absent()`-safe pre-seeded series) is the intended observability surface.
 > Compare with `yuzu_onbehalf_rejected_total` and `yuzu_auth_lockout_blocked_
@@ -359,7 +373,7 @@ conditions and the triage differs. The current rule set is
 |---|---|---|
 | `YuzuAuditRetentionClockAnomaly` | A pass declined. Nothing was deleted. | Read on. |
 | `YuzuAuditRetentionFailing` | The pass is **erroring**, not declining. | `yuzu_server_audit_cleanup_failed_total` in the metric table below. |
-| `YuzuAuditRetentionNotRunning` | The reaper is not running at all --- retention is unenforced and `audit.db` grows without bound. | Triage is in [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionnotrunning) --- **start there**: it opens with the routine, self-clearing causes (a Prometheus restart false-pages for ~45 minutes) before the real diagnosis, and it states the cadence band where this rule cannot fire at all (measured: [`prometheus/blind-band-measurement.md`](../prometheus/blind-band-measurement.md)). Then `yuzu_server_audit_retention_passes_total` in the metric table below. |
+| `YuzuAuditRetentionNotRunning` | The reaper is not running at all --- retention is unenforced and the audit store grows without bound. | Triage is in [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionnotrunning) --- **start there**: it opens with the routine, self-clearing causes (a Prometheus restart false-pages for ~45 minutes) before the real diagnosis, and it states the cadence band where this rule cannot fire at all (measured: [`prometheus/blind-band-measurement.md`](../prometheus/blind-band-measurement.md)). Then `yuzu_server_audit_retention_passes_total` in the metric table below. |
 | `YuzuAuditRetentionMetricMissing` | The liveness metric is not being scraped **at all**, so `YuzuAuditRetentionNotRunning` cannot fire for anyone. **Check `up` for the Yuzu target first** — if it is down, or the target has left service discovery, this is an outage rather than just a monitoring gap, and on a single-server Prometheus this may be the only rule firing. | The three-state triage is in [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionmetricmissing) — start there; then `yuzu_server_audit_retention_passes_total` in the metric table below. |
 | `YuzuAuditRetentionStateNotPersisting` | The durable clock reading cannot be written, so detection will not survive a restart. | `yuzu_server_audit_retention_persist_failed_total` in the metric table below. |
 | `YuzuAuditRetentionCapBinding` | Expiry is outrunning the drain. | [Capacity](#capacity). |
@@ -370,6 +384,31 @@ would destroy the audit trail declines instead of deleting: it logs a warning an
 adds one to `yuzu_server_audit_clock_anomaly_skips_total`. **A decline deletes
 nothing.** It is the protection working, not evidence lost. The rest of this
 section is about declines.
+
+**Retention sweeps fleet-wide from a single process.** On the PostgreSQL
+substrate every replica runs the cleanup thread, but each pass first tries to
+take an advisory lease (`pg_try_advisory_xact_lock('audit_store:reap')`); only
+the lease winner sweeps, so exactly one process prunes per tick across the whole
+fleet. The 25,000-rows-per-pass cap therefore stays calibrated as a single
+drain rate — it can never become "N replicas × 25,000." The clock guard's dedup
+state now lives durably in the `audit_retention_meta` table (the previous pass's
+serialized fact-set, alongside the last clock reading), so a condition reported
+by one replica is not re-reported by another, and the state survives a restart
+or a failover to a different replica. (Previously, on the single SQLite server,
+this dedup state was an in-process member — correct for one writer, but it does
+not port to a multi-replica store.)
+
+**Dedup-semantics change (multi-replica correctness).** Because the dedup state
+is now shared across replicas, an identical-magnitude clock step that repeats
+with the *same* fact-set is reported **once** and then stands down, rather than
+re-incrementing `yuzu_server_audit_clock_anomaly_skips_total` on every pass as
+the single-process guard did. A genuinely *different* anomaly (for example a
+dead-CMOS boot followed by an NTP correction — a distinct fact-set) still
+reports; the catastrophic whole-window-wipe protection is fully preserved. Only
+a *second identical* clock step re-emitting the counter is lost. If you
+previously alerted on the *cadence* of that counter (a fresh increment every
+pass), alert on a sustained non-zero increase over several consecutive passes
+instead — see "Is retention actually stalled?" below.
 
 **Start with the log line.** Every decline logs an `AuditStore:` warning naming
 which condition fired, and for an elapsed-time decline it prints the actual gap
@@ -423,8 +462,8 @@ the state you are testing for.
 
 Whether that stall *matters* is a separate question, and there is no metric for
 it --- confirm a backlog exists by querying for events older than the retention
-window (see Protecting evidence below), or by watching `audit.db` grow on disk. A
-store with nothing to delete shows the same two counters.
+window (see Protecting evidence below), or by watching the `audit_store` schema
+grow in PostgreSQL. A store with nothing to delete shows the same two counters.
 
 If skips and `yuzu_server_audit_rows_deleted_total` are **both** flat, retention
 is not declining --- it is failing or not running at all; check
@@ -485,12 +524,19 @@ since-process-start and make skips smaller than passes on any healthy store.
 The drain resumes on its own within a pass or two of the readings becoming
 stable, paced at the cap, and nothing needs to be deleted by hand.
 
-**Do not delete rows yourself, and do not move `audit.db` aside**, however large
-it has grown. Over-retention is the SAFE direction here and it is deliberate:
+**Do not delete rows yourself** from the live store, however large it has grown.
+Over-retention is the SAFE direction here and it is deliberate:
 retention is a floor, not a ceiling, and the guard errs toward keeping evidence
 longer than configured because this is an evidence store. Rows older than the
 configured window are the guard working, not a fault. If disk is the immediate
 problem, treat it as a capacity incident (see below) rather than an audit one.
+
+This is distinct from the one-time **legacy `audit.db` SQLite file** the Postgres
+migration moves aside after a verified backfill (see
+`docs/user-manual/upgrading.md`): that file is a completed, operator-managed
+backup of the pre-cutover trail, so relocating or archiving it is expected, not
+forbidden. The prohibition above is about the *live* `audit_store` schema in
+PostgreSQL — there is no live SQLite file to move.
 
 Safe for *evidence*, which is not the same as safe for *privacy*: audit rows
 carry `principal`, `source_ip` and `user_agent`. If you are under a retention
@@ -569,8 +615,8 @@ directly. Do not collapse the first two:
 | Metric | Meaning |
 |---|---|
 | `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete; nothing was deleted, and each declined pass adds exactly 1. Triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was not usable -- ahead of the clock, negative, present but not an integer, or unreadable. Reducing `audit_retention_days` can also cause a decline by design. For triage, see [The retention clock guard](#the-retention-clock-guard) above. |
-| `yuzu_server_audit_cleanup_failed_total` | A pass did not fully do its job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. **One site fires after a SUCCESSFUL delete** (the post-delete backlog probe), so read this as "retention is not fully healthy", not "nothing was deleted". |
-| `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
+| `yuzu_server_audit_cleanup_failed_total` | A pass did not fully do its job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. Every site INSIDE the pass's transaction rolls the whole pass back, INCLUDING the post-delete backlog probe: a probe failure after the delete undoes the delete too. The thread-boundary catch is the one exception — it wraps the post-commit bookkeeping (counters, the summary log line) too, so an exception thrown there counts a pass that DID delete rows as failed. Read a rise as "retention is not fully healthy", not as proof nothing was removed. (On the retired SQLite store the backlog probe was a warning after a committed delete, and this row said so; the substrate change inverted the in-transaction case but not the thread-boundary one.) |
+| `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and the audit store is growing without bound. |
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
 | `yuzu_server_audit_retention_bootstrap_declines_total` | A pass declined because it had NO stored clock reading while rows were already expired (#2579); nothing was deleted. Counted apart from the clock-anomaly series on purpose - it claims only that nothing can yet rule out a wrong clock, not that the clock moved, so it must not fire an alert that says otherwise. Expect 0 or 1 per database; a climbing value means the anchor is not surviving, so read it with `..._retention_persist_failed_total`. |
 | `yuzu_server_audit_retention_persist_failed_total` | The durable clock reading could not be written. Detection will not survive a restart while this is rising. |
@@ -584,32 +630,68 @@ cap itself introduces, which neither of the first two would show.
 
 ### Capacity
 
-**The drain is a fixed 25,000 rows per hourly pass** -- about 600,000 rows/day, or
-a sustained ceiling of roughly **6.9 audit events/second**. Above that, expiry
-outruns deletion and `audit.db` grows without bound;
-`yuzu_server_audit_retention_cap_reached_total` is the signal. Compare that figure
-against your own audit-event rate before deploying at scale. The cap is a
-compile-time constant today, so exceeding it needs an engineering change rather
-than configuration.
+**Two different cadences, not one.** A pass that does NOT hit the per-pass
+25,000-row cap re-arms after the full `cleanup_interval_min` (default 60
+minutes). A pass that DOES hit the cap AND leaves a genuine remainder
+re-arms after `kAuditBacklogRearmSec` (5 seconds) instead — `audit_next_wait_s`
+in `audit_store.hpp` — and keeps doing so every subsequent pass until a pass
+clears the backlog. An earlier revision of this section quoted only the first
+cadence as if it were the hard ceiling; it is not — it is the QUIET
+threshold, the rate below which `cap_reached_total` never moves at all.
 
-The **file-size** ceiling is likely to bind first, though this is an estimate
-rather than a measurement: sustaining 6.9 events/second for a 365-day retention
-window means roughly 219M rows. At an assumed ~200 bytes/row that is on the order
-of 44 GB plus a comparable index footprint in a single SQLite file -- but row size
-varies with `principal`, `action`, `detail`, `target` and `user_agent`, so treat
-the byte figure as an order of magnitude, not a threshold. A deployment
-approaching the drain-rate ceiling has a storage problem before it has a
-retention-pacing problem. Audit rows are emitted per REQUEST rather than per
-device, but not only for operator requests: agent enrolment, fleet-topology pushes
-and rejections, and background schedule execution all write rows too, so fleet
-size does influence the rate. Measure your own `yuzu_server_audit_events_total`
-rate rather than assuming an operator-only workload.
+- **Quiet-operation threshold: ~6.9 audit events/second** (25,000 rows /
+  hourly pass, ~600,000 rows/day). Stay under this and the guard never
+  enters backlog mode — `yuzu_server_audit_retention_cap_reached_total`
+  stays at 0.
+- **The actual drain ceiling is far higher**, because backlog mode
+  self-accelerates: once `cap_reached_total` starts moving, passes run every
+  5 seconds instead of every hour, each still capped at 25,000 rows — up to
+  **~5,000 rows/second** if the DELETE itself stays fast relative to the
+  5-second floor. Measured this session (not a promise for every
+  environment — DELETE cost scales with backlog size, hardware, and
+  concurrent load): a 25,000-row capped delete against a 200,000-row backlog
+  took 44 ms, and against a 5,000,000-row backlog took 570 ms — both
+  comfortably inside the 5-second floor, so the achieved cadence there is
+  genuinely bound by the 5-second sleep, not by DELETE execution time.
+  Exceeding ~6.9 events/second is normal, expected, and self-corrects; the
+  store only grows WITHOUT BOUND if the sustained write rate exceeds the
+  backlog-recovery ceiling itself, which is roughly three orders of
+  magnitude higher than the quiet-operation figure this section used to
+  present as the ceiling.
+- **`yuzu_server_audit_retention_cap_reached_total` rising is not itself a
+  problem** — it means backlog mode engaged, which is the system doing its
+  job faster, not falling behind. Falling behind is `cap_reached_total`
+  rising and STAYING elevated for a sustained period with
+  `yuzu_server_audit_rows_deleted_total` not keeping pace — see
+  `YuzuAuditRetentionCapBinding` (`docs/prometheus/yuzu-alerts.yml`), which
+  alerts on sustained capping, not on a single capped pass.
 
-**The cap also bounds peak WAL.** The old unguarded delete cleared its whole
-backlog in one uncheckpointable transaction: measured at 152 MB of WAL for a
-337k-row backlog, extrapolating to about 2 GB at 4.5M. A capped pass writes about
-51 MB for its 25,000 rows and checkpoints between passes, so disk high-water is
-bounded too, not just lock-hold time.
+The cap (25,000 rows/pass) and the re-arm floor (5 seconds) are both
+compile-time constants today, so raising either needs an engineering change
+rather than configuration.
+
+The **file-size** ceiling is likely to bind before the drain-rate ceiling
+does, though this is an estimate rather than a measurement: sustaining even
+the QUIET threshold of 6.9 events/second for a 365-day retention window
+means roughly 219M rows. At an assumed ~200 bytes/row that is on the order
+of 44 GB plus a comparable index footprint in the `audit_store.audit_events`
+table -- but row size varies with `principal`, `action`, `detail`, `target`
+and `user_agent`, so treat the byte figure as an order of magnitude, not a
+threshold. Audit rows are emitted per REQUEST rather than per device, but
+not only for operator requests: agent enrolment, fleet-topology pushes and
+rejections, and background schedule execution all write rows too, so fleet
+size does influence the rate. Measure your own
+`yuzu_server_audit_events_total` rate rather than assuming an operator-only
+workload.
+
+**The cap also bounds each pass's transaction size.** The old unguarded delete
+cleared its whole backlog in one transaction; capping the pass at 25,000 rows
+keeps each retention transaction bounded, so it commits and lets PostgreSQL
+recycle write-ahead log between passes rather than accumulating unbounded WAL for
+one giant delete. (On the legacy SQLite store this was measured at 152 MB of WAL
+for a 337k-row backlog — extrapolating to about 2 GB at 4.5M — versus about
+51 MB for a capped 25,000-row pass; the bound is the same principle on the
+PostgreSQL substrate.)
 
 
 ## Integration patterns

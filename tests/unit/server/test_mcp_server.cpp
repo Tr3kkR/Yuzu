@@ -28,6 +28,7 @@
 #include "auth_routes.hpp"           // real-AuthRoutes integration test (C1)
 #include <yuzu/server/server.hpp>     // Config (real-AuthRoutes integration test)
 #include "audit_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "ca_store.hpp"
 #include "discover_routes.hpp"     // A2 discovery builders (Issue 17.1)
 #include "event_bus.hpp"
@@ -59,6 +60,7 @@
 #include <memory>
 #include <set>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -67,6 +69,18 @@
 
 using namespace yuzu::server::mcp;
 using namespace yuzu::server;
+
+namespace {
+// AuditStore migrated to Postgres (ADR-0006) — "MCP AuditStore: query with
+// mcp_tool field" below clones this pre-migrated template instead of opening
+// a SQLite path.
+yuzu::test::PgTestTemplate mcp_audit_tpl{"mcpaudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("mcpaudit template: store failed to migrate");
+}};
+} // namespace
 
 // ── JSON-RPC 2.0 parsing ─────────────────────────────────────────────────
 
@@ -528,8 +542,10 @@ TEST_CASE("MCP InstructionStore: query definitions", "[mcp][instruction]") {
 
 // ── Audit store integration (used by query_audit_log) ─────────────────────
 
-TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
-    AuditStore store(":memory:");
+TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
     REQUIRE(store.is_open());
 
     AuditEvent evt;
@@ -544,8 +560,9 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
     AuditQuery aq;
     aq.principal = "mcp-admin";
     auto events = store.query(aq);
-    REQUIRE(events.size() >= 1);
-    CHECK(events[0].action == "mcp.list_agents");
+    REQUIRE(events.has_value());
+    REQUIRE(events->size() >= 1);
+    CHECK((*events)[0].action == "mcp.list_agents");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -644,6 +661,11 @@ struct McpTestServer {
     /// the new execution_id exact-correlation collect path. Default nullptr
     /// keeps existing tests on the "Response store unavailable" path.
     yuzu::server::ResponseStore* response_store_for_test{nullptr};
+
+    /// Optionally wire a real AuditStore so query_audit_log can be exercised
+    /// end-to-end through the actual MCP dispatch path. Default nullptr keeps
+    /// every pre-existing test on the "Audit store unavailable" path.
+    yuzu::server::AuditStore* audit_store_for_test{nullptr};
 
     /// PR4 B-2: optionally wire a CaStore + CRL-republish stub so the CA MCP
     /// tools (list_issued_certs / revoke_certificate) can be exercised. Default
@@ -939,7 +961,7 @@ private:
             /*instruction_store=*/instruction_store_for_test,
             /*execution_tracker=*/execution_tracker_for_test,
             /*response_store=*/response_store_for_test,
-            /*audit_store=*/nullptr,
+            /*audit_store=*/audit_store_for_test,
             /*tag_store=*/tag_store_for_test,
             /*inventory_store=*/nullptr,
             /*policy_store=*/nullptr,
@@ -4639,6 +4661,53 @@ TEST_CASE("MCP query_responses: limit is clamped to [1,1000] (no false-empty, no
     // limit:0 clamps to 1 — a non-empty result, never a false "done".
     CHECK(query_limit("0").size() == 1);
     // limit:-1 clamps to 1 — does NOT become an unbounded SQLite LIMIT -1.
+    CHECK(query_limit("-1").size() == 1);
+    // A normal limit returns all matching rows up to the cap.
+    CHECK(query_limit("50").size() == 3);
+}
+
+TEST_CASE("MCP query_audit_log: limit is clamped to [1,500] (no false-empty)",
+          "[pg][mcp][integration][audit]") {
+    // Same class as query_responses's clamp above, and the SAME store-side
+    // trap: AuditStore::query() clamps a non-positive limit to `LIMIT 0` at
+    // its own sink (std::max(q.limit, 0)), which for every OTHER caller is a
+    // legitimate zero-results answer but here reads as "no audit activity" —
+    // exactly the false-empty result ADR-0040 says this store must never
+    // produce. Before this fix, query_audit_log clamped only the upper bound
+    // (std::min(..., 500)), so a caller-supplied limit:0 or limit:-1 reached
+    // the store unclamped on the low end.
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    for (int i = 0; i < 3; ++i) {
+        AuditEvent evt;
+        evt.principal = "mcp-limit-probe";
+        evt.action = "mcp.query_audit_log";
+        evt.target_type = "mcp_tool";
+        evt.target_id = "query_audit_log";
+        evt.result = "success";
+        evt.mcp_tool = "query_audit_log";
+        REQUIRE(store.log(evt));
+    }
+
+    McpTestServer ts;
+    ts.audit_store_for_test = &store;
+    ts.start("readonly");
+
+    auto query_limit = [&](const std::string& limit_literal) {
+        auto res = ts.call(
+            std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":74,)"
+                        R"("params":{"name":"query_audit_log","arguments":)") +
+            R"({"principal":"mcp-limit-probe","limit":)" + limit_literal + "}}}");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    };
+
+    // limit:0 clamps to 1 — a non-empty result, never a false "no activity".
+    CHECK(query_limit("0").size() == 1);
+    // limit:-1 clamps to 1 — does NOT become an unbounded PostgreSQL LIMIT -1.
     CHECK(query_limit("-1").size() == 1);
     // A normal limit returns all matching rows up to the cap.
     CHECK(query_limit("50").size() == 3);

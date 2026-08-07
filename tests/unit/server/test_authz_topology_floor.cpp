@@ -44,6 +44,7 @@
 #include <memory>
 #include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -51,20 +52,34 @@ using namespace yuzu::server;
 
 namespace {
 
-/// Wires a real (SQLite-backed) RbacStore + AuditStore behind AuthRoutes, so
-/// each test only has to mint a cookie session and call
+// AuditStore migrated to Postgres (ADR-0006) — mirrors
+// test_auth_routes_hardened.cpp's HardenedHarness: a template-cloned
+// ephemeral database + pool, cached once and cloned per fixture
+// construction (12 TEST_CASEs below construct FloorFixture, so re-migrating
+// from scratch each time would be wasteful). SKIPs the enclosing TEST_CASE
+// when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken.
+yuzu::test::PgTestTemplate authz_floor_audit_tpl{"authzflooraudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("authzflooraudit template: store failed to migrate");
+}};
+
+/// Wires a real SQLite-backed RbacStore + Postgres-backed AuditStore (ADR-0040)
+/// behind AuthRoutes, so each test only has to mint a cookie session and call
 /// require_permission/require_scoped_permission directly — no ApiTokenStore
-/// (PG-backed) or engine-principal machinery needed for the human-session
+/// (also PG-backed) or engine-principal machinery needed for the human-session
 /// matrix below (`api_token_store=nullptr`; AuthRoutes null-guards it, and
 /// resolve_session's cookie branch never touches it — mirrors
 /// test_auth_routes_hardened.cpp's HardenedHarness).
 struct FloorFixture {
     yuzu::test::TempDbFile rbac_db_file{"yuzu_test_authz_floor_rbac_"};
-    yuzu::test::TempDbFile audit_db_file{"yuzu_test_authz_floor_audit_"};
     Config cfg{};
     yuzu::MetricsRegistry metrics;
     auth::AuthManager auth_mgr{};
     RbacStore rbac_store{rbac_db_file.path};
+    std::optional<yuzu::test::PostgresTestDb> audit_db;
+    std::optional<yuzu::server::pg::PgPool> audit_pool;
     std::unique_ptr<AuditStore> audit_store;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
@@ -72,7 +87,23 @@ struct FloorFixture {
 
     FloorFixture() {
         REQUIRE(rbac_store.is_open());
-        audit_store = std::make_unique<AuditStore>(audit_db_file.path);
+        // Gate 3 quality-engineer (merge-fix retroactive review): unlike
+        // HardenedHarness, this fixture has no earlier-constructed PG member
+        // to inherit a SKIP from (rbac_store above is SQLite-only) — needs
+        // its own explicit guard, matching ModelHarness's shape
+        // (test_access_review_model.cpp) exactly. Without this, every
+        // FloorFixture-constructing TEST_CASE hard-FAILs rather than skips
+        // when YUZU_TEST_POSTGRES_DSN is unset, breaking the standard
+        // skip-vs-fail contract for local dev runs with no Postgres up (not
+        // CI-visible — ensure-postgres.sh guarantees a DSN there).
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
+        audit_db.emplace(authz_floor_audit_tpl);
+        INFO("[FloorFixture] audit db status (blank == ok): " << audit_db->error());
+        REQUIRE(audit_db->available());
+        audit_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = audit_db->dsn(), .size = 4});
+        audit_store = std::make_unique<AuditStore>(*audit_pool);
         REQUIRE(audit_store->is_open());
         auth_mgr.set_metrics_registry(&metrics);
         ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac_store,
@@ -186,7 +217,7 @@ TEST_CASE("kTopologyFloor: every floored securable is a real, seeded securable t
 // ── 2. RBAC OFF + non-admin → 403 on every floored pair ─────────────────
 
 TEST_CASE("require_permission: RBAC off, non-admin is denied on every floored pair",
-          "[authz][floor]") {
+          "[pg][authz][floor]") {
     FloorFixture fix;
     auto req = fix.session_request("mallory", auth::Role::user);
     REQUIRE_FALSE(fix.rbac_store.is_rbac_enabled()); // default-off — the hazard scenario
@@ -203,7 +234,7 @@ TEST_CASE("require_permission: RBAC off, non-admin is denied on every floored pa
 
 TEST_CASE("require_permission: RBAC off, non-admin still gets the ordinary legacy Read-allow "
           "on an unfloored securable",
-          "[authz][floor]") {
+          "[pg][authz][floor]") {
     FloorFixture fix;
     auto req = fix.session_request("frank", auth::Role::user);
 
@@ -214,7 +245,7 @@ TEST_CASE("require_permission: RBAC off, non-admin still gets the ordinary legac
 // ── 4. RBAC OFF + admin → allowed on every floored pair ──────────────────
 
 TEST_CASE("require_permission: RBAC off, admin is allowed on every floored pair",
-          "[authz][floor]") {
+          "[pg][authz][floor]") {
     FloorFixture fix;
     auto req = fix.session_request("grace", auth::Role::admin);
 
@@ -235,7 +266,7 @@ TEST_CASE("require_permission: RBAC off, admin is allowed on every floored pair"
 
 TEST_CASE("require_permission: RBAC on, a non-admin with a real AccessReview:Read grant is "
           "allowed — the floor must never run ahead of a live RBAC grant",
-          "[authz][floor]") {
+          "[pg][authz][floor]") {
     FloorFixture fix;
     REQUIRE(fix.rbac_store.create_role({"ReviewerTest", "d", false, 0}).has_value());
     REQUIRE(fix.rbac_store.set_permission({"ReviewerTest", "AccessReview", "Read", "allow"})
@@ -256,7 +287,7 @@ TEST_CASE("require_permission: RBAC on, a non-admin with a real AccessReview:Rea
 
 TEST_CASE("require_scoped_permission: mirrors require_permission's floor (RBAC-off denial + "
           "RBAC-on granted-allow)",
-          "[authz][floor]") {
+          "[pg][authz][floor]") {
     FloorFixture fix;
 
     SECTION("RBAC off: non-admin is denied") {
@@ -285,7 +316,7 @@ TEST_CASE("require_scoped_permission: mirrors require_permission's floor (RBAC-o
 // ── 7. JIT-elevated non-admin → allowed (elevation short-circuits above the floor) ──
 
 TEST_CASE("require_permission: a JIT-elevated non-admin is allowed on every floored pair",
-          "[authz][floor]") {
+          "[pg][authz][floor]") {
     FloorFixture fix;
     auto req = fix.elevated_session_request("heidi");
 
@@ -300,7 +331,7 @@ TEST_CASE("require_permission: a JIT-elevated non-admin is allowed on every floo
 
 TEST_CASE("require_permission: a floored denial's audit reason and counter are distinguishable "
           "from an ordinary non-Read denial",
-          "[authz][floor]") {
+          "[pg][authz][floor]") {
     FloorFixture fix;
 
     SECTION("floored denial: audit reason starts 'topology floor: ' and the counter increments") {
@@ -309,8 +340,9 @@ TEST_CASE("require_permission: a floored denial's audit reason and counter are d
         CHECK_FALSE(fix.ar->require_permission(req, res, "AccessReview", "Read"));
 
         auto rows = fix.audit_store->query(AuditQuery{.action = "auth.permission_required", .limit = 1});
-        REQUIRE_FALSE(rows.empty());
-        CHECK(rows.front().detail.starts_with("topology floor: "));
+        REQUIRE(rows.has_value());
+        REQUIRE_FALSE(rows->empty());
+        CHECK(rows->front().detail.starts_with("topology floor: "));
 
         auto& counter = fix.metrics.counter("yuzu_auth_topology_floor_denied_total",
                                             {{"permission", "AccessReview:Read"}});
@@ -323,9 +355,10 @@ TEST_CASE("require_permission: a floored denial's audit reason and counter are d
         CHECK_FALSE(fix.ar->require_permission(req, res, "Infrastructure", "Write"));
 
         auto rows = fix.audit_store->query(AuditQuery{.action = "auth.permission_required", .limit = 1});
-        REQUIRE_FALSE(rows.empty());
-        CHECK(rows.front().detail.starts_with("non-admin role denied "));
-        CHECK_FALSE(rows.front().detail.starts_with("topology floor: "));
+        REQUIRE(rows.has_value());
+        REQUIRE_FALSE(rows->empty());
+        CHECK(rows->front().detail.starts_with("non-admin role denied "));
+        CHECK_FALSE(rows->front().detail.starts_with("topology floor: "));
 
         auto& counter = fix.metrics.counter("yuzu_auth_topology_floor_denied_total",
                                             {{"permission", "Infrastructure:Write"}});
@@ -336,7 +369,7 @@ TEST_CASE("require_permission: a floored denial's audit reason and counter are d
 // ── 10. Securable seeding ─────────────────────────────────────────────────
 
 TEST_CASE("RbacStore::seed_defaults: EnginePrincipal is seeded with Administrator+Viewer Read",
-          "[authz][floor]") {
+          "[pg][authz][floor]") {
     FloorFixture fix;
 
     auto types = fix.rbac_store.list_securable_types();
