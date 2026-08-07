@@ -181,9 +181,10 @@ sentences that name a file is blind to claims from memory, the riskier class: a 
 citation is a typo, a wrong memory is an invention.
 
 "Leaves your hands" means any of: a commit, a GitHub issue or comment, a PR body, a
-brief handed to an agent, or a claim made straight to another person. There is no
-automated check standing between you and any of these channels — this procedure is
-the only thing that runs on any of them.
+brief handed to an agent, or a claim made straight to another person. None of these
+channels runs an automated content check today (Gate 0 reviews a diff only when
+`/governance` is explicitly invoked, which is not every commit) — this re-read is
+what stands in for one.
 
 ## 4. A ledger row is a claim, and its fields must agree with each other
 
