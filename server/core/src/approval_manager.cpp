@@ -112,6 +112,15 @@ ApprovalOrigin approval_origin_from_string(std::string_view text) {
 // grant — but it would silently pick the REFUSE side for a surface that may
 // have been added precisely to be redeemable, and the author would never be
 // told. Guarding one of the two was an inconsistency, not a judgement.
+//
+// DO NOT ADD A `default:` LABEL HERE. `-Wswitch` only fires while the switch
+// has none, so a defensive `default: return true;` — which looks like
+// belt-and-braces, and does exactly what the statement below already does —
+// silently deletes this guard, with no warning and no failing test. MEASURED
+// on GCC 15.2: with a default label added, a missing enumerator stops erroring
+// here while still erroring in `to_string`. The trailing return living OUTSIDE
+// the switch is what keeps the guard armed, and that is the whole reason it is
+// out there rather than in a default arm.
 bool declares_non_mcp_surface(ApprovalOrigin origin) {
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
