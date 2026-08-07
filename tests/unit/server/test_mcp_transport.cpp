@@ -48,6 +48,17 @@ TEST_CASE("MCP transport: Accept opts into SSE (case-insensitive)", "[mcp][trans
     CHECK(accept_wants_sse("TEXT/EVENT-STREAM"));
     CHECK(accept_wants_sse("application/json,Text/Event-Stream;q=0.9"));
     CHECK(accept_wants_sse("  text/event-stream ; charset=utf-8")); // OWS + params trimmed
+    // `q=0` means "not acceptable" in RFC 9110, and this function IGNORES it -
+    // parameters are stripped before the compare, so this opts IN. Pinned as
+    // INTENDED, not overlooked: from the streamed-POST rung on, this predicate
+    // decides whether a tools/call gets an SSE stream instead of a plain JSON
+    // response, and _meta.progressToken is the real opt-in gate. A client that
+    // sends a progressToken AND lists text/event-stream at q=0 is contradicting
+    // itself; honouring the token is the useful reading, and the spec requires
+    // conformant clients to accept both types anyway. Change this only with the
+    // streamed-POST eligibility rule in hand - it is not a local decision.
+    CHECK(accept_wants_sse("text/event-stream;q=0"));
+    CHECK(accept_wants_sse("application/json, text/event-stream;q=0"));
     CHECK(accept_wants_sse("text/plain, application/json, text/event-stream")); // last range
     CHECK_FALSE(accept_wants_sse("application/json"));
     CHECK_FALSE(accept_wants_sse(""));

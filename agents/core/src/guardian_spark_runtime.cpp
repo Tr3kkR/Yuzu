@@ -128,10 +128,16 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         // assignment after the arm) leaked the subscription and left a ghost index entry
         // that corrupted a future sibling attach. Every undo is a safe no-op if its
         // mutation never ran, and GuardianRollback's destructor is terminate-safe.
-        // SCOPE LIMIT (Sol B4): if backend_->arm() itself THROWS after partially mutating
-        // SparkEngine (a bad_alloc inside arm_impl, no subscription returned), armed_here
-        // stays false and this rollback cannot clean the engine's partial state - that is
-        // a SparkEngine strong-guarantee gap tracked separately as a PR-2 flip blocker.
+        // If backend_->arm() itself THROWS (a bad_alloc inside arm_impl, no subscription
+        // returned), armed_here stays false and this rollback undoes only the
+        // Guardian-side mutations. That is sufficient for the engine's OWN bookkeeping:
+        // as of #2270 a bad_alloc can escape arm_impl only from its pre-commit/in-lock
+        // phase, which restores armed_/sub_keys_ exactly, so there is no partial armed_
+        // entry left for anyone to clean (arm_impl enumerates the residuals; they are
+        // not duplicated here). It does NOT make a failed arm
+        // invisible - a watch that fails to arm still fails for every rule sharing that spark key
+        // (#2270 UP-9, unchanged and pre-existing), and Guardian learns of it through
+        // the returned error, not through this rollback.
         // (Fable rung-7.7b M3; extends Sol rung-7.5 finding 1.)
         std::shared_ptr<PerKey> pk;
         std::uint64_t sub = 0;

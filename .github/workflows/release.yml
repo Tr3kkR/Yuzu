@@ -514,6 +514,10 @@ jobs:
             Write-Host "ccache already present: $((Get-Command ccache).Source)"
           }
 
+      - name: Assert toolchain manifest (self-hosted)
+        shell: pwsh
+        run: ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath 'C:\actions-runner\toolchain-manifest.json'
+
       # ccache (~\AppData\Local\ccache) and vcpkg_installed/ both
       # persist on the self-hosted Windows runner between jobs. The
       # original cache/restore@v5 calls were already restore-only —
@@ -527,6 +531,10 @@ jobs:
         with:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
+
+      - name: Assert effective vcpkg checkout
+        shell: pwsh
+        run: ./deploy/windows/Assert-VcpkgCheckout.ps1 -VcpkgRoot (Join-Path $env:GITHUB_WORKSPACE 'vcpkg')
 
       - name: vcpkg sentinel (x64-windows)
         # Universal cache-key contract — see scripts/ci/vcpkg-triplet-sentinel.sh.
@@ -1213,7 +1221,7 @@ jobs:
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
         with:
           registry: ghcr.io
           # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
@@ -1445,7 +1453,7 @@ jobs:
           driver: docker-container
 
       - name: Log in to GHCR
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
         with:
           registry: ghcr.io
           # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
@@ -1651,7 +1659,7 @@ jobs:
           driver: docker-container
 
       - name: Log in to GHCR
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
         with:
           registry: ghcr.io
           # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
@@ -1879,7 +1887,7 @@ jobs:
           driver: docker-container
 
       - name: Log in to GHCR
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
         with:
           registry: ghcr.io
           # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
