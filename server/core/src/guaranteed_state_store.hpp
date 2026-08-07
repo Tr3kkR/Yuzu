@@ -312,7 +312,11 @@ public:
     /// empty or the migration failed. `now_fn`, when set, replaces
     /// `reap_expired()`'s process-clock read (`std::chrono::system_clock`) —
     /// unset (default) uses the real clock; this is a test seam only (mirrors
-    /// `PolicyEvaluator::Deps::now_fn`), never wired from production.
+    /// `PolicyEvaluator::Deps::now_fn`), never wired from production. As of
+    /// #2663 (fjarvis review) this value feeds ONLY the cheap pre-transaction
+    /// plausibility check — every retention DECISION reads PostgreSQL's own
+    /// clock instead (`AuditStore::cleanup_once`'s `#2360/1d` shape), so
+    /// `now_fn` can no longer move a reap verdict.
     explicit GuaranteedStateStore(pg::PgPool& pool,
                                    int retention_days = kDefaultEventRetentionDays,
                                    std::function<int64_t()> now_fn = nullptr);

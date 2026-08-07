@@ -132,6 +132,14 @@ std::string query_scalar(const std::string& dsn, const std::string& sql) {
     return PQgetvalue(r.get(), 0, 0);
 }
 
+// PostgreSQL's own clock, for tests that need to reason about what the FIXED
+// reap_expired() actually compares against — mirrors test_audit_store.cpp's
+// pg_now(). A fixed epoch constant would drift from "what the guard compares
+// against" the same way test_audit_store.cpp's own history warns about.
+int64_t pg_now(const std::string& dsn) {
+    return std::stoll(query_scalar(dsn, "SELECT EXTRACT(EPOCH FROM now())::bigint"));
+}
+
 // Pass `reap_expired()` over an EMPTY table BEFORE seeding, so the #2579
 // missing-anchor trigger's bootstrap decline is consumed on nothing — mirrors
 // test_audit_store.cpp's `anchor_guard`. Needed because the trigger makes "no
@@ -2290,6 +2298,54 @@ TEST_CASE("GuaranteedStateStore: reap_expired declines once on an all-expired "
     CHECK(gc_meta_anomaly_count() == "0");   // consumed/cleared
 }
 
+// fjarvis's PR #2663 review, "still open": no test seeded an honest OLD
+// last_pass_now and advanced real elapsed time past kReapBigStepSecs to prove
+// the Step anomaly actually fires — the would_wipe test above covers a
+// DIFFERENT detector, and a regression that broke big_step construction (e.g.
+// #2663's own pg_now switch getting the comparison backwards) would go
+// uncaught. Seeds gc_meta directly (bootstrap already settled, a stale
+// last_pass_now 2 days back — comfortably past the 1-day kReapBigStepSecs)
+// rather than via anchor_guard(), which would always stamp a FRESH reading.
+TEST_CASE("GuaranteedStateStore: reap_expired declines once on a big forward clock step, "
+          "then drains",
+          "[pg][guaranteed_state_store][retention][clock-guard]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    const int64_t real_now = pg_now(db.dsn());
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool, /*retention_days=*/30);
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    exec_sql(db.dsn(),
+             "INSERT INTO guaranteed_state_store.gc_meta (key, value) VALUES "
+             "('bootstrap_settled', '1'), ('last_pass_now', '" +
+                 std::to_string(real_now - 2 * 86400) + "')");
+
+    REQUIRE(store.insert_event(make_event("expired", "r", "a")));
+    REQUIRE(store.insert_event(make_event("survivor", "r", "a"))); // keeps this out of would_wipe
+    exec_sql(db.dsn(), "UPDATE guaranteed_state_store.guaranteed_state_events SET "
+                       "ttl_expires_at = 1 WHERE event_id = 'expired'");
+
+    // First pass: has_expired (partial — "survivor" keeps would_wipe false),
+    // big_step (2 days > kReapBigStepSecs's 1 day) — declines, nothing reaped.
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 0);
+    CHECK(store.event_count() == 2); // both still present — the decline held
+    CHECK(query_scalar(db.dsn(), "SELECT value FROM guaranteed_state_store.gc_meta WHERE key = "
+                                 "'last_anomaly_facts'") == "e-s--");
+    CHECK(metrics.counter("yuzu_server_guardian_reap_passes_total", {{"result", "declined"}})
+              .value() == 1.0);
+
+    // Second pass: re-anchored by the first pass's own (unconditional) stamp,
+    // so the delta collapses to ~0 — no longer a big step. Drains, capped.
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 1);
+    CHECK(store.event_count() == 1); // only "survivor" remains
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store.gc_meta WHERE key "
+                                 "= 'last_anomaly_facts'") == "0"); // consumed/cleared
+}
+
 // #2579's missing-anchor trigger, ported: the disclosed shape, end to end. A
 // fresh PG deploy — no `gc_meta` row exists yet — whose host clock is
 // forward-skewed at the very first guarded pass. Some rows are already
@@ -2394,10 +2450,11 @@ TEST_CASE("GuaranteedStateStore: reap_expired's datable horizon covers a long re
                                  "= 'last_anomaly_facts'") == "0"); // no anomaly recorded
 }
 
-// The upper-bound clock sanitiser (#2663 review should-fix): reap_expired()
-// reads its own process clock internally (unlike AuditStore's cleanup_once(now),
-// whose `now` is caller-supplied and directly testable), so exercising the
-// kMaxPlausibleNow branch needs the now_fn test seam — the ctor's third
+// The upper-bound clock sanitiser (#2663 review should-fix): the PRE-TXN
+// plausibility check still reads reap_expired()'s own process clock (the
+// actual retention DECISION reads PostgreSQL's own clock since the #2663
+// fjarvis-review fix, same as AuditStore's cleanup_once(now)), so exercising
+// the kMaxPlausibleNow branch needs the now_fn test seam — the ctor's third
 // parameter, unset in every other test here and never wired from production
 // (see the ctor doc comment).
 TEST_CASE("GuaranteedStateStore: reap_expired declines an implausibly large clock reading",
@@ -2426,6 +2483,59 @@ TEST_CASE("GuaranteedStateStore: reap_expired declines an implausibly large cloc
                                  "= 'bootstrap_settled'") == "0"); // rolled back, trigger stays armed
     CHECK(metrics.counter("yuzu_server_guardian_reap_passes_total", {{"result", "failed"}})
               .value() == 1.0);
+}
+
+// fjarvis's PR #2663 review (2026-08-07): reap_expired() decided against its
+// own PROCESS clock (now_fn_/now_epoch()), not Postgres's. Two replicas whose
+// process clocks disagree write the SAME shared gc_meta.last_pass_now row, and
+// the probe itself compares ttl_expires_at against each replica's OWN `now` —
+// so a replica running merely an hour fast (well under kReapBigStepSecs, 1
+// day) reads a row that is still LIVE by every other clock as already
+// expired. classify()'s existing detectors do not catch this: `has_expired`
+// alone with no other trigger derives `Anomaly::None` — an ordinary clean
+// sweep, zero anomaly recorded. This is the "one additional untraced failure
+// mode (a consistently-fast replica could delete early with zero anomaly
+// flagged)" the earlier governance run's `arch-M1` adjudication NAMED and then
+// left unproven, capping it at MEDIUM/E6 on the (disproven) premise that
+// multi-replica is not a supported deployment shape — the schema comment at
+// gc_meta's own CREATE TABLE and ADR-0038's "Considered and rejected" section
+// both say otherwise. Mirrors AuditStore's `#2360/1d`
+// ("a skewed process clock cannot change the verdict") regression exactly.
+TEST_CASE("GuaranteedStateStore #2663 fjarvis H1: a fast replica cannot sweep a row that is "
+          "still live by Postgres's own clock",
+          "[pg][guaranteed_state_store][retention][clock-guard]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    const int64_t real_now = pg_now(db.dsn());
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore replica_a(pool, /*retention_days=*/30);
+    anchor_guard(replica_a, db.dsn());
+
+    REQUIRE(replica_a.insert_event(make_event("still-live", "r", "a")));
+    // 30 minutes in the FUTURE by the real clock.
+    exec_sql(db.dsn(), "UPDATE guaranteed_state_store.guaranteed_state_events SET ttl_expires_at "
+                       "= " + std::to_string(real_now + 1800) + " WHERE event_id = 'still-live'");
+    // A second row, further out, so this is a PARTIAL expiry (0 < expiring <
+    // datable) under replica B's clock, not a would_wipe — a single-row table
+    // makes expiring==datable trivially, which the existing Wipe detector
+    // already declines and would mask the defect this test is isolating.
+    REQUIRE(replica_a.insert_event(make_event("far-live", "r", "a")));
+    exec_sql(db.dsn(), "UPDATE guaranteed_state_store.guaranteed_state_events SET ttl_expires_at "
+                       "= " + std::to_string(real_now + 5000) + " WHERE event_id = 'far-live'");
+
+    // Replica B's process clock is an hour FAST — comfortably under
+    // kReapBigStepSecs (1 day), so big_step never fires either.
+    GuaranteedStateStore replica_b(pool, /*retention_days=*/30,
+                                   [real_now] { return real_now + 3600; });
+    yuzu::MetricsRegistry metrics;
+    replica_b.set_metrics(&metrics);
+    replica_b.reap_expired();
+
+    // FIXED: replica B's own clock cannot move the verdict — "still-live" is
+    // still live by PostgreSQL's own clock, so both rows survive and the pass
+    // is a clean no-op, not a silent sweep.
+    CHECK(replica_a.event_count() == 2);
+    CHECK(metrics.counter("yuzu_server_guardian_reap_passes_total", {{"result", "swept"}})
+              .value() == 0.0);
 }
 
 TEST_CASE("GuaranteedStateStore: reap_expired is a no-op on a closed store",

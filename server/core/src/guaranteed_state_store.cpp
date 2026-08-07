@@ -2721,22 +2721,54 @@ void GuaranteedStateStore::reap_expired() {
         }
 
         const int64_t now = now_fn_ ? now_fn_() : now_epoch();
-        // Sanitise the clock reading before it feeds the probe's datable-horizon
-        // arithmetic below (signed-overflow UB near INT64_MAX — the horizon adds a
-        // retention-derived window that itself could not overflow on any accepted
-        // `retention_days_`, but `now` is the unbounded half of that sum) — clock-
-        // guard part 3. UPPER bound only: this store reads the PROCESS clock, not
-        // AuditStore's PG-side `pg_now` — the sanitiser applies regardless of clock
-        // source. This divergence pre-dates the #2663 fix (not this diff's decision)
-        // and ADR-0038 does not record a rationale for it; #2508 tracks bringing this
-        // store's clock source in line with the AuditStore reference shape, same as
-        // `ResultSetStore`'s own deferred process-clock use. A NEGATIVE reading is the
-        // legitimate dead-CMOS case the guard exists for, so it is not rejected here.
+        // Sanitise the CALLER's (process) clock cheaply, before even attempting
+        // the pg_now read below — clock-guard part 3. UPPER bound only: a
+        // NEGATIVE reading is the legitimate dead-CMOS case the guard exists
+        // for, so it is not rejected here. This value plays NO further role in
+        // the pass: every DECISION below reads Postgres's OWN clock (see
+        // pg_now below), so an implausible process clock is refused here only
+        // to avoid touching the DB at all for a reading that could not matter.
         constexpr int64_t kMaxPlausibleNow = std::numeric_limits<int64_t>::max() / 4;
         if (now > kMaxPlausibleNow) {
             spdlog::warn("GuaranteedStateStore::reap_expired: implausible clock reading ({}); "
                          "declining the pass",
                          now);
+            outcome = "failed";
+            return false;
+        }
+
+        // PostgreSQL's OWN clock, not this replica's process clock, for every
+        // DECISION below (#2663, fjarvis review). This store originally read
+        // its own process clock, which let a fast/skewed replica's `now` win
+        // the shared `gc_meta.last_pass_now` anchor and misclassify a row
+        // still live by every other clock as expired — `classify()`'s
+        // existing detectors do not catch a moderately-fast clock, since
+        // `has_expired` alone with no other trigger derives `Anomaly::None`,
+        // an ordinary clean sweep, with zero anomaly recorded. Sharing
+        // `gc_meta` does not fix this on its own — it is the transmission
+        // medium: the fast replica's own reading gets written into the row
+        // every OTHER replica then measures against. Mirrors
+        // `AuditStore::cleanup_once`'s `#2360/1d` fix exactly: read PG's
+        // clock AFTER the advisory lock, inside this transaction, so every
+        // replica serialised through that lock gets the IDENTICAL comparison
+        // point regardless of its own clock's accuracy. `ResultSetStore::
+        // gc_sweep` still has this defect (still reads its own process
+        // clock) — a deferred follow-up, not a precedent this fix copies.
+        pg::PgResult clk = pg::exec_params(conn, "SELECT EXTRACT(EPOCH FROM now())::bigint",
+                                           std::vector<std::string>{});
+        if (clk.status() != PGRES_TUPLES_OK) {
+            spdlog::error("GuaranteedStateStore::reap_expired: pg clock read failed: {}",
+                          PQerrorMessage(conn));
+            return false;
+        }
+        const int64_t pg_now = to_i64(PQgetvalue(clk.get(), 0, 0));
+        // Same overflow guard, applied to PG's reading too — cheap to bound
+        // both sources the same way rather than trust one implicitly because
+        // it is "the database" (AuditStore precedent).
+        if (pg_now > kMaxPlausibleNow) {
+            spdlog::error("GuaranteedStateStore::reap_expired: PostgreSQL's own clock reading "
+                          "({}) is implausible; declining the pass",
+                          pg_now);
             outcome = "failed";
             return false;
         }
@@ -2775,7 +2807,7 @@ void GuaranteedStateStore::reap_expired() {
                 bootstrap_settled = true;
             }
         }
-        if (prev && (*prev < 0 || *prev > now)) {
+        if (prev && (*prev < 0 || *prev > pg_now)) {
             prev_unusable = true;
             prev.reset();
         }
@@ -2784,7 +2816,7 @@ void GuaranteedStateStore::reap_expired() {
             conn,
             "INSERT INTO guaranteed_state_store.gc_meta (key, value) VALUES ('last_pass_now', "
             "$1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            std::vector<std::string>{std::to_string(now)});
+            std::vector<std::string>{std::to_string(pg_now)});
         if (stamp.status() != PGRES_COMMAND_OK) {
             spdlog::error("GuaranteedStateStore::reap_expired: meta stamp failed: {}",
                           PQerrorMessage(conn));
@@ -2806,7 +2838,7 @@ void GuaranteedStateStore::reap_expired() {
         // positive ttl_expires_at for it), mirrored here as a zero window.
         const int64_t retention_window_secs =
             retention_days_ > 0 ? static_cast<int64_t>(retention_days_) * 86400 : 0;
-        const int64_t datable_horizon = now + retention_window_secs + kReapTtlFutureSlackSec;
+        const int64_t datable_horizon = pg_now + retention_window_secs + kReapTtlFutureSlackSec;
         pg::PgResult probe = pg::exec_params(
             conn,
             "SELECT count(*) FILTER (WHERE ttl_expires_at > 0 AND ttl_expires_at < $1::bigint) "
@@ -2814,7 +2846,7 @@ void GuaranteedStateStore::reap_expired() {
             "count(*) FILTER (WHERE ttl_expires_at > 0 AND ttl_expires_at <= $2::bigint) "
             "AS datable "
             "FROM guaranteed_state_store.guaranteed_state_events",
-            std::vector<std::string>{std::to_string(now), std::to_string(datable_horizon)});
+            std::vector<std::string>{std::to_string(pg_now), std::to_string(datable_horizon)});
         if (probe.status() != PGRES_TUPLES_OK) {
             spdlog::error("GuaranteedStateStore::reap_expired: probe failed: {}",
                           PQerrorMessage(conn));
@@ -2827,7 +2859,8 @@ void GuaranteedStateStore::reap_expired() {
             .has_expired = expiring > 0,
             .would_wipe = expiring > 0 && expiring >= datable,
             .big_step = prev.has_value() && expiring > 0 &&
-                        audit_retention::moved_at_least(*prev, now, kReapBigStepSecs) && now > *prev,
+                        audit_retention::moved_at_least(*prev, pg_now, kReapBigStepSecs) &&
+                        pg_now > *prev,
             .prev_unusable = prev_unusable,
             // #2579's missing-anchor trigger. RECORDED ANSWER (routed-concern
             // "Clock-guarded retention" part 6): decline — AuditStore's answer, not
@@ -2887,7 +2920,7 @@ void GuaranteedStateStore::reap_expired() {
                                  "retention clock reading and rows are already expired "
                                  "(now={} facts={}) — declining this pass and anchoring; the "
                                  "next pass has a comparison point and proceeds (#2579)",
-                                 now, facts_ser);
+                                 pg_now, facts_ser);
                 } else {
                     spdlog::warn("GuaranteedStateStore::reap_expired: retention clock anomaly "
                                  "({} facts={}) — declining this pass; an identical next pass "
@@ -2944,7 +2977,7 @@ void GuaranteedStateStore::reap_expired() {
             "SELECT event_id FROM guaranteed_state_store.guaranteed_state_events "
             "WHERE ttl_expires_at > 0 AND ttl_expires_at < $1::bigint "
             "ORDER BY ttl_expires_at ASC, event_id ASC LIMIT $2::bigint) RETURNING event_id",
-            std::vector<std::string>{std::to_string(now), std::to_string(kReapCapPerPass)});
+            std::vector<std::string>{std::to_string(pg_now), std::to_string(kReapCapPerPass)});
         if (ev.status() != PGRES_TUPLES_OK) {
             spdlog::error("GuaranteedStateStore::reap_expired: events delete failed: {}",
                           PQerrorMessage(conn));
@@ -2958,7 +2991,7 @@ void GuaranteedStateStore::reap_expired() {
             "SELECT event_id FROM guaranteed_state_store.guardian_observations "
             "WHERE ttl_expires_at > 0 AND ttl_expires_at < $1::bigint "
             "ORDER BY ttl_expires_at ASC, event_id ASC LIMIT $2::bigint) RETURNING event_id",
-            std::vector<std::string>{std::to_string(now), std::to_string(kReapCapPerPass)});
+            std::vector<std::string>{std::to_string(pg_now), std::to_string(kReapCapPerPass)});
         if (obs.status() != PGRES_TUPLES_OK) {
             spdlog::error("GuaranteedStateStore::reap_expired: observations delete failed: {}",
                           PQerrorMessage(conn));
