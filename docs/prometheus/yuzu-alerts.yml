@@ -970,13 +970,39 @@ groups:
       #
       # WHY `<= 1` AND NOT `== 0`. A young server that restarts ONCE in the
       # window -- install, then a config fix -- is healthy and must not page, but
-      # it has a reset. Excusing one costs nothing: to complete ZERO passes at the
-      # 60-minute default a process must restart more often than hourly, which is
-      # at least three resets across 3h. Any cadence slow enough to leave only one
-      # reset also leaves a segment long enough for a pass to complete, which
-      # fails `increase(...) == 0` on its own. Both halves are pinned in the test
-      # file -- the single-restart case must stay quiet, the 30-minute crash loop
-      # must still fire.
+      # it has a reset. Excusing one is a deliberate trade, and it is NOT free.
+      # Both halves are pinned in the test file: the single-restart case must
+      # stay quiet, the 30-minute crash loop must still fire.
+      #
+      # WHAT THE TRADE COSTS, MEASURED (#2553, governance pass 13). An earlier
+      # revision of this comment argued it cost NO coverage -- "to complete zero
+      # passes a process must restart more often than hourly, which is at least
+      # three resets across 3h; any cadence slow enough to leave only one reset
+      # also leaves a segment long enough for a pass to complete". That argument
+      # presupposes a WORKING reaper. Where none runs at all -- a failed migration
+      # closes the store and `start_cleanup()` early-returns, or a pass threw --
+      # no segment is long enough for anything, so `increase(...) == 0` never
+      # engages as the backstop. The states this rule's own description names are
+      # the states that argument assumed away.
+      #
+      # SO IT IS STILL BLIND for a genuinely dead reaper at restart cadences of
+      # roughly 160-195 MINUTES: uptime never reaches 10800, and the window holds
+      # two resets for only `10800 - cadence` seconds, which is under `for: 15m`
+      # once the cadence passes 9900s. The band MOVES with the evaluation
+      # interval -- measured 164-195 at 1m, 160-195 at 5m -- so do not treat those
+      # bounds as constants or validate a change against them.
+      #
+      # NARROWED, NOT CLOSED. What this replaced required `uptime > 10800`
+      # outright and was blind at EVERY cadence under ~195 min (measured against
+      # the previous expression at 60, 120 and 170). This is strictly better and
+      # still has a hole.
+      #
+      # Closing it needs a SERVER change, not a PromQL one. The natural signal,
+      # `..._retention_last_pass_unixtime`, is seeded 0 and never reloaded from
+      # the persisted `audit_retention_meta` anchor, so it zeroes on every restart
+      # and a freshness rule built on it REGRESSES the 30-minute crash loop this
+      # rule already catches. Tracked separately; do not rewrite this expression
+      # in place without a cadence x evaluation-interval sweep.
       #
       # KNOWN LIMIT, and it bites hardest where crash loops live. `resets()` needs
       # ONE CONTINUOUS SERIES per server. If a restart changes the `instance`

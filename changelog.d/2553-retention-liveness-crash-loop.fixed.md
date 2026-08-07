@@ -7,13 +7,22 @@
   excluded it on every evaluation and a reaper completing zero passes stayed
   silent. The grace now excuses a young server only while its uptime has at most
   one reset across the window — one restart is an ordinary
-  install-then-config-fix, while completing zero passes at the 60-minute default
-  needs at least three. It is expressed with `unless` so a missing uptime series
-  cannot silence the rule either. **Expect a new-to-you firing on any
-  crash-looping server.** Known limit, documented on the rule: `resets()` needs a
+  install-then-config-fix. It is expressed with `unless` so a missing uptime
+  series cannot silence the rule either. **Expect a new-to-you firing on any
+  crash-looping server.** **Narrowed, not closed:** the previous expression
+  required `uptime > 10800` outright and was blind at every restart cadence below
+  about 195 minutes; this one is still blind at cadences of roughly 160–195
+  minutes, and that band moves with the Prometheus evaluation interval (measured
+  164–195 at a 1-minute interval, 160–195 at 5). Closing it needs a server-side
+  change rather than a rule change — the natural signal,
+  `yuzu_server_audit_retention_last_pass_unixtime`, is not reloaded from its
+  persisted anchor at startup, so a freshness rule built on it regresses the very
+  crash-loop case this fix addresses. Two further known limits: `resets()` needs a
   continuous series per server, so if a restart changes the `instance` label
   (dynamic-port or IP-based service discovery, a rescheduled pod) the grace still
-  applies forever — the fix is scrape config targeting a stable identity.
+  applies forever — the fix is scrape config targeting a stable identity; and on a
+  still-dead reaper the alert can resolve and re-fire, so treat a resolution as
+  recovery only once a pass has actually landed.
 - **The same alert could be silenced by an unrelated server.** The rule joined its
   two operands with an explicit `on(instance)`, so any other young, reset-free
   `yuzu_server_uptime_seconds` series that merely shared an `instance` value — a
