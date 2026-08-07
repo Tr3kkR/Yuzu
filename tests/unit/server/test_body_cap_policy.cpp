@@ -54,6 +54,7 @@
 using yuzu::server::BodyCapMatch;
 using yuzu::server::body_cap_prefix_matches;
 using yuzu::server::body_unmeasurable;
+using yuzu::server::content_length_for_body_cap;
 using yuzu::server::has_non_identity_content_encoding;
 using yuzu::server::kBodyCapAnyMethod;
 using yuzu::server::kBodyCapTable;
@@ -355,9 +356,22 @@ struct UnifiedBodyCapTestServer {
 
         svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res)
                                         -> httplib::Server::HandlerResponse {
-            // D1-D4, replicated: unified resolve_body_cap for EVERY
-            // method/path (D2: no GET/HEAD exclusion), checked BEFORE the
-            // probe-style early return below (D3).
+            // D1-D4, GENUINELY replicated (#2407 R2 hardening,
+            // 2026-08-07): unified resolve_body_cap for EVERY method/path
+            // (D2: no GET/HEAD exclusion), checked BEFORE the probe-style
+            // early return below (D3). The Content-Length VALUE is read
+            // via `content_length_for_body_cap` — the EXACT SAME function
+            // server.cpp's production pre-routing handler calls — not a
+            // second, independently-written expression that happens to
+            // look similar. A prior version of this fixture called
+            // `req.get_header_value_u64` directly here while production
+            // hand-rolled a `std::from_chars` parse; the two disagreed on
+            // an all-digit Content-Length above 2^64-1, and this fixture's
+            // 777 assertions passed green with that CRITICAL bypass live
+            // in the code it claimed to replicate. Routing both through
+            // the one shared function makes that divergence structurally
+            // impossible instead of something to keep re-verifying by
+            // hand.
             const auto cap_match = resolve_body_cap(req.method, req.path);
             if (has_non_identity_content_encoding(req.get_header_value("Content-Encoding"))) {
                 res.status = 415;
@@ -368,8 +382,7 @@ struct UnifiedBodyCapTestServer {
                 req.get_header_value("Transfer-Encoding"));
             const bool refuse_unmeasurable = unmeasurable && cap_match.requires_measurable;
             const bool oversize =
-                !unmeasurable &&
-                req.get_header_value_u64("Content-Length", 0) > cap_match.max_body_bytes;
+                !unmeasurable && content_length_for_body_cap(req) > cap_match.max_body_bytes;
             if (refuse_unmeasurable || oversize) {
                 res.status = refuse_unmeasurable ? 411 : 413;
                 return httplib::Server::HandlerResponse::Handled;
@@ -589,5 +602,131 @@ TEST_CASE("Pre-routing body cap: /mcp/ still behaves as before through the unifi
     CHECK(at_cap->status == 200);
     CHECK(ts.handler_calls.load() == 1);
 }
+
+#ifndef _WIN32
+TEST_CASE("Pre-routing body cap: an all-digit Content-Length above 2^64-1 is refused as "
+          "oversize, not silently admitted as absent (#2407 R2 — the CRITICAL bypass)",
+          "[body_cap][bounds][integration]") {
+    // The defect this pins: `std::from_chars` reports
+    // `result_out_of_range` for these two values and the pre-#2407-R1 code
+    // folded that to `content_length = 0` ("no header present, don't
+    // cap") — while httplib's own `is_numeric()` + `strtoull()` parser
+    // (httplib.h:2769-2789) accepts the same all-digit string and returns
+    // `SIZE_MAX`, which is what it ALSO uses to decide what it buffers.
+    // `content_length_for_body_cap` (web_utils.hpp) now delegates to that
+    // same accessor, so both values must resolve to "oversize" (413), on
+    // the plain catch-all class, not just /mcp/.
+    UnifiedBodyCapTestServer ts;
+    ts.start();
+
+    for (const std::string& overflow_value :
+         {std::string("99999999999999999999999"), std::string("18446744073709551616")}) {
+        const std::string req = "POST /api/v1/devices HTTP/1.1\r\n"
+                                "Host: 127.0.0.1\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Content-Length: " +
+                                overflow_value + "\r\n\r\n";
+        INFO("Content-Length: " << overflow_value);
+        const auto resp = raw_request_status_line(ts.port, req);
+        CHECK(resp.starts_with("HTTP/1.1 413"));
+    }
+    CHECK(ts.handler_calls.load() == 0);
+}
+
+TEST_CASE("Pre-routing body cap: a malformed (non-numeric) Content-Length is never "
+          "silently admitted — refused end-to-end even where this gate alone reads it "
+          "as absent (#2407 R2)",
+          "[body_cap][bounds][integration]") {
+    // `is_numeric()` (httplib.h:2769-2773) requires EVERY character to be
+    // an ASCII digit, so each of these fails it and
+    // `content_length_for_body_cap` reads them as 0 — matching httplib's
+    // OWN accessor exactly (that is the point of #2407 R1/R2: one shared
+    // function, not two that might disagree). A 0 reading is NOT oversize,
+    // so THIS gate alone lets the request past as Unhandled. That is fine,
+    // not a re-opened gap: httplib's own body reader
+    // (`detail::read_content`, httplib.h:7057-7063) independently rejects
+    // the SAME malformed header with its own `is_invalid_value` check and
+    // answers 400 before any route handler runs — this test asserts THAT
+    // end-to-end outcome, proving the request is refused somewhere in the
+    // pipeline, never silently processed with an unbounded/unmeasured
+    // body.
+    UnifiedBodyCapTestServer ts;
+    ts.start();
+
+    for (const std::string& malformed_value :
+         {std::string("-1"), std::string("+5"), std::string(" 12"), std::string("abc"),
+          std::string("")}) {
+        const std::string req = "POST /api/v1/devices HTTP/1.1\r\n"
+                                "Host: 127.0.0.1\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Content-Length: " +
+                                malformed_value + "\r\n\r\n";
+        INFO("Content-Length: '" << malformed_value << "'");
+        const auto resp = raw_request_status_line(ts.port, req);
+        // httplib itself answers 400 for an invalid Content-Length value
+        // it cannot parse (is_invalid_value branch) before any handler
+        // runs — accept a 4xx broadly (never 200/2xx) so this stays
+        // resilient to which layer of the pipeline answers, while still
+        // failing if the request were ever admitted through to the
+        // handler.
+        CHECK(!resp.starts_with("HTTP/1.1 2"));
+    }
+    CHECK(ts.handler_calls.load() == 0);
+}
+
+TEST_CASE("Pre-routing body cap: duplicate Content-Length headers cannot desync the "
+          "gate's decision from httplib's own body read (#2407 R2)",
+          "[body_cap][bounds][integration]") {
+    // httplib's `Headers` is `std::unordered_multimap<..., case_ignore::hash,
+    // case_ignore::equal_to>` (httplib.h:778-780) — an UNORDERED container,
+    // not the ordered `std::multimap` an RFC 7230 "first occurrence" framing
+    // might suggest. WHICH of two duplicate `Content-Length` values
+    // `get_header_value_u64("Content-Length", 0, /*id=*/0)` resolves to is
+    // therefore UNSPECIFIED by the C++ standard (hash-bucket insertion
+    // order, not header-line order). Measured empirically against this
+    // vcpkg baseline while writing this test (a standalone reproduction
+    // against a real httplib::Server): `id=0` resolved to the LAST header
+    // LINE sent, not the first — the opposite of what an ordered container,
+    // or an RFC-literal reading, would give. This test deliberately does
+    // NOT assert on that specific measurement, because it is an
+    // IMPLEMENTATION detail that could shift with a future vcpkg bump, not
+    // a contract. What it asserts instead is the SAFETY property that holds
+    // regardless of which duplicate value httplib's bucket order happens to
+    // prefer: `content_length_for_body_cap` (this gate) and httplib's own
+    // body reader (httplib.h:7057-7061) call the IDENTICAL accessor with
+    // the IDENTICAL id against the SAME already-parsed `Headers` object,
+    // for the SAME single request — so whichever value "wins" is the SAME
+    // value at BOTH call sites, deterministically, every time. There is no
+    // pair of duplicate values where this gate's admit/refuse decision and
+    // httplib's actual buffering decision can disagree.
+    UnifiedBodyCapTestServer ts;
+    ts.start();
+
+    const std::string small_body = "ok";
+    const std::string req = "POST /api/v1/devices HTTP/1.1\r\n"
+                            "Host: 127.0.0.1\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Content-Length: " +
+                            std::to_string(small_body.size()) +
+                            "\r\n"
+                            "Content-Length: 99999999999999999999999\r\n\r\n" +
+                            small_body;
+    const auto resp = raw_request_status_line(ts.port, req);
+    // Whichever duplicate value httplib's unordered_multimap resolves as
+    // id=0: either it is the oversize one — refused here, 413, handler
+    // never runs — or it is the small one — admitted, and httplib's ACTUAL
+    // body read is then bounded to those `small_body.size()` bytes we
+    // genuinely sent, so the handler runs normally, 200. Anything else
+    // (a hang waiting on unsent bytes, a mid-read reset, a status neither
+    // of these) would mean the gate and the real reader disagreed about
+    // which duplicate to trust — the split-brain this test exists to rule
+    // out.
+    const bool refused = resp.starts_with("HTTP/1.1 413");
+    const bool admitted = resp.starts_with("HTTP/1.1 200");
+    INFO("response: " << resp);
+    CHECK((refused || admitted));
+    CHECK(ts.handler_calls.load() == (admitted ? 1 : 0));
+}
+#endif // !_WIN32
 
 #endif // !YUZU_TSAN_BUILD

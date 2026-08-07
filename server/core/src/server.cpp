@@ -334,6 +334,24 @@ using yuzu::server::audit_token;
 // second, hand-re-expressed copy of the rule in this file to drift against
 // it. See the pre-routing handler below for the chokepoint itself.
 //
+// `kBodyCapTable`'s `/mcp/` row (body_cap_policy.hpp) hardcodes its cap as
+// `4u * 1024 * 1024` rather than referencing `mcp::kMcpMaxRequestBodyBytes`
+// (mcp_jsonrpc.hpp) directly — body_cap_policy.hpp is a pure data table with
+// no dependency on the MCP transport headers, and pulling that dependency in
+// just for this one row would be a worse trade than a literal plus a bound
+// check. The static_assert below is that bound check: it fails the build the
+// moment the two values disagree, so the "two authorities for one property"
+// class of bug #2407 D1 fixed for the /mcp/-vs-general-table split cannot
+// reopen here as an /mcp/-table-vs-/mcp/-input-bounds split instead.
+static_assert(yuzu::server::kBodyCapTable[0].path_prefix == "/mcp/" &&
+                  yuzu::server::kBodyCapTable[0].max_body_bytes ==
+                      mcp::kMcpMaxRequestBodyBytes,
+              "kBodyCapTable's /mcp/ row (body_cap_policy.hpp) must stay bound to "
+              "mcp::kMcpMaxRequestBodyBytes (mcp_jsonrpc.hpp) — the /mcp/ row is "
+              "expected to be table index 0 and its max_body_bytes must equal that "
+              "constant exactly; if the table's row order changed, update this "
+              "assert to locate the /mcp/ row instead of assuming index 0");
+//
 // -- KEK rotation seam helpers (#2395) -----------------------------------------
 //
 // The three KekOps lambdas (register_routes call site below) all need to
@@ -960,8 +978,13 @@ public:
         // `reason` distinguishes a measured over-cap body (413) from one this
         // server refuses to measure at all (411: chunked, or POST with no
         // Content-Length — both would otherwise revert to httplib's 100 MB
-        // default and evade the cap entirely).
-        for (auto reason : {"over_cap", "unmeasurable"}) {
+        // default and evade the cap entirely) from a non-identity
+        // Content-Encoding (415, #2407 R4 hardening 2026-08-07 — see the
+        // pre-routing handler's Content-Encoding branch: it now increments
+        // this counter too, on `path_class == "mcp"`, so the compatibility
+        // series genuinely covers every reason this class can be refused
+        // for, not just the two that predate #2407's unification).
+        for (auto reason : {"over_cap", "unmeasurable", "unsupported_encoding"}) {
             metrics_.counter("yuzu_mcp_body_too_large_total", {{"reason", reason}});
         }
         // #2407 general pre-auth body-cap rejection, EVERY route class
@@ -7448,18 +7471,41 @@ private:
             // contract.
             detail::tls_engine_principal() = false;
 
-            // -- Pre-auth request-body cap (#2407, hardened 2026-08) -------------
-            // ONE check, every method, every path — INCLUDING the four
-            // unauthenticated health-probe paths just below, which is why this
-            // sits ABOVE that early return rather than after it (D3, governance
-            // finding: those four paths also skip the 401 gate further down, so
-            // before this move they were the last unauthenticated 100 MiB
-            // buffer on the server; the probe EXEMPTION itself — skipping
-            // on-behalf-of and the rate limiter — is unchanged, only the body
-            // cap now also reaches them). Ahead of on-behalf-of and the rate
-            // limiter for the same reason: an oversized/malformed-framing body
-            // is refused for free (a header read, no allocation, no lock)
-            // before spending a rate-limit token or a header scan on it.
+            // -- Pre-auth request-body cap (#2407, hardened 2026-08-07 R3) -------
+            // ONE ENFORCEMENT LAMBDA, called from TWO call sites (D3, R3 —
+            // never forked into two copies of the check). The four
+            // unauthenticated health-probe paths (/livez, /readyz, /health,
+            // /api/health) also skip the 401 gate further down, so before
+            // this cap existed they were the last unauthenticated 100 MiB
+            // buffer on the server — the cap MUST still reach them even
+            // though they are exempt from on-behalf-of and the rate limiter.
+            // A single unconditional placement cannot satisfy that AND the
+            // separate requirement below, which is why this is a callable,
+            // not an inline block:
+            //
+            //   1. Probes are capped — call site 1, inside the probe branch
+            //      just below: for a probe, this cap is the ONLY gate it
+            //      hits, so it runs immediately, before the Unhandled
+            //      return that skips everything else.
+            //   2. Probes stay exempt from on-behalf-of and rate limiting —
+            //      unchanged: the probe branch returns before either runs.
+            //   3. Every NON-probe request hits the on-behalf-of guard and
+            //      the rate limiter BEFORE this cap — call site 2, after
+            //      both, restores the pre-R3 ordering an earlier version of
+            //      this fix accidentally reversed by moving the whole
+            //      block, comment included, above BOTH gates: a bogus/
+            //      oversized Content-Length or Content-Encoding header
+            //      could flood unlimited, unthrottled 4xx responses (each
+            //      building an A4 envelope) past the rate limiter, and a
+            //      request carrying a reserved on-behalf-of header would be
+            //      swallowed by the cap's 413 before
+            //      `yuzu_onbehalf_rejected_total` ever incremented,
+            //      masking the header-injecting-proxy CRITICAL alert. A
+            //      flood of genuinely oversized/malformed-framing bodies
+            //      from a single source IP is now rate-limited like any
+            //      other traffic; the on-behalf-of guard sees — and
+            //      counts — a reserved header before a coincidentally
+            //      oversized body could hide it.
             //
             // Formerly two authorities for one property: an `/mcp/`-only
             // branch (#2437, `mcp_body_exceeds_cap`/`mcp_body_unmeasurable`)
@@ -7540,7 +7586,12 @@ private:
             // documented constraint, not a live bug; re-evaluate if that
             // topology ever changes, or if a future httplib version exposes
             // the stream/close-flag to `pre_routing_handler_`.
-            {
+            //
+            // Returns true (and has already populated `res`) when the
+            // request was refused; false means "not this gate's business,
+            // keep going" — the caller decides what Unhandled/the next
+            // gate means at ITS call site, this lambda never does.
+            auto enforce_pre_auth_body_cap = [&]() -> bool {
                 const auto cap_match = resolve_body_cap(req.method, req.path);
                 bool unmeasurable_cause = false;
                 // CONTAIN THE WHOLE BLOCK, not just the metric (governance
@@ -7576,6 +7627,37 @@ private:
                                          {{"path_class", std::string(cap_match.path_class)},
                                           {"reason", "unsupported_encoding"}})
                                 .increment();
+                            if (cap_match.path_class == "mcp") {
+                                // #2407 R4 fix (2026-08-07): this branch runs
+                                // BEFORE the framing/measurability check
+                                // below (D4 — Content-Encoding is refused
+                                // UNCONDITIONALLY on every class, checked
+                                // first, and that ordering is unchanged by
+                                // this fix, deliberately: 415 is the
+                                // correct status for an unsupported
+                                // encoding, and reordering it behind the
+                                // framing check just for /mcp/ would
+                                // resurrect the wrong 411 status D4 fixed).
+                                // What WAS lost by that reordering is the
+                                // #2437 compatibility counter, which an
+                                // earlier round of this fix only
+                                // incremented from the unmeasurable/
+                                // over_cap branch further down — an /mcp/
+                                // request with a bad Content-Encoding
+                                // returned 415 (correct) but silently
+                                // stopped incrementing
+                                // `yuzu_mcp_body_too_large_total`, dropping
+                                // an arm of the alert at
+                                // docs/prometheus/yuzu-alerts.yml:414.
+                                // Incrementing it here, unconditionally
+                                // alongside the (also unconditional) 415
+                                // status, restores that without touching
+                                // the status code.
+                                metrics_
+                                    .counter("yuzu_mcp_body_too_large_total",
+                                             {{"reason", "unsupported_encoding"}})
+                                    .increment();
+                            }
                         } catch (...) { // NOLINT(bugprone-empty-catch)
                             // Observability must never kill the process from
                             // the unguarded WebSocket-upgrade path.
@@ -7606,30 +7688,28 @@ private:
                                             "Yuzu route accepts a compressed request body"}),
                                 "application/json");
                         }
-                        return httplib::Server::HandlerResponse::Handled;
+                        return true;
                     }
 
-                    // One header lookup answers both "is Content-Length
-                    // present" and "what is its value" — httplib's
-                    // has_header() + get_header_value_u64() each separately
-                    // walk the header multimap for the same key (~24 ns of
-                    // duplicate lookup per request on the admit path,
-                    // measured). Presence is the iterator; a non-numeric
-                    // value reads as 0, matching httplib's own
-                    // get_header_value_u64 (httplib.h:2769-2790).
-                    // std::from_chars, not strtoull: no c_str()/null-
-                    // terminator dependency on a std::string_view-shaped
-                    // source, and no errno to reset.
+                    // TWO deliberately separate header lookups (#2407 R1 fix,
+                    // hardened 2026-08-07 — do not "simplify" back to one).
+                    // Presence (`has_content_length`, for `body_unmeasurable`
+                    // below) is answered by this iterator range. The VALUE
+                    // comes from `content_length_for_body_cap`
+                    // (web_utils.hpp) — see that function's doc comment for
+                    // the CRITICAL bypass a hand-rolled `std::from_chars`
+                    // parse caused here once already (an all-digit
+                    // `Content-Length` above 2^64-1 parsed to 0 — "no
+                    // header, don't cap" — under the old code, while
+                    // httplib's own accessor, which this now calls
+                    // directly, correctly reports `SIZE_MAX`). Routing both
+                    // this call site and the test fixtures' through the ONE
+                    // shared function makes that divergence structurally
+                    // impossible instead of something to keep re-verifying
+                    // by hand.
                     const auto cl_range = req.headers.equal_range("Content-Length");
                     const bool has_content_length = cl_range.first != cl_range.second;
-                    std::uint64_t content_length = 0;
-                    if (has_content_length) {
-                        const std::string& raw = cl_range.first->second;
-                        const auto [ptr, ec] =
-                            std::from_chars(raw.data(), raw.data() + raw.size(), content_length);
-                        if (ec != std::errc{} || ptr != raw.data() + raw.size())
-                            content_length = 0;
-                    }
+                    const std::uint64_t content_length = content_length_for_body_cap(req);
 
                     const bool unmeasurable =
                         body_unmeasurable(req.method, has_content_length,
@@ -7670,8 +7750,15 @@ private:
                                            refuse_unmeasurable ? "unmeasurable" : "over_cap"}})
                                 .increment();
                             if (cap_match.path_class == "mcp") {
-                                // #2437 compatibility series, PRESERVED (D1):
-                                // dashboards/alerts still key off this one.
+                                // #2437 compatibility series, PRESERVED (D1)
+                                // for these two reasons — the THIRD
+                                // (`unsupported_encoding`) is incremented
+                                // from the separate Content-Encoding branch
+                                // above (#2407 R4), since that check runs
+                                // first and returns before reaching here.
+                                // Both sites together are what make the
+                                // series genuinely complete; dashboards/
+                                // alerts still key off this one.
                                 metrics_
                                     .counter("yuzu_mcp_body_too_large_total",
                                              {{"reason", refuse_unmeasurable
@@ -7746,7 +7833,7 @@ private:
                                                   "per-route limit"}),
                                 "application/json");
                         }
-                        return httplib::Server::HandlerResponse::Handled;
+                        return true;
                     }
                 } catch (...) { // NOLINT(bugprone-empty-catch)
                     // Last-resort containment for the WHOLE block, including
@@ -7755,16 +7842,24 @@ private:
                     // than let the throw reach httplib's UNGUARDED WebSocket-
                     // upgrade call site and take the process down.
                     res.status = unmeasurable_cause ? 411 : 413;
-                    return httplib::Server::HandlerResponse::Handled;
+                    return true;
                 }
-            }
+                return false;
+            };
 
-            // Lightweight probes — always allowed, no auth, no rate limit.
-            // /health and /api/health are included here (governance Gate 7,
-            // unhappy-path UP-1) so monitoring integrations behind a NAT or
-            // sharing a source-IP bucket with authed REST traffic cannot
-            // 429-starve the health probe. The endpoints themselves are
-            // strictly read-only and documented as unauthenticated.
+            // Lightweight probes — capped (R3, call site 1 of
+            // `enforce_pre_auth_body_cap` above), but otherwise always
+            // allowed: no auth, no rate limit. /health and /api/health are
+            // included here (governance Gate 7, unhappy-path UP-1) so
+            // monitoring integrations behind a NAT or sharing a source-IP
+            // bucket with authed REST traffic cannot 429-starve the health
+            // probe. The endpoints themselves are strictly read-only and
+            // documented as unauthenticated. This IS the probes' only gate:
+            // the cap check runs here, unconditionally, before the
+            // Unhandled return, precisely because everything past this
+            // point (on-behalf-of, rate limiting) is skipped for these four
+            // paths — before the cap reached them too, they were the last
+            // unauthenticated 100 MiB buffer on the server.
             // Liveness/readiness probes are EXEMPT from the on-behalf-of guard
             // below — a RECORDED ADR-1005 exception (documented in
             // docs/auth-architecture.md; ledger entry lands with the ADR).
@@ -7776,6 +7871,8 @@ private:
             // guard exists to surface. Every other path rejects below.
             if (req.path == "/livez" || req.path == "/readyz" || req.path == "/health" ||
                 req.path == "/api/health") {
+                if (enforce_pre_auth_body_cap())
+                    return httplib::Server::HandlerResponse::Handled;
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
@@ -7859,6 +7956,22 @@ private:
                     "application/json");
                 return httplib::Server::HandlerResponse::Handled;
             }
+
+            // Pre-auth request-body cap (R3, call site 2 of
+            // `enforce_pre_auth_body_cap` — see that lambda's header
+            // comment above). Every path reaching here is a NON-probe path
+            // that has already cleared the on-behalf-of guard and the rate
+            // limiter above, restoring the invariant those two gates run
+            // BEFORE this cap for everyone except the four exempt probes
+            // (call site 1): a flood of bogus/oversized Content-Length or
+            // Content-Encoding headers from one source IP is rate-limited
+            // like any other traffic before it can generate unlimited
+            // unthrottled 4xx responses here, and a request also carrying
+            // a reserved on-behalf-of header is rejected — and counted —
+            // by that guard first, rather than being swallowed by a 413
+            // before `yuzu_onbehalf_rejected_total` ever increments.
+            if (enforce_pre_auth_body_cap())
+                return httplib::Server::HandlerResponse::Handled;
 
             // Allow unauthenticated access to login pages, health, OIDC flow, and OpenAPI spec.
             // /health and /api/health are ALSO covered by the early-return

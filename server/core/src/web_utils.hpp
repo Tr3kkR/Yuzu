@@ -552,6 +552,45 @@ has_non_identity_content_encoding(std::string_view content_encoding) noexcept {
     return !identity;
 }
 
+/// The single Content-Length-for-the-body-cap-gate computation (#2407 R1/R2
+/// hardening, 2026-08-07). `Req` is a TEMPLATE PARAMETER, not a concrete
+/// `httplib::Request`, specifically so this file stays httplib-free at the
+/// header level (see `is_mcp_path`'s doc comment above for why that
+/// matters) while still being the literal, single implementation both real
+/// callers share — in practice always instantiated with `httplib::Request`,
+/// which already exposes the exact public surface this needs
+/// (`get_header_value_u64`).
+///
+/// MUST delegate to httplib's OWN accessor rather than re-implement the
+/// parse. A prior round hand-rolled this with `std::from_chars` in
+/// server.cpp's pre-routing handler, reasoning (in a since-deleted comment)
+/// that a non-numeric value "reads as 0, matching httplib's own
+/// get_header_value_u64" — true for a non-numeric value, FALSE for an
+/// all-digit value above 2^64-1: `std::from_chars` reports
+/// `std::errc::result_out_of_range` for that input and the old code folded
+/// that to `content_length = 0` ("no header, don't cap"), while httplib's
+/// own `is_numeric()` + `strtoull()` parser (httplib.h:2769-2789) accepts
+/// the same digits and returns `SIZE_MAX` — the value it then ALSO uses to
+/// decide what it buffers (httplib.h:7057-7061). One unauthenticated
+/// `Content-Length: 99999999999999999999999` (or any all-digit value above
+/// 2^64-1) defeated every class's cap, including /mcp/'s and the 256 KiB
+/// ca_import_chain/scim classes (governance Gate 8 CRITICAL). Calling
+/// httplib's accessor from this ONE function — used by both server.cpp's
+/// production gate and this file's own test fixtures
+/// (`test_body_cap_policy.cpp`'s `UnifiedBodyCapTestServer`,
+/// `test_mcp_body_cap.cpp`'s `BodyCapTestServer`) — makes that divergence
+/// structurally impossible rather than something to keep re-verifying by
+/// hand every time either call site is touched. A genuinely malformed
+/// (non-numeric / negative / whitespace-padded) `Content-Length` still
+/// reads as 0 here — that is fine, NOT a re-opened gap: httplib's OWN
+/// reader (the `is_invalid_value` branch, httplib.h:7057-7063) answers 400
+/// and refuses to read the body at all for that case, so no handler is
+/// ever reached regardless of what this gate alone decides.
+template <typename Req>
+[[nodiscard]] inline std::uint64_t content_length_for_body_cap(const Req& req) noexcept {
+    return req.get_header_value_u64("Content-Length", 0);
+}
+
 /// True when a request body's SIZE cannot be measured before reading it:
 /// chunked (or any other non-empty) `Transfer-Encoding`, or a POST/PUT/PATCH
 /// with no declared `Content-Length`. `Content-Encoding` is judged separately
