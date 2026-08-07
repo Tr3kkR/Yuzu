@@ -804,11 +804,15 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
     // watch, if any) and undo our subscription on a lost race — see
     // unregister_consumer()'s erase-before-scan ordering for why this
     // re-check is airtight. Inline subs have no registered consumer to check.
-    // The teardown is teardown_arm_race(), NOT disarm(). Both are allocation-free in
-    // their locked section now, so the reason is no longer allocation: disarm() must
-    // LOOK UP a key this caller already holds, and its last-subscriber branch is
-    // whole-key-capable, while what a lost M1 race owes is the removal of exactly ONE
-    // subscription — a sibling that deduped onto this key keeps its own.
+    // The teardown is teardown_arm_race(), NOT disarm(). Read the next clause as
+    // precisely as :580-584 above: it is NOT that either one's locked section never
+    // allocates — the log line in each still formats into a heap buffer (:902-905
+    // there, :1008-1011 in disarm()) — it is that both now CONTAIN that allocation in
+    // a catch-all rather than letting it escape. So the reason to route through
+    // teardown_arm_race is no longer allocation: disarm() must LOOK UP a key this
+    // caller already holds, and its last-subscriber branch is whole-key-capable,
+    // while what a lost M1 race owes is the removal of exactly ONE subscription — a
+    // sibling that deduped onto this key keeps its own.
     if (tier == SparkTier::Queued) {
         bool consumer_alive = false;
         {
@@ -1047,7 +1051,7 @@ void SparkEngine::disarm(SubscriptionId id) {
             if (armed_.contains(unwatch_key))
                 return; // a concurrent re-arm already renewed this key
         }
-        // CONTAINED AND COUNTED, matching teardown_arm_race (:942-953) — the fourth and
+        // CONTAINED AND COUNTED, matching teardown_arm_race (:965-977) — the fourth and
         // last lockstep difference between the two. unwatch() is not noexcept and the real
         // mechanisms allocate inside it (spark_service queues a Cmd holding a key copy;
         // spark_file grows retiring_), so under the memory pressure this layer is about it
