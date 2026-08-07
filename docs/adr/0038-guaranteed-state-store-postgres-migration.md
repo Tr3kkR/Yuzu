@@ -93,8 +93,19 @@ reconcile warm. So: single-transaction backfill of all five tables from the lega
 never row-count-inferred), per-row SQLSTATE discrimination exactly as ADR-0037 H1 settled
 it (22xxx/23xxx/54xxx = skip + persisted `skipped_bad`; anything else aborts UNSTAMPED and
 the boot log carries the operator remediation line). Legacy file retained read-only for
-one release. TTL-expired legacy rows are skipped at read time (WHERE clause), not
-migrated-then-reaped.
+one release. **Amended (#2663, security-guardian review):** events/observations are
+copied UNCONDITIONALLY, `ttl_expires_at` included — the original design (TTL-expired
+rows skipped at read time, WHERE-clause, bound to the migrating replica's own
+`now_epoch()`) made a retention decision outside the clock-guard machinery entirely,
+with no anchor, sanitiser, cap, or decline; a migrating host whose clock read ahead at
+first boot could silently and permanently exclude a genuinely-live row. Mirrors
+`AuditStore::migrate_from_sqlite`: the guarded `reap_expired()` is the sole authority on
+what has expired, draining any already-expired legacy row itself, capped and counted
+like any other row, rather than the migration silently deciding first. Trade-off: a
+large expired legacy backlog now drains at the reaper's cap pace (~10k/pass, hourly)
+instead of being excluded instantly — acceptable, since it now produces disposal
+evidence (reap counters) rather than silent exclusion, better serving this section's
+own works-council continuity argument.
 
 ### Retention (the part that must not port as-is)
 

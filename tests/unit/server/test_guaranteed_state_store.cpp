@@ -234,6 +234,99 @@ void write_legacy_gsstore_db(const std::filesystem::path& path) {
     sqlite3_close(db);
 }
 
+// One legacy event past its TTL, one still live with a genuine FUTURE
+// ttl_expires_at within the store's own datable horizon — NOT the 0/never-
+// expire sentinel (excluded from BOTH expiring and datable, leaving only the
+// expired row counted and trivially would_wipe-declining every pass) and NOT
+// an arbitrary far-future constant (excluded from datable by the horizon
+// itself, same trivial-wipe trap from the other direction). `live_ttl` must
+// be > pg_now (not yet expiring) and inside pg_now + retention_window +
+// kReapTtlFutureSlackSec (still datable) for this to be a genuine partial
+// expiry. For the #2663 security-guardian falsifier below: migration must
+// copy BOTH rows, never decide expiry itself.
+void write_legacy_gsstore_db_with_expired_event(const std::filesystem::path& path,
+                                                int64_t live_ttl) {
+    sqlite3* db = nullptr;
+    open_legacy_gsstore_db(path, &db);
+    const std::string seed =
+        "INSERT INTO guaranteed_state_rules (rule_id, name, yaml_source, version, enabled, "
+        " enforcement_mode, severity, os_target, scope_expr, created_at, updated_at, created_by, "
+        " updated_by) VALUES "
+        "('legacy-rule-1', 'legacy-block-446', 'apiVersion: yuzu.io/v1alpha1', 1, 1, 'enforce', "
+        " 'high', 'windows', 'tag:all', '2026-04-19T12:00:00Z', '2026-04-19T12:00:00Z', 'alice', "
+        " 'alice');"
+        "INSERT INTO guaranteed_state_events (event_id, rule_id, agent_id, event_type, severity, "
+        " timestamp, ttl_expires_at) VALUES "
+        "('legacy-evt-expired', 'legacy-rule-1', 'agent-A', 'drift.remediated', 'high', "
+        " '2026-01-01T00:00:00Z', 1),"
+        "('legacy-evt-live', 'legacy-rule-1', 'agent-A', 'drift.remediated', 'high', "
+        " '2026-04-19T12:00:00Z', " + std::to_string(live_ttl) + ");"
+        "INSERT INTO guardian_observations (event_id, agent_id, observed_at, obs_type, "
+        " ttl_expires_at) VALUES "
+        "('legacy-evt-expired', 'agent-A', '2026-01-01T00:00:00Z', 'process.crashed', 1),"
+        "('legacy-evt-live', 'agent-A', '2026-04-19T12:00:00Z', 'process.crashed', " +
+        std::to_string(live_ttl) + ");";
+    REQUIRE(sqlite3_exec(db, seed.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(db);
+}
+
+// #2663 security-guardian: migrate_from_sqlite() used to skip TTL-expired
+// legacy rows AT SCAN TIME, bound to the migrating replica's own now_epoch()
+// — a retention decision made outside the clock-guard machinery entirely (no
+// anchor, no sanitiser, no cap, no decline). A migrating host whose clock read
+// ahead at the moment of a one-time first-boot backfill could silently and
+// PERMANENTLY exclude a genuinely-live row from every product surface (no
+// re-migration path once `sqlite_backfill` is stamped). Fixed to copy
+// unconditionally, mirroring AuditStore::migrate_from_sqlite — this falsifier
+// needs no clock injection: on the pre-fix code, "legacy-evt-expired" (ttl=1,
+// always in the past) is unconditionally excluded regardless of what the
+// migrating host's clock actually reads, so this fails on old code by
+// construction, not by chance.
+TEST_CASE("GuaranteedStateStore::migrate_from_sqlite copies an already-expired legacy row "
+          "unconditionally, letting reap_expired() drain it afterward",
+          "[pg][guaranteed_state][backfill][clock-guard]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    const int64_t real_now = pg_now(db.dsn());
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool, /*retention_days=*/30);
+    REQUIRE(store.is_open());
+
+    auto legacy_path =
+        yuzu::test::unique_temp_path("yuzu_test_gsstore_expired") / "guaranteed-state.db";
+    std::filesystem::create_directories(legacy_path.parent_path());
+    // Comfortably future (not yet expiring) but well inside the 30-day
+    // datable horizon — a genuine partial expiry, not a trivial would_wipe.
+    write_legacy_gsstore_db_with_expired_event(legacy_path, real_now + 5000);
+
+    REQUIRE(store.migrate_from_sqlite(legacy_path));
+
+    // FIXED: both rows survive the migration itself — expiry is reap_expired()'s
+    // decision alone, never migrate_from_sqlite()'s.
+    CHECK(store.event_count() == 2);
+    CHECK(store.query_observations().size() == 2);
+    CHECK(query_scalar(db.dsn(), "SELECT events_inserted FROM "
+                                 "guaranteed_state_store.sqlite_backfill") == "2");
+    CHECK(query_scalar(db.dsn(), "SELECT observations_inserted FROM "
+                                 "guaranteed_state_store.sqlite_backfill") == "2");
+
+    // The now-guarded reap_expired() drains the genuinely-expired row — but
+    // this store has never reached a verdict before (migration doesn't
+    // anchor), so the FIRST pass is the #2579 no_anchor bootstrap decline
+    // (there IS an honestly-expired row and no prior reading), not an
+    // immediate drain: 0 reaped, nothing deleted. The SECOND pass is
+    // re-anchored and drains it, capped as always.
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 0);
+    CHECK(store.event_count() == 2); // decline held — both rows still present
+
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 1);
+    CHECK(store.event_count() == 1);
+    auto remaining = store.query_events();
+    REQUIRE(remaining.size() == 1);
+    CHECK(remaining[0].event_id == "legacy-evt-live");
+}
+
 // Two rules sharing the SAME `name` (distinct rule_id): the target table's
 // UNIQUE(name) constraint is not the ON CONFLICT(rule_id) target the
 // production INSERT dedups on, so the second row's insert genuinely fails
@@ -2508,6 +2601,7 @@ TEST_CASE("GuaranteedStateStore #2663 fjarvis H1: a fast replica cannot sweep a 
     const int64_t real_now = pg_now(db.dsn());
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore replica_a(pool, /*retention_days=*/30);
+    REQUIRE(replica_a.is_open());
     anchor_guard(replica_a, db.dsn());
 
     REQUIRE(replica_a.insert_event(make_event("still-live", "r", "a")));
@@ -2526,6 +2620,7 @@ TEST_CASE("GuaranteedStateStore #2663 fjarvis H1: a fast replica cannot sweep a 
     // kReapBigStepSecs (1 day), so big_step never fires either.
     GuaranteedStateStore replica_b(pool, /*retention_days=*/30,
                                    [real_now] { return real_now + 3600; });
+    REQUIRE(replica_b.is_open());
     yuzu::MetricsRegistry metrics;
     replica_b.set_metrics(&metrics);
     replica_b.reap_expired();
@@ -2536,6 +2631,18 @@ TEST_CASE("GuaranteedStateStore #2663 fjarvis H1: a fast replica cannot sweep a 
     CHECK(replica_a.event_count() == 2);
     CHECK(metrics.counter("yuzu_server_guardian_reap_passes_total", {{"result", "swept"}})
               .value() == 0.0);
+
+    // The shared ANCHOR itself must reflect PG's clock, not replica B's own
+    // skewed reading (quality-engineer, Gate 8: gc_meta is "the transmission
+    // medium" per the fix's own comment — a hypothetical partial revert of
+    // only the stamp line would still pass the checks above while poisoning
+    // this row for the next replica's prev-comparison). Tolerance is wide
+    // (60s) purely for test-execution latency, nowhere near replica B's
+    // 3600s skew.
+    const int64_t stamped =
+        std::stoll(query_scalar(db.dsn(), "SELECT value FROM guaranteed_state_store.gc_meta "
+                                          "WHERE key = 'last_pass_now'"));
+    CHECK(std::abs(stamped - pg_now(db.dsn())) < 60);
 }
 
 TEST_CASE("GuaranteedStateStore: reap_expired is a no-op on a closed store",

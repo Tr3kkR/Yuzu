@@ -651,7 +651,6 @@ bool GuaranteedStateStore::migrate_from_sqlite(const std::filesystem::path& lega
         return false;
     }
 
-    const int64_t now = now_epoch();
     std::vector<LegacyRule> legacy_rules;
     std::vector<LegacyMeta> legacy_meta;
     std::vector<LegacyStatus> legacy_status;
@@ -755,22 +754,32 @@ bool GuaranteedStateStore::migrate_from_sqlite(const std::filesystem::path& lega
             return false;
         }
     }
-    // events — TTL-expired rows skipped AT SCAN TIME (never migrated-then-reaped).
+    // events — copied UNCONDITIONALLY, ttl_expires_at included (#2663, security-guardian
+    // review): the original scan-time skip (`WHERE ttl_expires_at = 0 OR ttl_expires_at
+    // > ?1`, bound to this replica's own now_epoch()) was an unguarded process-clock
+    // retention decision made outside the clock-guard machinery entirely — no anchor, no
+    // sanitiser, no cap, no decline. A migrating host whose clock read ahead at first boot
+    // (plausible before NTP settles) could silently exclude a genuinely-live row from
+    // every product surface, permanently (no re-migration path once `sqlite_backfill` is
+    // stamped) — the same defect class fjarvis's H1 finding closed in reap_expired()
+    // itself, just at migration time. Mirrors AuditStore::migrate_from_sqlite exactly
+    // ("ALL columns copied incl. ttl_expires_at so the retention horizon is preserved
+    // exactly"): the now-pg_now-guarded reap_expired() is the ONLY place that decides
+    // what has expired, so it drains any genuinely-expired legacy row itself, capped and
+    // counted like every other row. See ADR-0038's amended Migration section.
     {
         SqliteStmt s;
         const char* sql =
             "SELECT event_id, rule_id, agent_id, event_type, severity, guard_type, "
             "guard_category, detected_value, expected_value, remediation_action, "
             "remediation_success, detection_latency_us, remediation_latency_us, timestamp, "
-            "ttl_expires_at, detail_json FROM guaranteed_state_events "
-            "WHERE ttl_expires_at = 0 OR ttl_expires_at > ?1;";
+            "ttl_expires_at, detail_json FROM guaranteed_state_events;";
         if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK) {
             spdlog::error("GuaranteedStateStore::migrate_from_sqlite: legacy events query "
                           "failed: {}",
                           sqlite3_errmsg(legacy.get()));
             return false;
         }
-        sqlite3_bind_int64(s.get(), 1, now);
         int rc = SQLITE_OK;
         while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
             LegacyEvent e;
@@ -800,20 +809,18 @@ bool GuaranteedStateStore::migrate_from_sqlite(const std::filesystem::path& lega
             return false;
         }
     }
-    // observations — same TTL-expired-at-scan-time skip.
+    // observations — copied unconditionally, same as events above.
     {
         SqliteStmt s;
         const char* sql =
             "SELECT event_id, agent_id, observed_at, obs_type, subject, reason, symbolic, "
-            "component, metric, platform, version, ttl_expires_at FROM guardian_observations "
-            "WHERE ttl_expires_at = 0 OR ttl_expires_at > ?1;";
+            "component, metric, platform, version, ttl_expires_at FROM guardian_observations;";
         if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK) {
             spdlog::error("GuaranteedStateStore::migrate_from_sqlite: legacy observations query "
                           "failed: {}",
                           sqlite3_errmsg(legacy.get()));
             return false;
         }
-        sqlite3_bind_int64(s.get(), 1, now);
         int rc = SQLITE_OK;
         while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
             LegacyObservation o;
