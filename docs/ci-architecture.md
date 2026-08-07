@@ -104,6 +104,84 @@ or exposing the administration-scoped PAT to fork-controlled code.
 
 ## Gates outside the tier ladder
 
+### Plugin spawn lexical gate (`plugin-spawn-gate.yml`, ADR-3002 decision 10a)
+
+A per-PR grep over `agents/plugins/*` and `agents/core` for a raw
+process-spawn token (the `fork`/`exec` family, `system`, `popen`,
+`CreateProcess` family, ...) outside the registered allowlist —
+`scripts/ci/check-plugin-spawn-lexical.sh` carries the full
+token/allowlist contract in its own header. It is tier (a) of a
+two-tier enforcement scheme; a scheduled, call-identity-aware CodeQL
+query is tier (b), the deep net for what a lexical scan can't see. See
+`docs/adr/3002-acquisition-ladder.md:459-488` for why neither tier
+alone is sufficient.
+
+It runs as its **own workflow**, not folded into `ci.yml`: a source
+grep needs no build, so it doesn't share `ci.yml`'s build-dependent
+PR fast-path or `changes`-job path filtering — there is nothing
+expensive to skip, so the workflow simply always runs on every PR and
+push to `main`/`dev`. A failing lexical scan is a **merge-blocking**
+required check; remediation is either moving the call into the
+registered allowlist (if it is a legitimate, reviewed acquisition
+path) or removing the raw spawn in favour of the sanctioned subprocess
+runner.
+
+### Capability matrix drift gate (`check-capability-matrix.sh`, #2204)
+
+Runs on every Linux CI leg immediately after `Build`, once
+`capmatrix-gen` and every `agents/plugins/*/` shared object already
+exist. The script discovers the full plugin set from the source tree
+itself — not a hand-maintained subset — so a missing capability-matrix
+artifact for **any** plugin is a hard failure, never a silent skip,
+and a stale generated block in `docs/os-capability-matrix.md` fails
+the same way. It currently runs in **ratchet mode only**: the
+undeclared-plugin count must not grow PR-over-PR; it does not yet
+hard-fail on any plugin being undeclared (that is a later PR). A
+companion step, `tests/shell/test_capability_matrix_gate.sh` (#2204
+finding F10), exercises both the "renders a DECLARED descriptor" path
+and both ratchet-rejection branches against the real built binary and
+the real gate script, using the `tests/fixtures/abi4/` declaring
+fixture plugin inside throwaway git repos — it also runs right after
+`Build` for the same reason (needs the built artifacts), not on the
+preflight shell-gate step.
+
+Both steps are **merge-blocking** required checks. A red
+capability-matrix gate on a fork or source build is remediated by
+running `capmatrix-gen` against the local build and committing the
+refreshed generated block between the `<!-- BEGIN GENERATED -->` /
+`<!-- END GENERATED -->` markers in `docs/os-capability-matrix.md`, or
+by declaring the newly undeclared plugin(s) so the ratchet count stops
+growing — `check-capability-matrix.sh`'s own header spells out the
+three drifts it catches and the ratchet-baseline mechanics.
+
+### Pin-displacement claim gate (`pin-displacement-claim-gate.yml`, #2740)
+
+A per-PR grep asserting that every surface stating what CAUSES an MCP replay-ring pin
+displacement agrees on the cause set. `scripts/ci/check-pin-displacement-claim-set.sh`
+carries the invariant and its derivation pointer; the surfaces are one array in that
+script, and both of its checks derive from it.
+
+It exists because that claim lives as an independent paraphrase in seven files, #2740
+falsified it, and successive review passes each fixed a different subset — a convention
+did not hold. It checks the machine-comparable part (which counters each surface names as
+a cause) and deliberately NOT the derivation prose, which is where the parked lexical-gate
+approach walls.
+
+Two properties worth knowing before editing it:
+
+- **It self-tests first.** The workflow runs `--selftest` (fixture cases proving each
+  defect shape reddens) before the real check, on the `plugin-spawn-gate.yml` precedent —
+  a gate nobody has watched fail is an assertion, not a check. Three of those cases exist
+  because a review proved the gate was false-green for surfaces its own header claimed to
+  protect; add a case whenever you add a surface.
+- **Add surfaces to `STATING_SURFACES`, not to a loop.** The two holes review found were
+  both a divergence between two hand-maintained lists. There is now one.
+
+A failing check is **merge-blocking** — the job exits non-zero and the workflow has no
+`continue-on-error`. No build, no `paths:` filter (nothing expensive to skip, and no filter
+means it always reports — see the trap noted for `docker-healthcheck-invariants.yml`
+below).
+
 ### Docker healthcheck invariants (`docker-healthcheck-invariants.yml`, #751)
 
 The five Yuzu **application** images' compose healthchecks depend on a tool baked

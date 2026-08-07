@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -26,6 +27,7 @@ struct FakeDispatch {
     struct Call {
         std::string plugin, action, correlation;
         std::vector<std::string> agent_ids;
+        yuzu::server::authz::VisibleSet exec_visible; // governance UP-8: what the caller threaded
     };
     std::vector<Call> calls;
     int sent = 1; // agents_reached returned for every step
@@ -34,8 +36,9 @@ struct FakeDispatch {
         return [this](const std::string& plugin, const std::string& action,
                       const std::vector<std::string>& agent_ids, const std::string& /*scope*/,
                       const std::unordered_map<std::string, std::string>& /*params*/,
-                      const std::string& correlation) -> std::pair<std::string, int> {
-            calls.push_back(Call{plugin, action, correlation, agent_ids});
+                      const std::string& correlation,
+                      const yuzu::server::authz::VisibleSet& exec_visible) -> std::pair<std::string, int> {
+            calls.push_back(Call{plugin, action, correlation, agent_ids, exec_visible});
             return {"cmd-" + plugin + "-" + action, sent};
         };
     }
@@ -96,6 +99,47 @@ TEST_CASE("orchestrator dispatch fans each step under one bundle- correlation id
     CHECK(fd.calls[0].correlation == "bundle-abc");
     CHECK(fd.calls[0].agent_ids == std::vector<std::string>{"agent-1"});
     CHECK(audited == 2);
+}
+
+TEST_CASE("orchestrator threads the caller's exec_visible into DispatchFn unchanged "
+          "(governance UP-8)",
+          "[bundle][orchestrator][scope]") {
+    // Before this fix `dispatch()` hardcoded an unfiltered VisibleSet{} into
+    // every step regardless of what the caller (REST/MCP) had already derived
+    // — a drift hazard: a future dispatch_fn that started consulting this set
+    // for its own confinement would silently see "unfiltered" no matter what
+    // the wrapper actually authorized. This proves the caller's set survives
+    // unchanged, per step.
+    FakeDispatch fd;
+    ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    BundleOrchestrator orch(fd.fn(), &store, fixed_id("vis"));
+
+    std::unordered_set<std::string> caller_visible{"agent-1"};
+    auto res = orch.dispatch("agent-1", two_steps(), "alice", null_audit(),
+                             yuzu::server::authz::VisibleSet{caller_visible});
+    CHECK(res.expected == 2);
+    REQUIRE(fd.calls.size() == 2);
+    for (const auto& call : fd.calls) {
+        REQUIRE(call.exec_visible.has_value()); // NOT nullopt/unfiltered
+        CHECK(call.exec_visible->size() == 1);
+        CHECK(call.exec_visible->count("agent-1") == 1);
+    }
+}
+
+TEST_CASE("orchestrator defaults to unfiltered exec_visible when the caller supplies none",
+          "[bundle][orchestrator][scope]") {
+    // REST's confinement model authorizes agent_id via scoped_perm_fn BEFORE
+    // calling dispatch() (never derives a VisibleSet), so omitting the
+    // argument must preserve that — nullopt, not a present-empty deny-all.
+    FakeDispatch fd;
+    ResponseStore store(":memory:");
+    REQUIRE(store.is_open());
+    BundleOrchestrator orch(fd.fn(), &store, fixed_id("def"));
+
+    orch.dispatch("agent-1", two_steps(), "alice", null_audit());
+    REQUIRE(fd.calls.size() == 2);
+    CHECK_FALSE(fd.calls[0].exec_visible.has_value());
 }
 
 TEST_CASE("orchestrator collate groups responses in request order", "[bundle][orchestrator]") {
@@ -180,7 +224,7 @@ TEST_CASE("orchestrator: a throwing dispatch step is isolated, manifest still st
     BundleOrchestrator::DispatchFn throwing =
         [&n](const std::string& plugin, const std::string& action, const std::vector<std::string>&,
              const std::string&, const std::unordered_map<std::string, std::string>&,
-             const std::string&) -> std::pair<std::string, int> {
+             const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         if (++n == 2)
             throw std::runtime_error("gRPC write failed");
         return {"cmd-" + plugin + "-" + action, 1};

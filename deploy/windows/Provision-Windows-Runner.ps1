@@ -62,6 +62,43 @@ param(
 $ErrorActionPreference = 'Continue'
 $ProgressPreference    = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# The committed contract is the reviewed version policy. Keep the familiar
+# provisioning parameters for operator ergonomics, but refuse an ad-hoc
+# override: update the contract in review first, then provision from it.
+$toolchainContractPath = Join-Path $PSScriptRoot 'toolchain-contract.json'
+$toolchainModulePath = Join-Path $PSScriptRoot 'Toolchain-Contract.psm1'
+try {
+  Import-Module $toolchainModulePath -Force -ErrorAction Stop
+  $toolchainContract = Read-YuzuToolchainContract -Path $toolchainContractPath
+} catch {
+  Write-Host "FAIL: cannot load the toolchain contract/module ($($_.Exception.Message))" -ForegroundColor Red
+  exit 1
+}
+if([string]$toolchainContract.schema -ne 'yuzu/windows-toolchain/v1'){
+  Write-Host "FAIL: unsupported toolchain contract schema '$($toolchainContract.schema ?? '<unset>')'" -ForegroundColor Red
+  exit 1
+}
+$requestedPins = [ordered]@{
+  python=$PythonVersion
+  meson=$MesonVersion
+  erlang=$ErlangVersion
+  rebar3=$Rebar3Version
+  postgres=$PostgresVersion
+  vcpkg_baseline=$VcpkgBaseline
+}
+foreach($pin in $requestedPins.GetEnumerator()){
+  $expected = if($pin.Key -eq 'vcpkg_baseline'){
+    [string]$toolchainContract.job_pins.vcpkg_baseline
+  } else {
+    [string]$toolchainContract.pins.($pin.Key)
+  }
+  if(-not [string]::Equals([string]$pin.Value, $expected, [StringComparison]::OrdinalIgnoreCase)){
+    Write-Host "FAIL: requested $($pin.Key) '$($pin.Value)' differs from reviewed contract '$expected'; update toolchain-contract.json first." -ForegroundColor Red
+    exit 1
+  }
+}
+
 New-Item -ItemType Directory -Force 'C:\ProvisionLogs' | Out-Null
 Start-Transcript -Path "C:\ProvisionLogs\provision-$(Get-Date -Format yyyyMMdd-HHmmss).log" | Out-Null
 
@@ -222,8 +259,11 @@ Step 'winget sanity' { "winget " + (winget --version) }
 
 Step 'Python + Meson + Ninja + PyYAML' {
   # PyYAML is a HARD configure-time dep (embed_content.py); install it apt-style.
-  if(-not (Get-Command python -EA SilentlyContinue)){ WG -id 'Python.Python.3.14' -ver $PythonVersion }
-  $py = (Get-Command python -EA SilentlyContinue).Source
+  $python = Resolve-YuzuPinnedPython -ExpectedVersion $PythonVersion `
+    -CommandResolver { try { Resolve-YuzuEffectiveCommand -Name python } catch { '' } } `
+    -VersionProbe { param([string]$path) & $path -c 'import platform; print(platform.python_version())' 2>$null } `
+    -Installer { WG -id 'Python.Python.3.14' -ver $PythonVersion }
+  $py = $python.Path
   if($py){
     & $py -m pip install --upgrade pip | Out-Null
     & $py -m pip install "meson==$MesonVersion" ninja pyyaml | Out-Null
@@ -231,7 +271,7 @@ Step 'Python + Meson + Ninja + PyYAML' {
 }
 
 Step 'Persistent per-runner CI telemetry databases' {
-  $py = (Get-Command python -EA SilentlyContinue).Source
+  $py = @(Get-Command python -CommandType Application -EA SilentlyContinue | Select-Object -First 1).Source
   $testDbScript = Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..\..')) 'scripts\test\test_db.py'
   if(-not $py){ throw 'python is required to initialize CI telemetry' }
   if(-not (Test-Path $testDbScript)){ throw "test DB schema tool missing at $testDbScript" }
@@ -255,7 +295,7 @@ Step 'Persistent per-runner CI telemetry databases' {
 Step 'Deploy versioned runner control scripts' {
   $controlRoot = Split-Path $ManifestPath
   New-Item -ItemType Directory -Force $controlRoot | Out-Null
-  foreach($name in @('Start-PinnedRunner.ps1','Assert-Toolchain.ps1')){
+  foreach($name in @('Start-PinnedRunner.ps1','Assert-Toolchain.ps1','Toolchain-Contract.psm1','toolchain-contract.json')){
     $source = Join-Path $PSScriptRoot $name
     if(-not (Test-Path $source)){ throw "runner control script missing at $source" }
     Copy-Item -LiteralPath $source -Destination (Join-Path $controlRoot $name) -Force
@@ -817,10 +857,18 @@ Step 'Scheduled sweep of leaked C:\Windows\Temp\yuzu* (NTFS dir-index hygiene)' 
 
 Step "vcpkg @ pinned baseline $($VcpkgBaseline.Substring(0,7))" {
   $git=(Get-Command git -EA SilentlyContinue).Source
-  if(-not (Test-Path "$VcpkgRoot\.git")){ & $git clone https://github.com/microsoft/vcpkg $VcpkgRoot }
+  if(-not (Test-Path "$VcpkgRoot\.git")){
+    & $git clone https://github.com/microsoft/vcpkg $VcpkgRoot
+    if($LASTEXITCODE -ne 0){ throw "vcpkg clone failed with exit $LASTEXITCODE" }
+  }
   & $git -C $VcpkgRoot fetch --depth 1 origin $VcpkgBaseline
-  & $git -C $VcpkgRoot checkout $VcpkgBaseline
-  if(-not (Test-Path "$VcpkgRoot\vcpkg.exe")){ & "$VcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics }
+  if($LASTEXITCODE -ne 0){ throw "vcpkg fetch failed with exit $LASTEXITCODE" }
+  & $git -C $VcpkgRoot checkout --detach $VcpkgBaseline
+  if($LASTEXITCODE -ne 0){ throw "vcpkg checkout failed with exit $LASTEXITCODE" }
+  # Always reconcile the executable after moving HEAD. Checking only for its
+  # existence leaves a binary built from the previous baseline on upgrades.
+  & "$VcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+  if($LASTEXITCODE -ne 0){ throw "vcpkg bootstrap failed with exit $LASTEXITCODE" }
   "vcpkg bootstrapped at $VcpkgRoot"
 }
 
@@ -858,17 +906,16 @@ Step "emit toolchain manifest -> $ManifestPath" {
   $pgbin = @("C:\pgsql\bin","C:\Program Files\PostgreSQL\$major\bin") | Where-Object { Test-Path (Join-Path $_ 'psql.exe') } | Select-Object -First 1
   if(-not $pgbin){ $pgbin = "C:\Program Files\PostgreSQL\$major\bin" }
   $tools = @(
-    @{ name='python';     path=(Get-Command python -EA SilentlyContinue).Source; version=(Ver { python --version }); required=$true }
-    @{ name='meson';      path=(Get-Command meson  -EA SilentlyContinue).Source; version=(Ver { meson --version });  required=$true }
-    @{ name='ninja';      path=(Get-Command ninja  -EA SilentlyContinue).Source; version=(Ver { ninja --version });  required=$true }
-    @{ name='cmake';      path=(Get-Command cmake  -EA SilentlyContinue).Source; version=(Ver { cmake --version });  required=$true }
-    @{ name='git';        path=(Get-Command git    -EA SilentlyContinue).Source; version=(Ver { git --version });    required=$true }
-    @{ name='ccache';     path=(Get-Command ccache -EA SilentlyContinue).Source; version=(Ver { ccache --version }); required=$true }
+    @{ name='python';     path=@(Get-Command python -CommandType Application -EA SilentlyContinue | Select-Object -First 1).Source; version=(Ver { python --version }); required=$true }
+    @{ name='meson';      path=@(Get-Command meson  -CommandType Application -EA SilentlyContinue | Select-Object -First 1).Source; version=(Ver { meson --version });  required=$true }
+    @{ name='ninja';      path=@(Get-Command ninja  -CommandType Application -EA SilentlyContinue | Select-Object -First 1).Source; version=(Ver { ninja --version });  required=$true }
+    @{ name='cmake';      path=@(Get-Command cmake  -CommandType Application -EA SilentlyContinue | Select-Object -First 1).Source; version=(Ver { cmake --version });  required=$true }
+    @{ name='git';        path=@(Get-Command git    -CommandType Application -EA SilentlyContinue | Select-Object -First 1).Source; version=(Ver { git --version });    required=$true }
+    @{ name='ccache';     path=@(Get-Command ccache -CommandType Application -EA SilentlyContinue | Select-Object -First 1).Source; version=(Ver { ccache --version }); required=$true }
     @{ name='escript';    path=[Environment]::GetEnvironmentVariable('YUZU_ESCRIPT','Machine'); version=(Ver { erl -version }); required=$true }
     @{ name='rebar3';     path=[Environment]::GetEnvironmentVariable('YUZU_REBAR3','Machine');  version=$Rebar3Version; required=$true }
     @{ name='msvc';       path=$msvc; version=$null; required=$true }
     @{ name='msys2_bash'; path="$Msys2Root\usr\bin\bash.exe"; version=(Ver { & "$Msys2Root\usr\bin\bash.exe" --version }); required=$true }
-    @{ name='vcpkg';      path="$VcpkgRoot\vcpkg.exe"; version=(Ver { & "$VcpkgRoot\vcpkg.exe" version }); required=$true }
     @{ name='postgres';   path=(Join-Path $pgbin 'psql.exe'); version=$PostgresVersion; required=$true }
   )
   $postgresClusters = @(for($n=0; $n -lt $RunnerCount; $n++){
@@ -886,6 +933,7 @@ Step "emit toolchain manifest -> $ManifestPath" {
     }
   })
   $manifest = [ordered]@{
+    schema    = [string]$toolchainContract.schema
     generated = (Get-Date).ToUniversalTime().ToString('o')
     host      = $env:COMPUTERNAME
     runner_count = $RunnerCount

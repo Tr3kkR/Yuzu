@@ -178,6 +178,64 @@ groups:
             failure poisons that session's stream). Results remain durably
             fetchable by execution_id, but the streaming surface is degraded;
             this is an allocation-pressure or stream-state signal worth paging.
+      - alert: YuzuMcpStreamPinDisplaced
+        expr: |
+          increase(yuzu_mcp_stream_pin_displaced_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP replay-ring pin slots exhausted (corroborate before treating as drift)"
+          description: >-
+            A session filled every replay-ring pin slot and the oldest pin was
+            displaced. A SUCCESSFUL #2740 admission reclaim cannot cause this - it
+            releases one pin and adds one charge, so the session stays AT cap and a
+            slot is always free. Only two paths reach a full set: a release that lost
+            a race (yuzu_mcp_bridge_pin_release_raced_total, #2795) and a contained
+            release throw (yuzu_mcp_bridge_pin_release_failed_total, #2805). Rule
+            those two out; what remains is genuine admission-accounting drift. The
+            server degraded gracefully - the oldest pinned terminal yielded its
+            eviction exemption to the newest, the displaced final stays committed, and
+            results remain fetchable by execution_id. No restart; this is diagnostic,
+            not an outage. Follow docs/ops-runbooks/mcp-stream-pin-displacement.md - it
+            owns the procedure and this annotation only points at it.
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement#what-to-do"
+      - alert: YuzuMcpStreamFinalUnpinned
+        expr: |
+          rate(yuzu_mcp_stream_final_unpinned_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP terminal committed with no pin at all (defence-in-depth tripped)"
+          description: >-
+            yuzu_mcp_stream_final_unpinned_total is moving. This is structurally
+            unreachable while the pin array is non-empty (a full slot set displaces
+            its oldest pin instead), so a non-zero value means the pin array was
+            resized to zero or the displacement path was bypassed. The affected
+            terminal is evictable from the replay ring but remains fetchable by
+            execution_id. File a bug; no restart needed.
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement#what-to-do"
+      - alert: YuzuMcpBridgeForcedExpireUnavailable
+        expr: |
+          rate(yuzu_mcp_bridge_forced_expire_total{disposition="synthesize_unavailable"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP progress bridge is deciding -32014 (bus says no terminal ever landed)"
+          description: >-
+            The ring-only pressure escape hatch is force-expiring parked records for
+            which the bus verdict was that the execution never reached a terminal,
+            so -32014 is the disposition it published. Counted at the decision, not
+            on delivery - if you also see
+            yuzu_mcp_stream_terminal_publish_failures_total or
+            yuzu_mcp_bridge_teardown_incomplete_total moving, the frame may not have
+            reached the ring either. The verdict is honest, but a sustained rate
+            means records are parking faster than they settle: check
+            yuzu_mcp_bridge_records_active against the record cap and whether
+            executions are completing at all. The sibling
+            disposition="fallback_final" is a different, milder signal (a terminal
+            DID happen but its payload was gone) - rule out
+            yuzu_mcp_bridge_projection_degraded_total before reading that one as a
+            bus-buffer sizing question.
       - alert: YuzuMcpBridgeTeardownIncomplete
         expr: |
           sum by (reason) (yuzu_mcp_bridge_teardown_incomplete_total) > 0
@@ -202,6 +260,112 @@ groups:
             retention lasts until the process restarts, so an alert that cleared
             after 15 minutes would contradict the contract it exists to report.
             Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
+      - alert: YuzuMcpStreamedPinSlotsWedged
+        expr: |
+          increase(yuzu_mcp_bridge_pin_slots_reject_total{held="pins"}[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP streamed admissions refused with every slot held by a committed final"
+          description: >-
+            A streamed request was refused for want of a session slot, and every
+            slot was held by a final the bridge had already committed rather than by
+            a call still in flight. After the rule-(a) unpin those pins are released
+            when the final reaches the wire, and since #2740 admission RECLAIMS such a
+            slot rather than refusing - including an orphan pin no record references.
+            A SUSTAINED rate therefore no longer means the client is locked out; it
+            means the reclaim kept finding nothing to take, which narrows the cause to
+            a final still being written, a transient mid-projection decline, or a
+            genuinely stuck slot. The 429 the client receives says so (it advises a
+            retry, not a wait); "wait for one to finish" is now the charges branch
+            only. The `for` is load-bearing, not tuning: the
+            charge-to-pin handover happens at terminal projection but the unpin only
+            once the final reaches the wire, so every HEALTHY session passes through
+            pinned>0/unpinned==0 during that flush window, and a lone refusal landing
+            inside it is not a wedge. Only persistence separates the two. Note also
+            that held="charges" is NOT purely benign: it is emitted whenever ANY
+            charge is outstanding, so a partial wedge (some pins stuck, one call
+            genuinely in flight) is bucketed there and this alert cannot see it.
+            Runbook: docs/ops-runbooks/mcp-stream-pin-displacement.md
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement#yuzumcpstreamedpinslotswedged--a-session-is-being-refused-not-merely-degraded"
+      - alert: YuzuMcpBridgePinReleaseFailed
+        expr: |
+          yuzu_mcp_bridge_pin_release_failed_total > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP streamed admission's pin release THREW and was contained"
+          description: >-
+            The streamed-admission reclaim (#2740) selected a pin to release and the
+            release itself THREW. This counts ONLY that throw - it does not count a
+            release that merely lost a race to another release route, which is the
+            ordinary residual (#2795), counted separately as
+            yuzu_mcp_bridge_pin_release_raced_total. So a zero HERE does not mean no
+            session ever sat over its cap - check that counter too. It is contained deliberately: the new admission is
+            already committed at that point, so letting the throw escape would leave a
+            session slot nothing reclaims until the arming reaper fires. Like its
+            sibling YuzuMcpBridgeChargeReleaseDeferred this needs a genuinely broken
+            platform mutex, so any non-zero value is a signal about the host rather
+            than a rate to tune. The admission itself stands; that session is one slot
+            tighter than its nominal cap implies until the pin clears by another route
+            (a GET resume acking past it, or session death). Distinct from
+            yuzu_mcp_bridge_pin_displaced_for_admission_total, which counts the
+            SUCCESSFUL reclaims and is expected traffic.
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-stream-pin-displacement#what-to-do"
+      - alert: YuzuMcpBridgeChargeReleaseDeferred
+        expr: |
+          yuzu_mcp_bridge_charge_release_deferred_total > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP streamed admission charge could not be released at its natural point"
+          description: >-
+            A charge release could not take its locks and was deferred to the
+            record's teardown (#2529). The record and the ledger still AGREE, so
+            this is a deferral rather than a stranded slot - but it needs a
+            genuinely broken platform mutex to happen at all, so any non-zero value
+            is a signal about the host rather than a rate to tune. Read it together
+            with yuzu_mcp_bridge_projection_degraded_total, which the same fault
+            class also drives.
+      - alert: YuzuMcpBridgeStreamingBackstop
+        expr: |
+          increase(yuzu_mcp_bridge_streaming_backstop_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP sweep had to park a stranded streamed-POST record"
+          description: >-
+            The backstop only fires when a streamed record was left in kStreaming
+            past its cap - normally impossible, because the response releaser parks
+            it. A sustained rate points at a releaser or connection-teardown bug;
+            the records are parked rather than reaped, so nothing is lost, but the
+            path should not be exercised in a healthy server.
+      - alert: YuzuMcpBridgeProjectionDegraded
+        expr: |
+          yuzu_mcp_bridge_projection_degraded_total > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP progress-bridge projection released its claim without the record lock"
+          description: >-
+            A projection guard could not retake the record lock, so it released
+            the projection claim WITHOUT running the settle bookkeeping (#2528).
+            Releasing the claim is the correct trade - leaving it set would wedge
+            that record out of every consumer (and, before #2489 made a deferred
+            victim advance the pressure pass instead of ending it, would have
+            stalled ring-only pressure relief bridge-wide) - but the
+            settle is lossy: a terminal payload that was mid-retry cannot be put
+            back, so that request is answered by the success-shaped fallback final
+            ("fetch by execution_id") instead of its real result. Client results
+            stay durably fetchable by execution_id. This needs a genuinely broken
+            platform mutex, so ANY nonzero value is a signal about the host, not a
+            rate to tune - the same mutex fault reaches
+            yuzu_mcp_bridge_teardown_incomplete_total, so check that too.
+            DELIBERATELY a raw counter test, not increase() over a window: the
+            lost payload is permanent, so an alert that cleared after 15 minutes
+            would contradict what it reports.
           runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpMaintenanceTickFailing
         expr: |
@@ -662,8 +826,9 @@ groups:
             yuzu_server_audit_emit_failed_total is rising. Every REST route that uses
             fail-closed audit-on-open (guardian.device.view, dex.device.view,
             dex.signal.view) is returning 503 and withholding PII, so a ServiceNow /
-            CMDB poll blackouts fleet-wide. Check audit.db health (/healthz
-            stores.audit) and free disk on the data directory. Note: a bad_alloc-class
+            CMDB poll blackouts fleet-wide. Check audit_store health (/healthz
+            stores.audit) and free disk / connection saturation on the PostgreSQL
+            server (ADR-0040 — audit is Postgres-backed, not a local file). Note: a bad_alloc-class
             throw in the audit pipeline fails closed the same way but does NOT bump this
             counter (it is catch-logged only) — correlate with a spike in 503s on the
             behavioural routes.
@@ -675,6 +840,27 @@ groups:
       # clock moved in a way that WOULD have wiped audit evidence -- an
       # unattended host whose time sync is broken is one guard away from losing
       # its SOC 2 trail.
+      # yuzu_server_audit_retention_bootstrap_declines_total (#2579) is NOT
+      # folded into the rule below, and that is deliberate rather than an
+      # oversight. It has its own rule further down
+      # (YuzuAuditRetentionAnchorNotSurviving) keyed on the value CLIMBING; what
+      # is deliberately unalerted is a SINGLE decline. That counter
+      # marks a pass declined for having NO stored clock reading while rows were
+      # already expired - it asserts only that nothing can yet RULE OUT a wrong
+      # clock, never that the clock moved, so folding it into the rule below
+      # would make this alert's own description untrue and fire it on every
+      # server carrying a backlog through the schema-v3 upgrade. Expect 0 or 1
+      # per database, so a SINGLE decline is not alerted: that is the ordinary
+      # schema-v3 upgrade of a server carrying a backlog.
+      #
+      # A value that keeps CLIMBING is a different thing and IS alerted, below.
+      # An earlier draft of this comment claimed the persist-failure counter
+      # already covered it; that was false and is worth stating so nobody
+      # restores it. The anchor can be destroyed OUT OF BAND - a restore from a
+      # pre-v3 backup, a replica rehydrated from a template, a disk-level
+      # rollback - and in every one of those `store_meta` SUCCEEDS each pass, so
+      # `..._retention_persist_failed_total` stays flat at zero while the anchor
+      # never survives.
       - alert: YuzuAuditRetentionClockAnomaly
         expr: |
           increase(yuzu_server_audit_clock_anomaly_skips_total[1h]) > 0
@@ -695,7 +881,7 @@ groups:
       # The counterpart signal. Both a declined pass and a broken pass leave rows
       # undeleted, so an audit table that never shrinks looks identical either
       # way - only the pair separates "the guard is working" from "cleanup is
-      # broken". Without this alert an unbounded audit.db reads as a healthy guard.
+      # broken". Without this alert an unbounded audit_store reads as a healthy guard.
       - alert: YuzuAuditRetentionFailing
         expr: |
           increase(yuzu_server_audit_cleanup_failed_total[1h]) > 0
@@ -712,38 +898,51 @@ groups:
             probe. That last one fires AFTER a successful delete, so a rising counter does
             NOT prove nothing was deleted; read it as "retention is not fully healthy".
             This is NOT the clock guard (that is
-            yuzu_server_audit_clock_anomaly_skips_total). Check audit.db
-            free disk and the server log. The seven sites do NOT share one message - grep
+            yuzu_server_audit_clock_anomaly_skips_total). Check the PostgreSQL
+            server's free disk and the server log. The seven sites do NOT share one message - grep
             for any of: "retention probe failed", "cleanup error", "the post-delete backlog
             probe failed", "retention pass called with an implausible clock reading",
             "retention pass threw". Note a store closed by a failed migration runs ZERO
             passes (start_cleanup early-returns), so this rule cannot fire in that state -
             YuzuAuditRetentionNotRunning is the one that does. NOTE /healthz stores.audit will report healthy
             in this state - it reflects only whether the database is OPEN, and a pass
-            failing on a SQLite fault leaves it open. Surfacing retention health there
+            failing on a PostgreSQL fault leaves it open. Surfacing retention health there
             is tracked in #2509.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # The per-pass delete cap is what turns an allowed wipe into a paced drain,
       # but it introduces its own failure: if it binds on every pass, expiry is
-      # outrunning the drain and audit.db grows without bound. Neither counter
+      # outrunning the drain and audit_store grows without bound. Neither counter
       # above moves in that state, so this is the only signal for it.
       #
-      # ASSUMES the default 60-minute cleanup interval: the threshold is "every
-      # pass in the window hit the cap", i.e. 6 passes in 6h. A server started with
-      # a different cleanup_interval_min needs this number adjusted -- PromQL
-      # cannot read the server's own interval, so it cannot be derived here.
+      # NOT a fixed-interval count. An earlier revision assumed every capped
+      # pass is spaced by the full cleanup_interval_min (default 60m) and set
+      # "6 passes in a 6h window" as the threshold -- but audit_next_wait_s
+      # (audit_store.hpp) re-arms the NEXT pass after kAuditBacklogRearmSec
+      # (5s), not the full interval, for as long as the cap keeps binding. A
+      # genuinely stuck backlog therefore produces thousands of increments in
+      # that same 6h window, and the count-based rule fired within about 30
+      # seconds of the first cap hit, not after 6 real hours of sustained
+      # overload -- PERFORMANCE measured this and it was wrong (governance
+      # ROUND 3). This rule asks a threshold-free question instead: has a
+      # cap-hit recurred within every 10-minute slice for the FULL `for:`
+      # duration? 10 minutes is a wide margin over the 5s re-arm (absorbs
+      # scheduling jitter and any non-cap pass interspersed), and `for: 30m`
+      # is what makes this "sustained", not the count. A brief burst that
+      # drains within a few minutes never satisfies `for:` and does not page.
+      # Self-adjusting: if kAuditBacklogRearmSec ever changes, this rule does
+      # not need re-deriving the way the old count-based one did.
       - alert: YuzuAuditRetentionCapBinding
         expr: |
-          increase(yuzu_server_audit_retention_cap_reached_total[6h]) >= 6
+          increase(yuzu_server_audit_retention_cap_reached_total[10m]) > 0
         for: 30m
         labels:
           severity: warning
         annotations:
           summary: "Audit retention is not keeping up with expiry"
           description: >-
-            Every audit retention pass in the last 6 hours hit the per-pass delete cap, so
-            a backlog is carried forward each hour and audit.db is growing. Note the
+            Audit retention has hit the per-pass delete cap continuously for at least 30
+            minutes, so a backlog is being carried forward and audit_store is growing. Note the
             counter is incremented on an OBSERVED backlog or, when the post-delete probe
             could not be read, a conservatively ASSUMED one - an "AuditStore: the post-delete
             backlog probe failed" warning in the log means the remainder was assumed, not
@@ -751,9 +950,9 @@ groups:
             probe, on which the pass skips entirely and this counter cannot have moved.) Check
             yuzu_server_audit_rows_deleted_total to see whether the backlog is moving at
             all. Sustained firing means the fixed drain rate (25,000 rows per cleanup
-            pass) is below this fleet's audit volume, so audit.db grows without bound;
-            the cap is a compile-time constant today, so this needs an engineering
-            escalation rather than a config change.
+            pass, re-armed every 5s while capped) is below this fleet's audit volume, so
+            audit_store grows without bound; the cap is a compile-time constant today, so this
+            needs an engineering escalation rather than a config change.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#capacity"
 
       # THE ABSENCE ALERT. Every other COUNTER-driven rule in this group fires on
@@ -761,7 +960,7 @@ groups:
       # runs. No rule detects a reaper that never ran
       # (never started because the store was closed at boot, died, or was
       # stopped and not restarted). In that state all six other series sit flat
-      # at 0 -- indistinguishable from a quiet, healthy store -- while audit.db
+      # at 0 -- indistinguishable from a quiet, healthy store -- while audit_store
       # grows without bound and rows are retained past the stated window. This
       # is the only rule that catches it.
       #
@@ -778,7 +977,7 @@ groups:
         annotations:
           summary: "Audit retention has not run for 3 hours"
           description: >-
-            No audit retention pass has been attempted in 3 hours, so audit.db is not
+            No audit retention pass has been attempted in 3 hours, so audit_store is not
             being drained and rows are being retained past the configured window. Note the
             other five retention COUNTERS cannot move in this state - they all key on a
             counter rising, and nothing is running to raise one. The
@@ -793,6 +992,32 @@ groups:
       # The durable clock reading is what makes anomaly detection survive a
       # restart. If it cannot be written, that half of the guard silently
       # degrades to nothing on the next boot.
+      # The climbing case the comment above describes. Threshold follows the
+      # contract, not a guess: the bootstrap decline is expected AT MOST ONCE per
+      # database, so more than one inside a day means the stored reading is not
+      # surviving between passes and the guard is re-bootstrapping instead of
+      # comparing. Deliberately NOT keyed on > 0, which would fire on every
+      # legitimate schema-v3 upgrade.
+      - alert: YuzuAuditRetentionAnchorNotSurviving
+        expr: |
+          increase(yuzu_server_audit_retention_bootstrap_declines_total[24h]) > 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit retention keeps re-bootstrapping - the stored clock reading is not surviving"
+          description: >-
+            The retention guard has declined more than once in a day for having NO stored
+            clock reading. Expect this AT MOST once per database, on the upgrade that adds
+            the reading. Repeating means the anchor is being lost between passes, so the
+            restart-surviving half of the clock guard is not working and each pass starts
+            blind. Nothing has been deleted by these passes. Check
+            yuzu_server_audit_retention_persist_failed_total first - if it is FLAT, the row
+            is being destroyed outside the server (a restore from a pre-v3 backup, a replica
+            rehydrated from a template, a disk-level rollback), which that counter cannot
+            see. Runbook: docs/ops-runbooks/audit-store-clock-guard.md.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/audit-store-clock-guard.md"
+
       - alert: YuzuAuditRetentionStateNotPersisting
         expr: |
           increase(yuzu_server_audit_retention_persist_failed_total[1h]) > 0
@@ -807,6 +1032,90 @@ groups:
             a server that reboots with a wrong clock would then see no elapsed-time step.
             Usually a disk or permissions problem on the audit database.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
+
+      # ADR-0040 PostgreSQL cutover. The audit trail migrated from SQLite
+      # audit.db to the PostgreSQL schema audit_store via a MANDATORY one-time
+      # streamed backfill that PRESERVES history. A failed/partial backfill
+      # fails the boot CLOSED (the server refuses to serve a knowingly-incomplete
+      # evidence chain) and retries on the next start -- so a replica stuck
+      # failing backfill sits in a restart loop with no audit evidence chain
+      # available.
+      #
+      # WHY THIS DOES NOT KEY ON result="failed". The backfill runs during server
+      # CONSTRUCTION and a failure sets startup_failed_, so run() returns before
+      # the HTTP listener starts (server.cpp): /metrics is never served and that
+      # sample is never scraped. An expression over the failed series can
+      # therefore never fire, however the counter behaves. What IS observable
+      # from outside is the absence of a SUCCESS outcome -- a server that refused
+      # to boot publishes no audit-backfill series at all -- so that is what this
+      # alerts on.
+      #
+      # THIS RULE DEPENDS ON THE PRE-SEED. `AuditStore::set_metrics` initialises
+      # the whole `result` set to 0 when a registry is wired, which is what makes
+      # "series absent" mean "no server is serving". Without it the ordinary
+      # restart of an already-migrated server exports nothing (it returns at the
+      # backfill marker check without reaching an outcome) and this rule pages on
+      # every routine restart. Do not drop the seed and keep this expression.
+      #
+      # LIMITS, stated because the alert reads stronger than it is: it fires only
+      # when NO scraped server reports a completed/fresh backfill, so in a
+      # multi-replica deployment one wedged replica among healthy ones will not
+      # trip it (that one shows up as a down instance, `up == 0`). It ALSO fires
+      # during a legitimately long first-boot backfill on a large legacy
+      # audit.db, because the server does not serve /metrics until the backfill
+      # finishes — expected during that upgrade window; silence it for the
+      # window (upgrading.md says so too). The BOOT LOG is the primary signal in
+      # every case; this is the outside-in backstop.
+      - alert: YuzuAuditBackfillFailing
+        expr: |
+          absent_over_time(yuzu_server_audit_backfill_total{result=~"completed|fresh"}[15m])
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No server is reporting a completed audit-store backfill (possible boot refusal)"
+          description: >-
+            No scraped Yuzu server has reported a successful one-time legacy audit.db ->
+            PostgreSQL audit_store backfill (ADR-0040) in the last 15 minutes. After an
+            upgrade the usual cause is a server that FAILED the backfill: it fails CLOSED,
+            refuses to serve with a knowingly-incomplete SOC 2 evidence chain, never starts
+            its /metrics listener, and retries on the next start -- a restart loop with the
+            audit trail unavailable. Read the server BOOT log for the loud backfill
+            diagnostic (row-count reconciliation / prefix mismatch / stream error): it is
+            the primary signal and carries the remediation. Confirm the legacy audit.db is
+            readable and the PostgreSQL substrate is reachable and writable, then let the
+            resumable backfill re-run. In a multi-replica deployment bring up ONE replica
+            and let it finish the backfill (the backfill_complete marker is stamped in
+            audit_store) BEFORE starting the rest. Rule out the benign causes of an absent
+            series too: no server scraped at all, or a changed job/label set.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md"
+
+      # Read-path evidence-availability. On the PostgreSQL substrate an audit
+      # QUERY that cannot be served degrades to DENY (503), never a false-empty
+      # 200 -- so a reviewer or SIEM can never mistake an infrastructure blip for
+      # "no audit activity". A sustained non-zero increase means audit reads are
+      # 503ing (store not open / pool acquire timeout / query error), i.e. the
+      # evidence trail is unreadable to a wired integration.
+      - alert: YuzuAuditReadDegraded
+        expr: |
+          increase(yuzu_server_audit_read_degrade_total[15m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit-store reads are degrading to 503 — evidence trail unreadable"
+          description: >-
+            yuzu_server_audit_read_degrade_total is rising: audit-log queries are
+            returning 503 rather than serving results (deny-on-degrade, never a
+            false-empty 200). Break down by the {reason} label -- store_not_open
+            (the store failed construction / is closed), pool_acquire_timeout (the
+            shared PgPool is saturated or Postgres is slow), or query_error (the
+            SELECT itself failed). A CMDB / SIEM / auditor pulling the trail gets
+            503s while this persists. Check PostgreSQL health and pool saturation
+            (see the substrate metrics) and free disk on the database host.
+            Escalate toward critical if it does not clear, since evidence reads are
+            a SOC 2 CC7.2 availability obligation.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#storage"
 
   - name: yuzu-bundles
     # Live-query bundle surface (ADR-0011). The manifest map is in-memory + bounded
@@ -994,6 +1303,56 @@ groups:
             <CVE>") reads as degraded, NOT "installed nowhere" — do not trust a
             zero-result inventory answer while this fires.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuMgmtGroupReadDegraded
+        # A CONFINEMENT-feeding management-group hierarchy read (ancestors /
+        # descendants / agent-groups, ADR-0042) degraded, so the caller failed
+        # closed to DenyAll. This is the confinement substrate itself faulting,
+        # not the fleet shrinking: a fired alert means SCOPED operators see
+        # reduced/empty lists, NOT that groups were deleted. Same dashboard-
+        # invisibility as YuzuInventoryReadDegraded — /readyz stays green under
+        # pure pool saturation, so only the store-specific counter moves.
+        # reason = store_not_open | pool_acquire_timeout | query_error.
+        expr: |
+          sum(rate(yuzu_server_mgmt_group_read_degrade_total[5m])) by (reason) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Management-group confinement reads degrading ({{ $labels.reason }})"
+          description: >-
+            yuzu_server_mgmt_group_read_degrade_total{reason="{{ $labels.reason }}"}
+            is non-zero: a confinement-feeding hierarchy read degraded and the
+            caller failed closed to DenyAll. This is a confinement-substrate
+            degrade — scoped operators now see REDUCED or EMPTY lists, it does
+            NOT mean management groups shrank or devices left the fleet.
+            pool_acquire_timeout/query_error correlate with yuzu_pg_* saturation
+            or outage; store_not_open means the store failed to open at boot. Do
+            not read a scoped operator's short/empty list as authoritative while
+            this fires.
+          runbook_url: "https://docs.yuzu.io/runbooks/management-groups"
+      - alert: YuzuMgmtGroupBackfillFailing
+        # The one-time SQLite->Postgres confinement backfill (ADR-0042) reported
+        # a failed outcome. The server fails closed at boot on a backfill failure
+        # (write error, or an over-deep/cyclic legacy tree) and retries next
+        # start, so a failed sample means the server refused to come up with a
+        # partial/empty confinement hierarchy — an operator must repair or move
+        # aside the legacy management-groups.db before it will boot.
+        expr: |
+          sum(rate(yuzu_server_mgmt_group_backfill_total{result="failed"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Management-group confinement backfill failed (server refused to boot)"
+          description: >-
+            yuzu_server_mgmt_group_backfill_total{result="failed"} advanced: the
+            one-time confinement backfill could not complete (Postgres write
+            error, or an over-deep/cyclic legacy management-groups.db). The server
+            fails closed at boot rather than come up with partial confinement and
+            retries on the next start — repair the legacy tree (flatten below 10
+            levels / break the cycle) or move management-groups.db aside, then
+            restart.
+          runbook_url: "https://docs.yuzu.io/runbooks/management-groups"
       - alert: YuzuInventoryIngestSlow
         # Leading indicator for ingest transaction-hold saturation: full-payload
         # ingests taking >10s. Distinct from the yuzu_pg_acquire_* family, which

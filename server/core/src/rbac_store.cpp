@@ -270,6 +270,16 @@ void RbacStore::create_tables() {
                 ('Reviewer', 'AuditLog', 'Attest')
             );
         )"},
+        // NOTE for #2376 (task A) and any future securable addition: adding
+        // the `EnginePrincipal` securable deliberately did NOT get a migration
+        // here. `seed_defaults()` runs unconditionally on every construction
+        // and its `types[]` / `viewer_types[]` / Administrator-CRUD loops are
+        // all `INSERT OR IGNORE`, so an EXISTING deployment picks the new
+        // securable and its grants up on the next boot with no migration at
+        // all — which is exactly how `AccessReview` and `SoftwareLicensing`
+        // were introduced. A migration is needed here only when a change
+        // cannot be expressed as an idempotent additive re-seed: v4 above
+        // DELETES rows, which is why it had to be one.
     };
     if (!MigrationRunner::run(db_, "rbac_store", kMigrations)) {
         spdlog::error("RbacStore: schema migration failed, closing database");
@@ -324,7 +334,18 @@ void RbacStore::seed_defaults() {
                            // Licences view in-server, but it is not built; the compliance
                            // sub-views are the SAM UCE module's.) Seeding it here
                            // also grants Administrator full CRUD via the loop below.
-                           "SoftwareLicensing"};
+                           "SoftwareLicensing",
+                           // #2376 (task A) — engine-principal INVENTORY + grant-graph
+                           // reads (list/get engine principals, list their fleet-wide
+                           // roles) cut away from the over-broad Security:Read, which
+                           // also gates unrelated operational reads (quarantine
+                           // visibility, CA issued-certs, KEK status) that a follow-up
+                           // change floors to admin-only when RBAC is disabled —
+                           // flooring all of Security:Read would sweep those in too.
+                           // Seeded to Administrator (CRUD via the loop below) + Viewer
+                           // (Read, below) — the same two roles that reached the
+                           // migrated routes via Security:Read before this cut.
+                           "EnginePrincipal"};
     for (auto* t : types) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(db_,
@@ -701,7 +722,11 @@ void RbacStore::seed_defaults() {
                                   // entitlement-cost visibility deny/remove this Viewer
                                   // grant before enabling the SLE sources (deny-override
                                   // wins) — see the seeded securable description.
-                                  "SoftwareLicensing"};
+                                  "SoftwareLicensing",
+                                  // #2376 (task A) — Viewer held Security:Read (the only
+                                  // non-Administrator role that did), so it keeps
+                                  // equivalent access on the new EnginePrincipal securable.
+                                  "EnginePrincipal"};
     for (auto* t : viewer_types) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(
@@ -1902,11 +1927,21 @@ bool RbacStore::check_scoped_permission(const std::string& username,
     if (!pg)
         return false;
 
+    // CONFINEMENT reads are now degrade-distinguishable (ADR-0042): a `nullopt`
+    // means the mgmt-store degraded (store-not-open / pool-acquire timeout /
+    // query error), NOT a genuine empty. Treat it as DenyAll (fail-closed) — a
+    // silent empty here would drop the agent's reachable groups and could admit
+    // a scoped grant that a DENY assignment should have blocked (fail-open).
     auto groups = mgmt_store->get_agent_groups(agent_id);
+    if (!groups)
+        return false; // mgmt-store degrade → deny
     std::unordered_set<std::string> reachable;
-    for (const auto& gid : groups) {
+    for (const auto& gid : *groups) {
         reachable.insert(gid);
-        for (const auto& aid : mgmt_store->get_ancestor_ids(gid))
+        auto ancestors = mgmt_store->get_ancestor_ids(gid);
+        if (!ancestors)
+            return false; // mgmt-store degrade → deny
+        for (const auto& aid : *ancestors)
             reachable.insert(aid);
     }
     if (reachable.empty())

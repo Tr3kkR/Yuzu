@@ -1,5 +1,15 @@
 # Yuzu — Claude Code Guide
 
+## Active workstreams (temporary — 2026-07-29 → ~2026-08-05)
+
+Four parallel streams are running across three machines. **Read `docs/workstreams.md` and the
+`STREAM.md` at your worktree root before starting work.** Work belongs to exactly one stream:
+`ci` (CI/test revamp) · `adr17` (list-read confinement) · `adr31` (decomposition) ·
+`pg` (SQLite → Postgres). If a task is outside all four, say so and ask rather than starting it.
+
+Shulgi's Windows and WSL2 halves are one shared box and a live runner host — **take the semaphore
+(`~/yz/bin/shulgi-lock`) before any build or test there, and release it when done.**
+
 ## What is Yuzu?
 
 Yuzu is an agentic enterprise endpoint management platform — a single control plane where agentic colleagues query, command, scan, patch, and enforce policy compliance on Windows/Linux/macOS fleets in real time; an open-source alternative to commercial endpoint platforms, built in C++23.
@@ -112,9 +122,19 @@ The script runs `vcpkg install` then `meson setup` automatically.
 ### Manual configure
 ```bash
 vcpkg install --triplet x64-linux --x-manifest-root=.
-meson setup build-linux --buildtype=debug -Dcmake_prefix_path=$VCPKG_ROOT/installed/x64-linux -Dbuild_tests=true
+meson setup build-linux --buildtype=debug -Dbuild_tests=true \
+  -Dcmake_prefix_path=$PWD/vcpkg_installed/x64-linux \
+  -Dpkg_config_path=$PWD/vcpkg_installed/x64-linux/lib/pkgconfig,/usr/lib/x86_64-linux-gnu/pkgconfig
 meson compile -C build-linux
 ```
+**Both paths are load-bearing, and both point INTO THE TREE.** `--x-manifest-root=.` is vcpkg
+*manifest* mode, which installs to `<repo>/vcpkg_installed/<triplet>` — **not** to
+`$VCPKG_ROOT/installed/<triplet>`, which stays near-empty (measured: 7 packages vs 237) and
+makes `meson setup` fail on `Dependency PostgreSQL not found`. `pkg_config_path` is separately
+required because spdlog/fmt resolve via pkg-config, not cmake: with the prefix alone the
+headers are found and the link then fails on `undefined reference to fmt::v12::…`. An
+out-of-tree build dir (a review worktree, a scratch checkout) needs the same two flags
+pointing at a populated `vcpkg_installed`.
 
 ### Build options
 `-Dbuild_agent` / `-Dbuild_server` / `-Dbuild_examples` (default true), `-Dbuild_tests` (default false), and the Meson built-ins `-Db_lto`, `-Db_sanitize=address,undefined` (ASan+UBSan) or `-Db_sanitize=thread` (TSan).
@@ -231,7 +251,7 @@ The `frontend-design` plugin is **marketing / sales / demo surfaces only** — i
 
 ### Issue tracker, triage labels, domain docs
 
-Issues follow `docs/agents/issue-standard.md`: dedupe before filing; automation never closes `security`/`do-not-close` issues. Commands: `docs/agents/issue-tracker.md`; labels: `docs/agents/triage-labels.md`. Domain docs: `CONTEXT.md`, ADRs in `docs/adr/` (`docs/agents/domain.md`).
+Issues follow `docs/agents/issue-standard.md`: dedupe before filing; automation never closes `security`/`do-not-close` issues. Commands: `docs/agents/issue-tracker.md`; labels: `docs/agents/triage-labels.md`. Domain docs: `CONTEXT.md`, ADRs in `docs/adr/` (`docs/agents/domain.md`). ADR numbers are **author-namespaced** and `0016`/`0031` each host two accepted ADRs — cite those by filename, never number alone: `docs/adr/README.md`.
 
 ## CLAUDE.md updates
 

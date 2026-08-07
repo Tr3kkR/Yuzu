@@ -450,6 +450,23 @@ All validation runs at the `ManagementGroupStore` layer as well as the REST hand
 }
 ```
 
+**Error (503) -- store unavailable:**
+
+Cycle and depth validation walk the hierarchy via recursive ancestor/descendant
+reads against the `management_group_store` Postgres substrate (ADR-0042). If
+those reads degrade (store not open, connection-pool acquire timeout, or a query
+error) the re-parent cannot be validated safely, so it **fails closed with 503**
+rather than risk applying an unvalidated move — the caller did nothing wrong, the
+store did. This is distinct from the `400` validation errors above (a genuinely
+bad request); retry a `503` once the substrate recovers.
+
+```json
+{
+  "error": "management group store unavailable",
+  "meta": { "api_version": "v1" }
+}
+```
+
 ---
 
 #### `DELETE /api/v1/management-groups/{id}`
@@ -738,7 +755,7 @@ The same ownership constraint applies to the HTMX dashboard path `DELETE /api/se
 
 Engine principals are the durable identities behind autonomous use-case-engine modules (ADR-1005 item 2b) — a distinct principal class from human users and human-created API tokens, with a named responsible human owner, a grant justification captured at creation, and a required `internal`/`external` classification. Design reference: `docs/auth-engine-principals-design.md`. Every credential minted against an engine principal is hard-locked to MCP tier `readonly` and can never be granted the admin/wildcard role ("no admin, ever" — independently provable via the auditor route below).
 
-**Every *mutating* route is admin + MFA-step-up gated.** The read routes (`GET`/list, `GET /{id}`, and `GET /audit/no-admin`) are admin + RBAC gated (`Security:Read` / `AuditLog:Read`) but do **not** require a fresh MFA step-up. Beyond that, every route — reads included — structurally denies a caller whose *own* session is engine-classed (`principal_kind="engine"` or `auth_source="engine_token"`): an engine principal can never enumerate, read, or mutate any entry on this surface, not even itself. A denied engine-classed caller gets `403`; the corresponding audit verb is recorded with `result=denied`.
+**Every *mutating* route is admin + MFA-step-up gated.** The read routes (`GET`/list, `GET /{id}`, and `GET /audit/no-admin`) are admin + RBAC gated (`EnginePrincipal:Read` for the two engine-principal reads, `AuditLog:Read` for `/audit/no-admin`) but do **not** require a fresh MFA step-up. Beyond that, every route — reads included — structurally denies a caller whose *own* session is engine-classed (`principal_kind="engine"` or `auth_source="engine_token"`): an engine principal can never enumerate, read, or mutate any entry on this surface, not even itself. A denied engine-classed caller gets `403`; the corresponding audit verb is recorded with `result=denied`.
 
 **Storage failure:** if the engine-principal store failed to open at startup (no PostgreSQL configured, or a migration failure), every route on this surface returns `503 service unavailable`.
 
@@ -798,7 +815,7 @@ Create a new engine-principal identity. `principal_id` is derived server-side as
 
 List every engine principal (all lifecycle states), with each principal's active-credential count.
 
-**Permission:** `Security:Read`
+**Permission:** `EnginePrincipal:Read`
 
 **Response:**
 
@@ -828,7 +845,7 @@ List every engine principal (all lifecycle states), with each principal's active
 
 Get one engine principal's full identity row plus its active credentials (token id, name, timestamps, rotation group, overlap-expiry — never the raw secret; `token_hash` stays masked). `active_credentials` here is an **array** of credential objects — contrast with the list route above (`active_credential_count`, an integer) and with the MCP `get_engine_principal` twin, whose `active_credentials` field is an integer count under the same field name (see `docs/user-manual/mcp.md`).
 
-**Permission:** `Security:Read`
+**Permission:** `EnginePrincipal:Read`
 
 **Errors:** `404` — engine principal not found. `503` — engine-principal store unavailable (not open, or the read itself failed).
 
@@ -1228,11 +1245,22 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
 
 Quarantine isolates a device from receiving commands or participating in normal operations. Quarantined devices remain connected but are blocked from instruction execution.
 
+> **Scoped per-target authorization (#1788).** All three routes below authorize
+> per-device, matching the MCP `quarantine_device` tool: a management-group-confined
+> operator holding `Security:Execute`/`Security:Read` only through a group can
+> act on and see devices inside their own group(s), and is refused (`403`) for
+> devices outside them. A global grant (or an unfiltered/legacy-RBAC-disabled
+> deployment) still reaches every device, unchanged. If the per-target scope
+> gate is ever left unconfigured, every request on these routes fails **closed**
+> with a `500` rather than silently widening to a fleet-wide check.
+
 #### `GET /api/v1/quarantine`
 
-List all currently quarantined devices.
+List currently quarantined devices visible to the caller — admit-then-filter:
+a device outside the caller's management-group scope is omitted from the
+list entirely, not merely hidden from write access.
 
-**Permission:** `Security:Read`
+**Permission:** `Security:Read`, scoped per-device
 
 **Response:**
 
@@ -1259,7 +1287,7 @@ List all currently quarantined devices.
 
 Quarantine a device.
 
-**Permission:** `Security:Execute`
+**Permission:** `Security:Execute`, scoped per-device (see the note above)
 
 > **Supervised MCP tokens are approval-gated here too.** A bearer token minted
 > with `mcp_tier: "supervised"` gets `403` on this route (and on the `DELETE`
@@ -1298,7 +1326,7 @@ Quarantine a device.
 
 Release a device from quarantine.
 
-**Permission:** `Security:Execute`
+**Permission:** `Security:Execute`, scoped per-device (see the note above)
 
 **Response:**
 
@@ -1692,7 +1720,7 @@ role, or a wildcard role. `POST .../roles` **rejects** such a request outright
 
 List the fleet-wide roles currently assigned to an engine principal.
 
-**Permission:** `Security:Read`
+**Permission:** `EnginePrincipal:Read`
 
 **Response:**
 
@@ -1707,7 +1735,7 @@ List the fleet-wide roles currently assigned to an engine principal.
 
 An unknown or revoked `{id}` is not distinguished here — it simply returns an
 empty `data` array (no RBAC row can exist for a principal that was never
-granted one). Errors: `403` (missing `Security:Read`), `503` (RBAC store
+granted one). Errors: `403` (missing `EnginePrincipal:Read`), `503` (RBAC store
 unavailable).
 
 ---
@@ -2204,6 +2232,8 @@ Remove a template. Returns 400 when `template_id` is `__default__`.
 
 Query the server audit trail. All state-changing operations are recorded with the acting principal, action, target, and result.
 
+> **Reads deny on store degrade (ADR-0040).** The audit trail is the SOC 2 evidence chain, so the audit query endpoints (`GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, and the legacy `GET /api/audit`) **return `503` when the underlying store or connection pool is unavailable — never an empty `200`.** A reviewer, SIEM, or CMDB integration can therefore never mistake an infrastructure blip for "no audit activity"; treat a `503` here as a transient, retryable evidence-availability gap, not as an empty result set. This is the read-side counterpart to the fail-hard write posture (`503` + `Sec-Audit-Failed` on the behavioural-PII routes).
+
 #### `GET /api/v1/audit`
 
 Query audit events.
@@ -2255,6 +2285,15 @@ Query audit events.
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Errors:** `403` — caller lacks `AuditLog:Read`; `400` — `limit` parses to
+less than 1 (a negative or zero limit; caught explicitly rather than reaching
+PostgreSQL as an invalid `LIMIT`); `503` — the audit store is unavailable or
+the query degraded (ADR-0040 deny-on-degrade — see the note above this
+section; never a false-empty `200`). A non-numeric `limit` (e.g. `abc`) is
+NOT a 400 here — it is silently caught and the request proceeds with the
+default `limit` (100); the sibling `auth-sample` route below is stricter and
+400s on the same input.
 
 #### `GET /api/v1/audit/auth-sample`
 
@@ -2308,10 +2347,14 @@ curl -s -G \
 `target_type`, `target_id`, `detail`); the sample deliberately does **not**
 widen what `AuditLog:Read` discloses (no `session_id` / `source_ip`). The
 envelope additionally carries a `sampling` object (`candidates_considered`,
-`scan_cap`, `recency_capped`). `400` if `from`/`to` are not non-negative
-digits, `from > to`, or `limit` is non-integer; `503` if the audit store is
-unavailable. If the export's own audit row fails to persist, the response
-carries a `Sec-Audit-Failed: true` header (the export still returns).
+`scan_cap`, `recency_capped`). **Errors:** `403` — caller lacks
+`AuditLog:Read`; `400` — `from`/`to` are not non-negative digits, `from >
+to`, or `limit` is non-integer (unlike the sibling `GET /api/v1/audit`, a
+non-numeric `limit` here IS a 400, not a silent fallback); `503` — the audit
+store is closed (checked up front, before any query parameter is even
+parsed) or the query itself degraded mid-request. If the export's own audit
+row fails to persist, the response carries a `Sec-Audit-Failed: true` header
+(the export still returns).
 
 **Audit action names:**
 
@@ -2378,9 +2421,10 @@ flag it for revocation. Covers all three RBAC principal types: **user**,
 > earlier round of this feature gated it on `AuditLog:Read`/`AuditLog:Attest`
 > instead, which over-disclosed the full grant population to the `Operator`
 > and `PlatformEngineer` roles (both seeded `AuditLog:Read` for unrelated
-> reasons, neither seeded `UserManagement:Read`/`Security:Read`, the
+> reasons, neither seeded `UserManagement:Read`/`EnginePrincipal:Read`, the
 > permissions gating the equivalent-sensitivity `/rbac/roles` and
-> `/engine-principals/{id}/roles` routes). See
+> `/engine-principals/{id}/roles` routes — the latter moved off the
+> over-broad `Security:Read` in #2376). See
 > `docs/security-reviews/access-reviews-2026-07-21.md` "#2225 round 2" for
 > the finding and fix.
 
@@ -3023,7 +3067,10 @@ Per-policy compliance detail with per-agent statuses.
 
 ### Runtime Configuration
 
-Runtime configuration endpoints allow reading and updating server settings without a restart. Only a predefined set of keys can be changed at runtime.
+Runtime configuration endpoints read and update a predefined set of server settings. Every accepted
+write is persisted immediately; **whether it also takes effect immediately depends on the key** - see
+[When a change takes effect](#when-a-change-takes-effect). In particular, writing an OIDC key through
+this API does **not** re-initialise the running OIDC provider.
 
 #### `GET /api/config`
 
@@ -3031,20 +3078,42 @@ Returns current configuration values and any active runtime overrides.
 
 **Permission:** `Infrastructure:Read`
 
-**Response:**
+> **Secret values are never returned.** For an override whose key holds a credential
+> (today: `oidc_client_secret`) the `value` field is **omitted entirely** and replaced
+> by `"is_set": true|false`. It is not a placeholder string: a placeholder is a legal
+> value, so a config-as-code or backup-restore client that read this and wrote it back
+> would silently overwrite the real secret. `updated_by` and `updated_at` are still
+> returned. `PUT /api/config/oidc_client_secret` sets it, and its 200 response omits
+> the value too.
+
+**Error (503) - runtime config store unavailable.** If the store is closed or failed to open, this
+returns 503 rather than an empty `overrides`, so a degraded store is never read as "nothing is
+configured". That distinction matters here specifically: this route no longer returns a secret's
+value, so key presence and `is_set` are the only way to answer "is the OIDC secret set on this
+server?" - the question [Security hardening](security-hardening.md#oidc-hardening) sends operators to
+before deciding whether to rotate.
+
+```json
+{ "error": { "code": 503, "message": "runtime configuration store unavailable" }, "meta": { "api_version": "v1" } }
+```
+
+**Response** (shape corrected - the handler returns `config`, `overrides` and
+`allowed_keys`, not a `data`/`meta` envelope):
 
 ```json
 {
-  "data": {
-    "heartbeat_timeout": 120,
-    "response_retention_days": 90,
-    "audit_retention_days": 365,
-    "auto_approve_enabled": false,
-    "log_level": "info"
+  "config": { "heartbeat_timeout": 120, "log_level": "info" },
+  "overrides": {
+    "log_level":          { "value": "debug", "updated_by": "admin", "updated_at": 1754150400 },
+    "oidc_client_secret": { "is_set": true,   "updated_by": "admin", "updated_at": 1754150400 }
   },
-  "meta": { "api_version": "v1" }
+  "allowed_keys": ["heartbeat_timeout", "log_level", "oidc_client_secret"]
 }
 ```
+
+`allowed_keys` above is abridged for readability; the real response lists every key in the
+[allowed-keys table](#put-apiconfigkey). `config` reports effective values and `overrides` only the
+keys with a stored override, so a key can appear in `config` without appearing in `overrides`.
 
 ---
 
@@ -3054,15 +3123,72 @@ Update a single runtime configuration value. The key must be one of the allowed 
 
 **Permission:** `Infrastructure:Write`
 
-**Allowed keys:**
+**Allowed keys** (the full set; source of truth is `kAllowedKeys` in
+`server/core/src/runtime_config_store.cpp`):
 
-| Key | Type | Description |
-|---|---|---|
-| `heartbeat_timeout` | integer | Seconds before an agent is considered offline |
-| `response_retention_days` | integer | Days to retain command response data |
-| `audit_retention_days` | integer | Days to retain audit log entries |
-| `auto_approve_enabled` | boolean | Whether auto-approve rules are active |
-| `log_level` | string | Server log verbosity (`trace`, `debug`, `info`, `warn`, `error`) |
+| Key | Type | Takes effect | Description |
+|---|---|---|---|
+| `heartbeat_timeout` | integer | immediately | Seconds before an agent is considered offline |
+| `response_retention_days` | integer | **stored only, applied at next restart** | Days to retain command response data |
+| `audit_retention_days` | integer | **stored only, applied at next restart** | Days to retain audit log entries |
+| `guardian_event_retention_days` | integer | **stored only, applied at next restart** | Days to retain guaranteed-state events |
+| `log_level` | string | immediately | Server log verbosity (`trace`, `debug`, `info`, `warn`, `error`) |
+| `auto_approve_enabled` | boolean | **never - see note** | Accepted and stored, but no consumer reads it back |
+| `plugin_signing_required` | boolean | **records intent only - see note** | Server-side record of the Settings "Require signed plugins" toggle |
+| `oidc_issuer` | string | **see note** | OIDC issuer URL |
+| `oidc_client_id` | string | **see note** | OIDC client ID |
+| `oidc_client_secret` | string | **see note** | OIDC client secret (write-only through this API) |
+| `oidc_redirect_uri` | string | **see note** | OIDC redirect URI |
+| `oidc_admin_group` | string | **see note** | OIDC admin group ID |
+| `oidc_skip_tls_verify` | boolean | **see note** | Skip TLS verification to the IdP (test only) |
+| `dex_alert_routing` | string (JSON array) | **persisted only - see note** | Routed DEX observation types |
+| `dex_blast_min_devices` | integer | **persisted only - see note** | Blast-radius alert threshold (clamped on apply) |
+| `dex_blast_window_seconds` | integer | **persisted only - see note** | Blast-radius window |
+| `dex_blast_cooldown_seconds` | integer | **persisted only - see note** | Blast-radius cooldown |
+| `dex_cohort_export_key` | string | **persisted only - see note** | Cohort export tag key; `""` disables export |
+
+##### When a change takes effect
+
+Persisting a value and applying it are separate steps, and this endpoint only does the first for
+most keys:
+
+- **immediately** - only two keys. `heartbeat_timeout` is assigned into the live server config and
+  re-read on every stale-session sweep; `log_level` is applied by `RuntimeConfigStore::set()` itself
+  via `spdlog::set_level`.
+- **stored only, applied at next restart** - `response_retention_days`, `audit_retention_days`,
+  `guardian_event_retention_days`. The handler updates the in-memory config, so `GET /api/config`
+  and the Settings page immediately report the NEW value - but each store captured its retention
+  window when it was constructed and exposes no setter, so the store still enforcing retention keeps
+  the old value until the server restarts. **The API reports the stored value, not the value being
+  enforced.** Restart after changing a retention window.
+- **records intent only** - `plugin_signing_required` is read in exactly two places, both of which
+  render the Settings status badge. **No server or agent code consumes it to require signatures**,
+  and it is not carried in any proto field, so it never reaches an agent. Agent-side enforcement is
+  the agent's own `--plugin-require-signature` flag paired with an operator-distributed
+  `--plugin-trust-bundle`. Setting this key records the operator's intent and changes what Settings
+  displays; **it does not harden anything by itself**.
+- **persisted only, applied at next boot or next DEX-alerts Settings save** - `dex_alert_routing`,
+  `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`,
+  `dex_cohort_export_key`. The live consumers (`DexAlertRouter`, the blast-radius detector, the
+  cohort-gauge export key) are **cached in memory** and refreshed only by `apply_dex_alert_config()`,
+  which runs at server startup and from the Settings -> DEX alerts save handler - never from this
+  endpoint. A `PUT` through this API is inert on the running server until one of those two happens.
+  To change DEX alerting and have it apply at once, use Settings -> DEX alerts.
+- **never** - `auto_approve_enabled` is accepted by the allow-list and written to the store, but no
+  code reads it back from there. `GET /api/config` reports `auto_approve_enabled` **derived from
+  whether any auto-approve rule exists**, not from the stored value, so a `PUT` of this key can
+  appear to have no effect - because it has none. Manage auto-approve through its own rules API.
+- **OIDC keys (see note)** - persisted only, and **a restart does not apply them either.** The
+  `OidcProvider` is constructed early in server startup (`server.cpp:1894`) from CLI/environment
+  configuration, whereas the stored runtime-config overrides are not read until much later in the
+  same startup (`server.cpp:3466`); nothing rebuilds the provider afterwards. So a value written
+  through this API never reaches the live provider, on this boot or any later one.
+  **Only Settings -> OIDC (`POST /api/settings/oidc`) applies OIDC settings**, because that handler
+  constructs a new provider and swaps it in - but that swap is **process-local**. The startup path
+  DOES read these keys out of the store, just too late to matter - the provider is already built and
+  nothing rebuilds it - so a restart runs on whatever the command line or environment supplies. To
+  change OIDC durably, update that value as well as saving through Settings. This matters most for a credential rotation: a `PUT` of
+  `oidc_client_secret` returns `"applied": true` meaning *persisted and accepted*, never *in use*.
 
 **Request body:**
 
@@ -3072,23 +3198,81 @@ Update a single runtime configuration value. The key must be one of the allowed 
 }
 ```
 
-**Response:**
+**Response** (flat, not a `data`/`meta` envelope). `applied` means *persisted and accepted* - see
+[When a change takes effect](#when-a-change-takes-effect) for whether the running server is using it
+yet:
+
+```json
+{ "key": "heartbeat_timeout", "value": 180, "applied": true }
+```
+
+For a secret-valued key the response **omits `value`**, for the same reason `GET /api/config` does:
+
+```json
+{ "key": "oidc_client_secret", "applied": true }
+```
+
+**Removing a stored secret.** Send an empty value — `{"value": ""}` — and `GET /api/config` then
+reports `"is_set": false` for that key. Two things to know before relying on this. It clears only the
+stored **override**: an empty stored value is skipped at startup, so if `--oidc-client-secret` or
+`YUZU_OIDC_CLIENT_SECRET` is still set, that value takes effect again on the next restart. And like
+every write to this route, it does **not** reach the running OIDC provider — the process keeps using
+whatever secret it started with until it restarts. Clearing the Settings → OIDC form field does *not*
+remove the secret either: a blank field there means "leave the stored value unchanged".
+
+**After clearing, do not save the Settings → OIDC form with the secret field blank.** That form falls
+back to the secret the process is currently holding, rebuilds the live provider with it, and — because
+the field was blank — does not write **the secret** back to the store (the form's other OIDC fields are
+persisted as normal). The result is the previously loaded secret live in the running process while
+`GET /api/config` still reports `"is_set": false`. If you have cleared the secret and need to change
+another OIDC field, restart first so the process is not holding the old value.
+
+> **Two different error sources, two different shapes.** The shared authorization gate in front of
+> this route **does** emit the A4 envelope: a `401`, a `403` permission denial, or a `503`
+> authorization-store failure carries `correlation_id` (echoed on `X-Correlation-Id`) like any other
+> gated route. The bodies **the handler itself** emits do not — `/api/config` is a legacy
+> non-`/api/v1` route, and its own errors are either a bare `error` string or a nested
+> `{"error":{"code","message"},"meta":{"api_version"}}` object with no `correlation_id` and no
+> `retry_after_ms`. Besides those shown below, the handler emits nested bodies for `400` "missing
+> 'value' in request body", `400` "invalid JSON body", and a `503` when the runtime-config store is
+> unavailable (`GET` says "runtime configuration store unavailable", `PUT` says "runtime config store
+> unavailable"). Note `503` is emitted by **both** sources, so status alone does not tell you which
+> shape you have: test for `error.correlation_id` rather than assuming it, on every status.
+
+**Error (400) - key not configurable.** This one is a bare `error` string with no envelope:
+
+```json
+{ "error": "key 'foo' is not a configurable runtime setting" }
+```
+
+**Error (400) - bad value for an integer key**, which uses a nested error body:
 
 ```json
 {
-  "data": { "updated": true, "key": "heartbeat_timeout", "value": 180 },
+  "error": { "code": 400, "message": "value must be a non-negative integer" },
   "meta": { "api_version": "v1" }
 }
 ```
 
-**Error (400) -- invalid key:**
+A value of `0` for `heartbeat_timeout`, `response_retention_days` or `audit_retention_days` passes
+the route's `>= 0` pre-check and is then rejected by the store's own `> 0` check, so it returns the
+**bare** shape with a different message: `{ "error": "value must be a positive integer" }`.
+
+**Error (400) - the redaction placeholder submitted as a secret.** `GET /api/config` omits a
+secret's value and the startup log prints `<redacted>` in its place. Any value **containing** that
+literal is refused for a secret-valued key, ignoring surrounding whitespace and control bytes, so
+copying it back cannot destroy the stored credential. The rule is deliberately broad: a paste can
+carry an invisible code point (a BOM, a zero-width space) that no trim list catches exhaustively,
+and the two failure directions are not symmetric - refusing an implausible secret costs an error
+message, while accepting a padded placeholder silently destroys a live credential. If your real
+client secret contains `<redacted>`, rotate it at the IdP to a value that does not. Bare shape:
 
 ```json
-{
-  "error": "unknown config key 'foo'; allowed: heartbeat_timeout, response_retention_days, audit_retention_days, auto_approve_enabled, log_level",
-  "meta": { "api_version": "v1" }
-}
+{ "error": "value is the redaction placeholder, not a credential; send the real secret, or omit the key to leave it unchanged" }
 ```
+
+**Audit:** a successful write emits `config.update` / `RuntimeConfig` with `target_id` = the key.
+See [Audit log](audit-log.md) for the `detail` contract, which differs for secret-valued keys.
 
 ---
 
@@ -3494,9 +3678,32 @@ All five share the same caching contract: a content-derived `ETag` header + `Cac
 
 #### `GET /api/v1/discover/permissions`
 
-RBAC permission catalog: every `securable_type` × `operation` pair the RBAC store recognizes, plus the full role → allowed-operations grid.
+RBAC permission catalog. The response has **two halves with different permissions** (#2376):
 
-**Permission:** `Infrastructure:Read`
+- the **taxonomy** — `securable_types` and `operations`, i.e. what the RBAC model can express —
+  requires only the route's own `Infrastructure:Read`. It says nothing about who holds what, and an
+  agentic worker needs it to author a grant at all (A2 discovery).
+- the **role grid** — `roles[].permissions[]`, every role's actual granted securable/operation/effect
+  — additionally requires **`UserManagement:Read`**. That grid *is* authorization topology, and it is
+  strictly more than `GET /api/v1/rbac/roles` discloses, so it carries the same permission the
+  authorization-topology floor applies there.
+
+A caller holding `Infrastructure:Read` but not `UserManagement:Read` still gets `200` and the full
+taxonomy; the grid is replaced by `"roles_omitted": true` plus a `roles_omitted_reason`. **The
+omission is declared, never silent** — `roles` absent with no `roles_omitted` flag would mean
+"no roles exist", which is a different fact.
+
+**Permission:** `Infrastructure:Read` (taxonomy) · `UserManagement:Read` (role grid)
+
+**Caching:** because the body varies with the caller's grants, this route responds
+`Cache-Control: private, max-age=300` with `Vary: Authorization, Cookie` — never `public`.
+A shared cache must not store one caller's representation and serve it to another.
+`GET /api/v1/discover/plugins` is `private` for the same reason (its `parameter_schema`
+enrichment is gated on `InstructionDefinition:Read`); the caller-independent catalogues
+(`instructions`, `routes`, `scope-kinds`) remain `public, max-age=300`. `Vary` names all
+three credential channels this server accepts — `Cookie`, `Authorization` and
+`X-Yuzu-Token` — because a caller-local cache keyed on only some of them can serve one
+API-token caller's representation to another.
 
 **Response:**
 ```json
@@ -3515,6 +3722,14 @@ RBAC permission catalog: every `securable_type` × `operation` pair the RBAC sto
       ]
     }
   ]
+}
+```
+
+Without `UserManagement:Read` the `roles` key is replaced by:
+```json
+{
+  "roles_omitted": true,
+  "roles_omitted_reason": "requires UserManagement:Read (#2376 authorization-topology floor); the securable_types and operations taxonomy above is unaffected"
 }
 ```
 
@@ -3672,6 +3887,40 @@ the server row cap or 8 MiB aggregate payload cap, the route returns **503**
 ("inventory query truncated ... refusing to materialise a partial result set") rather than
 persisting a silently-incomplete set — a fleet-targeting set is never silently
 narrowed.
+
+#### `POST /api/v1/result-sets/from-tar-query`<br>`POST /api/v1/result-sets/from-instruction-result`<br>`POST /api/v1/result-sets/{id}/re-eval`
+
+The three **asynchronous** result-set producers. Unlike `from-inventory-query`,
+which answers from server-side inventory, these **dispatch a command to agents**
+and materialise the set once the responses land — so they are operator dispatch
+surfaces, not reads. `from-tar-query` runs SQL on TAR agents; `from-instruction-result`
+runs an `InstructionDefinition` and filters responders by `matcher`; `{id}/re-eval`
+re-runs a set's own source query and creates a **sibling** (same parent, new id).
+
+**Permission:** `Execution:Execute`, **confined per device**
+
+> **Per-device confinement (#1788).** These routes admit on a global
+> `Execution:Execute` grant and then reach the fleet by scope (`parent_id`) or
+> `__all__` broadcast, so the caller's derived visible set is their only
+> per-device authorization. A service-scoped token reaches only agents tagged
+> with its own service; devices outside the caller's reach are dropped from the
+> send set rather than refused individually. A global administrator or a
+> JIT-elevated session keeps full-fleet reach — that is their actual authority.
+
+**Targeting:** omit `parent_id` to dispatch to `__all__` deliberately. A
+**supplied** `parent_id` that is empty, non-string, or `null` is refused with
+`400 RESULT_SET_BAD_PARENT` rather than silently widening to the fleet.
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent; or missing `sql` / `instruction_id` |
+| 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
+| 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
+| 500 | `RESULT_SET_GATE_UNCONFIGURED` — the server's dispatch-visibility gate is not wired. Fails **closed**: nothing is dispatched, and the refusal is audited. An operator seeing this has a server misconfiguration, not an authorization problem |
+| 503 | `RESULT_SET_NO_AGENTS` — no agents were reached in the target scope. Deliberately indistinguishable from "every resolved target was outside your reach": a distinct status would disclose devices the caller may not see |
+| 503 | `RESULT_SET_DISPATCH_UNAVAILABLE` / `RESULT_SET_DISPATCH_FAILED` — dispatch not wired, or the dispatch itself raised |
 
 #### `GET /api/v1/inventory/{plugin}/{agent_id}`
 
@@ -4095,7 +4344,7 @@ The server expands the bundle into N ordinary plugin commands, each dispatched u
 
 Dispatch a bundle. Returns the correlation id immediately; poll `GET /api/v1/bundles/{id}` for the collated result.
 
-**Permission:** `Execution:Execute`
+**Permission:** `Execution:Execute`, scoped per-device (management-group-confined operators are admitted for devices in their own group(s)). The caller's derived visibility is also enforced a second time at dispatch (#1788, defense-in-depth) — a target outside it is treated as unreached (`result=no_agents`, `state=dispatch_failed` on collate) rather than reaching the device.
 
 **Request body:**
 
@@ -5228,7 +5477,7 @@ The one device list behind every network-quality drill: worst devices by a metri
 | `skip_tls_verify` | string | No | `"true"` to disable TLS cert verification for OIDC endpoints (insecure, dev only) |
 
 - **Response:** Re-rendered Settings fragment (HTMX). Returns toast notification on success.
-- **Effect:** Immediately reinitializes the OIDC provider with the new configuration. No server restart required.
+- **Effect:** Immediately reinitializes the OIDC provider with the new configuration - in THIS process only. The swap is NOT durable: the provider is rebuilt at the next startup from the command-line/environment value, not from the stored runtime config, so a restart reverts to that value. Rotating a credential durably requires updating `--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET` as well - see [When a change takes effect](#when-a-change-takes-effect).
 
 **`POST /api/settings/oidc/test`** — Test OIDC discovery connectivity.
 
@@ -5592,7 +5841,24 @@ uniqueness against existing definitions.
 **Response (200):** `{"id": "<id>"}` for the newly-created definition.
 
 **Response (400):** Validation error (missing required field, invalid
-`approval_mode`, malformed JSON). Body is `{"error": "<reason>"}`.
+`approval_mode`, malformed JSON, or an `id` under the reserved `mcp.` prefix).
+Body is `{"error": "<reason>"}`.
+
+The `mcp.` definition-id prefix is **reserved** (#2442): it names MCP approval
+tickets, and the MCP recall matches a ticket on its definition id and scope
+expression without binding the submitter, so a definition authored under that
+prefix could line up with an MCP tool's canonical arguments. Every authoring
+route that accepts an explicit id refuses it — this one, `POST
+/api/instructions/yaml`, and `POST /api/instructions/import` — and boot-time
+auto-import skips such a definition. Product-pack install is unaffected: it
+never carries a declared id through, so the store always assigns one.
+
+The store applies this at **create time**, so an id that predates the rule stays
+executable and can still be saved through `PUT /api/instructions/{id}`, because
+an update cannot originate an id. Note the dashboard's YAML editor is stricter
+than the store here: `POST /api/instructions/yaml` validates a declared id on
+every save, so an existing `mcp.`-prefixed definition cannot be edited through
+it unless its document omits `metadata.id`.
 
 **Response (409):** Returned when an explicit `id` is supplied that already
 exists in the store. Body is
@@ -5860,7 +6126,22 @@ Reject a pending instruction execution.
 
 #### `GET /api/audit`
 
-Query audit events. Accepts `limit`, `principal`, and `action` as query parameters. Functionally equivalent to `GET /api/v1/audit` but without the v1 envelope.
+Query audit events. Legacy route — **not** merely `GET /api/v1/audit` without
+the v1 envelope; the response shape and accepted parameters both genuinely
+differ. Accepts `principal`, `action`, `target_type`, `target_id`, `since`,
+`until`, `limit`, and `offset` (more than the v1 route's `limit`/`principal`/
+`action`). Response is `{"events": [...], "count": N, "total": <number-or-
+null>}` (field names `events`/`count`/`total`, not v1's `data`/`pagination`/
+`meta`), and each event row additionally carries `id`, `principal_role`, and
+`source_ip`, which v1's row shape omits. `total` is a best-effort second read
+taken after the page itself succeeds — it is `null`, not `0` or the page
+size, when that second read degrades; do not treat `null` as "unknown but
+probably zero".
+
+**Errors:** `403` — caller lacks `AuditLog:Read`; `400` — a `since`/`until`/
+`limit`/`offset` query parameter is not a valid integer, or `limit < 1` /
+`offset < 0`; `503` — the audit store is closed, or the page-rows query
+degraded (ADR-0040 deny-on-degrade; never a false-empty `200`).
 
 ---
 
@@ -6086,10 +6367,10 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 | 503 | The per-execution event bus is not configured (test harness opt-out, or a configuration path that omits the bus). Returned at request time so the operator does not silently freeze waiting on a missing publisher. |
 
 This stream holds an HTTP worker thread for as long as the drawer stays open, so it leases
-from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, `GET /api/v1/events`, and the
-legacy `/events` stream (ADR-0034). That means enough open drawers — or enough traffic on any
-of the other three surfaces — can cause a *new* drawer to be refused with `429`. A live stream
-is never evicted to make room.
+from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, MCP streamed POST,
+`GET /api/v1/events`, and the legacy `/events` stream (ADR-0034). That means enough open
+drawers — or enough traffic on any of the other surfaces — can cause a *new* drawer to be
+refused with `429`. A live stream is never evicted to make room.
 
 **Audit:** every successful subscribe emits one `execution.live_subscribe` audit event (`target_type=Execution, target_id={id}, result=success`). Per-session-per-execution dedup is **not** currently implemented (#700) — operators on the SOC 2 evidence chain receive a row per reconnect; the forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`.
 
@@ -6189,7 +6470,7 @@ The `type` field is the canonical taxonomy: `agent-transition`, `execution-progr
 
 This endpoint holds an HTTP worker thread open for the life of the subscription, so it
 leases from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, the dashboard
-executions drawer, and the legacy `/events` stream (ADR-0034). A cap hit rejects the
+executions drawer, MCP streamed POST, and the legacy `/events` stream (ADR-0034). A cap hit rejects the
 *new* stream with `429` — a live stream is never evicted to make room.
 
 A4 envelope shape:
@@ -6502,8 +6783,9 @@ The MCP Streamable HTTP **SSE channel** — the server→client half of a sessio
 (`notifications/progress`) arrive with the next 2f rung.
 
 **Permission:** the same credential as `POST /mcp/v1/`, plus the session's
-`Mcp-Session-Id` header. The credential is re-checked on every heartbeat, so revoking it
-ends a *live* stream, not just future ones.
+`Mcp-Session-Id` header. The credential is re-checked once per tick (~3 s), whether or
+not a heartbeat frame is emitted, so revoking it ends a *live* stream, not just future
+ones.
 
 **Required headers:** `Mcp-Session-Id` (from `initialize`), `Accept: text/event-stream`.
 **Optional:** `Last-Event-ID` to resume.

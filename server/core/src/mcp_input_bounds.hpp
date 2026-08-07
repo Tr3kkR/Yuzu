@@ -192,10 +192,16 @@ static_assert(targeting_reasons_are_bound(),
 check_exec_instruction_shape(const nlohmann::json& args) {
     // ── required identifiers must be non-empty ───────────────────────────
     // The schema marks plugin/action `required`, which C8 enforces, but the
-    // closed subset has no `minLength` (that gap is #2444), so `""` passes
-    // every published check. The handler then refuses it — AFTER the C8 gate
-    // has minted a ticket, waited for a human, and consumed it. Fifth instance
-    // of the burn class, on the two most obvious fields in the tool.
+    // SERVED schema puts no floor on their length, so `""` passes every
+    // published check. The handler then refuses it — AFTER the C8 gate has
+    // minted a ticket, waited for a human, and consumed it. Fifth instance of
+    // the burn class, on the two most obvious fields in the tool.
+    // The closed subset compiler CAN express that floor since #2444 added
+    // `minLength`; the served schema does not use it yet, because those
+    // literals live in kTools[] in mcp_server.cpp (frozen for a parallel
+    // rebase). This check is what makes the bound real in the meantime, and
+    // stays afterwards as the defense in depth the ungated tiers need — they
+    // never reach C8 at all.
     // Absent, non-string, or empty - all three, because this must SUBSUME the
     // handler's own `plugin.empty() || action.empty()` guard rather than sit
     // behind it. It previously sat behind: that guard returned first with a

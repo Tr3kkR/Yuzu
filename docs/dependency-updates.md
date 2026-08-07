@@ -166,10 +166,11 @@ runs at 10:00 UTC on the 1st of each month (and is
    to get the current master SHA.
 2. Reads `vcpkg.json` `builtin-baseline` via `jq`.
 3. If they match, exits silently.
-4. Otherwise, `sed -i`s the new SHA into **every** tracked reference —
-   the workflow file keeps an authoritative list and fails loudly if any
-   listed file still has the old SHA after the sed (guards against new
-   references being added without updating the workflow).
+4. Otherwise, `sed -i`s the new SHA into every **active** tracked reference.
+   Historical `docs/reviews/` evidence is immutable and deliberately keeps the
+   baseline that was reviewed at the time. The workflow file keeps the
+   authoritative active list and fails loudly if a listed file still has the
+   old SHA after the sed.
 5. Opens a PR via `peter-evans/create-pull-request@v7` with label
    `dependencies,ci`.
 
@@ -177,10 +178,11 @@ CI on the PR re-resolves every downstream vcpkg port against the new
 baseline — if anything breaks, the PR is left open for manual
 investigation instead of silently merging a broken build.
 
-When adding a new file that pins the vcpkg baseline SHA (e.g., a new
-CI workflow, a new Dockerfile), **add it to the `files` array in
-`.github/workflows/vcpkg-baseline-update.yml`**. The post-sed grep
-verifier ensures the omission doesn't slip through silently.
+When adding a new active file that pins the vcpkg baseline SHA (e.g., a new CI
+workflow or Dockerfile), **add it to the `files` array in
+`.github/workflows/vcpkg-baseline-update.yml`**. Do not add immutable
+`docs/reviews/` evidence. The post-sed verifier checks listed files, while the
+toolchain-contract inventory test finds an unlisted active reference.
 
 ## Rebar3 deps review checklist
 

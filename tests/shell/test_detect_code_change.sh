@@ -52,6 +52,14 @@ expect true  "nested LICENSE is code-side"        1 $'gateway/_checkouts/grpcbox
 expect false "root LICENSE.md (root *.md, not README)" 1 $'LICENSE.md'
 expect true  "docs + nested markdown mixed"       2 $'docs/guide.md\nsdk/README.md'
 
+# --- #2204 PR1.1: docs/os-capability-matrix.md is carved OUT of docs/** ---
+# It carries a machine-generated block (tools/capmatrix-gen +
+# scripts/ci/check-capability-matrix.sh); a hand-edit there must still run
+# the build/gate matrix, unlike an ordinary docs/** change.
+expect true  "os-capability-matrix.md is carved out of docs-only" 1 $'docs/os-capability-matrix.md'
+expect false "ordinary docs/** still docs-only"   1 $'docs/some-other-doc.md'
+expect true  "capability-matrix + ordinary docs mixed" 2 $'docs/os-capability-matrix.md\ndocs/guide.md'
+
 # --- fail-closed guards ---
 expect true  "truncation guard: 3 seen of 4"      4 $'docs/a.md\ndocs/b.md\ndocs/c.md'
 expect false "3000 docs files at cap boundary"    3000 "$(printf 'docs/f%d.md\n' $(seq 1 3000))"
