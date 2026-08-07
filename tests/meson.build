@@ -72,6 +72,15 @@ invalid_name_fixture_plugin = shared_library(
   install: false,
 )
 
+# PLAN-08: test_native_raii.cpp (PR1.3) includes <IOKit/IOKitLib.h> and
+# <CoreFoundation/CoreFoundation.h> for the ScopedIOObject/ScopedCFRef vectors;
+# agents/core links no IOKit on darwin, so the test exe must pull the frameworks
+# itself. Darwin-only; empty elsewhere.
+agent_test_native_deps = []
+if host_machine.system() == 'darwin'
+  agent_test_native_deps += dependency('appleframeworks', modules: ['IOKit', 'CoreFoundation'])
+endif
+
 # ── Test fixture: FROZEN ABI3-layout plugin (PLAN-03 — real backward-compat) ──
 # A genuine old-layout plugin compiled against the FROZEN tests/fixtures/abi3/
 # plugin_abi3.h (quoted include, resolved next to the .cpp) — deliberately NOT
@@ -235,6 +244,7 @@ agent_test_exe = executable(
     'unit/agent/test_msi_macos.cpp',          # C-1.21: pkgutil --pkg-info parser (P8)
     'unit/agent/test_bitlocker_macos.cpp',    # A-1.16: diskutil apfs list parser (P8)
     'unit/test_subprocess_runner.cpp',        # #2273: agent-core bounded subprocess runner (POSIX deadline/reap)
+    'unit/test_native_raii.cpp',              # PR1.3: ScopedCFRef/ScopedIOObject/ScopedFd RAII
     'unit/test_subprocess_launch_spec.cpp',   # PR1.2: host-agnostic pure launch-spec tests (run on Windows too)
     'unit/test_capability_descriptor.cpp',    # PR1.1: ABI4 descriptor + plugin->host result seam + declared-vs-observable honesty
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
@@ -278,7 +288,7 @@ agent_test_exe = executable(
   # only way to exercise KvStore's fallible-read branches end to end rather than through
   # an injected stand-in. Already a transitive dep of yuzu_agent_core; naming it here is
   # what puts sqlite3.h on the test TU's include path (same shape as tar_test_deps).
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep],
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep] + agent_test_native_deps,
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp / test_capability_descriptor.cpp find them
   # under MESON_BUILD_ROOT/tests/.
@@ -299,6 +309,35 @@ agent_test_exe = executable(
 # budget is tracked in #2373 (split/redesign), not papered over with a wall-clock cap here -
 # that route introduced its own flakiness (a busy main thread starving the workers it waited on)
 # and was backed out.
+# ── #2270 allocation-budget probe (separate binary, deliberately) ────────────
+# test_spark_alloc_budget.cpp REPLACES the global operator new/delete to count
+# allocations, which is process-wide and cannot be scoped to one test. Two
+# reasons it is not a source of yuzu_agent_tests:
+#   * a sanitizer owns the allocator, so the replacement must be ABSENT from
+#     those binaries, not merely disabled inside them;
+#   * a global allocator replacement has no business in the 1500-case agent
+#     binary that gates every push.
+# Executable-side interposition for libyuzu_agent_core.so is an ELF/libstdc++
+# property (measured on Linux, and it does hold) — not a portable contract, so
+# the target is Linux-only and the cross-platform pin stays with the fault seams
+# in test_spark_mechanism.cpp. See the file header.
+if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
+  spark_alloc_budget_exe = executable(
+    'yuzu_spark_alloc_budget_tests',
+    files('unit/test_spark_alloc_budget.cpp'),
+    include_directories: [include_directories('../agents/core/src')],
+    cpp_args: test_partial_init_args + agent_platform_args,
+    dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, catch2_dep,
+                   spdlog_dep],
+  )
+  test(
+    'spark allocation budget',
+    spark_alloc_budget_exe,
+    suite: 'agent',
+    timeout: 60,
+  )
+endif
+
 agent_test_args = (get_option('b_sanitize') == 'none') ? ['~[tsan-heavy]'] : []
 test(
   'agent unit tests',
@@ -815,6 +854,38 @@ test('changelog order',
   args: [files('test_changelog_order.py')],
   suite: 'docs',
   timeout: 10,
+)
+
+# Prometheus alert-rule unit tests (#2553). The same script the docs-lint
+# workflow runs, so self-hosted legs and /test exercise the same code path CI
+# does -- WHEREVER A USABLE PROMTOOL IS PRESENT. No CI leg sets the opt-in below
+# and none is documented as carrying a 3.x promtool, so the realistic outcome on
+# all three is SKIP; the authoritative run is the workflow job. Rationale for the
+# tests themselves: tests/prometheus/run_promtool_tests.py.
+#
+# DOES NOT PULL A CONTAINER unless you opt in. `scripts/ci/flake-retry.py` runs
+# `meson test` with NO --suite filter on three REQUIRED build legs, so a
+# docker-dependent test registered here puts a container registry on all three;
+# an earlier version of this wiring did exactly that and was reverted. Without
+# YUZU_TEST_ENABLE_PROMTOOL_DOCKER the harness needs a native promtool of the
+# pinned major and skips (77) otherwise. Timeout matches the workflow's own
+# 10-minute budget for the same work: under the opt-in this pulls a ~110 MB
+# image before it runs anything.
+test('prometheus alert rules',
+  _python3_test,
+  args: [files('prometheus/run_promtool_tests.py')],
+  suite: 'docs',
+  timeout: 600,
+)
+
+# Pure-logic selftest for the harness above (version-banner parsing, docker argv
+# construction, the pin's own shape). No promtool, no docker, no network, so it
+# runs everywhere -- mirroring the flake-retry and plugin-spawn selftests below.
+test('prometheus harness selftest',
+  _python3_test,
+  args: [files('prometheus/run_promtool_tests.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
 )
 
 # Tracker close-automation regression corpus (ADR-3001 A1 §11-§12): the frozen

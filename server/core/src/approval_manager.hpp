@@ -1,7 +1,5 @@
 #pragma once
 
-#include "reserved_definition_id.hpp" // is_reserved_definition_id (#2442)
-
 #include <sqlite3.h>
 
 #include <cstdint>
@@ -24,10 +22,14 @@ namespace yuzu::server {
 /// split.
 enum class ApprovalOrigin {
     /// A mint that predates this enum, or one that has not declared itself:
-    /// today ONLY the MCP gate, which cannot be updated to declare `kMcp` while
-    /// mcp_server.cpp is frozen for a parallel rebase. Kept honest rather than
-    /// mislabelled — a ticket recorded `instruction` when MCP minted it would be
-    /// false evidence. Tighten to `kMcp` when the MCP mint declares itself.
+    /// today ONLY the MCP gate. It is left undeclared deliberately, not for want
+    /// of an opportunity — `kUnspecified` is the value that GRANTS at
+    /// redemption, so it is the only correct choice for the one surface the
+    /// binding must not refuse. Kept honest rather than mislabelled: a ticket
+    /// recorded `instruction` when MCP minted it would be false evidence.
+    /// Declaring `kMcp` here is a behaviour change, not a relabelling — it makes
+    /// `kUnspecified` non-granting and every undeclared row unredeemable — so it
+    /// belongs with that change, not with this one.
     kUnspecified,
     /// The interactive REST/dashboard instruction-approval gate
     /// (workflow_routes.cpp).
@@ -37,12 +39,27 @@ enum class ApprovalOrigin {
     /// The MCP approval-ticket gate (mcp_server.cpp). Not yet passed by that
     /// caller — see kUnspecified.
     kMcp,
+    /// A stored value this build does not know — a row written by a newer
+    /// binary, or a corrupted column. DISTINCT from kUnspecified because
+    /// kUnspecified is the value that GRANTS redemption (#2442): folding an
+    /// unknown string into it would make an unrecognised surface redeemable,
+    /// which is the fail-open direction. Never written, only decoded.
+    kUnrecognised,
 };
 
-/// Column text for `origin`. `kUnspecified` stores the empty string, which is
-/// also what migration v5 back-fills into pre-existing rows, so "no declared
-/// origin" reads identically whether the row predates the column or the caller
-/// stayed silent.
+/// True when `origin` names a surface that is NOT the MCP recall — including
+/// kUnrecognised, which fails closed. False for kMcp and for kUnspecified, the
+/// undeclared case that stays redeemable until the MCP mint declares itself.
+bool declares_non_mcp_surface(ApprovalOrigin origin);
+
+/// Column text for `origin`. `kUnspecified` stores the empty string.
+///
+/// A row that predates the column does NOT read back as `kUnspecified`, and the
+/// difference is the whole point: migration v7 rewrites every `''` row to a
+/// sentinel that decodes to `kUnrecognised` and is REFUSED at redemption, while
+/// a caller that simply stayed silent writes `''` and is GRANTED. "No declared
+/// origin" and "declared nothing because the column did not exist yet" are
+/// deliberately not the same value.
 const char* to_string(ApprovalOrigin origin);
 ApprovalOrigin approval_origin_from_string(std::string_view text);
 
@@ -75,7 +92,8 @@ struct Approval {
     /// tuple. Additive column (migration v4).
     std::string schedule_id;
     /// Which surface minted this ticket (#2442). Additive column (migration
-    /// v5); pre-existing rows read back as kUnspecified.
+    /// v5); rows that predate it are rewritten by v7 and read back as
+    /// kUnrecognised, NOT kUnspecified — see `to_string`'s comment.
     ApprovalOrigin origin{ApprovalOrigin::kUnspecified};
 };
 
@@ -103,7 +121,69 @@ enum class ConsumeFailure {
     kPrecondition,  ///< precondition denied — ticket UNTOUCHED, still recallable
     kNotConsumable, ///< absent / not approved / already consumed (the CAS lost)
     kStoreError,    ///< store unavailable, missing argument, or a SQLite failure
+    kForeignOrigin, ///< minted on a surface other than the MCP recall (#2442)
 };
+
+/// The one refusal message for every "this ticket cannot be redeemed" outcome.
+/// kForeignOrigin deliberately shares it with kNotConsumable: the KIND separates
+/// a forgery attempt from a replay for the log, but the MESSAGE must not, or the
+/// recall becomes an oracle for which SURFACE minted a ticket. (Not for which
+/// definition ids exist: a mismatched id is refused earlier, and with a
+/// different message, before this is reached.) One home so the copies cannot drift apart.
+/// Stable audit token, one per failure kind. The AUDIT trail is server-side and
+/// is never returned to the caller, so the anti-oracle reasoning below does NOT
+/// reach it: suppressing the distinction there would destroy the only evidence
+/// a cross-surface redemption attempt was refused, which is the thing #2442
+/// exists to produce.
+///
+/// Closed set. Adding a `ConsumeFailure` without a token here fails the build on
+/// GCC and Clang — `-Wswitch` is promoted to an error locally because
+/// `meson.build` sets `werror=false`, so the warning alone would not stop it,
+/// and a new kind would otherwise inherit whatever the caller happens to say.
+///
+/// The ORDER of the MSVC pragmas is load-bearing. C4062 is off by default, and
+/// `#pragma warning(error : N)` does NOT enable an off-by-default warning —
+/// Microsoft documents that behaviour only for the `1|2|3|4` and `default`
+/// specifiers — so promoting it alone sets an as-error flag on a diagnostic
+/// that is never emitted. The explicit level enable has to come first.
+///
+/// Unverified on MSVC: no Windows leg has built this. That is the only reason
+/// the claim is hedged. (An earlier version of this comment blamed the
+/// whole-function pragma rule instead; that rule is scoped to warnings
+/// 4700-4999, and C4062 is parse-time, so it does not reach the `pop` below.)
+[[nodiscard]] constexpr const char* consume_denial_reason(ConsumeFailure kind) {
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(1 : 4062) // off by default; `error:` alone does NOT enable it
+#pragma warning(error : 4062)
+#endif
+    switch (kind) {
+    case ConsumeFailure::kPrecondition:
+        return "precondition";
+    case ConsumeFailure::kNotConsumable:
+        return "not_consumable";
+    case ConsumeFailure::kStoreError:
+        return "store_error";
+    case ConsumeFailure::kForeignOrigin:
+        return "foreign_origin";
+    }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+    // Not reachable today: the switch above has an arm per ConsumeFailure
+    // value, and the pragma makes a missing arm a compile ERROR rather than a
+    // warning. Present so the function still returns on a compiler that does
+    // not honour the pragma.
+    return "unknown";
+}
+
+inline constexpr const char* kNotConsumableMessage =
+    "approval not consumable (already used, not approved, or absent)";
 
 struct ConsumeError {
     ConsumeFailure kind{ConsumeFailure::kStoreError};
@@ -138,14 +218,15 @@ public:
     /// the owning schedule's id for a scheduled-fire submission — see the
     /// `Approval::schedule_id` doc comment for why this matters.
     ///
-    /// `origin` (#2442) declares the minting surface. A caller that declares a
-    /// non-MCP origin may NOT mint a `mcp.`-prefixed definition_id: that is the
-    /// forgeable half of the cross-surface confusion, since the REST
-    /// instruction gate mints with a caller-influenced definition id and a
-    /// fully caller-controlled scope expression, which the MCP recall matches
-    /// on. Declaring no origin still permits the prefix, because the MCP mint
-    /// itself is the one caller that cannot yet declare — see
-    /// ApprovalOrigin::kUnspecified.
+    /// `origin` (#2442) RECORDS the minting surface. It is not enforced here:
+    /// this store does not refuse a `mcp.`-prefixed definition_id from any
+    /// surface. The binding is applied at REDEMPTION, in `consume_ticket`,
+    /// which refuses a ticket whose recorded surface is not MCP — see the
+    /// rationale in `submit()`'s body for why the check moved.
+    ///
+    /// Pick the value deliberately. `kUnspecified` is what GRANTS at
+    /// redemption, and it is the correct choice only for the MCP mint, which
+    /// cannot yet declare `kMcp`.
     std::expected<std::string, std::string>
     submit(const std::string& definition_id, const std::string& submitted_by,
            const std::string& scope_expression, const std::string& schedule_id = "",
@@ -210,8 +291,6 @@ public:
     /// `consumed_by` records WHO recalled the ticket (PR #1796 H3/N2, SOC-2
     /// CC7.2) — the caller passes the authenticated principal; it is stored in
     /// the same CAS UPDATE so the who and the when can never disagree.
-    std::expected<void, std::string> consume_ticket(const std::string& id,
-                                                    const std::string& consumed_by);
 
     /// consume_ticket with a pre-consume recheck (#2443). A ticket can sit
     /// approved-but-unconsumed for up to the 7-day TTL, so the state its effect
