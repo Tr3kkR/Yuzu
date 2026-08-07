@@ -104,11 +104,14 @@ ApprovalOrigin approval_origin_from_string(std::string_view text) {
     return ApprovalOrigin::kUnrecognised;
 }
 
-// Guarded like the other two closed-set switches over this enum in this file.
-// The trailing `return true` already fails closed, so a missing arm cannot grant
-// — but it would silently pick the REFUSE side for a surface that may have been
-// added precisely to be redeemable, and the author would never be told. Adding
-// the guard to two of the three was an inconsistency, not a judgement.
+// Guarded like the other closed-set switch over this enum, `to_string` above.
+// (`consume_denial_reason` in the header carries the same guard, but over
+// `ConsumeFailure` — a different enum, so it is not part of this set.)
+//
+// The trailing `return true` already fails closed, so a missing arm cannot
+// grant — but it would silently pick the REFUSE side for a surface that may
+// have been added precisely to be redeemable, and the author would never be
+// told. Guarding one of the two was an inconsistency, not a judgement.
 bool declares_non_mcp_surface(ApprovalOrigin origin) {
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
