@@ -1454,11 +1454,15 @@ public:
                           "from_result_set: scope references that failed owner-checked "
                           "resolution at dispatch (set absent, expired, or not owned)",
                           "counter");
-        // Audit-pipeline observability (governance PR4 OBS-4). Increments when
-        // audit_store->add_event()'s SQLite step does not return DONE — pages
-        // operators that the audit chain itself is degraded.
+        // Audit-pipeline observability (governance PR4 OBS-4). Increments when an
+        // audit write does not persist — pages operators that the audit chain
+        // itself is degraded. ADR-0040 made that write a PostgreSQL INSERT, so
+        // the failure modes are store-not-open, pool-acquire timeout and query
+        // error, NOT the retired SQLite step this HELP used to name.
         metrics_.describe("yuzu_server_audit_emit_failed_total",
-                          "Audit events that failed to persist (sqlite3_step != DONE)", "counter");
+                          "Audit events that failed to persist to the PostgreSQL audit_store "
+                          "(store not open, pool acquire timeout, or INSERT error)",
+                          "counter");
         // #2360 retention clock guard. The two counters answer DIFFERENT
         // questions and must not be collapsed: skips means the guard declined a
         // delete that would have wiped the evidence table (this server's clock
@@ -2802,12 +2806,37 @@ public:
                 gateway_service_->set_fleet_topology_store(fleet_topology_store_.get());
         }
 
-        // Initialize audit store
+        // Initialize audit store — PostgreSQL (ADR-0040, schema audit_store),
+        // born-on-PG like the other migrated stores: fail-closed on open, then
+        // a MANDATORY backfill of the legacy audit.db (SOC 2 evidence chain —
+        // refuse boot rather than serve a knowingly-incomplete trail).
         {
-            auto audit_db = cfg_.db_dir() / "audit.db";
-            audit_store_ = std::make_unique<AuditStore>(audit_db, cfg_.audit_retention_days);
-            if (audit_store_->is_open()) {
-                audit_store_->start_cleanup();
+            if (pg_pool_ && !startup_failed_) {
+                audit_store_ =
+                    std::make_unique<AuditStore>(*pg_pool_, cfg_.audit_retention_days);
+                if (!audit_store_->is_open()) {
+                    spdlog::error("[PG] Refusing to start: audit store migration/open failed "
+                                  "(database reachable but the audit_store schema could not be "
+                                  "created/opened)");
+                    startup_failed_ = true;
+                } else {
+                    // Wire metrics BEFORE the backfill so yuzu_server_audit_backfill_total
+                    // actually emits — the backfill's own outcome metric was dead when
+                    // set_metrics ran after it (Gate 2 security MEDIUM).
+                    audit_store_->set_metrics(&metrics_);
+                    auto audit_db = cfg_.db_dir() / "audit.db";
+                    if (!audit_store_->migrate_from_sqlite(audit_db)) {
+                        spdlog::error("[PG] Refusing to start: audit store backfill from legacy {} "
+                                      "failed (ADR-0009 mandatory-backfill fail-closed; see prior "
+                                      "log lines). The SOC 2 evidence chain must be complete before "
+                                      "serving; the next boot retries. Operator remediation: repair "
+                                      "the file, or quarantine it aside if it is unrecoverable.",
+                                      audit_db.string());
+                        startup_failed_ = true;
+                    } else {
+                        audit_store_->start_cleanup();
+                    }
+                }
             }
             // Internal-CA store (ca.db) — cert inventory + CRL versions. The CA
             // root key itself is a 0600 file via default_certs, never in this DB.
@@ -5553,6 +5582,18 @@ public:
             auth_secret_codec_->set_audit_hook({});
         auth_secret_codec_.reset();
         auth_key_provider_.reset();
+        // AuditStore (ADR-0040) borrows pg_pool_ via its retention thread — that
+        // thread is joined at stop_cleanup() above; drop the store before the
+        // pool so no late lease touches a destroyed pool. Unwire the borrowed
+        // pointer from every writer FIRST (belt-and-braces, matching the sibling
+        // stores above + ADR-0040 §Lifecycle) rather than relying on RPC/HTTP
+        // drain ordering — a late log() must not touch a reset store.
+        agent_service_.set_audit_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_audit_store(nullptr);
+        if (fleet_topology_store_)
+            fleet_topology_store_->set_audit_store(nullptr);
+        audit_store_.reset();
         pg_pool_.reset();
     }
 
@@ -9985,11 +10026,34 @@ private:
                     "application/json");
                 return;
             }
+            // Range, not just parseability: a negative limit would otherwise
+            // reach PG as `LIMIT -1`, error, and be reported as an audit-store
+            // DEGRADE — 503 plus the read-degrade counter the availability
+            // alert pages on — rather than the client error it is (Gate 2
+            // security). A negative offset is already inert at the store, but
+            // it is a client error here too, so say so.
+            if (q.limit < 1 || q.offset < 0) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"limit must be >= 1 and offset >= 0"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
 
+            // ADR-0040: reads are degrade-distinguishable. A store/pool failure
+            // returns nullopt — surface 503, NEVER a false-empty 200 (an audit
+            // blip must not read as "no activity" — evidence integrity).
             auto results = audit_store_->query(q);
+            if (!results) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"audit store degraded"},"data":null})",
+                    "application/json");
+                return;
+            }
 
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& e : results) {
+            for (const auto& e : *results) {
                 arr.push_back({{"id", e.id},
                                {"timestamp", e.timestamp},
                                {"principal", e.principal},
@@ -10001,9 +10065,20 @@ private:
                                {"source_ip", e.source_ip},
                                {"result", e.result}});
             }
+            // Total is a best-effort adornment now that the page rows are in
+            // hand: it takes a SECOND, independent lease, so it can degrade while
+            // the page rows are perfectly good. Do not answer a second 503 —
+            // but do NOT substitute the page size either. That reads as
+            // `count == total`, i.e. "this page is the whole trail", which is
+            // plausible and wrong on the one store whose entire posture in this
+            // change is that a blip must never read as an absence (Gate 3
+            // cpp-expert + Gate 2 security; the old `0` was at least obviously
+            // wrong). `null` is the honest answer and JSON has it.
+            auto total = audit_store_->total_count();
             res.set_content(nlohmann::json({{"events", arr},
                                             {"count", arr.size()},
-                                            {"total", audit_store_->total_count()}})
+                                            {"total", total ? nlohmann::json(*total)
+                                                            : nlohmann::json(nullptr)}})
                                 .dump(),
                             "application/json");
         });

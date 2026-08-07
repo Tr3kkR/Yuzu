@@ -789,7 +789,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "List instruction definitions", "tags": ["Instructions"], "responses": {"200": {"description": "List of instruction definitions"}}}
     },
     "/audit": {
-      "get": {"summary": "Query audit log", "tags": ["Audit"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100}}, {"name": "principal", "in": "query", "schema": {"type": "string"}}, {"name": "action", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "List of audit events"}}}
+      "get": {"summary": "Query audit log", "tags": ["Audit"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000}}, {"name": "principal", "in": "query", "schema": {"type": "string"}}, {"name": "action", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "List of audit events"}, "400": {"description": "limit below 1 (a client error, deliberately NOT reported as a store degrade)"}, "503": {"description": "Audit store or connection pool unavailable — deny-on-degrade, never a false-empty 200"}}}
     },
     "/audit/auth-sample": {
       "get": {"summary": "Sampled authentication-log evidence export (SOC 2 CC7.2)", "tags": ["Audit"], "description": "Pseudo-random sample of authentication-surface audit events (action prefixes auth./mfa./session.) over an optional [from,to] window. Requires AuditLog:Read. The export is itself audited as audit.auth_sample.exported. SAMPLING NOTE: the sample is drawn from at most the 10000 most-recent matching events in the window; when the window holds more than that, the sample is recency-biased (NOT uniform over the full window). The response `sampling` object reports `candidates_considered`, `scan_cap`, and `recency_capped` so evidence consumers can detect this. Samples are non-reproducible (no seed); the audited `audit.auth_sample.exported` row is the chain-of-custody record.", "parameters": [{"name": "from", "in": "query", "schema": {"type": "integer"}, "description": "Window start, epoch seconds (optional, digits only)"}, {"name": "to", "in": "query", "schema": {"type": "integer"}, "description": "Window end, epoch seconds (optional, digits only)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Sampled list of auth audit events; envelope adds a `sampling` object (candidates_considered, scan_cap, recency_capped)"}, "400": {"description": "from/to not non-negative digits, from>to, or non-integer limit"}, "503": {"description": "Audit store unavailable"}}}
@@ -4620,13 +4620,31 @@ void RestApiV1::register_routes(
                  }
                  if (q.limit > 1000)
                      q.limit = 1000;
+                 // A negative limit is a client error, not a store degrade: left
+                 // alone it reaches PG as `LIMIT -1`, errors, and reports as an
+                 // audit-availability incident (Gate 2 security).
+                 if (q.limit < 1) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "limit must be >= 1"),
+                                     "application/json");
+                     return;
+                 }
                  q.principal = req.get_param_value("principal");
                  q.action = req.get_param_value("action");
 
+                 // ADR-0040: degrade-distinguishable read — nullopt on a
+                 // store/pool failure. Surface 503, never a false-empty 200 (an
+                 // audit blip must not read as "no activity" — evidence integrity).
                  auto events = audit_store->query(q);
+                 if (!events) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "audit store degraded"),
+                                     "application/json");
+                     return;
+                 }
                  JArr arr;
-                 for (size_t i = 0; i < events.size(); ++i) {
-                     const auto& e = events[i];
+                 for (size_t i = 0; i < events->size(); ++i) {
+                     const auto& e = (*events)[i];
                      arr.add(JObj()
                                  .add("timestamp", e.timestamp)
                                  .add("principal", e.principal)
@@ -4636,7 +4654,7 @@ void RestApiV1::register_routes(
                                  .add("target_id", e.target_id)
                                  .add("detail", e.detail));
                  }
-                 res.set_content(list_json(arr.str(), static_cast<int64_t>(events.size())),
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(events->size())),
                                  "application/json");
              });
 
@@ -4750,7 +4768,20 @@ void RestApiV1::register_routes(
                 q.limit = 1;
 
             std::size_t pool_size = 0;
-            auto events = audit_store->query(q, &pool_size);
+            // ADR-0040: degrade-distinguishable read — nullopt on a store/pool
+            // failure. 503, never a false-empty sample (evidence integrity; the
+            // is_open() guard above only catches a closed store, not a runtime blip).
+            auto events_opt = audit_store->query(q, &pool_size);
+            if (!events_opt) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "audit store degraded", cid,
+                                                      /*retry_after_ms=*/5000,
+                                                      "the audit store is temporarily unavailable; "
+                                                      "retry shortly"),
+                                "application/json");
+                return;
+            }
+            const auto& events = *events_opt;
             // recency_capped: the window held at least the scan cap, so the sample
             // was drawn only from the most-recent kAuditSampleScanCap events and is
             // NOT a uniform sample of the full window. Surfaced in the response so an

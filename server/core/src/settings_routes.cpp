@@ -920,8 +920,11 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
             // "credentials_revoked=N[; superseded_by=X]" — NOT an
             // operator-supplied free-text reason (the route has no such
             // field; an earlier draft of this fragment assumed one).
-            // Degrades honestly to "(not recorded)" if that audit row is
-            // absent or pruned.
+            // Two DIFFERENT outcomes, distinguished: "(not recorded)" when the
+            // store answered and had no such row, "(unavailable)" when it could
+            // not answer at all. Collapsing them would state an absence the read
+            // never established — the revocation facts beside it come from the
+            // principal store and are unaffected either way.
             std::string revocation_cell = "—";
             if (!active) {
                 std::string linkage =
@@ -935,9 +938,14 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                     q.target_id = p.principal_id;
                     q.action_prefixes = {"engine_principal.revoke"};
                     q.limit = 1;
+                    // Best-effort HTML cell (not an evidence endpoint): on a
+                    // degrade (nullopt, ADR-0040) say so rather than 503-ing the
+                    // whole settings page.
                     auto events = audit_store_->query(q);
-                    if (!events.empty() && !events.front().detail.empty())
-                        audit_detail = events.front().detail;
+                    if (!events)
+                        audit_detail = "(unavailable)";
+                    else if (!events->empty() && !events->front().detail.empty())
+                        audit_detail = events->front().detail;
                 }
                 revocation_cell = linkage +
                                   "<br><span style=\"font-size:0.7rem;color:"
