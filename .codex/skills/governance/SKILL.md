@@ -15,7 +15,7 @@ Run Yuzu governance as a Codex-native review fanout. This skill may use Codex su
 
 ## Gates
 
-0. Claim discipline: apply `docs/claim-discipline.md` to the commit range, unconditionally, before Gate 1. **Identical to the Claude runner — load the "Gate 0" section of `.claude/skills/governance/SKILL.md` and apply it verbatim; do not restate its scope, severity mapping, or halt mechanics here.** In short: Gate 0 findings derive through the same severity block as every other gate (no separate scale, no separate ledger record kind); on any finding, stop and offer fix-now-and-re-run-Gate-0 vs. proceed-without-fixing; proceeding never waives a CRITICAL/HIGH or policy-floor finding, which still must resolve before the final decision like any other blocking finding. Zero findings gets one line in the Gate 1 output (site count, rule set applied) so a clean pass is distinguishable from a skipped one.
+0. Claim discipline: apply `docs/claim-discipline.md` to the commit range, unconditionally, before Gate 1. **Identical to the Claude runner — load the "Gate 0" section of `.claude/skills/governance/SKILL.md` and apply it verbatim: scope, severity mapping, halt mechanics, and the ledger recording contract are ALL defined there, not here.** A summary here is how this line drifted from the canonical on the day it was added (found in PR #2870 review) — the pointer is the whole entry; do not add one back.
 1. Change Summary: write this locally from `git log`, `git diff --stat`, and targeted diffs.
 2. Mandatory review: launch `security-guardian` and `docs-writer` in parallel.
 3. Domain review: select roles by changed files and launch them in parallel.

@@ -537,10 +537,17 @@ from the actual facts every time; these are anchors, not a lookup table):
   ledger-schema rules already stated in Gate 8 below, not derived fresh
 
 A rule-2 "unverifiable" finding where the underlying fact turns out to be TRUE on
-investigation is not zero — it is `speculative` epistemic status on a finding that
-still derives its band from IMPACT/EXPOSURE, per the shared Absences rule. Do not
-downgrade IMPACT because the claim happened to be true; the defect is that it shipped
-unchecked, not that it shipped wrong.
+investigation is not zero. **Record it `verified`, not `speculative`** (found in PR
+#2870 review): CLAUDE.md's standing rule reserves `speculative` for when you can name
+"neither the code path nor a candidate trigger" — the opposite of this case, where
+you investigated and found both. `speculative` is also the one status that exempts a
+finding from the gate, so mislabeling it here would hand a gate exemption to a defect
+you directly confirmed. What the finding is ABOUT is the process failure — an
+unverified claim shipped — and that failure is itself directly observed, hence
+`verified`. Note separately, in `summary`, that investigation found the underlying
+product claim to be true; that note does not change the epistemic status of the
+process defect, and do not downgrade IMPACT because the claim happened to be true —
+the defect is that it shipped unchecked, not that it shipped wrong.
 
 ### The halt
 
