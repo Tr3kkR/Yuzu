@@ -2418,7 +2418,11 @@ TEST_CASE("bridge reserve races on_final_written releasing the pin it would recl
     Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
     auto s = fx.make_session();
     // Fill all four pin slots with parked, undelivered finals - the state in which the
-    // next admission must reclaim rather than refuse (same setup as CH-26).
+    // next admission must reclaim rather than refuse (same setup as CH-26). Waits for
+    // the FULL settle (pinned==i AND unpinned==0), not just the ring pin becoming
+    // visible: pinned_count() reflects publish_terminal_ladder's ring commit before
+    // project_record reaches its own stall-check line, so a pinned_count()-only wait
+    // does not prove record i's projection has fully finished (#2791 UP-4).
     for (int i = 1; i <= 4; ++i) {
         const std::string exec = "exec-r1-" + std::to_string(i);
         REQUIRE(poll_until([&] {
@@ -2429,8 +2433,10 @@ TEST_CASE("bridge reserve races on_final_written releasing the pin it would recl
                 Bridge::ArmOutcome::kArmed);
         REQUIRE(fx.bridge->on_post_closed(s.id, json(i)));  // -> kRingOnly, charged
         fx.bus.publish(exec, "execution-completed", kCompleted, /*is_terminal=*/true);
-        REQUIRE(poll_until(
-            [&] { return s.stream->pinned_count() == static_cast<std::size_t>(i); }));
+        REQUIRE(poll_until([&] {
+            const auto snap = fx.bridge->accounting_snapshot_for_test(s.id, s.stream);
+            return snap.pinned == static_cast<std::size_t>(i) && snap.unpinned == 0;
+        }));
     }
     REQUIRE(s.stream->pinned_count() == 4);
 
@@ -2443,10 +2449,12 @@ TEST_CASE("bridge reserve races on_final_written releasing the pin it would recl
     REQUIRE(key1.has_value());
 
     std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> racer_iterations{0};
     auto releaser = std::async(std::launch::async, [&] {
         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (!stop.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < until) {
             fx.bridge->on_final_written(*key1);
+            racer_iterations.fetch_add(1, std::memory_order_relaxed);
             std::this_thread::yield();
         }
     });
@@ -2465,6 +2473,15 @@ TEST_CASE("bridge reserve races on_final_written releasing the pin it would recl
     }
     stop.store(true, std::memory_order_release);
     releaser.get();
+    // Diagnostic only, never a hard assert: a starved racer thread on a loaded CI box
+    // is a real, non-buggy outcome (the admitted==4 invariant below holds regardless -
+    // reserve()'s own commit-time release alone can reclaim all four pins), but zero
+    // iterations means this run gave zero ACTUAL concurrent coverage, which is worth
+    // knowing about without failing the build over it (#2791 Gate 5 UP-3).
+    if (racer_iterations.load(std::memory_order_relaxed) == 0) {
+        WARN("on_final_written racer thread never ran an iteration - this pass exercised "
+             "no actual concurrency, only the deterministic admitted==4 outcome");
+    }
 
     CHECK(admitted == 4);
     const auto displaced =
@@ -2502,21 +2519,37 @@ TEST_CASE("bridge reserve races a GET resume ack clearing every pin at or below 
                 Bridge::ArmOutcome::kArmed);
         REQUIRE(fx.bridge->on_post_closed(s.id, json(i)));
         fx.bus.publish(exec, "execution-completed", kCompleted, /*is_terminal=*/true);
-        REQUIRE(poll_until(
-            [&] { return s.stream->pinned_count() == static_cast<std::size_t>(i); }));
+        // Full settle, not just the ring pin - see the matching comment on the
+        // sibling on_final_written racer test above (#2791 UP-4).
+        REQUIRE(poll_until([&] {
+            const auto snap = fx.bridge->accounting_snapshot_for_test(s.id, s.stream);
+            return snap.pinned == static_cast<std::size_t>(i) && snap.unpinned == 0;
+        }));
     }
     REQUIRE(s.stream->pinned_count() == 4);
 
+    // Captured ONCE, before the race, not recomputed per iteration: nothing published
+    // during the race (the 200 reserve() calls below only ever create kArming records,
+    // which never call stream->publish(...)), so next_event_id() is constant for the
+    // whole run. A cursor equal to the LIVE next_event_id() is never resumable
+    // (attach_and_replay's gate requires last_event_id < next_id_, strictly) - using it
+    // directly made every attach_and_replay call in this test return kGap and skip the
+    // rule-(b) unpin block entirely, so the racer thread raced nothing (#2791 Gate 4
+    // happy-path finding). `next_event_id() - 1` is the highest id already ASSIGNED -
+    // resumable, and >= every one of the four pins set up above, so rule-(b) clears all
+    // four the first time this cursor is used.
+    const std::uint64_t cursor = s.stream->next_event_id() - 1;
+
     std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> racer_iterations{0};
     auto acker = std::async(std::launch::async, [&] {
         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (!stop.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < until) {
-            // A cursor at next_event_id() is always >= every pin published so far -
-            // covers all four regardless of how many more frames land meanwhile.
-            auto att = s.stream->attach_and_replay(s.stream->next_event_id(), nullptr, "alice");
+            auto att = s.stream->attach_and_replay(cursor, nullptr, "alice");
             if (att.status == mcp::McpStreamState::AttachStatus::kAttached) {
                 s.stream->detach(att.sink);
             }
+            racer_iterations.fetch_add(1, std::memory_order_relaxed);
             std::this_thread::yield();
         }
     });
@@ -2530,6 +2563,10 @@ TEST_CASE("bridge reserve races a GET resume ack clearing every pin at or below 
     }
     stop.store(true, std::memory_order_release);
     acker.get();
+    if (racer_iterations.load(std::memory_order_relaxed) == 0) {
+        WARN("attach_and_replay racer thread never ran an iteration - this pass exercised "
+             "no actual concurrency, only the deterministic admitted==4 outcome");
+    }
 
     CHECK(admitted == 4);
     const auto displaced =
@@ -4397,7 +4434,11 @@ TEST_CASE("bridge admission declines rather than reclaiming while a candidate is
     Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
     auto s = fx.make_session();
 
-    // Two fully-settled, individually reclaimable parked finals.
+    // Two fully-settled, individually reclaimable parked finals. Full settle wait
+    // (pinned==i AND unpinned==0), not just the ring pin - see the matching comment
+    // on the on_final_written racer test above (#2791 UP-4): waiting on pinned_count()
+    // alone does not prove record i's projection has moved past its own (unarmed, so
+    // harmless to IT, but relevant to whichever record gets stalled next) check line.
     for (int i = 1; i <= 2; ++i) {
         const std::string exec = "exec-decline-" + std::to_string(i);
         REQUIRE(poll_until([&] {
@@ -4408,8 +4449,10 @@ TEST_CASE("bridge admission declines rather than reclaiming while a candidate is
                 Bridge::ArmOutcome::kArmed);
         REQUIRE(fx.bridge->on_post_closed(s.id, json(i)));
         fx.bus.publish(exec, "execution-completed", kCompleted, /*is_terminal=*/true);
-        REQUIRE(poll_until(
-            [&] { return s.stream->pinned_count() == static_cast<std::size_t>(i); }));
+        REQUIRE(poll_until([&] {
+            const auto snap = fx.bridge->accounting_snapshot_for_test(s.id, s.stream);
+            return snap.pinned == static_cast<std::size_t>(i) && snap.unpinned == 0;
+        }));
     }
     REQUIRE(s.stream->pinned_count() == 2);
 
@@ -4423,7 +4466,21 @@ TEST_CASE("bridge admission declines rather than reclaiming while a candidate is
     REQUIRE(fx.bridge->arm(s.id, json(3), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json(3)));  // -> kRingOnly, charged
 
+    // Guards the arm/release pair against a fatal REQUIRE between them: if any REQUIRE
+    // below throws before the intentional release() call further down runs, this
+    // destructs first (declared after the arm, so it unwinds before `fx` per reverse
+    // declaration order) and releases the parked projector thread itself, rather than
+    // leaving it to the 10s internal backstop. release_projection_stall_for_test() is
+    // documented idempotent, so running it again here after the intentional release
+    // below is a harmless no-op, not a double-release bug (#2791, cpp-safety floor -
+    // this mirrors the file's existing UnsubGuard idiom above, "built to survive fatal
+    // REQUIREs below").
+    struct StallGuard {
+        Bridge& bridge;
+        ~StallGuard() { bridge.release_projection_stall_for_test(); }
+    };
     fx.bridge->arm_projection_stall_for_test();
+    StallGuard stall_guard{*fx.bridge};
     fx.bus.publish("exec-decline-3", "execution-completed", kCompleted, /*is_terminal=*/true);
     REQUIRE(fx.bridge->wait_projection_stall_reached_for_test());
     // Confirms the phantom double-count is live: the ring already shows the

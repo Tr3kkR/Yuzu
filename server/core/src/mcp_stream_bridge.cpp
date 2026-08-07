@@ -1735,14 +1735,23 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
     // committed to the ring (a live pin), but rec->pinned_event_id below is not
     // yet stamped, so a scan right now cannot tell this pin from an orphan.
     // Neither bridge_mu_ nor rec->mu is held here. Zero-cost when unarmed (one
-    // relaxed atomic load).
+    // acquire atomic load).
     if (projection_stall_armed_for_test_.load(std::memory_order_acquire)) {
         std::unique_lock<std::mutex> stall_lk(projection_stall_mu_);
         projection_stall_armed_for_test_.store(false, std::memory_order_release);  // one-shot
         projection_stall_reached_for_test_ = true;
         projection_stall_cv_.notify_all();
-        projection_stall_cv_.wait_for(stall_lk, std::chrono::seconds(10),
-                                      [&] { return projection_stall_release_for_test_; });
+        // The 10s backstop MUST exceed wait_projection_stall_reached_for_test's
+        // 5s default: a backstop shorter than the harness's own wait would let an
+        // armed stall self-release mid-test into a confusing partial state
+        // instead of a clean REQUIRE failure on the harness side.
+        const bool released = projection_stall_cv_.wait_for(
+            stall_lk, std::chrono::seconds(10), [&] { return projection_stall_release_for_test_; });
+        if (!released) {
+            spdlog::warn("MCP bridge: #2791 test stall hit its 10s backstop without an "
+                         "explicit release - likely a forgotten release_projection_stall_for_test() "
+                         "call after a failed REQUIRE");
+        }
     }
     // Settle IMMEDIATELY after the commit/poison decision (C4): no later
     // bookkeeping failure may restore + republish.

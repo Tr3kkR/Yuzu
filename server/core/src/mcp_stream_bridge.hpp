@@ -721,12 +721,13 @@ public:
 
     /// #2791 test seam. ONE combined read of the two halves of admission
     /// accounting for `session_id` - the charge ledger (`bridge_mu_`) and
-    /// `stream`'s pinned count (its own mutex) - taken in the same order and
-    /// under the same hold reserve() itself uses at cpp:347-350. Two separate
-    /// calls (a hypothetical `unpinned_for_test()` plus `stream->pinned_count()`)
-    /// would not be atomic with EACH OTHER and could observe a torn pair under
-    /// concurrent admission/release traffic; this reads both in one `bridge_mu_`
-    /// hold, so a caller gets the same snapshot reserve() would have decided on.
+    /// `stream`'s pinned count (its own mutex) - under the SAME `bridge_mu_`
+    /// hold reserve() itself uses at cpp:347-350 (read order does not matter;
+    /// only the shared hold does). Two separate calls (a hypothetical
+    /// `unpinned_for_test()` plus `stream->pinned_count()`) would not be atomic
+    /// with EACH OTHER and could observe a torn pair under concurrent
+    /// admission/release traffic; this reads both in one `bridge_mu_` hold, so
+    /// a caller gets the same snapshot reserve() would have decided on.
     struct AccountingSnapshot {
         std::size_t pinned = 0;
         std::size_t unpinned = 0;
@@ -737,7 +738,14 @@ public:
     /// #2791 test seam: the NEXT project_record call to reach the window after
     /// `publish_terminal_ladder` commits the frame but before `pinned_event_id`
     /// is stamped (cpp:1719 area) blocks until release_projection_stall_for_test()
-    /// runs. This is exactly the window `select_displaceable_pin_locked`'s
+    /// runs. BRIDGE-GLOBAL, not per-record: the arm applies to whichever record's
+    /// project_record call reaches the window next, on whichever thread reaches
+    /// it (the single projector thread, or a live POST pump's take_post_batch).
+    /// Every caller in this file arms it only when it can prove no OTHER record
+    /// is concurrently projectable, which is what makes "the next call" mean
+    /// "the intended one" - do not reuse this seam with concurrent multi-record
+    /// streamed activity in flight without first scoping it to a specific `rec`.
+    /// This is exactly the window `select_displaceable_pin_locked`'s
     /// `projection_in_flight` guard exists to mask (see its header contract
     /// above `select_displaceable_pin_locked`'s declaration) - a live call's pin
     /// is committed to the ring but not yet attributable to a record, which is
