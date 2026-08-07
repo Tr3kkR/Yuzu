@@ -498,8 +498,12 @@ public:
     /// outlive its parent event). One sweeping replica at a time via
     /// `pg_try_advisory_xact_lock`; a durable `gc_meta` reading +
     /// anomaly-fact-set guards against a skewed wall clock mass-expiring
-    /// live rows. Emits `yuzu_server_guardian_reap_passes_total{result=swept|noop|
-    /// declined|failed|skipped_lock}`.
+    /// live rows, including the #2579 missing-anchor trigger (a pass that has
+    /// not yet reached a verdict on this database, with rows already expired,
+    /// declines once and anchors — this store's recorded answer is AuditStore's
+    /// decline, not ResultSetStore's opt-out; see the `Facts` construction site).
+    /// Emits `yuzu_server_guardian_reap_passes_total{result=swept|noop|declined|
+    /// declined_no_anchor|failed|skipped_lock}`.
     void reap_expired();
 
 private:

@@ -26,6 +26,7 @@
 #include <cstring>
 #include <format>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
@@ -2710,11 +2711,25 @@ void GuaranteedStateStore::reap_expired() {
         }
 
         const int64_t now = now_epoch();
+        // Sanitise the clock reading before it feeds `now + kReapImplausiblyAheadSecs`
+        // below (signed-overflow UB near INT64_MAX) — clock-guard part 3. UPPER bound
+        // only: this store reads the PROCESS clock (unlike AuditStore's PG-side
+        // `pg_now`, ADR-0038 divergence, deliberate — the sanitiser applies regardless
+        // of clock source). A NEGATIVE reading is the legitimate dead-CMOS case the
+        // guard exists for, so it is not rejected here.
+        constexpr int64_t kMaxPlausibleNow = std::numeric_limits<int64_t>::max() / 4;
+        if (now > kMaxPlausibleNow) {
+            spdlog::warn("GuaranteedStateStore::reap_expired: implausible clock reading ({}); "
+                         "declining the pass",
+                         now);
+            outcome = "failed";
+            return false;
+        }
 
         pg::PgResult meta = pg::exec_params(
             conn,
             "SELECT key, value FROM guaranteed_state_store.gc_meta WHERE key IN "
-            "('last_pass_now','last_anomaly_facts')",
+            "('last_pass_now','last_anomaly_facts','bootstrap_settled')",
             std::vector<std::string>{});
         if (meta.status() != PGRES_TUPLES_OK) {
             spdlog::error("GuaranteedStateStore::reap_expired: meta read failed: {}",
@@ -2724,6 +2739,10 @@ void GuaranteedStateStore::reap_expired() {
         std::optional<int64_t> prev;
         bool prev_unusable = false;
         std::string last_facts;
+        // #2579: has ANY pass on this database ever reached a verdict? Durable and
+        // SHARED across replicas (not a per-process flag) — settled below, AFTER
+        // classify(), never derived from `prev` (see that site for why).
+        bool bootstrap_settled = false;
         for (int i = 0; i < PQntuples(meta.get()); ++i) {
             const std::string key = text_col(meta.get(), i, 0);
             const std::string val = text_col(meta.get(), i, 1);
@@ -2737,6 +2756,8 @@ void GuaranteedStateStore::reap_expired() {
                     prev = static_cast<int64_t>(v);
             } else if (key == "last_anomaly_facts") {
                 last_facts = val;
+            } else if (key == "bootstrap_settled") {
+                bootstrap_settled = true;
             }
         }
         if (prev && (*prev < 0 || *prev > now)) {
@@ -2782,18 +2803,70 @@ void GuaranteedStateStore::reap_expired() {
             .big_step = prev.has_value() && expiring > 0 &&
                         audit_retention::moved_at_least(*prev, now, kReapBigStepSecs) && now > *prev,
             .prev_unusable = prev_unusable,
+            // #2579's missing-anchor trigger. RECORDED ANSWER (routed-concern
+            // "Clock-guarded retention" part 6): decline — AuditStore's answer, not
+            // ResultSetStore's. A mis-timed pass here would destroy Guardian
+            // drift/remediation events and their DEX observation projection, the
+            // non-regenerable compliance evidence ADR-0038 exists to bring into
+            // #2508 compliance — unlike ResultSetStore's reproducible one-TTL-window
+            // scratch result sets, which is why that store opts out.
+            .no_anchor = !bootstrap_settled,
         };
         const auto anomaly = audit_retention::classify(facts);
+        // FIVE chars — the 5th ('b') is safe to add here without the mixed-version
+        // dedup hazard ResultSetStore's comment warns about: the 4-char format never
+        // shipped (born-on-PG in this same PR; no deployed writer emits it).
         const std::string facts_ser = std::string(facts.has_expired ? "e" : "-") +
                                       (facts.would_wipe ? "w" : "-") +
                                       (facts.big_step ? "s" : "-") +
-                                      (facts.prev_unusable ? "u" : "-");
+                                      (facts.prev_unusable ? "u" : "-") +
+                                      (facts.no_anchor ? "b" : "-");
+
+        // The pass has now REACHED A VERDICT, so settle the bootstrap marker — HERE,
+        // not at the re-anchor above. The re-anchor runs before the probes, so
+        // deriving the trigger from the stored reading would let a transient probe
+        // failure spend it permanently: the next pass would see a reading, call
+        // itself anchored, and delete with every detector false — the exact defect
+        // #2579 closes. Every early return above this line rolls the whole
+        // transaction back, so a pass that never reached a verdict leaves the
+        // trigger armed.
+        if (!bootstrap_settled) {
+            pg::PgResult settle = pg::exec_params(
+                conn,
+                "INSERT INTO guaranteed_state_store.gc_meta (key, value) VALUES "
+                "('bootstrap_settled', '1') ON CONFLICT (key) DO NOTHING",
+                std::vector<std::string>{});
+            if (settle.status() != PGRES_COMMAND_OK) {
+                spdlog::error("GuaranteedStateStore::reap_expired: bootstrap settle failed: {}",
+                              PQerrorMessage(conn));
+                return false;
+            }
+        }
+
         if (anomaly != audit_retention::Anomaly::None) {
             if (facts_ser != last_facts) {
-                spdlog::warn("GuaranteedStateStore::reap_expired: retention clock anomaly ({} "
-                             "facts={}) — declining this pass; an identical next pass will "
-                             "drain, capped",
-                             static_cast<int>(anomaly), facts_ser);
+                // A NAME, not the enum ordinal: #2579 inserted an enumerator
+                // mid-enum, so an ordinal silently renames itself across an
+                // upgrade while the operator-facing string stays put.
+                const char* anomaly_name = "unknown";
+                switch (anomaly) {
+                case audit_retention::Anomaly::None: anomaly_name = "none"; break;
+                case audit_retention::Anomaly::NoAnchor: anomaly_name = "no-anchor"; break;
+                case audit_retention::Anomaly::Wipe: anomaly_name = "wipe"; break;
+                case audit_retention::Anomaly::Step: anomaly_name = "step"; break;
+                case audit_retention::Anomaly::BadState: anomaly_name = "bad-state"; break;
+                }
+                if (anomaly == audit_retention::Anomaly::NoAnchor) {
+                    spdlog::warn("GuaranteedStateStore::reap_expired: no usable previous "
+                                 "retention clock reading and rows are already expired — "
+                                 "declining this pass and anchoring; the next pass has a "
+                                 "comparison point and proceeds (#2579)");
+                } else {
+                    spdlog::warn("GuaranteedStateStore::reap_expired: retention clock anomaly "
+                                 "({} facts={}) — declining this pass; an identical next pass "
+                                 "will drain, capped",
+                                 anomaly_name, facts_ser);
+                }
                 pg::PgResult rec = pg::exec_params(
                     conn,
                     "INSERT INTO guaranteed_state_store.gc_meta (key, value) VALUES "
@@ -2805,7 +2878,8 @@ void GuaranteedStateStore::reap_expired() {
                                   PQerrorMessage(conn));
                     return false;
                 }
-                outcome = "declined";
+                outcome = anomaly == audit_retention::Anomaly::NoAnchor ? "declined_no_anchor"
+                                                                        : "declined";
                 return true;
             }
             // Suppressed repeat of the SAME fact set — condition already
