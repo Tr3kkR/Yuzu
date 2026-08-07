@@ -105,7 +105,11 @@ The SQLite store's background cleanup thread issues **bare wall-clock TTL delete
 `gc_meta`-style rows (`last_pass_now`, `last_anomaly_facts`, `bootstrap_settled`) in the
 store schema, one sweeping replica per pass via
 `pg_try_advisory_xact_lock('guaranteed_state_store:reap',0)`, outcome probe excluding
-implausibly-ahead rows, `audit_retention_rules::classify` + fact-set decline-once,
+implausibly-ahead rows — the horizon is derived from this store's own `retention_days_`
+(`now + retention_window_secs + kReapTtlFutureSlackSec`, matching `audit_store.cpp`'s
+`datable_horizon` shape, own constant), not a fixed guess, so no accepted
+`--guardian-event-retention-days` value can falsify it (#2663 review) —
+`audit_retention_rules::classify` + fact-set decline-once,
 **unconditional per-pass cap** (substrate-tuned constant; events and observations reaped
 in the same guarded pass so the PII projection never outlives its parent event — the
 lockstep invariant survives). The `events_reaped_`/`observations_reaped_` counters

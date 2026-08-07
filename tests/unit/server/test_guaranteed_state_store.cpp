@@ -146,10 +146,20 @@ std::string query_scalar(const std::string& dsn, const std::string& sql) {
 // still reaches a verdict and settles `bootstrap_settled` (see
 // `guaranteed_state_store.cpp`'s `reap_expired`), which is the effect this
 // helper exists for. Call it immediately after construction, before seeding.
-void anchor_guard(GuaranteedStateStore& store) {
+//
+// The `last_anomaly_facts` check is load-bearing, not decorative (governance
+// UP-consistency finding): the reaped-count checks above hold identically on
+// ANY decline path, since nothing is ever deleted on a decline — they cannot
+// tell a genuinely clean `None` short-circuit apart from a wrong-reason
+// decline (`Wipe`/`BadState`) a future `classify()`-path regression might
+// cause on an empty table. Only the ABSENCE of a recorded anomaly fact set
+// discriminates the two.
+void anchor_guard(GuaranteedStateStore& store, const std::string& dsn) {
     store.reap_expired();
     REQUIRE(store.events_reaped_total() == 0);
     REQUIRE(store.observations_reaped_total() == 0);
+    REQUIRE(query_scalar(dsn, "SELECT COUNT(*) FROM guaranteed_state_store.gc_meta WHERE key = "
+                              "'last_anomaly_facts'") == "0");
 }
 
 // ── Backfill legacy-SQLite fixtures (ADR-0038's 5-table shape) ─────────────
@@ -2053,7 +2063,7 @@ TEST_CASE("GuaranteedStateStore: reap_expired reaps observations in lockstep wit
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool, /*retention_days=*/30);
-    anchor_guard(store); // consume the #2579 bootstrap decline before seeding
+    anchor_guard(store, db.dsn()); // consume the #2579 bootstrap decline before seeding
     auto obs = [&](const std::string& id) {
         GuaranteedStateEventRow e;
         e.event_id = id;
@@ -2119,6 +2129,48 @@ TEST_CASE("GuaranteedStateStore: retention_days=0 disables TTL",
     CHECK(store.events_reaped_total() == 0);
 }
 
+// Quality-engineer gap (governance): the test above can't discriminate a
+// broken `retention_window_secs` guard, because every row IT seeds gets
+// ttl_expires_at=0 via compute_ttl_epoch()'s OWN, separate, unmodified
+// `retention_days_ <= 0` sentinel — excluded from the reap probe's
+// `ttl_expires_at > 0` predicate regardless of the horizon value, so
+// `retention_window_secs`'s identically-shaped guard is never exercised.
+// This test seeds rows with POSITIVE ttl_expires_at directly via SQL
+// (bypassing compute_ttl_epoch entirely) under a NEGATIVE retention_days_ —
+// legitimate input: the guard's own `<= 0` shape treats 0 and negative
+// identically, so a negative value pins the same branch a future caller
+// could reach. If the horizon guard were ever removed
+// (`retention_window_secs = retention_days_ * 86400` unconditionally),
+// -5 * 86400 would push `datable_horizon` into the PAST, wrongly excluding
+// "future-live" from `datable` and turning a clean partial-expiry drain into
+// a false `would_wipe` decline.
+TEST_CASE("GuaranteedStateStore: negative retention_days computes the same "
+          "zero-window reap horizon as zero",
+          "[pg][guaranteed_state_store][retention][clock-guard]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool, /*retention_days=*/-5);
+    anchor_guard(store, db.dsn());
+
+    REQUIRE(store.insert_event(make_event("old-expired", "r", "a")));
+    REQUIRE(store.insert_event(make_event("future-live", "r", "a")));
+    exec_sql(db.dsn(),
+            "UPDATE guaranteed_state_store.guaranteed_state_events SET ttl_expires_at = "
+            "(EXTRACT(EPOCH FROM clock_timestamp())::bigint - 500000) WHERE event_id = "
+            "'old-expired'"); // ~5.8 days past — deeply expired regardless of horizon
+    exec_sql(db.dsn(),
+            "UPDATE guaranteed_state_store.guaranteed_state_events SET ttl_expires_at = "
+            "(EXTRACT(EPOCH FROM clock_timestamp())::bigint + 100) WHERE event_id = "
+            "'future-live'"); // barely in the future — inside a correct (0d+2d slack) horizon,
+                              // outside a broken (negative-window) one
+
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 1); // clean partial-expiry drain, not a would_wipe decline
+    CHECK(store.event_count() == 1);
+    CHECK(query_scalar(db.dsn(), "SELECT event_id FROM guaranteed_state_store."
+                                 "guaranteed_state_events") == "future-live");
+}
+
 TEST_CASE("GuaranteedStateStore: reap_expired deletes rows past ttl_expires_at, keeps fresh ones",
           "[pg][guaranteed_state_store][retention]") {
     // Ported to reap_expired()'s #2496 gc_sweep shape (ADR-0038) — a real PG
@@ -2129,7 +2181,7 @@ TEST_CASE("GuaranteedStateStore: reap_expired deletes rows past ttl_expires_at, 
     YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool, /*retention_days=*/30);
-    anchor_guard(store); // consume the #2579 bootstrap decline before seeding
+    anchor_guard(store, db.dsn()); // consume the #2579 bootstrap decline before seeding
 
     for (int i = 0; i < 3; ++i)
         REQUIRE(store.insert_event(make_event("fresh-" + std::to_string(i), "r", "a")));
@@ -2172,13 +2224,15 @@ TEST_CASE("GuaranteedStateStore: reap_expired declines once on an all-expired "
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool, /*retention_days=*/30);
     REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
     // Anchored first: without this, pass 1's fact set carries no_anchor=true
     // (#2579 — a decline in its own right, would_wipe outranks it so the
     // decline reason is unaffected) but SETTLES the bootstrap marker, so pass
     // 2's fact set differs from pass 1's in that one field alone and is no
     // longer a suppressed repeat — it declines a second time instead of
     // draining. Anchoring first keeps this test's decline-once contract intact.
-    anchor_guard(store);
+    anchor_guard(store, db.dsn());
 
     for (int i = 0; i < 3; ++i)
         REQUIRE(store.insert_event(make_event("wipe-" + std::to_string(i), "r", "a")));
@@ -2212,6 +2266,14 @@ TEST_CASE("GuaranteedStateStore: reap_expired declines once on an all-expired "
     CHECK(store.events_reaped_total() == 0);
     CHECK(store.event_count() == 3); // still present — the decline held
     CHECK(gc_meta_anomaly_count() == "1");
+    // The metric label itself, not just the functional decline (governance
+    // gap): a regression mapping Wipe to declined_no_anchor would pass every
+    // check above while silently firing the WRONG alert.
+    CHECK(metrics.counter("yuzu_server_guardian_reap_passes_total", {{"result", "declined"}})
+              .value() == 1.0);
+    CHECK(metrics.counter("yuzu_server_guardian_reap_passes_total",
+                          {{"result", "declined_no_anchor"}})
+              .value() == 0.0);
 
     // Second pass: suppressed repeat (same fact set) — drains, capped.
     store.reap_expired();
@@ -2314,7 +2376,7 @@ TEST_CASE("GuaranteedStateStore: reap_expired's datable horizon covers a long re
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool, /*retention_days=*/500);
     REQUIRE(store.is_open());
-    anchor_guard(store);
+    anchor_guard(store, db.dsn());
 
     REQUIRE(store.insert_event(make_event("long-expired", "r", "a")));
     REQUIRE(store.insert_event(make_event("long-live", "r", "a"))); // ~500d-ahead ttl
@@ -2402,7 +2464,7 @@ TEST_CASE("GuaranteedStateStore: reap_expired caps a large expired batch at kRea
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool, /*retention_days=*/30);
     REQUIRE(store.is_open());
-    anchor_guard(store); // consume the #2579 bootstrap decline before seeding
+    anchor_guard(store, db.dsn()); // consume the #2579 bootstrap decline before seeding
 
     {
         pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
@@ -2545,7 +2607,7 @@ TEST_CASE("GuaranteedStateStore: reap_expired reaps a tied-ttl cohort of events 
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool, /*retention_days=*/30);
     REQUIRE(store.is_open());
-    anchor_guard(store); // consume the #2579 bootstrap decline before seeding
+    anchor_guard(store, db.dsn()); // consume the #2579 bootstrap decline before seeding
 
     {
         pg::PgConn conn{PQconnectdb(db.dsn().c_str())};

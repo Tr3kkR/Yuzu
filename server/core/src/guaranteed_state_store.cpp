@@ -2725,11 +2725,13 @@ void GuaranteedStateStore::reap_expired() {
         // arithmetic below (signed-overflow UB near INT64_MAX — the horizon adds a
         // retention-derived window that itself could not overflow on any accepted
         // `retention_days_`, but `now` is the unbounded half of that sum) — clock-
-        // guard part 3. UPPER bound only: this store reads the PROCESS clock (unlike
-        // AuditStore's PG-side `pg_now`, ADR-0038 divergence, deliberate — the
-        // sanitiser applies regardless of clock source). A NEGATIVE reading is the
-        // legitimate dead-CMOS case the
-        // guard exists for, so it is not rejected here.
+        // guard part 3. UPPER bound only: this store reads the PROCESS clock, not
+        // AuditStore's PG-side `pg_now` — the sanitiser applies regardless of clock
+        // source. This divergence pre-dates the #2663 fix (not this diff's decision)
+        // and ADR-0038 does not record a rationale for it; #2508 tracks bringing this
+        // store's clock source in line with the AuditStore reference shape, same as
+        // `ResultSetStore`'s own deferred process-clock use. A NEGATIVE reading is the
+        // legitimate dead-CMOS case the guard exists for, so it is not rejected here.
         constexpr int64_t kMaxPlausibleNow = std::numeric_limits<int64_t>::max() / 4;
         if (now > kMaxPlausibleNow) {
             spdlog::warn("GuaranteedStateStore::reap_expired: implausible clock reading ({}); "
@@ -2882,9 +2884,10 @@ void GuaranteedStateStore::reap_expired() {
                 }
                 if (anomaly == audit_retention::Anomaly::NoAnchor) {
                     spdlog::warn("GuaranteedStateStore::reap_expired: no usable previous "
-                                 "retention clock reading and rows are already expired — "
-                                 "declining this pass and anchoring; the next pass has a "
-                                 "comparison point and proceeds (#2579)");
+                                 "retention clock reading and rows are already expired "
+                                 "(now={} facts={}) — declining this pass and anchoring; the "
+                                 "next pass has a comparison point and proceeds (#2579)",
+                                 now, facts_ser);
                 } else {
                     spdlog::warn("GuaranteedStateStore::reap_expired: retention clock anomaly "
                                  "({} facts={}) — declining this pass; an identical next pass "
