@@ -856,6 +856,38 @@ test('changelog order',
   timeout: 10,
 )
 
+# Prometheus alert-rule unit tests (#2553). The same script the docs-lint
+# workflow runs, so self-hosted legs and /test exercise the same code path CI
+# does -- WHEREVER A USABLE PROMTOOL IS PRESENT. No CI leg sets the opt-in below
+# and none is documented as carrying a 3.x promtool, so the realistic outcome on
+# all three is SKIP; the authoritative run is the workflow job. Rationale for the
+# tests themselves: tests/prometheus/run_promtool_tests.py.
+#
+# DOES NOT PULL A CONTAINER unless you opt in. `scripts/ci/flake-retry.py` runs
+# `meson test` with NO --suite filter on three REQUIRED build legs, so a
+# docker-dependent test registered here puts a container registry on all three;
+# an earlier version of this wiring did exactly that and was reverted. Without
+# YUZU_TEST_ENABLE_PROMTOOL_DOCKER the harness needs a native promtool of the
+# pinned major and skips (77) otherwise. Timeout matches the workflow's own
+# 10-minute budget for the same work: under the opt-in this pulls a ~110 MB
+# image before it runs anything.
+test('prometheus alert rules',
+  _python3_test,
+  args: [files('prometheus/run_promtool_tests.py')],
+  suite: 'docs',
+  timeout: 600,
+)
+
+# Pure-logic selftest for the harness above (version-banner parsing, docker argv
+# construction, the pin's own shape). No promtool, no docker, no network, so it
+# runs everywhere -- mirroring the flake-retry and plugin-spawn selftests below.
+test('prometheus harness selftest',
+  _python3_test,
+  args: [files('prometheus/run_promtool_tests.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Tracker close-automation regression corpus (ADR-3001 A1 §11-§12): the frozen
 # parser fixtures (incl. PR #1711, the canonical negated close) + the decision
 # ladder's never-close/fail-closed/cap contracts. No network. scripts/ changes

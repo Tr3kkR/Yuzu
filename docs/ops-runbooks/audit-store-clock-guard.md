@@ -50,7 +50,9 @@ clock-anomaly series, deliberately: it makes no claim that the clock moved, so i
 must not fire an alert that says one did. Expect 0 or 1 per database, typically on
 first boot against a fresh `audit_store` schema. A value that keeps climbing means
 the anchor is not surviving, and `YuzuAuditRetentionAnchorNotSurviving` (below)
-fires on it.
+fires on it — triage is stated there rather than here so it has one home. The
+full trigger list and the reasoning behind these signals live on the canonical
+page: [Limits](../user-manual/audit-log.md#the-retention-clock-guard).
 
 ## YuzuAuditPersistFailures - audit WRITES are failing
 
@@ -190,11 +192,93 @@ nothing is running to raise one, so the store looks identical to a quiet healthy
 one while `audit_store.audit_events` grows without bound and the configured
 window stops being enforced.
 
+**First: was this expected?** Three routine, self-clearing causes account for a
+firing that needs no action. All three share one shape — Prometheus, not the
+server, lost the history.
+
+- **Prometheus was restarted, or its TSDB is fresh.** `increase()` over a
+  PARTIAL range returns 0, and the young-server grace watches the SERVER's
+  uptime, not Prometheus's, so it does not apply. A healthy long-lived server
+  whose last hourly pass predates the first scrape is indistinguishable from a
+  dead reaper until a pass lands inside the new window.
+- **A new HA replica joined**, which is the same thing from the replica's side.
+- **You applied this rules file for the first time.**
+
+In all three the alert clears the moment the next pass lands. **Measured: about
+45 minutes**, bounded by the 60-minute cleanup interval rather than by anything
+this rule controls. (Do not re-derive that as `for:` plus the interval — `for:`
+delays when firing STARTS, it does not extend the end, and adding the two is the
+arithmetic that produced an earlier wrong "~75 minutes".) If the
+firing began within an hour of a Prometheus restart and clears on its own inside
+that window, it was this. **If it does NOT clear, it was never this** — carry on
+below.
+
+**A resolution is not by itself evidence of recovery.** On a still-dead reaper
+this rule can resolve and re-fire (measured: as little as 2 minutes firing per
+162-minute restart cycle), so a fired-then-resolved sequence in Alertmanager
+history reads like a transient blip when the control is still down. Confirm
+recovery by seeing `yuzu_server_audit_retention_passes_total` actually RISE, not
+by seeing the alert go away.
+
 Check that the store opened at boot (a failed migration closes it, and
 `start_cleanup()` then early-returns), and look for `AuditStore: retention pass
 threw` in the log. The rule carries an uptime guard because the cleanup thread
 sleeps a full interval before its first pass, so a freshly started server
-legitimately has no pass yet.
+legitimately has no pass yet. That grace excuses a server only while its uptime
+has at most ONE reset across the alert window - one restart is an ordinary
+install-then-config-fix, while a process restarting more often than hourly never
+accumulates uptime past the grace, and a crash loop is a leading cause of zero
+completed passes, so it must not be excused. If the alert is firing on a young
+server, check whether it is actually restarting:
+`resets(yuzu_server_uptime_seconds[3h])`.
+
+> **If you suspect a crash loop but this alert is SILENT, there are TWO causes
+> and one of them is this rule.**
+>
+> *Unstable target identity.* `resets()` needs one continuous series per server.
+> When a restart changes the `instance` label - dynamic-port or IP-based service
+> discovery, a rescheduled pod - every restart starts a fresh series with no
+> resets and a young uptime, so the grace applies forever and this rule cannot
+> fire. That one IS a scrape-configuration problem: target a stable identity.
+>
+> *Or the cadence is inside this rule's blind band, with perfectly stable
+> labels.* Measured (#2553): a genuinely dead reaper is undetected at restart
+> cadences of **164-195 minutes** (163-196 at a 5-minute evaluation interval). Uptime never reaches the 3-hour grace, and the window
+> holds two resets for too little time to satisfy `for: 15m`. Nothing is
+> misconfigured; there is nothing to fix in scrape config. Narrower than what it
+> replaced - which was silent at every cadence sampled against it - but not
+> closed. Full sweep and method: `docs/prometheus/blind-band-measurement.md`.
+>
+> Either way, **do not read this rule's silence as a healthy reaper.** Confirm
+> restarts with `journalctl --list-boots` or the orchestrator's restart count
+> rather than trusting `resets()`, and read
+> `yuzu_server_audit_retention_passes_total` directly - a counter flat while the
+> process is up IS the dead-reaper condition, whatever this rule says.
+
+**Before assuming a crash loop, check the uptime series exists.** If
+`yuzu_server_uptime_seconds` returns nothing for this instance, the rule fired
+on its absent-series arm — deliberate, because a server that stops exporting
+uptime must not be able to silence its own liveness alert. **What that tells you
+is that the GRACE is gone, not that the SIGNAL is spurious.** The alert's other
+arm, `increase(yuzu_server_audit_retention_passes_total[3h]) == 0`, is what
+actually fired, and `cleanup_once` bumps that counter unconditionally before
+every return — so a flat counter is the dead-reaper condition itself. With the
+uptime series missing, this rule can no longer tell a legitimately young server
+from a stopped reaper, and BOTH need checking:
+
+- Fix the scrape path — confirm the target is up and that a
+  `metric_relabel_configs` rule is not dropping `yuzu_server_uptime_seconds`.
+- **And** establish process age out of band (`journalctl --list-boots`, the
+  orchestrator's restart count) and read
+  `yuzu_server_audit_retention_passes_total` yourself. A process up for more than
+  a couple of cleanup intervals with a flat counter is a stopped reaper, and the
+  checks earlier in this section — `AuditStore: retention pass threw`, whether
+  the store opened at boot, `..._retention_last_pass_unixtime` — are the work.
+
+Treating this as scrape-only leaves audit retention unenforced while the audit
+store grows. The separate `YuzuAuditRetentionMetricMissing` alert covers the other half
+— the retention *counter* not being scraped at all, which leaves this rule unable
+to fire for anyone.
 
 To check the retention index directly:
 ```sql
@@ -224,6 +308,63 @@ replica rehydrated from an older template, a manual `DELETE`/`TRUNCATE` on
 itself is succeeding each pass; the problem is something else deleting the
 row between passes. If it is RISING, see `YuzuAuditRetentionStateNotPersisting`
 below instead — that is the write actually failing.
+
+## YuzuAuditRetentionMetricMissing
+
+No `yuzu_server_audit_retention_passes_total` series exists in this Prometheus at
+all, so `YuzuAuditRetentionNotRunning` cannot fire for anyone: `increase()` over a
+metric with no series is an empty vector, and an alert that selects nothing never
+alerts. Retention is unmonitored until this is resolved.
+
+**Check `up` for the Yuzu target first — this rule cannot tell these three states
+apart.**
+
+- **`up` is 0.** The server or its scrape is down. This is an OUTAGE, not a
+  monitoring gap, and on a single-server Prometheus this rule may be the only one
+  firing, because nothing in the shipped rule set alerts on `up` directly. Work
+  the outage; this alert clears when scraping resumes.
+- **`up` returns no series at all.** Two very different things look identical
+  here, so do not assume the benign one:
+  - this Prometheus was never configured to scrape a Yuzu server — **expected and
+    ignorable** before the first one is stood up. Check the targets page.
+  - the target has **left service discovery**. Under dynamic-port, IP-based or
+    scheduler-managed SD that is exactly what a dead or deleted server looks
+    like. An empty target list for a fleet you believe is running is an outage.
+- **`up` is 1.** The metric itself is missing. Either the server predates it (the
+  rules file is a copy you apply yourself, so it routinely runs ahead of the
+  servers it points at), or a scrape config is dropping it. Confirm with
+  `curl -s <server>/metrics | grep audit_retention_passes`, then check
+  `metric_relabel_configs`.
+
+It is **fleet-wide by construction**: `absent()` fires only when NO series exists
+anywhere in this Prometheus, so one server going quiet among many is invisible
+here.
+
+**An `up`-based target-down alert does not cover that**, and this page said it did
+until #2553 pass 13. The server you are missing is alive and scraped - typically
+an older build that does not export the counter yet, since the rules file is
+applied by hand and routinely runs ahead of the servers - so its `up` is 1.
+Measured: with one server exporting the counter and one not, neither retention
+rule fires for either server. During a staged upgrade, confirm coverage directly
+with `count(yuzu_server_audit_retention_passes_total)` against your expected
+server count. A per-target rule is tracked separately.
+
+## YuzuAuditRetentionAnchorNotSurviving
+
+The guard has declined more than once in a day for having NO stored clock
+reading. Expect that AT MOST ONCE per database, on the upgrade that adds the
+reading. Repeating means the anchor is being lost between passes, so the
+restart-surviving half of the clock guard is not working and every pass starts
+blind. **Nothing was deleted by those passes** - this is lost detection, not lost
+evidence.
+
+Check `yuzu_server_audit_retention_persist_failed_total` FIRST. If it is rising,
+the server cannot write the row: disk, permissions, or a read-only mount. If it
+is FLAT, the row is being destroyed outside the server - a restore from a pre-v3
+backup, a replica rehydrated from a template, a disk-level rollback - which that
+counter cannot see, because the write it counts succeeded every time. A flat
+`persist_failed_total` is therefore not evidence the anchor is fine; it only
+rules out one of the two causes.
 
 ## YuzuAuditRetentionStateNotPersisting
 

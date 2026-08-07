@@ -143,10 +143,14 @@ documented in `docs/user-manual/audit-log.md`.
 | `yuzu_server_audit_read_degrade_total{reason}` | counter | Audit **read** queries that could not be served and so returned `503` (deny-on-degrade — the SOC 2 evidence trail never reads as a false-empty `200`). `reason` is a closed set: `store_not_open`, `pool_acquire_timeout`, `query_error`. Any sustained non-zero value is an evidence-availability gap; see the `YuzuAuditReadDegraded` alert. |
 | `yuzu_server_audit_backfill_total{result}` | counter | Outcome of the one-time legacy-`audit.db` → PostgreSQL backfill at boot (ADR-0040). `result` is a closed set: `fresh` (no legacy DB present — nothing to migrate), `completed` (streamed backfill ran and reconciled), `failed` (backfill errored — the server fails **closed**, refuses boot, and retries on the next start). **`failed` is not scrapeable**: the backfill runs during construction, so a failure returns from `run()` before the HTTP listener starts and `/metrics` is never served on that path — the boot log is the signal, and `YuzuAuditBackfillFailing` alerts on the *absence* of `completed`/`fresh` instead. All three series are **pre-seeded to 0** when the store is wired, so a healthy server always exports the family: a restart that finds the backfill already complete reaches no outcome at all and leaves every value at 0, and only a server that never started serving makes the series absent. |
 
-**Alert on absence, not just on rising counters.** Four of the five retention alert
-rules fire on something going wrong; `..._retention_passes_total` is the only one that catches the reaper not running at
+**Alert on absence, not just on rising counters.** Most of the retention alert
+rules fire on something going wrong; `..._retention_passes_total` is what catches the reaper not running at
 all, which is the state in which none of the other *counter*-driven rules can fire. The `YuzuAuditRetentionNotRunning`
-rule covers it.
+rule covers it. **Its companion `YuzuAuditRetentionMetricMissing` covers the one case it structurally cannot:** if this
+series is absent entirely - a server predating the metric, or a scrape config dropping it - `increase()` returns an empty
+vector, so `YuzuAuditRetentionNotRunning` selects nothing and can never fire. That rule keys on `absent(...)` instead, and
+is fleet-wide by construction (it cannot see one server among many going quiet). The current rule set is
+`docs/prometheus/yuzu-alerts.yml`.
 
 The skips and failed counters must be alerted on separately and never collapsed:
 both leave rows undeleted, so an audit table that never shrinks looks identical
