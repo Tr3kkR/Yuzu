@@ -118,6 +118,21 @@ void emit_spark_heartbeat_tags(TagMap& tags, bool running, const SparkEngineStat
         tags["yuzu.spark_armed_faulted"] = std::to_string(ss.armed_faulted);
     if (ss.watch_faults_total > 0)
         tags["yuzu.spark_watch_faults"] = std::to_string(ss.watch_faults_total);
+    // #2270: a throwing unwatch during the arm-race teardown orphans an OS watch, and
+    // the fallback log line is inside a catch-all so it is dropped under the very OOM
+    // that triggers the path. Without this tag the residual has NO egress at all — the
+    // agent has no /metrics, so heartbeat tags are the only route off the box. Covers
+    // teardown_arm_race ONLY; see the field doc. The fleet rollup is deferred to the
+    // prefer_spark flip, as retiring/retiring_cap already is.
+    if (ss.arm_race_unwatch_failures_total > 0)
+        tags["yuzu.spark_arm_race_unwatch_failures"] =
+            std::to_string(ss.arm_race_unwatch_failures_total);
+    // The same residual on the ordinary disarm() teardown, counted separately because the
+    // scope is in each name on purpose. Neither covers unregister_consumer(), which still
+    // propagates — so a zero across both is not a fleet-wide all-clear.
+    if (ss.disarm_unwatch_failures_total > 0)
+        tags["yuzu.spark_disarm_unwatch_failures"] =
+            std::to_string(ss.disarm_unwatch_failures_total);
     if (ss.queued_dropped_total > 0)
         tags["yuzu.spark_queued_dropped"] = std::to_string(ss.queued_dropped_total);
     if (ss.consumer_errors_total > 0)

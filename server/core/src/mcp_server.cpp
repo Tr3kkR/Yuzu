@@ -304,7 +304,7 @@ static const ToolDef kTools[] = {
 
     {"query_audit_log",
      "Query the audit log with filters. Returns timestamped entries showing who did what, when.",
-     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"maximum":500}}})"},
+     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500}}})"},
 
     {"list_definitions",
      "List available instruction definitions (commands that can be dispatched to agents).",
@@ -2708,9 +2708,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 AuditQuery aq;
                 aq.limit = 50;
+                // ADR-0040: degrade-distinguishable read — nullopt on a
+                // store/pool failure. Surface an error, never a false-empty
+                // resource (an audit blip must not read as "no activity").
                 auto events = audit_store->query(aq);
+                if (!events) {
+                    res.set_content(error_response(id, kInternalError, "Audit store degraded"),
+                                    "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& e : events) {
+                for (const auto& e : *events) {
                     arr.add(JObj()
                                 .add("timestamp", e.timestamp)
                                 .add("principal", e.principal)
@@ -3333,7 +3341,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     if (appr->status != "approved") {
                         // rejected / expired.
-                        mcp_audit("denied", "approval " + supplied_id + " status=" + appr->status);
+                        mcp_audit("denied",
+                                  "approval_id=" + supplied_id + " status=" + appr->status);
                         res.set_content(
                             a4_error(kPermissionDenied, "approval was " + appr->status,
                                      "submit a new request without approval_id to obtain a fresh "
@@ -3347,10 +3356,102 @@ McpServer::HandlerFn McpServer::build_handler(
                     // most once per ticket).
                     // H3/N2 (SOC-2 CC7.2): stamp WHO consumed the ticket — the
                     // authenticated principal recalling the tool.
-                    if (auto consumed =
-                            approval_manager->consume_ticket(supplied_id, session->username);
+                    if (auto consumed = approval_manager->consume_ticket(
+                            supplied_id, session->username, {});
                         !consumed) {
-                        mcp_audit("denied", "approval " + supplied_id + " already used");
+                        const ConsumeFailure kind = consumed.error().kind;
+                        // AUDIT names the kind. This row is server-side and is
+                        // never returned to the caller, so the anti-oracle
+                        // argument below does not reach it. Auditing every
+                        // refusal as "already used" recorded a cross-surface
+                        // forgery attempt — the event #2442 exists to detect —
+                        // identically to a benign replay, and said it about a
+                        // row whose consumed_at is still 0.
+                        //
+                        // The METRIC is a separate instrument from the audit
+                        // row: the row is the forensic record, one per event
+                        // and its write unchecked, so nothing can alert on it.
+                        // The counter gives an operator a refusal RATE.
+                        //
+                        // It deliberately carries NO reason label. The denial
+                        // token is exactly the distinction the client response
+                        // below refuses to make, and `/metrics` is not a
+                        // stronger reader than the caller: it is exempt for
+                        // localhost and otherwise needs only a resolved
+                        // session — the same credential the MCP caller already
+                        // holds. A `reason` label would therefore let a token
+                        // holder recall a suspect ticket, read the series
+                        // either side, and recover which surface minted it,
+                        // reopening the oracle this handler exists to close.
+                        // The kind stays in the audit trail, which is genuinely
+                        // server-side.
+                        count_denial("yuzu_mcp_approval_refused_total", nullptr);
+                        mcp_audit("denied", "approval_id=" + supplied_id +
+                                                " refused: " + consume_denial_reason(kind));
+
+                        // CLIENT message stays uniform for the two that must not
+                        // be distinguishable: a foreign-origin refusal reads
+                        // exactly like an ordinary replay, or the recall becomes
+                        // a probe for which surface minted a ticket.
+                        //
+                        // kStoreError is NOT one of those. It leaves the ticket
+                        // UNTOUCHED, so telling the caller it was "already used"
+                        // and to fetch a fresh one would burn a live human
+                        // approval on a failure a retry may clear.
+                        //
+                        // The remediation says "not consumed", which is always
+                        // true, rather than "still valid", which is not: the
+                        // 7-day TTL keeps running through an outage, so an
+                        // outage outlasting the ticket's remaining window ends
+                        // with it expired. Promising validity and then refusing
+                        // the ticket would leave the caller waiting on a
+                        // capability that had been retired underneath them.
+                        //
+                        // The retry directive is CONDITIONAL, and the condition
+                        // is the point. A5 wants a retry hint to be machine
+                        // metadata rather than prose, and omitting it emits
+                        // null, which this file's convention reads as NOT
+                        // retryable — so a transient failure must carry one.
+                        //
+                        // `kStoreError` also covers the store never having
+                        // opened, and telling a client to retry every 5s a
+                        // condition that cannot clear is an unbounded loop that
+                        // writes an audit row per attempt.
+                        //
+                        // The `!is_open()` arm below is DEFENCE IN DEPTH, not a
+                        // live discriminator, and saying otherwise was wrong:
+                        // a closed store cannot reach this line today. The
+                        // lookup above uses `get()`, which collapses a failed
+                        // read to "no row", so a closed store returns -32003
+                        // there and consume is never called. The arm is kept
+                        // because it costs one branch and stops this site
+                        // becoming the fail-open one if that lookup changes.
+                        //
+                        // What is NOT covered either way: an OPEN handle whose
+                        // reads fail permanently — CORRUPT, NOTADB, READONLY,
+                        // FULL — takes the retry arm and is told to retry
+                        // forever. That is the real gap, it needs
+                        // sqlite3_extended_errcode carried on ConsumeError,
+                        // and it is not closed here.
+                        if (kind == ConsumeFailure::kStoreError) {
+                            const bool open = approval_manager->is_open();
+                            res.set_content(
+                                open ? a4_error(kInternalError,
+                                                "approval store temporarily unavailable",
+                                                "retry this call unchanged — the approval was NOT "
+                                                "consumed, so do not request a fresh one. The "
+                                                "7-day approval window keeps running during an "
+                                                "outage: if it elapses the ticket expires and a "
+                                                "new approval is required",
+                                                5000)
+                                     : a4_error(kInternalError, "approval store unavailable",
+                                                "this will NOT clear on retry — the approval was "
+                                                "NOT consumed and does not need re-requesting "
+                                                "while the 7-day window holds. Escalate to an "
+                                                "operator"),
+                                "application/json");
+                            return;
+                        }
                         res.set_content(
                             a4_error(kPermissionDenied,
                                      "approval already used (one-time ticket)",
@@ -3477,10 +3578,29 @@ McpServer::HandlerFn McpServer::build_handler(
                 aq.target_type = param_str(args, "target_type");
                 aq.since = param_int(args, "since");
                 aq.until = param_int(args, "until");
-                aq.limit = std::min(param_int32(args, "limit", 50), 500);
+                // Clamp BOTH bounds, in 64-bit BEFORE narrowing — the
+                // query_responses idiom (`:3660`). Upper alone left a
+                // negative or zero `limit` reaching `AuditStore::query`,
+                // which clamps a non-positive limit to `LIMIT 0` at its own
+                // sink (`std::max(q.limit, 0)`) — a caller-supplied bad
+                // limit therefore came back as an EMPTY page, not an error,
+                // for the one query this store's ADR explicitly promises
+                // never reads false-empty. `param_int32`'s int64->int32 cast
+                // also wraps a limit above INT_MAX negative before `std::min`
+                // ever saw it; clamping the raw int64 first avoids that.
+                aq.limit = static_cast<int>(
+                    std::clamp<std::int64_t>(param_int(args, "limit", 50), 1, 500));
+                // ADR-0040: degrade-distinguishable read — nullopt on a
+                // store/pool failure. Surface an error, never a false-empty
+                // result (an audit blip must not read as "no activity").
                 auto events = audit_store->query(aq);
+                if (!events) {
+                    res.set_content(error_response(id, kInternalError, "Audit store degraded"),
+                                    "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& e : events) {
+                for (const auto& e : *events) {
                     arr.add(JObj()
                                 .add("id", e.id)
                                 .add("timestamp", e.timestamp)

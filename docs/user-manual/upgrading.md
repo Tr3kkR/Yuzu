@@ -602,6 +602,128 @@ for lockout/break-glass recovery — that runbook has been rewritten for this
 cutover and is Postgres-native throughout (`psql "$YUZU_POSTGRES_DSN"` against
 the `auth` schema).
 
+## Audit trail migrates to PostgreSQL — history preserved (AuditStore, ADR-0040)
+
+The audit log (`AuditStore`, the SOC 2 evidence chain) moves from the SQLite
+`audit.db` file to the server's PostgreSQL substrate in this release (ADR-0006
+Wave 1.3), schema `audit_store`. **Unlike the AuthDB/ScimStore and ApiTokenStore
+cutovers above, this is NOT a fresh start — audit history is preserved.** Because
+the audit trail is SOC 2 evidence retained 365 days, pre-cutover rows are
+migrated, not reset.
+
+No new flag or environment variable is introduced: the store reuses the shared
+`--postgres-dsn` / `YUZU_POSTGRES_DSN` connection the rest of the server already
+requires, and (like every server store) it **fails closed** at boot if Postgres
+is unreachable — there is no SQLite fallback.
+
+**What happens on first PG boot:**
+
+- If a legacy `audit.db` is present, the server runs a **one-time, mandatory,
+  streamed backfill** of every audit row (in bounded batches, so a multi-GB table
+  does not exhaust memory) into `audit_store` before serving. The retention
+  horizon (`ttl_expires_at`) and clock-guard state come across too, so retention
+  behaviour is preserved exactly. Row counts are reconciled and logged.
+- The backfill is **idempotent and resumable** (a `backfill_complete` marker
+  gates re-runs; a crash mid-backfill resumes from where it stopped, with no
+  duplication and no loss).
+- **A failed or partial backfill fails the boot** — the server refuses to serve
+  with a knowingly-incomplete evidence chain, logs a loud diagnostic, and
+  **retries on the next start**. It does not silently start with a partial trail.
+  **The boot log is your primary signal here, not a metric.** The backfill runs
+  during server construction, and a failure stops the boot before the HTTP
+  listener starts, so `/metrics` is never served on that path and the
+  `yuzu_server_audit_backfill_total{result="failed"}` sample is never scraped.
+  The metric's `fresh` / `completed` values are observable on a server that came
+  up; the shipped `YuzuAuditBackfillFailing` sample rule therefore alerts on the
+  *absence* of a success outcome (see `docs/prometheus/yuzu-alerts.yml`), and a
+  wedged replica among healthy ones shows up as a down instance rather than on
+  that alert. **Silence that rule for the upgrade window if your legacy
+  `audit.db` is large enough to make the first boot long** — the server does not
+  serve `/metrics` until the backfill finishes, so a healthy multi-hour backfill
+  looks exactly like a wedged one from outside. The boot log is what tells them
+  apart.
+- **The backfill only ever runs against an empty `audit_store` schema or its own
+  interrupted copy.** Before resuming, it checks that the audit rows already in
+  PostgreSQL really are the partial copy of *this* `audit.db`. If they are not —
+  the usual causes are a DSN pointing at a different deployment's database, or a
+  restore that brought back `audit_events` without `audit_retention_meta` (which
+  carries the `backfill_complete` marker) — the server **refuses to start** with
+  `the existing rows are NOT an interrupted copy of …` rather than resuming past
+  rows it cannot account for and reporting a complete migration. Point the server
+  at the right database, or clear `audit_store.audit_events` if those rows are
+  not wanted, then restart.
+- **A server with no `audit.db` of its own will not "complete" someone else's
+  partial backfill.** The completion marker asserts the trail is whole, so a
+  server that finds audit rows already in PostgreSQL, no marker, and no usable
+  legacy file **refuses to start** rather than stamping the marker over rows it
+  cannot account for. The two ways to reach that state are a replica started
+  while another is still streaming (bring up one replica first, below), and a
+  partial backfill whose `audit.db` was moved aside before it finished. Restore
+  the legacy file and let the backfill finish, or use the abandon procedure in
+  [audit-store-backfill-recovery.md](../ops-runbooks/audit-store-backfill-recovery.md)
+  if it is genuinely unrecoverable.
+- After a verified backfill the legacy `audit.db` is **moved aside, not deleted**
+  — it becomes an operator-managed backup of the pre-cutover trail. Relocating or
+  archiving that file afterward is expected and safe. Its `-wal`/`-shm` sidecars,
+  if the previous server stopped uncleanly and left any, are moved with it: the
+  main file **alone is not a usable copy** when a WAL tail exists, so keep the set
+  together if you relocate it.
+
+**What to expect / do:**
+
+- **Budget for a longer first boot on a large `audit.db`.** A trail with tens of
+  millions of rows (~16 GB) can take meaningfully longer to stream than a normal
+  startup. **Widen your startup budget accordingly:** raise the Kubernetes
+  `startupProbe` (and any liveness) failure/period budget, or the Docker Compose
+  healthcheck `start_period`, so the orchestrator does not kill the server
+  mid-backfill and restart it into the same long boot repeatedly. The backfill is
+  resumable, so a killed boot is not corrupting — but it wastes the window.
+- **Scale-out: bring up the replica that HOLDS `audit.db` first — recommended,
+  not load-bearing for safety.** In a multi-replica deployment, starting that
+  one server first and letting it finish the backfill (the `backfill_complete`
+  marker is stamped in `audit_store`) before the rest avoids a refusal, but a
+  wrong boot order no longer loses evidence: if a replica with no legacy
+  `audit.db` of its own boots first against an empty table, it stamps the
+  completion marker over that emptiness (logging a WARNING naming what it
+  forecloses — routine on a genuine fresh install, the signal you started the
+  wrong host on an upgrade) — but the replica that DOES hold the trail does
+  **not** silently trust that marker. It re-reads its own `audit.db`, proves
+  (by fingerprint) whether that file's content was ever actually migrated, and
+  **refuses to boot** on a mismatch rather than reporting success over an
+  unmigrated trail. The file is left untouched at its original path — nothing
+  is lost, but that host needs an operator to resolve it (see
+  [audit-store-backfill-recovery.md](../ops-runbooks/audit-store-backfill-recovery.md))
+  before it will serve. Getting the boot order right the
+  first time avoids that operator step; it is no longer the thing standing
+  between you and silent evidence loss. Once the marker is present (and, for
+  every OTHER holder, verified) the remaining replicas start normally;
+  retention afterward is single-swept fleet-wide via an advisory lease (see
+  [Audit Log](audit-log.md#the-retention-clock-guard)).
+- **Reads deny-on-degrade.** After cutover, an audit-store or connection-pool
+  failure makes `GET /api/v1/audit*` return `503` rather than an empty `200`, so
+  an infrastructure blip can never be mistaken for "no audit activity."
+- **The break-glass one-shots run the backfill too.** `--mfa-reset` and
+  `--break-glass-arm` write an audit record without going through boot, so on an
+  upgraded host the first one of them to run performs the same migration a first
+  boot would (streaming the trail, stamping the marker, moving `audit.db` aside)
+  before it writes its record. Budget for that if you use one during the upgrade
+  window; if the backfill cannot complete, the one-shot refuses and changes
+  nothing rather than writing a record that would block every later boot.
+
+**Backfill refused at boot or from a one-shot?** Both refusal shapes — a
+holder-side verification failure (marker already set, this host's file
+unproven) and an unrecoverable legacy trail (marker absent, rows present) —
+including the SQL for the second one, now live in their own runbook:
+[audit-store-backfill-recovery.md](../ops-runbooks/audit-store-backfill-recovery.md).
+Not duplicated here.
+
+**Not affected:** the audit event vocabulary and REST/MCP query surface are
+unchanged; SIEM export recipes keep working. One deliberate behaviour change: on
+a multi-replica deployment an identical-magnitude repeat clock step no longer
+re-emits `yuzu_server_audit_clock_anomaly_skips_total` on every pass (only a
+distinct anomaly does) — if you alerted on that counter's *cadence*, alert on a
+sustained increase instead. See
+[Audit Log](audit-log.md#the-retention-clock-guard).
 ## Management-group confinement config migrates to Postgres (mandatory backfill, ADR-0042)
 
 The `ManagementGroupStore` — the confinement hierarchy that backs operator
@@ -996,8 +1118,8 @@ replaced, but the failure is logged as an error.
 **No manual migration steps are required.** Just replace the binary (or pull the new image and `up -d`) and start the server. Migration progress is logged at `info` level as:
 
 ```
-[info] MigrationRunner: audit_store migrated to v1
 [info] MigrationRunner: rbac_store migrated to v1
+[info] MigrationRunner: response_store migrated to v1
 ...
 ```
 
@@ -1006,17 +1128,32 @@ replaced, but the failure is logged as an error.
 **Verifying migration state after startup**, query the per-store audit trail directly:
 
 ```bash
-docker exec -i yuzu-server sqlite3 /var/lib/yuzu/audit.db \
+docker exec -i yuzu-server sqlite3 /var/lib/yuzu/rbac.db \
   "SELECT store, version, datetime(upgraded_at, 'unixepoch') FROM schema_meta ORDER BY upgraded_at;"
 ```
 
 Every store that has ever run through the migration runner has a row here with its current version and the wall-clock timestamp of the last stamp. This is the operator-side audit trail for schema evolution.
 
+**The Postgres-backed stores are not in that file.** Stores migrated onto the PostgreSQL
+substrate — `audit_store` among them (ADR-0040) — run through `PgMigrationRunner`, log
+`PgMigrationRunner: <store> migrated to v<N>`, and stamp `public.schema_meta` **in
+PostgreSQL**. Query those there instead:
+
+```bash
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT store, version, to_timestamp(upgraded_at) FROM public.schema_meta ORDER BY upgraded_at;"
+```
+
+For `audit_store` specifically, the legacy `audit.db` also **stops existing at its old path**
+after the one-time backfill: it is renamed to `audit.db.migrated-<epoch>` (with any
+`-wal`/`-shm` sidecars). A `sqlite3 /var/lib/yuzu/audit.db` command therefore fails with
+`unable to open database file` on a migrated server, and that is expected, not a fault.
+
 If a migration fails:
 
 1. Check the log for `MigrationRunner: migration v<N> failed for <store>: <sqlite error>` and note both the store name and the SQLite error.
 2. The server will have **closed the failing store's database handle**, so `/readyz` returns 503 with the failed store name in the `failed_stores` body field — the probe accurately reflects degraded state. Don't rely on `/livez` for readiness; it only checks process liveness, not schema integrity.
-3. Stop the server and restore the **affected** database file from backup — not the whole data directory. Restoring all databases to fix one broken store wipes in-flight approvals, pending agents, and enrollment tokens.
+3. Stop the server and restore the **affected** database file from backup — not the whole data directory. Restoring all databases to fix one broken store wipes in-flight approvals, pending agents, and enrollment tokens. **This step does not apply to a Postgres-backed store** such as `audit_store`: there is no per-store file to restore, so use the Postgres dump procedure under "Rollback if a migration fails" above.
 4. Start the previous server version against the restored data.
 5. Open an issue with the full error line, the source/target version numbers, and the output of the `schema_meta` query above.
 
@@ -1033,15 +1170,52 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
   rows, so a large backlog ages out over hours rather than in one statement.
   Watch `yuzu_server_audit_retention_cap_reached_total` alongside
   `yuzu_server_audit_rows_deleted_total` to see whether a backlog is draining.
-  That cap is a fixed drain rate, which implies a sustained ceiling of roughly
-  6.9 audit events/second - compare it against your own event rate before
-  deploying at scale. Note that changing `--audit-retention-days` never re-dates
+  The cap paces at two different cadences depending on whether a backlog is
+  forming — see [Audit Log § Capacity](audit-log.md#capacity) for both
+  figures; comparing your event rate against only the quiet-operation one is
+  overly conservative by roughly three orders of magnitude. Note that
+  changing `--audit-retention-days` never re-dates
   existing rows (`ttl_expires_at` is stamped at INSERT), so a reduction does not
   reclaim disk retroactively. Operator triage when the guard declines a pass:
   [audit-log.md § The retention clock guard](audit-log.md#the-retention-clock-guard).
 - **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
   table holding the durable clock reading - one row, instant) plus the
   best-effort index build described under Schema Migrations above.
+- **`YuzuAuditRetentionNotRunning` now fires for a crash-looping server (#2553).**
+  Its young-server grace previously keyed on uptime alone, so a process restarting
+  more often than the 3-hour alert window never accumulated enough uptime to leave
+  the grace and was excused on every evaluation - silently, and for one of the
+  leading causes of the exact condition the rule detects. The grace now also
+  requires the uptime series to have at most one reset across the window. **If you
+  deployed this rule and have a crash-looping server, expect a new-to-you firing**
+  that reflects a pre-existing condition rather than a new fault. The rules file is
+  a copy you apply yourself; the server does not upgrade it for you. One limit is
+  worth knowing before you rely on the fix: `resets()` needs a continuous series per
+  server, so if a restart changes the `instance` label (dynamic-port or IP-based
+  service discovery, a rescheduled pod) the grace still applies forever and the rule
+  stays silent - target a stable identity in scrape config. The same re-apply also
+  removes an `on(instance)` join from that rule, so a server that was being
+  silenced by an unrelated young series sharing its `instance` value (a canary, an
+  HA pair, a federated series) can now correctly fire too - the same
+  new-to-you-firing shape as the crash-loop fix, for the same reason.
+- **You must ADD a new rule by hand: `YuzuAuditRetentionMetricMissing` (#2553).**
+  `YuzuAuditRetentionNotRunning` cannot detect its own input going missing -
+  `increase()` over a metric with no series is an empty vector, so the rule selects
+  nothing and never fires. A Prometheus holding these rules against a server that
+  does not export `yuzu_server_audit_retention_passes_total` therefore reports
+  healthy forever while the audit reaper is entirely unmonitored, which is exactly
+  the state you are in if you apply this rules file ahead of upgrading your
+  servers. The new rule keys on `absent(...)` and fires after 15m. It is
+  **fleet-wide by construction**: it cannot see one server among many going quiet.
+  **A `up`-based target-down alert does NOT close that gap** — a server that is
+  running an older build is alive and scraped, so its `up` is 1; it simply does
+  not export this counter. Measured (#2553): in a fleet where one server exports
+  the counter and another does not, *neither* retention rule fires, for either
+  server, indefinitely. During a staged upgrade the practical mitigation is to
+  confirm coverage directly rather than to rely on an alert —
+  `count(yuzu_server_audit_retention_passes_total)` against your expected server
+  count — until every server is upgraded. A per-target rule for this is tracked
+  separately.
 - **The first guarded pass now declines when it has no stored reading and rows
   are already expired (#2579).** The stored clock reading (the anchor) is new in
   schema v3, so every database starts its first guarded pass without one. An
@@ -1093,12 +1267,13 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
   but a large excess (after a long disable, or an upgrade backlog) drains over
   several 900 s rollup ticks rather than in one statement.
 
-Five new Prometheus alert rules ship in `docs/prometheus/yuzu-alerts.yml`. The
-declined-pass and failed-pass counters must be alerted on separately: both leave
-rows undeleted, so an audit table that never shrinks looks identical either way.
-One rule, `YuzuAuditRetentionNotRunning`, fires on the reaper NOT running - the
-state in which none of the other counter-driven rules can fire, because they all
-key on a counter rising.
+New Prometheus alert rules ship in `docs/prometheus/yuzu-alerts.yml`, which is the
+current set. The declined-pass and failed-pass
+counters must be alerted on separately: both leave rows undeleted, so an audit
+table that never shrinks looks identical either way. One rule,
+`YuzuAuditRetentionNotRunning`, fires on the reaper NOT running - the state in
+which none of the other counter-driven rules can fire, because they all key on a
+counter rising.
 
 ### SLE — the `SoftwareLicensing` securable auto-grants on upgrade (ADR-0024)
 
