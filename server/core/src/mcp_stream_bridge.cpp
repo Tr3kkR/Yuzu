@@ -1730,6 +1730,20 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
         // still correct; it just does not round-trip to the same bytes.
         out->final_frame->event_id = fid;
     }
+    // #2791 test seam: exactly the window select_displaceable_pin_locked's
+    // projection_in_flight guard exists to mask - the frame is already
+    // committed to the ring (a live pin), but rec->pinned_event_id below is not
+    // yet stamped, so a scan right now cannot tell this pin from an orphan.
+    // Neither bridge_mu_ nor rec->mu is held here. Zero-cost when unarmed (one
+    // relaxed atomic load).
+    if (projection_stall_armed_for_test_.load(std::memory_order_acquire)) {
+        std::unique_lock<std::mutex> stall_lk(projection_stall_mu_);
+        projection_stall_armed_for_test_.store(false, std::memory_order_release);  // one-shot
+        projection_stall_reached_for_test_ = true;
+        projection_stall_cv_.notify_all();
+        projection_stall_cv_.wait_for(stall_lk, std::chrono::seconds(10),
+                                      [&] { return projection_stall_release_for_test_; });
+    }
     // Settle IMMEDIATELY after the commit/poison decision (C4): no later
     // bookkeeping failure may restore + republish.
     guard.terminal_settled = true;
@@ -2948,5 +2962,34 @@ void McpStreamBridge::inject_charge_lock_fault_for_test(int times) {
 }
 
 void McpStreamBridge::set_clock_for_test(ClockFn clock) { clock_ = std::move(clock); }
+
+McpStreamBridge::AccountingSnapshot McpStreamBridge::accounting_snapshot_for_test(
+    const std::string& session_id, const std::shared_ptr<McpStreamState>& stream) {
+    std::lock_guard<std::mutex> lk(bridge_mu_);
+    AccountingSnapshot snap;
+    snap.pinned = stream ? stream->pinned_count() : 0;
+    auto it = streamed_unpinned_.find(session_id);
+    snap.unpinned = it == streamed_unpinned_.end() ? 0 : it->second;
+    return snap;
+}
+
+void McpStreamBridge::arm_projection_stall_for_test() {
+    std::lock_guard<std::mutex> lk(projection_stall_mu_);
+    projection_stall_reached_for_test_ = false;
+    projection_stall_release_for_test_ = false;
+    projection_stall_armed_for_test_.store(true, std::memory_order_release);
+}
+
+bool McpStreamBridge::wait_projection_stall_reached_for_test(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lk(projection_stall_mu_);
+    return projection_stall_cv_.wait_for(lk, timeout,
+                                         [&] { return projection_stall_reached_for_test_; });
+}
+
+void McpStreamBridge::release_projection_stall_for_test() {
+    std::lock_guard<std::mutex> lk(projection_stall_mu_);
+    projection_stall_release_for_test_ = true;
+    projection_stall_cv_.notify_all();
+}
 
 }  // namespace yuzu::server::mcp
