@@ -18,5 +18,9 @@
   forever while the audit reaper was entirely unmonitored. Since the rules file is
   a copy operators apply themselves, it routinely runs ahead of the servers it
   points at. The new rule fires on `absent(...)` after 15m. It is fleet-wide by
-  construction: it cannot see one server among many going quiet, which needs a
-  `up`-based target-down alert instead.
+  construction: it cannot see one server among many going quiet. Note an
+  `up`-based target-down alert does **not** cover that case either — the server
+  you are missing is alive and scraped, so its `up` is 1; until a per-target rule
+  exists, confirm coverage during a staged upgrade with
+  `count(yuzu_server_audit_retention_passes_total)` against your expected server
+  count.

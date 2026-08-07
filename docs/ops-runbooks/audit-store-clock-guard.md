@@ -152,8 +152,10 @@ server, lost the history.
 - **You applied this rules file for the first time.**
 
 In all three the alert clears the moment the next pass lands. **Measured: about
-45 minutes** — `for: 15m` plus the remainder of the 60-minute cleanup interval —
-bounded by the cleanup interval, not by anything this rule controls. If the
+45 minutes**, bounded by the 60-minute cleanup interval rather than by anything
+this rule controls. (Do not re-derive that as `for:` plus the interval — `for:`
+delays when firing STARTS, it does not extend the end, and adding the two is the
+arithmetic that produced an earlier wrong "~75 minutes".) If the
 firing began within an hour of a Prometheus restart and clears on its own inside
 that window, it was this. **If it does NOT clear, it was never this** — carry on
 below.
@@ -191,7 +193,8 @@ server, check whether it is actually restarting:
 > cadences of **164-195 minutes** (163-196 at a 5-minute evaluation interval). Uptime never reaches the 3-hour grace, and the window
 > holds two resets for too little time to satisfy `for: 15m`. Nothing is
 > misconfigured; there is nothing to fix in scrape config. Narrower than what it
-> replaced - which was blind below about 195 minutes outright - but not closed.
+> replaced - which was silent at every cadence sampled against it - but not
+> closed. Full sweep and method: `docs/prometheus/blind-band-measurement.md`.
 >
 > Either way, **do not read this rule's silence as a healthy reaper.** Confirm
 > restarts with `journalctl --list-boots` or the orchestrator's restart count
@@ -268,7 +271,16 @@ apart.**
 
 It is **fleet-wide by construction**: `absent()` fires only when NO series exists
 anywhere in this Prometheus, so one server going quiet among many is invisible
-here. Use a `up`-based target-down alert for per-target coverage.
+here.
+
+**An `up`-based target-down alert does not cover that**, and this page said it did
+until #2553 pass 13. The server you are missing is alive and scraped - typically
+an older build that does not export the counter yet, since the rules file is
+applied by hand and routinely runs ahead of the servers - so its `up` is 1.
+Measured: with one server exporting the counter and one not, neither retention
+rule fires for either server. During a staged upgrade, confirm coverage directly
+with `count(yuzu_server_audit_retention_passes_total)` against your expected
+server count. A per-target rule is tracked separately.
 
 ## YuzuAuditRetentionAnchorNotSurviving
 

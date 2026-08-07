@@ -130,7 +130,7 @@ def gh_error(msg: str) -> None:
         print(f"::error::{msg}", flush=True)
 
 
-def run(argv: list[str], timeout: int = 300) -> tuple[int, str]:
+def run(argv: list[str], timeout: int = 300, quiet: bool = False) -> tuple[int, str]:
     """Run promtool, echo its output, and return `(rc, combined output)`.
 
     The output is returned because promtool's exit code is not sufficient
@@ -152,7 +152,7 @@ def run(argv: list[str], timeout: int = 300) -> tuple[int, str]:
         gh_error(msg)
         return 1, ""
     out = proc.stdout + proc.stderr
-    if out:
+    if out and not quiet:
         print(out, end="" if out.endswith("\n") else "\n", flush=True)
     return proc.returncode, out
 
@@ -177,9 +177,14 @@ def check_gate_output(check_out: str, test_out: str,
     proves nothing is worse than no check, because it is reported as evidence.
 
     NOTE the decoy case - `rule_files:` naming some OTHER existing rules file -
-    needs no check here. It is self-detecting: the suite asserts specific
-    alertnames FIRE, those alertnames do not exist in another file, and promtool
-    exits non-zero on its own. An earlier revision reimplemented Go's
+    needs no check HERE, but not because it is inherently self-detecting. It is
+    caught TODAY because the suite happens to assert that specific alertnames
+    FIRE, and those do not exist in another file, so promtool exits non-zero on
+    its own. NOTHING ENFORCES THAT PROPERTY - 10 of the 23 current assertions are
+    negative (`exp_samples: []`) and pass against any rules at all, including
+    none. Measured: a decoy glob plus negative-only assertions passes this whole
+    function. What actually closes it is the canary in `gate()`, not this
+    paragraph. An earlier revision reimplemented Go's
     `filepath.Glob` to catch it and that seam produced FOUR findings of its own
     (a false-PASS, a decoy widening, a case-sensitivity bug and the boundary
     objection itself). Deleted rather than maintained.
@@ -346,6 +351,15 @@ def build_canary_tree(dest: Path) -> None:
         )
     (dest / RULES).write_text(text.replace(CANARY_FROM, CANARY_TO, 1),
                               encoding="utf-8")
+    # The container runs as uid 65534 with the tree mounted read-only. Under a
+    # restrictive umask (077 is a common hardened-shell and CI default) these
+    # files are created 0600/0700 and promtool cannot stat them - it exits
+    # non-zero on a PERMISSION error, which the caller must not mistake for the
+    # suite reddening. MEASURED: without these chmods, `umask 077` makes the
+    # canary print "suite reddens against broken rules" while promtool never
+    # opened the file.
+    for path in [dest, *dest.rglob("*")]:
+        path.chmod(0o755 if path.is_dir() else 0o644)
 
 
 def gate(promtool_argv: list[str], rules: str, tests: str, canary_for=None) -> int:
@@ -386,9 +400,30 @@ def gate(promtool_argv: list[str], rules: str, tests: str, canary_for=None) -> i
     try:
         build_canary_tree(tmp)
         canary_argv, canary_tests = canary_for(tmp)
-        canary_rc, _ = run(canary_argv + ["test", "rules", canary_tests], timeout=120)
+        # Quiet on purpose: a PASSING canary means promtool printed a wall of
+        # `FAILED:` detail, which above the reassuring line reads as a broken
+        # build. The output is still captured and is printed on both failure
+        # arms below.
+        canary_rc, canary_out = run(canary_argv + ["test", "rules", canary_tests],
+                                    timeout=120, quiet=True)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+    # THREE-WAY, NOT TWO. A non-zero exit is not by itself evidence the suite
+    # reddened - promtool exits non-zero for "I could not read that file" too,
+    # and reading THAT as success makes this whole check a false green, which is
+    # the exact defect it was added to close. Measured: under `umask 077` the
+    # mounted tree is unreadable to uid 65534 and promtool exits on a permission
+    # error; the two-way version printed "suite reddens against broken rules".
+    # The sweep instrument (blind_band_sweep.py) had the identical bug and its
+    # `silent()` documents the same rule: an instrument that cannot run must say
+    # so, never return a value.
+    if canary_rc != 0 and "FAILED" not in canary_out:
+        sys.exit(
+            f"FAIL: the canary could not be MEASURED - promtool exited "
+            f"{canary_rc} against the mutated copy without reporting a test "
+            f"failure, so we do not know whether the suite would have caught it. "
+            f"This is not a pass.\n{canary_out.strip()[:500]}"
+        )
     if canary_rc == 0:
         sys.exit(
             f"FAIL: the suite stayed GREEN against a deliberately broken copy of "

@@ -27,9 +27,14 @@ sample from 30 to 190 was silent, so its band is reported as a floor rather than
 as bounds.
 
 **The band is real but narrow, and it moves by about a minute with the
-evaluation interval — not more.** An earlier review reported it as "160–195 at a
-5-minute interval"; the measurement is 163–196. Another reported "165–179"; that
-understated the upper end by 16 minutes. Both came from sparse sampling.
+evaluation interval — not more.** One caveat on the 30s row: the eval grid is
+whole-minute regardless of interval, so the 30s and 60s rows are checked at the
+same points and their agreement is not independent confirmation at sub-minute
+resolution. The `evaluation_interval` passed to promtool does differ.
+
+An earlier review reported the band as "160–195 at a 5-minute interval"; the
+measurement is 163–196. Another reported "165–179", understating the upper end by
+16 minutes. Both came from sparse sampling.
 
 ## Why it exists
 

@@ -8,8 +8,9 @@ name: Docs Lint
 # path-filtered-required-check trap). The changelog jobs are fast and
 # dependency-light — no build, no vcpkg, no caches — so running them
 # unconditionally is cheap. `prometheus-rules` below is the one exception: it
-# pulls a digest-pinned Prometheus image, which is why it is a separate job —
-# a registry outage reds only that check.
+# reaches TWO registries — a digest-pinned Prometheus image from Docker Hub and
+# a hash-pinned PyYAML from PyPI — which is why it is a separate job, so an
+# outage at either reds only that check.
 on:
   # No paths filter: the required CHANGELOG-order status must report on every
   # PR. push fires only on mainline branches so a feature/fix branch with an
@@ -118,13 +119,22 @@ jobs:
           persist-credentials: false
 
       # The harness FAIL-CLOSES without PyYAML on the gate path (it cannot count
-      # assertions, so it cannot prove the run was not vacuous). Installing it
+      # assertions, so it cannot prove the run was not vacuous). Install it
       # explicitly rather than relying on the runner image happening to ship it:
-      # the build legs already get it from requirements-ci.txt, and an image
-      # update that dropped it would red this job for a reason nobody would
-      # guess from the message.
+      # an image update that dropped it would red this job for a reason nobody
+      # would guess from the message.
+      #
+      # Hash-pinned via requirements-ci.txt, matching every other pip site in
+      # this repo (ci.yml:522, :929). A bare `pip install pyyaml` would take
+      # whatever PyPI serves at that moment into a job whose whole purpose is to
+      # be trustworthy evidence. `--break-system-packages` because ubuntu-24.04
+      # is PEP 668 externally-managed; the hosted image tolerates the bare form
+      # today, but self-hosted does not, and this survives that move.
       - name: Install PyYAML
-        run: python3 -m pip install --disable-pip-version-check pyyaml
+        run: |
+          python3 -c "import yaml" 2>/dev/null || \
+            python3 -m pip install --user --break-system-packages \
+              --disable-pip-version-check --require-hashes -r requirements-ci.txt
 
       - name: Validate and unit-test alert rules (promtool)
         env:

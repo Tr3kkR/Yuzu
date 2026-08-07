@@ -988,18 +988,20 @@ groups:
       # SO IT IS STILL BLIND for a genuinely dead reaper at restart cadences of
       # 164-195 MINUTES: uptime never reaches 10800, and the window holds two
       # resets for only `10800 - cadence` seconds, which is under `for: 15m` once
-      # the cadence passes 9900s. Swept at 1-minute resolution, all three
-      # evaluation intervals: 164-195 at 30s and 60s, 163-196 at 300s. The band
-      # shifts by about a minute with the interval, not more. Do not validate a
-      # change against these bounds -- re-run the sweep
-      # (`tests/prometheus/blind_band_sweep.py`); the numbers are a RESULT, and
-      # three earlier reviews each reported a different band from sparse
-      # sampling. Recorded: docs/prometheus/blind-band-measurement.md.
+      # the cadence passes 9900s. Measured 164-195 at 30s and 60s evaluation
+      # intervals, 163-196 at 300s. Do NOT validate a change against these
+      # bounds -- they are a RESULT, and three earlier reviews each reported a
+      # different band from sparse sampling. Re-run
+      # `tests/prometheus/blind_band_sweep.py`; method, resolution and the three
+      # ways this measurement goes wrong are in
+      # docs/prometheus/blind-band-measurement.md.
       #
       # NARROWED, NOT CLOSED. What this replaced required `uptime > 10800`
-      # outright and was blind at EVERY cadence under ~195 min (measured against
-      # the previous expression at 60, 120 and 170). This is strictly better and
-      # still has a hole.
+      # outright and was silent at EVERY cadence SAMPLED against it -- 30 to 190
+      # at 10-minute resolution, and to 200 at a 5-minute evaluation interval.
+      # That is reported as a FLOOR, not as bounds: the sweep did not look for an
+      # upper edge, and the old rule was blind above 195 too. This is strictly
+      # and substantially better, and still has a hole.
       #
       # Closing it needs a SERVER change, not a PromQL one. The natural signal,
       # `..._retention_last_pass_unixtime`, is seeded 0 and never reloaded from
@@ -1100,9 +1102,20 @@ groups:
       # NOTE it is fleet-wide, not per-server: `absent()` fires only when NO
       # series exists anywhere in this Prometheus. A single server that stops
       # exporting while others still do is invisible here (nothing in PromQL
-      # expresses "absent for a target I can no longer see"); use a `up`-based
-      # target-down alert for that. Scoped this way on purpose -- the alternative
-      # fires on every Prometheus that scrapes anything other than Yuzu.
+      # expresses "absent for a target I can no longer see"). Scoped this way on
+      # purpose -- the alternative fires on every Prometheus that scrapes
+      # anything other than Yuzu.
+      #
+      # AND AN `up`-BASED TARGET-DOWN ALERT DOES NOT COVER THAT GAP EITHER, which
+      # this comment claimed until #2553 pass 13. The uncovered server is ALIVE
+      # and scraped -- an older build that does not export this counter yet -- so
+      # its `up` is 1. Measured: with one server exporting the counter and one
+      # not, NEITHER retention rule fires, for EITHER server, indefinitely.
+      # Closing it needs a per-target rule
+      # (`up{job=<yuzu>} == 1 unless on(instance, job) <counter>`), which would be
+      # a documented exception to this file's bare-matching contract because `up`
+      # is Prometheus-synthesised. Tracked separately. Until then, confirm
+      # coverage directly: `count(<counter>)` against your expected server count.
       - alert: YuzuAuditRetentionMetricMissing
         expr: |
           absent(yuzu_server_audit_retention_passes_total)
