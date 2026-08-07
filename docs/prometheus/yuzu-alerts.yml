@@ -986,11 +986,15 @@ groups:
       # the states that argument assumed away.
       #
       # SO IT IS STILL BLIND for a genuinely dead reaper at restart cadences of
-      # roughly 160-195 MINUTES: uptime never reaches 10800, and the window holds
-      # two resets for only `10800 - cadence` seconds, which is under `for: 15m`
-      # once the cadence passes 9900s. The band MOVES with the evaluation
-      # interval -- measured 164-195 at 1m, 160-195 at 5m -- so do not treat those
-      # bounds as constants or validate a change against them.
+      # 164-195 MINUTES: uptime never reaches 10800, and the window holds two
+      # resets for only `10800 - cadence` seconds, which is under `for: 15m` once
+      # the cadence passes 9900s. Swept at 1-minute resolution, all three
+      # evaluation intervals: 164-195 at 30s and 60s, 163-196 at 300s. The band
+      # shifts by about a minute with the interval, not more. Do not validate a
+      # change against these bounds -- re-run the sweep
+      # (`tests/prometheus/blind_band_sweep.py`); the numbers are a RESULT, and
+      # three earlier reviews each reported a different band from sparse
+      # sampling. Recorded: docs/prometheus/blind-band-measurement.md.
       #
       # NARROWED, NOT CLOSED. What this replaced required `uptime > 10800`
       # outright and was blind at EVERY cadence under ~195 min (measured against

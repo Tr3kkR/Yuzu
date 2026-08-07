@@ -188,8 +188,7 @@ server, check whether it is actually restarting:
 >
 > *Or the cadence is inside this rule's blind band, with perfectly stable
 > labels.* Measured (#2553): a genuinely dead reaper is undetected at restart
-> cadences of roughly **160-195 minutes**, and the band moves with the Prometheus
-> evaluation interval. Uptime never reaches the 3-hour grace, and the window
+> cadences of **164-195 minutes** (163-196 at a 5-minute evaluation interval). Uptime never reaches the 3-hour grace, and the window
 > holds two resets for too little time to satisfy `for: 15m`. Nothing is
 > misconfigured; there is nothing to fix in scrape config. Narrower than what it
 > replaced - which was blind below about 195 minutes outright - but not closed.

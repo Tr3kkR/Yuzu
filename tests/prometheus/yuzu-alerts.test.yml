@@ -102,7 +102,7 @@ tests:
   # this window" -- which holds only for a WORKING reaper. Where none runs, no
   # segment completes a pass and that backstop never engages. Measured (#2553
   # pass 13): a dead reaper is still undetected at restart cadences of roughly
-  # 160-195 min, and the band moves with the evaluation interval. See the "WHAT
+  # 164-195 min (163-196 at a 5-minute evaluation interval). See the "WHAT
   # THE TRADE COSTS" block in docs/prometheus/yuzu-alerts.yml. Case 1 still
   # fires, which is what this file pins; it does NOT pin the general claim,
   # because the general claim is false.

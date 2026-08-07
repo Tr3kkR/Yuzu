@@ -11,9 +11,9 @@
   series cannot silence the rule either. **Expect a new-to-you firing on any
   crash-looping server.** **Narrowed, not closed:** the previous expression
   required `uptime > 10800` outright and was blind at every restart cadence below
-  about 195 minutes; this one is still blind at cadences of roughly 160–195
-  minutes, and that band moves with the Prometheus evaluation interval (measured
-  164–195 at a 1-minute interval, 160–195 at 5). Closing it needs a server-side
+  about 195 minutes; this one is still blind at restart cadences of 164–195
+  minutes (163–196 at a 5-minute evaluation interval), measured by sweeping the
+  cadence space at 1-minute resolution. Closing it needs a server-side
   change rather than a rule change — the natural signal,
   `yuzu_server_audit_retention_last_pass_unixtime`, is not reloaded from its
   persisted anchor at startup, so a freshness rule built on it regresses the very
