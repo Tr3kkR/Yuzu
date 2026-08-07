@@ -1545,10 +1545,16 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
 
             if (needs_approval) {
-                // Declaring the origin (#2442) is what bars this path from
-                // minting into the reserved `mcp.` ticket namespace: def_id is
-                // caller-influenced and scope_expr is caller-supplied verbatim,
-                // and the MCP recall matches on exactly that pair.
+                // Declaring the origin (#2442) is what makes a ticket minted
+                // here REFUSABLE at the MCP recall: def_id is caller-influenced
+                // and scope_expr is caller-supplied verbatim, and the MCP recall
+                // matches on exactly that pair.
+                //
+                // It does NOT bar this path from minting into the reserved
+                // namespace — nothing does, deliberately. So this argument is
+                // load-bearing rather than decorative: drop it and the ticket
+                // becomes `kUnspecified`, which is the value that GRANTS at
+                // redemption.
                 auto result = approval_manager->submit(def_id, session->username, scope_expr, "",
                                                        ApprovalOrigin::kInstruction);
                 if (!result) {

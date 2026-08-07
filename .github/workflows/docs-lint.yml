@@ -5,8 +5,12 @@ name: Docs Lint
 # workflow must run on EVERY pull request to main/dev. A `paths:` filter here
 # was the bug: a PR that didn't touch CHANGELOG.md never reported the required
 # check and got wedged forever on a status that never arrived (the
-# path-filtered-required-check trap). The job is fast and dependency-light — no
-# build, no vcpkg, no caches — so running it unconditionally is cheap.
+# path-filtered-required-check trap). The changelog jobs are fast and
+# dependency-light — no build, no vcpkg, no caches — so running them
+# unconditionally is cheap. `prometheus-rules` below is the one exception: it
+# reaches TWO registries — a digest-pinned Prometheus image from Docker Hub and
+# a hash-pinned PyYAML from PyPI — which is why it is a separate job, so an
+# outage at either reds only that check.
 on:
   # No paths filter: the required CHANGELOG-order status must report on every
   # PR. push fires only on mainline branches so a feature/fix branch with an
@@ -73,3 +77,68 @@ jobs:
         run: |
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           python3 scripts/assemble-changelog.py --guard "$BASE_SHA"
+
+  # Prometheus alert rules are code that runs in production and never compiles,
+  # so nothing caught a rule that parses perfectly and can still never fire for
+  # the case it was written for — which is exactly how YuzuAuditRetentionNotRunning
+  # shipped unable to fire for a crash-looping server (#2553). `check rules` is
+  # the parse gate; `test rules` is the behaviour gate, and it is the one that
+  # would have caught it.
+  #
+  # ITS OWN JOB, deliberately. This step pulls a container — the only Docker Hub
+  # dependency in THIS workflow (other workflows have their own: pre-release.yml
+  # runs distro images) — so a registry outage or an anonymous-pull rate limit
+  # fails THIS check, under a name that says what actually broke, instead of
+  # failing a required check called "CHANGELOG order" on a PR that never touched
+  # an alert rule. (A workflow-level `paths:` filter would be the wrong fix: a
+  # required check that is skipped rather than run never reports — the
+  # path-filtered-required-check trap this file's own top-of-workflow header
+  # documents.) Whether this job becomes a required check is a branch-protection
+  # decision, not something this file can assert.
+  #
+  # IT CALLS THE SCRIPT rather than inlining the invocation, so the pinned image
+  # has exactly one home (`tests/prometheus/run_promtool_tests.py`) and CI runs
+  # provably the same code as a local run — the pattern
+  # `scripts/ci/verify-healthcheck-invariants.sh` and `scripts/ci/ensure-postgres.sh`
+  # already use. The same script is registered in `tests/meson.build`, where it
+  # deliberately does NOT pull: without the opt-in below it needs a native
+  # promtool and otherwise skips, because flake-retry runs `meson test`
+  # unfiltered on three required build legs and an earlier version of this wiring
+  # put Docker Hub on all three (#2553).
+  #
+  # Runs on every PR rather than only rule changes: the rules and the code that
+  # feeds them drift apart from either side, and the whole run is a few seconds
+  # plus an image pull.
+  prometheus-rules:
+    name: Prometheus alert rules
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The harness FAIL-CLOSES without PyYAML on the gate path (it cannot count
+      # assertions, so it cannot prove the run was not vacuous). Install it
+      # explicitly rather than relying on the runner image happening to ship it:
+      # an image update that dropped it would red this job for a reason nobody
+      # would guess from the message.
+      #
+      # Hash-pinned via requirements-ci.txt, matching every other pip site in
+      # this repo (ci.yml:522, :929). A bare `pip install pyyaml` would take
+      # whatever PyPI serves at that moment into a job whose whole purpose is to
+      # be trustworthy evidence. `--break-system-packages` because ubuntu-24.04
+      # is PEP 668 externally-managed; the hosted image tolerates the bare form
+      # today, but self-hosted does not, and this survives that move.
+      - name: Install PyYAML
+        run: |
+          python3 -c "import yaml" 2>/dev/null || \
+            python3 -m pip install --user --break-system-packages \
+              --disable-pip-version-check --require-hashes -r requirements-ci.txt
+
+      - name: Validate and unit-test alert rules (promtool)
+        env:
+          # Makes the pinned image mandatory for this job: the script's opt-in
+          # takes precedence over any promtool that happens to be on PATH.
+          YUZU_TEST_ENABLE_PROMTOOL_DOCKER: "1"
+        run: python3 tests/prometheus/run_promtool_tests.py
