@@ -1067,8 +1067,16 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
   healthy forever while the audit reaper is entirely unmonitored, which is exactly
   the state you are in if you apply this rules file ahead of upgrading your
   servers. The new rule keys on `absent(...)` and fires after 15m. It is
-  **fleet-wide by construction**: it cannot see one server among many going quiet -
-  use a `up`-based target-down alert for that.
+  **fleet-wide by construction**: it cannot see one server among many going quiet.
+  **A `up`-based target-down alert does NOT close that gap** — a server that is
+  running an older build is alive and scraped, so its `up` is 1; it simply does
+  not export this counter. Measured (#2553): in a fleet where one server exports
+  the counter and another does not, *neither* retention rule fires, for either
+  server, indefinitely. During a staged upgrade the practical mitigation is to
+  confirm coverage directly rather than to rely on an alert —
+  `count(yuzu_server_audit_retention_passes_total)` against your expected server
+  count — until every server is upgraded. A per-target rule for this is tracked
+  separately.
 - **The first guarded pass now declines when it has no stored reading and rows
   are already expired (#2579).** The stored clock reading (the anchor) is new in
   schema v3, so every database starts its first guarded pass without one. An

@@ -351,8 +351,9 @@ below).
 
 ### The retention clock guard
 
-**Which alert sent you here?** Find it in the table below; only one of them is
-about a decline. The current rule set is `docs/prometheus/yuzu-alerts.yml`.
+**Which alert sent you here?** Find it in the table below — they report different
+conditions and the triage differs. The current rule set is
+`docs/prometheus/yuzu-alerts.yml`.
 
 | Alert | What it means | Go to |
 |---|---|---|

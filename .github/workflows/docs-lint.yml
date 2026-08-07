@@ -5,8 +5,11 @@ name: Docs Lint
 # workflow must run on EVERY pull request to main/dev. A `paths:` filter here
 # was the bug: a PR that didn't touch CHANGELOG.md never reported the required
 # check and got wedged forever on a status that never arrived (the
-# path-filtered-required-check trap). The job is fast and dependency-light — no
-# build, no vcpkg, no caches — so running it unconditionally is cheap.
+# path-filtered-required-check trap). The changelog jobs are fast and
+# dependency-light — no build, no vcpkg, no caches — so running them
+# unconditionally is cheap. `prometheus-rules` below is the one exception: it
+# pulls a digest-pinned Prometheus image, which is why it is a separate job —
+# a registry outage reds only that check.
 on:
   # No paths filter: the required CHANGELOG-order status must report on every
   # PR. push fires only on mainline branches so a feature/fix branch with an
@@ -113,6 +116,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # The harness FAIL-CLOSES without PyYAML on the gate path (it cannot count
+      # assertions, so it cannot prove the run was not vacuous). Installing it
+      # explicitly rather than relying on the runner image happening to ship it:
+      # the build legs already get it from requirements-ci.txt, and an image
+      # update that dropped it would red this job for a reason nobody would
+      # guess from the message.
+      - name: Install PyYAML
+        run: python3 -m pip install --disable-pip-version-check pyyaml
 
       - name: Validate and unit-test alert rules (promtool)
         env:
