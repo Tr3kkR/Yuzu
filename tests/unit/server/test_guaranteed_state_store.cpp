@@ -24,6 +24,8 @@
 #include "store_errors.hpp"
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
@@ -34,6 +36,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <random>
 #include <thread>
@@ -2241,6 +2244,8 @@ TEST_CASE("GuaranteedStateStore #2579: no stored reading + partial expiry declin
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool, /*retention_days=*/30);
     REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
 
     REQUIRE(store.insert_event(make_event("anchor-expired", "r", "a")));
     REQUIRE(store.insert_event(make_event("anchor-live", "r", "a"))); // 30d-ahead ttl, survives
@@ -2261,6 +2266,15 @@ TEST_CASE("GuaranteedStateStore #2579: no stored reading + partial expiry declin
                                  "'last_anomaly_facts'") == "e---b");
     CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store.gc_meta WHERE key "
                                  "= 'bootstrap_settled'") == "1");
+    // The operator-facing metric label, not just the functional decline: a
+    // regression mapping NoAnchor back to generic "declined" would still pass
+    // every check above while silently breaking the documented alert
+    // (increase(...{result="declined_no_anchor"}[24h]) > 1, metrics.md).
+    CHECK(metrics.counter("yuzu_server_guardian_reap_passes_total",
+                          {{"result", "declined_no_anchor"}})
+              .value() == 1.0);
+    CHECK(metrics.counter("yuzu_server_guardian_reap_passes_total", {{"result", "declined"}})
+              .value() == 0.0);
 
     // Second pass: re-anchored (bootstrap_settled from pass 1), so this is a
     // genuinely CLEAN pass (Anomaly::None) — drains the one expired row,
@@ -2270,11 +2284,86 @@ TEST_CASE("GuaranteedStateStore #2579: no stored reading + partial expiry declin
     CHECK(store.event_count() == 1); // only "anchor-live" survives
     CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store.gc_meta WHERE key "
                                  "= 'last_anomaly_facts'") == "0"); // consumed/cleared
+    CHECK(metrics.counter("yuzu_server_guardian_reap_passes_total", {{"result", "swept"}})
+              .value() == 1.0);
 
     // Once, not forever: a third pass against an already-settled bootstrap
     // marker does not decline again — nothing left to reap, clean no-op.
     store.reap_expired();
     CHECK(store.events_reaped_total() == 1); // unchanged
+    // The bootstrap decline never recurs, no matter how many passes follow.
+    CHECK(metrics.counter("yuzu_server_guardian_reap_passes_total",
+                          {{"result", "declined_no_anchor"}})
+              .value() == 1.0);
+}
+
+// Adversarial-review blocker (#2663, found independently by both reviewers):
+// a FIXED "implausibly ahead" horizon cannot exceed every accepted
+// `guardian_event_retention_days` configuration (no maximum is enforced at
+// any ingress), so a long-retention deployment's own honest, live TTLs get
+// excluded from `datable` and a partial-expiry pass misclassifies as a false
+// `would_wipe` decline. This falsifier uses a 500-day retention — comfortably
+// past the old fixed 400-day bound, comfortably short of anything else this
+// test needs to worry about — with one genuinely expired row and one live
+// row carrying that config's own honest ~500-day TTL. Anchored first so the
+// #2579 no_anchor trigger (a different, already-covered decline path) can't
+// also explain a decline here.
+TEST_CASE("GuaranteedStateStore: reap_expired's datable horizon covers a long retention window",
+          "[pg][guaranteed_state_store][retention][clock-guard]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool, /*retention_days=*/500);
+    REQUIRE(store.is_open());
+    anchor_guard(store);
+
+    REQUIRE(store.insert_event(make_event("long-expired", "r", "a")));
+    REQUIRE(store.insert_event(make_event("long-live", "r", "a"))); // ~500d-ahead ttl
+    exec_sql(db.dsn(), "UPDATE guaranteed_state_store.guaranteed_state_events SET "
+                       "ttl_expires_at = 1 WHERE event_id = 'long-expired'");
+
+    // expiring(1) < datable(2): a clean partial-expiry pass, PROVIDED the
+    // probe horizon actually covers "long-live"'s ~500-day TTL. A fixed
+    // 400-day horizon would exclude it from datable, making expiring(1) >=
+    // datable(0..1) and falsely declining would_wipe instead.
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 1);
+    CHECK(store.event_count() == 1); // only "long-live" survives — drained, not declined
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store.gc_meta WHERE key "
+                                 "= 'last_anomaly_facts'") == "0"); // no anomaly recorded
+}
+
+// The upper-bound clock sanitiser (#2663 review should-fix): reap_expired()
+// reads its own process clock internally (unlike AuditStore's cleanup_once(now),
+// whose `now` is caller-supplied and directly testable), so exercising the
+// kMaxPlausibleNow branch needs the now_fn test seam — the ctor's third
+// parameter, unset in every other test here and never wired from production
+// (see the ctor doc comment).
+TEST_CASE("GuaranteedStateStore: reap_expired declines an implausibly large clock reading",
+          "[pg][guaranteed_state_store][retention][clock-guard]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    // Comfortably past kMaxPlausibleNow (INT64_MAX / 4) without itself risking
+    // overflow in the test's own arithmetic.
+    const int64_t implausible_now = std::numeric_limits<int64_t>::max() / 2;
+    GuaranteedStateStore store(pool, /*retention_days=*/30,
+                               [implausible_now] { return implausible_now; });
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    REQUIRE(store.insert_event(make_event("evt", "r", "a")));
+    exec_sql(db.dsn(), "UPDATE guaranteed_state_store.guaranteed_state_events SET "
+                       "ttl_expires_at = 1 WHERE event_id = 'evt'");
+
+    store.reap_expired();
+    CHECK(store.events_reaped_total() == 0);
+    CHECK(store.event_count() == 1); // declined before it ever reached the probe
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store.gc_meta WHERE key "
+                                 "= 'last_pass_now'") == "0"); // never reached the stamp
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM guaranteed_state_store.gc_meta WHERE key "
+                                 "= 'bootstrap_settled'") == "0"); // rolled back, trigger stays armed
+    CHECK(metrics.counter("yuzu_server_guardian_reap_passes_total", {{"result", "failed"}})
+              .value() == 1.0);
 }
 
 TEST_CASE("GuaranteedStateStore: reap_expired is a no-op on a closed store",

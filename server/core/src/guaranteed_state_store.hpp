@@ -71,6 +71,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -308,9 +309,13 @@ class GuaranteedStateStore {
 public:
     /// Borrows the shared pool and runs the `guaranteed_state_store` schema
     /// migration on a pinned lease. `is_open()` is false if the lease was
-    /// empty or the migration failed.
+    /// empty or the migration failed. `now_fn`, when set, replaces
+    /// `reap_expired()`'s process-clock read (`std::chrono::system_clock`) —
+    /// unset (default) uses the real clock; this is a test seam only (mirrors
+    /// `PolicyEvaluator::Deps::now_fn`), never wired from production.
     explicit GuaranteedStateStore(pg::PgPool& pool,
-                                   int retention_days = kDefaultEventRetentionDays);
+                                   int retention_days = kDefaultEventRetentionDays,
+                                   std::function<int64_t()> now_fn = nullptr);
 
     GuaranteedStateStore(const GuaranteedStateStore&) = delete;
     GuaranteedStateStore& operator=(const GuaranteedStateStore&) = delete;
@@ -510,6 +515,7 @@ private:
     pg::PgPool& pool_;
     bool open_{false};
     int retention_days_;
+    std::function<int64_t()> now_fn_; // test seam only; see ctor doc
     yuzu::MetricsRegistry* metrics_{nullptr};
 
     std::atomic<uint64_t> events_written_{0};

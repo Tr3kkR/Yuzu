@@ -1843,8 +1843,8 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_guardian_reap_passes_total",
                           "Retention-reaper pass outcomes by result "
-                          "(swept/noop/declined/failed/skipped_lock) — the clock-guard "
-                          "observability the reaped counters lacked (ADR-0038, #2634).",
+                          "(swept/noop/declined/declined_no_anchor/failed/skipped_lock) — the "
+                          "clock-guard observability the reaped counters lacked (ADR-0038, #2634).",
                           "counter");
         metrics_.describe("yuzu_server_guardian_baselines_total",
                           "Total Guardian Baselines persisted", "gauge");

@@ -73,19 +73,28 @@ constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
 // kReapBigStepSecs (part 7, "did the clock move forward abnormally between
 // passes") stays the reference's absolute ~1-day value — it detects a wall-
 // clock jump between two passes and is deliberately unscaled to any TTL.
-// kReapImplausiblyAheadSecs (part 1, "exclude forward-skewed rows from the
+//
+// The probe's datable horizon (part 1, "exclude forward-skewed rows from the
 // datable denominator") is DIFFERENT: unlike kReapBigStepSecs it MUST exceed
 // the legitimate TTL horizon, or a live row's own honest ttl_expires_at gets
 // misclassified as "implausibly ahead" and wrongly excluded from `datable` —
-// which flips a normal partial-expiry pass into a false would_wipe decline
-// (caught in review: this store's operator-configurable retention_days
-// defaults to 30 days, an order of magnitude past ResultSetStore's 1-hour TTL
-// that the reference's 7-day bound was sized against). 400 days gives
-// generous headroom over any realistic retention_days configuration while
-// still catching genuinely corrupt/attacker-skewed far-future timestamps.
+// which flips a normal partial-expiry pass into a false would_wipe decline.
+// A FIXED bound cannot satisfy that for every accepted configuration:
+// `--guardian-event-retention-days`/`PUT .../guardian_event_retention_days`
+// have no enforced maximum (only non-negative, main.cpp/server.cpp), so any
+// fixed constant is falsifiable by a large-enough operator-chosen retention
+// window — caught in review (#2663) as a false-decline gap under a real
+// long-retention (e.g. multi-year SOC 2) configuration. Derive the horizon
+// from the CONFIGURED window instead, same shape as `audit_store.cpp`'s
+// `datable_horizon = pg_now + window + kAuditTtlFutureSlackSec`: it then
+// always covers every row this store's own `compute_ttl_epoch()` could have
+// stamped, for any retention_days_, by construction — no fixed guess to
+// falsify. kReapTtlFutureSlackSec is this store's OWN constant (substrate-
+// tuned per the routed-concern's "copy the shape, never the numbers" rule),
+// not a reuse of AuditStore's identically-valued one.
 constexpr int64_t kReapCapPerPass = 10'000;
-constexpr int64_t kReapBigStepSecs = 86'400;              // part 7: absolute, ~1 day
-constexpr int64_t kReapImplausiblyAheadSecs = 34'560'000; // part 1: probe excludes, ~400 days
+constexpr int64_t kReapBigStepSecs = 86'400;        // part 7: absolute, ~1 day
+constexpr int64_t kReapTtlFutureSlackSec = 2 * 86'400; // clock-imprecision buffer past the window
 
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -427,8 +436,9 @@ private:
 
 // ── Construction ─────────────────────────────────────────────────────────────
 
-GuaranteedStateStore::GuaranteedStateStore(pg::PgPool& pool, int retention_days)
-    : pool_(pool), retention_days_(retention_days) {
+GuaranteedStateStore::GuaranteedStateStore(pg::PgPool& pool, int retention_days,
+                                           std::function<int64_t()> now_fn)
+    : pool_(pool), retention_days_(retention_days), now_fn_(std::move(now_fn)) {
     auto lease = pool_.acquire();
     if (!lease) {
         spdlog::error("GuaranteedStateStore: no database connection at construction ({}) — "
@@ -2710,12 +2720,15 @@ void GuaranteedStateStore::reap_expired() {
             return true;
         }
 
-        const int64_t now = now_epoch();
-        // Sanitise the clock reading before it feeds `now + kReapImplausiblyAheadSecs`
-        // below (signed-overflow UB near INT64_MAX) — clock-guard part 3. UPPER bound
-        // only: this store reads the PROCESS clock (unlike AuditStore's PG-side
-        // `pg_now`, ADR-0038 divergence, deliberate — the sanitiser applies regardless
-        // of clock source). A NEGATIVE reading is the legitimate dead-CMOS case the
+        const int64_t now = now_fn_ ? now_fn_() : now_epoch();
+        // Sanitise the clock reading before it feeds the probe's datable-horizon
+        // arithmetic below (signed-overflow UB near INT64_MAX — the horizon adds a
+        // retention-derived window that itself could not overflow on any accepted
+        // `retention_days_`, but `now` is the unbounded half of that sum) — clock-
+        // guard part 3. UPPER bound only: this store reads the PROCESS clock (unlike
+        // AuditStore's PG-side `pg_now`, ADR-0038 divergence, deliberate — the
+        // sanitiser applies regardless of clock source). A NEGATIVE reading is the
+        // legitimate dead-CMOS case the
         // guard exists for, so it is not rejected here.
         constexpr int64_t kMaxPlausibleNow = std::numeric_limits<int64_t>::max() / 4;
         if (now > kMaxPlausibleNow) {
@@ -2780,6 +2793,18 @@ void GuaranteedStateStore::reap_expired() {
         // projection's ttl_expires_at always mirrors its parent event's (set
         // atomically at insert), so one probe/classify decision governs both
         // tables in this guarded pass (the lockstep invariant).
+        //
+        // The datable horizon is derived from the CONFIGURED retention window, not
+        // a fixed constant (#2663 review) — same shape as audit_store.cpp's
+        // `datable_horizon = pg_now + window + kAuditTtlFutureSlackSec`: it then
+        // covers every row this store's own compute_ttl_epoch() could have stamped,
+        // for any retention_days_, so there is no fixed guess for an operator's
+        // (unbounded) `--guardian-event-retention-days` to falsify. retention_days_
+        // <= 0 is the "never expire" sentinel (compute_ttl_epoch() never stamps a
+        // positive ttl_expires_at for it), mirrored here as a zero window.
+        const int64_t retention_window_secs =
+            retention_days_ > 0 ? static_cast<int64_t>(retention_days_) * 86400 : 0;
+        const int64_t datable_horizon = now + retention_window_secs + kReapTtlFutureSlackSec;
         pg::PgResult probe = pg::exec_params(
             conn,
             "SELECT count(*) FILTER (WHERE ttl_expires_at > 0 AND ttl_expires_at < $1::bigint) "
@@ -2787,8 +2812,7 @@ void GuaranteedStateStore::reap_expired() {
             "count(*) FILTER (WHERE ttl_expires_at > 0 AND ttl_expires_at <= $2::bigint) "
             "AS datable "
             "FROM guaranteed_state_store.guaranteed_state_events",
-            std::vector<std::string>{std::to_string(now),
-                                     std::to_string(now + kReapImplausiblyAheadSecs)});
+            std::vector<std::string>{std::to_string(now), std::to_string(datable_horizon)});
         if (probe.status() != PGRES_TUPLES_OK) {
             spdlog::error("GuaranteedStateStore::reap_expired: probe failed: {}",
                           PQerrorMessage(conn));
