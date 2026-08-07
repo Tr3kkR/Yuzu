@@ -6999,9 +6999,21 @@ TEST_CASE("MCP approval recall: a store fault at the lookup rung is a retryable 
     tags.set_tag("agent-1", "role", "web", "server");
 
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
-    yuzu::server::ApprovalManager appr(raw);
+    // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
+    // manual close is skipped on failure - leaking the connection and blocking
+    // the temp-file cleanup TempDbFile is trying to do.
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
     appr.create_tables();
 
     yuzu::MetricsRegistry reg;
@@ -7031,8 +7043,8 @@ TEST_CASE("MCP approval recall: a store fault at the lookup rung is a retryable 
     // migrations are gated on the stored version, so v1's CREATE TABLE never
     // re-runs). A transaction this test rolls back proves the ORIGINAL row
     // survives, not a recreated empty table.
-    REQUIRE(sqlite3_exec(raw, "BEGIN;", nullptr, nullptr, nullptr) == SQLITE_OK);
-    REQUIRE(sqlite3_exec(raw, "DROP TABLE approvals;", nullptr, nullptr, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(conn.h, "BEGIN;", nullptr, nullptr, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(conn.h, "DROP TABLE approvals;", nullptr, nullptr, nullptr) == SQLITE_OK);
 
     auto faulted = ts.call(recall);
     auto fbody = nlohmann::json::parse(faulted->body);
@@ -7048,13 +7060,12 @@ TEST_CASE("MCP approval recall: a store fault at the lookup rung is a retryable 
     REQUIRE(!ts.audit_details.empty());
     CHECK(ts.audit_details.back() == "approval_id=" + approval_id + " refused: store_error (lookup)");
 
-    REQUIRE(sqlite3_exec(raw, "ROLLBACK;", nullptr, nullptr, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(conn.h, "ROLLBACK;", nullptr, nullptr, nullptr) == SQLITE_OK);
 
     // The ORIGINAL approved ticket, not a fresh empty one, is what consumes.
     auto recovered = ts.call(recall);
     CHECK(write_tool_payload(recovered)["deleted"] == true);
     CHECK(tags.get_tag("agent-1", "role").empty());
-    sqlite3_close(raw);
 }
 
 TEST_CASE("MCP approval recall: a genuinely absent ticket stays -32003, not -32603",
@@ -7063,9 +7074,21 @@ TEST_CASE("MCP approval recall: a genuinely absent ticket stays -32003, not -326
     yuzu::server::TagStore tags(tagdb.path);
 
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
-    yuzu::server::ApprovalManager appr(raw);
+    // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
+    // manual close is skipped on failure - leaking the connection and blocking
+    // the temp-file cleanup TempDbFile is trying to do.
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
     appr.create_tables();
 
     McpTestServer ts;
@@ -7086,7 +7109,6 @@ TEST_CASE("MCP approval recall: a genuinely absent ticket stays -32003, not -326
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
     CHECK(body["error"]["message"] == "approval_id does not match this tool and arguments");
-    sqlite3_close(raw);
 }
 
 TEST_CASE("MCP approval recall: a store that never opened returns the permanent "
@@ -7124,10 +7146,24 @@ TEST_CASE("MCP approval recall: a store fault at the CONSUME rung is caught too,
     tags.set_tag("agent-1", "role", "web", "server");
 
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
-    yuzu::server::ApprovalManager appr(raw);
+    // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
+    // manual close is skipped on failure - leaking the connection and blocking
+    // the temp-file cleanup TempDbFile is trying to do.
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
     appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
 
     McpTestServer ts;
     ts.tag_store_for_test = &tags;
@@ -7135,6 +7171,7 @@ TEST_CASE("MCP approval recall: a store fault at the CONSUME rung is caught too,
                                     const std::string&, const std::string&,
                                     const std::string&) -> bool { return true; };
     ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
     ts.start("operator");
 
     auto mint = ts.call(
@@ -7148,7 +7185,7 @@ TEST_CASE("MCP approval recall: a store fault at the CONSUME rung is caught too,
     // this test's recall performs first must still succeed, so a trigger on
     // UPDATE (rather than dropping the table) isolates the site the replaced
     // ternary covers from the site rung 1 covers.
-    REQUIRE(sqlite3_exec(raw,
+    REQUIRE(sqlite3_exec(conn.h,
                         "CREATE TRIGGER approvals_block_update BEFORE UPDATE ON approvals "
                         "BEGIN SELECT RAISE(ABORT, 'fault injected'); END;",
                         nullptr, nullptr, nullptr) == SQLITE_OK);
@@ -7160,14 +7197,24 @@ TEST_CASE("MCP approval recall: a store fault at the CONSUME rung is caught too,
     REQUIRE(fbody.contains("error"));
     CHECK(fbody["error"]["code"] == yuzu::server::mcp::kInternalError);
     CHECK(fbody["error"]["message"] == "approval store temporarily unavailable");
+    // The shared body is identical from either rung by design, so message
+    // alone doesn't prove this response came from the CONSUME rung rather
+    // than the lookup rung. retry_after_ms pins the machine-readable A5
+    // directive a hand-written regression at this call site could drop
+    // silently, and the audit token (no " (lookup)" suffix, unlike rung 1's)
+    // is the one thing that actually distinguishes the two rungs.
+    REQUIRE(fbody["error"]["data"].contains("retry_after_ms"));
+    CHECK(fbody["error"]["data"]["retry_after_ms"] == 5000);
+    CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
+    REQUIRE(!ts.audit_details.empty());
+    CHECK(ts.audit_details.back() == "approval_id=" + approval_id + " refused: store_error");
 
-    REQUIRE(sqlite3_exec(raw, "DROP TRIGGER approvals_block_update;", nullptr, nullptr, nullptr) ==
-            SQLITE_OK);
+    REQUIRE(sqlite3_exec(conn.h, "DROP TRIGGER approvals_block_update;", nullptr, nullptr,
+                        nullptr) == SQLITE_OK);
 
     // Still approved, unconsumed, and still the same ticket → consumes now.
     auto recovered = ts.call(recall);
     CHECK(write_tool_payload(recovered)["deleted"] == true);
-    sqlite3_close(raw);
 }
 
 // Governance UP-1 (BLOCKING): the approval mint is deduplicated — two identical

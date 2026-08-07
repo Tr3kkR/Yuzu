@@ -1,11 +1,11 @@
 #pragma once
 
-#include "approval_manager.hpp"
-#include "mcp_jsonrpc.hpp"
-
 #include <concepts>
 #include <string>
 #include <string_view>
+
+#include "approval_manager.hpp"
+#include "mcp_jsonrpc.hpp"
 
 namespace yuzu::server::mcp {
 
@@ -55,7 +55,8 @@ concept ApprovalA4Error =
     };
 
 template <ApprovalA4Error A4Error>
-std::string approval_store_error_body(const ApprovalManager& mgr, const A4Error& a4_error) {
+[[nodiscard]] std::string approval_store_error_body(const ApprovalManager& mgr,
+                                                     const A4Error& a4_error) {
     if (!mgr.is_open())
         return a4_error(kInternalError, "approval store unavailable",
                         "this will NOT clear on retry, the approval was not consumed and does "

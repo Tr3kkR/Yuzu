@@ -1178,18 +1178,17 @@ It is not necessarily still usable, and the difference matters: the 7-day
 approval window keeps running during an outage, so an outage that outlasts the
 ticket's remaining window ends with it expired like any other.
 
-**Fix**: Retry the identical call, including the same `approval_id`, after at
-least the `retry_after_ms` the response carries. Two distinct bodies share
-this code:
+**Fix**: Check `retry_after_ms` in the response body — two distinct bodies
+share this code:
 
 - **`retry_after_ms` is a number (currently 5000)**: the store is open but the
   read or write failed, most likely transiently. Retry after the hint.
   Retrying indefinitely is not safe, and this body alone cannot tell you when
-  to stop: a store connection that never fully closed but is failing
-  permanently (corruption, read-only, disk full) still takes this arm and
-  will honour a client that retries forever. Bound your own retries — a
-  handful of attempts, then escalate to an operator. Distinguishing that case
-  from a genuinely transient one is a follow-up change.
+  to stop: a store that is open but failing permanently (corruption,
+  read-only, disk full) still takes this arm and will honour a client that
+  retries forever. Bound your own retries — a handful of attempts, then
+  escalate to an operator. Distinguishing that case from a genuinely
+  transient one is a follow-up change.
 - **`retry_after_ms` is `null`**: the store never opened. This will not clear
   on retry; escalate to an operator immediately.
 

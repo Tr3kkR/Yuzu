@@ -3335,7 +3335,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "application/json");
                         return;
                     }
-                    auto appr = *appr_read;
+                    auto appr = std::move(*appr_read);
                     if (!appr || appr->definition_id != definition_id ||
                         appr->scope_expression != canon) {
                         // Absent, or for a different tool / different arguments.
