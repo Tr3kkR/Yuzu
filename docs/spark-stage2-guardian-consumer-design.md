@@ -272,7 +272,18 @@ stuck-Unknown rule still re-reads its target every ~5 s forever, so only the *wi
 fixed, not the *read* flood (UP-6); (c) the **server-side rollup/consumer** for the suppression
 tag (the signal is agent-heartbeat-only today) - this is **pilot-trust-blocking**, not just SOC2
 evidence, because after suppression the only current-errored-state view is the no-TTL census, and
-`/status.errored_rules` is still the fail-closed placeholder. The census edge-record still depends
+`/status.errored_rules` is still the fail-closed placeholder. **(d) the four-artefact egress for
+`arm_race_unwatch_failures_total` AND `disarm_unwatch_failures_total` (#2270)** - both heartbeat
+tags ship and both keys are registered in `spark_fleet_tags.hpp`, but no rollup consumes either,
+there is no `docs/user-manual/metrics.md` row and no alert rule, and no REST route or dashboard
+renders raw `status_tags` - so an orphaned OS watch is not fleet-detectable and is not per-device
+queryable either; the value reaches the server and is read by nothing. Same class as (c) and same
+reason it matters: the residual either counter reports is a leaked watch in the agent's sole
+detection primitive, and reclamation is mechanism-dependent, not simply OS-dependent - a File
+watch (Windows-only mechanism) is never reclaimed short of a process restart, so for that
+mechanism the cost is permanent and cumulative rather than self-healing; a Service watch (Linux or
+Windows) is reclaimed the next time `stop()` runs; a Registry watch (Windows-only mechanism)
+cannot fail this way at all. The census edge-record still depends
 on the sole production `attach_rule` hardcoding `emit_compliant_edge=true` - do NOT sever that.
 
 ### PR-1 hardening items (commit order 1→2→3→4→7→5→6→9→8)
@@ -581,8 +592,26 @@ and MCP `tools/list`), and enforces RBAC + audit at the API layer — not a
 dashboard fragment. This section ticks every #1939 item.
 
 ### Fleet metrics (agent heartbeat → Prometheus)
+- **`arm_race_unwatch_failures_total` / `disarm_unwatch_failures_total` (#2270 — agent
+  side SHIPPED, fleet rollup DEFERRED):** two counters, both counting mechanism
+  `unwatch()` calls that THREW, where the throw is contained rather than propagated —
+  `arm_race_unwatch_failures_` during `arm_impl`'s consumer-race teardown
+  (`teardown_arm_race`), `disarm_unwatch_failures_` during `disarm()`. Emitted as the
+  sparse heartbeat tags `yuzu.spark_arm_race_unwatch_failures` and
+  `yuzu.spark_disarm_unwatch_failures`. **Scope is in the names and is deliberately not
+  fleet-wide:** the two together cover `teardown_arm_race` and `disarm()` only.
+  `unregister_consumer()`'s unwatch site is not a peer of these two — it still
+  propagates UNCONTAINED, and the consequence is worse than an uncounted orphaned
+  watch: escaping a void function there permanently strands the consumer's dispatch
+  thread (tracked as #2814). Two zeros do not mean "no orphaned watches", and say
+  nothing about #2814 at all. The `{os}` rollup, the `docs/user-manual/metrics.md`
+  row and an alert rule are **deferred to the
+  `prefer_spark` flip** on the same grounds as `retiring`/`retiring_cap`
+  (`spark_fleet_tags.hpp`): with `prefer_spark_` false nothing arms, so the gauges
+  would be structurally absent fleet-wide and unfalsifiable. Tracked as item (d) of the
+  flip gate above.
 - **Agent:** emit `SparkEngineStats` as `yuzu.spark_*` heartbeat `status_tags`.
-  `SparkEngineStats` (`spark_engine.hpp:81`) carries `armed_faulted`,
+  `SparkEngineStats` (`spark_engine.hpp`, the `SparkEngineStats` struct) carries `armed_faulted`,
   `watch_faults_total`, `mech_watch_rejected_total`, `mech_quarantined_total`,
   `mech_slow_op_total` (the #2011 counters already exist in the struct, not yet
   emitted) **plus** `queued_dropped_total`, `consumer_errors_total`, and the
@@ -1041,11 +1070,109 @@ Each rung is an independently-governed PR on `dev`, run through the full
        7 (KV lifecycle journal), 9 (R4 telemetry + the heartbeat wiring for the
        PR-1a counters), 8 (test seams), **M1 (the transition-edge health-emission
        fix)**, and the R2 `unsupported` terminal state.
-     - **FLIP GATE:** M1, item 9's heartbeat wiring, #2270, and the lifecycle-audit
-       journal ALL land in PR-1b and **gate PR-2** — the `prefer_spark` flip must not
-       ship while any is open. M1 in particular is a fleet ingest-DoS if the flip
-       precedes it, so it is not enough that it is "in PR-1" — it is specifically in
-       PR-1b, after PR-1a.
+     - **FLIP GATE — ELEVEN items gate PR-2**, each detailed in the bullets below: M1,
+       item 9's heartbeat wiring, #2270, the lifecycle-audit journal, #2797, #2818,
+       #2819, #2813, #2839, and two residues that own no issue, (a) and (b). **The
+       `prefer_spark` flip must not ship while any is open.** The first four land in
+       PR-1b except #2270, which ships as its own PR against `dev` ahead of it. M1 in
+       particular is a fleet ingest-DoS if the flip precedes it, so it is not enough
+       that it is "in PR-1" — it is specifically in PR-1b, after PR-1a.
+     - **#2797 gates PR-2 as well, and is the only gate whose headline defect is
+       already live pre-flip.** `apply_rules` discards
+       `reconcile_rule_locked`'s bool
+       (`guardian_engine.cpp:634`; the surrounding catch counts a THROW only), so a
+       RETURNED arm failure leaves `reconcile_failures` at 0, the generation
+       advances, the server stops re-pushing, and the rule stays persisted-but-
+       unarmed. The flip raises the rate rather than creating the defect: a returned
+       failure is the ordinary spark-backend arm error, whereas a legacy guard arm
+       rarely throws (#2278). #2797 is the reconcile-side half split out of #2270 -
+       #2270 itself closes only the strong-guarantee half, so closing #2270 does not
+       discharge this gate.
+     - **#2818 gates PR-2 too.** The engine tears down a whole spark key
+       (`spark_engine.cpp:821-836`) while `GuardianSparkRuntime` arms one shared
+       subscription per key on the 0->1 edge (`guardian_spark_runtime.cpp:159-166`),
+       and nothing tells the consumer its subscription died: Guardian goes on
+       believing it holds a live subscription, `backend_->disarm(sub)` is a no-op,
+       and nothing is enforced for any rule on that key. It is an ENFORCEMENT gap,
+       not a false-assurance one - `GuardianEngine::get_status()` is fail-closed
+       (`guardian_engine.cpp:684-686`, every rule reported errored), so the
+       originating findings' "get_status reports N rules armed" premise is false at
+       this tip and is corrected in #2818. Dormant while `prefer_spark` is false
+       because legacy `IGuard` is the live detection path - the flip is what makes
+       it a live enforcement hole. #2797 removes the `apply_rules` self-heal that
+       otherwise bounds it, so the two gates compound and neither alone closes the
+       exposure.
+     - **#2819 gates PR-2 as well — same dormancy test as #2818, applied
+       consistently.** An earlier revision of this block dismissed it as "a
+       shutdown-availability defect ... does not gate the flip". That was wrong:
+       availability-vs-enforcement is not the criterion this list uses, dormancy is,
+       and #2819 satisfies it. #2819 reaches a blocking `unwatch()`
+       by TWO routes — `arm_impl`'s `teardown_arm_race`, and the ordinary withdraw
+       path through `SparkEngine::disarm` — and both are dormant, for the same
+       reason. `attach_rule` runs only at `guardian_engine.cpp:1153`, inside
+       `try_spark = prefer_spark_ && spark_availability_ == SparkAvailability::Available`
+       (`guardian_engine.cpp:1139`), and Guardian is the sole registered consumer
+       (`guardian_engine.cpp:1244` is the only PRODUCTION `register_consumer`
+       caller). `detach_rule` itself IS reached pre-flip — three of its five sites
+       (`:1095`, `:1124`, `:1182`) sit outside the `try_spark` block, which spans
+       `:1140-1179` — but it reaches `backend_->disarm` only when
+       `index_->remove_rule` returns a key (`guardian_spark_runtime.cpp:253-258`),
+       and pre-flip nothing was ever attached, so `keys_` is empty. Both routes are
+       therefore dormant TRANSITIVELY, on the absence of a prior arm, and the wedge
+       is created by the flip exactly as #2818's hole is. Its terminal outcome is a
+       stalled agent shutdown whose F3 backstop is structurally unreachable, on a
+       trigger that correlates fleet-wide during an OTA wave. #2819 also carries a
+       related `service_win.cpp` instance that is live TODAY and needs no spark
+       involvement — see its Related section.
+     - **#2813 gates PR-2 on the same dormancy profile**, and is listed here rather
+       than left silent. Its sink is NOT #2819's, which is a lock wedge: #2813's
+       residue is a live OS watch whose `armed_` entry is gone, so its firings are
+       silently dropped.
+     - **#2839 gates PR-2 on the same dormancy profile.** A throwing
+       `push_retiring()` (`spark_file.cpp:331-336`) frees a `DirWatch` with a live,
+       uncompleted kernel I/O — not merely a leak — and separately leaves
+       `dirs_[dirkey]` half-erased (key present, `unique_ptr` null/moved-from,
+       since `dirs_.erase(di)` never runs after the throw). `SparkEngine::stop()`'s
+       later, unrelated `cancel(*w)` sweep (`spark_file.cpp:241-246`) dereferences
+       that null pointer with no check — #2270's containment is what makes this
+       survivable-but-silent rather than an immediate crash near the OOM event,
+       deferring and decontextualizing the eventual failure. File-mechanism-only
+       (Windows), OOM-triggered. First found by round-4's own `xp-1`/`UP-1`
+       (`governance.d/2270-arm-window-round4.4c0PeP.jsonl`, pass 1); the
+       stop()-time null-deref consequence specifically was surfaced later, by
+       this branch's own final `/governance` run's Gate 4 unhappy-path pass, and
+       Gate 5 chaos-injector then synthesized two test scenarios for it — do
+       NOT cite those scenarios as `CH-1`/`CH-2`, which are already distinct,
+       unrelated finding_ids in the round-4 ledger file (the stranded
+       consumer-dispatch-thread finding and the stop()-does-not-drain finding,
+       both deferred to #2814/#2815).
+     - **Two residues gate PR-2 and own no issue**, recorded here because a gate list
+       that enumerates only issue-backed items reads as complete when it is not.
+       (a) CLOSED by `5858844c` (`SparkEngine::disarm`'s in-lock teardown made
+       allocation-free) and `444c2458` (disarm's trailing `unwatch()` contained and
+       counted, matching `teardown_arm_race`) — the allocating prologue this residue
+       used to describe no longer allocates. Ledger `CH8-2`/`UP8-1` were adjudged
+       discharged on the merits by security-guardian after the fix (pass-10 evidence
+       row owed); `UP-4` deduped separately. A narrower residual remains, different in
+       kind: two ops between the (now allocation-free) bookkeeping and the
+       contained `unwatch()` still propagate uncontained — the two `std::lock_guard`
+       constructions at `spark_engine.cpp:1033`/`:1035` (mutex acquisition can raise
+       `std::system_error`). `mech_ops_mu_by_type_.at(unwatch_type)` on the same
+       line does NOT: the map is populated in lockstep with `mechanisms_` at
+       registration and frozen after `start()`, so the lookup key is always present
+       (`spark_engine.hpp:221-222`, implemented at `spark_engine.cpp:183-195`). By
+       this point `disarm`'s OWN bookkeeping (`armed_`/`sub_keys_`) is already
+       committed, so a throw here does not desync the engine's own state the way
+       the old defect did — the consequence is narrower: the `unwatch()` is never
+       attempted, so neither counter increments and the OS watch is never even
+       asked to release. `teardown_arm_race` documents the same residual on its
+       own declaration (`spark_engine.hpp:440-441`); `disarm` now does too
+       (`spark_engine.hpp:217-219`). (b) The `{os}` fleet
+       rollup, the `metrics.md` row and the alert rule for BOTH
+       `arm_race_unwatch_failures` and `disarm_unwatch_failures` —
+       `spark_fleet_tags.hpp:82` defers all three to this flip IN CODE, so the flip
+       makes an agent-side resource leak measurable at the endpoint and invisible at
+       the fleet. Ledger `arch8-2`.
 
      - **PR-1 (inert hardening, `prefer_spark` stays false — zero change to
        detection/enforcement *placement*).** The shared drift-event builder;

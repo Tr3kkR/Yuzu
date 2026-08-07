@@ -299,6 +299,35 @@ agent_test_exe = executable(
 # budget is tracked in #2373 (split/redesign), not papered over with a wall-clock cap here -
 # that route introduced its own flakiness (a busy main thread starving the workers it waited on)
 # and was backed out.
+# ── #2270 allocation-budget probe (separate binary, deliberately) ────────────
+# test_spark_alloc_budget.cpp REPLACES the global operator new/delete to count
+# allocations, which is process-wide and cannot be scoped to one test. Two
+# reasons it is not a source of yuzu_agent_tests:
+#   * a sanitizer owns the allocator, so the replacement must be ABSENT from
+#     those binaries, not merely disabled inside them;
+#   * a global allocator replacement has no business in the 1500-case agent
+#     binary that gates every push.
+# Executable-side interposition for libyuzu_agent_core.so is an ELF/libstdc++
+# property (measured on Linux, and it does hold) — not a portable contract, so
+# the target is Linux-only and the cross-platform pin stays with the fault seams
+# in test_spark_mechanism.cpp. See the file header.
+if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
+  spark_alloc_budget_exe = executable(
+    'yuzu_spark_alloc_budget_tests',
+    files('unit/test_spark_alloc_budget.cpp'),
+    include_directories: [include_directories('../agents/core/src')],
+    cpp_args: test_partial_init_args + agent_platform_args,
+    dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, catch2_dep,
+                   spdlog_dep],
+  )
+  test(
+    'spark allocation budget',
+    spark_alloc_budget_exe,
+    suite: 'agent',
+    timeout: 60,
+  )
+endif
+
 agent_test_args = (get_option('b_sanitize') == 'none') ? ['~[tsan-heavy]'] : []
 test(
   'agent unit tests',
