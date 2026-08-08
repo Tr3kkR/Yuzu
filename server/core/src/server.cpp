@@ -8219,10 +8219,20 @@ private:
         // `read_content` only appends bytes to `req.body` on the
         // NON-multipart branch; a `multipart/form-data` request's content
         // lands in `req.form.files`/`req.form.fields` instead, so
-        // `req.body.size()` reads 0 for the table's one multipart class
-        // (`plugin_trust_bundle`) regardless of the real bytes read off the
-        // wire. That class's unmeasurable-body hole is NOT closed by this
-        // stage.
+        // `req.body.size()` reads 0 for ANY multipart request regardless of
+        // the real bytes read off the wire. **NO multipart class is covered
+        // by this stage** — stated as a RULE, not a list. An earlier draft
+        // named a single class and was wrong: `/api/settings/updates/upload`
+        // (`ota_upload`) and `/api/settings/cert-upload` (no table entry, so
+        // the catch-all default) are multipart too. Enumerating instances is
+        // how that error was made; the rule is what holds.
+        //
+        // SECOND CALL SITE: httplib also reaches this handler from
+        // `dispatch_request_for_content_reader`, where the body was streamed
+        // through a `ContentReader` and `req.body` is likewise EMPTY — so a
+        // route registered that way is not covered either. Dormant today
+        // (this codebase registers no `ContentReader` route), but it is the
+        // same blind spot as multipart and will not announce itself.
         //
         // Same table, same `path_class` label (never the attacker-controlled
         // `req.path`), same 413 A4/SCIM envelope shapes, and the same
@@ -8237,12 +8247,22 @@ private:
         // dispatch_request — so a request the pre-routing gate already
         // refused can never also reach this handler for the same request.
         //
-        // CONTAIN THE WHOLE BLOCK (governance Gate 8, security + cpp-safety) —
-        // same reasoning as `enforce_pre_auth_body_cap` above: httplib invokes
-        // `pre_request_handler_` from the same unguarded call sites (routing's
-        // ordinary dispatch AND the WebSocket-upgrade path), and
-        // `ThreadPool::worker` runs tasks bare, so an escaped exception here
-        // is `std::terminate`.
+        // CONTAIN THE WHOLE BLOCK (governance Gate 8, security + cpp-safety).
+        //
+        // NOT for the reason the pre-routing handler is contained, and the
+        // difference matters because the wrong reason is the one a future
+        // maintainer would trust. `enforce_pre_auth_body_cap` is contained
+        // because httplib calls `pre_routing_handler_` from the UNGUARDED
+        // WebSocket-upgrade path. This handler is NOT reachable from there —
+        // that path calls only `pre_routing_handler_` and the upgrade
+        // entry's own handler, never `pre_request_handler_`. Both real call
+        // sites sit inside `routing()`, which httplib does wrap in try/catch.
+        //
+        // It is contained anyway, deliberately: relying on a caller's
+        // try/catch means this block's safety depends on vendored code we do
+        // not control and would silently lose on a version bump. Containing
+        // it locally costs nothing and fails CLOSED (413) rather than
+        // deferring to httplib's generic 500.
         //
         // `[this]` ONLY. The httplib member function that invokes this
         // handler (`Server::dispatch_request`) is `const`, but that constness
