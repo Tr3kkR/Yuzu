@@ -138,6 +138,26 @@ and an unbounded statement has no way to yield mid-delete. The chunk loop reuses
 capped/swept/backlog-probe reporting logic; `budget_exhausted` is a distinct reason from the
 row-count cap.
 
+**Correction (2026-08-09, Gate 5 chaos-injector, empirically measured):** chunking the
+*parent-row count* alone does not bound the CASCADE's own latency — `response_facets` has no
+row-count limit of its own, so a single chunk of 500 parent rows, each carrying up to
+`kMaxFacetsPerResponse=5000` facets, can still cascade up to 2,500,000 child-row deletes in
+ONE implicit statement. Measured live against PostgreSQL 18.4, an idle uncontended database:
+~1929ms for exactly that shape — already consuming nearly the entire `kReapDeleteBudget` in one
+statement, with none of the concurrent-write contention a real deployment adds. Past the
+connection's `statement_timeout`, that single statement fails outright, `with_txn_for` rolls the
+whole pass back (every earlier chunk in it too), and the deterministic `ORDER BY` re-selects the
+identical backlog next pass — a self-sustaining wedge on exactly the backlog that most needs to
+drain. Fixed: `response_facets` for each chunk's ids is now pre-deleted explicitly, in its own
+`kReapFacetDeleteBatchRows=5000`-row LIMIT-bounded batches (the same subquery-`ctid`-`IN`-LIMIT
+idiom the parent-row delete already used), deadline-checked between batches, BEFORE the
+parent-row delete runs — so by the time the parent `DELETE` executes, its CASCADE has nothing
+left to do and its latency no longer depends on how many facets happened to land in one chunk.
+A `YuzuResponseReapFailing` alert (`increase(result="failed")>=2` in 3h) was added alongside
+this fix: a repeating-wedge condition still increments the labeled counter, so it is invisible
+to `YuzuResponseReapNotRunning`'s liveness check — the counter IS moving, just onto the wrong
+label.
+
 ### Lifecycle
 
 `stop()` unwires from the ingest service(s) then resets before `pg_pool_`; store in `/readyz`
