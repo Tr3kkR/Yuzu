@@ -1688,8 +1688,10 @@ void RestApiV1::register_routes(
                          audit_fn(req, "bundle.collate", "failure", "Execution", id,
                                   "response store degraded");
                          res.status = 503;
-                         res.set_content(detail::a4_error(res, "response store degraded"),
-                                         "application/json");
+                         res.set_content(
+                             detail::a4_error(res, "response store degraded",
+                                              {.retry_after_ms = 5000}),
+                             "application/json");
                          return;
                      }
                      // not-found and not-owned return the same 404 so existence
@@ -6033,7 +6035,9 @@ void RestApiV1::register_routes(
             auto responses_opt = response_store->query(execution_id, q);
             if (!responses_opt) {
                 res.status = 503;
-                res.set_content(detail::a4_error(res, "response store degraded"), "application/json");
+                res.set_content(detail::a4_error(res, "response store degraded",
+                                                 {.retry_after_ms = 5000}),
+                                "application/json");
                 audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
                          definition_id + " reason=response_store_degraded");
                 return;

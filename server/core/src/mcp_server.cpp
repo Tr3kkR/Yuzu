@@ -3776,7 +3776,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!responses_opt) {
                     mcp_audit("failure", "store degraded; " + key);
                     res.set_content(
-                        error_response(id, kInternalError, "Response store degraded — query failed"),
+                        a4_error(kInternalError, "Response store degraded — query failed", {},
+                                 /*retry_after_ms=*/5000),
                         "application/json");
                     return;
                 }
@@ -4081,8 +4082,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         // #1634 sre review). Audit the degraded access for CC7.2 parity.
                         mcp_audit("failure", "store degraded; " + instr_id);
                         res.set_content(
-                            error_response(id, kInternalError,
-                                           "Response store degraded — aggregate failed"),
+                            a4_error(kInternalError,
+                                     "Response store degraded — aggregate failed", {},
+                                     /*retry_after_ms=*/5000),
                             "application/json");
                         return;
                     }
@@ -4102,8 +4104,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!results_opt) {
                     mcp_audit("failure", "store degraded; " + instr_id);
                     res.set_content(
-                        error_response(id, kInternalError,
-                                       "Response store degraded — aggregate failed"),
+                        a4_error(kInternalError,
+                                 "Response store degraded — aggregate failed", {},
+                                 /*retry_after_ms=*/5000),
                         "application/json");
                     return;
                 }
@@ -7392,7 +7395,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (agg.error() == CollateError::kDegraded) {
                         mcp_audit("failure", "response store degraded: " + bundle_id);
                         res.set_content(
-                            error_response(id, kInternalError, "Response store degraded"),
+                            a4_error(kInternalError, "Response store degraded", {},
+                                     /*retry_after_ms=*/5000),
                             "application/json");
                         return;
                     }
