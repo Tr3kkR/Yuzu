@@ -37,6 +37,21 @@ constexpr std::chrono::milliseconds kReadTimeout{2000};
 constexpr std::chrono::milliseconds kWriteTimeout{4000};
 constexpr std::chrono::milliseconds kIngestTimeout{500};
 
+// Ingest bounds (#2691, Doomgoose finding #4): this store shares the same PG
+// pool the auth/RBAC substrate leases from — an enrolled agent streaming
+// large or high-cardinality output can pressure that shared pool, degrading
+// auth reads, not just this store's own. `kMaxIngestBytes` matches the
+// agent's own per-dispatch cap (agent.cpp's `kCaptureMaxBytes`, 2 MiB) —
+// generous enough that a well-behaved agent never truncates, a backstop
+// against a compromised agent binary that bypasses its own cap (the same
+// premise finding #8's resolution already accepted for the NUL-density
+// question). `kMaxFacetsPerResponse` bounds facet cardinality independent of
+// output size — a highly-repetitive tabular output can carry many distinct
+// values without approaching the byte cap.
+constexpr std::size_t kMaxIngestBytes = 2ull * 1024 * 1024;
+constexpr std::size_t kMaxFacetsPerResponse = 5'000;
+constexpr const char* kTruncationMarker = "\n...[truncated by server ingest cap]";
+
 // Ingest-drop / read-degrade reason labels (ADR-0037 label convention).
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
@@ -141,6 +156,17 @@ std::string sanitize_pg_text(std::string_view s) {
     out.append(scrubbed, start, scrubbed.size() - start);
     return out;
 }
+
+// #2691 (Doomgoose finding #4): bound ingest volume before it reaches the
+// shared PG pool. Truncates on the RAW byte string, before sanitize_pg_text —
+// a truncation mid-UTF-8-sequence is exactly what sanitize_utf8_strict
+// already scrubs to U+FFFD, so ordering this first costs nothing extra.
+std::string truncate_ingest(std::string_view s, std::size_t max_bytes) {
+    if (s.size() <= max_bytes)
+        return std::string(s);
+    return std::string(s.substr(0, max_bytes)) + kTruncationMarker;
+}
+
 double to_double(const char* s) {
     if (s == nullptr || s[0] == '\0')
         return 0.0;
@@ -351,6 +377,15 @@ void ResponseStore::store(const StoredResponse& resp) {
     const int64_t ttl = resp.ttl_expires_at > 0 ? resp.ttl_expires_at : compute_ttl_epoch();
     const int64_t received_ms = resp.received_at_ms > 0 ? resp.received_at_ms : now_ms;
 
+    // Bound ingest volume BEFORE sanitizing (#2691, Doomgoose finding #4):
+    // this store shares the PG pool the auth/RBAC substrate leases from, so
+    // an agent (compromised or misbehaving) streaming output past its own
+    // dispatch cap must not be able to pressure that shared pool. Matches
+    // the agent's own per-dispatch cap (agent.cpp's kCaptureMaxBytes) — a
+    // well-behaved agent never truncates here.
+    const std::string bounded_output = truncate_ingest(resp.output, kMaxIngestBytes);
+    const std::string bounded_error = truncate_ingest(resp.error_detail, kMaxIngestBytes);
+
     // ADR-0039 addendum: `output`/`error_detail` are untrusted agent-supplied
     // bytes — a plugin can emit arbitrary (non-UTF-8) content, which SQLite's
     // permissive TEXT affinity tolerated but Postgres TEXT rejects outright
@@ -362,8 +397,8 @@ void ResponseStore::store(const StoredResponse& resp) {
     // ingest seam on untrusted text (inventory, app_perf, …) sanitizes the
     // same way before its own PG bind; `sanitize_utf8_strict` is the shared
     // implementation (utf8_sanitize.hpp).
-    const std::string sanitized_output = sanitize_pg_text(resp.output);
-    const std::string sanitized_error = sanitize_pg_text(resp.error_detail);
+    const std::string sanitized_output = sanitize_pg_text(bounded_output);
+    const std::string sanitized_error = sanitize_pg_text(bounded_error);
 
     // `with_txn_for` (not a manual BEGIN/PgTxn pair, #2691 Doomgoose finding
     // #1) refuses to COMMIT an aborted transaction: a failed SAVEPOINT/
@@ -425,6 +460,21 @@ void ResponseStore::store(const StoredResponse& resp) {
             for (const auto& [col_idx, value_counts] : facets)
                 for (const auto& [value, count] : value_counts)
                     flat.emplace_back(col_idx, value, count);
+
+            // Bound facet cardinality independently of output size (#2691,
+            // Doomgoose finding #4) — a highly-repetitive tabular output can
+            // carry many distinct values without approaching the byte cap
+            // above. Deterministic truncation (not a random subset) so a
+            // repeated ingest of the same over-wide output truncates the
+            // same facets every time, rather than jittering which columns
+            // the dashboard's facet filter can see.
+            if (flat.size() > kMaxFacetsPerResponse) {
+                spdlog::warn("ResponseStore: response_id={} facet count ({}) exceeds the "
+                            "per-response cap ({}); only the first {} persist",
+                            response_id, flat.size(), kMaxFacetsPerResponse,
+                            kMaxFacetsPerResponse);
+                flat.resize(kMaxFacetsPerResponse);
+            }
 
             if (!flat.empty()) {
                 pg::PgResult sp =

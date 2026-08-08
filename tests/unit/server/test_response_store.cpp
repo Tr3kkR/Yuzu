@@ -1296,6 +1296,83 @@ TEST_CASE("ResponseStore: sanitize_pg_text handles leading/trailing/adjacent NUL
     CHECK((*results)[0].output.find('\0') == std::string::npos);
 }
 
+// #2691 (Doomgoose finding #4): output/error_detail past the per-response
+// ingest cap (matches the agent's own per-dispatch cap) are truncated with a
+// marker, not stored raw — this store shares the PG pool the auth/RBAC
+// substrate leases from, so an unbounded ingest volume must not be able to
+// pressure it.
+TEST_CASE("ResponseStore: output past the ingest cap is truncated with a marker",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+
+    constexpr std::size_t kOverCap = 2ull * 1024 * 1024 + 100; // kMaxIngestBytes + 100
+    StoredResponse resp;
+    resp.instruction_id = "cmd-overcap";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.output = std::string(kOverCap, 'x');
+    store.store(resp);
+
+    auto results = store.get_by_instruction("cmd-overcap");
+    REQUIRE(results.has_value());
+    REQUIRE(results->size() == 1);
+    CHECK((*results)[0].output.size() < kOverCap); // genuinely truncated
+    CHECK((*results)[0].output.find("truncated by server ingest cap") != std::string::npos);
+
+    // Well under the cap: stored byte-for-byte, no truncation.
+    StoredResponse small;
+    small.instruction_id = "cmd-undercap";
+    small.agent_id = "agent-1";
+    small.status = 1;
+    small.output = std::string(1000, 'y');
+    store.store(small);
+    auto small_results = store.get_by_instruction("cmd-undercap");
+    REQUIRE(small_results.has_value());
+    REQUIRE(small_results->size() == 1);
+    CHECK((*small_results)[0].output.size() == 1000);
+    CHECK((*small_results)[0].output.find("truncated") == std::string::npos);
+}
+
+// #2691 (Doomgoose finding #4): facet cardinality is bounded independently
+// of output byte size — a highly-repetitive tabular output can carry many
+// distinct values without approaching the byte cap.
+TEST_CASE("ResponseStore: facet cardinality is capped independently of output size",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+
+    // vuln_scan schema: severity|category|title|detail. 6001 distinct
+    // category values in col_idx 1 — well under kMaxIngestBytes (a few
+    // hundred KB), comfortably over kMaxFacetsPerResponse (5000).
+    std::string output;
+    constexpr int kDistinctValues = 6001;
+    for (int i = 0; i < kDistinctValues; ++i)
+        output += "high|category-" + std::to_string(i) + "|title|detail\n";
+
+    StoredResponse resp;
+    resp.instruction_id = "cmd-facetcap";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.plugin = "vuln_scan";
+    resp.output = output;
+    store.store(resp);
+
+    auto results = store.get_by_instruction("cmd-facetcap");
+    REQUIRE(results.has_value());
+    REQUIRE(results->size() == 1);
+    // The full (untruncated) output still persists on the response row —
+    // only the FACET projection is capped, matching the cap's stated scope.
+    CHECK((*results)[0].output.size() == output.size());
+
+    const auto facet_count = query_scalar(
+        db.dsn(), "SELECT COUNT(*) FROM response_store.response_facets WHERE instruction_id = "
+                  "'cmd-facetcap'");
+    CHECK(std::stoll(facet_count) == 5000); // kMaxFacetsPerResponse, not 6001
+}
+
 // R1: a wide tabular output (>64 distinct facet values) must still persist ALL
 // its facets. The batched single-savepoint INSERT replaced the per-facet
 // savepoint loop (which suboverflowed the ingest txn's subxids on the shared

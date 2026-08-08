@@ -1782,12 +1782,25 @@ TEST_CASE("REST dex/devices/{id}/live: device output over the cap → 502",
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     RestGsHarness h(true, true, true, true, &pool);
-    StoredResponse r;
-    r.instruction_id = "processes-live";
-    r.agent_id = "WS-1";
-    r.status = kStatusSuccess;
-    r.output = std::string(5 * 1024 * 1024, 'x'); // > 4 MiB cap
-    h.resp_store->store(r);
+    // Seeded via a raw connection, NOT ResponseStore::store() (#2691): store()
+    // now truncates ingest at 2 MiB (Doomgoose finding #4, matching the
+    // agent's own per-dispatch cap) — a real agent can never legitimately
+    // reach this handler's own 4 MiB display-layer cap, so exercising it
+    // means bypassing ingest entirely, the same way a corrupt/pre-migration
+    // row could.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult res = yuzu::server::pg::exec_params(
+            conn.get(),
+            "INSERT INTO response_store.responses (instruction_id, agent_id, timestamp, "
+            "status, output) VALUES ($1,$2,$3::bigint,$4::integer,$5)",
+            std::vector<std::string>{"processes-live", "WS-1", "1700000000",
+                                     std::to_string(kStatusSuccess),
+                                     std::string(5 * 1024 * 1024, 'x')}); // > 4 MiB cap
+        INFO(PQresultErrorMessage(res.get()));
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=processes", "");
     REQUIRE(res);
     CHECK(res->status == 502);
