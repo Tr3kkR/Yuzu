@@ -540,11 +540,11 @@ What to expect / do:
 ## ⚠️ Behaviour change: response history resets on Postgres cutover (ADR-0039)
 
 `ResponseStore` (agentic command/instruction results — the executions drawer
-and TAR read source) moves from the SQLite `response.db` file to the server's
+and TAR read source) moves from the SQLite `responses.db` file to the server's
 PostgreSQL substrate in this release (ADR-0006 Wave 1, schema `response_store`).
 Like the `ApiTokenStore` and AuthDB cutovers, this is a **fresh-start cutover
 with no data migration** — response results are expendable, TTL'd telemetry
-(ADR-0009 skippable backfill), so the legacy `response.db` is **never read** on
+(ADR-0009 skippable backfill), so the legacy `responses.db` is **never read** on
 upgrade.
 
 **What happens on first PG boot:**
@@ -554,7 +554,7 @@ upgrade.
   are empty; results for commands issued after are unaffected and refill
   immediately as agents report.
 - No operator action required. To preserve pre-cutover response history,
-  export it from the old `response.db` before upgrading (see
+  export it from the old `responses.db` before upgrading (see
   `docs/user-manual/response-store.md` → periodic exports).
 
 **Also in this release:** non-UTF-8 bytes in a plugin's output/error (which

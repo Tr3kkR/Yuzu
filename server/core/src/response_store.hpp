@@ -37,7 +37,7 @@
 ///    `RETURNING` (no `sqlite3_changes()`).
 ///  - **Backfill**: SKIPPABLE (ADR-0009's skippable class) — responses are
 ///    TTL'd operational data, not authoritative config or compliance
-///    evidence. No `migrate_from_sqlite`; the legacy `response.db` is never
+///    evidence. No `migrate_from_sqlite`; the legacy `responses.db` is never
 ///    read. See ADR-0039.
 
 #include <atomic>

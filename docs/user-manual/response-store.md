@@ -278,10 +278,10 @@ curl -s -b cookies.txt \
 ## Storage substrate (PostgreSQL, ADR-0039)
 
 Since the Postgres migration (ADR-0006/0039), responses live in the server's
-PostgreSQL database (schema `response_store`), not a local `response.db`. Two
+PostgreSQL database (schema `response_store`), not a local `responses.db`. Two
 operator-visible notes:
 
-- **History reset on cutover.** The legacy SQLite `response.db` is **not**
+- **History reset on cutover.** The legacy SQLite `responses.db` is **not**
   migrated — response history is operational, TTL'd telemetry (skippable
   backfill, ADR-0009), so on the upgrade to the Postgres substrate the
   response history starts empty and refills as new commands run. The server

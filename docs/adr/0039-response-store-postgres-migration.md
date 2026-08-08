@@ -8,7 +8,7 @@
 
 ## Context
 
-`ResponseStore` (`response.db` today) persists agentic command/instruction **responses** —
+`ResponseStore` (`responses.db` today) persists agentic command/instruction **responses** —
 two tables: `responses` (per-agent result rows: status, output, error, plugin,
 `execution_id`, `ttl_expires_at`) and `response_facets` (denormalised column values powering
 the dashboard's facet filters). High-write (every command result from every agent), TTL'd
@@ -55,7 +55,7 @@ timestamps/output stay TEXT — behavior-preserving). All indexes carry over inc
 Responses are TTL'd 90-day operational data, not authoritative config and not compliance
 evidence — losing pre-cutover responses degrades only historical drawer/TAR views, which
 self-refill as new commands run. So **no backfill** (the ADR-0009 skippable class, the
-`ResponseStore` precedent the ladder cites): the legacy `response.db` is not read on upgrade;
+`ResponseStore` precedent the ladder cites): the legacy `responses.db` is not read on upgrade;
 a one-time loud "response history reset on Postgres cutover" boot log. (Matches
 `ApiTokenStore`'s fresh-start precedent in spirit — no legacy read, no marker table needed.)
 Rationale recorded here so it is a deliberate decision, not an omission.

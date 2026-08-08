@@ -2636,7 +2636,7 @@ public:
         // template as ResultSetStore/ScimStore above). NO backfill (ADR-0009
         // skippable class — ADR-0039): responses are TTL'd operational telemetry,
         // not authoritative config or compliance evidence, so the legacy
-        // `response.db` is never read on upgrade. One-time loud boot log records
+        // `responses.db` is never read on upgrade. One-time loud boot log records
         // the deliberate reset.
         if (pg_pool_ && !startup_failed_) {
             response_store_ =
@@ -2649,7 +2649,7 @@ public:
             } else {
                 response_store_->set_metrics(&metrics_);
                 spdlog::warn("[PG] response history reset on Postgres cutover — the legacy "
-                             "response.db is not migrated (ADR-0039, skippable backfill class); "
+                             "responses.db is not migrated (ADR-0039, skippable backfill class); "
                              "the executions drawer/TAR views self-refill as new commands run");
             }
         }
