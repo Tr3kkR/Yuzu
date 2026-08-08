@@ -1022,8 +1022,8 @@ groups:
       # the persisted `audit_retention_meta` anchor at startup, surviving a
       # restart (including the first PostgreSQL boot). A value of INT64_MIN
       # (-9223372036854775808) is a distinct anomaly sentinel -- the durable
-      # anchor exists but could not be trusted as an integer -- not a genuine
-      # timestamp, and self-corrects at the next successful pass; any future
+      # anchor could not be read or trusted as a plausible integer -- not a
+      # genuine timestamp, and self-corrects at the next successful pass; any future
       # rule reading this gauge must exclude it explicitly, the same way it
       # must exclude a negative dead-CMOS reading. What's still open is the
       # RULE that uses it -- a freshness expression built naively on this gauge

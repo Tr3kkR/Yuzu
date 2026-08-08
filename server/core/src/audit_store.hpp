@@ -463,12 +463,19 @@ public:
     ///     pass ran and the stamping clock was nonsense (dead CMOS). Stamped
     ///     and seeded unclamped on purpose — a `> 0` filter anywhere would
     ///     silently re-merge it with the `0` "never ran" state.
-    ///   * `std::numeric_limits<std::int64_t>::min()` means the durable anchor
-    ///     exists but could not be trusted as an integer (corrupt/hand-edited
-    ///     state, or the seed read itself failed) — seeded rather than
-    ///     laundered into `0`, so corruption cannot silently earn the
+    ///   * `std::numeric_limits<std::int64_t>::min()` means the seed could
+    ///     not establish a trustworthy reading — four distinct causes, all
+    ///     mapped to this one value on purpose (#2854): the seed's own
+    ///     connection/query could not run at all (so the anchor's existence
+    ///     is UNKNOWN, not merely untrusted); the stored value is not a clean
+    ///     integer (corrupt/hand-edited state); or it is out of the same
+    ///     plausible range `cleanup_once` itself enforces (`kMaxPlausibleNow`).
+    ///     Never laundered into `0`, so none of these can silently earn the
     ///     liveness family's "never ran" grace. Self-corrects at the next
-    ///     `cleanup_once` pass.
+    ///     `cleanup_once` pass. External prose (docs, alert-rule comments)
+    ///     should say "could not be READ OR TRUSTED as a plausible integer"
+    ///     rather than re-deriving this list — the four causes are recorded
+    ///     here, once, so they don't drift across sites (#2854 fold round 2).
     std::int64_t last_pass_unixtime() const noexcept {
         return last_pass_unixtime_.load(std::memory_order_relaxed);
     }

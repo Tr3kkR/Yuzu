@@ -1544,8 +1544,8 @@ public:
                           "the durable retention-meta anchor at startup, #2854 — survives a "
                           "restart, including the first Postgres boot). A value of "
                           "-9223372036854775808 (INT64_MIN) is a distinct anomaly sentinel — the "
-                          "durable anchor exists but could not be trusted as an integer — not a "
-                          "genuine timestamp; self-corrects at the next successful pass. Read WITH "
+                          "durable anchor could not be read or trusted as a plausible integer — "
+                          "not a genuine timestamp; self-corrects at the next successful pass. Read WITH "
                           "retention_passes_total: stale here while that RISES means the reaper "
                           "is alive but refusing an implausible clock, which is a different fault "
                           "from stopped",
