@@ -2286,6 +2286,19 @@ Query audit events.
 }
 ```
 
+**`total` and `page_size` are not what they look like.** `total` is the
+number of rows in this response's `data` array, not the number of rows that
+matched — the route has no `offset` support, so a response at exactly
+`limit` (max 1000) rows can be silently truncated, indistinguishable from a
+complete answer. `page_size` is always `50`, regardless of the `limit` you
+passed (tracked: [#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)). If
+you hit the cap, narrow with `principal=`/`action=`, or fall back to the
+legacy `GET /api/audit` endpoint, which also accepts `offset`. `since`/`until`
+alone only bounds the time window — it does not by itself guarantee
+completeness inside that window if more rows matched than one call returns.
+The reliable recipe is both together: freeze a bounded window with
+`since`/`until` first, then page through it with `offset`.
+
 **Errors:** `403` — caller lacks `AuditLog:Read`; `400` — `limit` parses to
 less than 1 (a negative or zero limit; caught explicitly rather than reaching
 PostgreSQL as an invalid `LIMIT`); `503` — the audit store is unavailable or
@@ -5147,7 +5160,8 @@ Queue a push of the active rule set to scoped agents. Returns `202 Accepted` —
 | `full_sync` | boolean | No | If `true`, agents replace their rule set; otherwise they merge. |
 
 - **Response:** `202` with `data.queued = true`, `data.rules` (server-side rule count), `data.agents` (number of agents the push was dispatched to), `data.scope`.
-- **4xx:** `400` if the JSON body is present but not an object.
+- **4xx:** `400` if the JSON body is present but not an object, or if `scope` fails to parse as a Scope DSL expression.
+- **5xx:** `503` if the Guaranteed-State rule store is degraded or unreachable — the push is refused rather than fanned out empty (ADR-0038). Retry once the store recovers; a `503` here means "cannot read the rules," never "zero rules configured." The heartbeat reconcile applies the same fail-closed rule (it declines to re-push rather than push an empty set).
 - **Audit:** `guaranteed_state.push` (`success`). A server-initiated re-push to a lagging agent on heartbeat reconnect is audited separately under `guaranteed_state.reconcile` (principal `system`).
 
 #### `GET /api/v1/guaranteed-state/events`
