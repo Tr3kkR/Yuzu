@@ -43,6 +43,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -147,8 +148,16 @@ class ResponseStore {
 public:
     /// Borrows the shared pool and runs the `response_store` schema
     /// migration on a pinned lease. `is_open()` is false if the lease was
-    /// empty or the migration failed.
-    explicit ResponseStore(pg::PgPool& pool, int retention_days = kDefaultResponseRetentionDays);
+    /// empty or the migration failed. `now_fn`, when set, replaces
+    /// `reap_expired()`'s process-clock read (`std::chrono::system_clock`) —
+    /// unset (default) uses the real clock; this is a test seam only (mirrors
+    /// `GuaranteedStateStore`'s), never wired from production. This value
+    /// feeds ONLY the cheap pre-transaction plausibility check — every
+    /// retention DECISION reads PostgreSQL's own clock instead
+    /// (`AuditStore::cleanup_once`'s `#2360/1d` shape), so `now_fn` can
+    /// never move a reap verdict.
+    explicit ResponseStore(pg::PgPool& pool, int retention_days = kDefaultResponseRetentionDays,
+                           std::function<int64_t()> now_fn = nullptr);
 
     ResponseStore(const ResponseStore&) = delete;
     ResponseStore& operator=(const ResponseStore&) = delete;
@@ -279,12 +288,16 @@ public:
     /// port to this store, ADR-0039). Called from the server's maintenance
     /// tick (~60-minute cadence, matching the old background thread's
     /// default `cleanup_interval_min`). One sweeping replica at a time via
-    /// `pg_try_advisory_xact_lock`; a durable `gc_meta` reading + anomaly-
-    /// fact-set guards against a skewed wall clock mass-expiring live rows.
-    /// `response_facets` rows are removed via `ON DELETE CASCADE` from
-    /// `responses` — a single DELETE on `responses` reaps both tables.
-    /// Emits `yuzu_server_response_reap_passes_total{result=swept|noop|
-    /// declined|failed|skipped_lock}`.
+    /// `pg_try_advisory_xact_lock`; every decision reads PostgreSQL's own
+    /// clock (read inside the lock, after it), not this replica's process
+    /// clock (#2691, transplanted from #2663/#2360) — a durable `gc_meta`
+    /// reading + anomaly-fact-set guards against a skewed wall clock
+    /// mass-expiring live rows, and a durable `bootstrap_settled` marker
+    /// declines once on a fresh database with no usable prior reading
+    /// (#2579). `response_facets` rows are removed via `ON DELETE CASCADE`
+    /// from `responses` — a single DELETE on `responses` reaps both tables.
+    /// Emits `yuzu_server_response_reap_passes_total{result=swept|capped|
+    /// noop|declined|declined_no_anchor|failed|skipped_lock}`.
     void reap_expired();
 
     /// Cumulative responses reaped (lock-free counter for Prometheus scraping
@@ -300,6 +313,7 @@ private:
     int retention_days_;
     yuzu::MetricsRegistry* metrics_{nullptr};
     std::atomic<uint64_t> responses_reaped_{0};
+    std::function<int64_t()> now_fn_; // test seam only; see ctor doc
 
     int64_t compute_ttl_epoch() const;
 };

@@ -65,6 +65,24 @@ std::string query_scalar(const std::string& dsn, const std::string& sql) {
     return PQgetvalue(r.get(), 0, 0);
 }
 
+// PostgreSQL's own clock, for tests that need a plausible reading to poison
+// or compare against — mirrors test_audit_store.cpp's own `pg_now`.
+std::int64_t pg_now(const std::string& dsn) {
+    return std::stoll(query_scalar(dsn, "SELECT EXTRACT(EPOCH FROM now())::bigint"));
+}
+
+// #2691 (transplanted from #2663/#2579): a `reap_expired()` pass over an
+// EMPTY table settles the durable `bootstrap_settled` marker with nothing
+// expired, so `classify()` short-circuits to `Anomaly::None` regardless of
+// `no_anchor` and no counter moves. Call BEFORE seeding any expired data so
+// a test about something else keeps its original decline-once-not-applicable,
+// drains-immediately contract instead of picking up an extra missing-anchor
+// decline on its first real pass.
+void anchor_guard(ResponseStore& store) {
+    store.reap_expired();
+    REQUIRE(store.responses_reaped_total() == 0);
+}
+
 } // namespace
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -347,7 +365,7 @@ TEST_CASE("ResponseStore: finalize_terminal_status sanitizes error_detail (inval
     // Terminal frame carries a non-UTF-8 error message.
     const std::string bad_err = std::string(1, '\xff') + "boom";
     auto fr = store.finalize_terminal_status("cmd-finalize-badutf8", "agent-1", /*status=*/2,
-                                             bad_err, "exec-1");
+                                             bad_err, "exec-1", /*plugin_result_status=*/0);
     CHECK(fr == ResponseStore::FinalizeResult::Updated); // row finalized, not lost to 22021
 
     auto results = store.get_by_instruction("cmd-finalize-badutf8");
@@ -808,6 +826,7 @@ TEST_CASE("ResponseStore: retention_days=0 disables TTL", "[pg][response_store][
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ResponseStore store(pool, /*retention_days=*/0);
+    anchor_guard(store);
     for (int i = 0; i < 5; ++i)
         store.store(mk_agg_resp("cmd-noreap", "agent-" + std::to_string(i), 1));
     store.reap_expired();
@@ -820,6 +839,7 @@ TEST_CASE("ResponseStore: reap_expired deletes rows past ttl_expires_at, keeps f
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ResponseStore store(pool, /*retention_days=*/30);
+    anchor_guard(store);
 
     for (int i = 0; i < 3; ++i)
         store.store(mk_agg_resp("fresh-" + std::to_string(i), "agent-a", 1));
@@ -859,6 +879,7 @@ TEST_CASE("ResponseStore: reap_expired declines once on an all-expired (would_wi
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ResponseStore store(pool, /*retention_days=*/30);
     REQUIRE(store.is_open());
+    anchor_guard(store);
 
     for (int i = 0; i < 3; ++i)
         store.store(mk_agg_resp("wipe-" + std::to_string(i), "agent-a", 1));
@@ -888,6 +909,107 @@ TEST_CASE("ResponseStore: reap_expired declines once on an all-expired (would_wi
     CHECK(gc_meta_anomaly_count() == "0");      // consumed/cleared
 }
 
+// #2691 (transplanted from #2663/#2579): the missing-anchor falsifier.
+// Deliberately NOT anchor_guard'd — a fresh store with no prior gc_meta
+// reading. Partial expiry (0 < expiring < datable, via the second, further-out
+// row) means neither `would_wipe` nor `big_step` trips, so before this fix
+// the pass would classify clean (Anomaly::None) and delete immediately with
+// no anomaly recorded — exactly the gap #2579 exists to close.
+TEST_CASE("ResponseStore: reap_expired declines once on a missing anchor with partial expiry, "
+          "then drains",
+          "[pg][response_store][retention][clock-guard]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool, /*retention_days=*/30);
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    store.store(mk_agg_resp("noanchor-expired", "agent-a", 1));
+    exec_sql(db.dsn(), "UPDATE response_store.responses SET ttl_expires_at = 1 WHERE "
+                       "instruction_id = 'noanchor-expired'");
+    // A second, further-out row so expiring(1) < datable(2) — a single-row
+    // table would make expiring==datable trivially, which the would_wipe
+    // detector already declines and would mask the missing-anchor defect
+    // this test isolates.
+    store.store(mk_agg_resp("noanchor-survivor", "agent-a", 1));
+
+    const auto reaped = [&](const char* result) {
+        return metrics.counter("yuzu_server_response_reap_passes_total", {{"result", result}})
+            .value();
+    };
+
+    // First pass: no prior gc_meta reading exists on this fresh database —
+    // declines (NoAnchor), zero deletes, and anchors the reading.
+    store.reap_expired();
+    CHECK(store.responses_reaped_total() == 0);
+    CHECK(store.total_count() == 2); // both rows survive — the decline held
+    CHECK(reaped("declined_no_anchor") == 1.0);
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM response_store.gc_meta WHERE key = "
+                                 "'last_anomaly_facts'") == "1");
+
+    // Second pass: now anchored (bootstrap_settled from pass 1) — drains the
+    // genuinely expired row, the survivor stays.
+    store.reap_expired();
+    CHECK(store.responses_reaped_total() == 1);
+    CHECK(store.total_count() == 1);
+    CHECK(reaped("swept") == 1.0);
+}
+
+// #2691 fjarvis H1 (transplanted from #2663): a fast replica cannot sweep a
+// row that is still live by Postgres's own clock. Verified the SAME bug
+// class this store shares with GuaranteedStateStore/AuditStore before the
+// #2663 clock-guard shape was transplanted here — mirrors that test exactly.
+TEST_CASE("ResponseStore #2691: a fast replica cannot sweep a row that is still live by "
+          "Postgres's own clock",
+          "[pg][response_store][retention][clock-guard]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    const int64_t real_now = pg_now(db.dsn());
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore replica_a(pool, /*retention_days=*/30);
+    REQUIRE(replica_a.is_open());
+    anchor_guard(replica_a);
+
+    replica_a.store(mk_agg_resp("still-live", "agent-a", 1));
+    // 30 minutes in the FUTURE by the real clock.
+    exec_sql(db.dsn(), "UPDATE response_store.responses SET ttl_expires_at = " +
+                           std::to_string(real_now + 1800) +
+                           " WHERE instruction_id = 'still-live'");
+    // A second row, further out, so this is a PARTIAL expiry (0 < expiring <
+    // datable) under replica B's clock, not a would_wipe — a single-row table
+    // makes expiring==datable trivially, which the existing Wipe detector
+    // already declines and would mask the defect this test is isolating.
+    replica_a.store(mk_agg_resp("far-live", "agent-a", 1));
+    exec_sql(db.dsn(), "UPDATE response_store.responses SET ttl_expires_at = " +
+                           std::to_string(real_now + 5000) +
+                           " WHERE instruction_id = 'far-live'");
+
+    // Replica B's process clock is an hour FAST — comfortably under
+    // kReapBigStepSecs (1 day), so big_step never fires either.
+    ResponseStore replica_b(pool, /*retention_days=*/30, [real_now] { return real_now + 3600; });
+    REQUIRE(replica_b.is_open());
+    yuzu::MetricsRegistry metrics;
+    replica_b.set_metrics(&metrics);
+    replica_b.reap_expired();
+
+    // FIXED: replica B's own clock cannot move the verdict — "still-live" is
+    // still live by PostgreSQL's own clock, so both rows survive and the
+    // pass is a clean no-op, not a silent sweep.
+    CHECK(replica_a.total_count() == 2);
+    CHECK(metrics.counter("yuzu_server_response_reap_passes_total", {{"result", "swept"}})
+              .value() == 0.0);
+
+    // The shared ANCHOR itself must reflect PG's clock, not replica B's own
+    // skewed reading — gc_meta is the transmission medium, not the fix; a
+    // hypothetical partial revert of only the stamp line would still pass
+    // the checks above while poisoning this row for the next replica's
+    // prev-comparison. Tolerance is wide (60s) purely for test-execution
+    // latency, nowhere near replica B's 3600s skew.
+    const int64_t stamped = std::stoll(query_scalar(
+        db.dsn(), "SELECT value FROM response_store.gc_meta WHERE key = 'last_pass_now'"));
+    CHECK(std::abs(stamped - pg_now(db.dsn())) < 60);
+}
+
 TEST_CASE("ResponseStore: reap_expired is a no-op on a closed store",
           "[response_store][retention]") {
     PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
@@ -908,6 +1030,7 @@ TEST_CASE("ResponseStore: reap_expired caps a large expired batch at kReapCapPer
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ResponseStore store(pool, /*retention_days=*/30);
     REQUIRE(store.is_open());
+    anchor_guard(store);
 
     exec_sql(db.dsn(),
             "INSERT INTO response_store.responses (instruction_id, agent_id, timestamp, "
@@ -971,6 +1094,7 @@ TEST_CASE("ResponseStore: reap_expired declines once on a clock reading ahead of
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ResponseStore store(pool, /*retention_days=*/30);
     REQUIRE(store.is_open());
+    anchor_guard(store);
 
     store.store(mk_agg_resp("clock-a", "agent-a", 1));
     store.store(mk_agg_resp("clock-b", "agent-a", 1));
@@ -1009,6 +1133,7 @@ TEST_CASE("ResponseStore: reap bound scales with a >120d retention (no false wou
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ResponseStore store(pool, /*retention_days=*/200); // > the old fixed ~120d bound
     REQUIRE(store.is_open());
+    anchor_guard(store);
 
     store.store(mk_agg_resp("ret200-live", "agent-a", 1)); // ttl ≈ now + 200d
     store.store(mk_agg_resp("ret200-old", "agent-a", 1));
@@ -1036,6 +1161,7 @@ TEST_CASE("ResponseStore: reap records result=capped when the per-pass cap is hi
     REQUIRE(store.is_open());
     yuzu::MetricsRegistry metrics;
     store.set_metrics(&metrics);
+    anchor_guard(store);
 
     exec_sql(db.dsn(),
             "INSERT INTO response_store.responses (instruction_id, agent_id, timestamp, "
@@ -1069,6 +1195,7 @@ TEST_CASE("ResponseStore: reap that hits the cap with an empty backlog records s
     REQUIRE(store.is_open());
     yuzu::MetricsRegistry metrics;
     store.set_metrics(&metrics);
+    anchor_guard(store);
 
     // EXACTLY kReapCapPerPass expired rows, nothing else expired.
     exec_sql(db.dsn(),
@@ -1164,8 +1291,10 @@ TEST_CASE("ResponseStore: wide facet set (>64 distinct values) all persist via b
 // accidentally reused `status` (also an int, also on this row) is caught too.
 
 TEST_CASE("ResponseStore: plugin_result_status round-trips through store/read (CC-07)",
-          "[response_store][cc07]") {
-    ResponseStore store(":memory:");
+          "[pg][response_store][cc07]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
 
     StoredResponse resp;
@@ -1177,9 +1306,10 @@ TEST_CASE("ResponseStore: plugin_result_status round-trips through store/read (C
     store.store(resp);
 
     auto results = store.get_by_instruction("cmd-cc07");
-    REQUIRE(results.size() == 1);
-    CHECK(results[0].status == 1);
-    CHECK(results[0].plugin_result_status == 3);
+    REQUIRE(results.has_value());
+    REQUIRE(results->size() == 1);
+    CHECK((*results)[0].status == 1);
+    CHECK((*results)[0].plugin_result_status == 3);
 
     // A response whose plugin never reported one stays honestly undeclared
     // rather than inheriting the neighbouring row's value.
@@ -1191,9 +1321,10 @@ TEST_CASE("ResponseStore: plugin_result_status round-trips through store/read (C
     store.store(silent);
 
     auto both = store.get_by_instruction("cmd-cc07");
-    REQUIRE(both.size() == 2);
+    REQUIRE(both.has_value());
+    REQUIRE(both->size() == 2);
     int declared = 0, undeclared = 0;
-    for (const auto& r : both) {
+    for (const auto& r : *both) {
         if (r.agent_id == "agent-1") {
             CHECK(r.plugin_result_status == 3);
             ++declared;
@@ -1208,8 +1339,10 @@ TEST_CASE("ResponseStore: plugin_result_status round-trips through store/read (C
 
 TEST_CASE("ResponseStore: finalize_terminal_status writes the typed status onto the RUNNING row "
           "(CC-07)",
-          "[response_store][cc07]") {
-    ResponseStore store(":memory:");
+          "[pg][response_store][cc07]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
 
     // The normal shape for a command that streamed output: a RUNNING row
@@ -1224,8 +1357,9 @@ TEST_CASE("ResponseStore: finalize_terminal_status writes the typed status onto 
     store.store(running);
 
     auto before = store.get_by_instruction("cmd-final");
-    REQUIRE(before.size() == 1);
-    REQUIRE(before[0].plugin_result_status == 0);
+    REQUIRE(before.has_value());
+    REQUIRE(before->size() == 1);
+    REQUIRE((*before)[0].plugin_result_status == 0);
 
     auto res = store.finalize_terminal_status("cmd-final", "agent-1", /*terminal_status=*/2,
                                               "denied by policy", "exec-1",
@@ -1233,8 +1367,9 @@ TEST_CASE("ResponseStore: finalize_terminal_status writes the typed status onto 
     REQUIRE(res == ResponseStore::FinalizeResult::Updated);
 
     auto after = store.get_by_instruction("cmd-final");
-    REQUIRE(after.size() == 1);
-    CHECK(after[0].status == 2);
-    CHECK(after[0].error_detail == "denied by policy");
-    CHECK(after[0].plugin_result_status == 4);
+    REQUIRE(after.has_value());
+    REQUIRE(after->size() == 1);
+    CHECK((*after)[0].status == 2);
+    CHECK((*after)[0].error_detail == "denied by policy");
+    CHECK((*after)[0].plugin_result_status == 4);
 }

@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string_view>
 #include <tuple>
 #include <unordered_map>
@@ -69,6 +70,26 @@ constexpr int64_t kReapBigStepSecs = 86'400; // part 7: absolute, ~1 day
 // literally), with a floor so a tiny/zero retention still catches genuinely
 // corrupt/attacker-skewed far-future timestamps.
 constexpr int64_t kReapImplausiblyAheadFloorSecs = 10'368'000; // ~120 days
+
+// EXISTS, NOT `count(*) FILTER (...)` (#2691, Doomgoose review + Sol plan
+// review): the counting form has no statement-level WHERE, so every row —
+// including the `ttl_expires_at = 0` majority, which sits outside the
+// partial index `idx_resp_ttl ... WHERE ttl_expires_at > 0` — must be
+// visited before either count is known: a full scan on every hourly pass,
+// on the store's highest-write table. EXISTS carries the `> 0` predicate
+// into the index and stops at the first matching row. The survivor half is
+// `ORDER BY ttl_expires_at LIMIT 1 ... IS NOT NULL` rather than a second
+// bare EXISTS, matching `audit_store.hpp`'s `kAuditRetentionProbeSql` shape
+// and its own comment on why: a bare `EXISTS(range-cond)` gives the planner
+// no signal beyond the range's estimated selectivity, which a wide
+// retention window (`response_retention_days` is operator-unclamped) with
+// sparse real matches at the tail can get wrong; ordering by the partial
+// index's leading column plus a LIMIT is plan-independent regardless.
+constexpr std::string_view kResponseRetentionProbeSql =
+    "SELECT EXISTS(SELECT 1 FROM response_store.responses WHERE ttl_expires_at > 0 AND "
+    "ttl_expires_at < $1::bigint), (SELECT 1 FROM response_store.responses WHERE "
+    "ttl_expires_at > 0 AND ttl_expires_at >= $1::bigint AND ttl_expires_at <= $2::bigint "
+    "ORDER BY ttl_expires_at LIMIT 1) IS NOT NULL";
 
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -267,8 +288,9 @@ const std::vector<pg::PgMigration>& migrations() {
 
 // ── Construction ─────────────────────────────────────────────────────────────
 
-ResponseStore::ResponseStore(pg::PgPool& pool, int retention_days)
-    : pool_(pool), retention_days_(retention_days) {
+ResponseStore::ResponseStore(pg::PgPool& pool, int retention_days,
+                             std::function<int64_t()> now_fn)
+    : pool_(pool), retention_days_(retention_days), now_fn_(std::move(now_fn)) {
     auto lease = pool_.acquire();
     if (!lease) {
         spdlog::error("ResponseStore: no database connection at construction ({}) — response "
@@ -288,6 +310,13 @@ ResponseStore::ResponseStore(pg::PgPool& pool, int retention_days)
 int64_t ResponseStore::compute_ttl_epoch() const {
     if (retention_days_ <= 0)
         return 0; // sentinel: never expire
+    // Accepted residual (#2691, Sol plan review): this reads the INGEST
+    // replica's own process clock, not PostgreSQL's. A slow replica can
+    // still stamp early default-expiry on a subset of rows at insert time —
+    // unlike reap_expired()'s clock-guard above, this is an ingest-time
+    // skew, not a delete-time false verdict, and once stamped it reads to
+    // the guarded reaper as ordinary partial expiry (no anomaly). Lower
+    // stakes than the reap-side defect this PR fixes; not addressed here.
     return now_epoch() + static_cast<int64_t>(retention_days_) * 86400;
 }
 
@@ -342,12 +371,15 @@ void ResponseStore::store(const StoredResponse& resp) {
     pg::PgResult ins = pg::exec_params(
         conn,
         "INSERT INTO response_store.responses (instruction_id, agent_id, timestamp, status, "
-        "output, error_detail, ttl_expires_at, plugin, execution_id, received_at_ms) "
-        "VALUES ($1,$2,$3::bigint,$4::integer,$5,$6,$7::bigint,$8,$9,$10::bigint) RETURNING id",
+        "output, error_detail, ttl_expires_at, plugin, execution_id, received_at_ms, "
+        "plugin_result_status) "
+        "VALUES ($1,$2,$3::bigint,$4::integer,$5,$6,$7::bigint,$8,$9,$10::bigint,$11::integer) "
+        "RETURNING id",
         std::vector<std::string>{resp.instruction_id, resp.agent_id, std::to_string(ts),
                                  std::to_string(resp.status), sanitized_output, sanitized_error,
                                  std::to_string(ttl), resp.plugin, resp.execution_id,
-                                 std::to_string(received_ms)});
+                                 std::to_string(received_ms),
+                                 std::to_string(resp.plugin_result_status)});
     if (ins.status() != PGRES_TUPLES_OK || PQntuples(ins.get()) != 1) {
         spdlog::warn("ResponseStore: insert failed for instruction={} agent={}: {}",
                      resp.instruction_id, resp.agent_id, PQerrorMessage(conn));
@@ -945,7 +977,53 @@ void ResponseStore::reap_expired() {
             return true;
         }
 
-        const int64_t now = now_epoch();
+        const int64_t now = now_fn_ ? now_fn_() : now_epoch();
+        // Sanitise the CALLER's (process) clock cheaply, before even
+        // attempting the pg_now read below (clock-guard part 3). UPPER bound
+        // only: a NEGATIVE reading is the legitimate dead-CMOS case the
+        // guard exists for. This value plays NO further role in the pass —
+        // every DECISION below reads Postgres's OWN clock (pg_now below),
+        // matching `GuaranteedStateStore::reap_expired`'s `#2663` fix and
+        // `AuditStore::cleanup_once`'s original `#2360/1d` fix — so an
+        // implausible process clock is refused here only to avoid touching
+        // the database at all for a reading that could not matter.
+        constexpr int64_t kMaxPlausibleNow = std::numeric_limits<int64_t>::max() / 4;
+        if (now > kMaxPlausibleNow) {
+            spdlog::warn("ResponseStore::reap_expired: implausible clock reading ({}); "
+                        "declining the pass",
+                        now);
+            outcome = "failed";
+            return false;
+        }
+
+        // PostgreSQL's OWN clock, not this replica's process clock, for
+        // every DECISION below (#2691, transplanted from #2663). Under the
+        // prior process-clock read, a replica whose own clock ran fast could
+        // win the shared `gc_meta.last_pass_now` anchor and sweep a row
+        // still live by every other clock, with no anomaly recorded — the
+        // shared row is the transmission medium, not the fix. Read AFTER the
+        // advisory lock, inside this transaction, so every replica
+        // serialised through that lock gets the IDENTICAL comparison point
+        // regardless of its own clock's accuracy.
+        pg::PgResult clk = pg::exec_params(conn, "SELECT EXTRACT(EPOCH FROM now())::bigint",
+                                           std::vector<std::string>{});
+        if (clk.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ResponseStore::reap_expired: pg clock read failed: {}",
+                          PQerrorMessage(conn));
+            return false;
+        }
+        const int64_t pg_now = to_i64(PQgetvalue(clk.get(), 0, 0));
+        // Same overflow guard, applied to PG's reading too — cheap to bound
+        // both sources the same way rather than trust one implicitly because
+        // it is "the database".
+        if (pg_now > kMaxPlausibleNow) {
+            spdlog::error("ResponseStore::reap_expired: PostgreSQL's own clock reading ({}) is "
+                         "implausible; declining the pass",
+                         pg_now);
+            outcome = "failed";
+            return false;
+        }
+
         // Derive the implausibly-ahead bound from THIS store's configured
         // retention (2× horizon, floored) so raising `response_retention_days`
         // above a fixed constant can't push the whole live set past the bound
@@ -958,7 +1036,7 @@ void ResponseStore::reap_expired() {
         pg::PgResult meta = pg::exec_params(
             conn,
             "SELECT key, value FROM response_store.gc_meta WHERE key IN ('last_pass_now',"
-            "'last_anomaly_facts')",
+            "'last_anomaly_facts','bootstrap_settled')",
             std::vector<std::string>{});
         if (meta.status() != PGRES_TUPLES_OK) {
             spdlog::error("ResponseStore::reap_expired: meta read failed: {}",
@@ -968,6 +1046,10 @@ void ResponseStore::reap_expired() {
         std::optional<int64_t> prev;
         bool prev_unusable = false;
         std::string last_facts;
+        // #2579: has ANY pass on this database ever reached a verdict?
+        // Durable and SHARED across replicas (not a per-process flag) —
+        // settled below, AFTER classify(), never derived from `prev`.
+        bool bootstrap_settled = false;
         for (int i = 0; i < PQntuples(meta.get()); ++i) {
             const std::string key = text_col(meta.get(), i, 0);
             const std::string val = text_col(meta.get(), i, 1);
@@ -981,9 +1063,11 @@ void ResponseStore::reap_expired() {
                     prev = static_cast<int64_t>(v);
             } else if (key == "last_anomaly_facts") {
                 last_facts = val;
+            } else if (key == "bootstrap_settled") {
+                bootstrap_settled = true;
             }
         }
-        if (prev && (*prev < 0 || *prev > now)) {
+        if (prev && (*prev < 0 || *prev > pg_now)) {
             prev_unusable = true;
             prev.reset();
         }
@@ -992,7 +1076,7 @@ void ResponseStore::reap_expired() {
             conn,
             "INSERT INTO response_store.gc_meta (key, value) VALUES ('last_pass_now', $1) ON "
             "CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            std::vector<std::string>{std::to_string(now)});
+            std::vector<std::string>{std::to_string(pg_now)});
         if (stamp.status() != PGRES_COMMAND_OK) {
             spdlog::error("ResponseStore::reap_expired: meta stamp failed: {}",
                           PQerrorMessage(conn));
@@ -1000,36 +1084,92 @@ void ResponseStore::reap_expired() {
         }
 
         pg::PgResult probe = pg::exec_params(
-            conn,
-            "SELECT count(*) FILTER (WHERE ttl_expires_at > 0 AND ttl_expires_at < $1::bigint) "
-            "AS expiring, count(*) FILTER (WHERE ttl_expires_at > 0 AND ttl_expires_at <= "
-            "$2::bigint) AS datable FROM response_store.responses",
-            std::vector<std::string>{std::to_string(now),
-                                     std::to_string(now + implausibly_ahead)});
+            conn, std::string(kResponseRetentionProbeSql).c_str(),
+            std::vector<std::string>{std::to_string(pg_now),
+                                     std::to_string(pg_now + implausibly_ahead)});
         if (probe.status() != PGRES_TUPLES_OK) {
             spdlog::error("ResponseStore::reap_expired: probe failed: {}", PQerrorMessage(conn));
             return false;
         }
-        const int64_t expiring = to_i64(PQgetvalue(probe.get(), 0, 0));
-        const int64_t datable = to_i64(PQgetvalue(probe.get(), 0, 1));
+        const bool has_expired = to_bool(PQgetvalue(probe.get(), 0, 0));
+        const bool has_survivor = to_bool(PQgetvalue(probe.get(), 0, 1));
+        const bool would_wipe = has_expired && !has_survivor;
 
         audit_retention::Facts facts{
-            .has_expired = expiring > 0,
-            .would_wipe = expiring > 0 && expiring >= datable,
-            .big_step = prev.has_value() && expiring > 0 &&
-                        audit_retention::moved_at_least(*prev, now, kReapBigStepSecs) && now > *prev,
+            .has_expired = has_expired,
+            .would_wipe = would_wipe,
+            .big_step = prev.has_value() && has_expired &&
+                        audit_retention::moved_at_least(*prev, pg_now, kReapBigStepSecs) &&
+                        pg_now > *prev,
             .prev_unusable = prev_unusable,
+            // #2579's missing-anchor trigger. RECORDED ANSWER (routed-concern
+            // "Clock-guarded retention" part 6): decline — AuditStore's/
+            // GuaranteedStateStore's answer, not ResultSetStore's. A
+            // mis-timed pass here would destroy agent command/instruction
+            // results powering the executions drawer + `/tar` dashboard,
+            // some of which carry usage-class behavioral PII (device.live.*,
+            // per-app panels) — not ResultSetStore's reproducible
+            // one-TTL-window scratch result sets.
+            .no_anchor = !bootstrap_settled,
         };
         const auto anomaly = audit_retention::classify(facts);
+        // FIVE chars — the 5th ('b') is safe to add here without the
+        // mixed-version dedup hazard result_set_store.cpp's comment warns
+        // about: the 4-char format never shipped to a deployed writer
+        // (born-on-PG in this same PR).
         const std::string facts_ser = std::string(facts.has_expired ? "e" : "-") +
                                       (facts.would_wipe ? "w" : "-") +
                                       (facts.big_step ? "s" : "-") +
-                                      (facts.prev_unusable ? "u" : "-");
+                                      (facts.prev_unusable ? "u" : "-") +
+                                      (facts.no_anchor ? "b" : "-");
+
+        // The pass has now REACHED A VERDICT, so settle the bootstrap marker
+        // — HERE, not at the re-anchor above. The re-anchor runs before the
+        // probes, so deriving the trigger from the stored reading would let
+        // a transient probe failure spend it permanently: the next pass
+        // would see a reading, call itself anchored, and delete with every
+        // detector false — the exact defect #2579 closes. Every early
+        // return above this line rolls the whole transaction back, so a
+        // pass that never reached a verdict leaves the trigger armed.
+        if (!bootstrap_settled) {
+            pg::PgResult settle = pg::exec_params(
+                conn,
+                "INSERT INTO response_store.gc_meta (key, value) VALUES "
+                "('bootstrap_settled', '1') ON CONFLICT (key) DO NOTHING",
+                std::vector<std::string>{});
+            if (settle.status() != PGRES_COMMAND_OK) {
+                spdlog::error("ResponseStore::reap_expired: bootstrap settle failed: {}",
+                              PQerrorMessage(conn));
+                return false;
+            }
+        }
+
         if (anomaly != audit_retention::Anomaly::None) {
             if (facts_ser != last_facts) {
-                spdlog::warn("ResponseStore::reap_expired: retention clock anomaly ({} facts={}) "
-                            "— declining this pass; an identical next pass will drain, capped",
-                            static_cast<int>(anomaly), facts_ser);
+                // A NAME, not the enum ordinal: #2579 inserted an
+                // enumerator mid-enum, so an ordinal silently renames
+                // itself across an upgrade while the operator-facing
+                // string stays put.
+                const char* anomaly_name = "unknown";
+                switch (anomaly) {
+                case audit_retention::Anomaly::None: anomaly_name = "none"; break;
+                case audit_retention::Anomaly::NoAnchor: anomaly_name = "no-anchor"; break;
+                case audit_retention::Anomaly::Wipe: anomaly_name = "wipe"; break;
+                case audit_retention::Anomaly::Step: anomaly_name = "step"; break;
+                case audit_retention::Anomaly::BadState: anomaly_name = "bad-state"; break;
+                }
+                if (anomaly == audit_retention::Anomaly::NoAnchor) {
+                    spdlog::warn("ResponseStore::reap_expired: no usable previous retention "
+                                "clock reading and rows are already expired (now={} facts={}) "
+                                "— declining this pass and anchoring; the next pass has a "
+                                "comparison point and proceeds (#2579)",
+                                pg_now, facts_ser);
+                } else {
+                    spdlog::warn("ResponseStore::reap_expired: retention clock anomaly ({} "
+                                "facts={}) — declining this pass; an identical next pass will "
+                                "drain, capped",
+                                anomaly_name, facts_ser);
+                }
                 pg::PgResult rec = pg::exec_params(
                     conn,
                     "INSERT INTO response_store.gc_meta (key, value) VALUES "
@@ -1041,7 +1181,8 @@ void ResponseStore::reap_expired() {
                                   PQerrorMessage(conn));
                     return false;
                 }
-                outcome = "declined";
+                outcome = anomaly == audit_retention::Anomaly::NoAnchor ? "declined_no_anchor"
+                                                                        : "declined";
                 return true;
             }
             // Suppressed repeat of the SAME fact set — proceed with the
@@ -1056,7 +1197,7 @@ void ResponseStore::reap_expired() {
                 return false;
             }
         }
-        if (expiring == 0) {
+        if (!has_expired) {
             outcome = "noop";
             return true;
         }
@@ -1070,7 +1211,7 @@ void ResponseStore::reap_expired() {
             "DELETE FROM response_store.responses WHERE id IN (SELECT id FROM "
             "response_store.responses WHERE ttl_expires_at > 0 AND ttl_expires_at < $1::bigint "
             "ORDER BY ttl_expires_at ASC, id ASC LIMIT $2::bigint) RETURNING id",
-            std::vector<std::string>{std::to_string(now), std::to_string(kReapCapPerPass)});
+            std::vector<std::string>{std::to_string(pg_now), std::to_string(kReapCapPerPass)});
         if (del.status() != PGRES_TUPLES_OK) {
             spdlog::error("ResponseStore::reap_expired: delete failed: {}", PQerrorMessage(conn));
             return false;
@@ -1091,7 +1232,7 @@ void ResponseStore::reap_expired() {
                 conn,
                 "SELECT EXISTS(SELECT 1 FROM response_store.responses WHERE ttl_expires_at > 0 "
                 "AND ttl_expires_at < $1::bigint)",
-                std::vector<std::string>{std::to_string(now)});
+                std::vector<std::string>{std::to_string(pg_now)});
             if (more.status() != PGRES_TUPLES_OK) {
                 spdlog::error("ResponseStore::reap_expired: backlog probe failed: {}",
                               PQerrorMessage(conn));
