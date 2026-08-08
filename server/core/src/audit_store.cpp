@@ -104,7 +104,7 @@ constexpr std::int64_t kMaxPlausibleNow = std::numeric_limits<std::int64_t>::max
 // liveness-gauge seed (`seed_last_pass_from_anchor`, #2854) so both treat
 // "not a clean integer" as the same anomaly rather than two independently
 // maintained `strtoll` call sites drifting apart.
-std::optional<std::int64_t> parse_meta_i64(const std::string& val) {
+[[nodiscard]] std::optional<std::int64_t> parse_meta_i64(const std::string& val) {
     errno = 0;
     char* end = nullptr;
     const long long v = std::strtoll(val.c_str(), &end, 10);
@@ -397,8 +397,10 @@ AuditStore::AuditStore(pg::PgPool& pool, int retention_days, int cleanup_interva
     // database — the anchor from a previous `cleanup_once` pass already
     // exists. It does NOT cover the first-ever Postgres boot: on that boot
     // the anchor is only copied by `migrate_from_sqlite`'s legacy-meta step,
-    // which runs after this constructor returns, so `backfill_ok` (below)
-    // seeds again once that copy has actually happened (#2854).
+    // which runs after this constructor returns — that function re-seeds
+    // itself, immediately before its own return, once that copy has
+    // actually happened (#2854). Deliberately NOT re-seeded from inside
+    // `backfill_ok` — see the comment at that call site for why.
     seed_last_pass_from_anchor();
     spdlog::info("AuditStore initialized (schema {}, retention={}d, liveness anchor {})",
                  kStoreName, retention_days_, last_pass_unixtime_.load(std::memory_order_relaxed));

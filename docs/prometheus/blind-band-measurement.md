@@ -58,7 +58,11 @@ a C++ change to `AuditStore`, out of scope for a rules-and-CI branch.
 
 **As of #2854, the server half is done**: the gauge is now seeded from the
 durable anchor at construction and again after the legacy backfill, so it
-survives a restart (including the first PostgreSQL boot). What remains open
+survives a restart (including the first PostgreSQL boot). A value of INT64_MIN
+(-9223372036854775808) is a distinct anomaly sentinel — the durable anchor
+exists but could not be trusted as an integer — not a genuine timestamp, and
+self-corrects at the next successful pass; a future rule must exclude it
+explicitly, same as the dead-CMOS negative case below. What remains open
 is the RULE that consumes it — the redesigned rule family, gated by a sweep
 against a committed manifest of silent cadences, still needs to land. The
 second trap below (the dead-CMOS negative stamp) still constrains its design.
