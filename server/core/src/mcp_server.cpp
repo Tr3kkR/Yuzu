@@ -3,6 +3,7 @@
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
+#include "mcp_approval_error.hpp" // shared approval-store failure body (#2786)
 #include "mcp_input_schema.hpp" // input-schema subset compiler (#2405 C8 pre-approval gate)
 #include "mcp_jsonrpc.hpp"
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
@@ -3315,7 +3316,26 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
 
                     // Recall path → validate the supplied ticket.
-                    auto appr = approval_manager->get(supplied_id);
+                    // get_checked, NOT get: a store read that FAILED is not a
+                    // read that found nothing. `get` collapsed the two, so a
+                    // transient SQLite failure here read as "no such ticket"
+                    // and the branch below told the caller to submit a fresh
+                    // request, discarding a live human-approved capability on
+                    // a failure a retry may clear. Same burn class the
+                    // consume-side guard below closes, on the same request
+                    // path, reached FIRST.
+                    auto appr_read = approval_manager->get_checked(supplied_id);
+                    if (!appr_read) {
+                        count_denial("yuzu_mcp_approval_refused_total", nullptr);
+                        mcp_audit("denied",
+                                  "approval_id=" + supplied_id + " refused: " +
+                                      consume_denial_reason(ConsumeFailure::kStoreError) +
+                                      " (lookup)");
+                        res.set_content(approval_store_error_body(*approval_manager, a4_error),
+                                        "application/json");
+                        return;
+                    }
+                    auto appr = std::move(*appr_read);
                     if (!appr || appr->definition_id != definition_id ||
                         appr->scope_expression != canon) {
                         // Absent, or for a different tool / different arguments.
@@ -3373,9 +3393,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         // and its write unchecked, so nothing can alert on it.
                         // The counter gives an operator a refusal RATE.
                         //
-                        // It deliberately carries NO reason label. The denial
-                        // token is exactly the distinction the client response
-                        // below refuses to make, and `/metrics` is not a
+                        // It deliberately carries NO reason label. A store
+                        // failure is already exposed via the response code
+                        // (-32603 vs -32003); what the audit token carries
+                        // and this counter withholds is the split WITHIN a
+                        // -32003 denial - foreign_origin vs an ordinary
+                        // replay - which is the distinction the client
+                        // response below refuses to make. `/metrics` is not a
                         // stronger reader than the caller: it is exempt for
                         // localhost and otherwise needs only a resolved
                         // session — the same credential the MCP caller already
@@ -3397,59 +3421,28 @@ McpServer::HandlerFn McpServer::build_handler(
                         // kStoreError is NOT one of those. It leaves the ticket
                         // UNTOUCHED, so telling the caller it was "already used"
                         // and to fetch a fresh one would burn a live human
-                        // approval on a failure a retry may clear.
+                        // approval on a failure a retry may clear. The shared
+                        // body below (also used by rung 1's lookup failure,
+                        // above) carries this remediation and the conditional
+                        // retry directive A5 requires.
                         //
-                        // The remediation says "not consumed", which is always
-                        // true, rather than "still valid", which is not: the
-                        // 7-day TTL keeps running through an outage, so an
-                        // outage outlasting the ticket's remaining window ends
-                        // with it expired. Promising validity and then refusing
-                        // the ticket would leave the caller waiting on a
-                        // capability that had been retired underneath them.
-                        //
-                        // The retry directive is CONDITIONAL, and the condition
-                        // is the point. A5 wants a retry hint to be machine
-                        // metadata rather than prose, and omitting it emits
-                        // null, which this file's convention reads as NOT
-                        // retryable — so a transient failure must carry one.
-                        //
-                        // `kStoreError` also covers the store never having
-                        // opened, and telling a client to retry every 5s a
-                        // condition that cannot clear is an unbounded loop that
-                        // writes an audit row per attempt.
-                        //
-                        // The `!is_open()` arm below is DEFENCE IN DEPTH, not a
-                        // live discriminator, and saying otherwise was wrong:
-                        // a closed store cannot reach this line today. The
-                        // lookup above uses `get()`, which collapses a failed
-                        // read to "no row", so a closed store returns -32003
-                        // there and consume is never called. The arm is kept
-                        // because it costs one branch and stops this site
-                        // becoming the fail-open one if that lookup changes.
+                        // The `!is_open()` arm inside that shared body is
+                        // defence in depth here, NOT the live discriminator for
+                        // a closed store: rung 1's lookup is `get_checked` now,
+                        // so a closed store is refused there and never reaches
+                        // this line. It is kept because it costs nothing and
+                        // stops THIS site becoming the fail-open one if rung 1's
+                        // lookup ever changes.
                         //
                         // What is NOT covered either way: an OPEN handle whose
                         // reads fail permanently — CORRUPT, NOTADB, READONLY,
-                        // FULL — takes the retry arm and is told to retry
+                        // FULL — takes the transient arm and is told to retry
                         // forever. That is the real gap, it needs
                         // sqlite3_extended_errcode carried on ConsumeError,
-                        // and it is not closed here.
+                        // and it is not closed here (#2786 PR 1c).
                         if (kind == ConsumeFailure::kStoreError) {
-                            const bool open = approval_manager->is_open();
-                            res.set_content(
-                                open ? a4_error(kInternalError,
-                                                "approval store temporarily unavailable",
-                                                "retry this call unchanged — the approval was NOT "
-                                                "consumed, so do not request a fresh one. The "
-                                                "7-day approval window keeps running during an "
-                                                "outage: if it elapses the ticket expires and a "
-                                                "new approval is required",
-                                                5000)
-                                     : a4_error(kInternalError, "approval store unavailable",
-                                                "this will NOT clear on retry — the approval was "
-                                                "NOT consumed and does not need re-requesting "
-                                                "while the 7-day window holds. Escalate to an "
-                                                "operator"),
-                                "application/json");
+                            res.set_content(approval_store_error_body(*approval_manager, a4_error),
+                                            "application/json");
                             return;
                         }
                         res.set_content(

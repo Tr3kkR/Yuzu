@@ -8,6 +8,7 @@
 
 #include <array>
 #include "approval_manager.hpp"
+#include "mcp_approval_error.hpp"
 #include "reserved_definition_id.hpp"
 #include "migration_runner.hpp"
 #include "sqlite_raii.hpp"
@@ -1407,4 +1408,92 @@ TEST_CASE("consume_denial_reason: every kind maps to its own audit token",
     for (size_t i = 0; i < tokens.size(); ++i)
         for (size_t j = i + 1; j < tokens.size(); ++j)
             CHECK(std::string(tokens[i]) != std::string(tokens[j]));
+}
+
+// ── approval_store_error_body (#2786) ───────────────────────────────────────
+// The branch these pin had ZERO coverage in either direction: a governance
+// reviewer deleted it wholesale once and no assertion moved, which is how a
+// permanent failure shipped telling the caller to "retry this call unchanged"
+// forever, with an audit row written per attempt.
+
+namespace {
+// #2880 review F1 (fjarvis/Codex/Kimi panel, reproduced on GCC): the concept
+// used to declare its operand as non-const `A4Error a4_error`, but
+// `approval_store_error_body` invokes it through `const A4Error&`. A
+// mutable-only callable satisfied the concept and then failed deep inside
+// template instantiation - exactly the failure mode the concept exists to
+// avoid at the declaration instead. Pin both directions: a const-callable
+// type still satisfies the concept, and a mutable-only-call-operator type
+// does not.
+struct ConstCallableProbe {
+    std::string operator()(int, std::string_view, std::string_view, long = -1,
+                           std::string_view = {}) const {
+        return "body";
+    }
+};
+static_assert(yuzu::server::mcp::ApprovalA4Error<ConstCallableProbe>);
+
+struct MutableOnlyProbe {
+    std::string operator()(int, std::string_view, std::string_view, long = -1,
+                           std::string_view = {}) {
+        return "body";
+    }
+};
+static_assert(!yuzu::server::mcp::ApprovalA4Error<MutableOnlyProbe>);
+} // namespace
+
+TEST_CASE("approval_store_error_body: a permanent failure is not described as temporary",
+          "[approval_manager][approval][security]") {
+    ApprovalManager closed(nullptr); // store never opened - cannot recover without an operator
+    REQUIRE(!closed.is_open());
+
+    int seen_code = 0;
+    std::string seen_message, seen_remediation;
+    long seen_retry = -7; // sentinel distinct from the production default (-1)
+    auto probe = [&](int code, std::string_view message, std::string_view remediation = {},
+                     long retry_after_ms = -1, std::string_view = {}) {
+        seen_code = code;
+        seen_message = std::string(message);
+        seen_remediation = std::string(remediation);
+        seen_retry = retry_after_ms;
+        return std::string("body");
+    };
+
+    (void)yuzu::server::mcp::approval_store_error_body(closed, probe);
+
+    CHECK(seen_code == yuzu::server::mcp::kInternalError);
+    CHECK(seen_message.find("temporarily") == std::string::npos);
+    CHECK(seen_remediation.find("retry this call unchanged") == std::string::npos);
+    // -1 is the production a4_error default, which the caller's envelope
+    // serialises as JSON `null` (present in the body, not a missing key) -
+    // this file's encoding for "not retryable". A concrete value here is an
+    // instruction to loop on a condition that never clears.
+    CHECK(seen_retry == -1);
+}
+
+TEST_CASE("approval_store_error_body: a transient failure carries a machine-readable retry",
+          "[approval_manager][approval][security]") {
+    TestDb tdb;
+    ApprovalManager open(tdb.db);
+    open.create_tables();
+    REQUIRE(open.is_open());
+
+    std::string seen_message, seen_remediation;
+    long seen_retry = -1;
+    auto probe = [&](int, std::string_view message, std::string_view remediation = {},
+                     long retry_after_ms = -1, std::string_view = {}) {
+        seen_message = std::string(message);
+        seen_remediation = std::string(remediation);
+        seen_retry = retry_after_ms;
+        return std::string("body");
+    };
+
+    (void)yuzu::server::mcp::approval_store_error_body(open, probe);
+
+    CHECK(seen_message.find("temporarily") != std::string::npos);
+    CHECK(seen_remediation.find("do NOT request a fresh one") != std::string::npos);
+    // Invariant A5: the retry directive must be machine metadata, not prose.
+    // Pinned EXACT, not `> 0`: a mutant that swaps 5000 for any other
+    // positive constant must still be caught (QA-3).
+    CHECK(seen_retry == 5000);
 }
