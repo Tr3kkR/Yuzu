@@ -1073,6 +1073,55 @@ TEST_CASE("ResponseStore: reap_expired caps a large expired batch at kReapCapPer
     CHECK(store.total_count() == 1); // only "cap-live" survives
 }
 
+// #2691 (Doomgoose finding #6): the parent-row delete is chunked
+// (kReapDeleteChunkRows=500) so the ON DELETE CASCADE fan-out per statement
+// is bounded — 1200 expired rows, each carrying its own facet, crosses that
+// chunk boundary twice within a single pass (well under kReapCapPerPass).
+// Every row AND every facet must still be gone, and the pass reports
+// "swept" (not "capped") since the total is under the per-pass ceiling —
+// pins that chunk-boundary crossing introduces no off-by-one or partial
+// deletion.
+TEST_CASE("ResponseStore: reap_expired deletes correctly across a chunk boundary",
+          "[pg][response_store][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool, /*retention_days=*/30);
+    REQUIRE(store.is_open());
+    anchor_guard(store);
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    constexpr int kRows = 1200; // > 2x kReapDeleteChunkRows (500)
+    for (int i = 0; i < kRows; ++i) {
+        StoredResponse r;
+        r.instruction_id = "chunk-" + std::to_string(i);
+        r.agent_id = "agent-a";
+        r.status = 1;
+        r.plugin = "vuln_scan";
+        r.output = "high|cat-" + std::to_string(i) + "|title|detail";
+        store.store(r);
+    }
+    exec_sql(db.dsn(), "UPDATE response_store.responses SET ttl_expires_at = 1 WHERE "
+                       "instruction_id LIKE 'chunk-%'");
+    store.store(mk_agg_resp("chunk-live", "agent-a", 1)); // avoids would_wipe
+
+    store.reap_expired();
+    CHECK(store.responses_reaped_total() == kRows);
+    CHECK(store.total_count() == 1); // only "chunk-live" survives
+
+    const auto reaped = [&](const char* result) {
+        return metrics.counter("yuzu_server_response_reap_passes_total", {{"result", result}})
+            .value();
+    };
+    CHECK(reaped("swept") == 1.0);
+    CHECK(reaped("capped") == 0.0);
+
+    // No orphaned facets — every reaped row's facet went with it via CASCADE.
+    // mk_agg_resp (the surviving "chunk-live" row) sets no `plugin`, so it
+    // produces zero facets of its own — the table should be fully empty.
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM response_store.response_facets") == "0");
+}
+
 // gc_sweep advisory-lock skip: a sibling replica already sweeping holds the
 // fleet-wide try-advisory-xact-lock, so this pass must skip quietly and never
 // even reach the gc_meta read/stamp, never mind the delete.

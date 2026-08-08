@@ -69,6 +69,18 @@ constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
 // matches GuaranteedStateStore's incident-volume figure rather than
 // ResultSetStore's much smaller operator-scratch cap.
 constexpr int64_t kReapCapPerPass = 10'000;
+// The DELETE that reaps `responses` cascades to `response_facets` (ON DELETE
+// CASCADE), whose fan-out per parent row is now bounded by
+// kMaxFacetsPerResponse but was NOT before that fix — even bounded, up to
+// kReapDeleteChunkRows * kMaxFacetsPerResponse child rows can cascade from
+// one statement (#2691, Doomgoose finding #6). Chunk the parent-row delete
+// into smaller statements under a wall-clock budget rather than one
+// unbounded cascading DELETE: past the pool's statement timeout, an
+// unchunked pass fails outright, and its deterministic ORDER BY re-selects
+// the identical batch every retry — wedging retention permanently on
+// exactly the backlog that most needs to drain.
+constexpr int64_t kReapDeleteChunkRows = 500;
+constexpr std::chrono::milliseconds kReapDeleteBudget{2000};
 constexpr int64_t kReapBigStepSecs = 86'400; // part 7: absolute, ~1 day
 // The implausibly-ahead bound (part 1) MUST exceed the legitimate TTL horizon
 // or a live row's own honest ttl_expires_at gets misclassified as
@@ -1292,32 +1304,55 @@ void ResponseStore::reap_expired() {
             return true;
         }
 
-        // Single DELETE on `responses` — `response_facets` rows for the
-        // reaped ids are removed automatically via ON DELETE CASCADE (no
-        // second lockstep statement needed, unlike GuaranteedStateStore's
-        // events/observations pair which has no FK between them).
-        pg::PgResult del = pg::exec_params(
-            conn,
-            "DELETE FROM response_store.responses WHERE id IN (SELECT id FROM "
-            "response_store.responses WHERE ttl_expires_at > 0 AND ttl_expires_at < $1::bigint "
-            "ORDER BY ttl_expires_at ASC, id ASC LIMIT $2::bigint) RETURNING id",
-            std::vector<std::string>{std::to_string(pg_now), std::to_string(kReapCapPerPass)});
-        if (del.status() != PGRES_TUPLES_OK) {
-            spdlog::error("ResponseStore::reap_expired: delete failed: {}", PQerrorMessage(conn));
-            return false;
+        // `responses` reaped in chunked DELETEs, not one unbounded statement
+        // (#2691, Doomgoose finding #6) — `response_facets` rows for each
+        // reaped id are still removed automatically via ON DELETE CASCADE
+        // (no second lockstep statement needed, unlike GuaranteedStateStore's
+        // events/observations pair which has no FK between them), but the
+        // fan-out per chunk is now bounded by kReapDeleteChunkRows *
+        // kMaxFacetsPerResponse instead of kReapCapPerPass * (no bound at
+        // all). The deterministic ORDER BY is unchanged across chunks (each
+        // chunk deletes the oldest still-remaining expired rows), so a
+        // wall-clock-budget stop mid-pass leaves a well-defined remainder for
+        // the next pass, not a re-selected duplicate of what already ran.
+        const auto delete_deadline =
+            std::chrono::steady_clock::now() + kReapDeleteBudget;
+        bool budget_exhausted = false;
+        while (responses_deleted < kReapCapPerPass) {
+            const int64_t chunk_limit =
+                std::min<int64_t>(kReapDeleteChunkRows, kReapCapPerPass - responses_deleted);
+            pg::PgResult del = pg::exec_params(
+                conn,
+                "DELETE FROM response_store.responses WHERE id IN (SELECT id FROM "
+                "response_store.responses WHERE ttl_expires_at > 0 AND ttl_expires_at < "
+                "$1::bigint ORDER BY ttl_expires_at ASC, id ASC LIMIT $2::bigint) RETURNING id",
+                std::vector<std::string>{std::to_string(pg_now), std::to_string(chunk_limit)});
+            if (del.status() != PGRES_TUPLES_OK) {
+                spdlog::error("ResponseStore::reap_expired: delete failed: {}",
+                              PQerrorMessage(conn));
+                return false;
+            }
+            const int64_t chunk_deleted = PQntuples(del.get());
+            responses_deleted += chunk_deleted;
+            if (chunk_deleted < chunk_limit)
+                break; // drained everything expired — no need to check the budget
+            if (std::chrono::steady_clock::now() >= delete_deadline) {
+                budget_exhausted = true;
+                break;
+            }
         }
-        responses_deleted = PQntuples(del.get());
         // Report a capped pass distinctly (result="capped") so on-call can tell
-        // a healthy fully-draining reaper from one whose 10k/pass ceiling is
-        // being outrun by ingest (this is the higher-write store; the AuditStore
-        // cap-reached shape, ported — sre Gate 6 / R2). Hitting the cap does NOT
-        // prove a backlog remains: an exact-boundary pass that drained the last
-        // row deleted exactly the cap with nothing left. Probe for a real
-        // remaining backlog (only when the cap was hit, so the cost is rare) so
-        // an exact-boundary drain labels "swept", not a false "capped" page —
-        // the AuditStore post-delete backlog probe (chaos Gate 5).
+        // a healthy fully-draining reaper from one whose 10k/pass ceiling (or
+        // this chunking budget) is being outrun by ingest (this is the
+        // higher-write store; the AuditStore cap-reached shape, ported — sre
+        // Gate 6 / R2). Hitting either limit does NOT prove a backlog
+        // remains: an exact-boundary pass that drained the last row hit the
+        // limit with nothing left. Probe for a real remaining backlog (only
+        // when a limit was hit, so the cost is rare) so an exact-boundary
+        // drain labels "swept", not a false "capped" page — the AuditStore
+        // post-delete backlog probe (chaos Gate 5).
         outcome = "swept";
-        if (responses_deleted >= kReapCapPerPass) {
+        if (responses_deleted >= kReapCapPerPass || budget_exhausted) {
             pg::PgResult more = pg::exec_params(
                 conn,
                 "SELECT EXISTS(SELECT 1 FROM response_store.responses WHERE ttl_expires_at > 0 "
