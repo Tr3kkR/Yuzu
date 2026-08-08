@@ -13,4 +13,10 @@
   alert ever firing. Both new `/api/v1/audit` query recipes now carry an explicit
   truncation caveat: the route's `total`/`page_size` fields describe what came back, not
   what matched ([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881), filed but not fixed
-  by this change).
+  by this change). `docs/user-manual/audit-log.md`'s `GET /api/v1/audit` example
+  previously showed a `total`/`page_size` shape that does not match the route's real
+  behaviour (a `limit=20` request returning `"total": 150, "page_size": 20`, implying
+  `total` is a true match count and `page_size` mirrors the request); corrected to the
+  real shape and given the same truncation caveat. `docs/user-manual/rest-api.md`'s
+  equivalent example was numerically accurate but silent on the same risk — added the
+  caveat there too.

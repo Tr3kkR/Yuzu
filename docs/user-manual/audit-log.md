@@ -283,15 +283,24 @@ curl -s -b cookies.txt \
     }
   ],
   "pagination": {
-    "total": 150,
+    "total": 20,
     "start": 0,
-    "page_size": 20
+    "page_size": 50
   },
   "meta": {
     "api_version": "v1"
   }
 }
 ```
+
+**`total` is the number of rows returned in this response, not the number of
+rows that matched** — the route caps at `limit` (max 1000) with no `offset`
+support, so a response at exactly `limit` rows can mean there are older
+matches you have not seen, not that you have everything. `page_size` is
+likewise always `50`, independent of the `limit` you actually passed
+([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)). If you hit the cap,
+narrow with `principal=`/`action=`, or use the legacy `GET /api/audit`
+endpoint's `since`/`until` to bound the time window instead.
 
 **Example --- filter by principal and action:**
 
