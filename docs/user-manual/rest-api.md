@@ -2293,7 +2293,11 @@ matched — the route has no `offset` support, so a response at exactly
 complete answer. `page_size` is always `50`, regardless of the `limit` you
 passed (tracked: [#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)). If
 you hit the cap, narrow with `principal=`/`action=`, or fall back to the
-legacy `GET /api/audit` endpoint's `since`/`until` to bound the window.
+legacy `GET /api/audit` endpoint, which also accepts `offset`. `since`/`until`
+alone only bounds the time window — it does not by itself guarantee
+completeness inside that window if more rows matched than one call returns.
+The reliable recipe is both together: freeze a bounded window with
+`since`/`until` first, then page through it with `offset`.
 
 **Errors:** `403` — caller lacks `AuditLog:Read`; `400` — `limit` parses to
 less than 1 (a negative or zero limit; caught explicitly rather than reaching

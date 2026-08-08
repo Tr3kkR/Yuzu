@@ -300,7 +300,11 @@ matches you have not seen, not that you have everything. `page_size` is
 likewise always `50`, independent of the `limit` you actually passed
 ([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)). If you hit the cap,
 narrow with `principal=`/`action=`, or use the legacy `GET /api/audit`
-endpoint's `since`/`until` to bound the time window instead.
+endpoint, which also accepts `offset`. `since`/`until` alone only bounds the
+time window — it does not by itself guarantee completeness inside that
+window if more rows matched than one call returns. The reliable recipe is
+both together: freeze a bounded window with `since`/`until` first, then page
+through it with `offset`.
 
 **Example --- filter by principal and action:**
 
