@@ -583,12 +583,13 @@ public:
                           "malformed arguments or probing",
                           "counter");
         metrics_.describe("yuzu_mcp_approval_refused_total",
-                          "MCP approval-ticket recalls refused at the consume step "
-                          "(#2442): a replay, a ticket minted on another surface, or a "
-                          "store failure. Deliberately carries NO reason label — the "
-                          "denial kind is exactly the distinction the client response "
-                          "withholds, and /metrics is not a stronger reader than the "
-                          "caller. Read the audit trail for the kind",
+                          "MCP approval-ticket recalls refused at the ticket-lookup step "
+                          "(#2786) or the consume step (#2442): a replay, a ticket minted "
+                          "on another surface, or a store failure at either step. "
+                          "Deliberately carries NO reason label — the denial kind is "
+                          "exactly the distinction the client response withholds, and "
+                          "/metrics is not a stronger reader than the caller. Read the "
+                          "audit trail for the kind",
                           "counter");
         // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
         // degrade reason is a static literal inside the bridge, never derived
