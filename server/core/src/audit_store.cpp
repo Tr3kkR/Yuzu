@@ -440,7 +440,7 @@ void AuditStore::seed_last_pass_from_anchor() {
     if (!lease) {
         spdlog::warn("AuditStore: could not acquire a connection to seed the retention "
                      "liveness gauge ({}); it starts at the anomaly sentinel and "
-                     "self-corrects at the next retention pass",
+                     "self-corrects at the next pass whose own clock is plausible",
                      pool_.last_error());
         last_pass_unixtime_.store(kLivenessAnomalySeed, std::memory_order_relaxed);
         return;
@@ -452,7 +452,7 @@ void AuditStore::seed_last_pass_from_anchor() {
     if (r.status() != PGRES_TUPLES_OK) {
         spdlog::warn("AuditStore: could not read the retention liveness anchor ({}); the "
                      "liveness gauge starts at the anomaly sentinel and self-corrects at "
-                     "the next retention pass",
+                     "the next pass whose own clock is plausible",
                      PQerrorMessage(lease.get()));
         last_pass_unixtime_.store(kLivenessAnomalySeed, std::memory_order_relaxed);
         return;
