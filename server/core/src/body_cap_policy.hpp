@@ -1,6 +1,11 @@
 #pragma once
 
+#include "web_utils.hpp" // body_unmeasurable / has_non_identity_content_encoding /
+                          // content_length_is_authoritative — evaluate_body_cap composes
+                          // these with resolve_body_cap below (#2898).
+
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
 
 /// @file body_cap_policy.hpp
@@ -76,18 +81,21 @@
 /// for why — kept in sync with `docs/user-manual/rest-api.md` "Pre-Auth
 /// Request Body Caps".
 ///
-/// NO ROUTED-CONCERN ROW YET, and that is a known gap rather than an
-/// oversight: `.claude/routed-concerns.md` is at its size ceiling (measured
-/// 39,996 of 40,000 bytes on `dev`, i.e. four bytes free) and physically
-/// cannot take one. Until the table is split, THIS HEADER is the only
-/// statement of the chokepoint's invariants — treat it as load-bearing and
-/// do not trim it for brevity. The invariants a row would carry: this table
-/// is the single per-route body-cap chokepoint, EXTEND it and never fork it;
-/// `path_class` is the only legal metric label, never the attacker-supplied
-/// path; matching is segment-boundary, never bare `starts_with`; a new
-/// mutating route needs its own entry or a reviewed catch-all decision, and
-/// should prefer an any-method row, because verb-scoping silently drops the
-/// whole prefix to the catch-all.
+/// ROUTED-CONCERN ROW: `.claude/routed-concerns-access-control.md`, which
+/// routes any change to this table or to `server.cpp`'s pre-routing cap
+/// branch to `security-guardian` + `architect` + `cpp-safety`. That routing
+/// is the row's ONLY job and nothing else performs it — this header, the
+/// user docs and the tests all DESCRIBE the invariants, but none of them
+/// puts a reviewer in front of a future change. Keep the row and this header
+/// in step; if they ever disagree, the row governs, because it is what a
+/// reviewer is actually handed.
+///
+/// (The row lives in the access-control file rather than the main table
+/// because `.claude/routed-concerns.md` hit CLAUDE.md's 40k-character
+/// ceiling and was split along that axis to make room — the same ceiling
+/// that once split the table out of CLAUDE.md itself. This chokepoint sits
+/// beside `authz_topology_floor` and `dispatch_target_shape` there, which is
+/// where it belongs: same family, same failure mode.)
 ///
 /// The numbers below are grounded in the cited call sites, not invented —
 /// but "grounded" is not "measured byte-for-byte": two different kinds of
@@ -478,17 +486,172 @@ struct BodyCapMatch {
     // accidentally removes or mis-scopes the default entry fails LOUD (a
     // zero-byte cap that rejects everything) instead of invoking UB.
     //
-    // UNDOCUMENTED-METRIC GAP (recorded, not yet closed): `path_class=
-    // "unmatched"` is a real value this function can emit, but it is not a
-    // row in `kBodyCapTable`, so `server.cpp`'s boot-time pre-seed loop
-    // (which iterates `kBodyCapTable` to pre-seed `yuzu_body_cap_rejected_
-    // total`'s closed label set to 0) never seeds it — the series would
+    // UNREACHABLE BY CONSTRUCTION, not merely by inspection: the
+    // `static_assert` below this function proves `kBodyCapTable` contains an
+    // any-method empty-prefix row, which `body_cap_prefix_matches` accepts
+    // for every path, so `best` can never be null and this branch can never
+    // execute. That is deliberate rather than pre-seeding the label: a
+    // sentinel that CANNOT occur is stronger than one that is instrumented
+    // when it does, and it removes the `yuzu_body_cap_rejected_total`
+    // unannounced-series question entirely rather than answering it.
+    //
+    // Kept as a fail-CLOSED fallback anyway (cap 0, requires_measurable
+    // true — reject everything) so that if a future edit defeats the assert
+    // in a way the compiler cannot see, the failure mode is refusal, never
+    // an uncapped admit. Historical note for anyone re-reading the metric
+    // docs: this was previously an open gap where the label was emittable
+    // but never pre-seeded (which `server.cpp`'s boot loop, iterating
+    // `kBodyCapTable`, could not seed since it is not a row) — the series would
     // appear unannounced the first time this sentinel is ever reached.
     // `server.cpp` owns that seeding loop; this header only owns documenting
     // the gap so it is not silently assumed closed.
     if (best == nullptr)
         return {0, true, "unmatched"};
     return {best->max_body_bytes, best->requires_measurable, best->path_class};
+}
+
+/// True iff `kBodyCapTable` carries an any-method, empty-prefix catch-all row.
+///
+/// `body_cap_prefix_matches` accepts an empty prefix for every path, and
+/// `kBodyCapAnyMethod` matches every verb, so such a row makes
+/// `resolve_body_cap`'s null-`best` branch unreachable — the `unmatched`
+/// sentinel becomes impossible rather than merely unlikely.
+[[nodiscard]] constexpr bool body_cap_table_has_catch_all() noexcept {
+    for (const auto& e : kBodyCapTable)
+        if (e.method == kBodyCapAnyMethod && e.path_prefix.empty())
+            return true;
+    return false;
+}
+
+// Removing the catch-all row would make `path_class="unmatched"` emittable,
+// and `server.cpp`'s boot-time pre-seed loop iterates kBodyCapTable, so that
+// label could never be seeded — an unannounced Prometheus series that breaks
+// the absent()-alert convention in docs/observability-conventions.md. This
+// fails the BUILD instead, which is strictly stronger than instrumenting a
+// series for a condition that should not exist.
+static_assert(body_cap_table_has_catch_all(),
+              "kBodyCapTable must keep its {kBodyCapAnyMethod, \"\"} catch-all row: without "
+              "it resolve_body_cap can return path_class=\"unmatched\", which server.cpp's "
+              "boot-time metric pre-seed loop cannot seed (it iterates the table), leaving an "
+              "unannounced series. Re-add the catch-all rather than deleting this assert.");
+
+/// The outcome of `evaluate_body_cap` for one request.
+///
+/// `status`/`reason` are only meaningful when `refuse` is true — a caller
+/// must not write `status` to a response, or read `reason` as a metric
+/// label, on the admit path (`status == 0`, `reason` empty there,
+/// deliberately not a sentinel worth matching on: check `refuse` first).
+///
+/// `reason` is always one of three literals — `"unsupported_encoding"`,
+/// `"unmeasurable"`, `"over_cap"` — the SAME strings `server.cpp` already
+/// publishes as `yuzu_body_cap_rejected_total{reason=...}`, returned here
+/// instead of re-spelled at the call site so the metric label and the
+/// decision that produced it cannot drift apart.
+struct BodyCapDecision {
+    bool refuse;
+    int status;
+    std::string_view path_class;
+    std::string_view reason;
+};
+
+/// THE pre-auth request-body-cap DECISION — the single callable both
+/// `server.cpp`'s pre-routing handler and
+/// `tests/unit/server/test_body_cap_policy.cpp`'s `UnifiedBodyCapTestServer`
+/// fixture invoke (#2898). Before this existed, the fixture re-implemented
+/// the same branching independently of `server.cpp`'s lambda — same pure
+/// predicates, but combined a second time by hand — so a mutation to the
+/// PRODUCTION combination (an inverted condition, a swapped status, a
+/// dropped branch) had no test that could see it: the fixture's own,
+/// separately-written combination still matched its own separately-written
+/// expectations. Routing both call sites through this one function makes
+/// that divergence structurally impossible instead of something to keep
+/// re-verifying by hand — see `docs/postgres-store-playbook.md`-style
+/// reasoning applied to a chokepoint rather than a store: EXTEND this
+/// function, never fork it.
+///
+/// Composes `resolve_body_cap` (this header) with the framing/encoding
+/// predicates in `web_utils.hpp` (`has_non_identity_content_encoding`,
+/// `body_unmeasurable`, `content_length_is_authoritative`) in the EXACT
+/// order and precedence `server.cpp`'s file-header comment documents as
+/// D1-D5: Content-Encoding refused unconditionally FIRST (D4), then framing
+/// unmeasurability gated per-class by `requires_measurable`, then the size
+/// check gated on `content_length_is_authoritative` rather than
+/// `!unmeasurable` (the #2407 R2 CRITICAL bypass this repo already paid for
+/// once — see that predicate's own doc comment in `web_utils.hpp`).
+///
+/// DOES ONLY THE DECISION — no metric increment, no log line, no A4/SCIM
+/// envelope, no write to an `httplib::Response`. Those are call-site-owned
+/// WIRING (response shaping, envelope selection by `path_class`, metric
+/// labels, log throttling) and stay in `server.cpp`; folding them in here
+/// would pull `httplib::Response`, `spdlog`, and the metrics registry into
+/// this pure header and make it untestable without booting a server, which
+/// is the exact problem this function exists to avoid.
+///
+/// NO `httplib::Request` IN THE SIGNATURE, deliberately, even though every
+/// production caller has one at hand: `is_chunked` MUST come from httplib's
+/// own `httplib::detail::is_chunked_transfer_encoding(req.headers)` (see
+/// `content_length_is_authoritative`'s doc comment for why re-deciding that
+/// bit from the raw header text was a live bypass, twice). Accepting
+/// `const httplib::Request&` here would tempt a future caller to re-derive
+/// `is_chunked` (or `content_length`, or `has_content_length`) INSIDE this
+/// function from the request instead of from the caller's own
+/// `content_length_for_body_cap`/`is_chunked_transfer_encoding` calls — at
+/// which point the production call site and the test fixture below are back
+/// to two independent implementations of the same httplib quirk, which is
+/// precisely the class of defect #2407 R2 was. Taking the already-extracted
+/// facts instead keeps this header httplib-free (matching `is_mcp_path`'s
+/// documented reason in `web_utils.hpp`) and keeps both callers reading the
+/// SAME httplib accessors rather than two callers each trusting their own
+/// reading of the same wire bytes.
+///
+/// `noexcept`, truthfully: every predicate this composes
+/// (`resolve_body_cap`, `has_non_identity_content_encoding`,
+/// `body_unmeasurable`, `content_length_is_authoritative`) is itself
+/// `noexcept`, and this function allocates nothing and calls nothing else.
+/// The header-comment requirement in `server.cpp` to "CONTAIN THE WHOLE
+/// BLOCK" in a `try`/`catch(...)` still applies to the WIRING around this
+/// call — extracting the request's `Content-Length`/`Transfer-Encoding`/
+/// `Content-Encoding` header VALUES (`req.get_header_value*`) can throw, and
+/// that extraction happens at the caller, before this function is invoked —
+/// this function itself is not the boundary that containment protects, the
+/// caller's header reads are.
+[[nodiscard]] inline BodyCapDecision
+evaluate_body_cap(std::string_view method, std::string_view path, bool has_content_length,
+                   std::uint64_t content_length, std::string_view transfer_encoding,
+                   std::string_view content_encoding, bool is_chunked) noexcept {
+    const BodyCapMatch cap_match = resolve_body_cap(method, path);
+
+    // D4: Content-Encoding is refused UNCONDITIONALLY, on every class,
+    // checked FIRST and separately from the framing/size check below —
+    // see server.cpp's file-header comment for why (httplib decompresses
+    // before enforcing its own global limit, so Content-Length is not a
+    // bound on a compressed body's expanded size).
+    if (has_non_identity_content_encoding(content_encoding))
+        return {true, 415, cap_match.path_class, "unsupported_encoding"};
+
+    // 1. Do we REFUSE this framing outright? Deliberately broad (#2437):
+    //    any non-empty Transfer-Encoding, on a class that opted into
+    //    requires_measurable.
+    const bool unmeasurable =
+        body_unmeasurable(method, has_content_length, transfer_encoding);
+    const bool refuse_unmeasurable = unmeasurable && cap_match.requires_measurable;
+
+    // 2. May we CHECK the size? Only when httplib will actually read
+    //    Content-Length bytes — asked of `is_chunked`, supplied by the
+    //    caller from httplib's own predicate, never re-derived here. Two
+    //    DIFFERENT questions; collapsing them back into one was a live
+    //    unauthenticated bypass (#2407 R2) — see
+    //    `content_length_is_authoritative`'s doc comment.
+    const bool oversize =
+        content_length_is_authoritative(has_content_length, is_chunked) &&
+        content_length > cap_match.max_body_bytes;
+
+    if (refuse_unmeasurable)
+        return {true, 411, cap_match.path_class, "unmeasurable"};
+    if (oversize)
+        return {true, 413, cap_match.path_class, "over_cap"};
+
+    return {false, 0, cap_match.path_class, ""};
 }
 
 } // namespace yuzu::server

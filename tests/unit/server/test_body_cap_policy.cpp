@@ -51,12 +51,11 @@
 #  include <unistd.h>
 #endif
 
+using yuzu::server::BodyCapDecision;
 using yuzu::server::BodyCapMatch;
 using yuzu::server::body_cap_prefix_matches;
-using yuzu::server::body_unmeasurable;
 using yuzu::server::content_length_for_body_cap;
-using yuzu::server::content_length_is_authoritative;
-using yuzu::server::has_non_identity_content_encoding;
+using yuzu::server::evaluate_body_cap;
 using yuzu::server::kBodyCapAnyMethod;
 using yuzu::server::kBodyCapTable;
 using yuzu::server::resolve_body_cap;
@@ -330,16 +329,29 @@ TEST_CASE("resolve_body_cap: requires_measurable is ON only for /mcp/", "[body_c
 // test_mcp_body_cap.cpp: this deliberately exercises httplib::Server's
 // middleware wiring, which crashes the TSan build.
 //
-// This fixture replicates the UNIFIED pre-routing decision server.cpp now
-// makes (D1: one branch for every path, including /mcp/) using the same pure
-// functions the production chokepoint calls — `resolve_body_cap`
-// (body_cap_policy.hpp) and `body_unmeasurable` /
-// `has_non_identity_content_encoding` (web_utils.hpp) — instead of the
-// server.cpp lambda itself (which has no seam for in-process testing; see
-// test_mcp_body_cap.cpp's header comment for why that gap is accepted). It
-// deliberately does NOT reproduce the metric/log/A4-envelope/SCIM-envelope
-// side effects — those are review-only at the call site, same convention as
-// test_mcp_body_cap.cpp's own fixture — only the STATUS the decision reaches.
+// This fixture drives the SAME UNIFIED pre-routing DECISION server.cpp's
+// `enforce_pre_auth_body_cap` lambda makes (D1: one branch for every path,
+// including /mcp/) by calling `evaluate_body_cap` (body_cap_policy.hpp)
+// directly — not the server.cpp lambda itself (which has no seam for
+// in-process testing; see test_mcp_body_cap.cpp's header comment for why
+// that gap is accepted), and, since #2898, not a second hand-written
+// combination of the underlying pure predicates either. Before #2898 this
+// fixture called `resolve_body_cap` / `body_unmeasurable` /
+// `has_non_identity_content_encoding` / `content_length_is_authoritative`
+// itself and re-derived the branching around them — the individual
+// predicates were shared with production, but the DECISION (branch order,
+// precedence, which status each reason maps to) was written twice. That is
+// exactly the gap a CHANGES_REQUESTED review on PR #2899 found (tracked as
+// #2898): a mutation to production's combination had no test that could see
+// it, because this fixture's own, separately-written combination still
+// matched its own separately-written expectations. `evaluate_body_cap` is
+// now that one combination, called from both places, so a mutation to it is
+// a mutation to what BOTH `server.cpp` and this fixture observe — see the
+// "Mutation test" note below the fixture for the empirical proof. This
+// fixture deliberately does NOT reproduce the metric/log/A4-envelope/
+// SCIM-envelope side effects — those are review-only at the call site, same
+// convention as test_mcp_body_cap.cpp's own fixture — only the STATUS the
+// decision reaches.
 //
 // D3 is additionally modelled by placing a probe-style early return (Get
 // "/health" answers 200 unconditionally) AFTER this cap check, so a fixture
@@ -374,41 +386,38 @@ struct UnifiedBodyCapTestServer {
 
         svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res)
                                         -> httplib::Server::HandlerResponse {
-            // D1-D4, GENUINELY replicated (#2407 R2 hardening,
-            // 2026-08-07): unified resolve_body_cap for EVERY method/path
-            // (D2: no GET/HEAD exclusion), checked BEFORE the probe-style
-            // early return below (D3). The Content-Length VALUE is read
-            // via `content_length_for_body_cap` — the EXACT SAME function
-            // server.cpp's production pre-routing handler calls — not a
-            // second, independently-written expression that happens to
-            // look similar. A prior version of this fixture called
-            // `req.get_header_value_u64` directly here while production
-            // hand-rolled a `std::from_chars` parse; the two disagreed on
-            // an all-digit Content-Length above 2^64-1, and this fixture's
-            // 777 assertions passed green with that CRITICAL bypass live
-            // in the code it claimed to replicate. Routing both through
-            // the one shared function makes that divergence structurally
-            // impossible instead of something to keep re-verifying by
-            // hand.
-            const auto cap_match = resolve_body_cap(req.method, req.path);
-            if (has_non_identity_content_encoding(req.get_header_value("Content-Encoding"))) {
-                res.status = 415;
-                return httplib::Server::HandlerResponse::Handled;
-            }
-            // Mirrors production's TWO-predicate split exactly. The fixture
-            // must not re-derive either question independently, or it stops
-            // being able to observe the defect it pins.
-            const bool unmeasurable =
-                body_unmeasurable(req.method, req.has_header("Content-Length"),
-                                  req.get_header_value("Transfer-Encoding"));
-            const bool refuse_unmeasurable = unmeasurable && cap_match.requires_measurable;
-            const bool oversize =
-                content_length_is_authoritative(
-                    req.has_header("Content-Length"),
-                    httplib::detail::is_chunked_transfer_encoding(req.headers)) &&
-                content_length_for_body_cap(req) > cap_match.max_body_bytes;
-            if (refuse_unmeasurable || oversize) {
-                res.status = refuse_unmeasurable ? 411 : 413;
+            // THE decision comes from `evaluate_body_cap`
+            // (body_cap_policy.hpp) — the SAME callable server.cpp's
+            // production `enforce_pre_auth_body_cap` lambda invokes, not a
+            // second, independently-written combination of the same
+            // predicates (#2898). Before this, the fixture combined
+            // `resolve_body_cap` + `body_unmeasurable` +
+            // `has_non_identity_content_encoding` +
+            // `content_length_is_authoritative` A SECOND TIME by hand — the
+            // individual pure functions were shared, but the DECISION (which
+            // branch wins, in which order, mapped to which status) was not,
+            // so a mutation to production's combination (an inverted
+            // condition, a swapped 411/413, a dropped branch) had nothing
+            // here that could see it. Routing through the one shared
+            // function makes that divergence structurally impossible instead
+            // of something to keep re-verifying by hand. `is_chunked` still
+            // MUST come from httplib's own `is_chunked_transfer_encoding`
+            // (unchanged from before this extraction — a prior version of
+            // this fixture called `req.get_header_value_u64` directly for
+            // Content-Length while production hand-rolled a
+            // `std::from_chars` parse; the two disagreed on an all-digit
+            // Content-Length above 2^64-1, and this fixture's assertions
+            // passed green with that CRITICAL bypass live in the code it
+            // claimed to replicate — `content_length_for_body_cap` closes
+            // that specific gap, `evaluate_body_cap` closes the
+            // decision-combination gap this same defect class lives in).
+            const auto decision = evaluate_body_cap(
+                req.method, req.path, req.has_header("Content-Length"),
+                content_length_for_body_cap(req), req.get_header_value("Transfer-Encoding"),
+                req.get_header_value("Content-Encoding"),
+                httplib::detail::is_chunked_transfer_encoding(req.headers));
+            if (decision.refuse) {
+                res.status = decision.status;
                 return httplib::Server::HandlerResponse::Handled;
             }
             // Everything below this point (onbehalf-of, rate limiting, the

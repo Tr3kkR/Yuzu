@@ -7578,7 +7578,6 @@ private:
             // keep going" — the caller decides what Unhandled/the next
             // gate means at ITS call site, this lambda never does.
             auto enforce_pre_auth_body_cap = [&]() -> bool {
-                const auto cap_match = resolve_body_cap(req.method, req.path);
                 bool unmeasurable_cause = false;
                 // CONTAIN THE WHOLE BLOCK, not just the metric (governance
                 // Gate 8, security + cpp-safety). httplib invokes this
@@ -7590,9 +7589,49 @@ private:
                 // must stay inside this try, or a crafted request reaches an
                 // unguarded call site and takes the whole process down.
                 try {
-                    const std::string content_encoding =
-                        req.get_header_value("Content-Encoding");
-                    if (has_non_identity_content_encoding(content_encoding)) {
+                    // TWO deliberately separate header lookups (#2407 R1 fix,
+                    // hardened 2026-08-07 — do not "simplify" back to one).
+                    // Presence (`has_content_length`) is answered by this
+                    // iterator range. The VALUE comes from
+                    // `content_length_for_body_cap` (web_utils.hpp) — see
+                    // that function's doc comment for the CRITICAL bypass a
+                    // hand-rolled `std::from_chars` parse caused here once
+                    // already (an all-digit `Content-Length` above 2^64-1
+                    // parsed to 0 — "no header, don't cap" — under the old
+                    // code, while httplib's own accessor, which this now
+                    // calls directly, correctly reports `SIZE_MAX`). Routing
+                    // both this call site and the test fixtures' through the
+                    // ONE shared function makes that divergence structurally
+                    // impossible instead of something to keep re-verifying
+                    // by hand.
+                    const auto cl_range = req.headers.equal_range("Content-Length");
+                    const bool has_content_length = cl_range.first != cl_range.second;
+
+                    // THE DECISION — the ONE callable both this production
+                    // chokepoint and test_body_cap_policy.cpp's
+                    // UnifiedBodyCapTestServer fixture invoke (#2898). See
+                    // `evaluate_body_cap`'s doc comment (body_cap_policy.hpp)
+                    // for the D1-D5 ordering it encodes and why it stays
+                    // httplib-free; `is_chunked` MUST come from httplib's own
+                    // `is_chunked_transfer_encoding`, never a re-derived
+                    // reading of the header text (third time this change was
+                    // bitten by re-deciding a framing/length header
+                    // ourselves instead of asking httplib — see
+                    // `content_length_is_authoritative`'s doc comment).
+                    const auto decision = yuzu::server::evaluate_body_cap(
+                        req.method, req.path, has_content_length,
+                        content_length_for_body_cap(req),
+                        req.get_header_value("Transfer-Encoding"),
+                        req.get_header_value("Content-Encoding"),
+                        httplib::detail::is_chunked_transfer_encoding(req.headers));
+
+                    if (!decision.refuse)
+                        return false;
+
+                    unmeasurable_cause = decision.status == 411;
+                    const auto& cap_match = decision;
+
+                    if (decision.reason == "unsupported_encoding") {
                         static std::atomic<std::uint64_t> encoding_hits{0};
                         constexpr std::uint64_t kBodyLogEvery = 100;
                         if (encoding_hits.fetch_add(1, std::memory_order_relaxed) %
@@ -7677,56 +7716,20 @@ private:
                         return true;
                     }
 
-                    // TWO deliberately separate header lookups (#2407 R1 fix,
-                    // hardened 2026-08-07 — do not "simplify" back to one).
-                    // Presence (`has_content_length`, for `body_unmeasurable`
-                    // below) is answered by this iterator range. The VALUE
-                    // comes from `content_length_for_body_cap`
-                    // (web_utils.hpp) — see that function's doc comment for
-                    // the CRITICAL bypass a hand-rolled `std::from_chars`
-                    // parse caused here once already (an all-digit
-                    // `Content-Length` above 2^64-1 parsed to 0 — "no
-                    // header, don't cap" — under the old code, while
-                    // httplib's own accessor, which this now calls
-                    // directly, correctly reports `SIZE_MAX`). Routing both
-                    // this call site and the test fixtures' through the ONE
-                    // shared function makes that divergence structurally
-                    // impossible instead of something to keep re-verifying
-                    // by hand.
-                    const auto cl_range = req.headers.equal_range("Content-Length");
-                    const bool has_content_length = cl_range.first != cl_range.second;
-                    const std::uint64_t content_length = content_length_for_body_cap(req);
-
-                    // TWO DIFFERENT QUESTIONS, two different predicates. Do not
-                    // collapse them back into one — that was an unauthenticated
-                    // bypass, found by the fifth reviewer of this change.
-                    //
-                    // 1. Do we REFUSE this framing outright? Deliberately broad
-                    //    (#2437): any non-empty Transfer-Encoding, on a class
-                    //    that opted into requires_measurable.
-                    const bool unmeasurable =
-                        body_unmeasurable(req.method, has_content_length,
-                                          req.get_header_value("Transfer-Encoding"));
-                    const bool refuse_unmeasurable =
-                        unmeasurable && cap_match.requires_measurable;
-                    unmeasurable_cause = refuse_unmeasurable;
-                    // 2. May we CHECK the size? Only when httplib will actually
-                    //    read Content-Length bytes — which is whenever it does
-                    //    not see an exact `chunked`. Gating this on (1) instead
-                    //    meant `Transfer-Encoding: identity` suppressed the cap
-                    //    on all 24 classes that do not set requires_measurable,
-                    //    including the rate-limit-exempt probes, while httplib
-                    //    went on to read the declared body in full.
-                    //
-                    //    is_chunked MUST come from httplib's own predicate.
-                    //    Re-deciding a framing header ourselves has now opened
-                    //    three separate holes in this change.
-                    const bool oversize =
-                        content_length_is_authoritative(
-                            has_content_length,
-                            httplib::detail::is_chunked_transfer_encoding(req.headers)) &&
-                        content_length > cap_match.max_body_bytes;
-                    if (refuse_unmeasurable || oversize) {
+                    // `decision.reason` here is always either "unmeasurable"
+                    // or "over_cap" — the "unsupported_encoding" case already
+                    // returned above. Both questions ("is this framing
+                    // refused outright?" vs "does the declared length exceed
+                    // the cap?") were decided together by `evaluate_body_cap`
+                    // (body_cap_policy.hpp) — see that function's doc comment
+                    // for why they must stay two separate predicates
+                    // internally (collapsing them was a live unauthenticated
+                    // bypass, found by the fifth reviewer of this change).
+                    // This call site only needs to know WHICH of the two
+                    // reasons fired, to pick the right throttle counter, log
+                    // wording, and envelope text below.
+                    const bool refuse_unmeasurable = decision.reason == "unmeasurable";
+                    {
                         // Own throttle per reason: a cheap over_cap flood
                         // (huge Content-Length, no body sent) must not
                         // suppress the rarer unmeasurable signal.
@@ -7773,7 +7776,7 @@ private:
                             // Observability must never kill the process from
                             // the unguarded WebSocket-upgrade path.
                         }
-                        res.status = refuse_unmeasurable ? 411 : 413;
+                        res.status = decision.status;
                         if (cap_match.path_class == "scim") {
                             // D7: match scim_routes.cpp's own now-superseded
                             // handler-level check's wording, so an IdP
