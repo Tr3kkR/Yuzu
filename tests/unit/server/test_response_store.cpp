@@ -1270,6 +1270,32 @@ TEST_CASE("ResponseStore: embedded NUL is defanged, output past it is not trunca
     CHECK((*results)[0].output.find('\0') == std::string::npos);
 }
 
+// #2691 (Doomgoose finding #8): sanitize_pg_text was rewritten from an
+// in-place find+replace loop to a single reserve-and-append pass — pin the
+// boundary cases a rewritten loop is most likely to get wrong: a leading
+// NUL, a trailing NUL, and adjacent NULs with nothing between them.
+TEST_CASE("ResponseStore: sanitize_pg_text handles leading/trailing/adjacent NULs",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+
+    StoredResponse resp;
+    resp.instruction_id = "cmd-nul-edges";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    // leading NUL, then adjacent NULs, then a trailing NUL.
+    resp.output = std::string("\0mid\0\0end\0", 10);
+    store.store(resp);
+
+    auto results = store.get_by_instruction("cmd-nul-edges");
+    REQUIRE(results.has_value());
+    REQUIRE(results->size() == 1);
+    CHECK((*results)[0].output ==
+          "\xEF\xBF\xBD" "mid" "\xEF\xBF\xBD" "\xEF\xBF\xBD" "end" "\xEF\xBF\xBD");
+    CHECK((*results)[0].output.find('\0') == std::string::npos);
+}
+
 // R1: a wide tabular output (>64 distinct facet values) must still persist ALL
 // its facets. The batched single-savepoint INSERT replaced the per-facet
 // savepoint loop (which suboverflowed the ingest txn's subxids on the shared

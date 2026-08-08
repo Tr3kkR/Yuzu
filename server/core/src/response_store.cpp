@@ -118,12 +118,27 @@ bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
 // canonical-hash invariant); NUL handling is a PG-bind concern local to this
 // store.
 std::string sanitize_pg_text(std::string_view s) {
-    std::string out = sanitize_utf8_strict(s);
-    std::size_t pos = 0;
-    while ((pos = out.find('\0', pos)) != std::string::npos) {
-        out.replace(pos, 1, "\xEF\xBF\xBD");
-        pos += 3;
+    std::string scrubbed = sanitize_utf8_strict(s);
+    // Single reserve-and-append pass (#2691, Doomgoose finding #8): the
+    // previous find+replace loop shifted every trailing byte on each NUL hit
+    // (1 byte -> 3), an O(k*n) rebuild in NUL count x length for a NUL-dense
+    // string. Count once, reserve the final size, then copy the segments
+    // between NULs directly — no in-place shifting.
+    const std::size_t nul_count =
+        static_cast<std::size_t>(std::count(scrubbed.begin(), scrubbed.end(), '\0'));
+    if (nul_count == 0)
+        return scrubbed;
+    std::string out;
+    out.reserve(scrubbed.size() + nul_count * 2); // each NUL grows 1 byte -> 3
+    std::size_t start = 0;
+    for (std::size_t i = 0; i < scrubbed.size(); ++i) {
+        if (scrubbed[i] == '\0') {
+            out.append(scrubbed, start, i - start);
+            out.append("\xEF\xBF\xBD");
+            start = i + 1;
+        }
     }
+    out.append(scrubbed, start, scrubbed.size() - start);
     return out;
 }
 double to_double(const char* s) {
