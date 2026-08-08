@@ -100,12 +100,15 @@ Add `&principal=<name>` to scope to a candidate you already suspect. Each row's
 (no surviving record to name), never for the ordinary case — and `detail` says whether it
 was a parked final or an orphan. There is no `session_id` field on this row; if you need a
 time window rather than a principal, the legacy `GET /api/audit` endpoint additionally
-takes `since`/`until` (epoch parameters `/api/v1/audit` does not have). **A response at
-exactly `limit` rows is not proof you have everything** — `/api/v1/audit` truncates
+takes `since`/`until` and `offset` (parameters `/api/v1/audit` does not have). **A response
+at exactly `limit` rows is not proof you have everything** — `/api/v1/audit` truncates
 silently, and its `total`/`page_size` fields describe what came back, not what matched
-([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)); scope further with `&principal=`
-or fall back to the legacy endpoint's `since`/`until` before concluding a candidate is
-clean. A `503` from either endpoint is the deny-on-degrade behavior `YuzuAuditReadDegraded`
+([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)); scope further with `&principal=`,
+or fall back to the legacy endpoint. There, `since`/`until` alone only bounds the time
+window — it does not by itself guarantee you retrieved everything inside that window if
+more rows matched than one call returns. The reliable recipe is both together: freeze a
+bounded window with `since`/`until` first, then page exhaustively through it with `offset`.
+A `503` from either endpoint is the deny-on-degrade behavior `YuzuAuditReadDegraded`
 covers, not "no matching rows" — treat it as an audit-store availability problem and
 retry once that alert clears, not as a clean result.
 
@@ -181,7 +184,9 @@ The underlying counter carries no session dimension (see the scoping note in ste
 below), so a reading that looks sustained can equally be several different,
 individually-transient rejections across different sessions overlapping in time, rather
 than one client failing to recover — the alert cannot tell the two apart, and neither can
-this derivation.
+this derivation. Either way, a sustained reading is real signal worth investigating: the
+ambiguity is about attribution (one client or several), not about whether something is
+wrong.
 
 **Since #2740 this should be rare**, because admission reclaims a slot rather than
 refusing. A `pins` refusal that survives the reclaim means the reclaim found nothing to
@@ -205,8 +210,10 @@ take, which happens in three states:
    directly (the `/api/v1/audit` route does not take `target_id`). **A response at exactly
    `limit` rows is not proof you have everything** — `/api/v1/audit` truncates silently, and
    its `total`/`page_size` fields describe what came back, not what matched
-   ([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)); if you hit the cap, fall back to
-   the legacy endpoint's `since`/`until` to narrow the window instead of trusting the count.
+   ([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)); if you hit the cap, the legacy
+   endpoint also takes `offset`, and `since`/`until` alone only bounds the time window — it
+   does not guarantee completeness inside that window by itself. Freeze the window with
+   `since`/`until` first, then page through it with `offset` if you need everything in it.
    A `503` from either endpoint is the deny-on-degrade behavior `YuzuAuditReadDegraded`
    covers, not "no matching rows" — treat it as an audit-store availability problem and
    retry once that alert clears, not as a clean result.
