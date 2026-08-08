@@ -44,6 +44,15 @@ extern const char* const kGuardianDetailPageHtml =
     .gp-note { font-size: 0.74rem; color: var(--muted); margin-top: 0.5rem; }
     .gp-note b { color: #a5d6ff; }
 
+    /* #2691 finding 10: an honest "store degraded, retrying" banner on a
+       running /auto Pre-flight page — distinct from a plain empty state so
+       it doesn't read as "these devices are done". */
+    .result-degrade-banner {
+      color: var(--red, #ff5765); background: rgba(255, 87, 101, 0.08);
+      border: 1px solid rgba(255, 87, 101, 0.4); border-radius: 0.5rem;
+      padding: 0.6rem 0.9rem; font-size: 0.8rem; margin-bottom: 0.75rem;
+    }
+
     /* lifecycle / severity / mode pills */
     .gp-pill { font-size: 0.62rem; font-weight: 700; text-transform: uppercase;
                letter-spacing: 0.03em; border-radius: 0.3rem; padding: 0.1rem 0.45rem;

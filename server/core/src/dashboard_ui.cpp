@@ -244,6 +244,13 @@ extern const char* const kDashboardIndexHtml =
       text-align: center; padding: 3rem 1rem; color: var(--mds-color-theme-outline-secondary);
       font-size: 0.85rem;
     }
+    /* #2691 finding 7: an honest "store degraded, not zero matches" banner —
+       distinct from .empty-state so it doesn't visually read as "nothing here". */
+    .result-degrade-banner {
+      color: var(--red, #ff5765); background: rgba(255, 87, 101, 0.08);
+      border: 1px solid rgba(255, 87, 101, 0.4); border-radius: 0.5rem;
+      padding: 0.6rem 0.9rem; font-size: 0.8rem;
+    }
 
     /* ── Scope Panel ─────────────────────────────────────────── */
     .scope {

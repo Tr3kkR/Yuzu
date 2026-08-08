@@ -238,16 +238,28 @@ should reach for one batch-under-one-savepoint, not a savepoint per row (subxid 
 - #2634-parity reap counters land here from day one.
 - The #1634 management-group-scoped response read (already threaded via `ResponseQuery`)
   stays defense-in-depth; no change.
-- **Resolved (#2691, 2026-08-08):** the accepted limitation this bullet originally recorded —
-  `facet_agent_count` / `facet_line_count` returning a plain `0` on pool-timeout / query error,
-  indistinguishable from a genuine `0` — is fixed. Both now return `std::optional<int64_t>`,
-  `nullopt` on degrade, empty-filter `0` returned first so it can never be mistaken for a
-  degrade. **Not yet wired to `yuzu_server_response_read_degrade_total`** — unlike the
-  `query`/`aggregate`/facet-listing readers, these two don't route through the shared
-  degrade-aware-read helper, so a degrade here is visible at the render layer but not counted
-  on that metric; promoting them to the shared helper is a small follow-up, not done here. The
-  dashboard group-creation path (`/fragments/create-group-form`, the results-table agent count,
-  `/api/dashboard/group-from-results`) threads the `nullopt` distinction through: a degraded
-  count renders "count unavailable (store degraded)" instead of a false `0`, and the
+- **Partially resolved (#2691, 2026-08-08):** the accepted limitation this bullet originally
+  recorded named three scalars. Two are fixed: `facet_agent_count` / `facet_line_count` now
+  return `std::optional<int64_t>`, `nullopt` on degrade, empty-filter `0` returned first so it
+  can never be mistaken for a degrade. **Not yet wired to `yuzu_server_response_read_degrade_
+  total`** — unlike the `query`/`aggregate`/facet-listing readers, these two don't route through
+  the shared degrade-aware-read helper, so a degrade here is visible at the render layer but not
+  counted on that metric; promoting them to the shared helper is a small follow-up, not done
+  here. The dashboard group-creation path (`/fragments/create-group-form`, the results-table
+  agent count, `/api/dashboard/group-from-results`) threads the `nullopt` distinction through: a
+  degraded count renders "count unavailable (store degraded)" instead of a false `0`, and the
   write-adjacent group-creation POST 503s with an honest message instead of misreporting
-  "no agents match the current filters."
+  "no agents match the current filters." **`total_count` is unchanged** — still a plain `0` on
+  degrade — because it has **no caller anywhere in the codebase** today; widening a dead
+  function was out of this round's scope. If a caller is added, promote it the same way before
+  wiring it up, not after.
+- **Accepted residual, not fixed (#2691):** `compute_ttl_epoch()` (ingest-time default TTL
+  stamp) still reads `now_epoch()`, the process clock, not `pg_now`. A slow/skewed replica can
+  therefore stamp a subset of rows with an early default `ttl_expires_at` at INSERT time. Once
+  the reap-side clock-guard fix above lands, those rows read to the guarded reaper as ordinary
+  partial expiry — no `would_wipe`/`big_step`/`no_anchor` anomaly trips, they simply drain on
+  their (slightly early) schedule. Lower stakes than the reap-side bug this ADR fixes (ingest-time
+  skew shifts *when* an already-expendable, TTL'd row ages out by at most the clock's drift, not
+  a delete-time false verdict on a row that should have survived), and bounded by the retention
+  window itself. Recorded as a deliberate accepted residual rather than left silent; revisit if
+  `response_retention_days` is ever tightened enough for ordinary clock drift to matter.
