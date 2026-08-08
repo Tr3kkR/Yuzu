@@ -1023,9 +1023,11 @@ groups:
       # restart (including the first PostgreSQL boot). A value of INT64_MIN
       # (-9223372036854775808) is a distinct anomaly sentinel -- the durable
       # anchor could not be read or trusted as a plausible integer -- not a
-      # genuine timestamp, and self-corrects at the next ATTEMPTED pass -- not
-      # necessarily a successful one, every attempt stamps this before deciding
-      # anything; any future
+      # genuine timestamp, and self-corrects at the next pass whose own clock
+      # reading is plausible -- even if that pass then declines or fails for an
+      # unrelated reason -- but NOT at a pass that itself refuses on an
+      # implausible clock, which skips the stamp entirely to avoid poisoning
+      # this gauge with a value already known to be garbage; any future
       # rule reading this gauge must exclude it explicitly, the same way it
       # must exclude a negative dead-CMOS reading. What's still open is the
       # RULE that uses it -- a freshness expression built naively on this gauge

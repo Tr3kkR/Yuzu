@@ -1545,9 +1545,10 @@ public:
                           "restart, including the first Postgres boot). A value of "
                           "-9223372036854775808 (INT64_MIN) is a distinct anomaly sentinel — the "
                           "durable anchor could not be read or trusted as a plausible integer — "
-                          "not a genuine timestamp; self-corrects at the next ATTEMPTED pass (not "
-                          "necessarily a successful one — every attempt stamps this before deciding "
-                          "anything). Read WITH "
+                          "not a genuine timestamp; self-corrects at the next pass whose own clock "
+                          "reading is plausible — even if that pass then declines or fails for an "
+                          "unrelated reason — but NOT at a pass refusing on its own implausible clock, "
+                          "which skips the stamp entirely (see below). Read WITH "
                           "retention_passes_total: stale here while that RISES means the reaper "
                           "is alive but refusing an implausible clock, which is a different fault "
                           "from stopped",

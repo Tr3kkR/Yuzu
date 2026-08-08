@@ -478,16 +478,26 @@ public:
     ///     integer (corrupt/hand-edited state); or it is out of the same
     ///     plausible range `cleanup_once` itself enforces (`kMaxPlausibleNow`).
     ///     Never laundered into `0`, so none of these can silently earn the
-    ///     liveness family's "never ran" grace. Self-corrects at the next
-    ///     ATTEMPTED `cleanup_once` pass — not "successful": the stamp at
-    ///     the top of that function runs before the transaction, the
-    ///     advisory lock, or any decision, so even a declined or failed
-    ///     pass clears the sentinel. External prose (docs, alert-rule
-    ///     comments) should say "could not be READ OR TRUSTED as a
-    ///     plausible integer" and "the next attempted pass" rather than
-    ///     re-deriving this — the causes and the correction condition are
-    ///     recorded here, once, so they don't drift across sites (#2854
-    ///     fold round 3).
+    ///     liveness family's "never ran" grace.
+    ///
+    ///     THE EXACT CORRECTION CONDITION (fold round 3 got this wrong once
+    ///     already — read `cleanup_once` itself before touching this again,
+    ///     do not paraphrase from memory): the sentinel clears at the next
+    ///     pass whose CALLER-SUPPLIED clock is itself plausible
+    ///     (`now <= kMaxPlausibleNow`) — even if that pass then declines or
+    ///     fails for an unrelated reason (lock contention, an anomaly,
+    ///     `!open_`), because the stamp happens before any of those
+    ///     decisions. The one case that does NOT clear it: a pass whose
+    ///     caller clock is ITSELF implausible returns before the stamp runs
+    ///     at all, specifically to avoid poisoning the gauge with a value
+    ///     already known to be garbage — "attempted" is not quite right
+    ///     either, since that one attempt is counted (`retention_passes_`)
+    ///     but does not touch this gauge.
+    ///
+    ///     External prose (docs, alert-rule comments) should quote this
+    ///     paragraph's substance rather than re-deriving it — the causes and
+    ///     the correction condition are recorded here, once, so they don't
+    ///     drift across sites (#2854 fold round 4).
     ///
     /// KNOWN LIMITATION, not fixed here, deferred to the rung-D rule
     /// redesign (#2854): neither `0` nor `INT64_MIN` is actually RESERVED.
