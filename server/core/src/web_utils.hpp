@@ -642,6 +642,41 @@ template <typename Req>
     return false;
 }
 
+/// True when `Content-Length` is the number of body bytes httplib will
+/// actually read, so a size check against it is meaningful.
+///
+/// SEPARATE FROM `body_unmeasurable` ON PURPOSE — do not merge them. They
+/// answer different questions and a caller needs both:
+///
+///   * `body_unmeasurable` = "is this framing something we refuse outright?"
+///     Deliberately BROAD (#2437): any non-empty `Transfer-Encoding` counts,
+///     because a class with `requires_measurable` refuses anything it is not
+///     the sole interpreter of. Narrowing it would LOOSEN `/mcp/`, which
+///     today 411s a `Transfer-Encoding: gzip` that this predicate calls
+///     perfectly measurable.
+///   * this one = "may we compare `Content-Length` against the cap?" Narrow,
+///     and it must match httplib exactly.
+///
+/// Conflating them was a live unauthenticated bypass. The caller computed
+/// `oversize = !unmeasurable && content_length > cap`, so the BROAD rule
+/// suppressed the size check: `Transfer-Encoding: identity` plus a
+/// `Content-Length` of 8 MiB was admitted on every class whose
+/// `requires_measurable` is false — 24 of 25, including the rate-limit-exempt
+/// health probes — because httplib honours an exact `chunked` and NOTHING
+/// else, falling through to `Content-Length` and reading every byte. The gate
+/// discarded a length httplib was about to act on. Verified on a raw socket
+/// against the real vendored httplib.
+///
+/// `is_chunked` MUST come from httplib's own `is_chunked_transfer_encoding`,
+/// never from a local reading of the header. Third time this change was bitten
+/// by that same root cause — `Content-Encoding` and the `Content-Length`
+/// overflow parse were the first two — and all three were fixed the same way:
+/// ask httplib instead of re-deciding.
+[[nodiscard]] inline bool content_length_is_authoritative(bool has_content_length,
+                                                          bool is_chunked) noexcept {
+    return has_content_length && !is_chunked;
+}
+
 /// True when an MCP request carries a body this server cannot size before
 /// reading it, and must therefore refuse (411) rather than admit. Composed
 /// from `has_non_identity_content_encoding` + `body_unmeasurable` above —

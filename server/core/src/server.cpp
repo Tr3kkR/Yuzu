@@ -7697,18 +7697,35 @@ private:
                     const bool has_content_length = cl_range.first != cl_range.second;
                     const std::uint64_t content_length = content_length_for_body_cap(req);
 
+                    // TWO DIFFERENT QUESTIONS, two different predicates. Do not
+                    // collapse them back into one — that was an unauthenticated
+                    // bypass, found by the fifth reviewer of this change.
+                    //
+                    // 1. Do we REFUSE this framing outright? Deliberately broad
+                    //    (#2437): any non-empty Transfer-Encoding, on a class
+                    //    that opted into requires_measurable.
                     const bool unmeasurable =
                         body_unmeasurable(req.method, has_content_length,
                                           req.get_header_value("Transfer-Encoding"));
                     const bool refuse_unmeasurable =
                         unmeasurable && cap_match.requires_measurable;
                     unmeasurable_cause = refuse_unmeasurable;
-                    // Only consult Content-Length as a size when it is
-                    // trustworthy — i.e. NOT unmeasurable. An unmeasurable-
-                    // but-not-refused body has no policy cap to check against
-                    // here; httplib's own 100 MiB backstop is what bounds it.
+                    // 2. May we CHECK the size? Only when httplib will actually
+                    //    read Content-Length bytes — which is whenever it does
+                    //    not see an exact `chunked`. Gating this on (1) instead
+                    //    meant `Transfer-Encoding: identity` suppressed the cap
+                    //    on all 24 classes that do not set requires_measurable,
+                    //    including the rate-limit-exempt probes, while httplib
+                    //    went on to read the declared body in full.
+                    //
+                    //    is_chunked MUST come from httplib's own predicate.
+                    //    Re-deciding a framing header ourselves has now opened
+                    //    three separate holes in this change.
                     const bool oversize =
-                        !unmeasurable && content_length > cap_match.max_body_bytes;
+                        content_length_is_authoritative(
+                            has_content_length,
+                            httplib::detail::is_chunked_transfer_encoding(req.headers)) &&
+                        content_length > cap_match.max_body_bytes;
                     if (refuse_unmeasurable || oversize) {
                         // Own throttle per reason: a cheap over_cap flood
                         // (huge Content-Length, no body sent) must not

@@ -55,6 +55,7 @@ using yuzu::server::BodyCapMatch;
 using yuzu::server::body_cap_prefix_matches;
 using yuzu::server::body_unmeasurable;
 using yuzu::server::content_length_for_body_cap;
+using yuzu::server::content_length_is_authoritative;
 using yuzu::server::has_non_identity_content_encoding;
 using yuzu::server::kBodyCapAnyMethod;
 using yuzu::server::kBodyCapTable;
@@ -394,12 +395,18 @@ struct UnifiedBodyCapTestServer {
                 res.status = 415;
                 return httplib::Server::HandlerResponse::Handled;
             }
-            const bool unmeasurable = body_unmeasurable(
-                req.method, req.has_header("Content-Length"),
-                req.get_header_value("Transfer-Encoding"));
+            // Mirrors production's TWO-predicate split exactly. The fixture
+            // must not re-derive either question independently, or it stops
+            // being able to observe the defect it pins.
+            const bool unmeasurable =
+                body_unmeasurable(req.method, req.has_header("Content-Length"),
+                                  req.get_header_value("Transfer-Encoding"));
             const bool refuse_unmeasurable = unmeasurable && cap_match.requires_measurable;
             const bool oversize =
-                !unmeasurable && content_length_for_body_cap(req) > cap_match.max_body_bytes;
+                content_length_is_authoritative(
+                    req.has_header("Content-Length"),
+                    httplib::detail::is_chunked_transfer_encoding(req.headers)) &&
+                content_length_for_body_cap(req) > cap_match.max_body_bytes;
             if (refuse_unmeasurable || oversize) {
                 res.status = refuse_unmeasurable ? 411 : 413;
                 return httplib::Server::HandlerResponse::Handled;
@@ -511,6 +518,61 @@ TEST_CASE("Pre-routing body cap: POST /health with an oversized declared Content
     const auto resp = raw_request_status_line(ts.port, req);
     CHECK(resp.starts_with("HTTP/1.1 413"));
     CHECK(ts.handler_calls.load() == 0);
+}
+
+TEST_CASE("Pre-routing body cap: a non-chunked Transfer-Encoding does NOT suppress the "
+          "size check on a class that has not opted into requires_measurable",
+          "[body_cap][mcp][bounds][integration]") {
+    // REGRESSION GUARD for an unauthenticated bypass that survived three
+    // governance rounds and an adversarial panel, and was found by the fifth
+    // reviewer of this change.
+    //
+    // `body_unmeasurable` treats ANY non-empty Transfer-Encoding as
+    // unmeasurable — the deliberately broad #2437 refuse rule. httplib only
+    // treats a request as chunked when the value is EXACTLY `chunked`
+    // (`is_chunked_transfer_encoding`, case-insensitive); for `identity`, `x`,
+    // or even `identity, chunked` it falls through to the Content-Length
+    // branch and reads that many bytes.
+    //
+    // So while the size check was gated on `!unmeasurable`, one header
+    // suppressed the cap on all 24 classes that do not set
+    // requires_measurable — including the rate-limit-exempt probe paths —
+    // while httplib went on to read the declared body in full. Production now
+    // gates the size check on `content_length_is_authoritative` instead, which
+    // asks httplib rather than re-deciding the header.
+    //
+    // Why no test caught it: the suite's only Transfer-Encoding integration
+    // case was on /mcp/, where requires_measurable=true makes the request
+    // 411 either way. No non-mcp class was exercised with a TE header at all.
+    UnifiedBodyCapTestServer ts;
+    ts.start();
+
+    // 8 MiB against ca_import_chain's 256 KiB cap. Every one of these values
+    // is non-chunked to httplib, so the declared length is authoritative and
+    // the cap must apply.
+    for (const auto* te : {"identity", "x", "identity, chunked", "CHUNKED, identity"}) {
+        const std::string req = std::string("POST /api/v1/ca/import-chain HTTP/1.1\r\n"
+                                            "Host: 127.0.0.1\r\n"
+                                            "Content-Length: 8388608\r\n"
+                                            "Transfer-Encoding: ") +
+                                te + "\r\n\r\n";
+        const auto resp = raw_request_status_line(ts.port, req);
+        INFO("Transfer-Encoding: " << te);
+        CHECK(resp.starts_with("HTTP/1.1 413"));
+    }
+    CHECK(ts.handler_calls.load() == 0);
+
+    // The genuine chunked case is UNCHANGED: no authoritative length, so the
+    // documented requires_measurable=false trade still applies and the request
+    // falls through to httplib's own backstop rather than being capped here.
+    // Asserting this keeps the fix honest — it must not have quietly turned
+    // into "refuse every Transfer-Encoding", which would break real clients.
+    const std::string chunked = "POST /api/v1/ca/import-chain HTTP/1.1\r\n"
+                                "Host: 127.0.0.1\r\n"
+                                "Transfer-Encoding: chunked\r\n\r\n"
+                                "0\r\n\r\n";
+    const auto resp = raw_request_status_line(ts.port, chunked);
+    CHECK_FALSE(resp.starts_with("HTTP/1.1 413"));
 }
 #endif // !_WIN32
 
