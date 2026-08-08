@@ -166,12 +166,35 @@ expendable, TTL'd operational telemetry (consistent with the store's overall fai
 skippable-backfill posture). This also removes a class of render-time risk at the source —
 invalid bytes never reach `aggregate_to_json`/any downstream JSON serializer in the first
 place, rather than relying on every consumer to defend against them independently. `status` is server/enum-controlled and is NOT sanitized. `plugin` (agent-supplied
-plugin name) and `instruction_id` (the agent-echoed command id) DO arrive on the wire, so a
-hostile agent could emit non-UTF-8 there — but a malformed value simply fail-soft-drops the
-whole row at INSERT (a garbage/hostile response defangs to a counted drop, by design), which
-is NOT the #1593 legitimate-output-must-surface case. Sanitization is applied only to the two
-free-text RESULT columns (`output`, `error_detail`) where dropping a real result would be the
-regression #1593 guards against.
+plugin name), `instruction_id` (the agent-echoed command id), and `execution_id` DO arrive on
+the wire, so a hostile agent could emit non-UTF-8 there — but a malformed value simply
+fail-soft-drops the whole row at INSERT (a garbage/hostile response defangs to a counted drop,
+by design), which is NOT the #1593 legitimate-output-must-surface case. Sanitization is applied
+only to the two free-text RESULT columns (`output`, `error_detail`) where dropping a real
+result would be the regression #1593 guards against.
+
+**Correction (2026-08-08, Gate 4 unhappy-path finding UP-5):** the "fail-soft-drops the whole
+row at INSERT" claim above is true for invalid UTF-8 (SQLSTATE 22021) but was FALSE for an
+embedded NUL specifically: NUL is valid UTF-8, so it does not fail the `INSERT` — and because
+`pg::exec_params` binds every parameter as a NUL-terminated C string (`paramLengths=nullptr`),
+libpq silently **truncated** an unsanitized `instruction_id`/`execution_id`/`plugin` at the
+first NUL instead of rejecting it. Since `agent_service_impl.cpp`'s
+`sr.instruction_id = resp.command_id()` is agent-controlled and unsanitized, a
+compromised/malicious agent could send a `command_id` like `"victim-id\0junk"` and have it
+land, truncated, as a response indistinguishable from a genuine one for the shorter real
+`instruction_id "victim-id"` — a forgery via truncation, not the documented fail-soft-drop.
+Fixed: `store()` now explicitly rejects (counted via
+`yuzu_server_response_ingest_dropped_total{reason="malformed_identity_field"}`, never
+truncates) any row whose `instruction_id`/`execution_id`/`plugin` contains an embedded NUL,
+*before* binding — restoring the fail-soft-drop guarantee this paragraph always intended for
+malformed identity fields. Six sibling stores (`auth_db`, `audit_store`, `instruction_store`,
+`instruction_yaml`, `guaranteed_state_store`, `scim_json`, `vuln_finding_store`) already guard
+their own identity-bearing fields this same way (`s.find('\0') != npos`); this store simply
+hadn't been given the guard. The mechanism is not new to this migration — the SQLite-era store
+had the identical truncate-at-NUL behaviour (`sqlite3_bind_text(..., -1, ...)` is also
+strlen-bound) — but this ADR's own posture claim was the first place the gap was written down
+as if it didn't exist, which is why it gates here rather than being filed as a standalone
+pre-existing-bug follow-up.
 
 One more byte the plain scrub does NOT catch: **NUL (U+0000)**. `sanitize_utf8_strict` treats
 it as a valid ASCII byte and keeps it, but PostgreSQL `TEXT` cannot store an embedded NUL and

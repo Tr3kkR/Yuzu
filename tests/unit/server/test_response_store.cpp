@@ -128,6 +128,62 @@ TEST_CASE("ResponseStore: store and retrieve", "[pg][response_store]") {
     CHECK((*results)[0].output == "hostname|WORKSTATION-01");
 }
 
+// #2691 (Gate 4 unhappy-path UP-5): pg::exec_params binds instruction_id/
+// execution_id/plugin unsanitized, as a NUL-terminated C string
+// (paramLengths=nullptr) — an embedded NUL byte (valid UTF-8) would
+// otherwise silently truncate the bound value at the store layer instead of
+// failing the INSERT, letting a forged short instruction_id collide with a
+// real one. store() must drop the whole row (counted, never truncate) when
+// any of those three fields contains an embedded NUL.
+TEST_CASE("ResponseStore: an embedded NUL in instruction_id is dropped, not silently truncated",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+
+    StoredResponse resp;
+    resp.instruction_id = std::string("victim-instruction") + '\0' + "attacker-payload";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.output = "forged";
+    store.store(resp);
+
+    // Must NOT appear under the truncated-to prefix "victim-instruction" —
+    // that would be exactly the forgery-via-truncation UP-5 describes.
+    auto results = store.get_by_instruction("victim-instruction");
+    REQUIRE(results.has_value());
+    CHECK(results->empty());
+}
+
+TEST_CASE("ResponseStore: an embedded NUL in execution_id or plugin is also dropped",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+
+    StoredResponse r1;
+    r1.instruction_id = "cmd-exec-nul";
+    r1.agent_id = "agent-1";
+    r1.status = 1;
+    r1.execution_id = std::string("real-exec") + '\0' + "junk";
+    store.store(r1);
+
+    StoredResponse r2;
+    r2.instruction_id = "cmd-plugin-nul";
+    r2.agent_id = "agent-1";
+    r2.status = 1;
+    r2.plugin = std::string("real-plugin") + '\0' + "junk";
+    store.store(r2);
+
+    auto results1 = store.get_by_instruction("cmd-exec-nul");
+    REQUIRE(results1.has_value());
+    CHECK(results1->empty());
+
+    auto results2 = store.get_by_instruction("cmd-plugin-nul");
+    REQUIRE(results2.has_value());
+    CHECK(results2->empty());
+}
+
 TEST_CASE("ResponseStore: multiple responses same instruction", "[pg][response_store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

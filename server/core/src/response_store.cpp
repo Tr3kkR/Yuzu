@@ -56,6 +56,7 @@ constexpr const char* kTruncationMarker = "\n...[truncated by server ingest cap]
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
+constexpr const char* kReasonMalformedIdentity = "malformed_identity_field";
 constexpr const char* kDegradeSource = "response_store";
 // Sample the per-site degrade WARN so a sustained PG outage cannot flood the
 // log — the counter is the continuous signal, the log a sampled breadcrumb.
@@ -167,6 +168,28 @@ std::string sanitize_pg_text(std::string_view s) {
     }
     out.append(scrubbed, start, scrubbed.size() - start);
     return out;
+}
+
+// #2691 (Gate 4 unhappy-path finding UP-5): `instruction_id`/`execution_id`/
+// `plugin` are deliberately NOT run through sanitize_pg_text — ADR-0039's
+// documented rationale is that a malformed value simply fail-soft-drops the
+// whole row at INSERT (SQLSTATE 22021, invalid UTF-8). That rationale covers
+// invalid UTF-8 but not an embedded NUL: NUL is valid UTF-8, so the INSERT
+// does not reject it, but `pg::exec_params` binds every parameter as a
+// NUL-terminated C string (paramLengths=nullptr) — libpq silently TRUNCATES
+// the value at the first NUL instead of failing. An agent-controlled
+// `command_id` containing an embedded NUL (`agent_service_impl.cpp`'s
+// `sr.instruction_id = resp.command_id()`, unsanitized) could therefore be
+// stored truncated to a shorter, real instruction_id it was never dispatched
+// for — indistinguishable from a genuine response once truncated. Six
+// sibling stores (auth_db, audit_store, instruction_store, instruction_yaml,
+// guaranteed_state_store, scim_json, vuln_finding_store) already guard their
+// own identity-bearing fields against embedded NUL this same way; this store
+// never got the guard. Reject (fail-soft-drop, counted) rather than
+// truncate-silently — matches ADR-0039's own stated intent for malformed
+// identity fields.
+bool has_embedded_nul(std::string_view s) {
+    return s.find('\0') != std::string_view::npos;
 }
 
 // #2691 (Doomgoose finding #4): bound ingest volume before it reaches the
@@ -378,6 +401,18 @@ int64_t ResponseStore::compute_ttl_epoch() const {
 void ResponseStore::store(const StoredResponse& resp) {
     if (!open_) {
         note_ingest_dropped(metrics_, kReasonStoreNotOpen);
+        return;
+    }
+
+    // #2691 (UP-5): reject before binding — see has_embedded_nul's doc
+    // comment. instruction_id/execution_id/plugin are bound unsanitized;
+    // a truncate-on-bind is a silent identity collision, not a safe default.
+    if (has_embedded_nul(resp.instruction_id) || has_embedded_nul(resp.execution_id) ||
+        has_embedded_nul(resp.plugin)) {
+        spdlog::warn("ResponseStore: dropping response with an embedded NUL byte in "
+                     "instruction_id/execution_id/plugin (agent={})",
+                     resp.agent_id);
+        note_ingest_dropped(metrics_, kReasonMalformedIdentity);
         return;
     }
 
