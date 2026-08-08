@@ -521,3 +521,107 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuMcpStreamedPinSlotsWedged", alertstate="firing", held="pins", instance="s1", job="yuzu", severity="warning"}'
             value: 1
+
+  # ── YuzuResponseReapNotRunning / YuzuResponseReapMetricMissing /
+  #    YuzuResponseReapAnchorNotSurviving / YuzuResponseReapBacklog ──────────
+  #
+  # #2691 Gate 6 (sre + enterprise-readiness, promtool-reproduced independently):
+  # yuzu_server_response_reap_passes_total is LABELED by `result` (unlike
+  # AuditStore's unlabeled sibling), and boot-seeded to 0 for every result
+  # value, so a `rate(...) == 0` with no sum() fires PERMANENTLY on every
+  # healthy install — every quiet-but-healthy result label independently
+  # satisfies `==0`. These cases are red against the shipped-and-wrong
+  # sum()-less form.
+
+  # CASE 17 -- the regression case. A perfectly healthy reaper runs "noop"
+  # every minute for 5h; every other result label sits boot-seeded flat at 0
+  # the whole time (exactly server.cpp's zero-seed loop). Without sum() this
+  # fires (5 separate always-zero series each satisfy ==0 over the window).
+  # With sum() it must stay quiet throughout.
+  - interval: 1m
+    name: response reap not running - a healthy noop-only reaper does not page
+    input_series:
+      - series: 'yuzu_server_response_reap_passes_total{job="yuzu",instance="s1",result="noop"}'
+        values: "0+1x300"
+      - series: 'yuzu_server_response_reap_passes_total{job="yuzu",instance="s1",result="swept"}'
+        values: "0x300"
+      - series: 'yuzu_server_response_reap_passes_total{job="yuzu",instance="s1",result="capped"}'
+        values: "0x300"
+      - series: 'yuzu_server_response_reap_passes_total{job="yuzu",instance="s1",result="declined"}'
+        values: "0x300"
+      - series: 'yuzu_server_response_reap_passes_total{job="yuzu",instance="s1",result="declined_no_anchor"}'
+        values: "0x300"
+      - series: 'yuzu_server_response_reap_passes_total{job="yuzu",instance="s1",result="skipped_lock"}'
+        values: "0x300"
+      - series: 'yuzu_server_response_reap_passes_total{job="yuzu",instance="s1",result="failed"}'
+        values: "0x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuResponseReapNotRunning", alertstate="firing"}'
+        eval_time: 5h
+        exp_samples: []
+
+  # CASE 18 -- the true-positive case the rule exists for: nothing runs at
+  # all (every result label flat at 0, none incrementing). Must fire.
+  - interval: 1m
+    name: response reap not running - a truly stalled reaper does page
+    input_series:
+      - series: 'yuzu_server_response_reap_passes_total{job="yuzu",instance="s1",result="noop"}'
+        values: "0x300"
+      - series: 'yuzu_server_response_reap_passes_total{job="yuzu",instance="s1",result="swept"}'
+        values: "0x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuResponseReapNotRunning", alertstate="firing"}'
+        eval_time: 5h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuResponseReapNotRunning", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE 19 -- absence companion: no series at all must fire the absence
+  # alert, and the (sum-based) liveness rule selects nothing and stays quiet.
+  - interval: 1m
+    name: response reap metric missing - an absent counter fires the absence alert, not the liveness one
+    input_series:
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
+        values: "20000+60x59"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuResponseReapMetricMissing", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuResponseReapMetricMissing", alertstate="firing", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuResponseReapNotRunning", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # CASE 20 -- anchor-not-surviving: exactly one declined_no_anchor pass ever
+  # (the expected first-boot bootstrap) must stay quiet; a second one within
+  # 24h (the anchor not surviving between passes) must fire.
+  - interval: 1m
+    name: response reap anchor not surviving - one decline is the expected bootstrap, a second pages
+    input_series:
+      - series: 'yuzu_server_response_reap_passes_total{job="yuzu",instance="s1",result="declined_no_anchor"}'
+        values: "0x60 1+0x300 2+0x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuResponseReapAnchorNotSurviving", alertstate="firing"}'
+        eval_time: 4h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuResponseReapAnchorNotSurviving", alertstate="firing"}'
+        eval_time: 10h30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuResponseReapAnchorNotSurviving", alertstate="firing", instance="s1", job="yuzu", result="declined_no_anchor", severity="warning"}'
+            value: 1
+
+  # CASE 21 -- backlog: hitting the per-pass cap on every pass for the full
+  # 3h `for:` window must page; a single capped pass surrounded by swept
+  # passes must not.
+  - interval: 1m
+    name: response reap backlog - sustained capped pages, an isolated one does not
+    input_series:
+      - series: 'yuzu_server_response_reap_passes_total{job="yuzu",instance="s1",result="capped"}'
+        values: "0+1x200"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuResponseReapBacklog", alertstate="firing"}'
+        eval_time: 3h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuResponseReapBacklog", alertstate="firing", instance="s1", job="yuzu", result="capped", severity="warning"}'
+            value: 1

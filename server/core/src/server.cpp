@@ -1093,9 +1093,14 @@ public:
         // scrape failure).
         metrics_.describe("yuzu_server_response_ingest_dropped_total",
                           "Response result rows that did not persist (fail-soft ingest, ADR-0039), "
-                          "by reason (store_not_open/pool_acquire_timeout/query_error) — the "
-                          "executions ladder still tracks the command; a sustained non-zero rate "
-                          "means drawer/TAR result history is silently lossy",
+                          "by reason (store_not_open/pool_acquire_timeout/query_error/"
+                          "malformed_identity_field) — the executions ladder still tracks the "
+                          "command; a sustained non-zero rate means drawer/TAR result history is "
+                          "silently lossy. malformed_identity_field is distinct: an "
+                          "instruction_id/execution_id/plugin containing an embedded NUL byte was "
+                          "rejected rather than silently truncated (#2691 UP-5) — a non-zero rate "
+                          "here means an agent sent a malformed identity field, not store "
+                          "unhealth",
                           "counter");
         metrics_.describe("yuzu_server_response_read_degrade_total",
                           "Response reads that returned a degrade (nullopt, not empty) rather than "
@@ -1109,16 +1114,24 @@ public:
                           "(swept = deleted the full expired set; capped = deleted the per-pass "
                           "cap of 10000 and a backlog likely remains — sustained non-zero means "
                           "expiry is outrunning the drain; noop = nothing expired; declined = "
-                          "retention classifier vetoed a would-wipe/clock-ahead pass; skipped_lock "
-                          "= another replica held the advisory lock; failed = pass errored)",
+                          "retention classifier vetoed a would-wipe/clock-ahead pass; "
+                          "declined_no_anchor = first pass ever against a store with expired rows "
+                          "present, declines once, the next pass drains; skipped_lock = another "
+                          "replica held the advisory lock; failed = pass errored). Alert on the "
+                          "TOTAL (sum across result) not increasing, never on one label alone — "
+                          "see YuzuResponseReapNotRunning.",
                           "counter");
-        for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"}) {
+        // malformed_identity_field is a write-path-only reason (never a read
+        // degrade) — seeded separately so read_degrade_total doesn't carry a
+        // spurious always-zero series for a reason it can never emit.
+        for (const auto reason :
+             {"store_not_open", "pool_acquire_timeout", "query_error", "malformed_identity_field"})
             metrics_.counter("yuzu_server_response_ingest_dropped_total", {{"reason", reason}});
+        for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
             metrics_.counter("yuzu_server_response_read_degrade_total",
                              {{"reason", reason}, {"source", "response_store"}});
-        }
-        for (const auto result :
-             {"swept", "capped", "noop", "declined", "skipped_lock", "failed"})
+        for (const auto result : {"swept", "capped", "noop", "declined", "declined_no_anchor",
+                                  "skipped_lock", "failed"})
             metrics_.counter("yuzu_server_response_reap_passes_total", {{"result", result}});
         // DEX app-perf-over-time (B1/B2) — ingest, rollup, and read-degrade signals.
         // Described up front so the HELP/TYPE lines exist on an idle server (a
