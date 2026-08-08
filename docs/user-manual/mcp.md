@@ -1152,9 +1152,12 @@ The last of those is deliberately indistinguishable from a replay in this
 response: reporting it separately would turn the recall into a probe for which
 surface minted a ticket. Server-side it is distinguishable — the audit row
 records `refused: foreign_origin`. The `yuzu_mcp_approval_refused_total` counter
-does **not** break the refusals down by reason — that breakdown is exactly what
-this response withholds, and `/metrics` is not a stronger reader than the caller
-— so alert on the refusal rate and read the audit trail for the kind.
+does **not** break the refusals down by reason: a store failure is already
+exposed via the response code (`-32603` vs `-32003`), and what stays withheld
+is the split *within* a `-32003` denial — foreign-origin vs an ordinary
+replay — which is exactly what this response refuses to make, and `/metrics`
+is not a stronger reader than the caller — so alert on the refusal rate and
+read the audit trail for the kind.
 
 **Fix**: For an RBAC denial — grant the permission to the token creator's
 principal, or use an account with the required permissions. For a ticket recall —
