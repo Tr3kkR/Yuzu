@@ -1081,8 +1081,10 @@ TEST_CASE("REST dex/devices/{id}: out-of-scope device → 403, no data leak, no 
 // left this whole suite green, so the layer could not be verified at all.
 
 TEST_CASE("REST dex/devices/{id}/live: the caller's confined VisibleSet reaches dispatch",
-          "[rest][dex][device][live][scope][1788]") {
-    RestGsHarness h;
+          "[pg][rest][dex][device][live][scope][1788]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool);
     h.exec_visible_override = std::unordered_set<std::string>{"WS-1"};
     StoredResponse r;
     r.instruction_id = "os_info-live";
@@ -1101,10 +1103,12 @@ TEST_CASE("REST dex/devices/{id}/live: the caller's confined VisibleSet reaches 
 
 TEST_CASE("REST dex/devices/{id}/live: a device the caller cannot see is not reached, even though "
           "the per-device gate admitted it",
-          "[rest][dex][device][live][scope][1788]") {
+          "[pg][rest][dex][device][live][scope][1788]") {
     // The scope gate is left ADMITTING on purpose, so the confinement layer is
     // the only thing that can refuse this dispatch.
-    RestGsHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool);
     h.exec_visible_override = std::unordered_set<std::string>{"WS-OTHER"};
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
     REQUIRE(res);
@@ -1114,9 +1118,11 @@ TEST_CASE("REST dex/devices/{id}/live: a device the caller cannot see is not rea
 }
 
 TEST_CASE("REST dex/devices/{id}/live: an UNWIRED ExecVisibleFn fails CLOSED (present-empty)",
-          "[rest][dex][device][live][scope][fail-closed][1788]") {
+          "[pg][rest][dex][device][live][scope][fail-closed][1788]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     RestGsHarness h(/*live_deps=*/true, /*wire_scoped_perm=*/true, /*wire_app_perf=*/true,
-                    /*with_exec_visible=*/false);
+                    /*with_exec_visible=*/false, /*resp_pool=*/&pool);
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
     REQUIRE(res);
     CHECK(res->status == 503);
