@@ -625,3 +625,21 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuResponseReapBacklog", alertstate="firing", instance="s1", job="yuzu", result="capped", severity="warning"}'
             value: 1
+
+  # CASE 22 -- failing: a lone failed pass (transient blip) must not page; two
+  # or more within 3h (a repeating wedge) must. Distinct from NotRunning — the
+  # counter IS moving, just onto the wrong label.
+  - interval: 1m
+    name: response reap failing - a lone failure is quiet, a repeat within 3h pages
+    input_series:
+      - series: 'yuzu_server_response_reap_passes_total{job="yuzu",instance="s1",result="failed"}'
+        values: "0x60 1+0x120 2+0x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuResponseReapFailing", alertstate="firing"}'
+        eval_time: 2h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuResponseReapFailing", alertstate="firing"}'
+        eval_time: 3h30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuResponseReapFailing", alertstate="firing", instance="s1", job="yuzu", result="failed", severity="warning"}'
+            value: 1

@@ -582,6 +582,31 @@ groups:
             engineering escalation (raise the cap, or shorten the reap cadence
             after a capped pass) rather than a config change.
 
+      # #2691 Gate 5 (chaos-injector): a reap pass that repeatedly ERRORS
+      # (statement failure / transaction rollback — result="failed") is a
+      # DIFFERENT condition from YuzuResponseReapNotRunning ("hasn't run at
+      # all") — the pass IS running, on schedule, and failing every time,
+      # which is invisible to the liveness rule (a failed pass still
+      # increments the labeled counter, so sum(rate(...)) stays nonzero).
+      # Left uncaught, a wedge where the same backlog re-selects and re-fails
+      # every pass (the exact self-sustaining-wedge risk the chunked-delete +
+      # bounded-facet-drain fix above exists to prevent) pages nobody.
+      - alert: YuzuResponseReapFailing
+        expr: |
+          increase(yuzu_server_response_reap_passes_total{result="failed"}[3h]) >= 2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Response TTL reap is repeatedly failing (not merely idle)"
+          description: >-
+            The response store's TTL reap has failed (statement error or
+            transaction rollback) at least twice in 3h — it is running on
+            schedule and erroring, not simply not running (that's
+            YuzuResponseReapNotRunning). Check the server log for
+            "ResponseStore::reap_expired" error lines and PostgreSQL health
+            (statement_timeout, lock contention, disk pressure).
+
       # #2691 Gate 6 (sre + enterprise-readiness, independently confirmed via a
       # live promtool simulation): yuzu_server_response_reap_passes_total is
       # LABELED by `result` (unlike AuditStore's unlabeled sibling counter), and

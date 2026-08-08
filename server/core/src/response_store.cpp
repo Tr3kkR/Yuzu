@@ -82,6 +82,24 @@ constexpr int64_t kReapCapPerPass = 10'000;
 // exactly the backlog that most needs to drain.
 constexpr int64_t kReapDeleteChunkRows = 500;
 constexpr std::chrono::milliseconds kReapDeleteBudget{2000};
+// #2691 Gate 5 (chaos-injector, empirically measured live against PostgreSQL
+// 18.4): the parent-row LIMIT above bounds ROW COUNT, not statement latency —
+// a single chunk of kReapDeleteChunkRows parent rows, each carrying up to
+// kMaxFacetsPerResponse facets, can still cascade up to 2,500,000 child-row
+// deletes in ONE implicit FK CASCADE statement (measured ~1929ms on an IDLE,
+// uncontended database — already consuming nearly the entire
+// kReapDeleteBudget in one statement with zero of the concurrent-write
+// friction a real deployment adds). Past the connection's statement_timeout,
+// that single statement fails outright, `with_txn_for` rolls back the WHOLE
+// pass (every earlier chunk in it too), and the deterministic ORDER BY
+// re-selects the identical backlog next pass — a self-sustaining wedge on
+// exactly the backlog that most needs to drain. Fix: pre-delete
+// response_facets for a chunk's ids in THEIR OWN small LIMIT-bounded batches
+// (FK CASCADE has no native LIMIT, a plain DELETE does via the same
+// subquery-LIMIT idiom the parent-row delete already uses) so no single
+// statement's size depends on how many facets happen to land in one chunk —
+// by the time the parent-row DELETE runs, its CASCADE is trivial.
+constexpr int64_t kReapFacetDeleteBatchRows = 5'000;
 constexpr int64_t kReapBigStepSecs = 86'400; // part 7: absolute, ~1 day
 // The implausibly-ahead bound (part 1) MUST exceed the legitimate TTL horizon
 // or a live row's own honest ttl_expires_at gets misclassified as
@@ -1351,34 +1369,92 @@ void ResponseStore::reap_expired() {
         }
 
         // `responses` reaped in chunked DELETEs, not one unbounded statement
-        // (#2691, Doomgoose finding #6) — `response_facets` rows for each
-        // reaped id are still removed automatically via ON DELETE CASCADE
-        // (no second lockstep statement needed, unlike GuaranteedStateStore's
-        // events/observations pair which has no FK between them), but the
-        // fan-out per chunk is now bounded by kReapDeleteChunkRows *
-        // kMaxFacetsPerResponse instead of kReapCapPerPass * (no bound at
-        // all). The deterministic ORDER BY is unchanged across chunks (each
-        // chunk deletes the oldest still-remaining expired rows), so a
-        // wall-clock-budget stop mid-pass leaves a well-defined remainder for
-        // the next pass, not a re-selected duplicate of what already ran.
+        // (#2691, Doomgoose finding #6). `response_facets` rows for each
+        // reaped id are DRAINED EXPLICITLY below, in their own small
+        // LIMIT-bounded batches, BEFORE the parent-row delete — not left to
+        // the implicit ON DELETE CASCADE, whose fan-out has no LIMIT of its
+        // own (chaos Gate 5: up to kReapDeleteChunkRows *
+        // kMaxFacetsPerResponse = 2.5M child rows in ONE statement if left to
+        // CASCADE — see kReapFacetDeleteBatchRows's comment). By the time the
+        // parent-row DELETE runs, its CASCADE has nothing left to do. The
+        // deterministic ORDER BY selecting each chunk's ids is unchanged, so
+        // a wall-clock-budget stop mid-pass (whether mid-facet-drain or
+        // between chunks) leaves a well-defined remainder for the next pass:
+        // a chunk whose facets are only partially drained is simply
+        // reselected (still expired, parent row not yet deleted) and its
+        // facet drain resumes where it left off.
         const auto delete_deadline =
             std::chrono::steady_clock::now() + kReapDeleteBudget;
         bool budget_exhausted = false;
         while (responses_deleted < kReapCapPerPass) {
+            if (std::chrono::steady_clock::now() >= delete_deadline) {
+                budget_exhausted = true;
+                break;
+            }
             const int64_t chunk_limit =
                 std::min<int64_t>(kReapDeleteChunkRows, kReapCapPerPass - responses_deleted);
+            pg::PgResult ids_res = pg::exec_params(
+                conn,
+                "SELECT id FROM response_store.responses WHERE ttl_expires_at > 0 AND "
+                "ttl_expires_at < $1::bigint ORDER BY ttl_expires_at ASC, id ASC "
+                "LIMIT $2::bigint",
+                std::vector<std::string>{std::to_string(pg_now), std::to_string(chunk_limit)});
+            if (ids_res.status() != PGRES_TUPLES_OK) {
+                spdlog::error("ResponseStore::reap_expired: chunk id select failed: {}",
+                              PQerrorMessage(conn));
+                return false;
+            }
+            const int64_t n_ids = PQntuples(ids_res.get());
+            if (n_ids == 0)
+                break; // nothing left expired
+            std::string id_list;
+            id_list.reserve(static_cast<std::size_t>(n_ids) * 8);
+            for (int i = 0; i < n_ids; ++i) {
+                if (i > 0)
+                    id_list += ',';
+                id_list += text_col(ids_res.get(), i, 0);
+            }
+
+            // Drain response_facets for this chunk's ids in bounded batches
+            // BEFORE touching the parent rows, so the parent DELETE's
+            // CASCADE below is always trivial regardless of how many facets
+            // this chunk's responses happen to carry.
+            for (;;) {
+                pg::PgResult fdel = pg::exec_params(
+                    conn,
+                    ("DELETE FROM response_store.response_facets WHERE ctid IN (SELECT ctid "
+                     "FROM response_store.response_facets WHERE response_id IN (" +
+                     id_list + ") LIMIT " + std::to_string(kReapFacetDeleteBatchRows) + ")")
+                        .c_str(),
+                    std::vector<std::string>{});
+                if (fdel.status() != PGRES_COMMAND_OK) {
+                    spdlog::error("ResponseStore::reap_expired: facet drain failed: {}",
+                                  PQerrorMessage(conn));
+                    return false;
+                }
+                if (affected_rows(fdel) < kReapFacetDeleteBatchRows)
+                    break; // this chunk's facets are fully drained
+                if (std::chrono::steady_clock::now() >= delete_deadline) {
+                    // Facets only partially drained — leave the parent rows
+                    // in place; the next pass reselects the same ids (still
+                    // expired) and resumes the drain.
+                    budget_exhausted = true;
+                    break;
+                }
+            }
+            if (budget_exhausted)
+                break;
+
             pg::PgResult del = pg::exec_params(
                 conn,
-                "DELETE FROM response_store.responses WHERE id IN (SELECT id FROM "
-                "response_store.responses WHERE ttl_expires_at > 0 AND ttl_expires_at < "
-                "$1::bigint ORDER BY ttl_expires_at ASC, id ASC LIMIT $2::bigint) RETURNING id",
-                std::vector<std::string>{std::to_string(pg_now), std::to_string(chunk_limit)});
-            if (del.status() != PGRES_TUPLES_OK) {
+                ("DELETE FROM response_store.responses WHERE id IN (" + id_list + ")").c_str(),
+                std::vector<std::string>{});
+            if (del.status() != PGRES_COMMAND_OK) {
                 spdlog::error("ResponseStore::reap_expired: delete failed: {}",
                               PQerrorMessage(conn));
                 return false;
             }
-            const int64_t chunk_deleted = PQntuples(del.get());
+            const int64_t chunk_deleted = affected_rows(del);
             responses_deleted += chunk_deleted;
             if (chunk_deleted < chunk_limit)
                 break; // drained everything expired — no need to check the budget

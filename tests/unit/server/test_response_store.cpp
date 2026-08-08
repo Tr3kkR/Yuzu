@@ -1178,6 +1178,59 @@ TEST_CASE("ResponseStore: reap_expired deletes correctly across a chunk boundary
     CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM response_store.response_facets") == "0");
 }
 
+// #2691 (Gate 5 chaos-injector): the reap's facet pre-drain runs in
+// kReapFacetDeleteBatchRows(5000)-row batches BEFORE the parent-row delete,
+// so a single chunk's cascade is never left to an unbounded implicit FK
+// CASCADE. This seeds enough facets in ONE reap chunk (500 responses x 12
+// facets = 6000, raw-SQL — bypassing plugin/output parsing so the count is
+// exact) to force the facet drain loop to run more than one batch within a
+// single chunk, and confirms it still fully drains both facets and parents.
+TEST_CASE("ResponseStore: reap_expired facet pre-drain spans more than one batch within a chunk",
+          "[pg][response_store][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool, /*retention_days=*/30);
+    REQUIRE(store.is_open());
+    anchor_guard(store);
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    constexpr int kRows = 500; // == kReapDeleteChunkRows, one chunk
+    constexpr int kFacetsPerRow = 12; // 500 * 12 = 6000 > kReapFacetDeleteBatchRows (5000)
+    for (int i = 0; i < kRows; ++i) {
+        StoredResponse r;
+        r.instruction_id = "facetchunk-" + std::to_string(i);
+        r.agent_id = "agent-a";
+        r.status = 1;
+        store.store(r);
+    }
+    exec_sql(db.dsn(), "UPDATE response_store.responses SET ttl_expires_at = 1 WHERE "
+                       "instruction_id LIKE 'facetchunk-%'");
+    // Raw-SQL facet seed, exact count, independent of plugin output parsing.
+    exec_sql(db.dsn(),
+             "INSERT INTO response_store.response_facets (response_id, instruction_id, "
+             "agent_id, col_idx, value, line_count) "
+             "SELECT r.id, r.instruction_id, r.agent_id, g, 'v' || g, 1 "
+             "FROM response_store.responses r, generate_series(0, " +
+                 std::to_string(kFacetsPerRow - 1) +
+                 ") g "
+                 "WHERE r.instruction_id LIKE 'facetchunk-%'");
+    REQUIRE(query_scalar(db.dsn(), "SELECT COUNT(*) FROM response_store.response_facets") ==
+            std::to_string(kRows * kFacetsPerRow));
+    store.store(mk_agg_resp("facetchunk-live", "agent-a", 1)); // avoids would_wipe
+
+    store.reap_expired();
+    CHECK(store.responses_reaped_total() == kRows);
+    CHECK(store.total_count() == 1); // only "facetchunk-live" survives
+
+    const auto reaped = [&](const char* result) {
+        return metrics.counter("yuzu_server_response_reap_passes_total", {{"result", result}})
+            .value();
+    };
+    CHECK(reaped("swept") == 1.0);
+    CHECK(query_scalar(db.dsn(), "SELECT COUNT(*) FROM response_store.response_facets") == "0");
+}
+
 // gc_sweep advisory-lock skip: a sibling replica already sweeping holds the
 // fleet-wide try-advisory-xact-lock, so this pass must skip quietly and never
 // even reach the gc_meta read/stamp, never mind the delete.
