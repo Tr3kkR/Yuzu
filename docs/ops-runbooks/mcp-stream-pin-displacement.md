@@ -159,15 +159,22 @@ state (3); this runbook's position is that the margin is worth more, since state
 rare and self-recoverable by the client either way (step 3 below), while a page on a
 slow-but-healthy retry cycle is a false one.
 
-That margin is not free. A client retrying slower than the window — a non-conforming
-client ignoring `Retry-After`, or one on a coarse fixed schedule — can keep re-triggering
-a genuinely-wedged state (3) without ever producing a *sustained* rate this rule can see,
-because each rejection's gap from the last resets against a span wider than `for: 15m`.
-Measured against the shipped rule: a 16-minute retry cadence never fires through 95
-simulated minutes; a 10-minute cadence does fire, but not until roughly 79 minutes in.
-Silence from this alert is therefore not evidence a slow-retrying client's session
-recovered — treat it as unresolved, not clean, for any client retrying slower than about
-15 minutes.
+That margin is not free. A client retrying at or slower than the window's own 15 minutes —
+a non-conforming client ignoring `Retry-After`, or one on a coarse fixed schedule — can
+keep re-triggering a genuinely-wedged state (3) without ever producing a *sustained* rate
+this rule can see, because each rejection's gap from the last is at least as wide as
+`for: 15m` itself. Measured against the shipped rule: a 16-minute retry cadence never
+fires through 95 simulated minutes, no matter how long it persists — the cliff sits
+exactly at the window's own width, not somewhere below it. A cadence *faster* than the
+window is a different case: successive rejections start overlapping inside the trailing
+15-minute range before the previous one ages out, so the reading locks into "sustained"
+and the alert does fire — but not immediately. Measured for a 10-minute cadence: roughly
+25 minutes from the first rejection, not the 15 of `for:` alone, because the rule still
+has to accumulate a full 15 continuous minutes of sustained reading before `for:` is
+satisfied. Silence from this alert is therefore not evidence a slow-retrying client's
+session recovered — treat it as unresolved, not clean, for any client retrying at or
+slower than 15 minutes, and note that even a faster-but-still-slow cadence buys a
+genuine wedge a real head start (tens of minutes) before this alert catches it.
 
 The margin argument above also implicitly reasons about a single client's retry cadence.
 The underlying counter carries no session dimension (see the scoping note in step 4
@@ -190,9 +197,9 @@ take, which happens in three states:
    `yuzu_mcp_bridge_pin_*` family, and the affected session id from the `mcp.session.reject`
    audit rows (`target_type=McpSession`, `target_id`=the session id's first 8 characters —
    a prefix, not a guaranteed-unique key; corroborate against the metric capture above
-   before treating two matching rows as the same session, `detail` carries
+   before treating two matching rows as the same session). `detail` carries
    `reason=post_pin_slots` for exactly this rejection — other reasons on the same action
-   share the row shape but not the reason). `GET /api/v1/audit?action=mcp.session.reject&limit=1000`,
+   share the row shape but not the reason. `GET /api/v1/audit?action=mcp.session.reject&limit=1000`,
    filtering the `detail` field for `reason=post_pin_slots`; if you already have a candidate
    session id, the legacy `GET /api/audit?action=mcp.session.reject&target_id=<8 chars>` narrows
    directly (the `/api/v1/audit` route does not take `target_id`). **A response at exactly
@@ -201,7 +208,8 @@ take, which happens in three states:
    ([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)); if you hit the cap, fall back to
    the legacy endpoint's `since`/`until` to narrow the window instead of trusting the count.
    A `503` from either endpoint is the deny-on-degrade behavior `YuzuAuditReadDegraded`
-   covers, not "no matching rows".
+   covers, not "no matching rows" — treat it as an audit-store availability problem and
+   retry once that alert clears, not as a clean result.
 2. If the rate is falling on its own, it was (1) or (2). Nothing to do.
 3. If it is flat and sustained with `held="pins"`, the session is wedged. **The client's
    recovery is its own**: it can resume with `Last-Event-ID` (which releases pins at or
