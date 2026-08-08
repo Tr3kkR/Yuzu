@@ -9,6 +9,6 @@
   hand-edited state), or is implausibly large now seeds a distinct nonzero anomaly
   sentinel rather than being laundered into `0`, so corruption or an unreadable anchor
   cannot silently earn the retention-liveness alert family's "never ran" grace. The
-  sentinel self-corrects at the next retention pass whose own clock reading is
-  plausible — not necessarily the very next attempt, since a pass declining on its own
-  implausible clock does not touch this gauge. (#2854)
+  sentinel self-corrects at the next pass whose own clock reading is plausible — not
+  necessarily the very next attempt, since a pass declining on its own implausible
+  clock does not touch this gauge. (#2854)
