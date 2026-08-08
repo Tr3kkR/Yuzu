@@ -29,13 +29,29 @@
 
 #include "dashboard_routes.hpp"
 #include "instruction_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "response_store.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
 
 namespace yuzu::server {
+
+using yuzu::server::pg::PgPool;
+
+namespace {
+// ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
+// "responsestore" template key with test_response_store.cpp (identical setup).
+yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("responsestore template: store failed to migrate");
+}};
+} // namespace
 
 // Test-only accessor for the private schema-aware column resolution +
 // render_results, and their store inputs (PR1.7 remediation, Gate 3).
@@ -111,14 +127,16 @@ std::size_t count_occurrences(const std::string& hay, std::string_view needle) {
 
 TEST_CASE("render_results: a schema-only definition (no visualization) resolves "
           "real columns instead of the plugin-only fallback (PR1.7 remediation)",
-          "[server][dashboard][render_results]") {
+          "[pg][server][dashboard][render_results]") {
     InstructionStore is{":memory:"};
     REQUIRE(is.is_open());
     auto created = is.create_definition(make_list_profiles_definition());
     REQUIRE(created.has_value());
     const std::string definition_id = *created;
 
-    ResponseStore rs{":memory:"};
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
     const std::string command_id = "cmd-list-profiles-1";
     rs.store(mk_list_profiles_response(command_id));
 
@@ -156,11 +174,13 @@ TEST_CASE("render_results: a schema-only definition (no visualization) resolves 
 
 TEST_CASE("render_results: no definition_id falls back to columns_for_plugin "
           "unchanged (regression pin for every other plugin/action)",
-          "[server][dashboard][render_results]") {
+          "[pg][server][dashboard][render_results]") {
     InstructionStore is{":memory:"};
     REQUIRE(is.is_open());
 
-    ResponseStore rs{":memory:"};
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
     const std::string command_id = "cmd-no-def-1";
     StoredResponse r;
     r.instruction_id = command_id;

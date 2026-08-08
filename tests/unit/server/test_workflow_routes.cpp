@@ -1818,8 +1818,10 @@ TEST_CASE("#2500 — an explicit agent_ids list wins over a broadcast request",
 // ═══════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("K-R7-02 — instruction execute threads the caller's exec_visible into dispatch",
-          "[workflow][executions][execute][scope]") {
-    ExecHarness h;
+          "[pg][workflow][executions][execute][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-CONF1", "conf1");
     h.dispatch_cmd_override = "cmd-x";
     h.dispatch_sent_override = 1;
@@ -1841,8 +1843,10 @@ TEST_CASE("K-R7-02 — instruction execute threads the caller's exec_visible int
 }
 
 TEST_CASE("K-R7-02 — instruction execute broadcast still carries the caller's exec_visible",
-          "[workflow][executions][execute][scope]") {
-    ExecHarness h;
+          "[pg][workflow][executions][execute][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-CONF3", "conf3");
     h.dispatch_cmd_override = "cmd-z";
     h.dispatch_sent_override = 1;
