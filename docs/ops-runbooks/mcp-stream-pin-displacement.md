@@ -50,8 +50,11 @@ one except a resume.
 ## What to do
 
 1. **Capture.** The stream metric family (`yuzu_mcp_stream_*`, `yuzu_mcp_bridge_*`) and
-   any `mcp.stream.attach` / `mcp.stream.close` / `mcp.bridge.pin_displaced_for_admission`
-   audit rows around the increment.
+   any `mcp.stream.attach` / `mcp.stream.close` audit rows around the increment. **Do
+   NOT gather `mcp.bridge.pin_displaced_for_admission` rows here** — step 2's rule-out
+   table below explains why: a successful reclaim explains zero displacement, so those
+   rows are not evidence for this investigation and pulling them in only dilutes the
+   capture with noise from an unrelated, benign counter.
 
 2. **Corroborate before concluding.** The alert fires on any displacement, so the
    rule-out is yours to do. A **successful** #2740 reclaim cannot have caused it — the
@@ -80,6 +83,31 @@ one except a resume.
 4. **Do not restart the server**: the counters are cumulative diagnostics, the degraded
    behavior is self-limiting, and a restart destroys the in-memory session state you
    would want to inspect.
+
+## A rising `pin_displaced_for_admission` rate — not a page, a query
+
+`yuzu_mcp_bridge_pin_displaced_for_admission_total` is **not alertable** (see its row in
+`docs/user-manual/metrics.md` for the full explanation — do not restate it here). But an
+operator who notices it climbing, for whatever reason, has a documented way to find out
+who is causing it without new instrumentation: every reclaim is also an audit row.
+
+```
+GET /api/v1/audit?action=mcp.bridge.pin_displaced_for_admission&limit=1000
+```
+
+Add `&principal=<name>` to scope to a candidate you already suspect. Each row's
+`target_id` is the reclaimed call's `execution_id` — empty specifically for an orphan
+(no surviving record to name), never for the ordinary case — and `detail` says whether it
+was a parked final or an orphan. There is no `session_id` field on this row; if you need a
+time window rather than a principal, the legacy `GET /api/audit` endpoint additionally
+takes `since`/`until` (epoch parameters `/api/v1/audit` does not have).
+
+If the rate correlates with a single principal, that is a client dropping connections
+before its results land — ordinary, if unusually frequent, client behaviour, not a
+server defect. If it does not correlate with any one principal, check
+`mcp.bridge.forced_expire` (`GET /api/v1/audit?action=mcp.bridge.forced_expire&limit=1000`)
+for server-side ring pressure tearing parked records down instead — the other of the two
+causes metrics.md's row names.
 
 ## Why this procedure changed
 
@@ -112,6 +140,18 @@ Read *sustained* strictly. Every healthy session passes through `pinned>0, unpin
 during the charge-to-pin handover, so a single sample is not a wedge; the alert carries a
 `for:` for exactly that reason and that `for:` is load-bearing, not tuning.
 
+**Why 15 minutes, not something shorter.** States (1) and (2) above both clear on the
+client's own retry — the streamed-POST `429` remediation carries `Retry-After` derived
+from `kMcpStreamedPostRetryAfterMs` (30s, `mcp_stream.hpp`), so a conforming client
+following it clears a genuine transient within tens of seconds, not minutes. `for: 15m`
+is therefore roughly 30x that retry cadence, not a tight fit to it — the margin is
+deliberate, not merely convenient: it also has to absorb a client that is slow to retry,
+one that retries with backoff, and the charge-to-pin handover window itself (which is
+well under a second). A shorter `for:` would trade that margin for faster detection of
+state (3); this runbook's position is that the margin is worth more, since state (3) is
+rare and self-recoverable by the client either way (step 3 below), while a page on a
+slow-but-healthy retry cycle is a false one.
+
 **Since #2740 this should be rare**, because admission reclaims a slot rather than
 refusing. A `pins` refusal that survives the reclaim means the reclaim found nothing to
 take, which happens in three states:
@@ -123,7 +163,13 @@ take, which happens in three states:
 **What to do.** Only (3) is a real wedge, and only (3) needs you.
 
 1. Capture `yuzu_mcp_bridge_pin_slots_reject_total{held}` for both label values, the
-   `yuzu_mcp_bridge_pin_*` family, and the affected session id from the audit rows.
+   `yuzu_mcp_bridge_pin_*` family, and the affected session id from the `mcp.session.reject`
+   audit rows (`target_type=McpSession`, `target_id`=the session id's first 8 characters,
+   `detail` carries `reason=post_pin_slots` for exactly this rejection — other reasons on the
+   same action share the row shape but not the reason). `GET /api/v1/audit?action=mcp.session.reject&limit=1000`,
+   filtering the `detail` field for `reason=post_pin_slots`; if you already have a candidate
+   session id, the legacy `GET /api/audit?action=mcp.session.reject&target_id=<8 chars>` narrows
+   directly (the `/api/v1/audit` route does not take `target_id`).
 2. If the rate is falling on its own, it was (1) or (2). Nothing to do.
 3. If it is flat and sustained with `held="pins"`, the session is wedged. **The client's
    recovery is its own**: it can resume with `Last-Event-ID` (which releases pins at or
@@ -137,8 +183,8 @@ take, which happens in three states:
    Be aware you probably **cannot** tell from this alert whether one session is wedged or
    many: `yuzu_mcp_bridge_pin_slots_reject_total` carries only the `held` label and has no
    session dimension, so the paging signal cannot separate "one session refused repeatedly"
-   from "many sessions refused once". The audit rows in step 1 give you the session ids you
-   captured, not a population count. **If you cannot establish the scope, treat it as a
+   from "many sessions refused once". The `mcp.session.reject` audit rows in step 1 give you
+   the session ids you captured, not a population count. **If you cannot establish the scope, treat it as a
    single session and do not restart** — that is the safe direction, because a wedged
    session is self-recoverable by the client and a restart is not recoverable for anyone
    else. Escalate for a `session_id` label on that counter rather than guessing.

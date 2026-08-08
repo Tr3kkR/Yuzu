@@ -429,3 +429,55 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
+
+  # First Mcp*-tagged cases in this file (#2792). Pin the runbook's `for: 15m`
+  # derivation (docs/ops-runbooks/mcp-stream-pin-displacement.md, "Why 15
+  # minutes, not something shorter") empirically rather than leaving it as
+  # unverified prose.
+
+  # CASE 1 -- the real wedge. A stuck slot draws repeated refusals every
+  # interval for well past 15m, the way a client hammering a genuinely
+  # unreleasable pin would. Must fire.
+  - interval: 1m
+    name: streamed pin slots wedged - a sustained rate fires
+    input_series:
+      - series: 'yuzu_mcp_bridge_pin_slots_reject_total{held="pins",job="yuzu",instance="s1"}'
+        values: "0+1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuMcpStreamedPinSlotsWedged", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuMcpStreamedPinSlotsWedged", alertstate="firing", held="pins", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 2 -- a single isolated rejection (the charge-to-pin handover blip, or
+  # one retry-clearable state-(1)/(2) refusal) must NEVER fire, at ANY eval
+  # time -- not "eventually resolves", never even momentarily true. This is a
+  # property of the rule's shape, not just the `for:` window: `increase(c[15m])`
+  # stays >0 for the ~15m following a single increment while that increment
+  # remains inside the trailing window, but that true-span is always strictly
+  # SHORTER than 15m (the increment ages out at the same moment the 15m mark
+  # would be reached), so `for: 15m` can never be satisfied by one isolated
+  # sample -- only a rate that keeps refreshing increase()>0 past where a
+  # single instance would have expired can accumulate 15 continuous minutes.
+  # Checked at 4m (mid-transient), 14m (just under the naive 15m-after-bump
+  # mark), 15m and 16m (straddling it), and 30m (long after) -- MEASURED
+  # against promtool 3.13.1, not derived from the paragraph above alone.
+  - interval: 1m
+    name: streamed pin slots wedged - one isolated rejection never fires
+    input_series:
+      - series: 'yuzu_mcp_bridge_pin_slots_reject_total{held="pins",job="yuzu",instance="s1"}'
+        values: "0x10 1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuMcpStreamedPinSlotsWedged", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuMcpStreamedPinSlotsWedged", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuMcpStreamedPinSlotsWedged", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuMcpStreamedPinSlotsWedged", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
