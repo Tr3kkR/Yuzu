@@ -177,12 +177,17 @@ public:
     /// plugin output schema). A lease/transaction/insert failure is logged +
     /// counted (`yuzu_server_response_ingest_dropped_total{reason}`), never
     /// throws, never blocks the gRPC thread. The response INSERT and every
-    /// per-facet INSERT run in ONE transaction; each facet INSERT is wrapped
-    /// in its OWN SAVEPOINT so a single malformed facet value cannot abort
-    /// the whole transaction and lose the response row too (Postgres aborts
-    /// the WHOLE transaction on any failed statement, unlike SQLite — the
-    /// ADR-0038 lesson). A facet failure is logged and the pass continues;
-    /// only the response INSERT failing aborts the whole call.
+    /// facet INSERT run in ONE transaction; ALL facets are written as a
+    /// single batched multi-row INSERT under ONE SAVEPOINT (chunked to stay
+    /// under libpq's param ceiling), not one savepoint per facet — a
+    /// per-facet savepoint mints a subtransaction XID per distinct value,
+    /// and a wide tabular output (>64 distinct facet values) suboverflows
+    /// the ingest txn's snapshot onto the shared server pool (ADR-0039
+    /// §Facet ingest). A facet-batch failure rolls back to the savepoint
+    /// and the response row still commits (Postgres aborts the WHOLE
+    /// transaction on any failed statement, unlike SQLite — the ADR-0038
+    /// lesson); only the response INSERT itself failing aborts the whole
+    /// call.
     void store(const StoredResponse& resp);
 
     /// Tri-state outcome of `finalize_terminal_status` so callers can
