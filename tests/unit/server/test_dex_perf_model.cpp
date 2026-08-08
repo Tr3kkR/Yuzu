@@ -18,10 +18,13 @@
 #include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
 #include "guaranteed_state_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "rest_api_v1.hpp"
 #include "runtime_config_store.hpp"
 #include "tag_store.hpp"
 #include "test_route_sink.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -32,9 +35,20 @@
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgPool;
 namespace rules = yuzu::server::detail;
 
 namespace {
+
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): every test
+// below constructs its own GuaranteedStateStore against a clone of this schema
+// (ADR-0038 migration).
+yuzu::test::PgTestTemplate guardian_pg_tpl{"guardianstate", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    GuaranteedStateStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("guardianstate template: store failed to migrate");
+}};
 
 DexPerfDevice dev(const std::string& id, std::optional<double> cpu, std::optional<double> commit,
                   std::optional<double> lat, const std::string& cohort = "",
@@ -900,7 +914,7 @@ TEST_CASE("procperf routes: own audit verb, Execute gate, result narrowing",
 }
 
 TEST_CASE("device fragment: strips + the own-click applications button ride along",
-          "[dex][perf][routes][device]") {
+          "[pg][dex][perf][routes][device]") {
     // The device drill route feeds the strips from the perf snapshot; the
     // per-app button must carry its OWN route (not the machine-health one).
     auto snap = two_cohorts(12, 0);
@@ -908,7 +922,11 @@ TEST_CASE("device fragment: strips + the own-click applications button ride alon
     // Null store → placeholder (store-gated), but the panel block isn't reached.
     CHECK(html.find("unavailable") != std::string::npos);
 
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+
+    GuaranteedStateStore store(pool);
     html = render_dex_device_fragment(&store, "a-0", "7d", &snap);
     CHECK(html.find("This device vs fleet") != std::string::npos);
     CHECK(html.find("/fragments/dex/device/procperf?agent_id=a-0") != std::string::npos);

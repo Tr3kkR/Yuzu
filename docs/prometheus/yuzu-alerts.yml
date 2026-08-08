@@ -807,6 +807,32 @@ groups:
             the guaranteed-state DB health (disk pressure, corruption, lock contention).
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-ingest-errors"
 
+      # #2663 review: the retention reaper's declined_no_anchor result value was
+      # documented (guaranteed-state.md "Retention", metrics.md) with this exact
+      # expression but shipped no rule — mirrors AuditStore's
+      # YuzuAuditRetentionAnchorNotSurviving (#2579), same reasoning: expect AT
+      # MOST one decline per database, on the pass that first reaches a verdict:
+      # the decline itself SETTLES the bootstrap marker, so a genuine repeat means
+      # the marker is not surviving between passes, not that the clock moved.
+      - alert: YuzuGuardianReapAnchorNotSurviving
+        expr: |
+          increase(yuzu_server_guardian_reap_passes_total{result="declined_no_anchor"}[24h]) > 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Guardian retention keeps re-bootstrapping - the stored clock reading is not surviving"
+          description: >-
+            The Guardian retention guard has declined more than once in a day for having
+            NO stored clock reading (guaranteed_state_store.gc_meta.bootstrap_settled).
+            Expect this AT MOST once per database, on the pass that first reaches a
+            verdict - that pass also settles the marker, so the next one has an anchor.
+            Repeating means the marker is being lost between passes (a restore from
+            backup, a replica rehydrated from a template, a disk-level rollback), not
+            that the clock moved. Nothing has been deleted by these passes - the guard
+            declines rather than deletes on this trigger.
+          runbook_url: "https://docs.yuzu.io/runbooks/guardian-reap-anchor-not-surviving"
+
   - name: yuzu-audit
     # Behavioural-data routes (guardian.device.view, dex.device.view, dex.signal.view)
     # audit-on-open then FAIL CLOSED: if the audit row cannot persist they return 503
