@@ -145,8 +145,11 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         // Enrich severity from the rule store (contract decision 4) — the agent
         // isn't pushed severity. Fall back to the event's own value, then
         // "unknown" for an already-deleted rule.
-        if (auto rule = store.get_rule(ev_row.rule_id); rule)
-            ev_row.severity = rule->severity;
+        // get_rule is now three-state (found / genuinely-absent / degraded — ADR-0038).
+        // Ingest is fail-soft: both "deleted rule" and "degraded read" fall through to
+        // the "unknown" default below, matching this comment's pre-existing intent.
+        if (auto rule = store.get_rule(ev_row.rule_id); rule && *rule)
+            ev_row.severity = (*rule)->severity;
         if (ev_row.severity.empty())
             ev_row.severity = "unknown";
         // Tri-state ingest (item-7 PR-Sv): the durable agent journal re-sends on every
