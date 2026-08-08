@@ -365,4 +365,29 @@ TEST_CASE("render_tar_retention_paused: no scan yet renders the placeholder",
     CHECK(contains(html, "No scan data yet"));
 }
 
+// #2691 (Doomgoose finding #7): a degraded response-store read must not
+// render as "every collector is running normally" or "scan still in
+// progress" — both are false claims about fleet state when the read simply
+// failed.
+TEST_CASE("render_tar_retention_paused: a degraded store read renders the "
+          "degrade banner not the clean-fleet claim",
+          "[pg][server][tar][retention-render]") {
+    PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    ResponseStore bad_rs{bad_pool};
+    REQUIRE_FALSE(bad_rs.is_open());
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    grant_visibility(mg, {"agent-A"});
+
+    DashboardTarRetentionTestAccess acc;
+    acc.set_stores(&bad_rs, &mg);
+    acc.set_scan(kUser, kScan, 1, 1); // scan recorded so the read is reached
+    const std::string html = acc.render(kUser);
+
+    CHECK(contains(html, "result-degrade-banner"));
+    CHECK(contains(html, "Retention state unavailable"));
+    CHECK_FALSE(contains(html, "No paused sources detected"));
+    CHECK_FALSE(contains(html, "still in progress"));
+}
+
 } // namespace yuzu::server

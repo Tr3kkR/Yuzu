@@ -1455,6 +1455,55 @@ TEST_CASE("ResponseStore: wide facet set (>64 distinct values) all persist via b
     CHECK(results->size() == 1);
 }
 
+// #2691 (Doomgoose finding #7): facet_agent_count/facet_line_count were a
+// plain int64_t degrading silently to 0 on a store/pool/query failure — the
+// SAME observable value as a genuine zero-match answer. The group-creation
+// dashboard flow this feeds must be able to tell "0 agents match" from
+// "the count could not be determined".
+TEST_CASE("ResponseStore: facet_agent_count and facet_line_count distinguish degrade from zero",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+
+    StoredResponse resp;
+    resp.instruction_id = "cmd-facetcount";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.plugin = "vuln_scan";
+    resp.output = "high|cat-a|title|detail\nhigh|cat-a|title2|detail2\n";
+    store.store(resp);
+
+    FacetFilter match{/*col_idx=*/1, "cat-a"};
+    auto count = store.facet_agent_count("cmd-facetcount", {match});
+    REQUIRE(count.has_value());
+    CHECK(*count == 1); // one distinct agent
+
+    auto lines = store.facet_line_count("cmd-facetcount", {match});
+    REQUIRE(lines.has_value());
+    CHECK(*lines == 2); // two matching lines
+
+    // A genuinely non-matching filter is a real 0, not a degrade.
+    FacetFilter no_match{/*col_idx=*/1, "cat-nonexistent"};
+    auto zero_count = store.facet_agent_count("cmd-facetcount", {no_match});
+    REQUIRE(zero_count.has_value());
+    CHECK(*zero_count == 0);
+
+    // Empty filters: genuine 0 (no scoped count to report), not a degrade —
+    // matches BOTH functions' documented "no filter -> no scoped count" rule.
+    auto empty_filter_count = store.facet_agent_count("cmd-facetcount", {});
+    REQUIRE(empty_filter_count.has_value());
+    CHECK(*empty_filter_count == 0);
+
+    // A genuinely closed/degraded store returns nullopt, not 0 — the actual
+    // defect this finding fixes.
+    PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    ResponseStore bad_store(bad_pool);
+    REQUIRE_FALSE(bad_store.is_open());
+    CHECK_FALSE(bad_store.facet_agent_count("cmd-facetcount", {match}).has_value());
+    CHECK_FALSE(bad_store.facet_line_count("cmd-facetcount", {match}).has_value());
+}
+
 // ── CC-07 typed plugin result status (PR1.1 finding F11) ───────────────────
 //
 // The typed status is written at response_store.cpp's insert bind and again by

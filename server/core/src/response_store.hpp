@@ -275,15 +275,22 @@ public:
     facet_agent_ids(const std::string& instruction_id,
                     const std::vector<FacetFilter>& filters) const;
 
-    /// Count of distinct agents matching facet filters. Degrades to 0 (scalar
-    /// convenience read, not in the ADR-0039 optional-wrapped vector set).
-    [[nodiscard]] int64_t facet_agent_count(const std::string& instruction_id,
-                                            const std::vector<FacetFilter>& filters) const;
+    /// Count of distinct agents matching facet filters. `nullopt` on a
+    /// store/pool/query failure — DISTINCT from an empty `filters` (a genuine
+    /// 0, no scoped count to report) and from a query that found zero
+    /// matches (also a genuine 0). Was a plain `int64_t` degrading silently
+    /// to 0 for every one of those cases alike; the group-creation dashboard
+    /// flow this feeds must not read a store outage as "0 agents match"
+    /// (#2691, Doomgoose finding #7).
+    [[nodiscard]] std::optional<int64_t>
+    facet_agent_count(const std::string& instruction_id,
+                      const std::vector<FacetFilter>& filters) const;
 
-    /// Total result line count matching facet filters. Degrades to 0 (same
-    /// convenience-scalar posture as facet_agent_count).
-    [[nodiscard]] int64_t facet_line_count(const std::string& instruction_id,
-                                           const std::vector<FacetFilter>& filters) const;
+    /// Total result line count matching facet filters. Same
+    /// degrade-distinguishable posture as facet_agent_count (#2691).
+    [[nodiscard]] std::optional<int64_t>
+    facet_line_count(const std::string& instruction_id,
+                     const std::vector<FacetFilter>& filters) const;
 
     /// Load specific responses by their IDs (for two-phase filtered display).
     [[nodiscard]] std::optional<std::vector<StoredResponse>>

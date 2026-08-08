@@ -201,4 +201,26 @@ TEST_CASE("render_results: no definition_id falls back to columns_for_plugin "
     CHECK_FALSE(contains(html, "profile_name"));
 }
 
+// #2691 (Doomgoose finding #7): a degraded response-store read must render
+// distinguishably from a genuine zero-match answer — "No results match your
+// filters" is a false claim when the store just couldn't be read.
+TEST_CASE("render_results: a degraded store read renders the degrade banner "
+          "not \"no results match your filters\"",
+          "[server][dashboard][render_results]") {
+    InstructionStore is{":memory:"};
+    REQUIRE(is.is_open());
+
+    PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    ResponseStore bad_rs{bad_pool};
+    REQUIRE_FALSE(bad_rs.is_open());
+
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(&is, &bad_rs);
+    const std::string html = acc.render("cmd-degraded", "registry");
+
+    CHECK(contains(html, "result-degrade-banner"));
+    CHECK(contains(html, "Results unavailable"));
+    CHECK_FALSE(contains(html, "No results match your filters"));
+}
+
 } // namespace yuzu::server

@@ -948,13 +948,19 @@ ResponseStore::facet_agent_ids(const std::string& instruction_id,
         });
 }
 
-int64_t ResponseStore::facet_agent_count(const std::string& instruction_id,
-                                         const std::vector<FacetFilter>& filters) const {
-    if (!open_ || filters.empty())
+std::optional<int64_t>
+ResponseStore::facet_agent_count(const std::string& instruction_id,
+                                 const std::vector<FacetFilter>& filters) const {
+    // No filter is a genuine "no scoped count to report" — 0, not a degrade
+    // (#2691, Doomgoose finding #7: distinct from the read-failure cases
+    // below, which must NOT collapse to the same observable 0).
+    if (filters.empty())
         return 0;
+    if (!open_)
+        return std::nullopt;
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return 0;
+        return std::nullopt;
     std::string sql = "SELECT COUNT(DISTINCT agent_id) FROM response_store.response_facets "
                       "WHERE instruction_id = $1";
     std::vector<std::string> binds{instruction_id};
@@ -962,17 +968,22 @@ int64_t ResponseStore::facet_agent_count(const std::string& instruction_id,
     append_facet_filters(sql, binds, idx, instruction_id, filters);
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), binds);
     if (res.status() != PGRES_TUPLES_OK)
-        return 0;
+        return std::nullopt;
     return to_i64(PQgetvalue(res.get(), 0, 0));
 }
 
-int64_t ResponseStore::facet_line_count(const std::string& instruction_id,
-                                        const std::vector<FacetFilter>& filters) const {
-    if (!open_ || filters.empty())
+std::optional<int64_t>
+ResponseStore::facet_line_count(const std::string& instruction_id,
+                                const std::vector<FacetFilter>& filters) const {
+    // See facet_agent_count's comment: no filter is a genuine 0, distinct
+    // from the read-failure cases below (#2691, Doomgoose finding #7).
+    if (filters.empty())
         return 0;
+    if (!open_)
+        return std::nullopt;
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return 0;
+        return std::nullopt;
     // Use the first filter for the line count — this gives the total lines
     // matching that filter. For multi-filter intersection, the count is an
     // upper bound (true intersection count requires row-level parsing) —
@@ -984,7 +995,7 @@ int64_t ResponseStore::facet_line_count(const std::string& instruction_id,
         std::vector<std::string>{instruction_id, std::to_string(filters[0].col_idx),
                                  filters[0].value});
     if (res.status() != PGRES_TUPLES_OK)
-        return 0;
+        return std::nullopt;
     return to_i64(PQgetvalue(res.get(), 0, 0));
 }
 

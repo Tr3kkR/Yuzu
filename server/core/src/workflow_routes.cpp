@@ -551,15 +551,19 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // server upgrade). Once an admin runs the backfill CLI
                 // (PR 2.1 follow-up) and audits show 100% coverage, the
                 // fallback can be removed.
-                // Degrade → empty (dashboard render, ADR-0039 deny-or-benign):
-                // a transient read failure renders the same as "no responses
-                // yet", falling through to the legacy-window attempt below
-                // exactly as an engaged-empty result would.
-                auto responses =
-                    response_store->query_by_execution(exec.id, rq).value_or(std::vector<StoredResponse>{});
+                // #2691 (Doomgoose finding #7): still falls through to the
+                // legacy-window attempt on empty exactly as an engaged-empty
+                // result would (ADR-0039 deny-or-benign — this is an
+                // informational drawer, not a gate), but `store_degraded`
+                // stays distinguishable through to the render below so a
+                // failed read doesn't print "No responses recorded."
+                auto primary_opt = response_store->query_by_execution(exec.id, rq);
+                bool store_degraded = !primary_opt.has_value();
+                auto responses = primary_opt.value_or(std::vector<StoredResponse>{});
                 if (responses.empty()) {
-                    auto legacy =
-                        response_store->query(exec.definition_id, rq).value_or(std::vector<StoredResponse>{});
+                    auto legacy_opt = response_store->query(exec.definition_id, rq);
+                    store_degraded = store_degraded || !legacy_opt.has_value();
+                    auto legacy = legacy_opt.value_or(std::vector<StoredResponse>{});
                     // Filter to agents that appear in this execution's
                     // status set, mirroring the pre-PR-2 best-effort join.
                     std::unordered_map<std::string, bool> in_set;
@@ -580,7 +584,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 html += std::format("<details class=\"per-agent-responses\">"
                                     "<summary>Show responses ({})</summary>",
                                     filtered.size());
-                if (filtered.empty()) {
+                if (store_degraded) {
+                    html += "<div class=\"empty-state result-degrade-banner\">"
+                            "<b>Responses unavailable.</b> The response store could "
+                            "not be read (Postgres pool/query degraded). This is "
+                            "<b>not</b> \"no responses\" — retry shortly.</div>";
+                } else if (filtered.empty()) {
                     html += "<div class=\"empty-state\">No responses recorded.</div>";
                 } else {
                     html += "<table class=\"per-agent-responses-table\"><thead><tr>"
