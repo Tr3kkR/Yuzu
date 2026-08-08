@@ -719,6 +719,57 @@ public:
     /// steady_clock::now). Only the difference between calls matters.
     void set_clock_for_test(ClockFn clock);
 
+    /// #2791 test seam. ONE combined read of the two halves of admission
+    /// accounting for `session_id` - the charge ledger (`bridge_mu_`) and
+    /// `stream`'s pinned count (its own mutex) - under the SAME `bridge_mu_`
+    /// hold reserve() itself uses at cpp:347-350 (read order does not matter;
+    /// only the shared hold does). Two separate calls (a hypothetical
+    /// `unpinned_for_test()` plus `stream->pinned_count()`) would not be atomic
+    /// with EACH OTHER and could observe a torn pair under concurrent
+    /// admission/release traffic; this reads both in one `bridge_mu_` hold, so
+    /// a caller gets the same snapshot reserve() would have decided on.
+    struct AccountingSnapshot {
+        std::size_t pinned = 0;
+        std::size_t unpinned = 0;
+    };
+    AccountingSnapshot accounting_snapshot_for_test(const std::string& session_id,
+                                                    const std::shared_ptr<McpStreamState>& stream);
+
+    /// #2791 test seam: the NEXT project_record call to reach the window after
+    /// `publish_terminal_ladder` commits the frame but before `pinned_event_id`
+    /// is stamped (cpp:1719 area) blocks until release_projection_stall_for_test()
+    /// runs. BRIDGE-GLOBAL, not per-record: the arm applies to whichever record's
+    /// project_record call reaches the window next, on whichever thread reaches
+    /// it (the single projector thread, or a live POST pump's take_post_batch).
+    /// Every caller of this seam (in test_mcp_stream_bridge.cpp) arms it only
+    /// when it can prove no OTHER record is concurrently projectable, which is
+    /// what makes "the next call" mean "the intended one" - do not reuse this
+    /// seam with concurrent multi-record
+    /// streamed activity in flight without first scoping it to a specific `rec`.
+    /// This is exactly the window `select_displaceable_pin_locked`'s
+    /// `projection_in_flight` guard exists to mask (see its header contract
+    /// above `select_displaceable_pin_locked`'s declaration) - a live call's pin
+    /// is committed to the ring but not yet attributable to a record, which is
+    /// indistinguishable from an orphan without the guard. Neither `bridge_mu_`
+    /// nor `rec->mu` is held while parked (both are released before this window
+    /// is reached), so a concurrent reserve() runs its full, real admission
+    /// decision - including the decline branch - against a record that is
+    /// genuinely, deterministically mid-projection, rather than racing for it.
+    /// One-shot: disarms itself the instant it is reached. No existing seam
+    /// reaches this branch deterministically - `ClaimGuard` is function-local
+    /// and every throw path in this file already clears `projection_in_flight`
+    /// before returning (#2528), so a fault injected anywhere in the claim
+    /// window still lets the NEXT scan see it cleared.
+    void arm_projection_stall_for_test();
+    /// Blocks until the armed stall has been reached (project_record is parked
+    /// in the window) or `timeout` elapses. Bounded like every racer in this
+    /// file: a stall never reached must fail the test, not hang CI.
+    bool wait_projection_stall_reached_for_test(
+        std::chrono::milliseconds timeout = std::chrono::seconds(5));
+    /// Releases a parked stall. A no-op if none is parked (idempotent, like the
+    /// file's other test-seam releases).
+    void release_projection_stall_for_test();
+
 private:
     /// One latched bus event. Nothrow-movable - load-bearing for the projector's
     /// extraction (C4) and the listener's construct-then-move commit (D2).
@@ -1164,6 +1215,15 @@ private:
     std::atomic<int> terminal_build_fault_{0}; ///< remaining teardown frame-build throws (test seam)
     std::atomic<int> charge_lock_fault_{0};    ///< remaining release_charge lock throws (#2529 seam)
     ClockFn clock_;                            ///< reaper clock (default steady_clock::now)
+    /// #2791 test seam: the post-ladder-publish, pre-pin-stamp stall. Distinct
+    /// mutex from `bridge_mu_`/`BridgeRecord::mu` on purpose - the whole point of
+    /// the seam is to park a thread in project_record while holding NEITHER, so
+    /// a concurrent reserve() is not itself blocked by the stall.
+    std::atomic<bool> projection_stall_armed_for_test_{false};
+    std::mutex projection_stall_mu_;
+    std::condition_variable projection_stall_cv_;
+    bool projection_stall_reached_for_test_ = false;
+    bool projection_stall_release_for_test_ = false;
 
     std::chrono::steady_clock::time_point now() const {
         return clock_ ? clock_() : std::chrono::steady_clock::now();
