@@ -1,5 +1,15 @@
 # Yuzu — Codex Agent Guide
 
+## Active workstreams (temporary — 2026-07-29 → ~2026-08-05)
+
+Four parallel streams are running across three machines. **Read `docs/workstreams.md` and the
+`STREAM.md` at your worktree root before starting work.** Work belongs to exactly one stream:
+`ci` (CI/test revamp) · `adr17` (list-read confinement) · `adr31` (decomposition) ·
+`pg` (SQLite → Postgres). If a task is outside all four, say so and ask rather than starting it.
+
+Shulgi's Windows and WSL2 halves are one shared box and a live runner host — **take the semaphore
+(`~/yz/bin/shulgi-lock`) before any build or test there, and release it when done.**
+
 ## What is Yuzu?
 
 Yuzu is an agentic enterprise endpoint management platform — a single control plane where agentic colleagues can query, command, scan, patch, and enforce policy compliance on Windows, Linux, and macOS fleets in real time. Think of it as an open-source alternative to commercial endpoint management platforms, built from scratch in C++23.
@@ -317,6 +327,8 @@ Every issue carries exactly one type label; every non-`roadmap` issue also carri
 ### Domain docs
 
 Single-context layout — `CONTEXT.md` at the repo root, ADRs under `docs/adr/`. See `docs/agents/domain.md`.
+
+**Numbering a new ADR:** the number space is author-namespaced — `0xxx` platform · `1xxx` Dave Rae · `2xxx` Fraser Jarvis · `3xxx` Alex Young · `4xxx` Andy Younie. Take the next free number **in your own block**, not the next free number overall. Two numbers currently host two accepted ADRs each (`0016`, `0031`), so cite those by filename rather than number. Full convention + the collision table: `docs/adr/README.md`.
 
 ## AGENTS.md updates
 

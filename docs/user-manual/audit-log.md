@@ -5,6 +5,15 @@ provides a tamper-evident trail suitable for compliance reporting, incident
 investigation, and forwarding to external SIEM platforms such as Splunk or
 Elastic.
 
+> **Fixed (#2579), and it affected upgrades only.** A retention pass that began
+> with NO stored clock reading declined nothing on its own account, so a host
+> whose clock was ALREADY skewed forward when it first ran the guard could delete
+> expired rows unremarked. Such a pass now declines once, warns, and anchors the
+> reading; the next pass proceeds normally. A correct clock was never at risk, and
+> a fresh install with nothing expired does not decline. If you ran an affected
+> version with a wrong clock, rows deleted then are not recoverable without a
+> backup taken before it. Detail under [Limits](#the-retention-clock-guard).
+
 > **Known issue in v0.9.0 (advisory YZA-2026-001):** audit rows for requests
 > authenticated via `Authorization: Bearer` or `X-Yuzu-Token` (every MCP tool
 > call and every REST automation using an API token) had an empty `principal`
@@ -15,13 +24,27 @@ Elastic.
 
 ## Storage
 
-Audit events are persisted in a dedicated SQLite database using WAL
-(Write-Ahead Logging) mode for high write throughput without blocking readers.
+Audit events are persisted in the server's PostgreSQL substrate under the
+dedicated schema `audit_store` (ADR-0006/0040) — the same database that backs the
+rest of the server's stores, not a separate file. There is **no SQLite
+fallback**: if the substrate is unreachable at boot the server fails closed and
+refuses to start.
+
+Because the audit log is the SOC 2 evidence chain, its write and read paths have
+deliberately asymmetric failure postures:
+
+- **Writes fail hard.** A persistence failure is never silently dropped — the
+  write returns an error to the caller. Behavioural-PII REST routes turn that
+  into `503` + `Sec-Audit-Failed: true` and serve **no** data, so evidence-less
+  PII is never recorded as audited.
+- **Reads degrade to DENY.** A store or connection-pool failure on a query
+  returns `503`, never a false-empty `200`. A reviewer or SIEM can never mistake
+  an infrastructure blip for "no audit activity."
 
 | Setting | Default | Description |
 |---|---|---|
 | Retention period | 365 days | Events older than this are deleted by background cleanup |
-| Cleanup interval | 1 hour | How often the background thread prunes expired events |
+| Cleanup interval | 1 hour | How often the sweeper prunes expired events (fleet-wide, single-sweeper — see [The retention clock guard](#the-retention-clock-guard)) |
 
 ## Event structure
 
@@ -69,7 +92,7 @@ required.
 > high-frequency, pre-handler operational event — an engine principal running
 > hot against its own cap, expected under normal steady-state load — not a
 > forensically interesting action against a resource. Auditing every
-> rejection would flood `audit.db` under a busy or misconfigured engine
+> rejection would flood the audit store under a busy or misconfigured engine
 > principal with no compliance benefit; the counter (SIEM-routable,
 > `absent()`-safe pre-seeded series) is the intended observability surface.
 > Compare with `yuzu_onbehalf_rejected_total` and `yuzu_auth_lockout_blocked_
@@ -105,7 +128,7 @@ required.
 | `instruction.execute` | Instruction | An instruction is dispatched to one or more agents |
 | `instruction.approve` | Instruction | An instruction pending approval is approved |
 | `instruction.deny` | Instruction | An instruction pending approval is denied |
-| `instruction.import` | InstructionDefinition | An InstructionDefinition JSON envelope was submitted via `POST /api/instructions/import`. On `result=success`: `target_id` is the new definition's id; `detail` is empty. On `result=denied`: `target_id` is empty (no id assigned on rejection); `detail` carries the store-returned error string, which begins with a stable SIEM-keyable token — known tokens are `duplicate_id` (409 conflict), `signature verification failed for instruction — content may have been tampered with` (#1073 / W7.4), `instruction-import is unsigned and signature enforcement is enabled` (#1073), `instruction-import has incomplete signing metadata` (#1073), `instruction-import has signing field of wrong JSON type` (#1073 R1), `signature length invalid` / `publicKey length invalid` (#1073 R1 DoS amplification guard), `instruction-import has signature + publicKey but no yaml_source` (#1073). Permission gate: `InstructionDefinition:Write`. SOC 2 CC6.7: every import attempt is logged regardless of outcome; if the audit-store write itself fails, the response carries the `Sec-Audit-Failed: true` header AND an `audit_emitted=false` field in the JSON body (PR #883 evidence-chain pattern). |
+| `instruction.import` | InstructionDefinition | An InstructionDefinition JSON envelope was submitted via `POST /api/instructions/import`. On `result=success`: `target_id` is the new definition's id; `detail` is empty. On `result=denied`: `target_id` is empty (no id assigned on rejection); `detail` carries the store-returned error string, which begins with a stable SIEM-keyable token — known tokens are `duplicate_id` (409 conflict), `signature verification failed for instruction — content may have been tampered with` (#1073 / W7.4), `instruction-import is unsigned and signature enforcement is enabled` (#1073), `instruction-import has incomplete signing metadata` (#1073), `instruction-import has signing field of wrong JSON type` (#1073 R1), `signature length invalid` / `publicKey length invalid` (#1073 R1 DoS amplification guard), `instruction-import has signature + publicKey but no yaml_source` (#1073), `definition id may not use the reserved 'mcp.' prefix` (#2442 — the `mcp.` definition-id namespace belongs to MCP approval tickets; note this one is reached AFTER signature verification, so a signed pack is verified first and then refused on the id). Permission gate: `InstructionDefinition:Write`. SOC 2 CC6.7: every import attempt is logged regardless of outcome; if the audit-store write itself fails, the response carries the `Sec-Audit-Failed: true` header AND an `audit_emitted=false` field in the JSON body (PR #883 evidence-chain pattern). |
 | `enrollment.approve` | Agent | A pending agent enrollment is approved |
 | `enrollment.deny` | Agent | A pending agent enrollment is denied |
 | `enrollment.token_create` | EnrollmentToken | An enrollment token is generated |
@@ -123,7 +146,7 @@ required.
 | `api_token.revoke` | ApiToken | An API token is revoked |
 | `engine_principal.role.assigned` | EnginePrincipal | A fleet-wide RBAC role was assigned to an engine principal via `POST /api/v1/engine-principals/{id}/roles` or the MCP `assign_engine_role` twin (PR 4.2, design §4.1). `target_id` is the full `engine:<slug>` principal id. `result=success` with `detail=<role_name>`; `result=denied` (target is not a live engine principal, the role is unknown, or `validate_assignment` rejects an admin/built-in/wildcard target — design §4.2 "no admin, ever") with `detail=<role_name>: <reason>`. Permission gate: `Security:Write`, plus admin + MFA step-up. |
 | `engine_principal.role.unassigned` | EnginePrincipal | A fleet-wide RBAC role was removed from an engine principal via `DELETE /api/v1/engine-principals/{id}/roles/{role}` or the MCP `unassign_engine_role` twin. `target_id` is the full `engine:<slug>` principal id; `detail=<role_name>`. `result=success` only — the unassign is **idempotent** (matching the management-group sibling): removing a role the principal never held still returns `200` and still writes a `success` row, so a success row does not by itself prove a grant existed. A `503` (store unavailable) writes no row. Permission gate: `Security:Write`, plus admin + MFA step-up. |
-| `engine_principal.role.listed` | EnginePrincipal | The fleet-wide RBAC roles assigned to an engine principal were enumerated via `GET /api/v1/engine-principals/{id}/roles` or the MCP `list_engine_roles` twin. `target_id` is the full `engine:<slug>` principal id; `result=success`. Audited because privilege enumeration is a security-sensitive read (SOC 2 CC7.2), even though it is a read. Permission gate: `Security:Read`. |
+| `engine_principal.role.listed` | EnginePrincipal | The fleet-wide RBAC roles assigned to an engine principal were enumerated via `GET /api/v1/engine-principals/{id}/roles` or the MCP `list_engine_roles` twin. `target_id` is the full `engine:<slug>` principal id; `result=success`. Audited because privilege enumeration is a security-sensitive read (SOC 2 CC7.2), even though it is a read. Permission gate: `EnginePrincipal:Read`. |
 | `engine_principal.create` | EnginePrincipal | A new engine-principal identity is minted via `POST /api/v1/engine-principals` or the `create_engine_principal` MCP tool. `detail` carries `owner=<username>; classification=<internal\|external>` on both REST and MCP. |
 | `engine_principal.list` | EnginePrincipal | The engine-principal list surface (`GET /api/v1/engine-principals`) was enumerated. Emitted on every successful call, including by a read-only auditor role — an admit-then-audit read, not a mutation. **REST-only** — the `list_engine_principals` MCP tool does not emit this verb; its call is recorded only under the generic `mcp.list_engine_principals` tool-call audit action (`target_type=mcp_tool`), not this domain-specific verb. |
 | `engine_principal.get` | EnginePrincipal | A single engine principal's identity row was read (`GET /api/v1/engine-principals/{id}`). **REST-only**, same caveat as `engine_principal.list` above — the `get_engine_principal` MCP tool records only the generic `mcp.get_engine_principal` tool-call audit action. |
@@ -180,6 +203,7 @@ required.
 | `inventory.device.software` | Inventory | An operator opened **one device's installed software** (`/inventory` Devices tab → device click). Machine-scope software data, **set-and-proceed** (HTML fragment renders even if the audit row can't persist). `target_id` is `agent=<id>`; `result=success` carries `rows=<n>`, a store degrade emits `result=failure`. Gated **per device** on `Inventory:Read` for that device's management group (`scoped_perm_fn` — the tier + management-group chokepoint), so an operator only reads a device in their scope. |
 | `inventory.devices` | Inventory | An operator opened the `/inventory` **Devices** tab — the device roster (hostnames + agent_ids + OS + online/last-seen), **plus the device-CI columns** (serial, model, CPU cores/threads, RAM) joined onto each row from `DeviceInventoryStore`. Because serial is a device-persistent identifier (GDPR personal data per ADR-0016), this verb is emitted via the **behavioural-PII audit tier** (`Sec-Audit-Failed` header on a persist failure) rather than the lighter machine-scope tier the other `inventory.*` list verbs use. The CI join is confinement-preserving relative to whatever roster the route renders (it only ever looks up an agent ID already present in that roster, so an out-of-scope device's CI is never attached or disclosed — regression-tested); **the roster itself gates on the global `Inventory:Read`, and per-operator management-group confinement of that roster is designed for, not yet verified effective** (ADR-0017 — the same inert-list-scoping class as the `inventory.software.query` Find verb above), not a per-device gate. `target_id` is `fleet`; `result=success` carries `devices=<n> (incl. CI columns: serial/model/cpu/ram)`; `result=failure` carries `devices=<n> (CI store degraded; roster rendered without CI columns)` when the CI-enrichment join degrades on a populated roster, or `devices=0 (device roster or CI store unavailable)` when the rendered roster is empty AND the CI-enrichment join degrades — reachable either from a legitimately empty visible fleet coinciding with a CI-store hiccup, or (practically unreachable, since ADR-0012 fails the server closed at boot) the roster provider itself being down — either way the roster still renders whatever it has, only the audit-fidelity signal changes. Set-and-proceed: the HTML fragment still renders on an audit-persist failure. (Distinct from `inventory.device.software`/`inventory.device.ci`, the per-device drill verbs, which are per-device scoped + audited.) |
 | `inventory.device.ci` | Inventory | An operator opened **one device's CI record** (`/inventory` Devices tab → device click → CI panel: manufacturer, model, serial, system UUID, domain/OU, BIOS, CPU, memory, MAC addresses, NIC count, OS name/version/build, architecture, first/last-synced). Device-persistent identifiers (GDPR personal data per ADR-0016), so this uses the **behavioural-PII audit tier** — same as `dex.device.view`/`tar.dns.read`/`tar.arp.read` — rather than the lighter tier `inventory.device.software` (installed-software content, not a device-persistent identifier) uses. `target_id` is `agent=<id>`; `result=success` carries `detail=found` (a CI record exists) or `detail=absent` (the device hasn't completed its first `device_ci` sync yet — NOT a failure); `result=failure` carries `detail=store degraded` (the store itself could not be read). Gated **per device** on `Inventory:Read` for that device's management group (`scoped_perm_fn`), so an operator only reads a device in their scope. |
+| `config.update` | RuntimeConfig | An operator wrote a runtime-config key via `PUT /api/config/:key` (`Infrastructure:Write`). `target_id` is the key name. For an ordinary key `detail` carries `value=<the new value>` verbatim, so this row is the change-management evidence for what a setting was changed to and by whom. **For a secret-valued key (today `oidc_client_secret`) `detail` never carries the real value** - the write path records `value=<redacted>`, and `AuditStore::query()` additionally redacts the `detail` of any *pre-existing* `config.update` row naming a secret key **on read**, so rows written before that fix shipped no longer disclose the plaintext through `GET /api/v1/audit`, the legacy `GET /api/audit`, or the MCP `query_audit_log` tool (every reader shares the one read path). The stored row on disk is left unchanged - an audit row is evidence, so this redacts what a caller *sees* rather than rewriting history. If you set `oidc_client_secret` before that fix, rotate it: the value was disclosed while it was being recorded in the clear. **Rotating durably takes more than one step, and rotating through Settings alone breaks the next restart** — see [`upgrading.md`](upgrading.md) ("Security: rotate `oidc_client_secret` if it was ever set on this install") for what to remediate, and [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to configure it. The note below about Settings is about where the audit evidence lands, not how to rotate. Note this verb covers the generic config API only; a change made through Settings emits its own verb instead (`settings.dex_alerts.*`, `plugin_signing.require.changed`, and for OIDC `oidc.configure` on `target_type="OidcConfig"` with the ISSUER as `target_id`). **Consequence for rotation evidence:** a Settings-driven OIDC secret rotation is audited as `oidc.configure` and does NOT name `oidc_client_secret` anywhere, so a query for `config.update` + `target_id=oidc_client_secret` finds only rotations done through the generic API. Since Settings is the only path that applies an OIDC change to the running server, expect key-level rotation evidence to be absent for the path operators are told to use. |
 | `settings.dex_alerts.cohort_export` | RuntimeConfig | An admin set or cleared the cohort metrics export tag key via Settings → DEX alerts. `target_id` is `dex_cohort_export_key`; `detail` carries `export_key=<key>` or `export disabled`. The runtime-config store keeps no history, so this row is the change-management evidence for what cohort labels were exported when. |
 | `tar.status.scan` | Infrastructure | An operator clicked **Scan fleet** on the TAR dashboard page (`/tar`). A `tar.status` command was dispatched to the operator's visible-agent set. `detail` carries the count of agents the dispatch reached (e.g. `dispatched to 47 agent(s) in scope`). One row per Scan button press; no row on page-load Refresh. |
 | `tar.source.reenable` | Infrastructure | An operator clicked **Re-enable** on a row of the TAR retention-paused list and a `tar.configure` command with `<source>_enabled=true` was dispatched to a single device. `detail` carries `device=<id> source=<process|tcp|service|user>` on success. Failures emit `result=failure` with `detail` set to the real reason (`scope_violation source=<src>` for out-of-scope device IDs, `agent_not_connected source=<src>` for connected-but-zero-sent dispatches) so SIEM rules can distinguish a forged-form attempt from a transient connectivity issue — even though the HTTP response body is identical (`Agent not reachable.` 404) for both, to deny enumeration. |
@@ -208,7 +232,7 @@ required.
 | `server.unsigned_packs_allowed` | ProductPack | Emitted ONCE at server startup when `--allow-unsigned-packs` / `YUZU_ALLOW_UNSIGNED_PACKS=1` is set (#802 / W7.4). `principal=system`, `target_id=signature_enforcement`, `detail` describes the flag source, `result=success`. Pairs with the `[SECURITY] product pack signature enforcement DISABLED by configuration` warn line in operator logs. SIEM rules can detect a server running with the relaxed posture even on deployments with no pack-install traffic. |
 | `server.unsigned_definitions_allowed` | InstructionDefinition | Sibling of `server.unsigned_packs_allowed`, emitted ONCE at server startup when `--allow-unsigned-definitions` / `YUZU_ALLOW_UNSIGNED_DEFINITIONS=1` is set (#1073 / W7.4 sibling-gap closure). `principal=system`, `target_id=signature_enforcement`, `detail` describes the flag source, `result=success`. Pairs with the `InstructionStore: signature enforcement DISABLED by configuration` warn line in operator logs. Same SIEM use case: identifies servers running with the relaxed instruction-import posture. |
 | `config.admin_group_set` | AuthConfig | Emitted ONCE per configured flag at server startup when `--oidc-admin-group` and/or `--saml-admin-group` is non-empty (#1829). `principal=system`, `target_id` is `oidc` or `saml` (one row per configured provider — up to two rows on a server with both wired), `detail=provider=<oidc\|saml>;admin_group=<value>` (the already-trimmed group value — a group identifier, not a secret), `result=success`. Makes the standing "which group grants admin via SSO" posture recoverable from the audit store even on a deployment with no SSO logins yet. |
-| `mcp.bridge.*` | Execution | Server-side lifecycle events of the MCP progress bridge (track 2f PR 3a), NOT operator actions - emitted from the background sweep/projector, so `principal=system` and `target_id` is the `execution_id` - **except** for a record reaped by the arming reaper before `subscribe()` assigned an execution id, where `target_id` is empty (that row is therefore not joinable to an execution; the `detail` still identifies the disposition). `result` is normally `success`, but every verb that routes through the claimed-teardown path (all of them except `mcp.bridge.cancel`) emits **`result=failure`** when the teardown could not settle one of the three resources it owns (`detail` begins `teardown incomplete: ...` and names what is retained - see `yuzu_mcp_bridge_teardown_incomplete_total{reason}` and `docs/ops-runbooks/mcp-bridge-teardown-recovery.md`), or when the terminal-frame publish ladder poisoned the session, threw, or was never reached (`detail` states which, and never asserts a delivery or a poisoning that did not happen - #2506). **Upgrade note:** before v0.13.0 these rows were unconditionally stamped `result=success` regardless of outcome; a SIEM rule that assumed the constant needs updating. The verb family: `mcp.bridge.done_reap` (a settled GET-only record was reaped), `mcp.bridge.session_dead` (a record torn down because its session idle-expired), `mcp.bridge.arming_reaped` (an orphaned reserved-but-never-armed record was reclaimed by the age reaper), `mcp.bridge.cancel` (a pending cancel was consumed at arm), `mcp.bridge.pin_acked` and `mcp.bridge.forced_expire` (parked-result teardown - only reachable once the later SSE-on-`POST` rung lands). The operator action that *starts* progress streaming (`execute_instruction`) is separately audited under its own `mcp.execute_instruction` verb with the real principal - the bridge does not replace it. |
+| `mcp.bridge.*` | Execution | Server-side lifecycle events of the MCP progress bridge (track 2f PR 3a), NOT operator actions - emitted from the background sweep/projector (and, for the three client-driven verbs `mcp.bridge.cancel`, `mcp.bridge.dispatch_failure` and `mcp.bridge.pin_displaced_for_admission`, from the request thread that lost, unwound, or was admitted), so `principal=system` for the bridge's own background work (sweep/projector) - **except** the three client-driven verbs, EVERY `mcp.bridge.cancel` row (whether the cancel detached a live streamed response or was consumed at `arm()` - as of the SSE-on-`POST` rung both carry the canceller; the session gate binds the record's principal to the authenticated caller, so the two cannot diverge) `mcp.bridge.dispatch_failure`, and `mcp.bridge.pin_displaced_for_admission` (#2740 — a streamed admission reclaimed a session slot from an already-committed final no wire took delivery of: either a parked record's, or an ORPHAN pin whose owning record a teardown erased without unpinning. `target_id` is the displaced final's `execution_id`, empty for an orphan because no record survives to name it, and the `detail` says which case it was), which carry the authenticated caller as `principal` so a cancel is attributable to the client that asked for it (Decision 15(j) non-repudiation) - and `target_id` is the `execution_id` - **except** in two cases where `target_id` is empty: a record reaped by the arming reaper before `subscribe()` assigned an execution id, and a `pin_displaced_for_admission` row for an ORPHAN pin, whose owning record no longer exists to name one — that row carries `released ring event_id=<n>` in its `detail` instead, which is per-session and so must be read together with the row's own session context (that row is therefore not joinable to an execution; the `detail` still identifies the disposition). `result` is normally `success`, but every verb that routes through the claimed-teardown path (all of them except `mcp.bridge.cancel`, `mcp.bridge.dispatch_failure` and `mcp.bridge.pin_displaced_for_admission`, which are transitions rather than teardowns) emits **`result=failure`** when the teardown could not settle one of the three resources it owns (`detail` begins `teardown incomplete: ...` and names what is retained - see `yuzu_mcp_bridge_teardown_incomplete_total{reason}` and `docs/ops-runbooks/mcp-bridge-teardown-recovery.md`), or when the terminal-frame publish ladder poisoned the session, threw, or was never reached (`detail` states which, and never asserts a delivery or a poisoning that did not happen - #2506). **Upgrade note:** before v0.13.0 these rows were unconditionally stamped `result=success` regardless of outcome; a SIEM rule that assumed the constant needs updating. The verb family: `mcp.bridge.done_reap` (a settled GET-only record was reaped), `mcp.bridge.session_dead` (a record torn down because its session idle-expired), `mcp.bridge.arming_reaped` (an orphaned reserved-but-never-armed record was reclaimed by the age reaper), `mcp.bridge.cancel` (a cancel took effect - either consumed at arm, or detaching a LIVE streamed response), `mcp.bridge.dispatch_failure` (a request failed AFTER its work was dispatched, so its record was PARKED rather than abandoned - the execution keeps running and its result stays fetchable by `execution_id`; unlike the pre-dispatch failure paths this deliberately does NOT cancel the execution), `mcp.bridge.pin_acked` and `mcp.bridge.forced_expire` (parked-result teardown), and `mcp.bridge.pin_displaced_for_admission` (#2740 — a streamed admission reclaimed a session slot; carries the admitting principal). **Correlate the last two:** since #2740 a released pin is no longer proof a client consumed anything, so a `pin_acked` row that follows a `pin_displaced_for_admission` row for the same execution records a reclaim, NOT an ack — the action name predates the reclaim and is kept for taxonomy stability. All of these are LIVE as of the SSE-on-`POST` rung (2f PR 3b), which wired their callers. The operator action that *starts* progress streaming (`execute_instruction`) is separately audited under its own `mcp.execute_instruction` verb with the real principal - the bridge does not replace it. |
 
 **Result vocabulary.** `result` is predominantly `success` or `denied`, with `failure` for a failure the handler audits itself. The set is not closed in practice - `ok`, `error`, `warning` and `skipped` also appear on specific verbs. `denied` is the usual token for an authorization or validation rejection with a real principal behind it, but that is a convention rather than an invariant: `enrollment.token_consumed` and `engine_principal.credential.rotate` both use `failure` for what are really rejections, and `instruction.scope_resolution_failed` was emitting a self-audited `failure` before the `mcp.bridge.*` family existed. **So a SIEM rule that surfaces failure branches by filtering on `denied` alone will miss several families, including every background-actor row.** Filter on `result != "success"` when you want all of them. Note `GET /api/v1/audit` does not currently expose a `result` query parameter, so that filter has to be applied by the SIEM after export rather than server-side. `denied` is used for RBAC rejections and for every 400/404/409 branch where the handler explicitly audits the failure — including Guardian `rule.create` (400 missing fields, 409 conflict), `rule.update` (400 invalid body, 404 not found, 409 conflict), `rule.delete` (404 not found), `push` (400 non-object body), and the Phase 8.3 `offload_target.create` (400 validation_failed) / `offload_target.delete` (404 not_found) handlers. SIEM rules that filter on `result == "success"` will match every completed mutation including `guaranteed_state.push` (which returns 202 rather than 201/200 because agent fan-out is asynchronous). To surface probe/fuzz traffic on the REST surface, filter on `result == "denied"` scoped to the actions you care about — every mutating branch produces a row.
 
@@ -341,22 +365,50 @@ below).
 
 ### The retention clock guard
 
-**Which alert sent you here?** Five point at this section and only one of them is
-about a decline.
+**Which alert sent you here?** Find it in the table below — they report different
+conditions and the triage differs. The current rule set is
+`docs/prometheus/yuzu-alerts.yml`.
 
 | Alert | What it means | Go to |
 |---|---|---|
 | `YuzuAuditRetentionClockAnomaly` | A pass declined. Nothing was deleted. | Read on. |
 | `YuzuAuditRetentionFailing` | The pass is **erroring**, not declining. | `yuzu_server_audit_cleanup_failed_total` in the metric table below. |
-| `YuzuAuditRetentionNotRunning` | The reaper is not running at all --- retention is unenforced and `audit.db` grows without bound. | `yuzu_server_audit_retention_passes_total` in the metric table below. |
+| `YuzuAuditRetentionNotRunning` | The reaper is not running at all --- retention is unenforced and the audit store grows without bound. | Triage is in [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionnotrunning) --- **start there**: it opens with the routine, self-clearing causes (a Prometheus restart false-pages for ~45 minutes) before the real diagnosis, and it states the cadence band where this rule cannot fire at all (measured: [`prometheus/blind-band-measurement.md`](../prometheus/blind-band-measurement.md)). Then `yuzu_server_audit_retention_passes_total` in the metric table below. |
+| `YuzuAuditRetentionMetricMissing` | The liveness metric is not being scraped **at all**, so `YuzuAuditRetentionNotRunning` cannot fire for anyone. **Check `up` for the Yuzu target first** — if it is down, or the target has left service discovery, this is an outage rather than just a monitoring gap, and on a single-server Prometheus this may be the only rule firing. | The three-state triage is in [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionmetricmissing) — start there; then `yuzu_server_audit_retention_passes_total` in the metric table below. |
 | `YuzuAuditRetentionStateNotPersisting` | The durable clock reading cannot be written, so detection will not survive a restart. | `yuzu_server_audit_retention_persist_failed_total` in the metric table below. |
 | `YuzuAuditRetentionCapBinding` | Expiry is outrunning the drain. | [Capacity](#capacity). |
+| `YuzuAuditRetentionAnchorNotSurviving` | The durable clock reading keeps being lost, so the guard re-bootstraps instead of comparing. Nothing was deleted by those passes. | [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionanchornotsurviving). |
 
 Retention is driven by the server's wall clock. A cleanup pass that looks like it
 would destroy the audit trail declines instead of deleting: it logs a warning and
 adds one to `yuzu_server_audit_clock_anomaly_skips_total`. **A decline deletes
 nothing.** It is the protection working, not evidence lost. The rest of this
 section is about declines.
+
+**Retention sweeps fleet-wide from a single process.** On the PostgreSQL
+substrate every replica runs the cleanup thread, but each pass first tries to
+take an advisory lease (`pg_try_advisory_xact_lock('audit_store:reap')`); only
+the lease winner sweeps, so exactly one process prunes per tick across the whole
+fleet. The 25,000-rows-per-pass cap therefore stays calibrated as a single
+drain rate — it can never become "N replicas × 25,000." The clock guard's dedup
+state now lives durably in the `audit_retention_meta` table (the previous pass's
+serialized fact-set, alongside the last clock reading), so a condition reported
+by one replica is not re-reported by another, and the state survives a restart
+or a failover to a different replica. (Previously, on the single SQLite server,
+this dedup state was an in-process member — correct for one writer, but it does
+not port to a multi-replica store.)
+
+**Dedup-semantics change (multi-replica correctness).** Because the dedup state
+is now shared across replicas, an identical-magnitude clock step that repeats
+with the *same* fact-set is reported **once** and then stands down, rather than
+re-incrementing `yuzu_server_audit_clock_anomaly_skips_total` on every pass as
+the single-process guard did. A genuinely *different* anomaly (for example a
+dead-CMOS boot followed by an NTP correction — a distinct fact-set) still
+reports; the catastrophic whole-window-wipe protection is fully preserved. Only
+a *second identical* clock step re-emitting the counter is lost. If you
+previously alerted on the *cadence* of that counter (a fresh increment every
+pass), alert on a sustained non-zero increase over several consecutive passes
+instead — see "Is retention actually stalled?" below.
 
 **Start with the log line.** Every decline logs an `AuditStore:` warning naming
 which condition fired, and for an elapsed-time decline it prints the actual gap
@@ -410,8 +462,8 @@ the state you are testing for.
 
 Whether that stall *matters* is a separate question, and there is no metric for
 it --- confirm a backlog exists by querying for events older than the retention
-window (see Protecting evidence below), or by watching `audit.db` grow on disk. A
-store with nothing to delete shows the same two counters.
+window (see Protecting evidence below), or by watching the `audit_store` schema
+grow in PostgreSQL. A store with nothing to delete shows the same two counters.
 
 If skips and `yuzu_server_audit_rows_deleted_total` are **both** flat, retention
 is not declining --- it is failing or not running at all; check
@@ -472,12 +524,19 @@ since-process-start and make skips smaller than passes on any healthy store.
 The drain resumes on its own within a pass or two of the readings becoming
 stable, paced at the cap, and nothing needs to be deleted by hand.
 
-**Do not delete rows yourself, and do not move `audit.db` aside**, however large
-it has grown. Over-retention is the SAFE direction here and it is deliberate:
+**Do not delete rows yourself** from the live store, however large it has grown.
+Over-retention is the SAFE direction here and it is deliberate:
 retention is a floor, not a ceiling, and the guard errs toward keeping evidence
 longer than configured because this is an evidence store. Rows older than the
 configured window are the guard working, not a fault. If disk is the immediate
 problem, treat it as a capacity incident (see below) rather than an audit one.
+
+This is distinct from the one-time **legacy `audit.db` SQLite file** the Postgres
+migration moves aside after a verified backfill (see
+`docs/user-manual/upgrading.md`): that file is a completed, operator-managed
+backup of the pre-cutover trail, so relocating or archiving it is expected, not
+forbidden. The prohibition above is about the *live* `audit_store` schema in
+PostgreSQL — there is no live SQLite file to move.
 
 Safe for *evidence*, which is not the same as safe for *privacy*: audit rows
 carry `principal`, `source_ip` and `user_agent`. If you are under a retention
@@ -490,6 +549,42 @@ fix --- not hand-deletion.
 - Detection is best-effort; the cap is the half that always applies. It bounds any
   allowed wipe to 25,000 rows per pass unconditionally, whether or not a detector
   fired --- an instantaneous wipe becomes a paced one plus an operator signal.
+- **A pass that begins with NO stored reading declines, once (#2579).** An
+  ABSENT reading is the ordinary fresh-install case and says nothing about the
+  clock; an unusable one is a separate, stronger signal and still reports as
+  corruption. But an absent reading together with rows ALREADY EXPIRED leaves the
+  pass nothing that could rule out a clock which was wrong before the guard ever
+  ran, so it holds back rather than delete. It declines once, warns, and anchors
+  the reading; the next pass has a comparison point and proceeds, paced by the cap
+  as always. With nothing expired there is nothing to hold back and no decline
+  happens, so a fresh install is unaffected. The same one-off decline recurs
+  wherever the reading goes missing again: after a failed anchor persist plus a
+  restart, or after restoring a pre-v3 snapshot. The rule itself is stated once,
+  above; this bullet deliberately does not restate it.
+- **Its signal is separate on purpose.** The decline raises
+  `yuzu_server_audit_retention_bootstrap_declines_total`, NOT
+  `yuzu_server_audit_clock_anomaly_skips_total`. The latter drives an alert
+  meaning "the clock moved in a way that would have wiped audit evidence", and
+  this decline claims nothing of the sort --- only that nothing can yet rule it
+  out. Expect 0 or 1 per database. A value that keeps climbing means the anchor is
+  not surviving, which `YuzuAuditRetentionAnchorNotSurviving` alerts on. Read
+  `yuzu_server_audit_retention_persist_failed_total` beside it, but do not treat
+  that counter as equivalent coverage: when the reading is destroyed OUT OF BAND
+  (a restore from a pre-v3 backup, a rehydrated replica, a disk rollback) the
+  write succeeds every pass and it stays flat at zero.
+- **Before the fix**, such a pass deleted up to the cap with no decline and no
+  clock-anomaly counter, and kept deleting rows stamped before the skew until that
+  cohort was exhausted --- only those lose time, since a row written under the skew
+  is stamped from the same wall clock the cutoff is read from and keeps its full
+  window, so a forward step of `S` on a window of `W` works through the pre-skew
+  rows and stops about `W - S` later. There is no reliable retrospective test for
+  whether a given database was affected, and the obvious checks do not
+  discriminate: a surviving-row floor near the configured cutoff is what a healthy
+  oldest-first reaper looks like; `MIN(timestamp)` is pinned indefinitely by any
+  row stamped `ttl_expires_at = 0`, which deletion never touches; and a cutoff
+  computed on the affected host moves with the skew. Rows deleted then are not
+  recoverable without a backup predating the pass. Upgrade guidance:
+  [upgrading.md § Retention clock guards](upgrading.md#retention-clock-guards-2360-server-audit-store-2361-tar-agent-warehouse).
 - Changing `--audit-retention-days` does not re-date existing rows.
   `ttl_expires_at` is stamped once at INSERT and never rewritten, so a reduction
   expires nothing retroactively and reclaims no disk.
@@ -520,11 +615,12 @@ directly. Do not collapse the first two:
 | Metric | Meaning |
 |---|---|
 | `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete; nothing was deleted, and each declined pass adds exactly 1. Triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was not usable -- ahead of the clock, negative, present but not an integer, or unreadable. Reducing `audit_retention_days` can also cause a decline by design. For triage, see [The retention clock guard](#the-retention-clock-guard) above. |
-| `yuzu_server_audit_cleanup_failed_total` | A pass did not fully do its job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. **One site fires after a SUCCESSFUL delete** (the post-delete backlog probe), so read this as "retention is not fully healthy", not "nothing was deleted". |
-| `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
+| `yuzu_server_audit_cleanup_failed_total` | A pass did not fully do its job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. Every site INSIDE the pass's transaction rolls the whole pass back, INCLUDING the post-delete backlog probe: a probe failure after the delete undoes the delete too. The thread-boundary catch is the one exception — it wraps the post-commit bookkeeping (counters, the summary log line) too, so an exception thrown there counts a pass that DID delete rows as failed. Read a rise as "retention is not fully healthy", not as proof nothing was removed. (On the retired SQLite store the backlog probe was a warning after a committed delete, and this row said so; the substrate change inverted the in-transaction case but not the thread-boundary one.) |
+| `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and the audit store is growing without bound. |
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
+| `yuzu_server_audit_retention_bootstrap_declines_total` | A pass declined because it had NO stored clock reading while rows were already expired (#2579); nothing was deleted. Counted apart from the clock-anomaly series on purpose - it claims only that nothing can yet rule out a wrong clock, not that the clock moved, so it must not fire an alert that says otherwise. Expect 0 or 1 per database; a climbing value means the anchor is not surviving, so read it with `..._retention_persist_failed_total`. |
 | `yuzu_server_audit_retention_persist_failed_total` | The durable clock reading could not be written. Detection will not survive a restart while this is rising. |
-| `yuzu_server_audit_retention_passes_total` | Passes **attempted**, including declined and failed ones. The one signal that catches a reaper which is not running at all - in that state the other five counters here stay flat at 0, which looks exactly like a quiet, healthy store. Alert on it NOT increasing. |
+| `yuzu_server_audit_retention_passes_total` | Passes **attempted**, including declined and failed ones. The one signal that catches a reaper which is not running at all - in that state the other six counters here stay flat at 0, which looks exactly like a quiet, healthy store. Alert on it NOT increasing. |
 | `yuzu_server_audit_retention_last_pass_unixtime` | When the most recent pass with a USABLE clock reading ran; `0` if none has in this process. A pass refused for an implausible `now` counts as a pass but does not stamp this gauge, and a restart resets it to `0` for up to one cleanup interval even though the durable reading survives. |
 
 The first two both leave rows undeleted, so an audit table that never shrinks
@@ -534,32 +630,68 @@ cap itself introduces, which neither of the first two would show.
 
 ### Capacity
 
-**The drain is a fixed 25,000 rows per hourly pass** -- about 600,000 rows/day, or
-a sustained ceiling of roughly **6.9 audit events/second**. Above that, expiry
-outruns deletion and `audit.db` grows without bound;
-`yuzu_server_audit_retention_cap_reached_total` is the signal. Compare that figure
-against your own audit-event rate before deploying at scale. The cap is a
-compile-time constant today, so exceeding it needs an engineering change rather
-than configuration.
+**Two different cadences, not one.** A pass that does NOT hit the per-pass
+25,000-row cap re-arms after the full `cleanup_interval_min` (default 60
+minutes). A pass that DOES hit the cap AND leaves a genuine remainder
+re-arms after `kAuditBacklogRearmSec` (5 seconds) instead — `audit_next_wait_s`
+in `audit_store.hpp` — and keeps doing so every subsequent pass until a pass
+clears the backlog. An earlier revision of this section quoted only the first
+cadence as if it were the hard ceiling; it is not — it is the QUIET
+threshold, the rate below which `cap_reached_total` never moves at all.
 
-The **file-size** ceiling is likely to bind first, though this is an estimate
-rather than a measurement: sustaining 6.9 events/second for a 365-day retention
-window means roughly 219M rows. At an assumed ~200 bytes/row that is on the order
-of 44 GB plus a comparable index footprint in a single SQLite file -- but row size
-varies with `principal`, `action`, `detail`, `target` and `user_agent`, so treat
-the byte figure as an order of magnitude, not a threshold. A deployment
-approaching the drain-rate ceiling has a storage problem before it has a
-retention-pacing problem. Audit rows are emitted per REQUEST rather than per
-device, but not only for operator requests: agent enrolment, fleet-topology pushes
-and rejections, and background schedule execution all write rows too, so fleet
-size does influence the rate. Measure your own `yuzu_server_audit_events_total`
-rate rather than assuming an operator-only workload.
+- **Quiet-operation threshold: ~6.9 audit events/second** (25,000 rows /
+  hourly pass, ~600,000 rows/day). Stay under this and the guard never
+  enters backlog mode — `yuzu_server_audit_retention_cap_reached_total`
+  stays at 0.
+- **The actual drain ceiling is far higher**, because backlog mode
+  self-accelerates: once `cap_reached_total` starts moving, passes run every
+  5 seconds instead of every hour, each still capped at 25,000 rows — up to
+  **~5,000 rows/second** if the DELETE itself stays fast relative to the
+  5-second floor. Measured this session (not a promise for every
+  environment — DELETE cost scales with backlog size, hardware, and
+  concurrent load): a 25,000-row capped delete against a 200,000-row backlog
+  took 44 ms, and against a 5,000,000-row backlog took 570 ms — both
+  comfortably inside the 5-second floor, so the achieved cadence there is
+  genuinely bound by the 5-second sleep, not by DELETE execution time.
+  Exceeding ~6.9 events/second is normal, expected, and self-corrects; the
+  store only grows WITHOUT BOUND if the sustained write rate exceeds the
+  backlog-recovery ceiling itself, which is roughly three orders of
+  magnitude higher than the quiet-operation figure this section used to
+  present as the ceiling.
+- **`yuzu_server_audit_retention_cap_reached_total` rising is not itself a
+  problem** — it means backlog mode engaged, which is the system doing its
+  job faster, not falling behind. Falling behind is `cap_reached_total`
+  rising and STAYING elevated for a sustained period with
+  `yuzu_server_audit_rows_deleted_total` not keeping pace — see
+  `YuzuAuditRetentionCapBinding` (`docs/prometheus/yuzu-alerts.yml`), which
+  alerts on sustained capping, not on a single capped pass.
 
-**The cap also bounds peak WAL.** The old unguarded delete cleared its whole
-backlog in one uncheckpointable transaction: measured at 152 MB of WAL for a
-337k-row backlog, extrapolating to about 2 GB at 4.5M. A capped pass writes about
-51 MB for its 25,000 rows and checkpoints between passes, so disk high-water is
-bounded too, not just lock-hold time.
+The cap (25,000 rows/pass) and the re-arm floor (5 seconds) are both
+compile-time constants today, so raising either needs an engineering change
+rather than configuration.
+
+The **file-size** ceiling is likely to bind before the drain-rate ceiling
+does, though this is an estimate rather than a measurement: sustaining even
+the QUIET threshold of 6.9 events/second for a 365-day retention window
+means roughly 219M rows. At an assumed ~200 bytes/row that is on the order
+of 44 GB plus a comparable index footprint in the `audit_store.audit_events`
+table -- but row size varies with `principal`, `action`, `detail`, `target`
+and `user_agent`, so treat the byte figure as an order of magnitude, not a
+threshold. Audit rows are emitted per REQUEST rather than per device, but
+not only for operator requests: agent enrolment, fleet-topology pushes and
+rejections, and background schedule execution all write rows too, so fleet
+size does influence the rate. Measure your own
+`yuzu_server_audit_events_total` rate rather than assuming an operator-only
+workload.
+
+**The cap also bounds each pass's transaction size.** The old unguarded delete
+cleared its whole backlog in one transaction; capping the pass at 25,000 rows
+keeps each retention transaction bounded, so it commits and lets PostgreSQL
+recycle write-ahead log between passes rather than accumulating unbounded WAL for
+one giant delete. (On the legacy SQLite store this was measured at 152 MB of WAL
+for a 337k-row backlog — extrapolating to about 2 GB at 4.5M — versus about
+51 MB for a capped 25,000-row pass; the bound is the same principle on the
+PostgreSQL substrate.)
 
 
 ## Integration patterns

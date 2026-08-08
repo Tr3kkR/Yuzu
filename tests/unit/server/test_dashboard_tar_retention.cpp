@@ -29,6 +29,7 @@
 #include "management_group_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
+#include "test_mgmt_group_pg_helper.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -114,9 +115,9 @@ TEST_CASE("render_tar_retention_paused: hostile _enabled value is escaped + flag
           "[pg][server][tar][retention-render]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-mg-"}};
     ResponseStore rs{pool};
-    ManagementGroupStore mg{mg_db.path};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
     grant_visibility(mg, {"agent-evil", "agent-ok"});
 
     // agent-evil reports a breakout payload as its process_enabled value; agent-ok
@@ -157,9 +158,9 @@ TEST_CASE("render_tar_retention_paused: a value in the _enabled attribute cannot
     // this, so pin the attribute-quote escape directly.
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-attr-mg-"}};
     ResponseStore rs{pool};
-    ManagementGroupStore mg{mg_db.path};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
     grant_visibility(mg, {"agent-x"});
 
     rs.store(mk_resp("agent-x", 1000,
@@ -179,9 +180,9 @@ TEST_CASE("render_tar_retention_paused: dedup keys on received_at_ms, latest win
           "[pg][server][tar][retention-render]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-dedup-mg-"}};
     ResponseStore rs{pool};
-    ManagementGroupStore mg{mg_db.path};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
     grant_visibility(mg, {"agent-A"});
 
     SECTION("a newer enabled=true response hides an older paused response") {
@@ -212,9 +213,9 @@ TEST_CASE("render_tar_retention_paused: each visible agent appears; out-of-scope
           "[pg][server][tar][retention-render]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-multi-mg-"}};
     ResponseStore rs{pool};
-    ManagementGroupStore mg{mg_db.path};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
     grant_visibility(mg, {"agent-A", "agent-B"}); // agent-C deliberately out of scope
 
     rs.store(mk_resp("agent-A", 10,
@@ -245,9 +246,9 @@ TEST_CASE("render_tar_retention_paused: paused_at==0 sorts oldest with schema ba
           "[pg][server][tar][retention-render]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-558-mg-"}};
     ResponseStore rs{pool};
-    ManagementGroupStore mg{mg_db.path};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
     grant_visibility(mg, {"agent-legacy", "agent-modern"});
 
     // Legacy agent: disabled but no paused_at (0) → oldest. Modern agent: a
@@ -275,9 +276,9 @@ TEST_CASE("render_tar_retention_paused: all-collecting fleet renders the clean e
           "[pg][server][tar][retention-render]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-empty-mg-"}};
     ResponseStore rs{pool};
-    ManagementGroupStore mg{mg_db.path};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
     grant_visibility(mg, {"agent-A"});
 
     rs.store(mk_resp("agent-A", 10, "config|process_enabled|true\nconfig|tcp_enabled|true\n"));
@@ -295,9 +296,9 @@ TEST_CASE("render_tar_retention_paused: renders the typed-confirm Purge button (
           "[pg][server][tar][retention-render]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-purge-mg-"}};
     ResponseStore rs{pool};
-    ManagementGroupStore mg{mg_db.path};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
     grant_visibility(mg, {"agent-A"});
 
     rs.store(mk_resp("agent-A", 10,
@@ -324,9 +325,9 @@ TEST_CASE("render_tar_retention_paused: row actions gate on effective permission
           "[pg][server][tar][retention-render]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-perm-mg-"}};
     ResponseStore rs{pool};
-    ManagementGroupStore mg{mg_db.path};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
     grant_visibility(mg, {"agent-A"});
     rs.store(mk_resp("agent-A", 10, "config|process_enabled|false\n"));
 

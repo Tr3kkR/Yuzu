@@ -1404,8 +1404,26 @@ int ResultSetStore::gc_sweep() {
             .big_step = prev.has_value() && expiring > 0 &&
                         audit_retention::moved_at_least(*prev, now, kGcBigStepSecs) && now > *prev,
             .prev_unusable = prev_unusable,
+            // part 6, decided and recorded rather than inherited: this store does
+            // NOT adopt #2579's missing-anchor trigger. `audit_store` now declines
+            // a first sweep that has no reading while rows are already expired,
+            // because what it loses is the SOC 2 evidence trail and it is
+            // unrecoverable. Here the same shape loses at most one TTL window
+            // (1 h) of scratch result sets, which are regenerable by re-running
+            // the query, so a decline would buy an operator nothing and cost a
+            // warning on every fresh deployment. Revisit if the TTL ever grows or
+            // the data stops being reproducible.
+            .no_anchor = false,
         };
         const auto anomaly = audit_retention::classify(facts);
+        // FOUR chars, matching the four facts that can VARY here: `no_anchor` is
+        // pinned false above, so serialising it would add a constant and change a
+        // DURABLE key format for nothing. That is not free -- this key lives in
+        // `gc_meta` and is compared, not parsed, so a mixed-version fleet writing
+        // 4- and 5-char values alternately would never match its own previous
+        // pass, and dedup would stop suppressing a standing anomaly for the whole
+        // rollout window. If the `no_anchor` pin above is ever revisited, this
+        // string MUST gain a character in the same change (#2579).
         const std::string facts_ser = std::string(facts.has_expired ? "e" : "-") +
                                       (facts.would_wipe ? "w" : "-") +
                                       (facts.big_step ? "s" : "-") +
@@ -1419,9 +1437,20 @@ int ResultSetStore::gc_sweep() {
                 // one must NOT hold the drain forever: the next pass with
                 // equal facts proceeds, paced by the cap, so a legitimately
                 // all-expired table still ages out.
+                // A NAME, not the enum ordinal: enumerators are inserted over time
+                // (#2579 added one mid-enum), so an ordinal silently renames itself
+                // across an upgrade while the operator-facing string is unchanged.
+                const char* anomaly_name = "unknown";
+                switch (anomaly) {
+                case audit_retention::Anomaly::None: anomaly_name = "none"; break;
+                case audit_retention::Anomaly::NoAnchor: anomaly_name = "no-anchor"; break;
+                case audit_retention::Anomaly::Wipe: anomaly_name = "wipe"; break;
+                case audit_retention::Anomaly::Step: anomaly_name = "step"; break;
+                case audit_retention::Anomaly::BadState: anomaly_name = "bad-state"; break;
+                }
                 spdlog::warn("ResultSetStore::gc_sweep: retention clock anomaly ({} facts={}) — "
                              "declining this pass; an identical next pass will drain, capped",
-                             static_cast<int>(anomaly), facts_ser);
+                             anomaly_name, facts_ser);
                 pg::PgResult rec = pg::exec_params(
                     conn,
                     "INSERT INTO result_set_store.gc_meta (key, value) VALUES "

@@ -247,6 +247,18 @@ const std::vector<pg::PgMigration>& migrations() {
                 value TEXT NOT NULL
             );
         )"},
+        // v2 (PR1.1 — ABI4 CC-07 result seam): plugin-reported typed status,
+        // mirroring agent.proto CommandResponse.plugin_result_status. Default
+        // 0 = PLUGIN_RESULT_UNDECLARED, exactly what a legacy row (and any
+        // response whose plugin never reported a typed status) should read as.
+        // Landed as a NEW migration, not folded into v1's CREATE TABLE:
+        // PgMigrationRunner stamps schema_meta(store, version) once per
+        // numbered migration and never replays a modified one, so editing
+        // v1 in place would silently no-op on any database that already
+        // ran this store's migrations (#2691, Sol plan review).
+        {2, R"(
+            ALTER TABLE responses ADD COLUMN plugin_result_status INTEGER NOT NULL DEFAULT 0;
+        )"},
     };
     return kMigrations;
 }
@@ -435,7 +447,8 @@ void ResponseStore::store(const StoredResponse& resp) {
 
 ResponseStore::FinalizeResult ResponseStore::finalize_terminal_status(
     const std::string& instruction_id, const std::string& agent_id, int terminal_status,
-    const std::string& error_detail, const std::string& execution_id) {
+    const std::string& error_detail, const std::string& execution_id,
+    int plugin_result_status) {
     if (!open_)
         return FinalizeResult::Error;
     auto lease = pool_.try_acquire_for(kIngestTimeout);
@@ -454,10 +467,12 @@ ResponseStore::FinalizeResult ResponseStore::finalize_terminal_status(
     const std::string sanitized_error = sanitize_pg_text(error_detail);
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "UPDATE response_store.responses SET status = $1::integer, error_detail = $2 "
-        "WHERE instruction_id = $3 AND agent_id = $4 AND status = 0 AND execution_id = $5",
-        std::vector<std::string>{std::to_string(terminal_status), sanitized_error, instruction_id,
-                                 agent_id, execution_id});
+        "UPDATE response_store.responses SET status = $1::integer, error_detail = $2, "
+        "plugin_result_status = $3::integer "
+        "WHERE instruction_id = $4 AND agent_id = $5 AND status = 0 AND execution_id = $6",
+        std::vector<std::string>{std::to_string(terminal_status), sanitized_error,
+                                 std::to_string(plugin_result_status), instruction_id, agent_id,
+                                 execution_id});
     if (res.status() != PGRES_COMMAND_OK) {
         spdlog::error("ResponseStore::finalize_terminal_status: update failed: {}",
                       PQerrorMessage(lease.get()));
@@ -485,12 +500,13 @@ StoredResponse parse_response_row(PGresult* res, int row) {
     r.plugin = text_col(res, row, 8);
     r.execution_id = text_col(res, row, 9);
     r.received_at_ms = to_i64(PQgetvalue(res, row, 10));
+    r.plugin_result_status = static_cast<int>(to_i64(PQgetvalue(res, row, 11)));
     return r;
 }
 
 constexpr const char* kResponseCols =
     "id, instruction_id, agent_id, timestamp, status, output, error_detail, ttl_expires_at, "
-    "plugin, execution_id, received_at_ms";
+    "plugin, execution_id, received_at_ms, COALESCE(plugin_result_status, 0)";
 
 } // namespace
 

@@ -13,6 +13,7 @@
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "test_mgmt_group_pg_helper.hpp"
 #include "policy_evaluator.hpp"
 #include "policy_store.hpp"
 #include "response_store.hpp"
@@ -57,12 +58,12 @@ std::string out_json2(const std::string& c1, const std::string& v1, const std::s
 }
 
 struct Harness {
-    yuzu::test::TempDbFile poldb{std::string_view("pol-")}, insdb{std::string_view("ins-")},
-        mgdb{std::string_view("mg-")};
+    yuzu::test::TempDbFile poldb{std::string_view("pol-")}, insdb{std::string_view("ins-")};
     PolicyStore ps{poldb.path};
     InstructionStore is{insdb.path};
     ResponseStore rs;
-    ManagementGroupStore mg{mgdb.path};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
 
     int64_t fake_now{1000};
     int dispatch_calls{0};

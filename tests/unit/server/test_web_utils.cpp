@@ -2,7 +2,7 @@
  * test_web_utils.cpp — Unit tests for server web utility functions
  *
  * Covers: base64_decode, html_escape, url_decode, extract_form_value,
- *         extract_plugin
+ *         form_value_supplied, extract_plugin
  */
 
 #include "mcp_jsonrpc.hpp"
@@ -544,6 +544,71 @@ TEST_CASE("extract_form_value: three pairs", "[web_utils][form]") {
 
 TEST_CASE("extract_form_value: value with special chars", "[web_utils][form]") {
     REQUIRE(extract_form_value("q=c%2B%2B+programming", "q") == "c++ programming");
+}
+
+// ── form_value_supplied (QE-4) ──────────────────────────────────────────────
+//
+// This is the CDX-R8-01 refusal's load-bearing predicate: it must tell an
+// OMITTED key apart from a SUPPLIED-but-empty one, which extract_form_value
+// cannot do (it returns "" for both — see its own doc comment). Every case
+// below is chosen to bind the key-boundary guard
+// (`pos == 0 || body[pos - 1] == '&'`) specifically: deleting that guard
+// leaves every one of these still green EXCEPT the two unanchored-match
+// cases, which is exactly the mutation this file exists to catch.
+
+TEST_CASE("form_value_supplied: key absent from empty body", "[web_utils][form]") {
+    CHECK_FALSE(form_value_supplied("", "scope"));
+}
+
+TEST_CASE("form_value_supplied: key absent entirely", "[web_utils][form]") {
+    CHECK_FALSE(form_value_supplied("instruction=run", "scope"));
+}
+
+TEST_CASE("form_value_supplied: key present with a value", "[web_utils][form]") {
+    CHECK(form_value_supplied("scope=dev-A", "scope"));
+}
+
+TEST_CASE("form_value_supplied: key present but empty is still SUPPLIED", "[web_utils][form]") {
+    // The exact distinction extract_form_value erases: "" for a supplied
+    // empty value must still read as supplied.
+    CHECK(form_value_supplied("scope=", "scope"));
+}
+
+TEST_CASE("form_value_supplied: key present but empty, first of several pairs",
+          "[web_utils][form]") {
+    CHECK(form_value_supplied("scope=&instruction=run", "scope"));
+}
+
+TEST_CASE("form_value_supplied: key present but empty, last of several pairs",
+          "[web_utils][form]") {
+    CHECK(form_value_supplied("instruction=run&scope=", "scope"));
+}
+
+TEST_CASE("form_value_supplied: key present but empty, in the middle", "[web_utils][form]") {
+    CHECK(form_value_supplied("a=1&scope=&b=2", "scope"));
+}
+
+TEST_CASE("form_value_supplied: a longer key sharing the same suffix is NOT a match",
+          "[web_utils][form]") {
+    // THE mutation target: without the `pos == 0 || body[pos - 1] == '&'`
+    // key-boundary guard, `body.find("scope=")` matches INSIDE "myscope="
+    // too, so a request naming an unrelated field would be misread as
+    // supplying `scope`. Deleting the guard flips this CHECK_FALSE to true.
+    CHECK_FALSE(form_value_supplied("myscope=dev-A", "scope"));
+}
+
+TEST_CASE("form_value_supplied: a longer key sharing the same suffix, empty value, still NOT a "
+          "match",
+          "[web_utils][form]") {
+    CHECK_FALSE(form_value_supplied("myscope=", "scope"));
+}
+
+TEST_CASE("form_value_supplied: the real key after a decoy suffix key IS a match",
+          "[web_utils][form]") {
+    // Companion to the two decoy cases above: once the real, boundary-anchored
+    // `scope=` key also appears, it must be found even though the unanchored
+    // decoy occurs first in the string.
+    CHECK(form_value_supplied("myscope=x&scope=", "scope"));
 }
 
 // ── extract_plugin ──────────────────────────────────────────────────────────

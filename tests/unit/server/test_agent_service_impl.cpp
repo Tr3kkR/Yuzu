@@ -79,6 +79,15 @@ yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::stri
 
 namespace apb = ::yuzu::agent::v1;
 
+// AuditStore migrated to Postgres (ADR-0006) — GatewayResponseHarness below
+// clones this pre-migrated template instead of opening a SQLite path.
+yuzu::test::PgTestTemplate agent_svc_audit_tpl{"agentaudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("agentaudit template: store failed to migrate");
+}};
+
 /// Minimal harness: real AgentServiceImpl wired against in-memory
 /// ResponseStore. analytics/notification/webhook stores stay null so
 /// the side-effect branches in process_gateway_response short-circuit
@@ -99,7 +108,12 @@ struct GatewayResponseHarness {
     yuzu::server::auth::AuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     ResponseStore responses;
-    AuditStore audit{":memory:"};
+    // AuditStore ported to Postgres (ADR-0006): a template-cloned ephemeral
+    // database + pool. This harness's ResponseStore is now also PG-backed
+    // (ADR-0039), so both share the caller-supplied pool below.
+    std::optional<yuzu::test::PostgresTestDb> audit_db;
+    std::optional<yuzu::server::pg::PgPool> audit_pool;
+    std::unique_ptr<AuditStore> audit;
     AgentServiceImpl svc{registry,
                          bus,
                          /*require_client_identity=*/false,
@@ -110,9 +124,18 @@ struct GatewayResponseHarness {
 
     explicit GatewayResponseHarness(pg::PgPool& pool) : responses(pool) {
         REQUIRE(responses.is_open());
-        REQUIRE(audit.is_open());
+
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
+        audit_db.emplace(agent_svc_audit_tpl);
+        INFO("[GatewayResponseHarness] audit db status (blank == ok): " << audit_db->error());
+        REQUIRE(audit_db->available());
+        audit_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = audit_db->dsn(), .size = 4});
+        audit = std::make_unique<AuditStore>(*audit_pool);
+        REQUIRE(audit->is_open());
         svc.set_response_store(&responses);
-        svc.set_audit_store(&audit);
+        svc.set_audit_store(audit.get());
     }
 
     static apb::CommandResponse make_response(const std::string& command_id,
@@ -1690,9 +1713,10 @@ TEST_CASE("Register: successful token enrollment emits a success audit row (#106
 
     // The success-path audit row is now captured + persisted (#1065). Find it
     // by its stable fields rather than the action constant.
-    auto rows = h.audit.query({});
+    auto rows = h.audit->query({});
+    REQUIRE(rows.has_value());
     bool found = false;
-    for (const auto& ev : rows) {
+    for (const auto& ev : *rows) {
         if (ev.action == "enrollment.token_consumed" && ev.result == "success" &&
             ev.principal == "agent:enroll-ok" && ev.target_type == "enrollment_token") {
             found = true;
@@ -1714,7 +1738,7 @@ TEST_CASE("ProxyRegister: admin-denied agent does not consume the enrollment tok
     GatewayResponseHarness h(pool);
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
-    gateway_svc.set_audit_store(&h.audit);
+    gateway_svc.set_audit_store(h.audit.get());
     auto raw =
         h.auth_mgr.create_enrollment_token("gw-dos-test", /*max_uses=*/1, std::chrono::hours(1));
     h.auth_mgr.add_pending_agent("gw-denied", "evil-host", "linux", "x86_64", "0.0.0-test");
@@ -1757,7 +1781,7 @@ TEST_CASE("ProxyRegister: audit attributes the agent origin IP, not the gateway 
     GatewayResponseHarness h(pool);
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
-    gateway_svc.set_audit_store(&h.audit);
+    gateway_svc.set_audit_store(h.audit.get());
 
     // An INVALID enrollment token drives the denied/failure audit site — where
     // the #1064 attribution records source_ip=agent origin + gateway_ip in
@@ -1773,7 +1797,9 @@ TEST_CASE("ProxyRegister: audit attributes the agent origin IP, not the gateway 
     apb::RegisterResponse resp;
 
     auto failure_row = [&]() -> yuzu::server::AuditEvent {
-        for (const auto& ev : h.audit.query({})) {
+        auto rows = h.audit->query({});
+        REQUIRE(rows.has_value());
+        for (const auto& ev : *rows) {
             if (ev.result == "failure")
                 return ev;
         }
@@ -1822,7 +1848,9 @@ TEST_CASE("ProxyRegister: audit attributes the agent origin IP, not the gateway 
         REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
         CHECK(resp.accepted());
         yuzu::server::AuditEvent success_row;
-        for (const auto& ev : h.audit.query({})) {
+        auto success_rows = h.audit->query({});
+        REQUIRE(success_rows.has_value());
+        for (const auto& ev : *success_rows) {
             if (ev.result == "success")
                 success_row = ev;
         }

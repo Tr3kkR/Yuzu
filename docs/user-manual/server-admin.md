@@ -76,8 +76,9 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
 | `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
 | `--mcp-no-streaming` | off | Disable the MCP **Streamable HTTP** transport (ADR-1005 Decision 15): no `Mcp-Session-Id` minting, `GET`/`DELETE /mcp/v1/` return `405`, and only plain JSON-RPC POST is served. The spec-required `202` status on notification POSTs still applies. Use where a buffering reverse proxy interferes with streaming. Env: `YUZU_MCP_NO_STREAMING`. |
+| `--mcp-enable-streamed-post` | off | Enable **SSE-on-POST** (streamed POST) for `execute_instruction` callers that supply a `progressToken`. **Ships OFF** — turning it on by default is a separate rung. The transport machinery is complete and reviewed, and the four defects that gated that flip are fixed: #2739 (the 120 s response cap is now enforced on a busy execution — after it expires the bridge delivers one final drain of already-latched progress and then settles, bounding the response at the cap plus at most two ~3 s pump ticks plus one mailbox drain), #2740 (a committed-but-undelivered final no longer locks a session out of streaming — admission reclaims the slot and audits it), #2785 (streamed-POST frames now carry the replay-ring event id, so a POST-only client can build a `Last-Event-ID` resume cursor) and #2789 (end-to-end coverage of the per-principal admission reject). Distinct from `--mcp-no-streaming`, which disables the whole transport including the session lifecycle and GET channel. |
 | `--mcp-allowed-origin` | *(none)* | **Repeatable.** An allowed `Origin` header value (`scheme://host:port`, exact match) for `/mcp/v1/` DNS-rebinding defence. An **absent** `Origin` is always allowed (the endpoint requires a credential); an **empty allowlist rejects any *present* Origin** (secure default) — browser-based MCP clients must be listed explicitly, non-browser clients need no configuration. Env: `YUZU_MCP_ALLOWED_ORIGINS`. |
-| `--max-sse-streams` | `128` | **Concurrent held-open SSE responses this server is sized for, across EVERY streaming surface** — `GET /mcp/v1/`, `GET /api/v1/events`, the dashboard executions drawer, and the legacy `/events` stream. The HTTP worker pool is derived *from* this number: cpp-httplib is thread-per-connection, so each held-open response pins one worker for its whole life. That thread burns no CPU, and its resident cost is a fraction of a stack reservation that is virtual and platform-dependent (8 MB on Linux/glibc, 1 MB on Windows, 512 KB for macOS secondary threads). The resident fraction itself is **not yet measured** on our platforms (ADR-0034), so treat the default as a starting point rather than a sizing guarantee until a per-platform baseline exists. Utilisation is `yuzu_http_held_open_responses / yuzu_http_held_open_capacity`. The ceiling is thread-count; see ADR-0034. Env: `YUZU_MAX_SSE_STREAMS`. |
+| `--max-sse-streams` | `128` | **Concurrent held-open SSE responses this server is sized for, across EVERY streaming surface** — `GET /mcp/v1/`, MCP streamed POST, `GET /api/v1/events`, the dashboard executions drawer, and the legacy `/events` stream. The HTTP worker pool is derived *from* this number: cpp-httplib is thread-per-connection, so each held-open response pins one worker for its whole life. That thread burns no CPU, and its resident cost is a fraction of a stack reservation that is virtual and platform-dependent (8 MB on Linux/glibc, 1 MB on Windows, 512 KB for macOS secondary threads). The resident fraction itself is **not yet measured** on our platforms (ADR-0034), so treat the default as a starting point rather than a sizing guarantee until a per-platform baseline exists. Utilisation is `yuzu_http_held_open_responses / yuzu_http_held_open_capacity`. The ceiling is thread-count; see ADR-0034. Env: `YUZU_MAX_SSE_STREAMS`. |
 | `--mcp-max-streams-per-principal` | `4` | Max concurrent MCP SSE streams for one principal. An **anti-monopoly policy, not a capacity limit** — capacity is `--max-sse-streams`. Stops a single agentic token taking the channel; does not ration the fleet. Env: `YUZU_MCP_MAX_STREAMS_PER_PRINCIPAL`. |
 | `--http-worker-threads` | `0` (derive) | Pin the shared HTTP worker pool by hand. `0` derives it from `--max-sse-streams`, which is what you want. If you set it, the stream target is clamped to what your pool can actually carry (the startup log reports the effective figure). Env: `YUZU_HTTP_WORKER_THREADS`. |
 | `--viz-disable` | off | Disable the fleet visualization feature. When set, the REST endpoints (`GET /api/v1/viz/fleet/topology`, `GET /fragments/viz/fleet/topology`, and the per-host drill-down routes) **and** the page shells (`GET /viz/fleet`, `GET /viz/host/<id>`) all return `503`. Tier-before-permission ordering: the kill switch takes effect even for callers who would otherwise fail RBAC. Two pieces of durable evidence that the switch took effect: the startup log line `[VIZ] viz endpoint disabled by configuration`, and a `server.viz_disabled` audit event (`target_type = FleetTopology`) written to the audit store at boot — so an auditor can confirm the disabled state from the audit trail even on a deployment with no viz traffic. Env: `YUZU_VIZ_DISABLE`. |
@@ -192,6 +193,234 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 ---
 
 ## Upgrade Notes
+
+### vNEXT — an authorization-topology floor now applies regardless of RBAC, and engine-principal reads move off `Security:Read` (#2376) (breaking)
+
+This note has **two independent breaking directions** — read both, they
+affect different deployments.
+
+**Direction 1 — RBAC-disabled installs lose three non-admin reads.**
+
+**Who this affects.** Any deployment running with `[rbac] enabled = false`
+(the shipped default) where a non-admin, authenticated session was relying
+on reading one of: the fleet-wide access-review export
+(`/api/v1/access-reviews*`), `GET /api/v1/rbac/roles`, or the
+engine-principal inventory/roles (`/api/v1/engine-principals*` and the
+`list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP
+tools). RBAC-enabled deployments are unaffected by this direction (see
+"Why" below).
+
+**Why.** RBAC ships disabled by default. With RBAC disabled, the legacy
+authorization fallback previously allowed **every** authenticated
+non-engine session to perform **every** `Read` — including reads of the
+authorization topology itself. A plain non-admin `user` on a default,
+just-installed server could read who holds what role and pull the complete
+access-review grant population that exists to be SOC 2 CC6.2 evidence. As
+of this release, `AccessReview:Read`, `UserManagement:Read`, and
+`EnginePrincipal:Read` (see Direction 2) require the `admin` session role
+**regardless of the RBAC toggle**. This is not configurable — there is no
+setting that reopens it. Full design rationale:
+`docs/security-reviews/authz-topology-floor-2026-08-05.md`.
+
+**What does NOT change.** A live RBAC grant is unaffected — under
+RBAC-**enabled** enforcement, a non-admin holding the seeded `Reviewer`
+role still reaches the access-review export exactly as before; a non-admin
+holding `UserManagement:Read`/`EnginePrincipal:Read` (e.g. the built-in
+`Viewer` role holds both) still reaches the other two reads. The floor only
+engages inside the RBAC-off legacy fallback.
+
+**What to do.** If a non-admin session needs one of these three reads,
+enable RBAC and grant the matching role:
+
+```cfg
+[rbac]
+enabled = true
+```
+
+- Access-review export → assign the built-in `Reviewer` role.
+- `/rbac/roles` → the built-in `Viewer` role already holds
+  `UserManagement:Read`, or grant it directly.
+- Engine-principal reads → the built-in `Viewer` role already holds
+  `EnginePrincipal:Read` (see Direction 2), or grant it directly.
+
+See [`rbac.md`](rbac.md) "The authorization topology floor" and "Before
+enabling RBAC in production" before flipping the toggle on a live fleet —
+turning RBAC on also applies management-group-scoped device visibility
+immediately.
+
+**Direction 2 — RBAC-enabled deployments with a custom role granted
+`Security:Read` for engine-principal access must re-grant.**
+
+**Who this affects.** Any RBAC-**enabled** deployment with a **custom**
+role (not `Administrator`/`Viewer`, which are updated automatically — see
+below) that was granted `Security:Read` specifically so its holders could
+reach `GET /api/v1/engine-principals*` or the
+`list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP
+tools.
+
+**Why.** Those reads moved off `Security:Read` onto a new, narrower
+`EnginePrincipal:Read` securable (the same move #2324 made cutting
+`AccessReview` away from `AuditLog:*`) — `Security:Read` also gates
+unrelated operational reads (quarantine visibility, CA issued-certs,
+`/ca/root-csr`, KEK status) that stay on `Security:Read` unchanged and
+un-floored.
+
+**What changes automatically.** No schema migration is required — the new
+`EnginePrincipal` securable and its `Administrator` (full CRUD) and
+`Viewer` (`Read`) grants are seeded idempotently on every server boot
+(`RbacStore::seed_defaults()`'s `INSERT OR IGNORE` loops), so the two
+built-in roles pick it up on the next boot automatically, with no operator
+action, matching exactly the access they held via `Security:Read` before
+this change.
+
+**What to do.** A custom role does **not** get this automatic re-seed.
+Check whether any custom role was granted `Security:Read` for this
+purpose, and if so, grant it `EnginePrincipal:Read` too — via the Settings
+UI or `RbacStore::set_permission()` directly. `Security:Read` alone no
+longer reaches `/api/v1/engine-principals*` or its MCP twins after this
+upgrade.
+
+**Direction 3 — API consumers of `GET /api/v1/discover/permissions` (and the MCP
+`discover_permissions` twin) lose the role grid unless they hold
+`UserManagement:Read`.**
+
+**Who this affects.** Anything reading the discovery catalogue's
+`roles[].permissions[]` under a principal that holds `Infrastructure:Read` but
+not `UserManagement:Read`.
+
+**What changes.** The route still returns `200` and the full
+`securable_types`/`operations` taxonomy — that half is unchanged and still needs
+only `Infrastructure:Read`. The `roles` key is replaced by `"roles_omitted": true`
+plus a `roles_omitted_reason`. A consumer that iterates `roles` must handle its
+absence; one that checks `roles_omitted` gets an unambiguous answer.
+
+**Why.** That grid is authorization topology, and strictly more of it than
+`GET /api/v1/rbac/roles` discloses — which this same change floors. Leaving it on
+the unfloored `Infrastructure:Read`, which every authenticated session holds on an
+RBAC-off install, left the floor reachable around. Flooring `Infrastructure:Read`
+itself was rejected: it gates ordinary operational reads and would have repeated
+the too-coarse mistake this change avoided with `Security:Read`.
+
+**What to do.** Grant the consuming principal `UserManagement:Read` if it
+legitimately needs the grid, or update it to read `roles_omitted`. Do not treat a
+missing `roles` key as "no roles exist" — that is precisely why the omission is
+declared.
+
+**Check your automation, not just your operators — this is the failure that
+hides.** Neither breaking direction produces a startup warning or a migration
+prompt. Both surface only as a `403` at some later moment, and that moment may
+be inside a script rather than in front of a person. Audit anything
+non-interactive that reads the three floored surfaces
+(`/api/v1/access-reviews/export`, `/api/v1/rbac/roles`,
+`/api/v1/engine-principals*` and their MCP twins) under a **non-admin** token:
+
+- A **compliance evidence collector** is the dangerous case. If it pulls the
+  access-review export on a schedule and treats a non-`2xx` as "no grants to
+  report" rather than as a hard failure, it will keep succeeding while
+  silently collecting nothing — potentially for a whole audit period. Confirm
+  yours fails loudly on `403`, and re-check the first collection after upgrade.
+- A **monitoring or inventory job** on a non-admin token will start logging
+  `403`s rather than breaking visibly.
+
+Either enable RBAC and grant the job's principal the appropriate role
+(`Reviewer` for access reviews, `UserManagement:Read` for `/rbac/roles`,
+`EnginePrincipal:Read` for engine-principal reads), or move the job to an admin credential.
+
+**One caveat on revoking a built-in role's grant.** Because the seed loops
+above run on *every* boot, a grant you deliberately remove from a built-in
+role — for example revoking `Viewer`'s `EnginePrincipal:Read` — is re-inserted
+on the next restart, with no audit line distinguishing it from an
+operator-set grant. This is long-standing behaviour for every seeded
+securable, not new here, but it is worth knowing before you narrow a built-in
+role: express the narrowing as a **custom role** or an explicit `deny` row
+instead, both of which survive a restart.
+
+### vNEXT — approval tickets outstanding at the upgrade must be re-requested (#2442) (breaking)
+
+**Who this affects.** Any deployment holding an **MCP** approval that was granted but not yet
+redeemed at the moment of upgrade — that is, one an agentic worker will present back to an MCP tool
+call. This is independent of the `mcp.` prefix entry below: it does not matter whether you author any
+`mcp.`-prefixed definitions, and a deployment running only Yuzu-supplied content **is** affected if
+it has an MCP approval in flight.
+
+**Scheduled approvals are not affected.** A schedule redeems its own approval by matching the
+schedule id, not through the MCP recall, so the origin check never sees it and a scheduled run
+outstanding across the upgrade still fires. If nothing is awaiting an MCP recall when you upgrade,
+there is nothing to do.
+
+**Rolling BACK across this release re-opens the check, and rolling forward does not close it
+again.** The back-fill runs once, as a schema migration. An older server started against an
+already-migrated database does not re-run it and does not refuse to start; approvals it mints while
+you are rolled back record no minting surface, which is the value that stays redeemable. Rolling
+forward will not revisit them, because the migration has already run. Treat a roll-back as a window
+in which the cross-surface check is not in force for newly minted approvals, and let those
+approvals expire rather than relying on them being re-checked. Expiry bounds the window, but note it
+runs from two different points: a pending approval expires 7 days after submission, and an approved
+but unredeemed one 7 days after its review — so an approval minted during a roll-back can remain
+redeemable for up to around a fortnight from the mint, not one week.
+
+**What happens.** This release records which surface minted each approval, and rows that predate the
+column carry no surface at all. Rather than assume one they may not have come from, the upgrade
+labels them with a sentinel that fails closed — so an approval granted before the upgrade is refused
+at recall. It is reported as `approval already used (one-time ticket)` even though it was never
+consumed: that message is deliberately identical for every refusal so the recall cannot be used to
+probe which surface minted a ticket, and that is why this note exists rather than the error
+explaining itself.
+
+**Recover** by calling the tool again without `approval_id` to mint a fresh ticket and have it
+re-approved. Nothing is lost but the review. The affected population is only what is outstanding at
+upgrade time, it does not grow afterwards, and approvals expire after 7 days regardless. On the
+server side the refusal is distinguishable: the audit row records `refused: foreign_origin`, not the
+uniform client message.
+
+### vNEXT — the `mcp.` instruction-definition id prefix is reserved (#2442) (breaking)
+
+**Who this affects.** Anyone whose instruction definitions include an id beginning `mcp.`. No
+shipped or bundled content uses that prefix, so a deployment running only Yuzu-supplied content
+needs no action *for this item* — but the outstanding-approval entry above applies regardless of
+what content you run.
+
+**Why.** `mcp.<tool>` names an MCP approval ticket. The MCP recall matches a ticket on its
+definition id and scope expression and does not bind the submitter, so a definition authored
+under that prefix could line up with an MCP tool's canonical arguments — a ticket raised on one
+surface being redeemable on another. Consuming it still required the schema check, the tier
+gate, per-handler RBAC and a human approval, so this closes a namespace confusion rather than an
+open escalation.
+
+**What changes.** Creating a definition whose id starts `mcp.` is refused with a 400 on every
+authoring route that accepts an explicit id — `POST /api/instructions`, `POST
+/api/instructions/yaml`, and `POST /api/instructions/import` — and such a definition is skipped
+(counted in `defs_errored`) at boot auto-import. The dashboard's YAML validator refuses it too,
+so Validate and Save agree on the create path. Product-pack install is unaffected because it
+never carries a declared id through at all: the store assigns one, so a pack's own id, reserved
+or not, has never been honoured.
+
+**What does NOT change.** The store applies the rule at creation only, so a definition that
+already carries such an id keeps executing and can still be saved through `PUT
+/api/instructions/{id}` — an update cannot originate an id, so blocking it there would strand
+content rather than protect anything. One exception, and it is the reason to rename rather than
+live with it: the dashboard's YAML editor runs the same validation on every save, create or
+update, so an existing `mcp.`-prefixed definition cannot be edited there if its document
+declares `metadata.id` (one that omits it still saves, since the validator only checks a
+declared id).
+
+**What to do.** Before upgrading, check for affected content. Query the instruction database
+directly rather than the REST list route: `GET /api/v1/definitions` caps its result at 100
+definitions, and the shipped content alone exceeds that, so an API-based check can report a
+false all-clear. `GLOB` rather than `LIKE` because SQLite's `LIKE` is case-insensitive and
+the reservation is not — `MCP.foo` is a different id everywhere else in the system and is
+not reserved.
+
+```bash
+sqlite3 /var/lib/yuzu/instructions.db \
+  "SELECT id FROM instruction_definitions WHERE id GLOB 'mcp.*';"
+```
+
+Any id listed keeps executing after the upgrade and can still be edited through
+`PUT /api/instructions/{id}`, but re-importing an export of it will fail, and so will saving it
+from the dashboard's YAML editor (that path validates the id on every save, not only on
+create). Rename those definitions before upgrading — create a replacement under a different id
+and delete the original.
 
 ### vNEXT — behind a reverse proxy, declare your external origin or CSRF-gated dashboard actions keep failing (#2537)
 
@@ -321,6 +550,8 @@ device filter that matched nothing produces. Each of these is now `400`.
 | `POST /api/instructions/{id}/execute` | body is not a JSON object | treated as "no target" → broadcast | `400` |
 | `POST /api/command` | `scope` is `"__all__"` | `400 invalid scope` | dispatches to **all connected agents** |
 | `POST /api/v1/result-sets/from-*` | body is not a JSON object | `500` (uncaught type error) | `400` |
+| `POST /api/dashboard/execute` | form field `scope=` supplied but EMPTY | broadcast to all | refused, nothing dispatched |
+| `POST /api/dashboard/tar-execute` | query param `scope=` supplied but EMPTY | broadcast to all | refused, nothing dispatched |
 
 The two remediation rows matter for the same reason as the rest: on that route an **absent**
 `agent_ids` means "every non-compliant agent in this policy", so a supplied selector that named
@@ -355,8 +586,16 @@ change is that the dashboard's "All agents" button now sends `__all__` explicitl
 that way look different from before. A saved query selecting historical broadcasts by
 `scope_expression = ''` still matches everything except dashboard-initiated ones.
 
-**Dashboard users need do nothing** — the Instructions execute dialog's "All agents" option now
-sends `__all__` instead of an empty string.
+**Dashboard users driving the UI in a browser need do nothing** — the Instructions execute
+dialog's "All agents" option sends `__all__` instead of an empty string.
+
+**But automation that POSTs the dashboard forms directly does need attention.** As of the
+Wave-1 foundations change, `/api/dashboard/execute` and `/api/dashboard/tar-execute`
+distinguish an OMITTED `scope` from one SUPPLIED as empty (`scope=`): omitted still means the
+whole fleet, but supplied-but-empty is now refused and dispatches to nobody, where it
+previously broadcast. If a script builds the form body unconditionally and leaves `scope`
+blank when no device is selected, it will stop dispatching — which is the intended outcome,
+but a silent one. Send `scope=__all__` to keep the fleet-wide behaviour deliberately.
 
 **Detecting affected clients — and the limit of what is possible.** There is no reliable way to
 find them *before* upgrading. The audit trail records the OUTCOME of a dispatch, not the request
@@ -377,6 +616,60 @@ After upgrading, refusals are counted by
 `YuzuDispatchTargetRejected` alert fires when the 15-minute increase exceeds 3 — deliberately not
 on every single refusal, because a rule that pages on one malformed request gets silenced. Use the
 audit rows, not the alert, to find individual offenders.
+
+### vNEXT — `POST /mcp/v1/` can now hold its response open as an SSE stream (2f PR 3b)
+
+A `tools/call` for `execute_instruction` that carries `_meta.progressToken` **and**
+an SSE-capable `Accept` now receives its progress on the POST response itself
+rather than on the session's GET stream. Opt-in and per request: a call that sends
+neither, or only one of the two, behaves exactly as before and is byte-identical on
+the wire. Plain POST clients (mcp-remote, Claude Desktop) are unaffected.
+
+Three operator-visible consequences:
+
+- **Sizing.** A streamed POST holds an HTTP worker for up to its response cap
+  (120 s), enforced on a busy execution too (#2739): after the cap expires the
+  bridge delivers one final drain of already-latched progress and then settles,
+  so the bound is the cap plus at most two ~3 s pump ticks plus one bounded
+  mailbox drain and its socket-write time — not the execution's duration. It
+  leases from the same held-open budget as the GET channel, so total
+  concurrency is unchanged — but `TimeoutStopSec` and any container termination
+  grace period should be sized above **120 s** with that margin in mind; 30 s —
+  which suited GET alone — is the figure to move away from. Under-sizing
+  SIGKILLs mid-drain and silently drops in-flight streams on deploy.
+- **Per-principal ceiling.** `--mcp-max-streams-per-principal` governs the GET
+  channel. The streamed-POST allowance is a separate, fixed 4 per session (twinned
+  to the replay ring's pin slots), so the real per-principal held-open ceiling is
+  `--mcp-max-streams-per-principal + 4`. Lowering the flag to contain a noisy
+  principal does not reduce its streamed-POST concurrency.
+- **Reverse proxies.** The response sets `X-Accel-Buffering: no`, which only nginx
+  honours. Envoy, HAProxy, ALB and Cloudflare need their own no-buffering opt-out,
+  or the stream is buffered and dead clients are not detected.
+
+`--mcp-no-streaming` remains the kill switch and now also degrades the streamed
+POST arm back to plain JSON, not just GET/DELETE.
+
+### vNEXT — MCP stream revalidation rides the tick, and the pin-drift alert moves to a new counter
+
+Two operator-visible changes to held-open MCP `GET` SSE streams. Neither changes a
+revocation bound: the documented one-tick single-server figure still holds and is now
+pinned by tests.
+
+**Credential re-checks are once per tick, and busy streams stop sending heartbeat
+filler.** A stream delivering frames continuously previously re-validated its
+credential and slid its session TTL on *every frame*; both now run once per ~3 s tick,
+and a pass that delivered real frames skips the redundant heartbeat. If anything on
+your side counts `event: heartbeat` frames as a liveness signal, key on *any*
+delivered frame instead.
+
+**The admission-drift reading moved counters.** `yuzu_mcp_stream_final_unpinned_total`
+used to carry the "replay-ring pin accounting has drifted" reading; that reading now
+belongs to the new `yuzu_mcp_stream_pin_displaced_total` (the server now displaces the
+oldest pinned terminal instead of committing the newest unprotected, which is strictly
+less bad). If you alert on `final_unpinned_total > 0`, keep that rule and add the same
+rule for `pin_displaced_total` — reference rules for both ship in
+`docs/prometheus/yuzu-alerts.yml`, and the response procedure is
+`docs/ops-runbooks/mcp-stream-pin-displacement.md` (diagnostic only — no restart).
 
 ### vNEXT — engine-principal streams: liveness re-checks are cached, and the outage grace window is measured differently (#2367)
 
@@ -596,7 +889,7 @@ Track 2f PR 2, plus ADR-0034. Three things change for an operator:
 
 1. **`GET /mcp/v1/` no longer returns `405`.** It is the MCP session's server→client SSE channel (heartbeats, `Last-Event-ID` resume). Nothing publishes onto it yet — `notifications/progress` arrives in the next rung — so a client that never issues a GET is unaffected. Behind a reverse proxy, note these are held-open responses: the server sets `X-Accel-Buffering: no` (nginx honours it); Envoy, HAProxy, ALB and Cloudflare need their own no-buffering opt-out.
 
-2. **Every held-open SSE response now leases from one shared budget** — MCP's GET channel, `GET /api/v1/events`, the dashboard executions drawer, and the legacy `/events` stream. cpp-httplib is thread-per-connection, so each of those pins a worker for its entire life; previously only MCP was counted, which meant the plain-REST reserve was arithmetic rather than a guarantee. A cap hit returns `429` with `Retry-After`; a live stream is never evicted. **This closes a starvation path that existed before MCP streaming shipped at all**: enough dashboard tabs could exhaust the pool and stall plain REST.
+2. **Every held-open SSE response now leases from one shared budget** — MCP's GET channel, MCP streamed POST, `GET /api/v1/events`, the dashboard executions drawer, and the legacy `/events` stream. cpp-httplib is thread-per-connection, so each of those pins a worker for its entire life; previously only MCP was counted, which meant the plain-REST reserve was arithmetic rather than a guarantee. A cap hit returns `429` with `Retry-After`; a live stream is never evicted. **This closes a starvation path that existed before MCP streaming shipped at all**: enough dashboard tabs could exhaust the pool and stall plain REST.
 
 3. **The worker pool is derived from `--max-sse-streams` (default 128), not the other way round.** The old default sized itself from httplib's accidental 32-thread pool and yielded 12 streams — on a platform designed for hundreds of agentic clients. A blocked thread burns no CPU; its resident cost is a fraction of a virtual, platform-dependent stack reservation and has not yet been measured (ADR-0034), so the pool is sized for the workload you declare rather than off a per-thread constant. Watch `yuzu_http_held_open_responses / yuzu_http_held_open_capacity`; the ceiling is thread-count, and the durable fix (moving long-lived connections off the thread-per-connection server) is recorded in ADR-0034.
 
@@ -835,7 +1128,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | OTA Updates | `/fragments/settings/updates` | Upload agent binaries, view available versions, promote a version to production. |
 | Tag Compliance | `/fragments/settings/tag-compliance` | View compliance summary across the fleet based on tag-driven policies. |
 | RBAC Management | *(planned -- no fragment yet)* | Enable or disable RBAC enforcement, create and manage roles. RBAC is enforced via `RbacStore` and the `/api/v1/rbac/*` REST API, but has no Settings page fragment yet. |
-| OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with "Test Connection" button. Changes persisted to runtime config and survive restart. |
+| OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with "Test Connection" button. Changes are applied to the running server AND persisted to runtime config. **This is the only path that applies an OIDC change to the RUNNING server** (the swap is process-local - a restart reverts to the command-line/environment value, so a durable rotation must update that too; see [security hardening](security-hardening.md#oidc-hardening)) - a `PUT /api/config/oidc_*` persists the value but never reaches the live provider, on this boot or a later one (see [REST API -> Runtime Configuration](rest-api.md#when-a-change-takes-effect)). |
 | Internal CA | `/fragments/settings/ca` | View the built-in Certificate Authority (algorithm, SHA-256 fingerprint, expiry), download the CA certificate + CRL, browse the issued-certificate inventory, and revoke a certificate. `Security:Read` to view, `Security:Delete` to revoke. |
 | DEX Alerts | `/fragments/settings/dex-alerts` | Route individual DEX signal types to operator notifications and the `dex.signal` webhook, tune the fleet blast-radius thresholds (min devices / window / cooldown), and set the per-cohort Prometheus gauge **export tag key**. Admin-only; changes apply live (no restart) and are audit-logged (`settings.dex_alerts.routing`, `settings.dex_alerts.blast`, `settings.dex_alerts.cohort_export`). See the user-manual *DEX → Routing signals to alerts* and *DEX → Fleet performance rollup* sections. |
 | Access Reviews | `/fragments/settings/access-reviews` | Periodic access review (SOC 2 CC6.2) convenience panel — pull/download the cross-principal grant export (JSON/CSV), open a new attestation campaign, and record per-grant `attested`/`flagged_revoke` decisions against an open campaign (`/fragments/settings/access-reviews/campaign?id=...`). A view over the same `AuditLog:Read`/`AuditLog:Attest`-gated `/api/v1/access-reviews*` REST API and its MCP twins — not a separate data path. See `docs/auth-architecture.md` "Periodic access reviews". |
@@ -2073,7 +2366,7 @@ note below.
 > single declined pass more likely right after the change. It is self-healing --
 > see [The retention clock guard](audit-log.md#the-retention-clock-guard).
 
-> **Note:** All three retention values can also be set via environment variables (`YUZU_RESPONSE_RETENTION_DAYS`, `YUZU_AUDIT_RETENTION_DAYS`, `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`) and can be updated at runtime via `PUT /api/v1/config/<key>` with an `Infrastructure:Write` permission. Runtime updates are persisted via `RuntimeConfigStore` and reflected immediately in the `/api/v1/config` GET response — **but the running store captures its retention value at construction time and does not re-read it, so TTL computation on new inserts continues to use the startup value until the next server restart.** This "takes effect on restart" limitation is shared across all three retention keys and is tracked as issue #483.
+> **Note:** All three retention values can also be set via environment variables (`YUZU_RESPONSE_RETENTION_DAYS`, `YUZU_AUDIT_RETENTION_DAYS`, `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`) and can be updated at runtime via `PUT /api/config/<key>` with an `Infrastructure:Write` permission. Runtime updates are persisted via `RuntimeConfigStore` and reflected immediately in the `/api/config` GET response — **but the running store captures its retention value at construction time and does not re-read it, so TTL computation on new inserts continues to use the startup value until the next server restart.** This "takes effect on restart" limitation is shared across all three retention keys and is tracked as issue #483.
 
 ---
 
@@ -2459,6 +2752,6 @@ The following server administration features are on the roadmap but not yet impl
 
 | Feature | Phase | Description |
 |---|---|---|
-| Runtime Configuration API | Phase 7 (7.3) | Change retention TTLs, connection limits, and other server parameters via REST API without restarting the server. |
+| Runtime Configuration API | Phase 7 (7.3) | Change retention TTLs, connection limits, and other server parameters via REST API. **Not all keys apply live** - retention TTLs are stored and reported immediately but enforced only after a restart, and OIDC keys apply only via Settings -> OIDC. See [REST API -> When a change takes effect](rest-api.md#when-a-change-takes-effect). |
 | AD/Entra Integration | Phase 7 (7.5) | Sync users and groups from Active Directory (LDAP) or Microsoft Entra ID. Auto-create Yuzu principals from directory membership. |
 | System Health Monitoring | Phase 7 (7.2) | Server-side health dashboard showing memory, CPU, disk, database size, connected agent count, and gRPC stream health. Prometheus metrics for server internals. |

@@ -28,6 +28,7 @@
 #include "auth_routes.hpp"           // real-AuthRoutes integration test (C1)
 #include <yuzu/server/server.hpp>     // Config (real-AuthRoutes integration test)
 #include "audit_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "ca_store.hpp"
 #include "discover_routes.hpp"     // A2 discovery builders (Issue 17.1)
 #include "event_bus.hpp"
@@ -69,6 +70,18 @@
 
 using namespace yuzu::server::mcp;
 using namespace yuzu::server;
+
+namespace {
+// AuditStore migrated to Postgres (ADR-0006) — "MCP AuditStore: query with
+// mcp_tool field" below clones this pre-migrated template instead of opening
+// a SQLite path.
+yuzu::test::PgTestTemplate mcp_audit_tpl{"mcpaudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("mcpaudit template: store failed to migrate");
+}};
+} // namespace
 
 // ── JSON-RPC 2.0 parsing ─────────────────────────────────────────────────
 
@@ -545,8 +558,10 @@ TEST_CASE("MCP InstructionStore: query definitions", "[mcp][instruction]") {
 
 // ── Audit store integration (used by query_audit_log) ─────────────────────
 
-TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
-    AuditStore store(":memory:");
+TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
     REQUIRE(store.is_open());
 
     AuditEvent evt;
@@ -561,8 +576,9 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
     AuditQuery aq;
     aq.principal = "mcp-admin";
     auto events = store.query(aq);
-    REQUIRE(events.size() >= 1);
-    CHECK(events[0].action == "mcp.list_agents");
+    REQUIRE(events.has_value());
+    REQUIRE(events->size() >= 1);
+    CHECK((*events)[0].action == "mcp.list_agents");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -591,6 +607,9 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
 
 #include <httplib.h>
 #include <libpq-fe.h> // PGRES_COMMAND_OK
+// C10 CH-6: proves the streamed arm adopts the engine quota slot at its install
+// site. Transitively pulls principal_quota.hpp (PrincipalQuota / QuotaSide).
+#include "principal_quota_gate.hpp"
 
 #include <memory>
 #include <stdexcept>
@@ -632,6 +651,19 @@ struct McpTestServer {
     /// test can assert round-trip identity with the response — mirrors
     /// `ExecHarness::last_dispatch_execution_id` in test_workflow_routes.cpp.
     std::string last_dispatch_execution_id;
+    /// CDX-R5-02: the VisibleSet the handler derived and threaded into
+    /// dispatch_fn (the confinement the production dispatch lambda applies).
+    yuzu::server::authz::VisibleSet last_dispatch_exec_visible;
+
+    /// CDX-R5-02: the per-caller exec-visible derivation for MCP dispatch
+    /// confinement. CDX-R6-02: an UNWIRED callback now fails CLOSED in the
+    /// handlers (a present-empty visible set denies every target), so the
+    /// harness DEFAULT wires a callback that explicitly returns nullopt
+    /// (unfiltered) -- that keeps every existing MCP test on the pre-#1788
+    /// full-fleet path. A confinement test overrides this with a specific set;
+    /// a fail-closed test sets it to `{}` (genuinely unwired).
+    yuzu::server::mcp::McpServer::ExecVisibleFn exec_visible_fn_for_test{
+        [](const auth::Session&) { return yuzu::server::authz::VisibleSet{}; }};
 
     /// governance R1 (QE SHOULD-1 + happy-LOW-2): allow a test to wire a
     /// real ExecutionTracker so the create_execution / set_agents_targeted
@@ -645,6 +677,11 @@ struct McpTestServer {
     /// the new execution_id exact-correlation collect path. Default nullptr
     /// keeps existing tests on the "Response store unavailable" path.
     yuzu::server::ResponseStore* response_store_for_test{nullptr};
+
+    /// Optionally wire a real AuditStore so query_audit_log can be exercised
+    /// end-to-end through the actual MCP dispatch path. Default nullptr keeps
+    /// every pre-existing test on the "Audit store unavailable" path.
+    yuzu::server::AuditStore* audit_store_for_test{nullptr};
 
     /// PR4 B-2: optionally wire a CaStore + CRL-republish stub so the CA MCP
     /// tools (list_issued_certs / revoke_certificate) can be exercised. Default
@@ -751,6 +788,12 @@ struct McpTestServer {
     /// present Origin). Default nullptr/{} = streaming OFF ⇒ pre-2f behaviour.
     yuzu::server::mcp::McpSessionRegistry* session_registry_for_test{nullptr};
     bool streaming_disabled_{false};
+    /// Streamed POST ships OFF in production - turning it on is a separate rung,
+    /// not a defect gate (see Config::mcp_streamed_post_enable). The harness turns it ON so the streamed
+    /// tests exercise the streamed path - without this every one of them would
+    /// silently take the plain path and pass while proving nothing. A test that
+    /// wants the shipped default sets this false explicitly.
+    bool streamed_post_enabled_{true};
     std::vector<std::string> allowed_origins_for_test{};
 
     /// 2f PR 2 (GET SSE channel): the shared held-open-stream budget and the
@@ -759,6 +802,10 @@ struct McpTestServer {
     yuzu::server::detail::StreamBudget* stream_budget_for_test{nullptr};
     yuzu::server::mcp::StreamRevalidateFn revalidate_fn_for_test{};
     yuzu::MetricsRegistry* metrics_for_test{nullptr};
+    /// 2f PR 3b: explicit-principal sink for mcp.stream.close. Empty = the
+    /// streamed releaser falls back to the generic audit_fn, which is what the
+    /// tests that only care THAT a close row was written rely on.
+    yuzu::server::mcp::StreamPrincipalAuditFn principal_audit_fn_for_test{};
 
     /// Auth identity the mock auth_fn returns. Read at CALL time (not install
     /// time) so a test can change the principal between two calls — used to drive
@@ -930,7 +977,7 @@ private:
             /*instruction_store=*/instruction_store_for_test,
             /*execution_tracker=*/execution_tracker_for_test,
             /*response_store=*/response_store_for_test,
-            /*audit_store=*/nullptr,
+            /*audit_store=*/audit_store_for_test,
             /*tag_store=*/tag_store_for_test,
             /*inventory_store=*/nullptr,
             /*policy_store=*/nullptr,
@@ -962,8 +1009,22 @@ private:
             /*scoped_perm_fn=*/scoped_perm_fn_for_test,
             /*sessions=*/session_registry_for_test,
             /*mcp_streaming_disabled=*/&streaming_disabled_,
+            /*mcp_streamed_post_enabled=*/&streamed_post_enabled_,
             /*allowed_origins=*/allowed_origins_for_test,
-            /*software_licensing_store=*/software_licensing_store_for_test);
+            /*software_licensing_store=*/software_licensing_store_for_test,
+            // Spelled out only because the streamed-POST params after them are
+            // what this call actually needs; nullptr is the pre-existing default.
+            /*engine_principal_store=*/nullptr,
+            /*access_review_store=*/nullptr,
+            /*auth_db=*/nullptr,
+            /*directory_sync=*/nullptr,
+            /*exec_visible_fn=*/exec_visible_fn_for_test,
+            // 2f PR 3b: the POST handler leases from the SAME budget as GET.
+            // Default nullptr keeps every pre-3b test on the plain path - a test
+            // that does not opt in cannot accidentally start streaming.
+            /*stream_budget=*/stream_budget_for_test,
+            /*revalidate_fn=*/revalidate_fn_for_test,
+            /*principal_audit_fn=*/principal_audit_fn_for_test);
     }
 };
 
@@ -1388,7 +1449,7 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
 // array is caught even when the rbac_store suite is filtered out.
 TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mcp][2g]") {
     CHECK(rbac_ops_for_test().size() == 7);
-    CHECK(rbac_securables_for_test().size() == 22);
+    CHECK(rbac_securables_for_test().size() == 23);
 }
 
 TEST_CASE("MCP 2383: three-way dispatch classifier — knownness decides first", "[mcp][2g]") {
@@ -1784,7 +1845,12 @@ TEST_CASE("MCP Integration: discover_permissions wired vs unwired", "[mcp][integ
     ts.rbac_store_for_test = &rbac;
     ts.start("readonly");
 
-    const auto expected = nlohmann::json::parse(yuzu::server::build_permissions_catalog(rbac).json);
+    // include_roles=true: the harness's perm_fn allows every permission unless a
+    // test installs perm_override_for_test, so this caller holds UserManagement:Read
+    // and gets the full grid. The DENIED case is the next test — #2376 split the
+    // catalogue so the role grid needs UserManagement:Read while the taxonomy does not.
+    const auto expected =
+        nlohmann::json::parse(yuzu::server::build_permissions_catalog(rbac, true).json);
 
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":22,"params":{"name":"discover_permissions"}})");
@@ -1795,6 +1861,49 @@ TEST_CASE("MCP Integration: discover_permissions wired vs unwired", "[mcp][integ
         nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
     CHECK(got == expected);
     CHECK_FALSE(got["securable_types"].empty());
+    CHECK(got.contains("roles")); // the grid IS present for a UserManagement:Read holder
+
+    // #2376 — the floor bypass this split closes. discover_permissions is gated
+    // Infrastructure:Read, which is NOT floored and which every authenticated
+    // session holds on an RBAC-off install via the legacy Read-allow. Before the
+    // split it therefore served the complete role -> permission grid to a caller
+    // the floor had just refused at /rbac/roles: a strictly larger disclosure than
+    // the floored route, through an alternate transport. Found by the adversarial
+    // panel AFTER a 14-agent governance run passed the change.
+    //
+    // Deny ONLY UserManagement:Read: the tool itself must still succeed on its own
+    // Infrastructure:Read gate, and the taxonomy must still be served — the split
+    // exists so A2 discovery of the permission MODEL survives.
+    {
+        yuzu::server::RbacStore rbac_denied(":memory:");
+        REQUIRE(rbac_denied.is_open());
+        McpTestServer ts_denied;
+        ts_denied.rbac_store_for_test = &rbac_denied;
+        ts_denied.perm_override_for_test = [](const std::string& securable,
+                                              const std::string& operation) {
+            return !(securable == "UserManagement" && operation == "Read");
+        };
+        ts_denied.start("readonly");
+
+        auto res_d = ts_denied.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":24,"params":{"name":"discover_permissions"}})");
+        REQUIRE(res_d);
+        CHECK(res_d->status == 200);
+        auto body_d = nlohmann::json::parse(res_d->body);
+        REQUIRE(body_d.contains("result")); // the TOOL still succeeds
+        auto got_d =
+            nlohmann::json::parse(body_d["result"]["content"][0]["text"].get<std::string>());
+
+        // The grid is gone — this is the assertion that closes the bypass.
+        CHECK_FALSE(got_d.contains("roles"));
+        // ...and its absence is stated, not silent: an agentic worker must not read
+        // this as "the fleet has no RBAC roles" (the absent-vs-empty trap).
+        CHECK(got_d.value("roles_omitted", false));
+        CHECK_FALSE(got_d.value("roles_omitted_reason", std::string{}).empty());
+        // The taxonomy survives — the split is narrow, not a blanket denial.
+        CHECK_FALSE(got_d["securable_types"].empty());
+        CHECK_FALSE(got_d["operations"].empty());
+    }
 
     // Unwired (RbacStore left null, the McpTestServer default) — a JSON-RPC
     // tool error, not a 5xx: MCP has no HTTP-status channel for a store-503
@@ -1911,6 +2020,17 @@ TEST_CASE("MCP: all five discover_* tools are advertised in tools/list",
 // — behavioral) and ADDITIONALLY emits dex.signal.view, so one SIEM filter
 // catches the dashboard, REST and MCP behavioral-access surfaces alike.
 
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): every MCP DEX
+// test below constructs its own GuaranteedStateStore against a clone of this
+// schema (ADR-0038 migration).
+static yuzu::test::PgTestTemplate mcp_guardian_pg_tpl{
+    "guardianstate", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        GuaranteedStateStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("guardianstate template: store failed to migrate");
+    }};
+
 // Seed one ruleless DEX observation (the __observation__ projection the DEX
 // aggregations read) — subject + platform land in detail_json.
 static void mcp_seed_obs(GuaranteedStateStore& store, const std::string& id,
@@ -1929,8 +2049,10 @@ static void mcp_seed_obs(GuaranteedStateStore& store, const std::string& id,
 }
 
 TEST_CASE("MCP DEX: list_dex_signals returns the rollup, audits only the tool call",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     mcp_seed_obs(store, "o2", "WS-2", "process.crashed", "chrome.exe", "windows",
@@ -1963,8 +2085,10 @@ TEST_CASE("MCP DEX: list_dex_signals returns the rollup, audits only the tool ca
 }
 
 TEST_CASE("MCP DEX: list_dex_signals os filter scopes the catalogue rollup (A1 parity)",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "w1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     mcp_seed_obs(store, "m1", "MAC-1", "storage.low", "disk", "macos", "2026-06-10T11:00:00Z");
@@ -1989,8 +2113,10 @@ TEST_CASE("MCP DEX: list_dex_signals os filter scopes the catalogue rollup (A1 p
 }
 
 TEST_CASE("MCP DEX: get_dex_signal_scope returns per-OS coverage, not audited as a view",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     mcp_seed_obs(store, "o2", "MB-1", "process.crashed", "Safari", "macos", "2026-06-10T11:00:00Z");
@@ -2017,8 +2143,10 @@ TEST_CASE("MCP DEX: get_dex_signal_scope returns per-OS coverage, not audited as
 }
 
 TEST_CASE("MCP DEX: get_dex_signal_detail returns the shape AND emits dex.signal.view",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     mcp_seed_obs(store, "o2", "WS-2", "process.crashed", "chrome.exe", "windows",
@@ -2051,8 +2179,10 @@ TEST_CASE("MCP DEX: get_dex_signal_detail returns the shape AND emits dex.signal
 }
 
 TEST_CASE("MCP DEX: get_dex_signal_detail os filter scopes subjects/devices (A1 parity)",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "w1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     mcp_seed_obs(store, "w2", "WS-2", "process.crashed", "outlook.exe", "windows",
@@ -2088,8 +2218,10 @@ TEST_CASE("MCP DEX: get_dex_signal_detail os filter scopes subjects/devices (A1 
 // dropped row via audit_persisted:false. MCP set-and-proceeds (parity with the
 // query_responses #1550 and revoke_certificate #1240 siblings — no header channel).
 TEST_CASE("MCP DEX: get_dex_signal_detail dropped audit row surfaces audit_persisted:false (#1647)",
-          "[mcp][integration][dex][audit]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     McpTestServer ts;
@@ -2113,8 +2245,10 @@ TEST_CASE("MCP DEX: get_dex_signal_detail dropped audit row surfaces audit_persi
 // MCP path (the bool was discarded). The shared kernel catches it → audit_persisted:false,
 // still serves (MCP set-and-proceed), and never lets the throw escape the handler.
 TEST_CASE("MCP DEX: get_dex_signal_detail throwing audit_fn is caught → audit_persisted:false",
-          "[mcp][integration][dex][audit]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     McpTestServer ts;
@@ -2133,8 +2267,10 @@ TEST_CASE("MCP DEX: get_dex_signal_detail throwing audit_fn is caught → audit_
 }
 
 TEST_CASE("MCP DEX: get_dex_signal_detail rejects a malformed obs_type without auditing the view",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     McpTestServer ts;
     ts.guaranteed_state_store_for_test = &store;
     ts.start("readonly");
@@ -3433,7 +3569,7 @@ TEST_CASE("MCP Integration: execute_instruction happy dispatch", "[mcp][integrat
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string& execution_id) -> std::pair<std::string, int> {
+                        const std::string& execution_id, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         ts.last_dispatch_plugin = plugin;
         ts.last_dispatch_action = action;
         ts.last_dispatch_agent_ids = agent_ids;
@@ -3473,6 +3609,64 @@ TEST_CASE("MCP Integration: execute_instruction happy dispatch", "[mcp][integrat
     // create_execution and dispatch_fn sees "").
     CHECK(text["execution_id"].get<std::string>().empty());
     CHECK(ts.last_dispatch_execution_id.empty());
+}
+
+// ── 23a2. CDX-R5-02: execute_instruction confinement handoff ───────────────
+TEST_CASE("MCP execute_instruction derives the caller's exec_visible and threads it into dispatch "
+          "(CDX-R5-02)",
+          "[mcp][integration][execute][scope]") {
+    McpTestServer ts;
+    // A service-scoped-style confinement: the caller can see only agent-A.
+    ts.exec_visible_fn_for_test = [](const auth::Session&) {
+        std::unordered_set<std::string> s{"agent-A"};
+        return yuzu::server::authz::VisibleSet{s};
+    };
+    auto dispatch = [&](const std::string&, const std::string&,
+                        const std::vector<std::string>& agent_ids, const std::string&,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::authz::VisibleSet& exec_visible)
+        -> std::pair<std::string, int> {
+        ts.last_dispatch_agent_ids = agent_ids;
+        ts.last_dispatch_exec_visible = exec_visible;
+        return {"cmd-x", 0};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+    // Target agent-B (outside the caller's visible set). This asserts the
+    // HANDOFF: the handler derived a PRESENT (confined) visible set and threaded
+    // it into dispatch_fn -- the production dispatch lambda then filters agent-B
+    // out via filter_to_scope (verified against the shared /api/command tests).
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":77,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","agent_ids":["agent-B"]}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(ts.last_dispatch_exec_visible.has_value()); // confined, NOT unfiltered
+    CHECK(ts.last_dispatch_exec_visible->count("agent-A") == 1);
+    CHECK(ts.last_dispatch_exec_visible->count("agent-B") == 0);
+}
+
+TEST_CASE("MCP execute_instruction FAILS CLOSED when the exec-visible derivation is unwired "
+          "(CDX-R6-02)",
+          "[mcp][integration][execute][scope]") {
+    McpTestServer ts;
+    // Genuinely UNWIRED (not the harness's nullopt default): the handler must
+    // hand dispatch a PRESENT EMPTY visible set (deny all), never nullopt
+    // (unfiltered) -- ADR-0033 §1, a missing applicable filter denies.
+    ts.exec_visible_fn_for_test = {};
+    auto dispatch = [&](const std::string&, const std::string&,
+                        const std::vector<std::string>&, const std::string&,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::authz::VisibleSet& exec_visible)
+        -> std::pair<std::string, int> {
+        ts.last_dispatch_exec_visible = exec_visible;
+        return {"cmd-x", 0};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":78,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","agent_ids":["agent-A"]}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(ts.last_dispatch_exec_visible.has_value()); // PRESENT (deny), not nullopt
+    CHECK(ts.last_dispatch_exec_visible->empty());       // EMPTY -> the production sink dispatches to no one
 }
 
 // ── 23b. execute_instruction with real ExecutionTracker — non-empty path ──
@@ -3518,7 +3712,7 @@ TEST_CASE("MCP Integration: execute_instruction populates execution_id and threa
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string& execution_id) -> std::pair<std::string, int> {
+                        const std::string& execution_id, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         ts.last_dispatch_plugin = plugin;
         ts.last_dispatch_action = action;
         ts.last_dispatch_agent_ids = agent_ids;
@@ -3585,7 +3779,7 @@ TEST_CASE("MCP Integration: execute_instruction missing plugin", "[mcp][integrat
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         return {"", 0};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -3608,7 +3802,7 @@ TEST_CASE("MCP Integration: execute_instruction missing action", "[mcp][integrat
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         return {"", 0};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -3641,7 +3835,7 @@ TEST_CASE("MCP Integration: execute_instruction enforces input bounds on the ope
     bool dispatched = false;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string&) -> std::pair<std::string, int> {
+                        const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         dispatched = true;
         return {"cmd-abc", 1};
     };
@@ -3815,7 +4009,7 @@ TEST_CASE("MCP Integration: type-confused targeting is rejected, never widened t
     auto dispatch = [&](const std::string&, const std::string&,
                         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                         const std::unordered_map<std::string, std::string>&,
-                        const std::string&) -> std::pair<std::string, int> {
+                        const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         ++dispatch_calls;
         dispatched_ids = agent_ids;
         dispatched_scope = scope_expr;
@@ -3910,7 +4104,7 @@ TEST_CASE("MCP Integration: an input-bound denial emits a counted, correlated au
     ts.metrics_for_test = &reg;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string&) -> std::pair<std::string, int> { return {"", 0}; };
+                       const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"", 0}; };
     ts.start_with_dispatch(dispatch, "operator");
 
     const std::string big(129, 'a');
@@ -4047,7 +4241,7 @@ TEST_CASE("MCP Integration: execute_instruction zero agents reached",
     McpTestServer ts;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string& /*execution_id*/) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         return {"cmd-xyz", 0};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -4075,7 +4269,7 @@ TEST_CASE("MCP Integration: execute_instruction default scope __all__",
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string& /*execution_id*/) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         ts.last_dispatch_scope = scope_expr;
         ts.last_dispatch_agent_ids = agent_ids;
         return {"cmd-default", 1};
@@ -4102,7 +4296,7 @@ TEST_CASE("MCP Integration: execute_instruction explicit agent_ids",
     auto dispatch = [&](const std::string&, const std::string&,
                         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                         const std::unordered_map<std::string, std::string>&,
-                        const std::string& /*execution_id*/) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         ts.last_dispatch_agent_ids = agent_ids;
         ts.last_dispatch_scope = scope_expr;
         return {"cmd-agents", 2};
@@ -4128,7 +4322,7 @@ TEST_CASE("MCP Integration: execute_instruction params forwarding", "[mcp][integ
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string& /*execution_id*/) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         ts.last_dispatch_params = params;
         return {"cmd-params", 1};
     };
@@ -4152,7 +4346,7 @@ TEST_CASE("MCP Integration: execute_instruction non-string params", "[mcp][integ
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string& /*execution_id*/) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         ts.last_dispatch_params = params;
         return {"cmd-nonstr", 1};
     };
@@ -4177,7 +4371,7 @@ TEST_CASE("MCP Integration: execute_instruction blocked by read_only_mode",
     ts.read_only_mode_ = true;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         return {"cmd-ro", 1};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -4200,7 +4394,7 @@ TEST_CASE("MCP Integration: execute_instruction blocked by readonly tier",
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         return {"cmd-ro", 1};
     };
     ts.start_with_dispatch(dispatch, "readonly");
@@ -4223,7 +4417,7 @@ TEST_CASE("MCP Integration: execute_instruction operator tier proceeds",
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>&, const std::string&,
                         const std::unordered_map<std::string, std::string>&,
-                        const std::string& /*execution_id*/) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         ts.last_dispatch_plugin = plugin;
         ts.last_dispatch_action = action;
         return {"cmd-op", 3};
@@ -4261,7 +4455,7 @@ TEST_CASE("MCP Integration: execute_instruction supervised tier, no approval man
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         return {"cmd-sup", 1};
     };
     ts.start_with_dispatch(dispatch, "supervised"); // approval_manager_for_test == nullptr
@@ -4301,7 +4495,7 @@ TEST_CASE("MCP Integration: execute_instruction supervised tier mints approval t
     bool dispatched = false;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string& /*execution_id*/) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         dispatched = true;
         return {"cmd-sup", 1};
     };
@@ -4328,7 +4522,7 @@ TEST_CASE("MCP Integration: execute_instruction audit on success", "[mcp][integr
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         return {"cmd-audit", 2};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -4352,7 +4546,7 @@ TEST_CASE("MCP Integration: execute_instruction audit on no-agents",
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         return {"cmd-empty", 0};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -4523,6 +4717,53 @@ TEST_CASE("MCP query_responses: limit is clamped to [1,1000] (no false-empty, no
     CHECK(query_limit("50").size() == 3);
 }
 
+TEST_CASE("MCP query_audit_log: limit is clamped to [1,500] (no false-empty)",
+          "[pg][mcp][integration][audit]") {
+    // Same class as query_responses's clamp above, and the SAME store-side
+    // trap: AuditStore::query() clamps a non-positive limit to `LIMIT 0` at
+    // its own sink (std::max(q.limit, 0)), which for every OTHER caller is a
+    // legitimate zero-results answer but here reads as "no audit activity" —
+    // exactly the false-empty result ADR-0040 says this store must never
+    // produce. Before this fix, query_audit_log clamped only the upper bound
+    // (std::min(..., 500)), so a caller-supplied limit:0 or limit:-1 reached
+    // the store unclamped on the low end.
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    for (int i = 0; i < 3; ++i) {
+        AuditEvent evt;
+        evt.principal = "mcp-limit-probe";
+        evt.action = "mcp.query_audit_log";
+        evt.target_type = "mcp_tool";
+        evt.target_id = "query_audit_log";
+        evt.result = "success";
+        evt.mcp_tool = "query_audit_log";
+        REQUIRE(store.log(evt));
+    }
+
+    McpTestServer ts;
+    ts.audit_store_for_test = &store;
+    ts.start("readonly");
+
+    auto query_limit = [&](const std::string& limit_literal) {
+        auto res = ts.call(
+            std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":74,)"
+                        R"("params":{"name":"query_audit_log","arguments":)") +
+            R"({"principal":"mcp-limit-probe","limit":)" + limit_literal + "}}}");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    };
+
+    // limit:0 clamps to 1 — a non-empty result, never a false "no activity".
+    CHECK(query_limit("0").size() == 1);
+    // limit:-1 clamps to 1 — does NOT become an unbounded PostgreSQL LIMIT -1.
+    CHECK(query_limit("-1").size() == 1);
+    // A normal limit returns all matching rows up to the cap.
+    CHECK(query_limit("50").size() == 3);
+}
+
 TEST_CASE("MCP query_responses: full execute_instruction -> collect-by-execution_id loop",
           "[pg][mcp][integration][response][fanout][execute]") {
     // End-to-end: dispatch via execute_instruction (real ExecutionTracker mints
@@ -4558,7 +4799,7 @@ TEST_CASE("MCP query_responses: full execute_instruction -> collect-by-execution
     ts.response_store_for_test = &store;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string& execution_id) -> std::pair<std::string, int> {
+                        const std::string& execution_id, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         ts.last_dispatch_execution_id = execution_id;
         return {"cmd-loop", 1};
     };
@@ -5550,11 +5791,116 @@ bool audit_has(const std::vector<std::string>& log, const std::string& entry) {
 yuzu::server::mcp::McpServer::DispatchFn fake_bundle_dispatch() {
     return [](const std::string& plugin, const std::string& action, const std::vector<std::string>&,
               const std::string&, const std::unordered_map<std::string, std::string>&,
-              const std::string&) -> std::pair<std::string, int> {
+              const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         return {"cmd-" + plugin + "-" + action, 1};
     };
 }
 } // namespace
+
+TEST_CASE("MCP execute_bundle denies an out-of-scope target agent, dispatches an in-scope one "
+          "(CDX-R5-02)",
+          "[pg][mcp][bundle][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    bool dispatched = false;
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    // Caller (service-scoped-style) can see only agent-A.
+    ts.exec_visible_fn_for_test = [](const auth::Session&) {
+        std::unordered_set<std::string> s{"agent-A"};
+        return yuzu::server::authz::VisibleSet{s};
+    };
+    ts.start_with_dispatch([&dispatched](const std::string&, const std::string&,
+                                         const std::vector<std::string>&, const std::string&,
+                                         const std::unordered_map<std::string, std::string>&,
+                                         const std::string&, const yuzu::server::authz::VisibleSet&)
+                               -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    });
+    // Target agent-B, OUTSIDE the caller's visible set -> denied at the handler
+    // (in_scope) BEFORE any dispatch: an error, never a bundle_id.
+    auto denied = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":88,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-B","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
+    REQUIRE(denied);
+    CHECK(nlohmann::json::parse(denied->body).contains("error"));
+    CHECK_FALSE(dispatched);
+    // Control: the same bundle for the IN-scope agent-A dispatches normally.
+    auto ok = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":89,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
+    REQUIRE(ok);
+    CHECK(dispatched);
+}
+
+TEST_CASE("MCP execute_bundle FAILS CLOSED when the exec-visible derivation is unwired (CDX-R6-02)",
+          "[pg][mcp][bundle][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    bool dispatched = false;
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    // Genuinely UNWIRED (not the harness's nullopt default): a missing applicable
+    // filter must DENY, not admit every target (ADR-0033 §1).
+    ts.exec_visible_fn_for_test = {};
+    ts.start_with_dispatch([&dispatched](const std::string&, const std::string&,
+                                         const std::vector<std::string>&, const std::string&,
+                                         const std::unordered_map<std::string, std::string>&,
+                                         const std::string&, const yuzu::server::authz::VisibleSet&)
+                               -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    });
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":91,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
+    REQUIRE(res);
+    CHECK(nlohmann::json::parse(res->body).contains("error")); // denied, no bundle_id
+    CHECK_FALSE(dispatched);                                     // never reached dispatch
+}
+
+TEST_CASE("MCP execute_bundle admits a management-group-scoped operator with NO global grant "
+          "(governance C4/sec-4 REST/MCP parity)",
+          "[pg][mcp][bundle][scope]") {
+    // Simulates the exact twin-disagreement the finding named: a caller who is
+    // NOT globally granted Execution:Execute (perm_override denies it) but IS
+    // scoped to see this one device (exec_visible_fn admits agent-A). REST's
+    // /api/v1/bundles has never required the global grant, only the per-target
+    // scoped_perm_fn; before this fix MCP additionally required the global
+    // grant and 403'd this exact caller. The twins must now agree: admitted.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    bool dispatched = false;
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        // Deny the GLOBAL grant this caller lacks; every other check (e.g. the
+        // C8 generic tier gate, which does not call perm_fn for a readonly-tier
+        // session here) is unaffected.
+        return !(securable == "Execution" && op == "Execute");
+    };
+    ts.exec_visible_fn_for_test = [](const auth::Session&) {
+        std::unordered_set<std::string> s{"agent-A"};
+        return yuzu::server::authz::VisibleSet{s};
+    };
+    ts.start_with_dispatch([&dispatched](const std::string&, const std::string&,
+                                         const std::vector<std::string>&, const std::string&,
+                                         const std::unordered_map<std::string, std::string>&,
+                                         const std::string&, const yuzu::server::authz::VisibleSet&)
+                               -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    });
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":96,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
+    REQUIRE(res);
+    CHECK(nlohmann::json::parse(res->body).contains("result")); // NOT 403 — admitted
+    CHECK(dispatched);
+}
 
 TEST_CASE("MCP execute_bundle fans each step out + returns bundle_id", "[pg][mcp][bundle]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -5572,7 +5918,7 @@ TEST_CASE("MCP execute_bundle fans each step out + returns bundle_id", "[pg][mcp
     ts.start_with_dispatch([&calls](const std::string& plugin, const std::string& action,
                                     const std::vector<std::string>&, const std::string&,
                                     const std::unordered_map<std::string, std::string>&,
-                                    const std::string& correlation) -> std::pair<std::string, int> {
+                                    const std::string& correlation, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         calls.push_back({plugin, action, correlation});
         return {"cmd-" + plugin + "-" + action, 1};
     });
@@ -5720,7 +6066,7 @@ TEST_CASE("MCP get_bundle_result surfaces dispatch_failed + succeeded=0", "[pg][
     ts.start_with_dispatch([](const std::string&, const std::string&,
                               const std::vector<std::string>&, const std::string&,
                               const std::unordered_map<std::string, std::string>&,
-                              const std::string&) -> std::pair<std::string, int> {
+                              const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         return {std::string{}, 0}; // reached no agent
     });
     auto disp = ts.call(
@@ -6428,6 +6774,9 @@ TEST_CASE("MCP set_tag operator sets the tag and fires the agent tag-push",
 
     McpTestServer ts;
     ts.tag_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };  // K-06: scope now fail-closed; wire a permissive stub
     ts.start("operator");
 
     auto res = ts.call(
@@ -6451,6 +6800,9 @@ TEST_CASE("MCP set_tag rejects an invalid category value", "[mcp][integration][t
 
     McpTestServer ts;
     ts.tag_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };  // K-06: scope now fail-closed; wire a permissive stub
     ts.start("operator");
 
     // "environment" is a structured category; "not-a-real-env" is not in its set.
@@ -6468,6 +6820,9 @@ TEST_CASE("MCP set_tag is tier-denied on the readonly tier", "[mcp][integration]
     yuzu::server::TagStore store(db.path);
     McpTestServer ts;
     ts.tag_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };  // K-06: scope now fail-closed; wire a permissive stub
     ts.start("readonly");
 
     auto res = ts.call(
@@ -6493,6 +6848,9 @@ TEST_CASE("MCP delete_tag full approval-ticket round-trip + replay is rejected",
 
     McpTestServer ts;
     ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };  // K-06: scope now fail-closed; wire a permissive stub
     ts.approval_manager_for_test = &appr;
     ts.start("operator"); // operator: Tag:Delete requires approval
 
@@ -6542,6 +6900,9 @@ TEST_CASE("MCP delete_tag with a mismatched-args approval_id is rejected",
 
     McpTestServer ts;
     ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };  // K-06: scope now fail-closed; wire a permissive stub
     ts.approval_manager_for_test = &appr;
     ts.start("operator");
 
@@ -6596,7 +6957,7 @@ TEST_CASE("MCP: a schema-inexpressible violation never mints or consumes a ticke
     int dispatch_calls = 0;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string&) -> std::pair<std::string, int> {
+                        const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         ++dispatch_calls;
         return {"cmd-abc", 1};
     };
@@ -6646,9 +7007,13 @@ TEST_CASE("MCP: a schema-inexpressible violation never mints or consumes a ticke
     }
     SECTION("empty plugin/action is refused BEFORE a ticket is minted") {
         // Sol's find, and the FIFTH instance of the burn class: the schema
-        // marks plugin/action `required` (which C8 enforces) but the closed
-        // subset has no minLength, so "" passes every published check and the
-        // handler refused it only after the ticket had been consumed.
+        // marks plugin/action `required` (which C8 enforces) but the SERVED
+        // schema puts no floor on their length, so "" passes every published
+        // check and the handler refused it only after the ticket had been
+        // consumed. The compiler gained `minLength` in #2444, so the served
+        // schema can express the floor directly once kTools[] in the frozen
+        // mcp_server.cpp reopens; check_exec_instruction_shape holds the line
+        // until then, and afterwards for the tiers that never reach C8.
         auto res = call_with(R"({"plugin":"","action":""})");
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);
@@ -6681,6 +7046,9 @@ TEST_CASE("MCP approval ticket cannot be reused across tools",
 
     McpTestServer ts;
     ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };  // K-06: scope now fail-closed; wire a permissive stub
     ts.quarantine_store_for_test = &quar;
     ts.approval_manager_for_test = &appr;
     ts.start("supervised"); // both delete_tag and quarantine_device are approval-gated here
@@ -6726,6 +7094,9 @@ TEST_CASE("MCP approval mint dedups identical pending requests",
 
     McpTestServer ts;
     ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };  // K-06: scope now fail-closed; wire a permissive stub
     ts.approval_manager_for_test = &appr;
     ts.start("operator");
 
@@ -6757,6 +7128,9 @@ TEST_CASE("MCP approval mint enforces a per-submitter pending sub-cap",
 
     McpTestServer ts;
     ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };  // K-06: scope now fail-closed; wire a permissive stub
     ts.approval_manager_for_test = &appr;
     ts.start("operator");
 
@@ -6912,7 +7286,7 @@ TEST_CASE("MCP 2405: non-string approval_id is rejected on declaring and non-dec
         auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                            const std::string&,
                            const std::unordered_map<std::string, std::string>&,
-                           const std::string&) -> std::pair<std::string, int> {
+                           const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
             return {"cmd-x", 1};
         };
         ts2.start_with_dispatch(dispatch, "supervised");
@@ -6946,7 +7320,7 @@ TEST_CASE("MCP 2405: string approval_id is tolerated on tools that do not declar
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
             dispatched = true;
             return {"cmd-ok", 1};
         };
@@ -7386,10 +7760,53 @@ TEST_CASE("MCP 2405: subset compiler enforces every supported keyword",
         CHECK_FALSE(z->validate(nlohmann::json::parse(R"({"none":[]})")));
         CHECK(z->validate(nlohmann::json::parse(R"({"none":["a"]})")));
     }
+    // minLength (#2444): the catalogue could bound a string's ceiling but not
+    // its floor, so a required string could be satisfied by "".
+    {
+        auto s = compile_input_schema(
+            R"({"type":"object","properties":{"tag":{"type":"string","minLength":1,"maxLength":8}}})");
+        REQUIRE(s);
+        CHECK_FALSE(s->validate(nlohmann::json::parse(R"({"tag":"a"})")));
+        auto empty = s->validate(nlohmann::json::parse(R"({"tag":""})"));
+        REQUIRE(empty);
+        CHECK(empty->path == "/tag");
+        CHECK(empty->reason.find("shorter than minLength 1 (bytes)") != std::string::npos);
+        // The ceiling still applies alongside the floor.
+        CHECK(s->validate(nlohmann::json::parse(R"({"tag":"aaaaaaaaa"})")));
+        // Bytes, not codepoints: a 2-byte single character satisfies
+        // minLength:2. The header says so explicitly — do not read a
+        // minLength above 1 as a character count.
+        auto b = compile_input_schema(
+            R"({"type":"object","properties":{"t":{"type":"string","minLength":2}}})");
+        REQUIRE(b);
+        CHECK_FALSE(b->validate(nlohmann::json::parse(R"({"t":"é"})")));
+    }
+    // minLength operands are validated at COMPILE time, so a schema the gate
+    // cannot enforce is unbootable rather than partially enforced.
+    {
+        CHECK_FALSE(compile_input_schema(
+                        R"({"type":"object","properties":{"t":{"type":"string","minLength":-1}}})")
+                        .has_value());
+        CHECK_FALSE(compile_input_schema(
+                        R"({"type":"object","properties":{"t":{"type":"string","minLength":"1"}}})")
+                        .has_value());
+        // string-only, like maxLength
+        CHECK_FALSE(compile_input_schema(
+                        R"({"type":"object","properties":{"n":{"type":"integer","minLength":1}}})")
+                        .has_value());
+        // an unsatisfiable window is an authoring error, not a runtime denial
+        auto inverted = compile_input_schema(
+            R"({"type":"object","properties":{"t":{"type":"string","minLength":5,"maxLength":2}}})");
+        REQUIRE_FALSE(inverted.has_value());
+        bool named = false;
+        for (const auto& e : inverted.error())
+            named = named || e.find("'minLength' exceeds 'maxLength'") != std::string::npos;
+        CHECK(named);
+    }
     // Catalogue drift tether: growing kSupportedKeywords must be a deliberate
     // act that also revisits the header contract comment and the
     // docs/mcp-server.md bullet (both enumerate the same closed list).
-    CHECK(yuzu::server::mcp::supported_keyword_count() == 15);
+    CHECK(yuzu::server::mcp::supported_keyword_count() == 16);
     // additionalProperties:false rejects undeclared keys at the WILDCARD path.
     {
         auto s = compile_input_schema(
@@ -7821,14 +8238,22 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     McpTestServer ts;
     ts.quarantine_store_for_test = &quar;
     ts.approval_manager_for_test = &appr;
+    // governance UP-9: quarantine_device now FAILS CLOSED when the per-device
+    // scope gate is unwired (matching set_tag/delete_tag) — wire it exactly as
+    // production does (server.cpp wires it unconditionally), same fix delete_tag's
+    // own approval round-trip test needed (see "MCP 2383" test below).
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>& agent_ids, const std::string&,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string&) -> std::pair<std::string, int> {
+                        const std::string&, const yuzu::server::authz::VisibleSet& exec_visible) -> std::pair<std::string, int> {
         ts.last_dispatch_plugin = plugin;
         ts.last_dispatch_action = action;
         ts.last_dispatch_agent_ids = agent_ids;
         ts.last_dispatch_params = params;
+        ts.last_dispatch_exec_visible = exec_visible;
         return {"cmd-quar", 1};
     };
     ts.start_with_dispatch(dispatch, "supervised"); // Security:Execute requires approval (C2)
@@ -7878,6 +8303,11 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     REQUIRE(ts.last_dispatch_agent_ids.size() == 1);
     CHECK(ts.last_dispatch_agent_ids[0] == "agent-q");
     CHECK(ts.last_dispatch_params.at("whitelist_ips") == "10.0.0.1");
+    // governance UP-9: the isolation dispatch threads a set CONFINED to the
+    // single scope-gate-checked target, never an unfiltered VisibleSet.
+    REQUIRE(ts.last_dispatch_exec_visible.has_value());
+    CHECK(ts.last_dispatch_exec_visible->size() == 1);
+    CHECK(ts.last_dispatch_exec_visible->count("agent-q") == 1);
     sqlite3_close(raw);
 }
 
@@ -8027,6 +8457,29 @@ TEST_CASE("MCP quarantine_device enforces the per-device scope gate",
     REQUIRE(quar.get_status("agent-inside").has_value());
 }
 
+TEST_CASE("MCP quarantine_device FAILS CLOSED when the scope gate is unwired (governance UP-9)",
+          "[mcp][integration][quarantine][scope]") {
+    // No scoped_perm_fn wired (default empty). Before this fix the handler
+    // widened to the global perm_fn (always-allow in this harness) and
+    // proceeded to record + dispatch — the LAST write tool still doing that;
+    // set_tag/delete_tag already refuse here (K-06/CDX-R4-09). Must refuse,
+    // never fall through.
+    yuzu::test::TempDbFile qdb{std::string_view{"mcp-quar-"}};
+    yuzu::server::QuarantineStore quar(qdb.path);
+    REQUIRE(quar.is_open());
+
+    McpTestServer ts;
+    ts.quarantine_store_for_test = &quar;
+    ts.start(); // scoped_perm_fn_for_test left default-unwired
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":266,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-x","reason":"sus"}}})");
+    REQUIRE(res);
+    CHECK(res->body.find("scope gate not configured") != std::string::npos);
+    CHECK(res->body.find("\"result\"") == std::string::npos); // fail closed, not served
+    CHECK_FALSE(quar.get_status("agent-x").has_value());       // never recorded
+}
+
 // ── M1 (PR #1796): reviewer == submitter surfaces through the MCP error path ─
 // approval_manager.cpp enforces "reviewer cannot be the same as the submitter"
 // at the store; this proves the FULL MCP path: a ticket minted via the C8 gate
@@ -8139,7 +8592,25 @@ TEST_CASE("MCP approval recall executes through the real AuthRoutes::require_per
         /*rbac_store=*/nullptr, /*instruction_store=*/nullptr, /*execution_tracker=*/nullptr,
         /*response_store=*/nullptr, /*audit_store=*/nullptr, &tags,
         /*inventory_store=*/nullptr, /*policy_store=*/nullptr, /*mgmt_store=*/nullptr, &appr,
-        /*schedule_engine=*/nullptr, read_only, disabled);
+        /*schedule_engine=*/nullptr, read_only, disabled,
+        /*dispatch_fn=*/nullptr, /*ca_store=*/nullptr, /*publish_crl_fn=*/{},
+        /*guaranteed_state_store=*/nullptr, /*dex_perf_fn=*/{}, /*net_perf_fn=*/{},
+        /*response_scope_fn=*/{}, /*software_inventory_store=*/nullptr,
+        /*inventory_scope_fn=*/{}, /*metrics=*/nullptr, /*app_perf_providers=*/{},
+        /*quarantine_store=*/nullptr, /*tag_push_fn=*/{}, /*agent_registry=*/nullptr,
+        // K-06/CDX-R4-09: delete_tag now FAILS CLOSED when the per-device scope
+        // gate is unwired, so this integration test must wire it exactly as
+        // production does (server.cpp wires it unconditionally). Leaving it
+        // empty made the approval-recall assert an error instead of a delete —
+        // and because this case is [pg]-gated it skipped locally and would have
+        // gone red only on the CI Postgres leg. This delegates to the SAME real
+        // AuthRoutes instance as perm_fn above, so the test keeps its point:
+        // no mocks on the auth layer.
+        /*scoped_perm_fn=*/
+        [&](const httplib::Request& rq, httplib::Response& rs, const std::string& type,
+            const std::string& op, const std::string& agent_id) {
+            return ar.require_scoped_permission(rq, rs, type, op, agent_id);
+        });
 
     auto call = [&](const std::string& body) {
         httplib::Request rq;
@@ -8928,7 +9399,7 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
             return {"cmd-bridge", 2};
         };
         ts.start_with_dispatch(dispatch, "operator");
@@ -8965,6 +9436,25 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         };
         CHECK(normalize(res_bridged->body, exec_bridged) ==
               normalize(res_plain->body, exec_plain));
+
+        // STOP-SHIP SURFACE, widened ahead of the streamed-POST rung (C8).
+        // Comparing bodies alone is not "byte-untouched": mcp-remote 0.1.37 and
+        // Claude Desktop negotiate on the status line and the headers, and the
+        // rung that lands next decides between a plain JSON response and an SSE
+        // stream by inspecting Accept. A regression there changes Content-Type
+        // and the transfer framing while leaving the body identical, which this
+        // test would have passed. Pin the whole response envelope, not its
+        // payload.
+        CHECK(res_bridged->status == res_plain->status);
+        CHECK(res_bridged->get_header_value("Content-Type") ==
+              res_plain->get_header_value("Content-Type"));
+        CHECK(res_plain->get_header_value("Content-Type") == "application/json");
+        // A plain POST must never acquire streaming framing or SSE-only headers.
+        CHECK(res_plain->get_header_value("Transfer-Encoding").empty());
+        CHECK(res_plain->get_header_value("Cache-Control").empty());
+        CHECK(res_plain->get_header_value("X-Accel-Buffering").empty());
+        CHECK(res_bridged->get_header_value("Transfer-Encoding").empty());
+        CHECK(res_bridged->get_header_value("X-Accel-Buffering").empty());
 
         // Progress reaches the session's GET ring LIVE, token echoed verbatim,
         // execution_id in _meta. NOTE (governance happy-path): S4.5's
@@ -9028,7 +9518,7 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
             return {"cmd-dup", 1};
         };
         ts.start_with_dispatch(dispatch, "operator");
@@ -9054,7 +9544,7 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
             throw std::runtime_error("boom");
         };
         ts.start_with_dispatch(dispatch, "operator");
@@ -9072,7 +9562,7 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
             return {"cmd-zero", 0};
         };
         ts.start_with_dispatch(dispatch, "operator");
@@ -9094,7 +9584,7 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string& execution_id) -> std::pair<std::string, int> {
+                            const std::string& execution_id, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
             yuzu::server::AgentExecStatus a;
             a.agent_id = "agent-001";
             a.status = "success";
@@ -9129,7 +9619,7 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
             return {"cmd-armfault", 2};
         };
         ts.start_with_dispatch(dispatch, "operator");
@@ -9157,7 +9647,7 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
             return {"cmd-resvfault", 2};
         };
         ts.start_with_dispatch(dispatch, "operator");
@@ -9179,7 +9669,7 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
             return {"cmd-subfault", 2};
         };
         ts.start_with_dispatch(dispatch, "operator");
@@ -9195,5 +9685,856 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         CHECK(bridge.record_count() == 0);  // reserved then abandoned on subscribe throw
         CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "subscribe_failed"}})
                   .value() == 1.0);
+    }
+}
+
+// ── 2f PR 3b (C8): streamed POST — SSE-on-POST ───────────────────────────────
+//
+// The eligibility fork and everything downstream of it. What these CAN observe is
+// the handler's decisions: status, the response envelope, bridge phase, the budget
+// ledger, metrics and audit rows. What they CANNOT observe is the wire: the
+// in-process fixture never runs the content provider (there is no socket - #438),
+// so progress-before-final, on_final_written and EOF are covered by the pump's own
+// tests in test_mcp_stream_bridge.cpp, NOT from here. Stated rather than implied,
+// because a test named "streamed happy path" reads like end-to-end proof.
+TEST_CASE("Config's shipped default for streamed POST is OFF", "[mcp][2f][3b][config]") {
+    // The dormancy test below pins the HARNESS field it is given, not Config's own
+    // default — flipping the production default alone, without also flipping the
+    // harness line, would leave that test green regardless.
+    //
+    // NOT a static_assert. `Config` (yuzu/server/server.hpp) holds
+    // `std::filesystem::path` members, so it is not a literal type and cannot
+    // appear in a constant expression.
+    //
+    // RESIDUAL, deliberately not closed here: nothing in this file exercises
+    // server.cpp's own `&cfg_.mcp_streamed_post_enable` wiring. Closing that needs
+    // a live ServerImpl, which is not a unit test; tracked as a follow-up.
+    REQUIRE_FALSE(yuzu::server::Config{}.mcp_streamed_post_enable);
+}
+
+TEST_CASE("streamed POST ships DORMANT: the default is off and a stream is not opened",
+          "[mcp][integration][execute][bridge][2f][3b]") {
+    // The shipped default. 3b's machinery is complete and the four defects that gated
+    // the on-by-default flip (#2739, #2740, #2785, #2789) are fixed, so the operator
+    // surfaces that document its bounds are now true of the implementation. It stays
+    // off because turning the default on is a SEPARATE rung - the same shape as Spark
+    // landing behind prefer_spark_ = false, cut over once the invariants hold.
+    //
+    // This test exists because an unpinned default is how dormancy silently ends: the
+    // harness sets streamed_post_enabled_ = true for every OTHER streamed test, so
+    // nothing else in this file would notice the production default changing.
+    namespace smcp = yuzu::server::mcp;
+
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    struct Guard {
+        sqlite3* h;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+        }
+    } guard{db};
+
+    yuzu::server::ExecutionTracker tracker(db);
+    tracker.create_tables();
+    yuzu::server::ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+    yuzu::MetricsRegistry metrics;
+    smcp::McpSessionRegistry sessions{smcp::McpSessionRegistry::Config{}, {}, &metrics};
+    smcp::McpStreamBridge bridge{&bus, &sessions, &metrics};
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{.global_cap = 8}};
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.session_registry_for_test = &sessions;
+    ts.metrics_for_test = &metrics;
+    ts.stream_budget_for_test = &budget;
+    // THE POINT: take the shipped default rather than the harness's opt-in.
+    ts.streamed_post_enabled_ = false;
+
+    auto minted = sessions.mint("test-user");
+    REQUIRE(minted.ok);
+    const auto sid = minted.session_id;
+
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&,
+                        const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd-dormant", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+    ts.mcp.set_stream_bridge(&bridge);
+
+    const std::string body =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":770,"params":{"name":"execute_instruction",)"
+        R"("arguments":{"plugin":"os_info","action":"version"},)"
+        R"("_meta":{"progressToken":"tok-dormant"}}})";
+    auto res = ts.call_raw("POST", body,
+                           {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
+    REQUIRE(res);
+
+    // The command still runs and still answers - dormant is a PLAIN response, not a
+    // refusal. A client asking to stream simply does not get a stream.
+    CHECK(res->status == 200);
+    CHECK(dispatched);
+    CHECK(res->get_header_value("Content-Type").find("text/event-stream") == std::string::npos);
+    auto parsed = nlohmann::json::parse(res->body);
+    CHECK(parsed.contains("result"));
+    // And no streamed admission was taken against the shared budget.
+    CHECK(budget.active_for(smcp::sse_bus::SseSurface::kMcpPost, "test-user") == 0);
+}
+
+TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
+          "[mcp][integration][execute][bridge][2f][3b]") {
+    namespace smcp = yuzu::server::mcp;
+
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    struct Guard {
+        sqlite3* h;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+        }
+    } guard{db};
+
+    yuzu::server::ExecutionTracker tracker(db);
+    tracker.create_tables();
+    yuzu::server::ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+    yuzu::MetricsRegistry metrics;
+    smcp::McpSessionRegistry sessions{smcp::McpSessionRegistry::Config{}, {}, &metrics};
+    smcp::McpStreamBridge bridge{&bus, &sessions, &metrics};
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{.global_cap = 8}};
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.session_registry_for_test = &sessions;
+    ts.metrics_for_test = &metrics;
+    ts.stream_budget_for_test = &budget;
+
+    auto minted = sessions.mint("test-user");
+    REQUIRE(minted.ok);
+    const auto sid = minted.session_id;
+    auto stream = sessions.stream_for(sid, "test-user");
+    REQUIRE(stream != nullptr);
+
+    const auto exec_body = [](int id, bool with_token) {
+        std::string meta = with_token ? R"(,"_meta":{"progressToken":"tok-1"})" : "";
+        return std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":)") +
+               std::to_string(id) +
+               R"(,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"})" +
+               meta + "}}";
+    };
+    // The only difference between a streamed call and a plain one is this header.
+    const auto call_sse = [&](const std::string& body) {
+        return ts.call_raw("POST", body,
+                           {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
+    };
+    const auto call_plain = [&](const std::string& body) {
+        return ts.call_raw("POST", body, {{"Mcp-Session-Id", sid}});
+    };
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&,
+                        const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+        return {"cmd-streamed", 2};
+    };
+    const auto audit_has = [&](const std::string& row) {
+        return std::find(ts.audit_log.begin(), ts.audit_log.end(), row) != ts.audit_log.end();
+    };
+    const auto reject_count = [&](const char* reason) {
+        return metrics.counter("yuzu_mcp_stream_rejects_total", {{"reason", reason}}).value();
+    };
+
+    SECTION("armed: SSE envelope, one Content-Type, kStreaming, gauge and attach audit") {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = call_sse(exec_body(700, /*with_token=*/true));
+        REQUIRE(res->status == 200);
+        // ONE Content-Type: httplib emplaces headers, so the application/json set
+        // at handler entry would otherwise ride along as a second value.
+        CHECK(res->get_header_value_count("Content-Type") == 1);
+        CHECK(res->get_header_value("Content-Type") == "text/event-stream");
+        CHECK(res->get_header_value("Cache-Control") == "no-cache");
+        CHECK(res->get_header_value("X-Accel-Buffering") == "no");
+        CHECK(res->get_header_value("X-Content-Type-Options") == "nosniff");
+        CHECK(res->get_header_value("X-Correlation-Id").rfind("req-", 0) == 0);
+        // The provider IS the response - no plain JSON body was written.
+        CHECK(res->body.empty());
+
+        CHECK(bridge.phase_for(sid, nlohmann::json(700)) ==
+              smcp::McpStreamBridge::Phase::kStreaming);
+        // #2068 discipline: the gauge is OBSERVED moving, not inferred from wiring.
+        CHECK(metrics.gauge("yuzu_mcp_post_streams_active").value() == 1.0);
+        CHECK(budget.active_for(smcp::sse_bus::SseSurface::kMcpPost, "test-user") == 1);
+        CHECK(audit_has("mcp.stream.attach|success"));
+        // The attach row names the surface, so a GET attach and a POST attach are
+        // distinguishable in the audit log rather than both reading "a stream".
+        // ONE row must carry both, not two different rows supplying one each - the
+        // looser form passed even when the attach row lacked a correlation id
+        // entirely, which is precisely the evidence-chain break governance found.
+        bool has_surface = false;
+        for (const auto& d : ts.audit_details) {
+            if (d.find("surface=post") != std::string::npos &&
+                d.find("cid=req-") != std::string::npos &&
+                d.find("execution_id=") != std::string::npos) {
+                has_surface = true;
+            }
+        }
+        CHECK(has_surface);
+    }
+
+    SECTION("S0 stays plain: no token, or no SSE Accept, is byte-identical") {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        // (a) SSE Accept but NO progressToken - the token is the real gate.
+        auto no_token = call_sse(exec_body(710, /*with_token=*/false));
+        REQUIRE(no_token->status == 200);
+        CHECK(no_token->get_header_value("Content-Type") == "application/json");
+        CHECK(no_token->get_header_value("Cache-Control").empty());
+        CHECK(no_token->get_header_value("X-Accel-Buffering").empty());
+        CHECK_FALSE(no_token->body.empty());
+
+        // (b) progressToken but NO SSE Accept - today's GET-only bridge path.
+        auto no_accept = call_plain(exec_body(711, /*with_token=*/true));
+        REQUIRE(no_accept->status == 200);
+        CHECK(no_accept->get_header_value("Content-Type") == "application/json");
+        CHECK(no_accept->get_header_value("X-Accel-Buffering").empty());
+        CHECK_FALSE(no_accept->body.empty());
+
+        // Neither spent an admission slot: the budget is only for real streams.
+        CHECK(budget.active() == 0);
+        CHECK(metrics.gauge("yuzu_mcp_post_streams_active").value() == 0.0);
+    }
+
+    SECTION("q=0 with a progressToken STREAMS - the pinned reading of accept_wants_sse") {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        // `q=0` means "not acceptable" in RFC 9110 and this stack deliberately
+        // ignores it (test_mcp_transport.cpp pins the predicate). A client that
+        // sends a progressToken AND q=0 is contradicting itself; honouring the
+        // token is the useful reading. Pinned HERE too, at the decision that
+        // actually uses it, so changing the predicate breaks the behaviour test
+        // and not just the unit test.
+        auto res = ts.call_raw("POST", exec_body(720, /*with_token=*/true),
+                               {{"Mcp-Session-Id", sid},
+                                {"Accept", "application/json, text/event-stream;q=0"}});
+        REQUIRE(res->status == 200);
+        CHECK(res->get_header_value("Content-Type") == "text/event-stream");
+    }
+
+    SECTION("budget exhausted -> 429 that echoes the id, with Retry-After and no execution row") {
+        // A cap of 1 across the whole server: the second streamed call cannot be
+        // admitted, and admission runs before reserve, so nothing was created.
+        yuzu::server::detail::StreamBudget tiny{
+            yuzu::server::detail::StreamBudget::Config{.global_cap = 1}};
+        ts.stream_budget_for_test = &tiny;
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto first = call_sse(exec_body(730, /*with_token=*/true));
+        REQUIRE(first->status == 200);
+        const auto rows_before = tracker.query_executions({}).size();
+
+        auto second = call_sse(exec_body(731, /*with_token=*/true));
+        REQUIRE(second->status == 429);
+        auto body = nlohmann::json::parse(second->body);
+        // Post-parse, so the id is KNOWN and echoed. The pre-parse engine-quota
+        // 429 on this same route answers id:null with -32010
+        // (test_principal_quota_chokepoint.cpp) - a client must be able to tell
+        // the two apart, which is why this asserts both halves.
+        CHECK(body["id"] == 731);
+        CHECK(body["error"]["code"] == smcp::kMcpStreamCap);
+        CHECK(body["error"]["code"] != -32010);
+        // The streamed-POST figure, NOT the GET one: a GET slot frees when a dead
+        // peer is detected, but a streamed slot is held until the work finishes or
+        // the response cap elapses, so advising the GET number would have a
+        // conforming client retry ~24 times before a slot could possibly free.
+        CHECK(body["error"]["data"]["retry_after_ms"] == smcp::kMcpStreamedPostRetryAfterMs);
+        CHECK(body["error"]["data"]["retry_after_ms"] != smcp::kMcpStreamCapRetryAfterMs);
+        CHECK_FALSE(body["error"]["data"]["remediation"].is_null());
+        CHECK(second->get_header_value("Retry-After") == "30");
+        // Denied, not dispatched: no execution row, and the denial is auditable.
+        CHECK(tracker.query_executions({}).size() == rows_before);
+        CHECK(audit_has("mcp.session.reject|failure"));
+        CHECK(reject_count("post_global_cap") == 1.0);
+        // Reject-not-evict: the live stream keeps its slot.
+        CHECK(tiny.active() == 1);
+    }
+
+    SECTION("duplicate request id -> 409, and the OLDER live record is untouched") {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto first = call_sse(exec_body(740, /*with_token=*/true));
+        REQUIRE(first->status == 200);
+        REQUIRE(bridge.phase_for(sid, nlohmann::json(740)) ==
+                smcp::McpStreamBridge::Phase::kStreaming);
+
+        auto dup = call_sse(exec_body(740, /*with_token=*/true));
+        REQUIRE(dup->status == 409);
+        auto body = nlohmann::json::parse(dup->body);
+        CHECK(body["id"] == 740);
+        CHECK(body["error"]["code"] == smcp::kInvalidRequest);
+        // Not capacity, so no retry advice: retrying cannot help while the first
+        // request is still live.
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(dup->get_header_value("Retry-After").empty());
+        CHECK(reject_count("post_duplicate_request_id") == 1.0);
+        // THE POINT: a rejected reservation must never abandon(), because this key
+        // belongs to the OLDER request. Its record and its slot survive.
+        CHECK(bridge.phase_for(sid, nlohmann::json(740)) ==
+              smcp::McpStreamBridge::Phase::kStreaming);
+        CHECK(budget.active_for(smcp::sse_bus::SseSurface::kMcpPost, "test-user") == 1);
+    }
+
+    SECTION("duplicate id arriving MID-FLIGHT must not erase the in-flight record") {
+        // The dangerous window for the no-abandon rule, and the only one where it
+        // bites: abandon() structurally refuses anything past kArming, so a
+        // duplicate that arrives once the first request is armed cannot hurt it
+        // however wrong the handler is. A duplicate that arrives while the first
+        // is still BETWEEN reserve and arm finds it in kArming - and there
+        // abandon() would succeed, erasing a live request's record, its
+        // subscription and its latched progress, and answering 409 to the wrong
+        // caller. The dispatch callback runs inside exactly that window.
+        std::shared_ptr<httplib::Response> inner;
+        ts.start_with_dispatch(
+            [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                const std::string&, const std::unordered_map<std::string, std::string>&,
+                const std::string&,
+                const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                inner = call_sse(exec_body(745, /*with_token=*/true)); // same id, re-entrant
+                return {"cmd-dup-inflight", 2};
+            },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto outer = call_sse(exec_body(745, /*with_token=*/true));
+        REQUIRE(inner != nullptr);
+        CHECK(inner->status == 409); // the LATE caller is the one refused
+        // The in-flight request is unharmed and still becomes a stream.
+        REQUIRE(outer->status == 200);
+        CHECK(outer->get_header_value("Content-Type") == "text/event-stream");
+        CHECK(bridge.phase_for(sid, nlohmann::json(745)) ==
+              smcp::McpStreamBridge::Phase::kStreaming);
+    }
+
+    SECTION("pin slots exhausted -> 429 naming the per-session limit") {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        // Reaching the bridge's pin-slot reject at all takes a specific state,
+        // because the budget's per-principal cap and the ring's pin cap are TWINS
+        // (kPerPrincipalMcpPost == kMaxStreamedPostsPerSession, static_asserted).
+        // With four streams LIVE the budget refuses the fifth first. The gap opens
+        // once the responses close: each releaser returns its lease immediately,
+        // but the record parks kRingOnly still holding its streamed charge until
+        // its terminal settles or it is torn down. So the budget reads 0 while the
+        // ring still owes four pins - and that window is exactly what pin_slots
+        // guards. Each Response below dies at the end of its iteration, which is
+        // what puts us there.
+        for (int i = 0; i < 4; ++i) {
+            auto ok = call_sse(exec_body(750 + i, /*with_token=*/true));
+            REQUIRE(ok->status == 200);
+        }
+        CHECK(budget.active_for(smcp::sse_bus::SseSurface::kMcpPost, "test-user") == 0);
+        CHECK(bridge.phase_for(sid, nlohmann::json(750)) ==
+              smcp::McpStreamBridge::Phase::kRingOnly);
+
+        auto fifth = call_sse(exec_body(754, /*with_token=*/true));
+        REQUIRE(fifth->status == 429);
+        auto body = nlohmann::json::parse(fifth->body);
+        CHECK(body["id"] == 754);
+        CHECK(body["error"]["code"] == smcp::kMcpStreamCap);
+        CHECK(reject_count("post_pin_slots") == 1.0);
+        // The lease taken for the REFUSED call went home rather than leaking - a
+        // rejected reservation must not strand the admission slot it acquired.
+        CHECK(budget.active() == 0);
+    }
+
+    SECTION("per-principal cap hit by CONCURRENT streams -> 429 naming "
+            "post_per_principal_cap (#2789)") {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        // The pin-slots sibling above closes every response before opening the
+        // next, so the budget always reads back down to 0 and only the ring's
+        // pin_slots arm is ever reached. HOLDING the responses is what makes the
+        // budget itself refuse: with kPerPrincipalMcpPost live streams for one
+        // principal, the fifth must be refused by the per-principal arm - not
+        // the global cap (8 in this fixture) and not pin_slots.
+        std::vector<std::unique_ptr<httplib::Response>> held;
+        for (int i = 0; i < static_cast<int>(smcp::sse_bus::kPerPrincipalMcpPost); ++i) {
+            auto ok = call_sse(exec_body(760 + i, /*with_token=*/true));
+            REQUIRE(ok->status == 200);
+            held.push_back(std::move(ok));
+        }
+        REQUIRE(budget.active_for(smcp::sse_bus::SseSurface::kMcpPost, "test-user") ==
+                smcp::sse_bus::kPerPrincipalMcpPost);
+        const auto rows_before = tracker.query_executions({}).size();
+
+        auto fifth = call_sse(exec_body(770, /*with_token=*/true));
+        REQUIRE(fifth->status == 429);
+        auto body = nlohmann::json::parse(fifth->body);
+        CHECK(body["id"] == 770);
+        CHECK(body["error"]["code"] == smcp::kMcpStreamCap);
+        // The DISTINCT reject reason - this is the arm nothing covered end-to-end.
+        CHECK(reject_count("post_per_principal_cap") == 1.0);
+        CHECK(reject_count("post_global_cap") == 0.0);
+        CHECK(reject_count("post_pin_slots") == 0.0);
+        // And its distinct remediation: the per-principal message tells the
+        // caller to finish THEIR calls, not to come back later.
+        const std::string remediation = body["error"]["data"]["remediation"];
+        CHECK(remediation.find("wait for one of your streamed calls to finish") !=
+              std::string::npos);
+        CHECK(body["error"]["data"]["retry_after_ms"] == smcp::kMcpStreamedPostRetryAfterMs);
+        CHECK(fifth->get_header_value("Retry-After") == "30");
+        // Refused at admission: reserve was never called, nothing dispatched.
+        CHECK(tracker.query_executions({}).size() == rows_before);
+        CHECK(audit_has("mcp.session.reject|failure"));
+        // Reject-not-evict: all four live streams keep their slots.
+        CHECK(budget.active_for(smcp::sse_bus::SseSurface::kMcpPost, "test-user") ==
+              smcp::sse_bus::kPerPrincipalMcpPost);
+    }
+
+    SECTION("reserve THROWS -> degrade to plain, never 429 and never 500") {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        bridge.inject_reserve_fault_for_test();
+
+        auto res = call_sse(exec_body(760, /*with_token=*/true));
+        // A rejection is the server saying no; an allocation failure is answered
+        // by doing LESS. The command is still dispatchable, so it is dispatched
+        // and answered plainly - the same bytes an Accept-less call would get.
+        REQUIRE(res->status == 200);
+        CHECK(res->get_header_value("Content-Type") == "application/json");
+        CHECK_FALSE(res->body.empty());
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "reserve_threw"}})
+                  .value() == 1.0);
+        // The lease taken before the throw went home with the optional.
+        CHECK(budget.active() == 0);
+        CHECK(metrics.gauge("yuzu_mcp_post_streams_active").value() == 0.0);
+    }
+
+    SECTION("arm THROWS post-dispatch -> parked, correlated error, execution stays RUNNING") {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        bridge.inject_arm_fault_for_test();
+
+        auto res = call_sse(exec_body(770, /*with_token=*/true));
+        // Post-dispatch: the command IS running, so this must not be a naked 500
+        // from httplib - it is an A4 error that tells the client how to recover.
+        REQUIRE(res->status == 500);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK(body["id"] == 770);
+        CHECK_FALSE(body["error"]["data"]["remediation"].is_null());
+        CHECK(body["error"]["data"]["remediation"].get<std::string>().find("execution_id") !=
+              std::string::npos);
+        // Parked, NOT abandoned: the subscription and any latched terminal survive
+        // so a GET resume still delivers the answer.
+        CHECK(bridge.phase_for(sid, nlohmann::json(770)) ==
+              smcp::McpStreamBridge::Phase::kRingOnly);
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "post_dispatch_threw"}})
+                  .value() == 1.0);
+        // The execution was dispatched and is still going, so it must NOT be
+        // marked cancelled - unlike the dispatch-throw and zero-agents paths.
+        auto rows = tracker.query_executions({});
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].status == "running");
+        CHECK(budget.active() == 0);
+    }
+
+    SECTION("cancel consumed while arming -> plain answer, no stream, slot returned") {
+        // request_cancel lands before arm, so arm degrades the streamed intent.
+        // The call is still perfectly answerable; a degraded answer beats an error.
+        ts.start_with_dispatch(
+            [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                const std::string&, const std::unordered_map<std::string, std::string>&,
+                const std::string&,
+                const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                (void)bridge.request_cancel(sid, nlohmann::json(780));
+                return {"cmd-cancelled", 2};
+            },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = call_sse(exec_body(780, /*with_token=*/true));
+        REQUIRE(res->status == 200);
+        CHECK(res->get_header_value("Content-Type") == "application/json");
+        CHECK_FALSE(res->body.empty());
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "arm_cancelled"}})
+                  .value() == 1.0);
+        CHECK(budget.active() == 0);
+        CHECK(metrics.gauge("yuzu_mcp_post_streams_active").value() == 0.0);
+    }
+
+    SECTION("zero agents reached -> plain response, no stream, nothing leaked") {
+        ts.start_with_dispatch(
+            [](const std::string&, const std::string&, const std::vector<std::string>&,
+               const std::string&, const std::unordered_map<std::string, std::string>&,
+               const std::string&,
+               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-none", 0}; },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = call_sse(exec_body(790, /*with_token=*/true));
+        REQUIRE(res->status == 200);
+        CHECK(res->get_header_value("Content-Type") == "application/json");
+        // Abandoned (not parked): nothing dispatched, so nothing is owed.
+        CHECK_FALSE(bridge.phase_for(sid, nlohmann::json(790)).has_value());
+        CHECK(budget.active() == 0);
+    }
+}
+
+// ── 2f PR 3b (C9): notifications/cancelled intercept ─────────────────────────
+TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR 3b C9)",
+          "[mcp][integration][bridge][2f][3b][cancel]") {
+    namespace smcp = yuzu::server::mcp;
+
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    struct Guard {
+        sqlite3* h;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+        }
+    } guard{db};
+
+    yuzu::server::ExecutionTracker tracker(db);
+    tracker.create_tables();
+    yuzu::server::ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+    yuzu::MetricsRegistry metrics;
+    smcp::McpSessionRegistry sessions{smcp::McpSessionRegistry::Config{}, {}, &metrics};
+    smcp::McpStreamBridge bridge{&bus, &sessions, &metrics};
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.session_registry_for_test = &sessions;
+    ts.metrics_for_test = &metrics;
+
+    auto minted = sessions.mint("test-user");
+    REQUIRE(minted.ok);
+    const auto sid = minted.session_id;
+    REQUIRE(sessions.stream_for(sid, "test-user") != nullptr);
+
+    const auto cancel_body = [](const std::string& request_id_json) {
+        return std::string(
+                   R"({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":)") +
+               request_id_json + "}}";
+    };
+    const auto post = [&](const std::string& body) {
+        return ts.call_raw("POST", body, {{"Mcp-Session-Id", sid}});
+    };
+    const auto cancel_count = [&](const char* outcome) {
+        return metrics.counter("yuzu_mcp_cancel_notifications_total", {{"outcome", outcome}})
+            .value();
+    };
+    // Only the live-streamed section below needs these; a streamed POST must be
+    // admitted by a real budget and must carry a progressToken.
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{.global_cap = 4}};
+    const auto exec_body = [](int id, bool with_token) {
+        std::string meta = with_token ? R"(,"_meta":{"progressToken":"tok-1"})" : "";
+        return std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":)") +
+               std::to_string(id) +
+               R"(,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"})" +
+               meta + "}}";
+    };
+
+    SECTION("a cancel for an in-flight request is recorded, and answered 202") {
+        ts.start_with_dispatch(
+            [](const std::string&, const std::string&, const std::vector<std::string>&,
+               const std::string&, const std::unordered_map<std::string, std::string>&,
+               const std::string&,
+               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        // Reserve leaves the record kArming, which is the only phase that has
+        // anything to cancel - request_cancel records INTENT and arm()/abandon()
+        // arbitrate it later.
+        REQUIRE(bridge.reserve(sid, "test-user", nlohmann::json(900), nlohmann::json("tok"),
+                               /*streamed_intent=*/false)
+                    .ok);
+
+        auto res = post(cancel_body("900"));
+        CHECK(res->status == 202);
+        CHECK(res->body.empty());
+        CHECK(cancel_count("accepted") == 1.0);
+        CHECK(cancel_count("noop") == 0.0);
+    }
+
+    SECTION("an unmatched cancel still answers 202 - no oracle for which ids are live") {
+        ts.start_with_dispatch(
+            [](const std::string&, const std::string&, const std::vector<std::string>&,
+               const std::string&, const std::unordered_map<std::string, std::string>&,
+               const std::string&,
+               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = post(cancel_body("12345"));
+        // Byte-identical to the matched case: a notification carries no outcome,
+        // and differing here would tell a caller which request ids exist.
+        CHECK(res->status == 202);
+        CHECK(res->body.empty());
+        CHECK(cancel_count("noop") == 1.0);
+        CHECK(cancel_count("accepted") == 0.0);
+    }
+
+    SECTION("the id is taken VERBATIM - \"900\" is not 900") {
+        ts.start_with_dispatch(
+            [](const std::string&, const std::string&, const std::vector<std::string>&,
+               const std::string&, const std::unordered_map<std::string, std::string>&,
+               const std::string&,
+               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        REQUIRE(bridge.reserve(sid, "test-user", nlohmann::json(900), nlohmann::json("tok"),
+                               /*streamed_intent=*/false)
+                    .ok);
+
+        // JSON-RPC ids are opaque: the string "900" addresses a DIFFERENT request
+        // from the number 900. Coercing them together would cancel the wrong one.
+        auto res = post(cancel_body(R"("900")"));
+        CHECK(res->status == 202);
+        CHECK(cancel_count("noop") == 1.0);
+        CHECK(cancel_count("accepted") == 0.0);
+    }
+
+    SECTION("other notifications and id-bearing requests are untouched") {
+        ts.start_with_dispatch(
+            [](const std::string&, const std::string&, const std::vector<std::string>&,
+               const std::string&, const std::unordered_map<std::string, std::string>&,
+               const std::string&,
+               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        // A different notification: still 202, and nothing counted - the intercept
+        // must not widen to every notification that happens to carry params.
+        auto other = post(
+            R"({"jsonrpc":"2.0","method":"notifications/initialized","params":{"requestId":900}})");
+        CHECK(other->status == 202);
+        CHECK(other->body.empty());
+        CHECK(cancel_count("accepted") == 0.0);
+        CHECK(cancel_count("noop") == 0.0);
+
+        // An id-bearing request NAMED like the notification is a request, not a
+        // cancellation: it gets a real JSON-RPC response, never a bare 202.
+        auto with_id = post(
+            R"({"jsonrpc":"2.0","id":901,"method":"notifications/cancelled","params":{"requestId":900}})");
+        CHECK(with_id->status != 202);
+        CHECK_FALSE(with_id->body.empty());
+        CHECK(cancel_count("accepted") == 0.0);
+        CHECK(cancel_count("noop") == 0.0);
+    }
+
+    SECTION("a cancel for a LIVE streamed POST detaches the response, not the execution") {
+        // THE path the adversarial review found missing: everything else in this
+        // TEST_CASE exercises a kArming record, where a cancel only records intent.
+        // A request that has actually been armed and is holding an SSE response
+        // open is the case a real client hits, and it went unimplemented because no
+        // test ever sent a cancel to one.
+        ts.stream_budget_for_test = &budget;
+        ts.start_with_dispatch(
+            [](const std::string&, const std::string&, const std::vector<std::string>&,
+               const std::string&, const std::unordered_map<std::string, std::string>&,
+               const std::string&,
+               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9live", 2}; },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        // Held open deliberately: the Response must stay alive so the record stays
+        // kStreaming while the cancel arrives, exactly as it would on a live wire.
+        auto streamed = ts.call_raw("POST", exec_body(910, /*with_token=*/true),
+                                    {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
+        REQUIRE(streamed->status == 200);
+        REQUIRE(streamed->get_header_value("Content-Type") == "text/event-stream");
+        REQUIRE(bridge.phase_for(sid, nlohmann::json(910)) ==
+                smcp::McpStreamBridge::Phase::kStreaming);
+        const auto rows_before = tracker.query_executions({}).size();
+
+        auto res = post(cancel_body("910"));
+        CHECK(res->status == 202);
+        CHECK(cancel_count("detached") == 1.0); // acted on, not merely recorded
+        CHECK(cancel_count("noop") == 0.0);
+        CHECK(cancel_count("accepted") == 0.0);
+
+        // The RESPONSE is finished with: its sink is closed, so the pump ends on
+        // its next tick and the releaser parks the record.
+        CHECK(bridge.post_sink_closed_for_test(sid, nlohmann::json(910)));
+
+        // The EXECUTION is untouched - still there, still running. A cancel that
+        // silently stopped a dispatched fleet change would be far worse than one
+        // that did nothing.
+        REQUIRE(tracker.query_executions({}).size() == rows_before);
+        auto rows = tracker.query_executions({});
+        REQUIRE_FALSE(rows.empty());
+        CHECK(rows[0].status == "running");
+    }
+
+    SECTION("a malformed cancel is still a notification - 202, nothing counted") {
+        ts.start_with_dispatch(
+            [](const std::string&, const std::string&, const std::vector<std::string>&,
+               const std::string&, const std::unordered_map<std::string, std::string>&,
+               const std::string&,
+               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+            "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto no_params = post(R"({"jsonrpc":"2.0","method":"notifications/cancelled"})");
+        CHECK(no_params->status == 202);
+        auto no_request_id =
+            post(R"({"jsonrpc":"2.0","method":"notifications/cancelled","params":{}})");
+        CHECK(no_request_id->status == 202);
+        CHECK(cancel_count("accepted") == 0.0);
+        CHECK(cancel_count("noop") == 0.0);
+    }
+}
+
+// ── C10: chaos P0 endpoint reproductions, handler half ───────────────────────
+TEST_CASE("CH-5/CH-6: streamed POSTs debit the shared budget and leave the plain path alone",
+          "[mcp][integration][bridge][2f][chaos][ch5][ch6]") {
+    namespace smcp = yuzu::server::mcp;
+
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    struct Guard {
+        sqlite3* h;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+        }
+    } guard{db};
+
+    yuzu::server::ExecutionTracker tracker(db);
+    tracker.create_tables();
+    yuzu::server::ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+    yuzu::MetricsRegistry metrics;
+    smcp::McpSessionRegistry sessions{smcp::McpSessionRegistry::Config{}, {}, &metrics};
+    smcp::McpStreamBridge bridge{&bus, &sessions, &metrics};
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.session_registry_for_test = &sessions;
+    ts.metrics_for_test = &metrics;
+
+    auto minted = sessions.mint("test-user");
+    REQUIRE(minted.ok);
+    const auto sid = minted.session_id;
+    REQUIRE(sessions.stream_for(sid, "test-user") != nullptr);
+
+    const auto exec_body = [](int id, bool with_token) {
+        std::string meta = with_token ? R"(,"_meta":{"progressToken":"tok-1"})" : "";
+        return std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":)") +
+               std::to_string(id) +
+               R"(,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"})" +
+               meta + "}}";
+    };
+    auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
+                       const std::string&, const std::unordered_map<std::string, std::string>&,
+                       const std::string&,
+                       const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+        return {"cmd-ch56", 2};
+    };
+
+    SECTION("CH-5: a GET channel and a streamed POST spend the SAME global budget") {
+        // Decision 15(h): ONE budget across every held-open surface, because they
+        // all pin the same worker pool. A global cap of exactly 1 makes the two
+        // surfaces compete for one slot, which is the only way to prove they are
+        // not each quietly counting their own.
+        yuzu::server::detail::StreamBudget shared{
+            yuzu::server::detail::StreamBudget::Config{.global_cap = 1}};
+        ts.stream_budget_for_test = &shared;
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto get_stream = ts.call_raw("GET", "", {{"Mcp-Session-Id", sid},
+                                                  {"Accept", "text/event-stream"}});
+        REQUIRE(get_stream->status == 200);
+        REQUIRE(shared.active() == 1);
+
+        // The POST is refused by the budget the GET is holding.
+        auto streamed = ts.call_raw("POST", exec_body(800, /*with_token=*/true),
+                                    {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
+        CHECK(streamed->status == 429);
+        CHECK(nlohmann::json::parse(streamed->body)["error"]["code"] == smcp::kMcpStreamCap);
+        CHECK(metrics.counter("yuzu_mcp_stream_rejects_total", {{"reason", "post_global_cap"}})
+                  .value() == 1.0);
+        // Reject-not-evict: the GET channel keeps its slot.
+        CHECK(shared.active() == 1);
+    }
+
+    SECTION("CH-6: with the stream budget fully spent, the PLAIN path is untouched") {
+        // The starvation question: caps exist so held-open responses cannot eat
+        // the worker pool out from under ordinary request/response traffic. A
+        // plain tool call must not even consult the budget.
+        yuzu::server::detail::StreamBudget shared{
+            yuzu::server::detail::StreamBudget::Config{.global_cap = 1}};
+        ts.stream_budget_for_test = &shared;
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto held = ts.call_raw("POST", exec_body(810, /*with_token=*/true),
+                                {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
+        REQUIRE(held->status == 200);
+        REQUIRE(shared.active() == 1); // saturated
+
+        // Same tool, same session, no SSE Accept: served normally.
+        auto plain = ts.call_raw("POST", exec_body(811, /*with_token=*/false),
+                                 {{"Mcp-Session-Id", sid}});
+        CHECK(plain->status == 200);
+        CHECK(plain->get_header_value("Content-Type") == "application/json");
+        CHECK_FALSE(plain->body.empty());
+        // And it spent nothing: a plain response holds no worker open.
+        CHECK(shared.active() == 1);
+    }
+
+    SECTION("the streamed arm ADOPTS the engine quota slot (C8 debt, not a tautology)") {
+        // The existing chokepoint coverage calls adopt_quota_slot_into_stream by
+        // hand, so it stays green even if the handler never calls it. This drives
+        // the REAL handler and watches the thread_local: the slot leaving it is
+        // proof the adopter ran at the install site, and in_flight surviving until
+        // the Response dies is proof the slot now tracks the STREAM's lifetime
+        // rather than the request's.
+        using yuzu::server::detail::tls_quota_slot;
+        tls_quota_slot().reset();
+
+        yuzu::server::PrincipalQuota quota{
+            yuzu::server::PrincipalQuotaConfig{.max_concurrency = 4}};
+        auto slot = quota.try_acquire("engine:ch6", yuzu::server::QuotaSide::kEngine);
+        REQUIRE(slot.admitted());
+        REQUIRE(quota.in_flight("engine:ch6") == 1);
+        tls_quota_slot() = std::move(slot);
+
+        yuzu::server::detail::StreamBudget shared{
+            yuzu::server::detail::StreamBudget::Config{.global_cap = 4}};
+        ts.stream_budget_for_test = &shared;
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        {
+            auto streamed = ts.call_raw("POST", exec_body(820, /*with_token=*/true),
+                                        {{"Mcp-Session-Id", sid},
+                                         {"Accept", "text/event-stream"}});
+            REQUIRE(streamed->status == 200);
+            REQUIRE(streamed->get_header_value("Content-Type") == "text/event-stream");
+            // Moved OUT of the thread_local by the adopter. Left behind, it would
+            // be released at post-routing while the stream was still running -
+            // exactly the accounting hole the registry contract warns about.
+            CHECK_FALSE(tls_quota_slot().has_value());
+            CHECK(quota.in_flight("engine:ch6") == 1); // still held, for the stream
+        }
+        // The Response died, so its releaser ran and the slot went home.
+        CHECK(quota.in_flight("engine:ch6") == 0);
+        tls_quota_slot().reset();
     }
 }

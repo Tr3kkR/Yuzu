@@ -6,6 +6,7 @@
 #include <yuzu/server/auth.hpp>
 
 #include "approval_manager.hpp"
+#include "authz_model.hpp" // yuzu::server::authz::VisibleSet (K-R7-02 / #1788)
 #include "custom_properties_store.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
@@ -57,11 +58,23 @@ public:
     /// loopback agent could reply before the post-dispatch
     /// register-mapping call). Empty `execution_id` skips registration
     /// (callers that don't track executions, e.g. raw command path).
+    ///
+    /// K-R7-02: the trailing `exec_visible` carries the caller's
+    /// Execution:Execute visible set so workflow/instruction dispatch narrows to
+    /// it via the shared `dispatch_confined` seam, exactly as /api/command and
+    /// MCP do. nullopt == unfiltered (background/system callers only).
     using CommandDispatchFn = std::function<std::pair<std::string, int>(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,
-        const std::string& execution_id)>;
+        const std::string& execution_id, const yuzu::server::authz::VisibleSet& exec_visible)>;
+
+    /// K-R7-02: resolves the caller's Execution:Execute visible set from the
+    /// request. Wired in server.cpp to a closure that resolves the session and
+    /// calls `derive_exec_visible`; an UNWIRED callback fails CLOSED (the handler
+    /// passes a present-EMPTY set — deny all, never nullopt).
+    using ExecVisibleFn =
+        std::function<yuzu::server::authz::VisibleSet(const httplib::Request&)>;
 
     /// PR 2.5 — deps-struct refactor (#670).
     ///
@@ -91,6 +104,10 @@ public:
         InstructionStore* instruction_store{nullptr};
         PolicyStore* policy_store{nullptr};
         CommandDispatchFn command_dispatch_fn;
+        /// K-R7-02: per-request Execution:Execute visible-set derivation for the
+        /// execute handlers. nullptr → the handlers fail CLOSED (present-empty
+        /// visible set, deny all) rather than dispatching unfiltered.
+        ExecVisibleFn exec_visible_fn;
         ApprovalManager* approval_manager{nullptr};
         ResponseStore* response_store{nullptr};
         /// PR 3 — per-execution SSE event bus for `/sse/executions/{id}`.
