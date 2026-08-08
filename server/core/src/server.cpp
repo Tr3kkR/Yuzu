@@ -1004,14 +1004,23 @@ public:
         // currently. `reason=unsupported_encoding` (D4 hardening) is seeded
         // for EVERY class, unconditionally: a non-identity Content-Encoding
         // is refused regardless of `requires_measurable`, so every class can
-        // reach it.
+        // reach it. `reason=over_cap_post_read` (body-cap-post-read-stage) is ALSO
+        // seeded for EVERY class, unconditionally — unlike `unmeasurable`,
+        // this is not gated on `requires_measurable`: the post-read stage
+        // (this file's `set_pre_request_handler`) is the backstop for every
+        // class that admits an unmeasurable body up to httplib's own 100 MiB
+        // backstop, which today is every class but /mcp/, and in principle
+        // any class could reach it if a future table edit ever widened a
+        // measured cap past what a handler can actually process.
         metrics_.describe(
             "yuzu_body_cap_rejected_total",
             "Pre-auth request-body cap rejections by route class and reason "
-            "(over_cap: measured and over the class's cap; unmeasurable: a "
-            "chunked/undeclared body refused outright for a class that "
-            "requires one it can size; unsupported_encoding: a non-identity "
-            "Content-Encoding, refused on every class)",
+            "(over_cap: measured and over the class's cap, pre-read; "
+            "unmeasurable: a chunked/undeclared body refused outright for a "
+            "class that requires one it can size; unsupported_encoding: a "
+            "non-identity Content-Encoding, refused on every class; "
+            "over_cap_post_read: the body was read in full — because it could not be "
+            "sized in advance — and turned out to be over the class's cap)",
             "counter");
         for (const auto& entry : yuzu::server::kBodyCapTable) {
             metrics_.counter("yuzu_body_cap_rejected_total",
@@ -1020,6 +1029,9 @@ public:
             metrics_.counter("yuzu_body_cap_rejected_total",
                              {{"path_class", std::string(entry.path_class)},
                               {"reason", "unsupported_encoding"}});
+            metrics_.counter("yuzu_body_cap_rejected_total",
+                             {{"path_class", std::string(entry.path_class)},
+                              {"reason", "over_cap_post_read"}});
             if (entry.requires_measurable) {
                 metrics_.counter("yuzu_body_cap_rejected_total",
                                  {{"path_class", std::string(entry.path_class)},
@@ -8160,6 +8172,152 @@ private:
             }
 
             return httplib::Server::HandlerResponse::Unhandled;
+        });
+
+        // -- Post-read pre-auth body cap, second stage (body-cap-post-read) -----
+        // The pre-routing gate above bounds the DECLARED size of a request
+        // whose framing lets it be measured in advance (a Content-Length the
+        // class's cap can be checked against before anything is read off the
+        // socket). It has a structural limit, recorded in body_cap_policy.hpp's
+        // KNOWN LIMITATION paragraph: on any class with `requires_measurable ==
+        // false` (24 of 25 rows) a genuine chunked — or otherwise unmeasurable
+        // — body is NOT size-checked there at all; it falls through to
+        // httplib's own 100 MiB backstop (`CPPHTTPLIB_PAYLOAD_MAX_LENGTH`) and
+        // is handed to the route handler uncapped by this table. This second
+        // stage closes that hole from the other side: httplib's
+        // `pre_request_handler_` (httplib.h `Server::dispatch_request`, called
+        // from `routing()` only once the pre-routing handler above has
+        // returned Unhandled) runs AFTER `read_content` has consumed the body
+        // off the socket into `req.body` and AFTER the route MATCHED
+        // (`req.matched_route` is set), but BEFORE the route's own handler
+        // runs. That ordering means this stage can compare the body's ACTUAL,
+        // now-known size against the same `resolve_body_cap` table the
+        // pre-routing gate uses — the one table, never forked — and refuse a
+        // request the earlier stage could not size before admitting it.
+        //
+        // The two stages are complementary, not redundant: pre-routing bounds
+        // what the server will ever BUFFER (a rejection there costs a header
+        // parse, never the body itself); this stage bounds what reaches a
+        // route HANDLER, and — because the body is already fully read off the
+        // socket by the time this runs — a rejection here leaves the
+        // connection in a clean state, unlike a pre-routing rejection, which
+        // necessarily leaves an unread body still queued on the wire (see the
+        // pre-routing handler's own D5 comment above). For a MEASURABLE
+        // over-cap body the pre-routing gate has already refused the request
+        // before dispatch_request is ever reached, so in practice this stage
+        // fires almost exclusively for the chunked/unmeasurable case the
+        // earlier gate deliberately admits.
+        //
+        // ROUTE-MATCH GATED, NOT UNIVERSAL: httplib's `dispatch_request` only
+        // invokes `pre_request_handler_` once a route has MATCHED (see the
+        // vendored httplib.h) — an unmatched path (a 404) never reaches this
+        // handler at all. Do not read this as a second universal pre-auth
+        // gate; the pre-routing handler above is that gate, and this is a
+        // narrower backstop that runs strictly behind it.
+        //
+        // MULTIPART LIMITATION, recorded rather than implied away: httplib's
+        // `read_content` only appends bytes to `req.body` on the
+        // NON-multipart branch; a `multipart/form-data` request's content
+        // lands in `req.form.files`/`req.form.fields` instead, so
+        // `req.body.size()` reads 0 for the table's one multipart class
+        // (`plugin_trust_bundle`) regardless of the real bytes read off the
+        // wire. That class's unmeasurable-body hole is NOT closed by this
+        // stage.
+        //
+        // Same table, same `path_class` label (never the attacker-controlled
+        // `req.path`), same 413 A4/SCIM envelope shapes, and the same
+        // per-reason log throttle as the pre-routing gate. `reason=over_cap_post_read`
+        // is its own value on `yuzu_body_cap_rejected_total` — pre-seeded for
+        // EVERY class in the boot-time seeding loop above — so an `absent()`
+        // alert can tell "this stage never fired" from "this stage isn't
+        // deployed".
+        //
+        // DOES NOT DOUBLE-COUNT: httplib's routing() returns immediately once
+        // the pre-routing handler above answers Handled, without ever calling
+        // dispatch_request — so a request the pre-routing gate already
+        // refused can never also reach this handler for the same request.
+        //
+        // CONTAIN THE WHOLE BLOCK (governance Gate 8, security + cpp-safety) —
+        // same reasoning as `enforce_pre_auth_body_cap` above: httplib invokes
+        // `pre_request_handler_` from the same unguarded call sites (routing's
+        // ordinary dispatch AND the WebSocket-upgrade path), and
+        // `ThreadPool::worker` runs tasks bare, so an escaped exception here
+        // is `std::terminate`.
+        //
+        // `[this]` ONLY. The httplib member function that invokes this
+        // handler (`Server::dispatch_request`) is `const`, but that constness
+        // is on httplib::Server's own members — it says nothing about what
+        // this lambda captures. `this` is the ServerImpl pointer, copied by
+        // value; calling `metrics_`/logging through it is unaffected. There
+        // are no pre-routing-handler locals in scope to capture by reference
+        // here, and none should be added — httplib can invoke
+        // `pre_request_handler_` from two distinct call sites
+        // (`dispatch_request` and `dispatch_request_for_content_reader`), so a
+        // captured reference to something scoped to one request's stack frame
+        // would be a dangling-reference hazard on the other.
+        web_server_->set_pre_request_handler([this](const httplib::Request& req,
+                                                     httplib::Response& res)
+                                                  -> httplib::Server::HandlerResponse {
+            try {
+                const auto cap_match = resolve_body_cap(req.method, req.path);
+                if (req.body.size() <= cap_match.max_body_bytes) {
+                    return httplib::Server::HandlerResponse::Unhandled;
+                }
+
+                static std::atomic<std::uint64_t> post_read_hits{0};
+                constexpr std::uint64_t kBodyLogEvery = 100;
+                if (post_read_hits.fetch_add(1, std::memory_order_relaxed) %
+                        kBodyLogEvery ==
+                    0) {
+                    spdlog::warn(
+                        "[#2407 post-read] rejected {} {} from {}: body {} bytes read, "
+                        "over the {}-byte cap (class={}, 1 log per {} rejections; the "
+                        "counter records all)",
+                        onbehalf::sanitize_for_log(req.method, 16),
+                        onbehalf::sanitize_for_log(req.path),
+                        onbehalf::sanitize_for_log(req.remote_addr, 64), req.body.size(),
+                        cap_match.max_body_bytes, cap_match.path_class, kBodyLogEvery);
+                }
+                try {
+                    metrics_
+                        .counter("yuzu_body_cap_rejected_total",
+                                 {{"path_class", std::string(cap_match.path_class)},
+                                  {"reason", "over_cap_post_read"}})
+                        .increment();
+                } catch (...) { // NOLINT(bugprone-empty-catch)
+                    // Observability must never kill the process from this
+                    // handler either — same reasoning as the pre-routing
+                    // gate's own metric try/catch above.
+                }
+
+                res.status = 413;
+                if (cap_match.path_class == "scim") {
+                    // D7 parity: same RFC 7644 §3.12 envelope the pre-routing
+                    // gate's SCIM branch uses.
+                    res.set_content(
+                        scim::error(413, "request body too large").dump(),
+                        "application/scim+json");
+                } else {
+                    res.set_content(
+                        detail::a4_denial(
+                            res, 413, "request body exceeds this route's size cap",
+                            detail::A4ErrorOpts{
+                                .remediation =
+                                    "reduce the request body size; see "
+                                    "docs/user-manual/rest-api.md for the per-route "
+                                    "limit"}),
+                        "application/json");
+                }
+                return httplib::Server::HandlerResponse::Handled;
+            } catch (...) { // NOLINT(bugprone-empty-catch)
+                // Last-resort containment for the whole block — see
+                // `enforce_pre_auth_body_cap`'s identical catch above. No
+                // envelope can be built once we are here, but the request
+                // must still be refused rather than let the throw reach an
+                // unguarded httplib call site.
+                res.status = 413;
+                return httplib::Server::HandlerResponse::Handled;
+            }
         });
 
         // -- Auth routes (login, logout, OIDC) — delegated to AuthRoutes --------
