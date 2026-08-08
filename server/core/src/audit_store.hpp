@@ -442,11 +442,18 @@ public:
     /// TWO CLOCKS FEED THIS GAUGE, and the difference is deliberate (#2854).
     ///   * AT CONSTRUCTION, and again after a successful `migrate_from_sqlite`,
     ///     it is SEEDED from the durable `audit_retention_meta` anchor
-    ///     (`last_pass_now`), which holds POSTGRESQL's clock — the one
-    ///     authority every replica serialises through (see the long note at
-    ///     `cleanup_once`'s advisory-lock transaction). That is what makes it
-    ///     survive a restart, including the FIRST Postgres boot, where the
-    ///     anchor is only copied by the legacy backfill.
+    ///     (`last_pass_now`), which — once at least one `cleanup_once` pass
+    ///     has run on Postgres — holds POSTGRESQL's clock, the one authority
+    ///     every replica serialises through (see the long note at
+    ///     `cleanup_once`'s advisory-lock transaction). ONE EXCEPTION: on the
+    ///     very first Postgres boot, before any `cleanup_once` pass has run,
+    ///     the anchor is a value copied verbatim from the retired SQLite
+    ///     predecessor's own `last_pass_now` — stamped by ITS `cleanup_once`
+    ///     from whatever caller clock that single-process store used, not
+    ///     Postgres's. Still a real epoch-seconds reading, just not from the
+    ///     authority the rest of this comment describes. That is what makes
+    ///     it survive a restart, including the FIRST Postgres boot, where
+    ///     the anchor is only copied by the legacy backfill.
     ///   * ON EVERY SUBSEQUENT PASS it is overwritten with the CALLER's
     ///     process clock (`cleanup_once`), which is a liveness signal only and
     ///     drives no decision.
@@ -472,10 +479,29 @@ public:
     ///     plausible range `cleanup_once` itself enforces (`kMaxPlausibleNow`).
     ///     Never laundered into `0`, so none of these can silently earn the
     ///     liveness family's "never ran" grace. Self-corrects at the next
-    ///     `cleanup_once` pass. External prose (docs, alert-rule comments)
-    ///     should say "could not be READ OR TRUSTED as a plausible integer"
-    ///     rather than re-deriving this list — the four causes are recorded
-    ///     here, once, so they don't drift across sites (#2854 fold round 2).
+    ///     ATTEMPTED `cleanup_once` pass — not "successful": the stamp at
+    ///     the top of that function runs before the transaction, the
+    ///     advisory lock, or any decision, so even a declined or failed
+    ///     pass clears the sentinel. External prose (docs, alert-rule
+    ///     comments) should say "could not be READ OR TRUSTED as a
+    ///     plausible integer" and "the next attempted pass" rather than
+    ///     re-deriving this — the causes and the correction condition are
+    ///     recorded here, once, so they don't drift across sites (#2854
+    ///     fold round 3).
+    ///
+    /// KNOWN LIMITATION, not fixed here, deferred to the rung-D rule
+    /// redesign (#2854): neither `0` nor `INT64_MIN` is actually RESERVED.
+    /// `cleanup_once` has no lower bound on the caller-supplied clock it
+    /// stamps here (only `now > kMaxPlausibleNow` is rejected), so a caller
+    /// passing exactly `0` or exactly `INT64_MIN` would be stamped as a
+    /// live reading, indistinguishable from "never ran" or the anomaly
+    /// sentinel respectively. In practice `run_cleanup`'s only real caller
+    /// passes `std::chrono::system_clock::now()`, which cannot plausibly
+    /// produce either value — this is a theoretical collision on the
+    /// current code, not a reachable one — but the redesigned rule family
+    /// this gauge feeds should reserve these values explicitly (or widen
+    /// its own documented meaning to cover "live but unusable") rather than
+    /// inherit an assumption this comment cannot actually guarantee.
     std::int64_t last_pass_unixtime() const noexcept {
         return last_pass_unixtime_.load(std::memory_order_relaxed);
     }

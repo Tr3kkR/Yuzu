@@ -98,12 +98,23 @@ bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
 // be rejected on sign alone.
 constexpr std::int64_t kMaxPlausibleNow = std::numeric_limits<std::int64_t>::max() / 4;
 
-// Strict integer parse for a durable meta-table TEXT value — no partial
-// parse, no leading/trailing junk, no locale surprises. Shared by the
-// retention decision (`cleanup_once`'s `last_pass_now` read) and the
-// liveness-gauge seed (`seed_last_pass_from_anchor`, #2854) so both treat
-// "not a clean integer" as the same anomaly rather than two independently
-// maintained `strtoll` call sites drifting apart.
+// Strict integer parse for a durable meta-table TEXT value — no trailing
+// junk (checked: `*end != '\0'`), no partial parse. NOT locale-independent
+// and NOT leading-junk-free in the way this comment used to imply: `strtoll`
+// silently accepts and skips LEADING whitespace (" 123" parses to 123, per
+// the C standard), and its digit-grouping/sign handling follows the process
+// locale. Neither matters for this file's actual writers — `std::to_string`
+// on an `int64_t` (this file) and `sqlite3_column_int64`-derived text (the
+// legacy backfill) never produce leading whitespace or locale-formatted
+// output — but a hand-edited row could, and would be silently accepted
+// rather than rejected as this comment once claimed. `std::from_chars`
+// would close that gap; not done here (#2854 fold round 3 found it, not
+// fixed it — low value against this file's actual writers).
+//
+// Shared by the retention decision (`cleanup_once`'s `last_pass_now` read)
+// and the liveness-gauge seed (`seed_last_pass_from_anchor`, #2854) so both
+// treat "not a clean integer" as the same anomaly rather than two
+// independently maintained `strtoll` call sites drifting apart.
 [[nodiscard]] std::optional<std::int64_t> parse_meta_i64(const std::string& val) {
     errno = 0;
     char* end = nullptr;

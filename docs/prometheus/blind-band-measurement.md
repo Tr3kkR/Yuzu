@@ -61,7 +61,8 @@ durable anchor at construction and again after the legacy backfill, so it
 survives a restart (including the first PostgreSQL boot). A value of INT64_MIN
 (-9223372036854775808) is a distinct anomaly sentinel — the durable anchor
 could not be read or trusted as a plausible integer — not a genuine
-timestamp, and self-corrects at the next successful pass; a future rule must exclude it
+timestamp, and self-corrects at the next ATTEMPTED pass — not necessarily a
+successful one, every attempt stamps this before deciding anything; a future rule must exclude it
 explicitly, same as the dead-CMOS negative case below. What remains open
 is the RULE that consumes it — the redesigned rule family, gated by a sweep
 against a committed manifest of silent cadences, still needs to land. The
