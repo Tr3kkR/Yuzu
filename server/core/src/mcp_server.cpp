@@ -3393,9 +3393,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         // and its write unchecked, so nothing can alert on it.
                         // The counter gives an operator a refusal RATE.
                         //
-                        // It deliberately carries NO reason label. The denial
-                        // token is exactly the distinction the client response
-                        // below refuses to make, and `/metrics` is not a
+                        // It deliberately carries NO reason label. A store
+                        // failure is already exposed via the response code
+                        // (-32603 vs -32003); what the audit token carries
+                        // and this counter withholds is the split WITHIN a
+                        // -32003 denial - foreign_origin vs an ordinary
+                        // replay - which is the distinction the client
+                        // response below refuses to make. `/metrics` is not a
                         // stronger reader than the caller: it is exempt for
                         // localhost and otherwise needs only a resolved
                         // session — the same credential the MCP caller already
