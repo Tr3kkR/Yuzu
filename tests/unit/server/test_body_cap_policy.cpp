@@ -97,7 +97,8 @@ constexpr ExpectedResolution kExpected[] = {
     {"POST",   "/api/settings/ca/import-chain",           512u * 1024,        false, "ca_import_chain_dashboard"},
     // settings_routes.cpp:3445,:3461, doubled for multipart framing overhead.
     {"POST",   "/api/settings/plugin-signing/upload",     512u * 1024,        false, "plugin_trust_bundle"},
-    // scim_routes.cpp:65 kMaxBodyBytes, three mutating methods.
+    // scim_routes.cpp:65 kMaxBodyBytes. ANY method — see the method-independence
+    // case below for why this is deliberately not scoped to the mutating verbs.
     {"POST",   "/scim/v2/Users",                          64u * 1024,         false, "scim"},
     {"PUT",    "/scim/v2/Users/deadbeef",                 64u * 1024,         false, "scim"},
     {"PATCH",  "/scim/v2/Users/deadbeef",                 64u * 1024,         false, "scim"},
@@ -215,12 +216,24 @@ TEST_CASE("resolve_body_cap: same prefix, different method -> different entry",
     CHECK(get.path_class == "default");
     CHECK(get.max_body_bytes == 4u * 1024 * 1024);
 
-    // SCIM: PATCH and PUT are in the table; DELETE (no route-registered
-    // body) is not, and must fall through rather than silently inherit.
-    const auto scim_patch = resolve_body_cap("PATCH", "/scim/v2/Users/deadbeef");
-    CHECK(scim_patch.path_class == "scim");
-    const auto scim_delete = resolve_body_cap("DELETE", "/scim/v2/Users/deadbeef");
-    CHECK(scim_delete.path_class == "default");
+    // SCIM is the DELIBERATE COUNTER-EXAMPLE: its row is kBodyCapAnyMethod,
+    // so every verb on the prefix resolves to the same 64 KiB class.
+    //
+    // This previously asserted the opposite — that DELETE "must fall through
+    // rather than silently inherit", on the stated grounds that DELETE has no
+    // route-registered body. Both halves were wrong. SCIM DELETE routes are
+    // real (scim_routes.cpp:1577, :2316), and an adversarial review showed the
+    // method-scoping let any verb switch drop the whole prefix to the 4 MiB
+    // catch-all, 64x this class's bound, on a prefix that is session-auth-
+    // exempt and buffered before the in-handler bearer check. The test had
+    // frozen that as intent. Kept inverted as a regression guard: narrowing
+    // the row back to the mutating verbs re-breaks here.
+    for (const auto* method : {"POST", "PUT", "PATCH", "DELETE", "OPTIONS", "GET"}) {
+        const auto scim = resolve_body_cap(method, "/scim/v2/Users/deadbeef");
+        INFO("method=" << method);
+        CHECK(scim.path_class == "scim");
+        CHECK(scim.max_body_bytes == 64u * 1024);
+    }
 }
 
 // ── 4. Longest match wins ─────────────────────────────────────────────────
@@ -285,7 +298,7 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // guardian_rule_authoring(2: POST create + PUT update) +
     // workflow_yaml(1) + product_pack_yaml(1) + instruction_import(1) +
     // instruction_yaml(3: save/validate/preview) + default(1).
-    CHECK(std::size(kBodyCapTable) == 27);
+    CHECK(std::size(kBodyCapTable) == 25);
 }
 
 // ── 7. requires_measurable: ON for /mcp/, OFF for the named public classes ──

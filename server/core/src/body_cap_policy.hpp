@@ -249,15 +249,25 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     {"POST", "/api/settings/plugin-signing/upload", 512u * 1024, false,
      "plugin_trust_bundle"},
 
-    // SCIM mutations — scim_routes.cpp:65 kMaxBodyBytes, currently checked
-    // only AFTER buffering (first call site :827). This moves the same
-    // bound BEFORE the buffer. Three entries (POST create, PUT replace,
-    // PATCH partial-update), one path prefix shared by both /Users and
-    // /Groups sub-resources (scim_routes.cpp's six route registrations all
-    // resolve under "/scim/v2/").
-    {"POST", "/scim/v2/", 64u * 1024, false, "scim"},
-    {"PUT", "/scim/v2/", 64u * 1024, false, "scim"},
-    {"PATCH", "/scim/v2/", 64u * 1024, false, "scim"},
+    // SCIM — scim_routes.cpp:65 kMaxBodyBytes, currently checked only AFTER
+    // buffering (first call site :827). This moves the same bound BEFORE the
+    // buffer. One path prefix covers both /Users and /Groups sub-resources
+    // (scim_routes.cpp's route registrations all resolve under "/scim/v2/").
+    //
+    // ANY-METHOD, deliberately, and do NOT narrow this back to the three
+    // mutating verbs. An adversarial review found that method-scoping let a
+    // verb switch (DELETE, OPTIONS, or a GET carrying a body) drop the whole
+    // prefix to the 4 MiB catch-all — 64x this class's bound. That is not a
+    // widening in the capability sense, since the catch-all already offers
+    // 4 MiB on every (method, path) by explicit reviewed decision, which is
+    // why it was adjudicated MEDIUM rather than blocking. It is still wrong
+    // here specifically: SCIM DELETE routes are real (scim_routes.cpp:1577,
+    // :2316), every /scim/v2/* path is session-auth-exempt, and httplib
+    // buffers before the in-handler require_bearer runs — so this prefix is
+    // reachable pre-auth on more verbs than the three that mutate. A class
+    // whose bound is justified by the shape of its payload should not depend
+    // on the verb used to deliver it.
+    {kBodyCapAnyMethod, "/scim/v2/", 64u * 1024, false, "scim"},
 
     // POST /saml/acs — SAML assertion consumer service
     // (auth_routes.cpp:2794-2798, kSamlMaxBodyBytes). A legitimate signed
