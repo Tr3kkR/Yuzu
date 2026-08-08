@@ -4035,6 +4035,20 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto instr_id = param_str(args, "instruction_id");
                 AggregationQuery aq;
                 aq.group_by = param_str(args, "group_by");
+                // Validate against aggregate()'s own allow-list BEFORE calling
+                // in (#2691, Doomgoose finding #2): an allow-list miss inside
+                // aggregate() returns nullopt, which this handler otherwise
+                // maps unconditionally to kInternalError below — a typo'd
+                // group_by would read as store degradation for a healthy
+                // database. Bad client input is kInvalidParams, not
+                // kInternalError.
+                if (std::find(ResponseStore::allowed_group_by().begin(),
+                              ResponseStore::allowed_group_by().end(),
+                              aq.group_by) == ResponseStore::allowed_group_by().end()) {
+                    res.set_content(error_response(id, kInvalidParams, "invalid group_by"),
+                                    "application/json");
+                    return;
+                }
                 auto agg_str = param_str(args, "aggregate", "count");
                 if (agg_str == "sum")
                     aq.op = AggregateOp::Sum;

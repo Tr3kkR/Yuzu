@@ -9870,10 +9870,38 @@ private:
             else if (op_str == "max")
                 op = AggregateOp::Max;
 
+            // Validate CLIENT input against ResponseStore::aggregate()'s own
+            // allow-lists BEFORE calling in (#2691, Doomgoose finding #2): an
+            // allow-list miss inside aggregate() itself returns nullopt,
+            // which this handler otherwise maps unconditionally to 503 "store
+            // degraded" below — a typo'd group_by/op_column would page the
+            // degrade alert for a healthy database. Bad TARGETED client input
+            // is a 400, not a 503.
+            if (std::find(ResponseStore::allowed_group_by().begin(),
+                          ResponseStore::allowed_group_by().end(),
+                          group_by) == ResponseStore::allowed_group_by().end()) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid group_by"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            auto op_column_param = req.get_param_value("op_column");
+            const std::string effective_op_column = op_column_param.empty() ? "id" : op_column_param;
+            if (std::find(ResponseStore::allowed_op_column().begin(),
+                          ResponseStore::allowed_op_column().end(),
+                          effective_op_column) == ResponseStore::allowed_op_column().end()) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid op_column"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+
             AggregationQuery aq;
             aq.group_by = group_by;
             aq.op = op;
-            aq.op_column = req.get_param_value("op_column");
+            aq.op_column = op_column_param;
 
             ResponseQuery filter;
             if (req.has_param("agent_id"))

@@ -222,6 +222,32 @@ TEST_CASE("ResponseStore: query with limit and offset", "[pg][response_store]") 
     CHECK(page2->size() == 3);
 }
 
+// #2691 (Doomgoose finding #2): a negative limit bound raw into `LIMIT $N`
+// is not a benign empty query — Postgres rejects a negative LIMIT outright,
+// so before the fix this failed the statement and read as store degradation
+// (nullopt) rather than falling back to the struct's default page size.
+TEST_CASE("ResponseStore: a negative limit is sanitized, not a degrade",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+
+    StoredResponse resp;
+    resp.instruction_id = "cmd-negfix";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    store.store(resp);
+
+    ResponseQuery q;
+    q.limit = -1;
+    auto out = store.query("cmd-negfix", q);
+    REQUIRE(out.has_value()); // NOT a degrade
+    CHECK(out->size() == 1);
+
+    auto out2 = store.query_by_execution("nonexistent-exec", q);
+    REQUIRE(out2.has_value()); // engaged-empty (unknown execution_id), not a degrade
+}
+
 TEST_CASE("ResponseStore: empty query returns an engaged-empty vector, not a degrade",
           "[pg][response_store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

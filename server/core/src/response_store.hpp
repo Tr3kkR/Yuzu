@@ -235,6 +235,16 @@ public:
     [[nodiscard]] std::optional<std::vector<AggregationResult>>
     aggregate(const std::string& instruction_id, const AggregationQuery& aq,
              const ResponseQuery& filter = {}, const AggregateScope& scope = std::nullopt) const;
+    /// `aggregate()`'s own `group_by`/`op_column` allow-lists, exposed so a
+    /// route handler can validate CLIENT-supplied values before calling in
+    /// (#2691, Doomgoose finding #2) — an allow-list miss inside `aggregate()`
+    /// itself returns `nullopt`, degrade-distinguishable from "no rows" but
+    /// NOT from a real store/pool failure, so a caller that maps every
+    /// `nullopt` to 503 pages the degrade alert for what is actually a caller
+    /// typo. Single source of truth: both this accessor and `aggregate()`'s
+    /// own internal check read the same list.
+    [[nodiscard]] static const std::vector<std::string>& allowed_group_by();
+    [[nodiscard]] static const std::vector<std::string>& allowed_op_column();
     /// Distinct agent_ids that have a response row for this instruction,
     /// ordered by agent_id (deterministic). Used to resolve a management-group
     /// scoped aggregate (#1634): enumerate the candidates, keep only those the

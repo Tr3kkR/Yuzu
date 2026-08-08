@@ -537,6 +537,20 @@ constexpr const char* kResponseCols =
     "id, instruction_id, agent_id, timestamp, status, output, error_detail, ttl_expires_at, "
     "plugin, execution_id, received_at_ms, COALESCE(plugin_result_status, 0)";
 
+// A non-positive `limit` (e.g. a client-supplied -1) bound raw into `LIMIT
+// $N` is not a benign empty query — Postgres rejects a negative LIMIT
+// outright, so the statement fails and the caller reads a genuine PG error
+// as store degradation (#2691, Doomgoose finding #2). Sanitize at the one
+// point every query-style read shares rather than at each of the ~10 REST/
+// MCP call sites that populate `ResponseQuery::limit` from client input —
+// one fix covers every current AND future caller. Falls back to the
+// struct's own documented default (100), matching how limits are already
+// clamped (not rejected) elsewhere on this surface (e.g. mcp_server.cpp's
+// `std::min(param_int32(args, "limit", 100), 1000)`).
+int sanitize_limit(int limit) {
+    return limit > 0 ? limit : ResponseQuery{}.limit; // struct default (100)
+}
+
 } // namespace
 
 std::optional<std::vector<StoredResponse>> ResponseStore::query(const std::string& instruction_id,
@@ -565,7 +579,7 @@ std::optional<std::vector<StoredResponse>> ResponseStore::query(const std::strin
                 binds.push_back(std::to_string(q.until));
             }
             sql += " ORDER BY timestamp DESC LIMIT $" + std::to_string(idx++) + "::integer";
-            binds.push_back(std::to_string(q.limit));
+            binds.push_back(std::to_string(sanitize_limit(q.limit)));
             if (q.offset > 0) {
                 sql += " OFFSET $" + std::to_string(idx++) + "::integer";
                 binds.push_back(std::to_string(q.offset));
@@ -614,7 +628,7 @@ ResponseStore::query_by_execution(const std::string& execution_id, const Respons
                 binds.push_back(std::to_string(q.until));
             }
             sql += " ORDER BY timestamp DESC LIMIT $" + std::to_string(idx++) + "::integer";
-            binds.push_back(std::to_string(q.limit));
+            binds.push_back(std::to_string(sanitize_limit(q.limit)));
             if (q.offset > 0) {
                 sql += " OFFSET $" + std::to_string(idx++) + "::integer";
                 binds.push_back(std::to_string(q.offset));
@@ -635,6 +649,16 @@ ResponseStore::get_by_instruction(const std::string& instruction_id) const {
     return query(instruction_id);
 }
 
+const std::vector<std::string>& ResponseStore::allowed_group_by() {
+    static const std::vector<std::string> v = {"status", "agent_id"};
+    return v;
+}
+
+const std::vector<std::string>& ResponseStore::allowed_op_column() {
+    static const std::vector<std::string> v = {"timestamp", "status", "id"};
+    return v;
+}
+
 std::optional<std::vector<AggregationResult>>
 ResponseStore::aggregate(const std::string& instruction_id, const AggregationQuery& aq,
                          const ResponseQuery& filter, const AggregateScope& scope) const {
@@ -646,15 +670,19 @@ ResponseStore::aggregate(const std::string& instruction_id, const AggregationQue
             // as the SQLite original.
             static constexpr std::size_t kScopeAgentBindCap = 10000;
 
-            static const std::vector<std::string> allowed_group = {"status", "agent_id"};
+            const auto& allowed_group = allowed_group_by();
             if (std::find(allowed_group.begin(), allowed_group.end(), aq.group_by) ==
                 allowed_group.end()) {
                 spdlog::warn("ResponseStore::aggregate: invalid group_by '{}'", aq.group_by);
                 return std::nullopt; // allow-list miss is a caller/code bug, not a real
                                      // empty result — degrade-distinguish it (Gate 4 R5)
                                      // so the seam's empty-vs-degrade discipline holds.
+                                     // Route handlers validate against
+                                     // allowed_group_by()/allowed_op_column() BEFORE
+                                     // calling in (#2691) so a client typo never
+                                     // reaches this fallback as a 503.
             }
-            static const std::vector<std::string> allowed_op_col = {"timestamp", "status", "id"};
+            const auto& allowed_op_col = allowed_op_column();
             auto effective_op_col = aq.op_column.empty() ? "id" : aq.op_column;
             if (std::find(allowed_op_col.begin(), allowed_op_col.end(), effective_op_col) ==
                 allowed_op_col.end()) {
