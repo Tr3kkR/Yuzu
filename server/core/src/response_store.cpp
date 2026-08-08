@@ -327,15 +327,6 @@ void ResponseStore::store(const StoredResponse& resp) {
         note_ingest_dropped(metrics_, kReasonStoreNotOpen);
         return;
     }
-    auto lease = pool_.try_acquire_for(kIngestTimeout);
-    if (!lease) {
-        spdlog::warn("ResponseStore: store skipped for instruction={} agent={}, no connection "
-                     "({})",
-                     resp.instruction_id, resp.agent_id, pool_.last_error());
-        note_ingest_dropped(metrics_, kReasonPoolTimeout);
-        return;
-    }
-    PGconn* conn = lease.get();
 
     const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                std::chrono::system_clock::now().time_since_epoch())
@@ -359,16 +350,18 @@ void ResponseStore::store(const StoredResponse& resp) {
     const std::string sanitized_output = sanitize_pg_text(resp.output);
     const std::string sanitized_error = sanitize_pg_text(resp.error_detail);
 
-    pg::PgResult begin = pg::exec_params(conn, "BEGIN", std::vector<std::string>{});
-    if (begin.status() != PGRES_COMMAND_OK) {
-        spdlog::warn("ResponseStore: BEGIN failed for instruction={} agent={}: {}",
-                     resp.instruction_id, resp.agent_id, PQerrorMessage(conn));
-        note_ingest_dropped(metrics_, kReasonQueryError);
-        return;
-    }
-    pg::PgTxn txn(conn);
-
-    pg::PgResult ins = pg::exec_params(
+    // `with_txn_for` (not a manual BEGIN/PgTxn pair, #2691 Doomgoose finding
+    // #1) refuses to COMMIT an aborted transaction: a failed SAVEPOINT/
+    // ROLLBACK-TO below left unnoticed would otherwise let a plain COMMIT
+    // report PGRES_COMMAND_OK while Postgres actually performed a ROLLBACK
+    // (PQTRANS_INERROR), silently dropping the response row with no counter.
+    // `reached_txn` distinguishes "never got a connection" (kReasonPoolTimeout)
+    // from "began, but something inside failed" (kReasonQueryError) — the
+    // pool/BEGIN failure classes with_txn_for's own bool return collapses.
+    bool reached_txn = false;
+    const bool ok = pool_.with_txn_for(kIngestTimeout, [&](PGconn* conn) -> bool {
+        reached_txn = true;
+        pg::PgResult ins = pg::exec_params(
         conn,
         "INSERT INTO response_store.responses (instruction_id, agent_id, timestamp, status, "
         "output, error_detail, ttl_expires_at, plugin, execution_id, received_at_ms, "
@@ -380,100 +373,104 @@ void ResponseStore::store(const StoredResponse& resp) {
                                  std::to_string(ttl), resp.plugin, resp.execution_id,
                                  std::to_string(received_ms),
                                  std::to_string(resp.plugin_result_status)});
-    if (ins.status() != PGRES_TUPLES_OK || PQntuples(ins.get()) != 1) {
-        spdlog::warn("ResponseStore: insert failed for instruction={} agent={}: {}",
-                     resp.instruction_id, resp.agent_id, PQerrorMessage(conn));
-        note_ingest_dropped(metrics_, kReasonQueryError);
-        return; // txn destructor rolls back
-    }
-    const int64_t response_id = to_i64(PQgetvalue(ins.get(), 0, 0));
-
-    // Extract facets from the output using the plugin schema, then insert them
-    // as a SINGLE batched multi-row INSERT under ONE savepoint. The savepoint
-    // preserves the ADR-0038 guarantee (Postgres aborts the WHOLE transaction
-    // on any failed statement, unlike SQLite's silent skip — so a facet failure
-    // must not take the just-inserted response row down): on batch failure we
-    // ROLLBACK TO this savepoint and still COMMIT the response row. But it is
-    // ONE savepoint, not one-per-facet: the old per-facet loop minted a
-    // subtransaction XID per distinct value, so a wide tabular output (>64
-    // distinct facet values — a routine process/vuln list) suboverflowed the
-    // ingest txn's snapshot and forced cluster-wide pg_subtrans SLRU lookups on
-    // the SHARED server pool (Gate 4 R1). One savepoint bounds it to a single
-    // subxid regardless of facet cardinality.
-    if (!resp.plugin.empty() && !sanitized_output.empty()) {
-        auto lines = split_output_lines(sanitized_output);
-        // Accumulate (col_idx, value) → line_count. col_idx is 0-based offset
-        // into the *field* array (excludes the Agent column, always column 0
-        // in the schema).
-        std::unordered_map<int, std::unordered_map<std::string, int>> facets;
-        for (const auto& line : lines) {
-            auto fields = split_fields(resp.plugin, line);
-            for (int i = 0; i < static_cast<int>(fields.size()); ++i) {
-                if (!fields[i].empty())
-                    facets[i][fields[i]]++;
-            }
+        if (ins.status() != PGRES_TUPLES_OK || PQntuples(ins.get()) != 1) {
+            spdlog::warn("ResponseStore: insert failed for instruction={} agent={}: {}",
+                         resp.instruction_id, resp.agent_id, PQerrorMessage(conn));
+            return false; // with_txn_for rolls back
         }
-        std::vector<std::tuple<int, std::string, int>> flat;
-        for (const auto& [col_idx, value_counts] : facets)
-            for (const auto& [value, count] : value_counts)
-                flat.emplace_back(col_idx, value, count);
+        const int64_t response_id = to_i64(PQgetvalue(ins.get(), 0, 0));
 
-        if (!flat.empty()) {
-            pg::PgResult sp =
-                pg::exec_params(conn, "SAVEPOINT facet_batch", std::vector<std::string>{});
-            if (sp.status() != PGRES_COMMAND_OK) {
-                spdlog::warn("ResponseStore: facet SAVEPOINT failed for response_id={}: {}",
-                             response_id, PQerrorMessage(conn));
-            } else {
-                bool facets_ok = true;
-                // Chunk so `3 + 3*chunk` stays well under libpq's 65535-param
-                // ceiling; response_id/instruction_id/agent_id are $1/$2/$3
-                // reused across every tuple, only (col_idx,value,count) vary.
-                constexpr std::size_t kFacetChunk = 2000;
-                for (std::size_t base = 0; facets_ok && base < flat.size();
-                     base += kFacetChunk) {
-                    const std::size_t stop = std::min(base + kFacetChunk, flat.size());
-                    std::string sql =
-                        "INSERT INTO response_store.response_facets (response_id, instruction_id, "
-                        "agent_id, col_idx, value, line_count) VALUES ";
-                    std::vector<std::string> params{std::to_string(response_id),
-                                                    resp.instruction_id, resp.agent_id};
-                    for (std::size_t i = base; i < stop; ++i) {
-                        const auto& [col_idx, value, count] = flat[i];
-                        const std::size_t p = params.size(); // 0-based; next is $(p+1)
-                        if (i != base)
-                            sql += ",";
-                        sql += "($1::bigint,$2,$3,$" + std::to_string(p + 1) + "::integer,$" +
-                               std::to_string(p + 2) + ",$" + std::to_string(p + 3) + "::integer)";
-                        params.push_back(std::to_string(col_idx));
-                        params.push_back(value);
-                        params.push_back(std::to_string(count));
-                    }
-                    sql += " ON CONFLICT (response_id, col_idx, value) DO UPDATE SET "
-                           "line_count = EXCLUDED.line_count";
-                    pg::PgResult fi = pg::exec_params(conn, sql.c_str(), params);
-                    if (fi.status() != PGRES_COMMAND_OK) {
-                        spdlog::warn("ResponseStore: facet batch insert failed for response_id={}: "
-                                     "{}",
-                                     response_id, PQerrorMessage(conn));
-                        facets_ok = false;
-                    }
+        // Extract facets from the output using the plugin schema, then insert
+        // them as a SINGLE batched multi-row INSERT under ONE savepoint. The
+        // savepoint preserves the ADR-0038 guarantee (Postgres aborts the
+        // WHOLE transaction on any failed statement, unlike SQLite's silent
+        // skip — so a facet failure must not take the just-inserted response
+        // row down): on batch failure we ROLLBACK TO this savepoint and
+        // still COMMIT the response row. But it is ONE savepoint, not
+        // one-per-facet: the old per-facet loop minted a subtransaction XID
+        // per distinct value, so a wide tabular output (>64 distinct facet
+        // values — a routine process/vuln list) suboverflowed the ingest
+        // txn's snapshot and forced cluster-wide pg_subtrans SLRU lookups on
+        // the SHARED server pool (Gate 4 R1). One savepoint bounds it to a
+        // single subxid regardless of facet cardinality.
+        if (!resp.plugin.empty() && !sanitized_output.empty()) {
+            auto lines = split_output_lines(sanitized_output);
+            // Accumulate (col_idx, value) → line_count. col_idx is 0-based
+            // offset into the *field* array (excludes the Agent column,
+            // always column 0 in the schema).
+            std::unordered_map<int, std::unordered_map<std::string, int>> facets;
+            for (const auto& line : lines) {
+                auto fields = split_fields(resp.plugin, line);
+                for (int i = 0; i < static_cast<int>(fields.size()); ++i) {
+                    if (!fields[i].empty())
+                        facets[i][fields[i]]++;
                 }
-                const char* fin_sql = facets_ok ? "RELEASE SAVEPOINT facet_batch"
-                                                : "ROLLBACK TO SAVEPOINT facet_batch";
-                pg::PgResult fin = pg::exec_params(conn, fin_sql, std::vector<std::string>{});
-                if (fin.status() != PGRES_COMMAND_OK)
-                    spdlog::warn("ResponseStore: facet savepoint finalize ({}) failed for "
-                                 "response_id={}: {}",
-                                 fin_sql, response_id, PQerrorMessage(conn));
+            }
+            std::vector<std::tuple<int, std::string, int>> flat;
+            for (const auto& [col_idx, value_counts] : facets)
+                for (const auto& [value, count] : value_counts)
+                    flat.emplace_back(col_idx, value, count);
+
+            if (!flat.empty()) {
+                pg::PgResult sp =
+                    pg::exec_params(conn, "SAVEPOINT facet_batch", std::vector<std::string>{});
+                if (sp.status() != PGRES_COMMAND_OK) {
+                    spdlog::warn("ResponseStore: facet SAVEPOINT failed for response_id={}: {}",
+                                 response_id, PQerrorMessage(conn));
+                } else {
+                    bool facets_ok = true;
+                    // Chunk so `3 + 3*chunk` stays well under libpq's
+                    // 65535-param ceiling; response_id/instruction_id/
+                    // agent_id are $1/$2/$3 reused across every tuple, only
+                    // (col_idx,value,count) vary.
+                    constexpr std::size_t kFacetChunk = 2000;
+                    for (std::size_t base = 0; facets_ok && base < flat.size();
+                         base += kFacetChunk) {
+                        const std::size_t stop = std::min(base + kFacetChunk, flat.size());
+                        std::string sql =
+                            "INSERT INTO response_store.response_facets (response_id, "
+                            "instruction_id, agent_id, col_idx, value, line_count) VALUES ";
+                        std::vector<std::string> params{std::to_string(response_id),
+                                                        resp.instruction_id, resp.agent_id};
+                        for (std::size_t i = base; i < stop; ++i) {
+                            const auto& [col_idx, value, count] = flat[i];
+                            const std::size_t p = params.size(); // 0-based; next is $(p+1)
+                            if (i != base)
+                                sql += ",";
+                            sql += "($1::bigint,$2,$3,$" + std::to_string(p + 1) +
+                                   "::integer,$" + std::to_string(p + 2) + ",$" +
+                                   std::to_string(p + 3) + "::integer)";
+                            params.push_back(std::to_string(col_idx));
+                            params.push_back(value);
+                            params.push_back(std::to_string(count));
+                        }
+                        sql += " ON CONFLICT (response_id, col_idx, value) DO UPDATE SET "
+                               "line_count = EXCLUDED.line_count";
+                        pg::PgResult fi = pg::exec_params(conn, sql.c_str(), params);
+                        if (fi.status() != PGRES_COMMAND_OK) {
+                            spdlog::warn("ResponseStore: facet batch insert failed for "
+                                        "response_id={}: {}",
+                                        response_id, PQerrorMessage(conn));
+                            facets_ok = false;
+                        }
+                    }
+                    const char* fin_sql = facets_ok ? "RELEASE SAVEPOINT facet_batch"
+                                                    : "ROLLBACK TO SAVEPOINT facet_batch";
+                    pg::PgResult fin = pg::exec_params(conn, fin_sql, std::vector<std::string>{});
+                    if (fin.status() != PGRES_COMMAND_OK)
+                        spdlog::warn("ResponseStore: facet savepoint finalize ({}) failed for "
+                                    "response_id={}: {}",
+                                    fin_sql, response_id, PQerrorMessage(conn));
+                }
             }
         }
-    }
+        return true;
+    });
 
-    if (!txn.commit()) {
-        spdlog::warn("ResponseStore: commit failed for instruction={} agent={}: {}",
-                     resp.instruction_id, resp.agent_id, PQerrorMessage(conn));
-        note_ingest_dropped(metrics_, kReasonQueryError);
+    if (!ok) {
+        spdlog::warn("ResponseStore: store failed for instruction={} agent={}: {}",
+                     resp.instruction_id, resp.agent_id, pool_.last_error());
+        note_ingest_dropped(metrics_, reached_txn ? kReasonQueryError : kReasonPoolTimeout);
     }
 }
 
