@@ -805,14 +805,16 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
     // unregister_consumer()'s erase-before-scan ordering for why this
     // re-check is airtight. Inline subs have no registered consumer to check.
     // The teardown is teardown_arm_race(), NOT disarm(). Read the next clause as
-    // precisely as :580-584 above: it is NOT that either one's locked section never
-    // allocates — the log line in each still formats into a heap buffer (:902-905
-    // there, :1008-1011 in disarm()) — it is that both now CONTAIN that allocation in
-    // a catch-all rather than letting it escape. So the reason to route through
-    // teardown_arm_race is no longer allocation: disarm() must LOOK UP a key this
-    // caller already holds, and its last-subscriber branch is whole-key-capable,
-    // while what a lost M1 race owes is the removal of exactly ONE subscription — a
-    // sibling that deduped onto this key keeps its own.
+    // precisely as arm_impl's "(2) past the commit" clause above: it is NOT that
+    // either one's locked section never allocates — the log line in each still
+    // formats into a heap buffer (teardown_arm_race's own contained "disarmed"
+    // log, disarm()'s twin contained "disarmed" log) — it is that both now
+    // CONTAIN that allocation in a catch-all rather than letting it escape. So the
+    // reason to route through teardown_arm_race is no longer allocation: disarm()
+    // must LOOK UP a key this caller already holds, and its last-subscriber
+    // branch is whole-key-capable, while what a lost M1 race owes is the
+    // removal of exactly ONE subscription — a sibling that deduped onto this
+    // key keeps its own.
     if (tier == SparkTier::Queued) {
         bool consumer_alive = false;
         {
@@ -1051,11 +1053,11 @@ void SparkEngine::disarm(SubscriptionId id) {
             if (armed_.contains(unwatch_key))
                 return; // a concurrent re-arm already renewed this key
         }
-        // CONTAINED AND COUNTED, matching teardown_arm_race (:965-977) — the fourth and
-        // last lockstep difference between the two. unwatch() is not noexcept and the real
-        // mechanisms allocate inside it (spark_service queues a Cmd holding a key copy;
-        // spark_file grows retiring_), so under the memory pressure this layer is about it
-        // can throw.
+        // CONTAINED AND COUNTED, matching teardown_arm_race's own unwatch catch — the
+        // fourth and last lockstep difference between the two. unwatch() is not
+        // noexcept and the real mechanisms allocate inside it (spark_service queues a
+        // Cmd holding a key copy; spark_file grows retiring_), so under the memory
+        // pressure this layer is about it can throw.
         //
         // WHY CONTAIN, and it is not merely symmetry. This is a void function whose caller
         // is Guardian's ordinary withdraw path: a throw escapes GuardianSparkBackend::disarm
