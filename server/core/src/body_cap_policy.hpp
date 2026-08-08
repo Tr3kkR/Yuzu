@@ -74,8 +74,20 @@
 /// are "refused" without naming `/mcp/` as the sole exception is wrong. This
 /// is a recorded adjudication, not an oversight — see the paragraph above
 /// for why — kept in sync with `docs/user-manual/rest-api.md` "Pre-Auth
-/// Request Body Caps" and the Pre-auth body caps row in
-/// `.claude/routed-concerns.md`.
+/// Request Body Caps".
+///
+/// NO ROUTED-CONCERN ROW YET, and that is a known gap rather than an
+/// oversight: `.claude/routed-concerns.md` is at its size ceiling (measured
+/// 39,996 of 40,000 bytes on `dev`, i.e. four bytes free) and physically
+/// cannot take one. Until the table is split, THIS HEADER is the only
+/// statement of the chokepoint's invariants — treat it as load-bearing and
+/// do not trim it for brevity. The invariants a row would carry: this table
+/// is the single per-route body-cap chokepoint, EXTEND it and never fork it;
+/// `path_class` is the only legal metric label, never the attacker-supplied
+/// path; matching is segment-boundary, never bare `starts_with`; a new
+/// mutating route needs its own entry or a reviewed catch-all decision, and
+/// should prefer an any-method row, because verb-scoping silently drops the
+/// whole prefix to the catch-all.
 ///
 /// The numbers below are grounded in the cited call sites, not invented —
 /// but "grounded" is not "measured byte-for-byte": two different kinds of
