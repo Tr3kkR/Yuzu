@@ -171,13 +171,16 @@ fires through 95 simulated minutes, no matter how long it persists — the cliff
 exactly at the window's own width, not somewhere below it. A cadence *faster* than the
 window is a different case: successive rejections start overlapping inside the trailing
 15-minute range before the previous one ages out, so the reading locks into "sustained"
-and the alert does fire — but not immediately. Measured for a 10-minute cadence: roughly
-25 minutes from the first rejection, not the 15 of `for:` alone, because the rule still
-has to accumulate a full 15 continuous minutes of sustained reading before `for:` is
-satisfied. Silence from this alert is therefore not evidence a slow-retrying client's
-session recovered — treat it as unresolved, not clean, for any client retrying at or
-slower than 15 minutes, and note that even a faster-but-still-slow cadence buys a
-genuine wedge a real head start (tens of minutes) before this alert catches it.
+and the alert does fire — but not immediately, and not after just the 15 minutes of
+`for:` alone. Pinned by a promtool case (CASE 16, `tests/prometheus/yuzu-alerts.test.yml`):
+for a 10-minute cadence, the reading first goes continuously sustained about a minute
+after the first rejection, then still needs its own full 15 minutes of that before
+`for:` is satisfied — roughly 16 minutes from the first rejection to the alert actually
+firing, not 15. Silence from this alert is
+therefore not evidence a slow-retrying client's session recovered — treat it as
+unresolved, not clean, for any client retrying at or slower than 15 minutes, and note
+that even a faster-but-still-slow cadence buys a genuine wedge a real head start (well
+over `for:`'s own 15 minutes) before this alert catches it.
 
 The margin argument above also implicitly reasons about a single client's retry cadence.
 The underlying counter carries no session dimension (see the scoping note in step 4

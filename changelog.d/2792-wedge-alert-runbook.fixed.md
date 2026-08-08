@@ -6,12 +6,14 @@
   reference to "the audit rows" that named no queryable event. A new section documents
   how to identify the principal or session behind a rising (non-alertable)
   `pin_displaced_for_admission` rate via `GET /api/v1/audit`. The `for: 15m` window on
-  `YuzuMcpStreamedPinSlotsWedged` now has its derivation recorded and pinned by a
-  promtool test: a single isolated rejection can never satisfy `for: 15m` by the rule's
-  own mathematical shape, only a sustained rate can — and the derivation now also names
-  its own blind spot, a client retrying slower than the window can wedge without the
-  alert ever firing. Both new `/api/v1/audit` query recipes now carry an explicit
-  truncation caveat: the route's `total`/`page_size` fields describe what came back, not
+  `YuzuMcpStreamedPinSlotsWedged` now has its derivation recorded and pinned by promtool
+  tests: a single isolated rejection can never satisfy `for: 15m` by the rule's own
+  mathematical shape, only a sustained rate can — the derivation now also names its own
+  blind spot (a client retrying at or slower than the window can wedge without the alert
+  ever firing), and a third case pins the faster-than-the-window delay itself (a 10-minute
+  retry cadence fires roughly 16 minutes after the first rejection, not instantly and not
+  after just `for:`'s own 15 minutes). Both new `/api/v1/audit` query recipes now carry an
+  explicit truncation caveat: the route's `total`/`page_size` fields describe what came back, not
   what matched ([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881), filed but not fixed
   by this change). `docs/user-manual/audit-log.md`'s `GET /api/v1/audit` example
   previously showed a `total`/`page_size` shape that does not match the route's real

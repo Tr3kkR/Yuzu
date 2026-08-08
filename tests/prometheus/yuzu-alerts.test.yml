@@ -492,3 +492,32 @@ tests:
       - expr: 'ALERTS{alertname="YuzuMcpStreamedPinSlotsWedged", alertstate="firing"}'
         eval_time: 30m
         exp_samples: []
+
+  # CASE 16 -- pins the "Why 15 minutes" derivation's own faster-than-the-window claim
+  # (docs/ops-runbooks/mcp-stream-pin-displacement.md, "A cadence faster than the window
+  # is a different case"). A 10-minute retry cadence is faster than the 15-minute window,
+  # so it does eventually fire (unlike CASE 15's single rejection or a cadence at/above the
+  # window), but not immediately: successive rejections keep refreshing the trailing
+  # increase() window before the previous one ages out, so the reading locks into
+  # "sustained" starting about a minute after the first rejection (t=11m for a bump at
+  # t=10m, matching CASE 15's own measured true-span start) -- then `for: 15m` still has to
+  # elapse from THAT point, not from the first rejection. Measured against promtool 3.13.1:
+  # empty through 25m, firing from 26m -- a 16-minute delay from the first rejection to
+  # first fire, not the naive 15m of `for:` alone. This exists because an earlier revision
+  # of the runbook prose stated this delay as "roughly 25 minutes" (conflating the absolute
+  # eval-time boundary with the delay-from-first-rejection quantity) -- caught in a Gate 8
+  # re-review round, twice, before landing here as a pinned case rather than unpinned prose.
+  - interval: 1m
+    name: streamed pin slots wedged - faster-than-window cadence fires with a delay, not instantly
+    input_series:
+      - series: 'yuzu_mcp_bridge_pin_slots_reject_total{held="pins",job="yuzu",instance="s1"}'
+        values: "0x10 1x10 2x10 3x10 4x10 5x10 6x10"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuMcpStreamedPinSlotsWedged", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuMcpStreamedPinSlotsWedged", alertstate="firing"}'
+        eval_time: 26m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuMcpStreamedPinSlotsWedged", alertstate="firing", held="pins", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
