@@ -100,7 +100,14 @@ Add `&principal=<name>` to scope to a candidate you already suspect. Each row's
 (no surviving record to name), never for the ordinary case — and `detail` says whether it
 was a parked final or an orphan. There is no `session_id` field on this row; if you need a
 time window rather than a principal, the legacy `GET /api/audit` endpoint additionally
-takes `since`/`until` (epoch parameters `/api/v1/audit` does not have).
+takes `since`/`until` (epoch parameters `/api/v1/audit` does not have). **A response at
+exactly `limit` rows is not proof you have everything** — `/api/v1/audit` truncates
+silently, and its `total`/`page_size` fields describe what came back, not what matched
+([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)); scope further with `&principal=`
+or fall back to the legacy endpoint's `since`/`until` before concluding a candidate is
+clean. A `503` from either endpoint is the deny-on-degrade behavior `YuzuAuditReadDegraded`
+covers, not "no matching rows" — treat it as an audit-store availability problem and
+retry once that alert clears, not as a clean result.
 
 If the rate correlates with a single principal, that is a client dropping connections
 before its results land — ordinary, if unusually frequent, client behaviour, not a
@@ -140,7 +147,7 @@ Read *sustained* strictly. Every healthy session passes through `pinned>0, unpin
 during the charge-to-pin handover, so a single sample is not a wedge; the alert carries a
 `for:` for exactly that reason and that `for:` is load-bearing, not tuning.
 
-**Why 15 minutes, not something shorter.** States (1) and (2) above both clear on the
+**Why 15 minutes, not something shorter.** States (1) and (2) below both clear on the
 client's own retry — the streamed-POST `429` remediation carries `Retry-After` derived
 from `kMcpStreamedPostRetryAfterMs` (30s, `mcp_stream.hpp`), so a conforming client
 following it clears a genuine transient within tens of seconds, not minutes. `for: 15m`
@@ -151,6 +158,23 @@ well under a second). A shorter `for:` would trade that margin for faster detect
 state (3); this runbook's position is that the margin is worth more, since state (3) is
 rare and self-recoverable by the client either way (step 3 below), while a page on a
 slow-but-healthy retry cycle is a false one.
+
+That margin is not free. A client retrying slower than the window — a non-conforming
+client ignoring `Retry-After`, or one on a coarse fixed schedule — can keep re-triggering
+a genuinely-wedged state (3) without ever producing a *sustained* rate this rule can see,
+because each rejection's gap from the last resets against a span wider than `for: 15m`.
+Measured against the shipped rule: a 16-minute retry cadence never fires through 95
+simulated minutes; a 10-minute cadence does fire, but not until roughly 79 minutes in.
+Silence from this alert is therefore not evidence a slow-retrying client's session
+recovered — treat it as unresolved, not clean, for any client retrying slower than about
+15 minutes.
+
+The margin argument above also implicitly reasons about a single client's retry cadence.
+The underlying counter carries no session dimension (see the scoping note in step 4
+below), so a reading that looks sustained can equally be several different,
+individually-transient rejections across different sessions overlapping in time, rather
+than one client failing to recover — the alert cannot tell the two apart, and neither can
+this derivation.
 
 **Since #2740 this should be rare**, because admission reclaims a slot rather than
 refusing. A `pins` refusal that survives the reclaim means the reclaim found nothing to
@@ -164,12 +188,20 @@ take, which happens in three states:
 
 1. Capture `yuzu_mcp_bridge_pin_slots_reject_total{held}` for both label values, the
    `yuzu_mcp_bridge_pin_*` family, and the affected session id from the `mcp.session.reject`
-   audit rows (`target_type=McpSession`, `target_id`=the session id's first 8 characters,
-   `detail` carries `reason=post_pin_slots` for exactly this rejection — other reasons on the
-   same action share the row shape but not the reason). `GET /api/v1/audit?action=mcp.session.reject&limit=1000`,
+   audit rows (`target_type=McpSession`, `target_id`=the session id's first 8 characters —
+   a prefix, not a guaranteed-unique key; corroborate against the metric capture above
+   before treating two matching rows as the same session, `detail` carries
+   `reason=post_pin_slots` for exactly this rejection — other reasons on the same action
+   share the row shape but not the reason). `GET /api/v1/audit?action=mcp.session.reject&limit=1000`,
    filtering the `detail` field for `reason=post_pin_slots`; if you already have a candidate
    session id, the legacy `GET /api/audit?action=mcp.session.reject&target_id=<8 chars>` narrows
-   directly (the `/api/v1/audit` route does not take `target_id`).
+   directly (the `/api/v1/audit` route does not take `target_id`). **A response at exactly
+   `limit` rows is not proof you have everything** — `/api/v1/audit` truncates silently, and
+   its `total`/`page_size` fields describe what came back, not what matched
+   ([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)); if you hit the cap, fall back to
+   the legacy endpoint's `since`/`until` to narrow the window instead of trusting the count.
+   A `503` from either endpoint is the deny-on-degrade behavior `YuzuAuditReadDegraded`
+   covers, not "no matching rows".
 2. If the rate is falling on its own, it was (1) or (2). Nothing to do.
 3. If it is flat and sustained with `held="pins"`, the session is wedged. **The client's
    recovery is its own**: it can resume with `Last-Event-ID` (which releases pins at or

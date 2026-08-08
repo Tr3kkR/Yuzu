@@ -8,4 +8,9 @@
   `pin_displaced_for_admission` rate via `GET /api/v1/audit`. The `for: 15m` window on
   `YuzuMcpStreamedPinSlotsWedged` now has its derivation recorded and pinned by a
   promtool test: a single isolated rejection can never satisfy `for: 15m` by the rule's
-  own mathematical shape, only a sustained rate can.
+  own mathematical shape, only a sustained rate can — and the derivation now also names
+  its own blind spot, a client retrying slower than the window can wedge without the
+  alert ever firing. Both new `/api/v1/audit` query recipes now carry an explicit
+  truncation caveat: the route's `total`/`page_size` fields describe what came back, not
+  what matched ([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881), filed but not fixed
+  by this change).
