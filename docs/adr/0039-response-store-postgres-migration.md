@@ -33,21 +33,45 @@ Migrate to PostgreSQL schema **`response_store`** (ADR-0008), construction fail-
 timestamps/output stay TEXT — behavior-preserving). All indexes carry over incl. the partial
 `idx_resp_ttl WHERE ttl_expires_at > 0` the reaper uses.
 
+`plugin_result_status` (the ABI3→4 typed plugin-result column, `dev`'s `12b97f5f`/`d103ac54`)
+lands as **migration v2** (`ALTER TABLE responses ADD COLUMN plugin_result_status INTEGER NOT
+NULL DEFAULT 0`), not folded into v1's `CREATE TABLE` — `PgMigrationRunner` stamps
+`schema_meta(store, version)` once per numbered migration and never replays an edited one, so
+changing v1 in place would silently no-op on any database that already ran it.
+
 ### Posture (ADR-0012 §1)
 
 - **Response ingest (`store`): FAIL-SOFT** (ADR-0037 shape) — a dropped result row is
   re-derivable operational telemetry (the executions ladder tracks the command; the agent's
   result is best-effort persisted for the drawer/TAR). Ingest must never block the gRPC
   thread. Drops counted (`yuzu_server_response_ingest_dropped_total{reason}`, kReason*
-  constants).
+  constants). `store()` runs the full insert-plus-facet-batch body through
+  `PgPool::with_txn_for` rather than a hand-rolled `PgTxn`/lease pair (Doomgoose finding #1) —
+  `with_txn_for` already refuses to `COMMIT` and rolls back instead when the transaction isn't
+  `PQTRANS_INTRANS`, so sharing it closes the aborted-txn-silently-committed gap without a
+  second copy of that check. **Bounded**: output/error_detail are truncated to
+  `kMaxIngestBytes` (2 MiB, matches the agent's own `kCaptureMaxBytes`) before sanitize, and a
+  response's facet count is capped at `kMaxFacetsPerResponse` (5000) — an unbounded row or an
+  unbounded facet fan-out from one command result no longer pressures the shared pool that auth
+  reads also share (Doomgoose finding #4).
 - **Reads (`query`/`query_by_execution`/`aggregate`/facets/…): degrade-distinguishable at
   the store seam** (`std::optional<vector>` nullopt-on-degrade + `yuzu_server_response_read_
-  degrade_total{reason}` + sampled logs). **NOT the catastrophic class** — these feed the
-  executions drawer / TAR dashboard, not an enforce/target/authz decision, so per the
-  playbook's deny-or-benign carve-out the consumers may render degraded (503 on the REST
+  degrade_total{reason}` + sampled logs). For the executions drawer / TAR dashboard / dashboard
+  results table these feed a **display**, not an enforce/target/authz decision, so per the
+  playbook's deny-or-benign carve-out those consumers may render degraded (503 on the REST
   twin, empty+degrade-banner on the dashboard) — but the seam MUST distinguish empty from
-  degraded so a future authz-adjacent consumer can't misread a blip as "no responses." The
-  #1634 group-scoped-read seam (`ResponseQuery{.agent_id}`) is preserved exactly.
+  degraded so a consumer can't misread a blip as "no responses." The #1634 group-scoped-read
+  seam (`ResponseQuery{.agent_id}`) is preserved exactly.
+
+  **Correction (2026-08-08, #2691 finding 10):** the "not an enforce/target/authz decision"
+  framing above does NOT extend to `/auto` Pre-flight — `preflight_eval.cpp`'s
+  `collect_check_responses()` reads this same seam, and the grid it builds IS what
+  `deployment_routes.cpp` reads to select `/auto` Deploy's go-cohort. A degrade there is
+  gate-adjacent, not display-only, and both the background runner and the live result poll
+  now check `any_check_degraded()` before persisting or completing a run — a degraded tick
+  skips persisting entirely (retry next tick/poll) rather than collapsing to empty and
+  silently downgrading an already-resolved device's verdict. See
+  `docs/user-manual/preflight.md` + `docs/executions-history-ladder.md`.
 - **Writes other than store** (`delete_by_instruction`): fail-hard (`RETURNING` count).
 
 ### Backfill (ADR-0009) — SKIPPABLE
@@ -82,6 +106,37 @@ The per-pass cap is observable: a pass that deletes the full cap records
 `result="capped"` (distinct from `swept`), so on-call can tell a healthy fully-draining reaper
 from one whose 10 000/pass ceiling is being outrun by ingest on this high-write store — the
 `AuditStore` cap-reached signal, ported.
+
+**Clock source (2026-08-08, #2691):** the first cut of this reaper decided `has_expired` /
+`would_wipe` / `big_step` from the process's own clock, and had no `bootstrap_settled` anchor —
+the exact pre-ADR-0038-round-2 shape `GuaranteedStateStore` shipped and then had to fix twice
+(FortitudeEtc's original review, then fjarvis's H1). Fixed to match: every decision-driving read
+switches from `now_epoch()` to `pg_now` (`SELECT EXTRACT(EPOCH FROM now())::bigint`, read inside
+the advisory-locked transaction, after the lock) — a fast/skewed replica can no longer sweep a
+row that is still live by Postgres's own clock. `bootstrap_settled` joins the `gc_meta` read;
+`no_anchor` in the `Facts` literal declines the very first pass on a missing anchor with partial
+expiry rather than draining immediately, settling the marker only after `classify()` reaches a
+verdict (never before an early return, so an early return rolls the whole transaction back). The
+process clock's only remaining job is its own independent `> kMaxPlausibleNow` decline check
+before the transaction opens — it does not feed the horizon. `facts_ser` carries a 5th char
+(`b`) for `bootstrap_settled`; `outcome="declined_no_anchor"` is a new label on
+`yuzu_server_response_reap_passes_total{result}`.
+
+The anomaly probe (Doomgoose finding #5) is `EXISTS(...)`-based, not `count(*) FILTER` —
+`count(*) FILTER` has no statement-level `WHERE`, so even with the partial index eligible it
+still counts every positive-TTL row (most of the table in steady state), which is a full scan in
+practice, not O(1). Two booleans instead: any-expired (`EXISTS`) and any-datable-survivor
+(`(SELECT 1 ... ORDER BY ttl_expires_at LIMIT 1) IS NOT NULL`, deliberately not a second bare
+`EXISTS` — a plan-independence argument against Seq-Scan-vs-Index-Scan planner drift on a wide
+retention window). `kResponseRetentionProbeSql` is the reference shape; `AuditStore`'s probe is
+the sibling that motivated it.
+
+The capped DELETE itself (Doomgoose finding #6) is chunked (`kReapDeleteChunkRows=500`) under a
+wall-clock budget (`kReapDeleteBudget=2000ms`), not one unbounded cascading statement — a wide
+facet fan-out on a single response row makes the CASCADE to `response_facets` expensive per row,
+and an unbounded statement has no way to yield mid-delete. The chunk loop reuses the existing
+capped/swept/backlog-probe reporting logic; `budget_exhausted` is a distinct reason from the
+row-count cap.
 
 ### Lifecycle
 
@@ -152,9 +207,12 @@ should reach for one batch-under-one-savepoint, not a savepoint per row (subxid 
 - **Mandatory backfill**: rejected — responses are expendable TTL'd telemetry (ADR-0009
   skippable); a mandatory multi-GB backfill of a high-write table would add boot latency and
   OOM risk (cf. #2661) for data that self-refills.
-- **Catastrophic-read type-distinguishable everywhere**: unnecessary — no response read feeds
-  an enforce/target/authz decision; the seam stays degrade-distinguishable but consumers may
-  render degraded (the ResultSetStore `list_by_owner` precedent).
+- **Catastrophic-read type-distinguishable everywhere**: unnecessary for the display consumers
+  (executions drawer / TAR / dashboard results) — the seam stays degrade-distinguishable but
+  those consumers may render degraded (the ResultSetStore `list_by_owner` precedent). The
+  `/auto` Pre-flight consumer is the exception (see the Posture correction above): its two
+  callers check the seam's `degraded` signal explicitly and decline to persist rather than
+  rendering degraded, because what they'd persist is a go-cohort input, not a display.
 
 ## Consequences
 
@@ -163,17 +221,33 @@ should reach for one batch-under-one-savepoint, not a savepoint per row (subxid 
   cycle. Executions drawer / TAR read fleet-consistent across replicas afterward.
 - Tests → `YUZU_REQUIRE_PG_DB_TPL` + a file-local `"responsestore"` `PgTestTemplate`;
   migration/fresh-DB tests keep plain `YUZU_REQUIRE_PG_DB`.
+- `plugin_result_status` (ABI3→4) round-trips through `ResponseStore` unchanged — a caller
+  that reads it back after this migration sees the same value it wrote before.
+- `BundleOrchestrator::collate()` returns `std::expected<BundleAggregate, CollateError>`
+  instead of `std::optional` (Doomgoose finding #3) — its two REST/MCP callers
+  (`GET /api/v1/bundles/{id}`, `get_bundle_result`) now 503/`kInternalError` a degraded
+  `ResponseStore` read distinctly from a genuine not-found/denied 404, instead of both
+  collapsing to the same audit row and status code.
+- A degraded `/auto` Pre-flight tick no longer completes a run or overwrites a resolved
+  device's verdict (see the Posture correction above) — an operator watching a run through a
+  transient Postgres blip now sees an honest "temporarily unavailable, retrying" state instead
+  of devices silently flipping from a real Pass to Incomplete.
 
 ## Follow-ups
 
 - #2634-parity reap counters land here from day one.
 - The #1634 management-group-scoped response read (already threaded via `ResponseQuery`)
   stays defense-in-depth; no change.
-- **Accepted limitation (chaos Gate 5 R4):** the convenience scalar reads
-  (`total_count` / `facet_agent_count` / `facet_line_count`) return a plain `0` on a
-  pool-timeout / query error, indistinguishable from a genuine `0` and NOT counted on
-  `yuzu_server_response_read_degrade_total`. Benign today — no caller treats these as a
-  trigger for a destructive/skip action (the reap uses its own probe, not these), and they
-  feed display/metrics only. If a future authz-adjacent consumer reads one, promote it to the
-  `std::optional`-nullopt seam like the row/aggregate readers. Recorded so it is a deliberate
-  carve-out, not an omission.
+- **Resolved (#2691, 2026-08-08):** the accepted limitation this bullet originally recorded —
+  `facet_agent_count` / `facet_line_count` returning a plain `0` on pool-timeout / query error,
+  indistinguishable from a genuine `0` — is fixed. Both now return `std::optional<int64_t>`,
+  `nullopt` on degrade, empty-filter `0` returned first so it can never be mistaken for a
+  degrade. **Not yet wired to `yuzu_server_response_read_degrade_total`** — unlike the
+  `query`/`aggregate`/facet-listing readers, these two don't route through the shared
+  degrade-aware-read helper, so a degrade here is visible at the render layer but not counted
+  on that metric; promoting them to the shared helper is a small follow-up, not done here. The
+  dashboard group-creation path (`/fragments/create-group-form`, the results-table agent count,
+  `/api/dashboard/group-from-results`) threads the `nullopt` distinction through: a degraded
+  count renders "count unavailable (store degraded)" instead of a false `0`, and the
+  write-adjacent group-creation POST 503s with an honest message instead of misreporting
+  "no agents match the current filters."
