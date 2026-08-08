@@ -1679,6 +1679,19 @@ void RestApiV1::register_routes(
                  const auto id = req.matches[1].str();
                  auto agg = bundle_orch->collate(id, principal, is_admin);
                  if (!agg) {
+                     // #2691 (Doomgoose finding #3): kDegraded is a real store
+                     // read failure on a bundle that WAS found and owned — a
+                     // retryable 503, never the same terminal 404 (or the
+                     // same false "denied" audit row) a genuinely-absent/
+                     // not-owned bundle gets.
+                     if (agg.error() == CollateError::kDegraded) {
+                         audit_fn(req, "bundle.collate", "failure", "Execution", id,
+                                  "response store degraded");
+                         res.status = 503;
+                         res.set_content(detail::a4_error(res, "response store degraded"),
+                                         "application/json");
+                         return;
+                     }
                      // not-found and not-owned return the same 404 so existence
                      // isn't an enumeration oracle; the real reason is audited.
                      audit_fn(req, "bundle.collate", "denied", "Execution", id,

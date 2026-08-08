@@ -235,7 +235,42 @@ TEST_CASE("orchestrator collate of an unknown correlation id is nullopt", "[pg][
     ResponseStore store(pool);
     REQUIRE(store.is_open());
     BundleOrchestrator orch(fd.fn(), &store, fixed_id("abc"));
-    CHECK_FALSE(orch.collate("bundle-nope", "alice", false).has_value());
+    auto agg = orch.collate("bundle-nope", "alice", false);
+    CHECK_FALSE(agg.has_value());
+    CHECK(agg.error() == CollateError::kNotFoundOrDenied);
+}
+
+// #2691 (Doomgoose finding #3): a manifest that IS found and owned, but whose
+// ResponseStore read fails, must return a DISTINCT error from the same-shaped
+// "not found / not owned" case above — the caller maps kDegraded to a
+// retryable 503/kInternalError, never the terminal 404 a genuinely-absent or
+// denied bundle gets. A not-open store (bad pool) forces query_by_execution()
+// to fail without needing to break a healthy connection mid-test.
+TEST_CASE("orchestrator collate distinguishes a degraded store read from not-found/denied",
+          "[pg][bundle][orchestrator]") {
+    FakeDispatch fd;
+    PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    ResponseStore bad_store(bad_pool);
+    REQUIRE_FALSE(bad_store.is_open());
+    BundleOrchestrator orch(fd.fn(), &bad_store, fixed_id("abc"));
+
+    auto res = orch.dispatch("agent-1", two_steps(), "alice", null_audit());
+    auto agg = orch.collate(res.correlation_id, "alice", /*is_admin=*/false);
+    CHECK_FALSE(agg.has_value());
+    CHECK(agg.error() == CollateError::kDegraded); // NOT kNotFoundOrDenied
+}
+
+// The `!response_store_` (never-wired) branch is the SAME degrade signal,
+// not a third state — a caller must not be able to tell "substrate never
+// wired" apart from "substrate read failed" (#2691).
+TEST_CASE("orchestrator collate with an unwired response store is a degrade not a not-found",
+          "[bundle][orchestrator]") {
+    FakeDispatch fd;
+    BundleOrchestrator orch(fd.fn(), /*response_store=*/nullptr, fixed_id("abc"));
+    auto res = orch.dispatch("agent-1", two_steps(), "alice", null_audit());
+    auto agg = orch.collate(res.correlation_id, "alice", /*is_admin=*/false);
+    CHECK_FALSE(agg.has_value());
+    CHECK(agg.error() == CollateError::kDegraded);
 }
 
 // ── Gate-7 governance hardening regressions ─────────────────────────────────

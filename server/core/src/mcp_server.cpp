@@ -7391,6 +7391,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 const bool is_admin = session->role == auth::Role::admin;
                 auto agg = bundle_orch->collate(bundle_id, session->username, is_admin);
                 if (!agg) {
+                    // #2691 (Doomgoose finding #3): kDegraded is a real store
+                    // read failure on a bundle that WAS found and owned — a
+                    // retryable kInternalError, never the same terminal
+                    // "not found" (or false "denied" audit row) a genuinely-
+                    // absent/not-owned bundle gets.
+                    if (agg.error() == CollateError::kDegraded) {
+                        mcp_audit("failure", "response store degraded: " + bundle_id);
+                        res.set_content(
+                            error_response(id, kInternalError, "Response store degraded"),
+                            "application/json");
+                        return;
+                    }
                     mcp_audit("denied", "not found or not owned: " + bundle_id);
                     res.set_content(error_response(id, kInvalidParams, "bundle not found"),
                                     "application/json");

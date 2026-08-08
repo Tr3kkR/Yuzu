@@ -171,7 +171,7 @@ BundleOrchestrator::dispatch(const std::string& agent_id, const std::vector<Bund
     return DispatchResult{correlation, steps.size()};
 }
 
-std::optional<BundleAggregate>
+std::expected<BundleAggregate, CollateError>
 BundleOrchestrator::collate(const std::string& correlation_id, const std::string& principal,
                             bool is_admin) {
     auto meter = [&](const char* result) {
@@ -192,15 +192,15 @@ BundleOrchestrator::collate(const std::string& correlation_id, const std::string
         if (it == manifests_.end()) {
             maybe_sweep_locked(now);
             meter("not_found");
-            return std::nullopt; // unknown / already swept
+            return std::unexpected(CollateError::kNotFoundOrDenied); // unknown / already swept
         }
         // Ownership: only the dispatcher (or an admin) may collate. An empty
         // principal never owns anything (defensive — governance sec-M2/CH-7).
-        // nullopt is indistinguishable from not-found so existence isn't an
-        // enumeration oracle (the wrapper audits the real reason).
+        // kNotFoundOrDenied is indistinguishable from not-found so existence
+        // isn't an enumeration oracle (the wrapper audits the real reason).
         if (!is_admin && (principal.empty() || it->second.dispatched_by != principal)) {
             meter("denied");
-            return std::nullopt;
+            return std::unexpected(CollateError::kNotFoundOrDenied);
         }
         it->second.created_at_ms = now; // slide: an active poll keeps it alive
         steps = it->second.steps;       // copy so we release mu_ before the DB read
@@ -208,8 +208,12 @@ BundleOrchestrator::collate(const std::string& correlation_id, const std::string
     }
 
     if (!response_store_) {
-        meter("not_found");
-        return std::nullopt;
+        // The substrate itself isn't wired — this is a degrade, not a
+        // genuine absence (#2691): the manifest above WAS found and owned,
+        // so a caller-facing 404 here would be exactly the same false
+        // "not found" Doomgoose's finding named for a store-read failure.
+        meter("degraded");
+        return std::unexpected(CollateError::kDegraded);
     }
 
     ResponseQuery rq;
@@ -217,11 +221,13 @@ BundleOrchestrator::collate(const std::string& correlation_id, const std::string
     rq.status = -1;  // any status (step results may ride RUNNING or terminal rows)
     auto rows_opt = response_store_->query_by_execution(correlation_id, rq);
     if (!rows_opt) {
-        // Degraded read: distinct from "not found" for the meter, but the
-        // caller-facing contract stays the same nullopt (deny-or-benign,
-        // ADR-0039) — a poll retries.
+        // Degraded read (#2691, Doomgoose finding #3): distinct from
+        // "not found" in the CALLER-FACING contract too, not just the
+        // meter — the manifest was found and owned, so this must map to a
+        // retryable 503/kInternalError, not the same terminal 404 a
+        // genuinely-absent/denied bundle gets.
         meter("degraded");
-        return std::nullopt;
+        return std::unexpected(CollateError::kDegraded);
     }
     const auto& rows = *rows_opt;
 
