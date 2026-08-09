@@ -614,12 +614,15 @@ public:
                           "malformed arguments or probing",
                           "counter");
         metrics_.describe("yuzu_mcp_approval_refused_total",
-                          "MCP approval-ticket recalls refused at the consume step "
-                          "(#2442): a replay, a ticket minted on another surface, or a "
-                          "store failure. Deliberately carries NO reason label — the "
-                          "denial kind is exactly the distinction the client response "
-                          "withholds, and /metrics is not a stronger reader than the "
-                          "caller. Read the audit trail for the kind",
+                          "MCP approval-ticket recalls refused at the ticket-lookup step "
+                          "(#2786) or the consume step (#2442): a replay, a ticket minted "
+                          "on another surface, or a store failure at either step. A store "
+                          "failure is already exposed to the caller through the A4 retry "
+                          "envelope (-32603 vs -32003); what stays withheld is the split "
+                          "WITHIN a -32003 consume denial — a foreign-origin ticket reads "
+                          "exactly like an ordinary replay, so this counter deliberately "
+                          "carries NO reason label, and /metrics is not a stronger reader "
+                          "than the caller. Read the audit trail for the kind",
                           "counter");
         // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
         // degrade reason is a static literal inside the bridge, never derived
