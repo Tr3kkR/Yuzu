@@ -245,10 +245,14 @@ extern const char* const kDashboardIndexHtml =
       font-size: 0.85rem;
     }
     /* #2691 finding 7: an honest "store degraded, not zero matches" banner —
-       distinct from .empty-state so it doesn't visually read as "nothing here". */
+       distinct from .empty-state so it doesn't visually read as "nothing here".
+       Amber, not alarm-red (#2691 Gate 6 enterprise-readiness): this is a
+       "temporarily unavailable, retrying" state, not a confirmed failure —
+       red is reserved for that, so it works against the calm/accurate copy
+       every degrade banner already carries. */
     .result-degrade-banner {
-      color: var(--red, #ff5765); background: rgba(255, 87, 101, 0.08);
-      border: 1px solid rgba(255, 87, 101, 0.4); border-radius: 0.5rem;
+      color: var(--yellow, #ffcc00); background: rgba(255, 204, 0, 0.08);
+      border: 1px solid rgba(255, 204, 0, 0.4); border-radius: 0.5rem;
       padding: 0.6rem 0.9rem; font-size: 0.8rem;
     }
 

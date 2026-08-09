@@ -89,7 +89,7 @@ Rationale recorded here so it is a deliberate decision, not an omission.
 The cleanup thread's bare wall-clock TTL delete ports to the #2496 `gc_sweep` shape
 (the routed-concern requires it; #2508): shared `gc_meta` reading + advisory
 `pg_try_advisory_xact_lock('response_store:reap', 0)` (single sweeper) +
-`audit_retention_rules::classify` decline-once + unconditional per-pass cap (10 000,
+`audit_retention::classify` decline-once + unconditional per-pass cap (10 000,
 substrate-tuned to response write volume) + `yuzu_server_response_reap_passes_total{result}`.
 Reaped from the maintenance tick (like GS/ResultSetStore); the in-process cleanup thread goes
 away.

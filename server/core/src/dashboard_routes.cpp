@@ -2077,13 +2077,25 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
         // Get distinct facet values for this column
         int col_idx = static_cast<int>(i - 1);
         std::vector<FacetValue> facet_vals;
-        if (response_store_)
-            facet_vals = response_store_->facet_values(command_id, col_idx)
-                            .value_or(std::vector<FacetValue>{});
+        bool facet_degraded = false;
+        if (response_store_) {
+            auto facet_opt = response_store_->facet_values(command_id, col_idx);
+            facet_degraded = !facet_opt.has_value();
+            facet_vals = std::move(facet_opt).value_or(std::vector<FacetValue>{});
+        }
 
         html += "<label>" + html_escape(cols[i]) + "</label>";
 
-        if (facet_vals.size() <= 20) {
+        // #2691 (Gate 4 consistency-auditor): a degraded read must not render
+        // as an empty "All" dropdown — that's indistinguishable from "this
+        // column genuinely has no other values", right next to a results
+        // table that correctly banners the same degrade. Disable the control
+        // instead of silently offering a filter that can't be trusted.
+        if (facet_degraded) {
+            html += "<select name=\"" + param_name + "\" disabled title=\"Filter values "
+                    "unavailable — response store degraded\">"
+                    "<option value=\"\">(unavailable)</option></select>";
+        } else if (facet_vals.size() <= 20) {
             // Dropdown for small cardinality
             html += "<select name=\"" + param_name + "\""
                     " hx-get=\"/fragments/results\" hx-target=\"#results-tbody\""

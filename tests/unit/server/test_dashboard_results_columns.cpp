@@ -68,6 +68,9 @@ struct DashboardResultsColumnsTestAccess {
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
                                      /*filters=*/{}, /*text_query=*/"", definition_id);
     }
+    std::string render_filter_bar(const std::string& command_id, const std::string& plugin) {
+        return routes.render_filter_bar(command_id, plugin);
+    }
 };
 
 namespace {
@@ -221,6 +224,29 @@ TEST_CASE("render_results: a degraded store read renders the degrade banner "
     CHECK(contains(html, "result-degrade-banner"));
     CHECK(contains(html, "Results unavailable"));
     CHECK_FALSE(contains(html, "No results match your filters"));
+}
+
+// #2691 (Gate 4 consistency-auditor): the per-column filter dropdown must not
+// silently render "All" with zero options on a degraded facet_values() read —
+// indistinguishable from "this column genuinely has no other values", right
+// next to a results table that correctly banners the same degrade.
+TEST_CASE("render_filter_bar: a degraded facet read disables the dropdown "
+          "instead of rendering an empty All",
+          "[server][dashboard][render_filter_bar]") {
+    InstructionStore is{":memory:"};
+    REQUIRE(is.is_open());
+
+    PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    ResponseStore bad_rs{bad_pool};
+    REQUIRE_FALSE(bad_rs.is_open());
+
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(&is, &bad_rs);
+    const std::string html = acc.render_filter_bar("cmd-degraded", "registry");
+
+    CHECK(contains(html, "disabled"));
+    CHECK(contains(html, "(unavailable)"));
+    CHECK(contains(html, "response store degraded"));
 }
 
 } // namespace yuzu::server

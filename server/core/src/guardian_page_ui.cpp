@@ -46,10 +46,12 @@ extern const char* const kGuardianDetailPageHtml =
 
     /* #2691 finding 10: an honest "store degraded, retrying" banner on a
        running /auto Pre-flight page — distinct from a plain empty state so
-       it doesn't read as "these devices are done". */
+       it doesn't read as "these devices are done". Amber, not alarm-red
+       (#2691 Gate 6 enterprise-readiness): a transient retrying blip, not a
+       confirmed failure — matches the dashboard sibling banner. */
     .result-degrade-banner {
-      color: var(--red, #ff5765); background: rgba(255, 87, 101, 0.08);
-      border: 1px solid rgba(255, 87, 101, 0.4); border-radius: 0.5rem;
+      color: var(--yellow, #ffcc00); background: rgba(255, 204, 0, 0.08);
+      border: 1px solid rgba(255, 204, 0, 0.4); border-radius: 0.5rem;
       padding: 0.6rem 0.9rem; font-size: 0.8rem; margin-bottom: 0.75rem;
     }
 
