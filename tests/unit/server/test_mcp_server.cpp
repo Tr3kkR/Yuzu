@@ -7271,11 +7271,11 @@ TEST_CASE("MCP approval recall: a store fault AT the origin check masks a foreig
     // classifier-transient code, same as BUSY) isolates the fault to the
     // origin check specifically — see the classifier unit tests in
     // test_approval_manager.cpp for the BUSY case directly.
-    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::test::TempDbFile tagdb{std::string_view{"yuzu_test_mcp_tag_"}};
     yuzu::server::TagStore tags(tagdb.path);
     tags.set_tag("agent-1", "role", "web", "server");
 
-    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
     struct Conn {
         sqlite3* h{nullptr};
         Conn() = default;
@@ -7384,11 +7384,11 @@ TEST_CASE("MCP approval recall: an OPEN store failing permanently gets the escal
     // a way an unchanged retry cannot clear. PRAGMA query_only is used
     // because it deterministically yields SQLITE_READONLY on the very next
     // write, without corrupting the file the test fixture needs.
-    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::test::TempDbFile tagdb{std::string_view{"yuzu_test_mcp_tag_"}};
     yuzu::server::TagStore tags(tagdb.path);
     tags.set_tag("agent-1", "role", "web", "server");
 
-    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
     struct Conn {
         sqlite3* h{nullptr};
         Conn() = default;
