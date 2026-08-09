@@ -807,6 +807,32 @@ groups:
             the guaranteed-state DB health (disk pressure, corruption, lock contention).
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-ingest-errors"
 
+      # #2663 review: the retention reaper's declined_no_anchor result value was
+      # documented (guaranteed-state.md "Retention", metrics.md) with this exact
+      # expression but shipped no rule — mirrors AuditStore's
+      # YuzuAuditRetentionAnchorNotSurviving (#2579), same reasoning: expect AT
+      # MOST one decline per database, on the pass that first reaches a verdict:
+      # the decline itself SETTLES the bootstrap marker, so a genuine repeat means
+      # the marker is not surviving between passes, not that the clock moved.
+      - alert: YuzuGuardianReapAnchorNotSurviving
+        expr: |
+          increase(yuzu_server_guardian_reap_passes_total{result="declined_no_anchor"}[24h]) > 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Guardian retention keeps re-bootstrapping - the stored clock reading is not surviving"
+          description: >-
+            The Guardian retention guard has declined more than once in a day for having
+            NO stored clock reading (guaranteed_state_store.gc_meta.bootstrap_settled).
+            Expect this AT MOST once per database, on the pass that first reaches a
+            verdict - that pass also settles the marker, so the next one has an anchor.
+            Repeating means the marker is being lost between passes (a restore from
+            backup, a replica rehydrated from a template, a disk-level rollback), not
+            that the clock moved. Nothing has been deleted by these passes - the guard
+            declines rather than deletes on this trigger.
+          runbook_url: "https://docs.yuzu.io/runbooks/guardian-reap-anchor-not-surviving"
+
   - name: yuzu-audit
     # Behavioural-data routes (guardian.device.view, dex.device.view, dex.signal.view)
     # audit-on-open then FAIL CLOSED: if the audit row cannot persist they return 503
@@ -964,13 +990,118 @@ groups:
       # grows without bound and rows are retained past the stated window. This
       # is the only rule that catches it.
       #
-      # Threshold assumes the default 60-minute cleanup interval: no pass in 3h
-      # is unambiguously broken. A deployment that lengthens cleanup_interval_min
-      # must widen this window; PromQL cannot read the server's own interval.
+      # Threshold is tied to the 60-minute cleanup interval: no pass in 3h is
+      # unambiguously broken. That interval is NOT operator-configurable today --
+      # `server.cpp` constructs `AuditStore` with only `audit_retention_days`, so
+      # the `cleanup_interval_min` ctor parameter declared in `audit_store.hpp`
+      # keeps its 60-minute default. If it is ever exposed, this window and the
+      # `resets` bound below must both be revisited; PromQL cannot read the
+      # server's own interval.
+      #
+      # THE YOUNG-SERVER GRACE MUST NOT EXCLUDE A CRASH LOOP. run_cleanup sleeps
+      # a full interval BEFORE its first pass, so a server that has genuinely
+      # just started has no pass yet and is not broken. But a server restarting
+      # more often than this window NEVER accumulates uptime past the grace, so a
+      # bare `uptime > 10800` (equivalently `unless uptime < 10800`) excluded the
+      # rule's own motivating case on every evaluation: a reaper that completes
+      # zero passes because the process keeps dying. `resets()` separates the
+      # two, and `unless` rather than `and` so a missing uptime series cannot
+      # silence the rule either.
+      #
+      # WHY `<= 1` AND NOT `== 0`. A young server that restarts ONCE in the
+      # window -- install, then a config fix -- is healthy and must not page, but
+      # it has a reset. Excusing one is a deliberate trade, and it is NOT free.
+      # Both halves are pinned in the test file: the single-restart case must
+      # stay quiet, the 30-minute crash loop must still fire.
+      #
+      # WHAT THE TRADE COSTS, MEASURED (#2553, governance pass 13). An earlier
+      # revision of this comment argued it cost NO coverage -- "to complete zero
+      # passes a process must restart more often than hourly, which is at least
+      # three resets across 3h; any cadence slow enough to leave only one reset
+      # also leaves a segment long enough for a pass to complete". That argument
+      # presupposes a WORKING reaper. Where none runs at all -- a failed migration
+      # closes the store and `start_cleanup()` early-returns, or a pass threw --
+      # no segment is long enough for anything, so `increase(...) == 0` never
+      # engages as the backstop. The states this rule's own description names are
+      # the states that argument assumed away.
+      #
+      # SO IT IS STILL BLIND for a genuinely dead reaper at restart cadences of
+      # 164-195 MINUTES: uptime never reaches 10800, and the window holds two
+      # resets for only `10800 - cadence` seconds, which is under `for: 15m` once
+      # the cadence passes 9900s. Measured 164-195 at 30s and 60s evaluation
+      # intervals, 163-196 at 300s. Do NOT validate a change against these
+      # bounds -- they are a RESULT, and three earlier reviews each reported a
+      # different band from sparse sampling. Re-run
+      # `tests/prometheus/blind_band_sweep.py`; method, resolution and the three
+      # ways this measurement goes wrong are in
+      # docs/prometheus/blind-band-measurement.md.
+      #
+      # NARROWED, NOT CLOSED. What this replaced required `uptime > 10800`
+      # outright and was silent at EVERY cadence SAMPLED against it -- 30 to 190
+      # at 10-minute resolution, and to 200 at a 5-minute evaluation interval.
+      # That is reported as a FLOOR, not as bounds: the sweep did not look for an
+      # upper edge, and the old rule was blind above 195 too. This is strictly
+      # and substantially better, and still has a hole.
+      #
+      # Closing it needs a SERVER change, not a PromQL one. The natural signal,
+      # `..._retention_last_pass_unixtime`, is seeded 0 and never reloaded from
+      # the persisted `audit_retention_meta` anchor, so it zeroes on every restart
+      # and a freshness rule built on it REGRESSES the 30-minute crash loop this
+      # rule already catches. Tracked separately; do not rewrite this expression
+      # in place without a cadence x evaluation-interval sweep.
+      #
+      # KNOWN LIMIT, and it bites hardest where crash loops live. `resets()` needs
+      # ONE CONTINUOUS SERIES per server. If a restart changes the `instance`
+      # label -- dynamic-port or IP-based service discovery, a rescheduled pod --
+      # each restart starts a FRESH series with `resets == 0` and uptime under the
+      # grace, so the grace applies forever and this rule is silent again. Nothing
+      # in PromQL can recover from that; the fix is scrape config, not this rule
+      # (target a stable identity). It is called out in the runbook.
+      #
+      # MATCHING IS DELIBERATELY BARE, and that is load-bearing. Both operands are
+      # scraped from the SAME server target, so their label sets are already
+      # identical and an explicit `on(...)` can only narrow them. An earlier
+      # revision used `on(instance)`, which let a young reset-free neighbour that
+      # merely SHARED an `instance` value -- a canary, an HA pair, a federated
+      # series -- suppress the alert for a genuinely broken server. `on(instance,
+      # job)` is not the fix: it moves the same hole to the next distinguishing
+      # label (`namespace`, `pod`, `cluster`). Default matching is what every other
+      # cross-metric rule in this file uses; a rule that opts out of it needs a
+      # stated reason, and this one has none. Pinned by the two-target case in
+      # `tests/prometheus/yuzu-alerts.test.yml`.
+      #
+      # WHAT WOULD BREAK THE ASSUMPTION, since it is an operator-side change this
+      # file cannot guard: both metrics ship UNLABELLED (`server.cpp` emits them
+      # through the no-label `gauge(name)` overload), so their label sets are
+      # whatever the scrape adds -- identically, because it is one target. A
+      # `metric_relabel_configs` that adds or drops a label on ONE of the two makes
+      # the sets differ, the join then matches nothing, the grace silently stops
+      # applying, and every fresh boot pages. That is the inverse of the
+      # `on(instance)` bug above.
+      #
+      # KNOWN LIMIT: THIS FALSE-PAGES AFTER A PROMETHEUS RESTART. MEASURED under
+      # promtool with the next pass landing at the 60-minute cadence: it fires
+      # from ~15m (the `for:`) and clears the moment that pass lands, so about 45
+      # MINUTES of firing - bounded by the cleanup interval, not by anything this
+      # rule controls. (An earlier revision said ~75 minutes, adding `for:` to the
+      # interval. `for:` delays the START; it does not extend the end.)
+      # It predates this rule's current form - MEASURED identically against the
+      # previous expression (#2553, Gate 5 chaos analysis). `increase()` over a
+      # PARTIAL range returns 0, and the young-server grace watches the SERVER's
+      # uptime, not Prometheus's, so it does not apply: a healthy long-lived
+      # server whose last hourly pass predates the first scrape is
+      # indistinguishable from a dead reaper until a pass lands inside the new
+      # window. A fresh TSDB, a new HA replica, or applying this file for the
+      # first time all produce it. Documented rather than fixed here because the
+      # fix is a behaviour change (a `count_over_time(...) >= n` conjunct) that
+      # wants deciding on its own evidence rather than folding into this branch.
       - alert: YuzuAuditRetentionNotRunning
         expr: |
           increase(yuzu_server_audit_retention_passes_total[3h]) == 0
-          and on(instance) yuzu_server_uptime_seconds > 10800
+          unless (
+            yuzu_server_uptime_seconds < 10800
+            and resets(yuzu_server_uptime_seconds[3h]) <= 1
+          )
         for: 15m
         labels:
           severity: warning
@@ -982,11 +1113,83 @@ groups:
             other five retention COUNTERS cannot move in this state - they all key on a
             counter rising, and nothing is running to raise one. The
             uptime guard on this rule exists because run_cleanup sleeps BEFORE its first
-            pass, so a freshly started server legitimately has no pass for one interval.
+            pass, so a freshly started server legitimately has no pass for one interval;
+            it excuses a young server only while its uptime has AT MOST ONE RESET in the
+            window, so a crash-looping process - which never accumulates uptime past the
+            grace, and is a leading cause of zero completed passes - still fires.
             Check the server log for
             "AuditStore: retention pass threw", confirm the store opened at boot
             (a failed migration closes it and start_cleanup() then early-returns), and
             check yuzu_server_audit_retention_last_pass_unixtime for when it last ran.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
+
+      # THE RULE ABOVE CANNOT DETECT ITS OWN INPUT GOING MISSING, which is why
+      # this exists. `increase()` over a metric with NO series returns an empty
+      # vector, `== 0` on an empty vector is empty, and an alert that selects
+      # nothing never fires -- so a Prometheus carrying these rules against a
+      # server that does not export `yuzu_server_audit_retention_passes_total`
+      # reports healthy forever, while the reaper is entirely unmonitored. That
+      # is the shape an operator lands in by following upgrading.md's own advice:
+      # the rules file is a copy you apply yourself, so it routinely runs ahead
+      # of the servers it points at.
+      #
+      # `absent()` is deliberately a SEPARATE rule rather than an `or` folded
+      # into the one above: the young-server grace must not apply to it (a
+      # missing metric is not excused by a recent boot), and the two states want
+      # different remediation -- one is "the reaper stopped", this one is "you
+      # are not watching the reaper at all".
+      #
+      # NOTE it is fleet-wide, not per-server: `absent()` fires only when NO
+      # series exists anywhere in this Prometheus. A single server that stops
+      # exporting while others still do is invisible here (nothing in PromQL
+      # expresses "absent for a target I can no longer see"). Scoped this way on
+      # purpose -- the alternative fires on every Prometheus that scrapes
+      # anything other than Yuzu.
+      #
+      # AND AN `up`-BASED TARGET-DOWN ALERT DOES NOT COVER THAT GAP EITHER, which
+      # this comment claimed until #2553 pass 13. The uncovered server is ALIVE
+      # and scraped -- an older build that does not export this counter yet -- so
+      # its `up` is 1. Measured: with one server exporting the counter and one
+      # not, NEITHER retention rule fires, for EITHER server, indefinitely.
+      # Closing it needs a per-target rule
+      # (`up{job=<yuzu>} == 1 unless on(instance, job) <counter>`), which would
+      # need to be a DOCUMENTED EXCEPTION to this file's bare-matching contract:
+      # `up` is Prometheus-synthesised, so metric_relabel_configs never touches
+      # it and its label set genuinely can diverge from an exported metric's.
+      # Note that exception does NOT escape the objection recorded above against
+      # `on(instance)` and `on(instance, job)` -- an HA pair or a federated copy
+      # agreeing on the narrowed labels can still stand in for the target you
+      # meant. It is a different trade, not a refutation, and whoever implements
+      # it owes that argument. Tracked separately. Until then, confirm coverage
+      # directly: `count(<counter>)` against your expected server count.
+      - alert: YuzuAuditRetentionMetricMissing
+        expr: |
+          absent(yuzu_server_audit_retention_passes_total)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit retention liveness metric is absent - the reaper is unmonitored"
+          description: >-
+            No yuzu_server_audit_retention_passes_total series exists in this Prometheus, so
+            YuzuAuditRetentionNotRunning cannot fire and the audit retention window is
+            unmonitored. CHECK `up` FOR THE YUZU TARGET FIRST - this rule cannot tell the
+            cases apart. If `up` is 0 the SERVER OR ITS SCRAPE IS DOWN, which is an outage,
+            not a monitoring gap, and on a single-server Prometheus this rule may be the only
+            one firing (nothing here alerts on `up` directly). If `up` returns NO SERIES AT
+            ALL, do not assume that is benign: it means either this Prometheus was never
+            configured to scrape a Yuzu server (expected and ignorable before the first one
+            is stood up - check the targets page), OR the target has LEFT service discovery,
+            which under dynamic-port, IP-based or scheduler-managed SD is exactly what a dead
+            or deleted server looks like. An empty target list for a fleet you believe is
+            running is an outage. If `up` is 1 the
+            metric itself is missing: a server build predating it (the rules file is a copy
+            you apply yourself and the server never upgrades it), or a scrape config dropping
+            it - confirm with `curl -s <server>/metrics | grep audit_retention_passes`, then
+            check metric_relabel_configs. THAT STATE IS NOT BENIGN: the server is alive and
+            scraped and its reaper is unmonitored. Fleet-wide only - a single quiet server
+            among many is not detected this way, and an `up`-based target-down alert does not
+            cover it either, because that server's `up` is 1.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # The durable clock reading is what makes anomaly detection survive a

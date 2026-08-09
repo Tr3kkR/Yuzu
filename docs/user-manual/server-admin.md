@@ -335,11 +335,50 @@ securable, not new here, but it is worth knowing before you narrow a built-in
 role: express the narrowing as a **custom role** or an explicit `deny` row
 instead, both of which survive a restart.
 
+### vNEXT — approval tickets outstanding at the upgrade must be re-requested (#2442) (breaking)
+
+**Who this affects.** Any deployment holding an **MCP** approval that was granted but not yet
+redeemed at the moment of upgrade — that is, one an agentic worker will present back to an MCP tool
+call. This is independent of the `mcp.` prefix entry below: it does not matter whether you author any
+`mcp.`-prefixed definitions, and a deployment running only Yuzu-supplied content **is** affected if
+it has an MCP approval in flight.
+
+**Scheduled approvals are not affected.** A schedule redeems its own approval by matching the
+schedule id, not through the MCP recall, so the origin check never sees it and a scheduled run
+outstanding across the upgrade still fires. If nothing is awaiting an MCP recall when you upgrade,
+there is nothing to do.
+
+**Rolling BACK across this release re-opens the check, and rolling forward does not close it
+again.** The back-fill runs once, as a schema migration. An older server started against an
+already-migrated database does not re-run it and does not refuse to start; approvals it mints while
+you are rolled back record no minting surface, which is the value that stays redeemable. Rolling
+forward will not revisit them, because the migration has already run. Treat a roll-back as a window
+in which the cross-surface check is not in force for newly minted approvals, and let those
+approvals expire rather than relying on them being re-checked. Expiry bounds the window, but note it
+runs from two different points: a pending approval expires 7 days after submission, and an approved
+but unredeemed one 7 days after its review — so an approval minted during a roll-back can remain
+redeemable for up to around a fortnight from the mint, not one week.
+
+**What happens.** This release records which surface minted each approval, and rows that predate the
+column carry no surface at all. Rather than assume one they may not have come from, the upgrade
+labels them with a sentinel that fails closed — so an approval granted before the upgrade is refused
+at recall. It is reported as `approval already used (one-time ticket)` even though it was never
+consumed: that message is deliberately identical for every refusal so the recall cannot be used to
+probe which surface minted a ticket, and that is why this note exists rather than the error
+explaining itself.
+
+**Recover** by calling the tool again without `approval_id` to mint a fresh ticket and have it
+re-approved. Nothing is lost but the review. The affected population is only what is outstanding at
+upgrade time, it does not grow afterwards, and approvals expire after 7 days regardless. On the
+server side the refusal is distinguishable: the audit row records `refused: foreign_origin`, not the
+uniform client message.
+
 ### vNEXT — the `mcp.` instruction-definition id prefix is reserved (#2442) (breaking)
 
 **Who this affects.** Anyone whose instruction definitions include an id beginning `mcp.`. No
 shipped or bundled content uses that prefix, so a deployment running only Yuzu-supplied content
-is unaffected and needs no action.
+needs no action *for this item* — but the outstanding-approval entry above applies regardless of
+what content you run.
 
 **Why.** `mcp.<tool>` names an MCP approval ticket. The MCP recall matches a ticket on its
 definition id and scope expression and does not bind the submitter, so a definition authored

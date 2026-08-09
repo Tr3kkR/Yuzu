@@ -3,6 +3,7 @@
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
+#include "mcp_approval_error.hpp" // shared approval-store failure body (#2786)
 #include "mcp_input_schema.hpp" // input-schema subset compiler (#2405 C8 pre-approval gate)
 #include "mcp_jsonrpc.hpp"
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
@@ -3315,7 +3316,26 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
 
                     // Recall path → validate the supplied ticket.
-                    auto appr = approval_manager->get(supplied_id);
+                    // get_checked, NOT get: a store read that FAILED is not a
+                    // read that found nothing. `get` collapsed the two, so a
+                    // transient SQLite failure here read as "no such ticket"
+                    // and the branch below told the caller to submit a fresh
+                    // request, discarding a live human-approved capability on
+                    // a failure a retry may clear. Same burn class the
+                    // consume-side guard below closes, on the same request
+                    // path, reached FIRST.
+                    auto appr_read = approval_manager->get_checked(supplied_id);
+                    if (!appr_read) {
+                        count_denial("yuzu_mcp_approval_refused_total", nullptr);
+                        mcp_audit("denied",
+                                  "approval_id=" + supplied_id + " refused: " +
+                                      consume_denial_reason(ConsumeFailure::kStoreError) +
+                                      " (lookup)");
+                        res.set_content(approval_store_error_body(*approval_manager, a4_error),
+                                        "application/json");
+                        return;
+                    }
+                    auto appr = std::move(*appr_read);
                     if (!appr || appr->definition_id != definition_id ||
                         appr->scope_expression != canon) {
                         // Absent, or for a different tool / different arguments.
@@ -3341,7 +3361,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     if (appr->status != "approved") {
                         // rejected / expired.
-                        mcp_audit("denied", "approval " + supplied_id + " status=" + appr->status);
+                        mcp_audit("denied",
+                                  "approval_id=" + supplied_id + " status=" + appr->status);
                         res.set_content(
                             a4_error(kPermissionDenied, "approval was " + appr->status,
                                      "submit a new request without approval_id to obtain a fresh "
@@ -3355,10 +3376,75 @@ McpServer::HandlerFn McpServer::build_handler(
                     // most once per ticket).
                     // H3/N2 (SOC-2 CC7.2): stamp WHO consumed the ticket — the
                     // authenticated principal recalling the tool.
-                    if (auto consumed =
-                            approval_manager->consume_ticket(supplied_id, session->username);
+                    if (auto consumed = approval_manager->consume_ticket(
+                            supplied_id, session->username, {});
                         !consumed) {
-                        mcp_audit("denied", "approval " + supplied_id + " already used");
+                        const ConsumeFailure kind = consumed.error().kind;
+                        // AUDIT names the kind. This row is server-side and is
+                        // never returned to the caller, so the anti-oracle
+                        // argument below does not reach it. Auditing every
+                        // refusal as "already used" recorded a cross-surface
+                        // forgery attempt — the event #2442 exists to detect —
+                        // identically to a benign replay, and said it about a
+                        // row whose consumed_at is still 0.
+                        //
+                        // The METRIC is a separate instrument from the audit
+                        // row: the row is the forensic record, one per event
+                        // and its write unchecked, so nothing can alert on it.
+                        // The counter gives an operator a refusal RATE.
+                        //
+                        // It deliberately carries NO reason label. A store
+                        // failure is already exposed via the response code
+                        // (-32603 vs -32003); what the audit token carries
+                        // and this counter withholds is the split WITHIN a
+                        // -32003 denial - foreign_origin vs an ordinary
+                        // replay - which is the distinction the client
+                        // response below refuses to make. `/metrics` is not a
+                        // stronger reader than the caller: it is exempt for
+                        // localhost and otherwise needs only a resolved
+                        // session — the same credential the MCP caller already
+                        // holds. A `reason` label would therefore let a token
+                        // holder recall a suspect ticket, read the series
+                        // either side, and recover which surface minted it,
+                        // reopening the oracle this handler exists to close.
+                        // The kind stays in the audit trail, which is genuinely
+                        // server-side.
+                        count_denial("yuzu_mcp_approval_refused_total", nullptr);
+                        mcp_audit("denied", "approval_id=" + supplied_id +
+                                                " refused: " + consume_denial_reason(kind));
+
+                        // CLIENT message stays uniform for the two that must not
+                        // be distinguishable: a foreign-origin refusal reads
+                        // exactly like an ordinary replay, or the recall becomes
+                        // a probe for which surface minted a ticket.
+                        //
+                        // kStoreError is NOT one of those. It leaves the ticket
+                        // UNTOUCHED, so telling the caller it was "already used"
+                        // and to fetch a fresh one would burn a live human
+                        // approval on a failure a retry may clear. The shared
+                        // body below (also used by rung 1's lookup failure,
+                        // above) carries this remediation and the conditional
+                        // retry directive A5 requires.
+                        //
+                        // The `!is_open()` arm inside that shared body is
+                        // defence in depth here, NOT the live discriminator for
+                        // a closed store: rung 1's lookup is `get_checked` now,
+                        // so a closed store is refused there and never reaches
+                        // this line. It is kept because it costs nothing and
+                        // stops THIS site becoming the fail-open one if rung 1's
+                        // lookup ever changes.
+                        //
+                        // What is NOT covered either way: an OPEN handle whose
+                        // reads fail permanently — CORRUPT, NOTADB, READONLY,
+                        // FULL — takes the transient arm and is told to retry
+                        // forever. That is the real gap, it needs
+                        // sqlite3_extended_errcode carried on ConsumeError,
+                        // and it is not closed here (#2786 PR 1c).
+                        if (kind == ConsumeFailure::kStoreError) {
+                            res.set_content(approval_store_error_body(*approval_manager, a4_error),
+                                            "application/json");
+                            return;
+                        }
                         res.set_content(
                             a4_error(kPermissionDenied,
                                      "approval already used (one-time ticket)",

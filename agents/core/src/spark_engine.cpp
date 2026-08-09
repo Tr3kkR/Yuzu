@@ -45,6 +45,74 @@ bool params_match_type(const SparkSpec& spec) {
     return false;
 }
 
+// A message whose COMPLETION cannot allocate (#2270). Everything expensive happens
+// in the constructor — which arm_impl runs BEFORE its first shared-state commit,
+// where a throw is still harmless — so finish() can be noexcept:
+//   * the prefix is assigned FIRST, then the buffer is pre-SIZED (not merely
+//     reserved) to prefix + headroom. reserve() would be the wrong tool twice
+//     over: a later assign() invalidates the reasoning, and capacity is not a
+//     postcondition the standard carries across a move.
+//   * finish() copies at most `headroom` bytes over elements that ALREADY EXIST
+//     and then shrinks. Shrinking resize() erases in place on every implementation,
+//     and its only specified Throws case (n > max_size()) is unreachable here. Note
+//     that is a QoI fact, not a normative one: [string.require]/4 lists resize among
+//     the reference-invalidating operations, so the standard does not FORBID a
+//     reallocation on shrink — libstdc++, libc++ and MSVC STL all set the length in
+//     place (cpp-expert, governance round 4).
+// The suffix is therefore TRUNCATED rather than grown when it overruns the
+// headroom. That is the deliberate trade: a clipped error message beats a
+// std::bad_alloc thrown past a committed subscription.
+constexpr std::size_t kErrHeadroom = 256;
+constexpr std::string_view kWatchThrewPrefix = "watch mechanism threw: ";
+constexpr std::string_view kWatchThrewNonStd = "a non-std exception";
+
+class BoundedMsg {
+public:
+    BoundedMsg() = default;
+    explicit BoundedMsg(std::string_view prefix, std::size_t headroom = kErrHeadroom)
+        : buf_(prefix.size() + headroom, '\0'), prefix_(prefix.size()) {
+        // Sized-then-filled, so this really is ONE allocation. Constructing from the
+        // prefix and then resize()ing measured TWO whenever the prefix exceeded the
+        // SSO threshold, which both production prefixes do.
+        // Same null-data() guard as finish(): an empty string_view has a null data(),
+        // and libc++ reaches __builtin_memmove(dst, nullptr, 0) where libstdc++
+        // short-circuits. Unreachable today — every ctor site passes a non-empty
+        // literal — but the guard belongs on both copies or on neither, and the round
+        // that added it to finish() left this one exposed (Gate 8, cs8-2).
+        if (!prefix.empty())
+            std::copy_n(prefix.data(), prefix.size(), buf_.data());
+    }
+    /// NON-COPYABLE by construction: a copy would allocate prefix_ + headroom, which
+    /// is precisely the cost this class exists to keep out of the post-commit window.
+    /// Nothing copies one today (Replay is nothrow-move-constructible so vector growth
+    /// moves), but a future throwing-move member of Replay would flip move_if_noexcept
+    /// to copy silently. Same tripwire idiom as the static_asserts in the header.
+    BoundedMsg(const BoundedMsg&) = delete;
+    BoundedMsg& operator=(const BoundedMsg&) = delete;
+    BoundedMsg(BoundedMsg&&) noexcept = default;
+    BoundedMsg& operator=(BoundedMsg&&) noexcept = default;
+    /// Complete the message with as much of `text` as the headroom holds, and
+    /// hand it over. Allocates nothing; the returned string is moved out.
+    /// [[nodiscard]] because discarding the result silently empties the buffer.
+    [[nodiscard]] std::string finish(std::string_view text) noexcept {
+        if (buf_.size() >= prefix_) {
+            const std::size_t n = std::min(buf_.size() - prefix_, text.size());
+            // Guard the zero case: an empty string_view has a null data(), and while
+            // libstdc++ short-circuits copy_n on n == 0, libc++ reaches
+            // __builtin_memmove(dst, nullptr, 0) which UBSan's nonnull-attribute
+            // reports. macOS is the leg nobody has compiled, so take the branch.
+            if (n != 0)
+                std::copy_n(text.data(), n, buf_.data() + prefix_);
+            buf_.resize(prefix_ + n);
+        }
+        return std::move(buf_);
+    }
+
+private:
+    std::string buf_;
+    std::size_t prefix_{0};
+};
+
 // Call a mechanism's watch() and convert an escaping throw into a returned
 // std::unexpected. A mechanism MUST report failure by returning std::unexpected,
 // but the real ones can throw (spark_file's watch() → fs::current_path() on a
@@ -52,18 +120,36 @@ bool params_match_type(const SparkSpec& spec) {
 // start() — route through here so the exception boundary and its message text
 // live in exactly one place and cannot drift apart (#2019 review). Each caller
 // keeps its OWN failure handling: arm_impl rolls the whole key back; the replay
-// faults in place (its subscribers already hold ids). This boundary contains a
-// mechanism's domain throw; it is NOT a defence against std::bad_alloc (the
-// message concat below can itself throw under OOM — accepted, matching the class
-// throughout start()).
+// faults in place (its subscribers already hold ids).
+//
+// #2270: error DELIVERY is non-throwing by construction. The caller passes a
+// BoundedMsg built before its own commit; completing it here cannot allocate. The
+// concat this used to do was the defect: it ran INSIDE the catch handler, so a
+// bad_alloc there escaped watch_guarded and both its callers — past arm_impl's
+// committed subscription (the ghost key), and out of the void start(). The hook
+// call and the completion are contained anyway, so no exception from this block
+// can reach a caller by any route.
 [[nodiscard]] std::expected<void, std::string>
-watch_guarded(ISparkMechanism* mech, const std::string& key, const SparkParams& params) {
+watch_guarded(ISparkMechanism* mech, const std::string& key, const SparkParams& params,
+              BoundedMsg& err, const std::function<void(int)>& fault_hook) {
     try {
         return mech->watch(key, params);
     } catch (const std::exception& e) {
-        return std::unexpected(std::string("watch mechanism threw: ") + e.what());
+        try {
+            if (fault_hook)
+                fault_hook(SparkEngine::kArmFaultPhaseWatchErrorBuild);
+            return std::unexpected(err.finish(e.what()));
+        } catch (...) {
+            return std::unexpected(err.finish(std::string_view{}));
+        }
     } catch (...) {
-        return std::unexpected(std::string("watch mechanism threw a non-std exception"));
+        try {
+            if (fault_hook)
+                fault_hook(SparkEngine::kArmFaultPhaseWatchErrorBuild);
+            return std::unexpected(err.finish(kWatchThrewNonStd));
+        } catch (...) {
+            return std::unexpected(err.finish(std::string_view{}));
+        }
     }
 }
 
@@ -440,6 +526,11 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm(Consume
         if (!consumers_.contains(consumer))
             return std::unexpected("unknown consumer id");
     }
+    // The FIRST half of the M1 window (#1994) — pre-check passed, nothing inserted
+    // yet. No locks held. See the seam's header doc for why arm_race_hook_for_test_
+    // cannot reach the same interleaving.
+    if (arm_precheck_race_hook_for_test_)
+        arm_precheck_race_hook_for_test_();
     Subscriber sub;
     sub.tier = SparkTier::Queued;
     sub.consumer = consumer;
@@ -471,9 +562,97 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
     // Set to the mechanism + params only when a NEW event-driven watch must be
     // armed live (a fresh key on a running engine). Deferred/deduped arms and
     // all timer-driven arms leave it null.
+    // #2270 — arm_impl is STRONG-GUARANTEE against std::bad_alloc. The old order
+    // inserted into armed_ and then kept allocating (spec copy, sub_keys_ node,
+    // subs growth, the log line), so a throw part-way left a GHOST key: an armed_
+    // entry with no subscriber and no watcher. A later equal-spec arm deduped onto
+    // it (inserted == false), skipped watch_guarded(), and reported SUCCESS with no
+    // OS watcher running — silent, durable detection loss that outlived the memory
+    // pressure. Two layers close it:
+    //   (1) inside mu_: every allocation happens BEFORE the first shared-state
+    //       commit, the one remaining allocating commit is try/caught, and the tail
+    //       that publishes the subscription cannot throw (pinned by static_assert).
+    //       Note the in-lock rollback also unpublishes nothing: the publish tail runs
+    //       AFTER the last allocating step, so there is nothing committed to undo.
+    //   (2) past the commit: NO ALLOCATION FAILURE CAN ESCAPE. Every string a
+    //       post-commit path can return is built below, before the commit, and only
+    //       moved afterwards; watch_guarded() completes its error into a pre-sized
+    //       buffer; the consumer-race teardown is a specialization of disarm() that
+    //       copies nothing. Read that precisely - it is NOT "the window never
+    //       allocates": the log lines in it still format into heap buffers. It is
+    //       that every remaining allocating statement sits inside a catch-all, so a
+    //       bad_alloc from one costs a log line and nothing else.
+    //       COVERAGE, STATED EXACTLY, because the blanket version of this sentence was
+    //       false: tests/unit/test_spark_alloc_budget.cpp counts this window with the
+    //       logger silenced for the FAILED-WATCH, DEDUP and fresh-SUCCESS shapes. The
+    //       pre-start/timer and teardown_arm_race shapes are covered by inspection
+    //       only (#2816). An adversarial reviewer disproved the earlier unqualified
+    //       "pinned by" wording by inserting an allocation on the success path and
+    //       watching the budget binary pass green - do not restore a blanket claim
+    //       here without a counted case behind every shape.
+    //
+    // There is deliberately NO post-commit rollback. An earlier revision had one and
+    // it was a net negative: across two review rounds it shipped a wrong branch
+    // predicate (it deleted healthy sibling subscriptions and orphaned live OS
+    // watches on the deduped, timer and pre-start shapes), then a TOCTOU whose
+    // converse re-created the very ghost this fix exists to close - a rollback
+    // running with no locks held, after an unwind window, cannot reliably decide
+    // what it is allowed to undo. Layer (2) removes the need for one: the round that
+    // deleted the rollback claimed the log line was the only thing left that could
+    // throw, and that was FALSE - the error concat inside watch_guarded's catch
+    // handler reproduced the ghost on demand.
+    //
+    // RESIDUALS, stated rather than papered over. Layer (2) is about ALLOCATION
+    // failure; two other things past the commit can still throw out of this function:
+    //   * a std::system_error from acquiring mech_ops_mu_by_type_ or consumers_mu_.
+    //     std::mutex::lock throws only on EDEADLK/EINVAL/EAGAIN - a process-is-broken
+    //     condition, not the memory pressure #2270 is about - and recovering from it
+    //     is what the rollback failed twice to do safely. Out of scope here.
+    //   * arm_race_hook_for_test_ below, which exists to inject exactly such a throw.
+    //     (The seam inside watch_guarded is contained there and cannot escape.)
+    // And one that does NOT escape but is not repaired either: a throwing mechanism
+    // unwatch() during the consumer-race teardown leaves an orphaned OS watch.
+    // Reclamation is mechanism-dependent, not simply OS-dependent: a File watch
+    // (Windows-only mechanism) is never reclaimed short of a process restart; a
+    // Service watch (Linux or Windows) is reclaimed the next time stop() runs; a
+    // Registry watch (Windows-only mechanism) cannot fail this way at all. Contained
+    // and counted as stats().arm_race_unwatch_failures_total, and surfaced as a
+    // sparse heartbeat tag; teardown_arm_race carries the per-mechanism bound and the
+    // reason repairing it is not attempted.
     ISparkMechanism* mech = nullptr;
     SparkParams watch_params;
     SubscriptionId id = 0;
+
+    // ── pre-built returns (#2270 layer 2) ─────────────────────────────────────────
+    // Built here, where a throw unwinds a still-untouched engine, and only MOVED
+    // after the commit. Building them later - inside a catch handler, or on a return
+    // path - is the defect this replaces: it puts an allocation in a window where a
+    // bad_alloc strands a live subscription. (next_id_ having advanced is not state a
+    // caller can observe; skipping an id is unobservable.)
+    //
+    // All of it happens BEFORE mu_ is taken. An earlier revision built the three
+    // watch-related carriers inside the lock, where the fresh-event-driven shape is
+    // known — but that put three allocations under the one mutex that also serialises
+    // disarm(), emit_event dispatch and every other arm(), on the ordinary success
+    // path, to save work only a failing arm needs (governance round 4, happy-path
+    // HP-1 + sre). `event_driven` is known here, so the shape test that matters is
+    // available without the lock. Four shapes now build carriers they will not use:
+    // a deduped event-driven arm; a PRE-START event-driven arm (which previously built
+    // nothing, since the build sat inside `if (running_)`); and an arm rejected inside
+    // the lock, either for `stopped_` or for an unsupported type - two shapes. All are bounded, per-call, and off
+    // the mutex, which is the cheaper side of the trade (Gate 8 - SRE8-4).
+    std::string consumer_race_msg;
+    std::string disarmed_mid_arm_msg;
+    BoundedMsg watch_threw_msg;
+    BoundedMsg watch_fail_msg;
+    if (tier == SparkTier::Queued)
+        consumer_race_msg = "consumer unregistered during arm";
+    if (event_driven) {
+        disarmed_mid_arm_msg = "spark '" + key + "' was disarmed before its watch could be armed";
+        watch_threw_msg = BoundedMsg(kWatchThrewPrefix);
+        watch_fail_msg = BoundedMsg("watch mechanism failed to arm '" + key + "': ");
+    }
+
     {
         std::lock_guard lk(mu_);
         if (stopped_)
@@ -485,40 +664,96 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
                                    spark_type_token(spec.type) + "' — unsupported on this platform");
         sub.id = next_id_++;
         id = sub.id;
-        auto [it, inserted] = armed_.try_emplace(key);
-        Armed& armed = it->second;
-        if (inserted) {
-            armed.spec = spec;
-            armed.cadence_ms = *cadence;
+
+        // Everything that allocates for a BRAND-NEW key is built on this local, so a
+        // throw here cannot touch armed_'s CONTENTS. One deliberate exception, below:
+        // the dedup branch grows an existing entry's subs capacity before the commit,
+        // which the catch does not undo — capacity only, no observable state change.
+        Armed fresh;
+        auto* existing = [&]() -> Armed* {
+            auto it = armed_.find(key);
+            return it == armed_.end() ? nullptr : &it->second;
+        }();
+        if (existing == nullptr) {
+            fresh.spec = spec;
+            fresh.cadence_ms = *cadence;
             if (event_driven) {
                 // TRAP 1: event-driven sparks NEVER sit on the wheel — the wheel
                 // scan + `default: continue` assume it. A live engine arms the
                 // watch now (below, mu_ released); a pre-start arm is armed by
                 // start()'s replay.
-                armed.scheduled = false;
+                fresh.scheduled = false;
                 if (running_) {
                     mech = mechanisms_.at(spec.type).get();
                     watch_params = spec.params;
+                    // The carriers this shape needs were built before the lock.
                 }
             } else {
-                armed.scheduled = true;
-                armed.next_due =
-                    initial_due(armed.spec, armed.cadence_ms, std::chrono::steady_clock::now());
+                fresh.scheduled = true;
+                fresh.next_due =
+                    initial_due(fresh.spec, fresh.cadence_ms, std::chrono::steady_clock::now());
             }
-            spdlog::info("SparkEngine: armed '{}'", key);
-        } else if (armed.spec.type == SparkType::Startup && !armed.scheduled && running_) {
-            // A late subscriber to an already-fired startup spark still gets its
-            // one-shot: re-schedule so the arm itself is the observable "startup".
-            armed.scheduled = true;
-            armed.next_due = std::chrono::steady_clock::now();
+            fresh.subs.push_back(std::move(sub));
+        } else {
+            // Dedup: a second arm of an equal event-driven spec shares the existing
+            // watcher — mech stays null, no second watch() (N subscriptions, 1
+            // watcher). Reserve now (strong-guarantee: a throw leaves the vector
+            // untouched) so the publishing push_back below cannot throw.
+            // LOAD-BEARING AND UNPINNED: deleting this line leaves the whole suite
+            // green (measured), because without a reallocation the publish behaves
+            // identically - the defect it prevents is only reachable when push_back
+            // itself must allocate under memory pressure. The static_assert on
+            // Subscriber's move covers the move, not the reallocation. Do not
+            // "simplify" it away on the strength of a green run.
+            existing->subs.reserve(existing->subs.size() + 1);
         }
-        // Dedup: a second arm of an equal event-driven spec falls through here
-        // (inserted == false) and shares the existing watcher — mech stays null,
-        // no second watch() (N subscriptions, 1 watcher).
-        sub_keys_.emplace(id, key);
-        armed.subs.push_back(std::move(sub));
+
+        // ── commit ────────────────────────────────────────────────────────────
+        // First shared-state mutation. try_emplace is itself strong: it throws
+        // before committing anything.
+        auto [it, inserted] = armed_.try_emplace(key);
+        try {
+            if (arm_fault_hook_for_test_)
+                arm_fault_hook_for_test_(kArmFaultPhaseBeforeSubKeys);
+            // The last allocating step. On a throw the armed_ entry we just made
+            // must go, or it becomes the ghost this whole ordering exists to prevent.
+            sub_keys_.emplace(id, key);
+        } catch (...) {
+            if (inserted)
+                armed_.erase(it);
+            throw;
+        }
+
+        // ── publish (nothrow tail) ────────────────────────────────────────────
+        // Nothing below allocates: the Armed move-assign and the Subscriber move
+        // into already-reserved capacity are both nothrow, pinned by the
+        // static_asserts in the header next to the structs they constrain.
+        if (inserted) {
+            it->second = std::move(fresh);
+        } else {
+            Armed& armed = it->second;
+            if (armed.spec.type == SparkType::Startup && !armed.scheduled && running_) {
+                // A late subscriber to an already-fired startup spark still gets its
+                // one-shot: re-schedule so the arm itself is the observable "startup".
+                armed.scheduled = true;
+                armed.next_due = std::chrono::steady_clock::now();
+            }
+            armed.subs.push_back(std::move(sub));
+        }
         if (!event_driven)
             wheel_cv_.notify_all();
+        if (inserted) {
+            // spdlog formats into a heap buffer, so under the very memory pressure
+            // #2270 is about it can throw - and a throw here would strand a committed
+            // subscription. Losing a log line is strictly better than unwinding a
+            // live arm. (Not the only allocating statement past the commit - see the
+            // pre-built returns above for the ones that were removed rather than
+            // contained.)
+            try {
+                spdlog::info("SparkEngine: armed '{}'", key);
+            } catch (...) {
+            }
+        }
     }
 
     // Arm the OS watch with mu_ RELEASED — watch() may block on handle setup,
@@ -535,36 +770,28 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
         {
             std::lock_guard lk(mu_);
             if (!armed_.contains(key))
-                return std::unexpected(std::string("spark '") + key +
-                                       "' was disarmed before its watch could be armed");
+                return std::unexpected(std::move(disarmed_mid_arm_msg));
         }
         // A mechanism must RETURN std::unexpected on failure, not throw — but
         // the real ones can (e.g. spark_file's watch() uses fs::current_path()
         // without an ec overload, which throws on a relative path with a bad
-        // CWD). An escaping throw would unwind PAST the rollback below, leaving
-        // a zombie armed_ entry with no watcher and no id ever returned to the
+        // CWD). An escaping throw would leave a zombie armed_ entry with no
+        // watcher and no id ever returned to the
         // caller — an std::expected-contract violation the caller can neither
         // observe nor disarm (governance UP-7). watch_guarded() turns a throw
         // into a returned failure so it falls into the whole-key teardown.
-        auto w = watch_guarded(mech, key, watch_params);
+        auto w = watch_guarded(mech, key, watch_params, watch_threw_msg,
+                               arm_fault_hook_for_test_);
         if (!w) {
-            // Tear down the ENTIRE key, not just our own subscription (governance
-            // B1): between our unlock above and here, a concurrent arm() of an
-            // equal spec may have deduped ONTO this key (adding its own sub with
-            // a valid id it believes is armed). disarm(id) would remove only ours
-            // and leave that sibling armed with NO watcher — violating "armed ==
-            // a watcher is running". Dropping the whole key makes any sibling id
-            // inert (idempotent disarm), which is correct: a failed watch is a
-            // failed arm for everyone sharing it.
-            std::lock_guard lk(mu_);
-            auto it = armed_.find(key);
-            if (it != armed_.end()) {
-                for (const auto& s : it->second.subs)
-                    sub_keys_.erase(s.id);
-                armed_.erase(it);
+            {
+                std::lock_guard lk(mu_);
+                drop_key_locked(key);
             }
-            return std::unexpected(std::string("watch mechanism failed to arm '") + key +
-                                   "': " + w.error());
+            // Bookkeeping is already clean, but the message is still completed from
+            // the pre-sized buffer: a mechanism error is caller-controlled in length,
+            // so concatenating it here would put an unbounded allocation past the
+            // commit and break the property the whole layer rests on.
+            return std::unexpected(watch_fail_msg.finish(w.error()));
         }
     }
 
@@ -574,9 +801,20 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
     // M1 (#1994): `consumer_id` existed at arm()'s pre-check, but a concurrent
     // unregister_consumer() may have removed it (and our subscription with it)
     // any time between that pre-check and here. Re-check AFTER the insert (and
-    // watch, if any) and roll back via disarm() on a lost race — see
+    // watch, if any) and undo our subscription on a lost race — see
     // unregister_consumer()'s erase-before-scan ordering for why this
     // re-check is airtight. Inline subs have no registered consumer to check.
+    // The teardown is teardown_arm_race(), NOT disarm(). Read the next clause as
+    // precisely as arm_impl's "(2) past the commit" clause above: it is NOT that
+    // either one's locked section never allocates — the log line in each still
+    // formats into a heap buffer (teardown_arm_race's own contained "disarmed"
+    // log, disarm()'s twin contained "disarmed" log) — it is that both now
+    // CONTAIN that allocation in a catch-all rather than letting it escape. So the
+    // reason to route through teardown_arm_race is no longer allocation: disarm()
+    // must LOOK UP a key this caller already holds, and its last-subscriber
+    // branch is whole-key-capable, while what a lost M1 race owes is the
+    // removal of exactly ONE subscription — a sibling that deduped onto this
+    // key keeps its own.
     if (tier == SparkTier::Queued) {
         bool consumer_alive = false;
         {
@@ -584,11 +822,162 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
             consumer_alive = consumers_.contains(consumer_id);
         }
         if (!consumer_alive) {
-            disarm(id);
-            return std::unexpected("consumer unregistered during arm");
+            teardown_arm_race(id, key, spec.type, event_driven);
+            return std::unexpected(std::move(consumer_race_msg));
         }
     }
     return id;
+}
+
+void SparkEngine::drop_key_locked(const std::string& key) {
+    // Tear down the ENTIRE key, not just one subscription (governance B1): a
+    // concurrent arm() of an equal spec may have deduped ONTO this key (adding
+    // its own sub with a valid id it believes is armed). Removing only one
+    // subscription would leave that sibling armed with NO watcher — violating
+    // "armed == a watcher is running" (spark.hpp). Dropping the whole key makes
+    // any sibling id inert (disarm is idempotent), which is correct: a failed
+    // arm of the key is a failed arm for everyone sharing it. Caller holds mu_
+    // and owns any OS-watch teardown — this touches bookkeeping only.
+    auto it = armed_.find(key);
+    if (it == armed_.end())
+        return;
+    for (const auto& s : it->second.subs)
+        sub_keys_.erase(s.id);
+    armed_.erase(it);
+}
+
+void SparkEngine::teardown_arm_race(SubscriptionId id, const std::string& key, SparkType type,
+                                    bool event_driven) {
+    // disarm()'s body, specialized so no allocation failure can escape it (#2270
+    // layer 2). Every difference from disarm() is deliberate; keep the two in lockstep:
+    //   * `key`/`type` come from the caller, so no lookup and no copy is needed.
+    //   * `event_driven` is likewise the caller's already-computed value (arm_impl's
+    //     own `const bool event_driven = is_event_driven(spec.type);`), not
+    //     recomputed from the stored Armed::spec.type the way disarm()'s
+    //     `is_event_driven(ai->second.spec.type)` is — same "the caller already
+    //     holds it" rationale as `key`/`type` above. Identical value today (both
+    //     derive from the same spec.type), found and confirmed equivalent-but-
+    //     undocumented by an external adversarial review (PR #2843) — kept as its
+    //     own bullet rather than folded into the first, since it is a PASSED value,
+    //     not merely an unlooked-up one, and a future edit that lets the two diverge
+    //     needs this spelled out to catch.
+    //   * the log line is contained — as disarm()'s now is too.
+    //   * a throwing unwatch() is contained and counted — as disarm()'s now is too,
+    //     into its own separately-scoped counter.
+    // The last two were differences until disarm() was hardened; they are recorded as
+    // parity rather than deleted, so a reader diffing the pair sees why each is there.
+    // Everything else is disarm() verbatim in effect (four documented differences,
+    // not zero), and must stay that way: ONE subscription is removed, never the key,
+    // because losing the M1 race invalidates OUR arm and nobody else's. A sibling
+    // that deduped onto this key keeps its subscription AND its watcher — deleting
+    // those is precisely the defect that failed review twice.
+    ISparkMechanism* mech = nullptr;
+    {
+        std::lock_guard lk(mu_);
+        auto ki = sub_keys_.find(id);
+        if (ki == sub_keys_.end())
+            return; // unregister_consumer's scan already removed us — nothing to undo
+        // Key off the LOCATED entry, not the caller's string, as disarm() does. The two
+        // are identical today — `sub_keys_` has exactly one insert site and ids are
+        // monotonic and never reused — but if they ever diverged, keying off the caller
+        // would make erase_if match nothing while sub_keys_.erase(ki) below still ran,
+        // leaving a live subscription that keeps receiving events and can never be
+        // disarmed. Reading ki->second costs nothing (the no-lookup argument for taking
+        // `key` from the caller is about disarm() having to FIND it, which this is not).
+        //
+        // SCOPE OF THIS HARDENING, stated exactly because an earlier revision overclaimed
+        // it (Gate 8 — sec8-3, CA8-2): `located` covers the find and the erase_if it
+        // guards, and NOTHING further. It is a reference INTO sub_keys_, so it dangles
+        // the moment sub_keys_.erase(ki) runs below. The M2 re-check and the unwatch are
+        // both AFTER that erase, so they can only use the caller's `key` — sound because
+        // the two are provably equal (one insert site, ids never reused). The log below
+        // is before the erase and could use either; it uses `key` for consistency, not
+        // necessity (Gate 9 — CA9-3/sec9-4 caught the earlier wording lumping all three). Copying it out to
+        // use later would reintroduce exactly the allocation this teardown exists to
+        // avoid. Do not "finish the job" by binding it wider without reading this.
+        const std::string& located = ki->second;
+        auto ai = armed_.find(located);
+        if (ai != armed_.end()) {
+            auto& subs = ai->second.subs;
+            std::erase_if(subs, [&](const Subscriber& s) { return s.id == id; });
+            if (subs.empty()) {
+                try {
+                    spdlog::info("SparkEngine: disarmed '{}' (last subscription gone)", key);
+                } catch (...) {
+                }
+                // Only while running_: the watch was armed only while running, and
+                // stop() unwinds every mechanism. Resolve the mechanism HERE rather
+                // than reusing arm_impl's `mech` — that local is null on a deduped
+                // arm, and a deduped arm whose sibling is removed by the same
+                // unregister scan can still be the call that empties the key.
+                if (running_ && event_driven) {
+                    auto mit = mechanisms_.find(type);
+                    if (mit != mechanisms_.end())
+                        mech = mit->second.get();
+                }
+                armed_.erase(ai);
+            }
+        }
+        sub_keys_.erase(ki);
+        wheel_cv_.notify_all();
+    }
+    if (mech) {
+        // Hook BEFORE the mech-ops lock, never while held — a test hook that re-arms
+        // from here would self-deadlock on that non-recursive mutex (disarm(), same
+        // placement and same reason).
+        if (disarm_race_hook_for_test_)
+            disarm_race_hook_for_test_();
+        std::lock_guard ops(mech_ops_mu_by_type_.at(type));
+        {
+            std::lock_guard lk(mu_);
+            if (armed_.contains(key))
+                return; // a concurrent equal-spec re-arm already renewed this key (M2)
+        }
+        // CONTAINED, as disarm() now is too (see its own unwatch, which was brought into
+        // lockstep on this point later). unwatch() is not noexcept and
+        // the real mechanisms allocate inside it (spark_service queues a Cmd holding a
+        // key copy; spark_file grows retiring_), so under the memory pressure this
+        // whole layer is about it can throw.
+        //
+        // WHY CONTAIN. The engine's OWN bookkeeping is consistent by this point, so
+        // propagating buys no repair. It is NOT that propagating is harmless: measured
+        // during governance round 4, the sibling site that DOES propagate
+        // (unregister_consumer's uncontained unwatch) escapes a void function and
+        // permanently strands the consumer's dispatch thread — the thread holds its own
+        // Consumer alive by shared_ptr, `stopping` is never set, and the entry is
+        // already erased so stop() cannot reach it either. That is the concrete
+        // argument for containing here rather than a preference.
+        //
+        // RESIDUAL, deliberately not repaired, and the BOUND IS PLATFORM-SPECIFIC —
+        // do not restate it as a flat "until stop()", which is what round 4 found to
+        // be false:
+        //   * Linux/sd-bus: the OS watch outlives its armed_ entry and IS reclaimed by
+        //     stop() (and by unregister_consumer, and re-adopted by a later equal-spec
+        //     arm, since watch() is idempotent per key).
+        //   * WINDOWS/spark_file: worse. push_retiring() takes the OWNING unique_ptr by
+        //     value,
+        //     so a throwing push_back destroys it with an IOCP completion still
+        //     pending, and stop()'s UAF quarantine walks dirs_/ancestors_/retiring_ —
+        //     none of which now hold it. The completion dangles for the REMAINING
+        //     PROCESS LIFETIME; only a process restart reclaims it. The underlying
+        //     strong-guarantee hole in push_retiring is pre-existing and tracked
+        //     separately; what belongs here is an honest bound.
+        // A retry loop would be another lock-free repair guessing at state it cannot
+        // see, which is exactly what failed twice.
+        try {
+            mech->unwatch(key);
+        } catch (...) {
+            arm_race_unwatch_failures_.fetch_add(1, std::memory_order_relaxed);
+            try {
+                spdlog::error("SparkEngine: unwatch('{}') threw during consumer-race teardown - "
+                              "the OS watch is not reclaimed by this call; a File watch "
+                              "(Windows) persists until a process restart, while other "
+                              "mechanisms are reclaimed at the mechanism's stop()",
+                              key);
+            } catch (...) {
+            }
+        }
+    }
 }
 
 void SparkEngine::disarm(SubscriptionId id) {
@@ -600,13 +989,28 @@ void SparkEngine::disarm(SubscriptionId id) {
         auto ki = sub_keys_.find(id);
         if (ki == sub_keys_.end())
             return;
-        const std::string key = ki->second;
+        // Key off the LOCATED entry BY REFERENCE (#2270). The copy this replaced
+        // allocated in a function that must not throw once erase_if below has run.
+        // PRECISELY: a throw AT THIS SITE was harmless — nothing is mutated yet and the
+        // disarm is cleanly retryable. The residue this hardening is about belongs to the
+        // two allocations BELOW erase_if; they are commented where they are, not here.
+        // SCOPE, stated exactly because the same wording had to be corrected once
+        // in teardown_arm_race: `key` is a reference INTO sub_keys_. It is read
+        // only ABOVE the move below; past that point it names a moved-from string
+        // and must not be read, and past sub_keys_.erase(ki) it dangles outright.
+        const std::string& key = ki->second;
         auto ai = armed_.find(key);
         if (ai != armed_.end()) {
             auto& subs = ai->second.subs;
             std::erase_if(subs, [&](const Subscriber& s) { return s.id == id; });
             if (subs.empty()) {
-                spdlog::info("SparkEngine: disarmed '{}' (last subscription gone)", key);
+                // CONTAINED, matching teardown_arm_race. spdlog allocates, and the
+                // condition this whole layer exists for is the one that makes it
+                // throw; the engine's bookkeeping below must complete regardless.
+                try {
+                    spdlog::info("SparkEngine: disarmed '{}' (last subscription gone)", key);
+                } catch (...) {
+                }
                 // Only tear the OS watch down when the engine is live: the watch
                 // was armed only while running_, and stop() already unwinds every
                 // mechanism. A pre-start or post-stop disarm has no watch to drop.
@@ -614,7 +1018,13 @@ void SparkEngine::disarm(SubscriptionId id) {
                     auto mit = mechanisms_.find(ai->second.spec.type);
                     if (mit != mechanisms_.end()) {
                         mech = mit->second.get();
-                        unwatch_key = key;
+                        // MOVE, not copy. It allocates nothing on ANY implementation:
+                        // basic_string's move-assign is noexcept for std::allocator, so it
+                        // cannot allocate whatever the SSO threshold — the buffer steal is
+                        // only the over-SSO mechanism, not the reason. Leaves `key` moved-from —
+                        // see the scope note above. armed_ holds its own key
+                        // string, so `ai` and the erase below are unaffected.
+                        unwatch_key = std::move(ki->second);
                         unwatch_type = ai->second.spec.type;
                     }
                 }
@@ -643,7 +1053,35 @@ void SparkEngine::disarm(SubscriptionId id) {
             if (armed_.contains(unwatch_key))
                 return; // a concurrent re-arm already renewed this key
         }
-        mech->unwatch(unwatch_key);
+        // CONTAINED AND COUNTED, matching teardown_arm_race's own unwatch catch — the
+        // fourth and last lockstep difference between the two. unwatch() is not
+        // noexcept and the real mechanisms allocate inside it (spark_service queues a
+        // Cmd holding a key copy; spark_file grows retiring_), so under the memory
+        // pressure this layer is about it can throw.
+        //
+        // WHY CONTAIN, and it is not merely symmetry. This is a void function whose caller
+        // is Guardian's ordinary withdraw path: a throw escapes GuardianSparkBackend::disarm
+        // into GuardianSparkRuntime::detach_rule_locked AFTER index_->remove_rule and
+        // rules_.erase have run but BEFORE keys_.erase and the "disarmed" lifecycle entry.
+        // That strands a keys_ row which makes a later same-key attach's keys_.emplace
+        // silently no-op, and loses the audit entry too. The engine's own bookkeeping is
+        // complete by this point, so propagating repairs nothing and costs both.
+        //
+        // The OS watch is still NOT reclaimed. That residual is unchanged, which is why
+        // this is counted rather than swallowed silently.
+        try {
+            mech->unwatch(unwatch_key);
+        } catch (...) {
+            disarm_unwatch_failures_.fetch_add(1, std::memory_order_relaxed);
+            try {
+                spdlog::error("SparkEngine: unwatch('{}') threw during disarm - the OS watch "
+                              "is not reclaimed by this call; a File watch (Windows) persists "
+                              "until a process restart, while other mechanisms are reclaimed "
+                              "at the mechanism's stop()",
+                              unwatch_key);
+            } catch (...) {
+            }
+        }
     }
 }
 
@@ -662,6 +1100,14 @@ void SparkEngine::start() {
         std::string key;
         SparkParams params;
         SparkType type; // picks this type's mech-ops lock at replay
+        /// Built during collection so watch_guarded's error completion allocates
+        /// nothing at replay time (#2270), the same buffer arm_impl hands it.
+        /// SCOPE LIMIT: this does NOT make start() OOM-safe. running_ is already
+        /// latched and the wheel is up by the time this vector is built, so a
+        /// bad_alloc in the collection pass itself still escapes the void start(),
+        /// exactly as before. #2270 is about arm_impl's post-commit window; the
+        /// replay path shares the boundary, not the guarantee.
+        BoundedMsg err;
     };
     std::vector<Replay> replays;
     {
@@ -682,7 +1128,8 @@ void SparkEngine::start() {
             } else if (is_event_driven(armed.spec.type)) {
                 auto mit = mechanisms_.find(armed.spec.type);
                 if (mit != mechanisms_.end())
-                    replays.push_back({mit->second.get(), key, armed.spec.params, armed.spec.type});
+                    replays.push_back({mit->second.get(), key, armed.spec.params, armed.spec.type,
+                                       BoundedMsg(kWatchThrewPrefix)});
             }
         }
         for (auto& [type, m] : mechanisms_)
@@ -714,7 +1161,7 @@ void SparkEngine::start() {
         // watcher is running" violation UP-7 closed on the live arm_impl path.
         // watch_guarded() turns a throw into a returned failure; unlike arm_impl
         // we fault in place (subscribers already hold ids — do NOT roll back).
-        auto w = watch_guarded(r.mech, r.key, r.params);
+        auto w = watch_guarded(r.mech, r.key, r.params, r.err, arm_fault_hook_for_test_);
         if (!w) {
             // Pre-start replay failure leaves the spark armed-without-watcher —
             // mark it faulted so the drift is observable (B1) rather than a
@@ -1108,6 +1555,9 @@ SparkEngineStats SparkEngine::stats() const {
         s.consumers = consumers_.size();
     }
     s.watch_faults_total = watch_faults_.load(std::memory_order_relaxed);
+    s.arm_race_unwatch_failures_total =
+        arm_race_unwatch_failures_.load(std::memory_order_relaxed);
+    s.disarm_unwatch_failures_total = disarm_unwatch_failures_.load(std::memory_order_relaxed);
     s.consumer_threads_detached = consumer_threads_detached_.load(std::memory_order_relaxed);
     s.events_total = events_total_.load(std::memory_order_relaxed);
     s.queued_delivered_total = delivery_->delivered.load(std::memory_order_relaxed);
@@ -1155,8 +1605,16 @@ void SparkEngine::set_arm_race_hook_for_test(std::function<void()> hook) {
     arm_race_hook_for_test_ = std::move(hook);
 }
 
+void SparkEngine::set_arm_precheck_race_hook_for_test(std::function<void()> hook) {
+    arm_precheck_race_hook_for_test_ = std::move(hook);
+}
+
 void SparkEngine::set_disarm_race_hook_for_test(std::function<void()> hook) {
     disarm_race_hook_for_test_ = std::move(hook);
+}
+
+void SparkEngine::set_arm_fault_hook_for_test(std::function<void(int)> hook) {
+    arm_fault_hook_for_test_ = std::move(hook);
 }
 
 } // namespace yuzu::agent

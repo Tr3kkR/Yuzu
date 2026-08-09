@@ -15,7 +15,7 @@
 # Linux runner pool (yuzu-bigtam-linux). GCC 15 / Clang 21 are 26.04 defaults;
 # gcc-13 (24.04 / Shulgi) is retired from this image as part of the runner
 # cutover. Digest is the multi-arch OCI index for ubuntu:26.04.
-FROM ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb
+FROM ubuntu:26.04@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03
 
 ARG VCPKG_COMMIT=4b77da7fed37817f124936239197833469f1b9a8
 

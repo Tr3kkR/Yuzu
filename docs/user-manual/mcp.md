@@ -771,9 +771,13 @@ proposes.
    an agentic worker cannot approve its own request.
 6. Once approved, the AI assistant **re-calls the same tool with the same
    arguments plus the `approval_id`**. The server validates (approved, matching
-   tool + arguments, not yet consumed) and **atomically consumes** the ticket
-   (one-time — a replay, or a mismatched tool/args, returns `-32003`
-   `PermissionDenied`), then executes.
+   tool + arguments, not yet consumed, and minted through the MCP surface rather
+   than another one — #2442) and **atomically consumes** the ticket (one-time —
+   a replay, a mismatched tool/args, or a ticket from another surface, returns
+   `-32003` `PermissionDenied`), then executes. A `-32603` means the store
+   failed at either the lookup or the consume step, not that the ticket is
+   spent — see the error-code reference below for the fix, which is the
+   opposite of `-32003`'s.
 
 ### What requires approval
 
@@ -1141,12 +1145,60 @@ expired, or mismatched ticket returns `-32003` (below).
 permission check (the token creator lacks the required RBAC permission for the
 securable type), **or** an approval-ticket recall supplied an `approval_id` that
 is no longer usable — already consumed (one-time ticket / replay), rejected,
-expired, or for a different tool/arguments than the current call (#289).
+expired, for a different tool/arguments than the current call (#289), **or**
+minted through a different Yuzu surface than the one recalling it (#2442).
+
+The last of those is deliberately indistinguishable from a replay in this
+response: reporting it separately would turn the recall into a probe for which
+surface minted a ticket. Server-side it is distinguishable — the audit row
+records `refused: foreign_origin`. The `yuzu_mcp_approval_refused_total` counter
+does **not** break the refusals down by reason: a store failure is already
+exposed via the response code (`-32603` vs `-32003`), and what stays withheld
+is the split *within* a `-32003` denial — foreign-origin vs an ordinary
+replay — which is exactly what this response refuses to make, and `/metrics`
+is not a stronger reader than the caller — so alert on the refusal rate and
+read the audit trail for the kind.
 
 **Fix**: For an RBAC denial — grant the permission to the token creator's
 principal, or use an account with the required permissions. For a ticket recall —
 submit the call **without** `approval_id` to obtain a fresh approval ticket, then
 recall once it is approved.
+
+> **Do not apply that fix to a `-32603`.** A store failure at the lookup or the
+> consume step returns `-32603`, and its remediation is the opposite of this
+> one's. See below.
+
+### -32603: Approval store unavailable
+
+**Symptom**: An approval-ticket recall returns error code `-32603` rather than
+`-32003`. This can come from either step of a recall: the ticket lookup or the
+consume.
+
+**Cause**: The approval store could not be read (or, at the consume step,
+written) while handling the ticket. The ticket was **not** consumed.
+
+It is not necessarily still usable, and the difference matters: the 7-day
+approval window keeps running during an outage, so an outage that outlasts the
+ticket's remaining window ends with it expired like any other.
+
+**Fix**: Check `retry_after_ms` in the response body — two distinct bodies
+share this code:
+
+- **`retry_after_ms` is a number (currently 5000)**: the store is open but the
+  read or write failed, most likely transiently. Retry after the hint.
+  Retrying indefinitely is not safe, and this body alone cannot tell you when
+  to stop: a store that is open but failing permanently (corruption,
+  read-only, disk full) still takes this arm and will honour a client that
+  retries forever. Bound your own retries — a handful of attempts, then
+  escalate to an operator. Distinguishing that case from a genuinely
+  transient one is a follow-up change.
+- **`retry_after_ms` is `null`**: the store never opened. This will not clear
+  on retry; escalate to an operator immediately.
+
+Do **not** re-submit without `approval_id` while the approval
+window is still open: the ticket was not consumed, and minting a fresh one asks
+a human to approve a capability you already hold. If the window has since
+elapsed, treat it as a `-32003` and request a fresh ticket.
 
 ### -32602: Invalid params
 

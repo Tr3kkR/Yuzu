@@ -283,15 +283,28 @@ curl -s -b cookies.txt \
     }
   ],
   "pagination": {
-    "total": 150,
+    "total": 20,
     "start": 0,
-    "page_size": 20
+    "page_size": 50
   },
   "meta": {
     "api_version": "v1"
   }
 }
 ```
+
+**`total` is the number of rows returned in this response, not the number of
+rows that matched** — the route caps at `limit` (max 1000) with no `offset`
+support, so a response at exactly `limit` rows can mean there are older
+matches you have not seen, not that you have everything. `page_size` is
+likewise always `50`, independent of the `limit` you actually passed
+([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)). If you hit the cap,
+narrow with `principal=`/`action=`, or use the legacy `GET /api/audit`
+endpoint, which also accepts `offset`. `since`/`until` alone only bounds the
+time window — it does not by itself guarantee completeness inside that
+window if more rows matched than one call returns. The reliable recipe is
+both together: freeze a bounded window with `since`/`until` first, then page
+through it with `offset`.
 
 **Example --- filter by principal and action:**
 
@@ -365,16 +378,19 @@ below).
 
 ### The retention clock guard
 
-**Which alert sent you here?** Five point at this section and only one of them is
-about a decline.
+**Which alert sent you here?** Find it in the table below — they report different
+conditions and the triage differs. The current rule set is
+`docs/prometheus/yuzu-alerts.yml`.
 
 | Alert | What it means | Go to |
 |---|---|---|
 | `YuzuAuditRetentionClockAnomaly` | A pass declined. Nothing was deleted. | Read on. |
 | `YuzuAuditRetentionFailing` | The pass is **erroring**, not declining. | `yuzu_server_audit_cleanup_failed_total` in the metric table below. |
-| `YuzuAuditRetentionNotRunning` | The reaper is not running at all --- retention is unenforced and the audit store grows without bound. | `yuzu_server_audit_retention_passes_total` in the metric table below. |
+| `YuzuAuditRetentionNotRunning` | The reaper is not running at all --- retention is unenforced and the audit store grows without bound. | Triage is in [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionnotrunning) --- **start there**: it opens with the routine, self-clearing causes (a Prometheus restart false-pages for ~45 minutes) before the real diagnosis, and it states the cadence band where this rule cannot fire at all (measured: [`prometheus/blind-band-measurement.md`](../prometheus/blind-band-measurement.md)). Then `yuzu_server_audit_retention_passes_total` in the metric table below. |
+| `YuzuAuditRetentionMetricMissing` | The liveness metric is not being scraped **at all**, so `YuzuAuditRetentionNotRunning` cannot fire for anyone. **Check `up` for the Yuzu target first** — if it is down, or the target has left service discovery, this is an outage rather than just a monitoring gap, and on a single-server Prometheus this may be the only rule firing. | The three-state triage is in [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionmetricmissing) — start there; then `yuzu_server_audit_retention_passes_total` in the metric table below. |
 | `YuzuAuditRetentionStateNotPersisting` | The durable clock reading cannot be written, so detection will not survive a restart. | `yuzu_server_audit_retention_persist_failed_total` in the metric table below. |
 | `YuzuAuditRetentionCapBinding` | Expiry is outrunning the drain. | [Capacity](#capacity). |
+| `YuzuAuditRetentionAnchorNotSurviving` | The durable clock reading keeps being lost, so the guard re-bootstraps instead of comparing. Nothing was deleted by those passes. | [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionanchornotsurviving). |
 
 Retention is driven by the server's wall clock. A cleanup pass that looks like it
 would destroy the audit trail declines instead of deleting: it logs a warning and

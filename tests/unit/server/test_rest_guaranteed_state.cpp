@@ -22,6 +22,9 @@
 #include "baseline_store.hpp"
 #include "dex_app_perf_model.hpp" // AppPerfProviders (slice-2 app-perf read seams)
 #include "guaranteed_state_store.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "response_store.hpp"
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
@@ -30,6 +33,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <httplib.h>
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
 #include "../test_helpers.hpp"
@@ -54,6 +58,19 @@ struct AuditRecord {
     std::string detail;
 };
 
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): every
+// RestGsHarness below constructs its own GuaranteedStateStore against a clone
+// of this schema (ADR-0038 migration). Shared key "guardianstate" — SAME
+// spelling as every other GuaranteedStateStore test file's template, so the
+// shared-key REPLAY verification (test_helpers.hpp) passes rather than
+// failing on a divergent setup callback for the same key.
+yuzu::test::PgTestTemplate guardianstate_tpl{"guardianstate", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    GuaranteedStateStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("guardianstate template: store failed to migrate");
+}};
+
 struct RestGsHarness {
     yuzu::server::test::TestRouteSink sink;
 
@@ -62,7 +79,15 @@ struct RestGsHarness {
     // file (+ -wal/-shm) is removed. RAII replaces the old manual dtor and
     // also covers a ctor REQUIRE throwing mid-construction, which previously
     // leaked all three DBs (#486 / qe-B1).
-    yuzu::test::TempDbFile db_file{"yuzu_test_rest_gs-"};
+    //
+    // GuaranteedStateStore is migrated to Postgres (ADR-0038): `gs_db_pg` /
+    // `gs_pool` replace the old TempDbFile for this store specifically and
+    // sit ABOVE `store` for the same reverse-destruction-order reason. Mirrors
+    // AuthDbPg's shape (test_auth_db_pg_helper.hpp) — `gs_db_pg` stays
+    // `std::optional` and is `.emplace()`d only after the ctor's own SKIP
+    // check, so PostgresTestDb is never touched when PG isn't configured.
+    std::optional<yuzu::test::PostgresTestDb> gs_db_pg;
+    std::optional<yuzu::server::pg::PgPool> gs_pool;
     std::unique_ptr<GuaranteedStateStore> store;
 
     // Live-info dispatch/poll deps. resp_store is a real ResponseStore the live
@@ -154,9 +179,19 @@ struct RestGsHarness {
     explicit RestGsHarness(bool live_deps = true, bool wire_scoped_perm = true,
                            bool wire_app_perf = true, bool with_exec_visible = true)
         : wire_live_deps(live_deps), wire_exec_visible(with_exec_visible) {
-        // retention=0 keeps the reaper out of the way for ingest tests.
-        store = std::make_unique<GuaranteedStateStore>(db_file.path, /*retention_days=*/0,
-                                                       /*cleanup_interval_min=*/60);
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
+        gs_db_pg.emplace(guardianstate_tpl);
+        INFO("[RestGsHarness] guaranteed-state fixture status (blank == database came up OK): "
+             << gs_db_pg->error());
+        REQUIRE(gs_db_pg->available());
+        gs_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = gs_db_pg->dsn(), .size = 4});
+        REQUIRE(gs_pool->valid());
+        // retention=0 keeps the reaper out of the way for ingest tests (reap_expired()
+        // is now called on-demand from the maintenance tick, not a background thread —
+        // retention_days=0 makes compute_ttl_epoch() return the "never expire" sentinel).
+        store = std::make_unique<GuaranteedStateStore>(*gs_pool, /*retention_days=*/0);
         REQUIRE(store->is_open());
         baseline_store = std::make_unique<BaselineStore>(bl_db_file.path);
         REQUIRE(baseline_store->is_open());
@@ -353,27 +388,27 @@ struct RestGsHarness {
     }
 
     // Write a RAW guardian_agent_rule_status row (arbitrary `state`) directly via
-    // a second SQLite connection — the public ingest path (insert_event →
+    // a second Postgres connection — the public ingest path (insert_event →
     // event_state_from_type) can only ever write "compliant"/"drifted"/"errored",
     // so this is the only way to exercise the handler's defensive "unrecognized
     // state → pending" fallthrough (e.g. a corrupt DB or a future state token).
+    // Ported from a raw sqlite3 connection (ADR-0038): unconditional
+    // INSERT ... ON CONFLICT DO UPDATE (no updated_at guard) — this helper
+    // wants to FORCE the state regardless, unlike the store's own
+    // upsert_rule_status, which only advances on a newer timestamp.
     void seed_raw_status(const std::string& agent, const std::string& rule_id,
                          const std::string& state, const std::string& ts) {
-        sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open(db_file.path.string().c_str(), &raw) == SQLITE_OK);
-        sqlite3_stmt* st = nullptr;
-        REQUIRE(sqlite3_prepare_v2(
-                    raw,
-                    "INSERT OR REPLACE INTO guardian_agent_rule_status"
-                    "(agent_id, rule_id, state, updated_at) VALUES(?1,?2,?3,?4)",
-                    -1, &st, nullptr) == SQLITE_OK);
-        sqlite3_bind_text(st, 1, agent.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, rule_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 3, state.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 4, ts.c_str(), -1, SQLITE_TRANSIENT);
-        REQUIRE(sqlite3_step(st) == SQLITE_DONE);
-        sqlite3_finalize(st);
-        REQUIRE(sqlite3_close(raw) == SQLITE_OK);
+        yuzu::server::pg::PgConn conn{PQconnectdb(gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult res = yuzu::server::pg::exec_params(
+            conn.get(),
+            "INSERT INTO guaranteed_state_store.guardian_agent_rule_status "
+            "(agent_id, rule_id, state, updated_at) VALUES ($1,$2,$3,$4) "
+            "ON CONFLICT (agent_id, rule_id) DO UPDATE SET state = EXCLUDED.state, "
+            "updated_at = EXCLUDED.updated_at",
+            std::vector<std::string>{agent, rule_id, state, ts});
+        INFO(PQresultErrorMessage(res.get()));
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
     }
 
     // Create + deploy a Baseline with the given member Guards (snapshot = members,
@@ -427,7 +462,7 @@ struct RestGsHarness {
 } // namespace
 
 TEST_CASE("REST gs.rules: create returns 201 and echoes rule_id",
-          "[rest][guaranteed_state][create]") {
+          "[pg][rest][guaranteed_state][create]") {
     RestGsHarness h;
     auto res = h.sink.Post("/api/v1/guaranteed-state/rules",
                            RestGsHarness::make_rule_body("r-001", "block-rdp"));
@@ -435,13 +470,16 @@ TEST_CASE("REST gs.rules: create returns 201 and echoes rule_id",
     CHECK(res->status == 201);
     CHECK(res->body.find("\"rule_id\":\"r-001\"") != std::string::npos);
 
+    // get_rule is three-state (ADR-0038): REQUIRE the outer expected (not
+    // degraded), then the inner optional (genuinely found).
     auto stored = h.store->get_rule("r-001");
     REQUIRE(stored.has_value());
-    CHECK(stored->name == "block-rdp");
-    CHECK(stored->severity == "high");
-    CHECK(stored->os_target == "windows");
-    CHECK(stored->created_by == "alice");
-    CHECK(stored->updated_by == "alice");
+    REQUIRE(stored->has_value());
+    CHECK((*stored)->name == "block-rdp");
+    CHECK((*stored)->severity == "high");
+    CHECK((*stored)->os_target == "windows");
+    CHECK((*stored)->created_by == "alice");
+    CHECK((*stored)->updated_by == "alice");
 
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].action == "guaranteed_state.rule.create");
@@ -450,7 +488,7 @@ TEST_CASE("REST gs.rules: create returns 201 and echoes rule_id",
 }
 
 TEST_CASE("REST gs.rules: missing required fields → 400",
-          "[rest][guaranteed_state][create][validation]") {
+          "[pg][rest][guaranteed_state][create][validation]") {
     RestGsHarness h;
     nlohmann::json bad;
     bad["rule_id"] = "r-bad";
@@ -463,7 +501,7 @@ TEST_CASE("REST gs.rules: missing required fields → 400",
 }
 
 TEST_CASE("REST gs.rules: duplicate name → 409 via kConflictPrefix",
-          "[rest][guaranteed_state][conflict]") {
+          "[pg][rest][guaranteed_state][conflict]") {
     RestGsHarness h;
     REQUIRE(h.sink
                 .Post("/api/v1/guaranteed-state/rules",
@@ -482,7 +520,7 @@ TEST_CASE("REST gs.rules: duplicate name → 409 via kConflictPrefix",
     CHECK(h.audit_log[1].result == "denied");
 }
 
-TEST_CASE("REST gs.rules: list, get, update, delete round-trip", "[rest][guaranteed_state][crud]") {
+TEST_CASE("REST gs.rules: list, get, update, delete round-trip", "[pg][rest][guaranteed_state][crud]") {
     RestGsHarness h;
     REQUIRE(h.sink
                 .Post("/api/v1/guaranteed-state/rules",
@@ -517,17 +555,22 @@ TEST_CASE("REST gs.rules: list, get, update, delete round-trip", "[rest][guarant
 
     auto refetched = h.store->get_rule("r-001");
     REQUIRE(refetched.has_value());
-    CHECK_FALSE(refetched->enabled);
-    CHECK(refetched->severity == "critical");
-    CHECK(refetched->version == 2); // bumped by handler
+    REQUIRE(refetched->has_value());
+    CHECK_FALSE((*refetched)->enabled);
+    CHECK((*refetched)->severity == "critical");
+    CHECK((*refetched)->version == 2); // bumped by handler
 
     auto del = h.sink.Delete("/api/v1/guaranteed-state/rules/r-001");
     REQUIRE(del);
     CHECK(del->status == 200);
-    CHECK_FALSE(h.store->get_rule("r-001").has_value());
+    // Three-state (ADR-0038): the outer expected still has_value() (the read
+    // itself succeeded) — genuinely-absent is the INNER optional being empty.
+    auto after_delete = h.store->get_rule("r-001");
+    REQUIRE(after_delete.has_value());
+    CHECK_FALSE(after_delete->has_value());
 }
 
-TEST_CASE("REST gs.rules: get unknown id → 404", "[rest][guaranteed_state][not_found]") {
+TEST_CASE("REST gs.rules: get unknown id → 404", "[pg][rest][guaranteed_state][not_found]") {
     RestGsHarness h;
     auto got = h.sink.Get("/api/v1/guaranteed-state/rules/nope");
     REQUIRE(got);
@@ -535,7 +578,7 @@ TEST_CASE("REST gs.rules: get unknown id → 404", "[rest][guaranteed_state][not
 }
 
 TEST_CASE("REST gs.rules: PUT with malformed body → 400 + denied audit",
-          "[rest][guaranteed_state][crud]") {
+          "[pg][rest][guaranteed_state][crud]") {
     // UP-R1 regression guard. The PUT invalid-body 400 branch must emit a
     // denied audit, matching the sibling /push 400 branch. Asymmetric audit
     // coverage across sibling rejection paths was the original finding.
@@ -560,7 +603,7 @@ TEST_CASE("REST gs.rules: PUT with malformed body → 400 + denied audit",
 }
 
 TEST_CASE("REST gs.rules: delete unknown id → 404 + denied audit",
-          "[rest][guaranteed_state][not_found]") {
+          "[pg][rest][guaranteed_state][not_found]") {
     RestGsHarness h;
     auto del = h.sink.Delete("/api/v1/guaranteed-state/rules/nope");
     REQUIRE(del);
@@ -570,7 +613,7 @@ TEST_CASE("REST gs.rules: delete unknown id → 404 + denied audit",
 }
 
 TEST_CASE("REST gs.push: returns 202 + audits the operator action",
-          "[rest][guaranteed_state][push]") {
+          "[pg][rest][guaranteed_state][push]") {
     RestGsHarness h;
     REQUIRE(h.sink
                 .Post("/api/v1/guaranteed-state/rules",
@@ -609,7 +652,7 @@ TEST_CASE("REST gs.push: returns 202 + audits the operator action",
 }
 
 TEST_CASE("REST gs.push: sanitizes scope before embedding in audit detail",
-          "[rest][guaranteed_state][push][security]") {
+          "[pg][rest][guaranteed_state][push][security]") {
     // UP-R3 regression guard. A scope containing raw quotes, control bytes,
     // or backslashes must not corrupt the audit detail string that SIEM
     // parsers consume. Attacker with GuaranteedState:Push could otherwise
@@ -659,7 +702,7 @@ TEST_CASE("REST gs.push: sanitizes scope before embedding in audit detail",
     CHECK(d.find("agents=") != std::string::npos);
 }
 
-TEST_CASE("REST gs.events: filter + limit pagination", "[rest][guaranteed_state][events]") {
+TEST_CASE("REST gs.events: filter + limit pagination", "[pg][rest][guaranteed_state][events]") {
     RestGsHarness h;
     GuaranteedStateEventRow ev;
     ev.event_id = "e-1";
@@ -683,14 +726,14 @@ TEST_CASE("REST gs.events: filter + limit pagination", "[rest][guaranteed_state]
     CHECK(j["data"][0]["event_id"].get<std::string>() == "e-1");
 }
 
-TEST_CASE("REST gs.events: invalid limit → 400", "[rest][guaranteed_state][events][validation]") {
+TEST_CASE("REST gs.events: invalid limit → 400", "[pg][rest][guaranteed_state][events][validation]") {
     RestGsHarness h;
     auto res = h.sink.Get("/api/v1/guaranteed-state/events?limit=-7");
     REQUIRE(res);
     CHECK(res->status == 400);
 }
 
-TEST_CASE("REST gs.status: returns store rule_count rollup", "[rest][guaranteed_state][status]") {
+TEST_CASE("REST gs.status: returns store rule_count rollup", "[pg][rest][guaranteed_state][status]") {
     RestGsHarness h;
     REQUIRE(h.sink
                 .Post("/api/v1/guaranteed-state/rules",
@@ -713,7 +756,7 @@ TEST_CASE("REST gs.status: returns store rule_count rollup", "[rest][guaranteed_
     CHECK_FALSE(j["data"].contains("errored"));
 }
 
-TEST_CASE("REST gs.alerts: empty list placeholder", "[rest][guaranteed_state][alerts]") {
+TEST_CASE("REST gs.alerts: empty list placeholder", "[pg][rest][guaranteed_state][alerts]") {
     RestGsHarness h;
     auto res = h.sink.Get("/api/v1/guaranteed-state/alerts");
     REQUIRE(res);
@@ -749,7 +792,7 @@ std::string make_structured_body(const std::string& rule_id, const std::string& 
 } // namespace
 
 TEST_CASE("REST gs.rules: structured create validates + canonicalises resilience params",
-          "[rest][guaranteed_state][create][resilience]") {
+          "[pg][rest][guaranteed_state][create][resilience]") {
     RestGsHarness h;
     auto res = h.sink.Post(
         "/api/v1/guaranteed-state/rules",
@@ -760,8 +803,9 @@ TEST_CASE("REST gs.rules: structured create validates + canonicalises resilience
 
     auto stored = h.store->get_rule("r-res");
     REQUIRE(stored.has_value());
-    REQUIRE_FALSE(stored->spec_json.empty());
-    auto spec = nlohmann::json::parse(stored->spec_json);
+    REQUIRE(stored->has_value());
+    REQUIRE_FALSE((*stored)->spec_json.empty());
+    auto spec = nlohmann::json::parse((*stored)->spec_json);
     const auto& params = spec["remediation"]["params"];
     // Canonical-out: mode lowercased, numeric stored as a decimal string.
     CHECK(params["mode"].get<std::string>() == "bounded");
@@ -769,7 +813,7 @@ TEST_CASE("REST gs.rules: structured create validates + canonicalises resilience
 }
 
 TEST_CASE("REST gs.rules: invalid resilience params → 400 A4 envelope + denied audit",
-          "[rest][guaranteed_state][create][resilience][validation]") {
+          "[pg][rest][guaranteed_state][create][resilience][validation]") {
     RestGsHarness h;
     auto res = h.sink.Post(
         "/api/v1/guaranteed-state/rules",
@@ -784,15 +828,19 @@ TEST_CASE("REST gs.rules: invalid resilience params → 400 A4 envelope + denied
     CHECK(j["error"].contains("correlation_id"));
     CHECK(j["error"].contains("remediation"));
     CHECK(j["meta"]["api_version"].get<std::string>() == "v1");
-    // Rule not persisted; reject audited.
-    CHECK_FALSE(h.store->get_rule("r-bad").has_value());
+    // Rule not persisted; reject audited. Three-state (ADR-0038): the outer
+    // expected still has_value() (the read succeeded) — not-persisted is the
+    // INNER optional being empty.
+    auto not_persisted = h.store->get_rule("r-bad");
+    REQUIRE(not_persisted.has_value());
+    CHECK_FALSE(not_persisted->has_value());
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].action == "guaranteed_state.rule.create");
     CHECK(h.audit_log[0].result == "denied");
 }
 
 TEST_CASE("REST gs.rules: PUT re-authors structured spec (no silent drop)",
-          "[rest][guaranteed_state][crud][resilience]") {
+          "[pg][rest][guaranteed_state][crud][resilience]") {
     RestGsHarness h;
     REQUIRE(h.sink
                 .Post("/api/v1/guaranteed-state/rules",
@@ -810,14 +858,15 @@ TEST_CASE("REST gs.rules: PUT re-authors structured spec (no silent drop)",
 
     auto stored = h.store->get_rule("r-edit");
     REQUIRE(stored.has_value());
-    auto spec = nlohmann::json::parse(stored->spec_json);
+    REQUIRE(stored->has_value());
+    auto spec = nlohmann::json::parse((*stored)->spec_json);
     CHECK(spec["remediation"]["params"]["mode"].get<std::string>() == "bounded");
     CHECK(spec["remediation"]["params"]["max_attempts"].get<std::string>() == "2");
-    CHECK(stored->version == 2);
+    CHECK((*stored)->version == 2);
 }
 
 TEST_CASE("REST gs.rules: PUT with an incomplete structured body → 400 (not silently dropped)",
-          "[rest][guaranteed_state][crud][resilience]") {
+          "[pg][rest][guaranteed_state][crud][resilience]") {
     RestGsHarness h;
     REQUIRE(h.sink
                 .Post("/api/v1/guaranteed-state/rules",
@@ -835,7 +884,7 @@ TEST_CASE("REST gs.rules: PUT with an incomplete structured body → 400 (not si
 }
 
 TEST_CASE("REST gs.rules: metadata-only PUT preserves the existing structured spec",
-          "[rest][guaranteed_state][crud][resilience]") {
+          "[pg][rest][guaranteed_state][crud][resilience]") {
     RestGsHarness h;
     REQUIRE(h.sink
                 .Post("/api/v1/guaranteed-state/rules",
@@ -850,12 +899,13 @@ TEST_CASE("REST gs.rules: metadata-only PUT preserves the existing structured sp
     CHECK(upd->status == 200);
     auto stored = h.store->get_rule("r-keep");
     REQUIRE(stored.has_value());
-    REQUIRE_FALSE(stored->spec_json.empty());
-    auto spec = nlohmann::json::parse(stored->spec_json);
+    REQUIRE(stored->has_value());
+    REQUIRE_FALSE((*stored)->spec_json.empty());
+    auto spec = nlohmann::json::parse((*stored)->spec_json);
     CHECK(spec["remediation"]["params"]["mode"].get<std::string>() == "backoff");
 }
 
-TEST_CASE("REST gs.schemas: catalog + ETag revalidation", "[rest][guaranteed_state][schemas]") {
+TEST_CASE("REST gs.schemas: catalog + ETag revalidation", "[pg][rest][guaranteed_state][schemas]") {
     RestGsHarness h;
     auto res = h.sink.Get("/api/v1/guaranteed-state/schemas");
     REQUIRE(res);
@@ -881,7 +931,7 @@ TEST_CASE("REST gs.schemas: catalog + ETag revalidation", "[rest][guaranteed_sta
 // same dex.signal.view verb the dashboard fragment does. Both halves are asserted.
 
 TEST_CASE("REST dex.signals: catalogue rollup returns seeded signals, NOT audited",
-          "[rest][dex][signals]") {
+          "[pg][rest][dex][signals]") {
     RestGsHarness h;
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.seed_obs("o2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
@@ -911,7 +961,7 @@ TEST_CASE("REST dex.signals: catalogue rollup returns seeded signals, NOT audite
 }
 
 TEST_CASE("REST dex.signals: os filter scopes the catalogue rollup to one OS (A1 parity)",
-          "[rest][dex][signals]") {
+          "[pg][rest][dex][signals]") {
     RestGsHarness h;
     h.seed_obs("w1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.seed_obs("m1", "MAC-1", "storage.low", "disk", "macos", "2026-06-10T11:00:00Z");
@@ -944,7 +994,7 @@ TEST_CASE("REST dex.signals: os filter scopes the catalogue rollup to one OS (A1
 }
 
 TEST_CASE("REST dex/devices/{id}: per-device read model — score + THIS device's signals, audited",
-          "[rest][dex][device]") {
+          "[pg][rest][dex][device]") {
     RestGsHarness h;
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.seed_obs("o2", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
@@ -978,7 +1028,7 @@ TEST_CASE("REST dex/devices/{id}: per-device read model — score + THIS device'
 }
 
 TEST_CASE("OpenAPI lists /dex/devices/{id} and the whole spec still parses",
-          "[rest][dex][device][a2]") {
+          "[pg][rest][dex][device][a2]") {
     RestGsHarness h;
     auto res = h.sink.Get("/api/v1/openapi.json");
     REQUIRE(res);
@@ -990,7 +1040,7 @@ TEST_CASE("OpenAPI lists /dex/devices/{id} and the whole spec still parses",
 }
 
 TEST_CASE("REST dex/devices/{id}: out-of-scope device → 403, no data leak, no audit",
-          "[rest][dex][device][scope]") {
+          "[pg][rest][dex][device][scope]") {
     RestGsHarness h;
     h.seed_obs("o1", "WS-9", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.deny_scoped_agent = "WS-9"; // the per-device scope gate denies this agent
@@ -1052,7 +1102,7 @@ TEST_CASE("REST dex/devices/{id}/live: an UNWIRED ExecVisibleFn fails CLOSED (pr
 }
 
 TEST_CASE("REST dex/devices/{id}/live uptime: dispatches + returns parsed JSON, audited",
-          "[rest][dex][device][live]") {
+          "[pg][rest][dex][device][live]") {
     RestGsHarness h;
     // Pre-insert the agent's response for the deterministic command_id the stub mints.
     StoredResponse r;
@@ -1083,7 +1133,7 @@ TEST_CASE("REST dex/devices/{id}/live uptime: dispatches + returns parsed JSON, 
 }
 
 TEST_CASE("REST dex/devices/{id}/live processes: parses proc|pid|name|sha256|path rows",
-          "[rest][dex][device][live]") {
+          "[pg][rest][dex][device][live]") {
     RestGsHarness h;
     StoredResponse r;
     r.instruction_id = "processes-live";
@@ -1114,7 +1164,7 @@ TEST_CASE("REST dex/devices/{id}/live processes: parses proc|pid|name|sha256|pat
 }
 
 TEST_CASE("REST dex/devices/{id}/live: offline device (sent=0) → 503, audited requested",
-          "[rest][dex][device][live]") {
+          "[pg][rest][dex][device][live]") {
     RestGsHarness h;
     h.live_sent = 0; // dispatch reaches no connected agent
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
@@ -1132,7 +1182,7 @@ TEST_CASE("REST dex/devices/{id}/live: offline device (sent=0) → 503, audited 
 }
 
 TEST_CASE("REST dex/devices/{id}/live: unknown kind → 400, no dispatch",
-          "[rest][dex][device][live]") {
+          "[pg][rest][dex][device][live]") {
     RestGsHarness h;
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=bogus", "");
     REQUIRE(res);
@@ -1141,7 +1191,7 @@ TEST_CASE("REST dex/devices/{id}/live: unknown kind → 400, no dispatch",
 }
 
 TEST_CASE("REST dex/devices/{id}/live: out-of-scope device → 403, no dispatch",
-          "[rest][dex][device][live][scope]") {
+          "[pg][rest][dex][device][live][scope]") {
     RestGsHarness h;
     h.deny_scoped_agent = "WS-9";
     auto res = h.sink.Post("/api/v1/dex/devices/WS-9/live?kind=uptime", "");
@@ -1175,7 +1225,7 @@ struct AtomicSave {
 
 
 TEST_CASE("REST dex/devices/{id}: off-enum window → 400, no audit, no data",
-          "[rest][dex][device]") {
+          "[pg][rest][dex][device]") {
     RestGsHarness h;
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     auto res = h.sink.Get("/api/v1/dex/devices/WS-1?window=banana");
@@ -1185,7 +1235,7 @@ TEST_CASE("REST dex/devices/{id}: off-enum window → 400, no audit, no data",
 }
 
 TEST_CASE("REST dex/devices/{id}/live: terminal failure WINS over a partial-output row → 502",
-          "[rest][dex][device][live]") {
+          "[pg][rest][dex][device][live]") {
     RestGsHarness h;
     // A single frame that carries BOTH partial output AND a failure status — the
     // pre-fix poll returned 200 with the partial data (UP-4). Failure must 502.
@@ -1205,7 +1255,7 @@ TEST_CASE("REST dex/devices/{id}/live: terminal failure WINS over a partial-outp
 }
 
 TEST_CASE("REST dex/devices/{id}/live: device error| output → 502",
-          "[rest][dex][device][live]") {
+          "[pg][rest][dex][device][live]") {
     RestGsHarness h;
     StoredResponse r;
     r.instruction_id = "os_info-live";
@@ -1223,7 +1273,7 @@ TEST_CASE("REST dex/devices/{id}/live: device error| output → 502",
 }
 
 TEST_CASE("REST dex/devices/{id}/live: terminal failure, no output → 502",
-          "[rest][dex][device][live]") {
+          "[pg][rest][dex][device][live]") {
     RestGsHarness h;
     StoredResponse r;
     r.instruction_id = "os_info-live";
@@ -1239,7 +1289,7 @@ TEST_CASE("REST dex/devices/{id}/live: terminal failure, no output → 502",
 }
 
 TEST_CASE("REST dex/devices/{id}/live: success terminal, no output → 200 empty (not a 504)",
-          "[rest][dex][device][live]") {
+          "[pg][rest][dex][device][live]") {
     RestGsHarness h;
     StoredResponse r;
     r.instruction_id = "processes-live";
@@ -1256,7 +1306,7 @@ TEST_CASE("REST dex/devices/{id}/live: success terminal, no output → 200 empty
 }
 
 TEST_CASE("REST dex/devices/{id}/live: over the concurrency cap → 429, no dispatch",
-          "[rest][dex][device][live]") {
+          "[pg][rest][dex][device][live]") {
     RestGsHarness h;
     AtomicSave cap_save{yuzu::server::detail::live_max_inflight()};
     yuzu::server::detail::live_max_inflight().store(0); // any call is over budget
@@ -1267,7 +1317,7 @@ TEST_CASE("REST dex/devices/{id}/live: over the concurrency cap → 429, no disp
 }
 
 TEST_CASE("REST dex/devices/{id}/live: agent never responds → 504",
-          "[rest][dex][device][live]") {
+          "[pg][rest][dex][device][live]") {
     RestGsHarness h;
     AtomicSave mp_save{yuzu::server::detail::live_poll_max_polls()};
     AtomicSave iv_save{yuzu::server::detail::live_poll_interval_ms()};
@@ -1279,7 +1329,7 @@ TEST_CASE("REST dex/devices/{id}/live: agent never responds → 504",
 }
 
 TEST_CASE("REST dex/devices/{id}/live: GET is not routed (POST-only side effect)",
-          "[rest][dex][device][live]") {
+          "[pg][rest][dex][device][live]") {
     RestGsHarness h;
     // The endpoint is POST-only (it dispatches a command). A GET must NOT reach the
     // handler — the TestRouteSink returns nullptr when no route matches the method,
@@ -1290,7 +1340,7 @@ TEST_CASE("REST dex/devices/{id}/live: GET is not routed (POST-only side effect)
 }
 
 TEST_CASE("REST dex/devices/{id}/live: emits outcome counter + in-flight gauge",
-          "[rest][dex][device][live][metrics]") {
+          "[pg][rest][dex][device][live][metrics]") {
     RestGsHarness h;
     StoredResponse r;
     r.instruction_id = "os_info-live";
@@ -1322,7 +1372,7 @@ TEST_CASE("REST dex/devices/{id}/live: emits outcome counter + in-flight gauge",
 // ── #1549 review hardening: audit-on-open fail-closed, A4 denials, headers ──
 
 TEST_CASE("REST dex/devices/{id}: audit persistence failure → 503, no PII served, Sec-Audit-Failed",
-          "[rest][dex][device][audit]") {
+          "[pg][rest][dex][device][audit]") {
     RestGsHarness h;
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.audit_succeeds = false; // the audit row cannot persist (DB locked/full/corrupt)
@@ -1344,7 +1394,7 @@ TEST_CASE("REST dex/devices/{id}: audit persistence failure → 503, no PII serv
 }
 
 TEST_CASE("REST dex/devices/{id}: success echoes X-Correlation-Id header",
-          "[rest][dex][device][a3]") {
+          "[pg][rest][dex][device][a3]") {
     RestGsHarness h;
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     auto res = h.sink.Get("/api/v1/dex/devices/WS-1?window=all");
@@ -1360,7 +1410,7 @@ TEST_CASE("REST dex/devices/{id}: success echoes X-Correlation-Id header",
 // required-param 400s, and the security-relevant device audit-fail-closed.
 
 TEST_CASE("REST dex/perf/apps: provider absent → 503 + A4 correlation id",
-          "[rest][dex][app_perf][route]") {
+          "[pg][rest][dex][app_perf][route]") {
     RestGsHarness h(/*live_deps=*/true, /*wire_scoped_perm=*/true, /*wire_app_perf=*/false);
     auto res = h.sink.Get("/api/v1/dex/perf/apps");
     REQUIRE(res);
@@ -1372,7 +1422,7 @@ TEST_CASE("REST dex/perf/apps: provider absent → 503 + A4 correlation id",
 }
 
 TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; present → 200",
-          "[rest][dex][app_perf][route]") {
+          "[pg][rest][dex][app_perf][route]") {
     SECTION("missing required app → 400") {
         RestGsHarness h;
         auto res = h.sink.Get("/api/v1/dex/perf/app");
@@ -1425,7 +1475,7 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
 }
 
 TEST_CASE("REST dex/perf/group: missing params → 400; provider absent → 503; floor echoed",
-          "[rest][dex][app_perf][route]") {
+          "[pg][rest][dex][app_perf][route]") {
     SECTION("missing group_id → 400") {
         RestGsHarness h;
         auto res = h.sink.Get("/api/v1/dex/perf/group?app=chrome.exe");
@@ -1455,7 +1505,7 @@ TEST_CASE("REST dex/perf/group: missing params → 400; provider absent → 503;
 }
 
 TEST_CASE("REST dex/perf/compare: param + degrade + paired-compute paths",
-          "[rest][dex][app_perf][verify][route]") {
+          "[pg][rest][dex][app_perf][verify][route]") {
     SECTION("missing baseline/candidate → 400") {
         RestGsHarness h;
         auto res = h.sink.Get("/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1");
@@ -1587,7 +1637,7 @@ TEST_CASE("REST dex/perf/compare: param + degrade + paired-compute paths",
 }
 
 TEST_CASE("REST dex/devices/{id}/app-perf: audit failure → 503 + Sec-Audit-Failed, no rows",
-          "[rest][dex][device][app_perf][audit]") {
+          "[pg][rest][dex][device][app_perf][audit]") {
     RestGsHarness h;
     h.audit_succeeds = false; // the evidence row cannot persist
     auto res = h.sink.Get("/api/v1/dex/devices/WS-1/app-perf");
@@ -1605,7 +1655,7 @@ TEST_CASE("REST dex/devices/{id}/app-perf: audit failure → 503 + Sec-Audit-Fai
 }
 
 TEST_CASE("REST dex/devices/{id}/app-perf: out-of-scope device → 403, scoped by the path id",
-          "[rest][dex][device][app_perf][scope]") {
+          "[pg][rest][dex][device][app_perf][scope]") {
     RestGsHarness h;
     h.deny_scoped_agent = "WS-9";
     auto res = h.sink.Get("/api/v1/dex/devices/WS-9/app-perf");
@@ -1615,7 +1665,7 @@ TEST_CASE("REST dex/devices/{id}/app-perf: out-of-scope device → 403, scoped b
 }
 
 TEST_CASE("REST dex/devices/{id}/app-perf: provider absent → 503 BEFORE audit",
-          "[rest][dex][device][app_perf][route]") {
+          "[pg][rest][dex][device][app_perf][route]") {
     RestGsHarness h(true, true, false); // app-perf seam unwired
     auto res = h.sink.Get("/api/v1/dex/devices/WS-1/app-perf");
     REQUIRE(res);
@@ -1625,7 +1675,7 @@ TEST_CASE("REST dex/devices/{id}/app-perf: provider absent → 503 BEFORE audit"
 
 TEST_CASE("REST dex/devices/{id}/live: audit persistence failure → 503, NO dispatch, "
           "Sec-Audit-Failed",
-          "[rest][dex][device][live][audit]") {
+          "[pg][rest][dex][device][live][audit]") {
     RestGsHarness h;
     h.audit_succeeds = false; // evidence row cannot persist
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
@@ -1638,7 +1688,7 @@ TEST_CASE("REST dex/devices/{id}/live: audit persistence failure → 503, NO dis
 }
 
 TEST_CASE("REST dex/devices/{id}/live: success echoes X-Correlation-Id header",
-          "[rest][dex][device][live][a3]") {
+          "[pg][rest][dex][device][live][a3]") {
     RestGsHarness h;
     StoredResponse r;
     r.instruction_id = "os_info-live";
@@ -1653,7 +1703,7 @@ TEST_CASE("REST dex/devices/{id}/live: success echoes X-Correlation-Id header",
 }
 
 TEST_CASE("REST dex/devices/{id}/live: Execute denied but Read allowed → 403, no dispatch",
-          "[rest][dex][device][live][scope]") {
+          "[pg][rest][dex][device][live][scope]") {
     RestGsHarness h;
     h.deny_scoped_op = "Execute"; // Read floor passes; Execute floor denies
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
@@ -1663,7 +1713,7 @@ TEST_CASE("REST dex/devices/{id}/live: Execute denied but Read allowed → 403, 
 }
 
 TEST_CASE("REST dex/devices/{id}/live: live substrate unavailable → 503",
-          "[rest][dex][device][live]") {
+          "[pg][rest][dex][device][live]") {
     RestGsHarness h{/*live_deps=*/false}; // no response_store + no command_dispatch_fn
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
     REQUIRE(res);
@@ -1673,7 +1723,7 @@ TEST_CASE("REST dex/devices/{id}/live: live substrate unavailable → 503",
 }
 
 TEST_CASE("REST dex/devices/{id}/live: device output over the cap → 502",
-          "[rest][dex][device][live]") {
+          "[pg][rest][dex][device][live]") {
     RestGsHarness h;
     StoredResponse r;
     r.instruction_id = "processes-live";
@@ -1689,7 +1739,7 @@ TEST_CASE("REST dex/devices/{id}/live: device output over the cap → 502",
 }
 
 TEST_CASE("REST dex/devices/{id}/live: a different agent's response row is never rendered → 504",
-          "[rest][dex][device][live][scope]") {
+          "[pg][rest][dex][device][live][scope]") {
     RestGsHarness h;
     AtomicSave mp_save{yuzu::server::detail::live_poll_max_polls()};
     AtomicSave iv_save{yuzu::server::detail::live_poll_interval_ms()};
@@ -1710,7 +1760,7 @@ TEST_CASE("REST dex/devices/{id}/live: a different agent's response row is never
 }
 
 TEST_CASE("REST dex/devices/{id}/live uptime: success terminal, no output → 200 empty",
-          "[rest][dex][device][live]") {
+          "[pg][rest][dex][device][live]") {
     RestGsHarness h;
     StoredResponse r;
     r.instruction_id = "os_info-live";
@@ -1726,7 +1776,7 @@ TEST_CASE("REST dex/devices/{id}/live uptime: success terminal, no output → 20
 
 TEST_CASE("REST dex/devices/{id}: scoped denial carries the A4 envelope (correlation_id + "
           "permission)",
-          "[rest][dex][device][scope][a4]") {
+          "[pg][rest][dex][device][scope][a4]") {
     // The scoped gate is wired in production to require_scoped_permission, whose
     // denial now emits the A4 envelope. Here the harness's scoped_perm_fn stands in
     // for the gate and writes only a 403 status — so this test asserts the handler
@@ -1748,7 +1798,7 @@ TEST_CASE("REST dex/devices/{id}: scoped denial carries the A4 envelope (correla
 // on a dropped audit row, same as GET /dex/devices/{id}.
 
 TEST_CASE("REST guaranteed-state/events: agent-scoped audit failure → 503, no PII, Sec-Audit-Failed",
-          "[rest][dex][events][audit]") {
+          "[pg][rest][dex][events][audit]") {
     RestGsHarness h;
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.audit_succeeds = false;
@@ -1769,7 +1819,7 @@ TEST_CASE("REST guaranteed-state/events: agent-scoped audit failure → 503, no 
 // #1651 review K5: the converted route's catch arm (a throwing audit_fn) was only
 // covered by the helper unit test, not end-to-end here. Pin it at the route level.
 TEST_CASE("REST guaranteed-state/events: agent-scoped throwing audit → 503, A4, Sec-Audit-Failed",
-          "[rest][dex][events][audit]") {
+          "[pg][rest][dex][events][audit]") {
     RestGsHarness h;
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.audit_throws = true; // bad_alloc-class throw — caught by the shared helper
@@ -1781,7 +1831,7 @@ TEST_CASE("REST guaranteed-state/events: agent-scoped throwing audit → 503, A4
 }
 
 TEST_CASE("REST guaranteed-state/events: NO agent_id filter is a bulk query — not gated by audit",
-          "[rest][dex][events][audit]") {
+          "[pg][rest][dex][events][audit]") {
     RestGsHarness h;
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.audit_succeeds = false; // would fail-close IF it were audited
@@ -1793,7 +1843,7 @@ TEST_CASE("REST guaranteed-state/events: NO agent_id filter is a bulk query — 
 }
 
 TEST_CASE("REST dex/signals/{obs_type}: audit failure → 503, no device list, Sec-Audit-Failed",
-          "[rest][dex][signals][audit]") {
+          "[pg][rest][dex][signals][audit]") {
     RestGsHarness h;
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.audit_succeeds = false;
@@ -1811,7 +1861,7 @@ TEST_CASE("REST dex/signals/{obs_type}: audit failure → 503, no device list, S
 
 // #1651 review K5: route-level catch-arm coverage for the converted dex.signal route.
 TEST_CASE("REST dex/signals/{obs_type}: throwing audit → 503, A4, Sec-Audit-Failed",
-          "[rest][dex][signals][audit]") {
+          "[pg][rest][dex][signals][audit]") {
     RestGsHarness h;
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.audit_throws = true; // caught by the shared helper, must still fail closed
@@ -1822,7 +1872,7 @@ TEST_CASE("REST dex/signals/{obs_type}: throwing audit → 503, A4, Sec-Audit-Fa
     CHECK(res->body.find("WS-1") == std::string::npos);
 }
 
-TEST_CASE("REST dex.scope: per-OS coverage returned, NOT audited", "[rest][dex][scope]") {
+TEST_CASE("REST dex.scope: per-OS coverage returned, NOT audited", "[pg][rest][dex][scope]") {
     RestGsHarness h;
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.seed_obs("o2", "MB-1", "process.crashed", "Safari", "macos", "2026-06-10T11:00:00Z");
@@ -1844,7 +1894,7 @@ TEST_CASE("REST dex.scope: per-OS coverage returned, NOT audited", "[rest][dex][
 }
 
 TEST_CASE("REST dex.signals/{type}: drill-down fires dex.signal.view audit + returns the shape",
-          "[rest][dex][signals][audit]") {
+          "[pg][rest][dex][signals][audit]") {
     RestGsHarness h;
     h.seed_obs("o1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.seed_obs("o2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
@@ -1872,7 +1922,7 @@ TEST_CASE("REST dex.signals/{type}: drill-down fires dex.signal.view audit + ret
 }
 
 TEST_CASE("REST dex.signals/{type}: os filter scopes subjects/devices/by_day (A1 parity)",
-          "[rest][dex][signals]") {
+          "[pg][rest][dex][signals]") {
     RestGsHarness h;
     h.seed_obs("w1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
     h.seed_obs("w2", "WS-2", "process.crashed", "outlook.exe", "windows", "2026-06-10T11:00:00Z");
@@ -1916,7 +1966,7 @@ TEST_CASE("REST dex.signals/{type}: os filter scopes subjects/devices/by_day (A1
 }
 
 TEST_CASE("REST dex.signals/{type}: well-formed but absent type → 200 empty arrays (still audited)",
-          "[rest][dex][signals]") {
+          "[pg][rest][dex][signals]") {
     RestGsHarness h; // empty store
     auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
     REQUIRE(res);
@@ -1930,7 +1980,7 @@ TEST_CASE("REST dex.signals/{type}: well-formed but absent type → 200 empty ar
     CHECK(h.audit_log[0].action == "dex.signal.view");
 }
 
-TEST_CASE("REST dex.signals/{type}: malformed obs_type → 400, no audit", "[rest][dex][signals]") {
+TEST_CASE("REST dex.signals/{type}: malformed obs_type → 400, no audit", "[pg][rest][dex][signals]") {
     RestGsHarness h;
     auto res = h.sink.Get("/api/v1/dex/signals/foo!bar?window=all");
     REQUIRE(res);
@@ -1940,7 +1990,7 @@ TEST_CASE("REST dex.signals/{type}: malformed obs_type → 400, no audit", "[res
     CHECK(h.audit_log.empty());
 }
 
-TEST_CASE("REST dex.signals/{type}: invalid limit → 400", "[rest][dex][signals]") {
+TEST_CASE("REST dex.signals/{type}: invalid limit → 400", "[pg][rest][dex][signals]") {
     RestGsHarness h;
     auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?limit=-3");
     REQUIRE(res);
@@ -1949,7 +1999,7 @@ TEST_CASE("REST dex.signals/{type}: invalid limit → 400", "[rest][dex][signals
 }
 
 TEST_CASE("REST dex: permission gate runs before audit on the per-signal view",
-          "[rest][dex][rbac]") {
+          "[pg][rest][dex][rbac]") {
     RestGsHarness h;
     h.grant_perms = false; // perm_fn denies → 403
     auto res = h.sink.Get("/api/v1/dex/signals/process.crashed?window=all");
@@ -1964,7 +2014,7 @@ TEST_CASE("REST dex: permission gate runs before audit on the per-signal view",
 // GET /api/v1/guaranteed-state/device-compliance?baseline={name}&agent_id={id}
 
 TEST_CASE("REST gs.device-compliance: applicable subset — only reported guards, keyed by name",
-          "[rest][guaranteed_state][baseline]") {
+          "[pg][rest][guaranteed_state][baseline]") {
     RestGsHarness h;
     h.seed_rule("r1", "Firewall on");
     h.seed_rule("r2", "RDP NLA");
@@ -2019,7 +2069,7 @@ TEST_CASE("REST gs.device-compliance: applicable subset — only reported guards
 }
 
 TEST_CASE("REST gs.device-compliance: per-machine variation from one shared baseline",
-          "[rest][guaranteed_state][baseline]") {
+          "[pg][rest][guaranteed_state][baseline]") {
     RestGsHarness h;
     h.seed_rule("r1", "G1");
     h.seed_rule("r2", "G2");
@@ -2073,7 +2123,7 @@ TEST_CASE("REST gs.device-compliance: per-machine variation from one shared base
 }
 
 TEST_CASE("REST gs.device-compliance: verdicts are isolated per agent (WHERE agent_id)",
-          "[rest][guaranteed_state][baseline]") {
+          "[pg][rest][guaranteed_state][baseline]") {
     RestGsHarness h;
     h.seed_rule("r1", "G1");
     h.seed_rule("r2", "G2");
@@ -2105,7 +2155,7 @@ TEST_CASE("REST gs.device-compliance: verdicts are isolated per agent (WHERE age
 }
 
 TEST_CASE("REST gs.device-compliance: a reported guard NOT in the deployed snapshot is excluded",
-          "[rest][guaranteed_state][baseline]") {
+          "[pg][rest][guaranteed_state][baseline]") {
     // The denominator is deployed_snapshot ∩ reported. This exercises the OTHER side
     // of the intersection: a guard the device REPORTED but that is NOT a member of the
     // deployed Baseline (left over from a prior Baseline, or retired post-deploy) must
@@ -2133,7 +2183,7 @@ TEST_CASE("REST gs.device-compliance: a reported guard NOT in the deployed snaps
 }
 
 TEST_CASE("REST gs.device-compliance: unknown agent on a deployed baseline → empty applicable set",
-          "[rest][guaranteed_state][baseline]") {
+          "[pg][rest][guaranteed_state][baseline]") {
     RestGsHarness h;
     h.seed_rule("r1", "G1");
     h.seed_rule("r2", "G2");
@@ -2154,7 +2204,7 @@ TEST_CASE("REST gs.device-compliance: unknown agent on a deployed baseline → e
 }
 
 TEST_CASE("REST gs.device-compliance: draft baseline → deployed:false, no guards",
-          "[rest][guaranteed_state][baseline]") {
+          "[pg][rest][guaranteed_state][baseline]") {
     RestGsHarness h;
     h.seed_rule("r1", "G1");
     // Members set but never deployed → empty deployed_snapshot.
@@ -2176,7 +2226,7 @@ TEST_CASE("REST gs.device-compliance: draft baseline → deployed:false, no guar
 }
 
 TEST_CASE("REST gs.device-compliance: unknown baseline name → 404 + not_found audit",
-          "[rest][guaranteed_state][baseline]") {
+          "[pg][rest][guaranteed_state][baseline]") {
     RestGsHarness h;
     auto res = h.sink.Get(
         "/api/v1/guaranteed-state/device-compliance?baseline=NoSuchBaseline&agent_id=WS-1");
@@ -2193,7 +2243,7 @@ TEST_CASE("REST gs.device-compliance: unknown baseline name → 404 + not_found 
 }
 
 TEST_CASE("REST gs.device-compliance: deployed-but-empty baseline → deployed:true, no guards",
-          "[rest][guaranteed_state][baseline]") {
+          "[pg][rest][guaranteed_state][baseline]") {
     RestGsHarness h;
     // A genuinely deployed Baseline with zero members (snapshot "[]") — distinct
     // from a draft (deployed:false). A consumer must branch on `deployed`, not on
@@ -2218,7 +2268,7 @@ TEST_CASE("REST gs.device-compliance: deployed-but-empty baseline → deployed:t
 }
 
 TEST_CASE("REST gs.device-compliance: permission gate runs before audit",
-          "[rest][guaranteed_state][baseline][rbac]") {
+          "[pg][rest][guaranteed_state][baseline][rbac]") {
     RestGsHarness h;
     h.seed_rule("r1", "G1");
     h.seed_deployed_baseline("B", {"r1"});
@@ -2230,7 +2280,7 @@ TEST_CASE("REST gs.device-compliance: permission gate runs before audit",
 }
 
 TEST_CASE("REST gs.device-compliance: per-device scope — out-of-scope agent 403, in-scope 200",
-          "[rest][guaranteed_state][baseline][rbac]") {
+          "[pg][rest][guaranteed_state][baseline][rbac]") {
     RestGsHarness h;
     h.seed_rule("r1", "G1");
     h.seed_deployed_baseline("B", {"r1"});
@@ -2256,7 +2306,7 @@ TEST_CASE("REST gs.device-compliance: per-device scope — out-of-scope agent 40
 }
 
 TEST_CASE("REST gs.device-compliance: unwired scoped_perm_fn → fail-closed 503 (A4)",
-          "[rest][guaranteed_state][baseline][rbac]") {
+          "[pg][rest][guaranteed_state][baseline][rbac]") {
     RestGsHarness h{/*live_deps=*/true, /*wire_scoped_perm=*/false};
     h.seed_rule("r1", "G1");
     h.seed_deployed_baseline("B", {"r1"});
@@ -2273,7 +2323,7 @@ TEST_CASE("REST gs.device-compliance: unwired scoped_perm_fn → fail-closed 503
 }
 
 TEST_CASE("REST gs.device-compliance: query-param validation — required + length cap (256)",
-          "[rest][guaranteed_state][baseline]") {
+          "[pg][rest][guaranteed_state][baseline]") {
     RestGsHarness h;
     h.seed_rule("r1", "G1");
     h.seed_deployed_baseline("B", {"r1"});
@@ -2322,7 +2372,7 @@ TEST_CASE("REST gs.device-compliance: query-param validation — required + leng
 }
 
 TEST_CASE("REST gs.device-compliance: control characters in a param → 400, no audit",
-          "[rest][guaranteed_state][baseline]") {
+          "[pg][rest][guaranteed_state][baseline]") {
     RestGsHarness h;
     h.seed_rule("r1", "G1");
     h.seed_deployed_baseline("B", {"r1"});
@@ -2349,7 +2399,7 @@ TEST_CASE("REST gs.device-compliance: control characters in a param → 400, no 
 }
 
 TEST_CASE("REST gs.device-compliance: audit-persist failure → 503 fail-closed, withholds data",
-          "[rest][guaranteed_state][baseline][audit]") {
+          "[pg][rest][guaranteed_state][baseline][audit]") {
     RestGsHarness h;
     h.seed_rule("r1", "G1");
     h.seed_deployed_baseline("B", {"r1"});
@@ -2377,7 +2427,7 @@ TEST_CASE("REST gs.device-compliance: audit-persist failure → 503 fail-closed,
 }
 
 TEST_CASE("REST gs.device-compliance: a throwing audit_fn → 503 fail-closed, not 500",
-          "[rest][guaranteed_state][baseline][audit]") {
+          "[pg][rest][guaranteed_state][baseline][audit]") {
     RestGsHarness h;
     h.seed_rule("r1", "G1");
     h.seed_deployed_baseline("B", {"r1"});
@@ -2401,7 +2451,7 @@ TEST_CASE("REST gs.device-compliance: a throwing audit_fn → 503 fail-closed, n
 }
 
 TEST_CASE("REST gs.device-compliance: audit success → 200, no header, serves compliance",
-          "[rest][guaranteed_state][baseline][audit]") {
+          "[pg][rest][guaranteed_state][baseline][audit]") {
     RestGsHarness h; // default audit_succeeds == true
     h.seed_rule("r1", "G1");
     h.seed_deployed_baseline("B", {"r1"});
@@ -2423,7 +2473,7 @@ TEST_CASE("REST gs.device-compliance: audit success → 200, no header, serves c
 }
 
 TEST_CASE("REST gs.device-compliance: audit-fail + unknown baseline → 503 (fail-closed precedes 404)",
-          "[rest][guaranteed_state][baseline][audit]") {
+          "[pg][rest][guaranteed_state][baseline][audit]") {
     // The audit-fail 503 returns BEFORE the 404 branch, so an audit outage never reveals
     // baseline existence without durable evidence (anti-enumeration — deliberate).
     RestGsHarness h;
@@ -2437,7 +2487,7 @@ TEST_CASE("REST gs.device-compliance: audit-fail + unknown baseline → 503 (fai
 }
 
 TEST_CASE("GuaranteedStateStore::rule_names_for resolves ONLY the requested ids",
-          "[guaranteed_state][store][rule_names]") {
+          "[pg][guaranteed_state][store][rule_names]") {
     // Backs the perf fix: the device-compliance handler resolves guard names with
     // rule_names_for(guard_ids) instead of the full-catalogue rule_names(). Confirm
     // the bounded WHERE rule_id IN (...) returns names for exactly the requested ids.
@@ -2446,23 +2496,31 @@ TEST_CASE("GuaranteedStateStore::rule_names_for resolves ONLY the requested ids"
     h.seed_rule("r2", "Name Two");
     h.seed_rule("r3", "Name Three");
 
+    // rule_names_for is now type-distinguishable (ADR-0038 catastrophic-read
+    // set): std::expected<unordered_map<...>, std::string>. Not double-wrapped
+    // like get_rule (the value type here IS the map, not an optional-of-map),
+    // so a single REQUIRE(...has_value()) + arrow/deref suffices.
     auto m = h.store->rule_names_for({"r1", "r3"});
-    CHECK(m.size() == 2);
-    CHECK(m["r1"] == "Name One");
-    CHECK(m["r3"] == "Name Three");
-    CHECK(m.find("r2") == m.end()); // r2 not requested → absent (scoped, not full read)
+    REQUIRE(m.has_value());
+    CHECK(m->size() == 2);
+    CHECK((*m)["r1"] == "Name One");
+    CHECK((*m)["r3"] == "Name Three");
+    CHECK(m->find("r2") == m->end()); // r2 not requested → absent (scoped, not full read)
 
-    CHECK(h.store->rule_names_for({}).empty()); // empty input → empty map, no query
+    auto empty_result = h.store->rule_names_for({});
+    REQUIRE(empty_result.has_value());
+    CHECK(empty_result->empty()); // empty input → empty map (success, not degrade), no query
 
     // An unknown id simply has no row — the map omits it (the handler then falls
     // back to rendering the rule_id).
     auto m2 = h.store->rule_names_for({"r1", "nope"});
-    CHECK(m2.size() == 1);
-    CHECK(m2["r1"] == "Name One");
+    REQUIRE(m2.has_value());
+    CHECK(m2->size() == 1);
+    CHECK((*m2)["r1"] == "Name One");
 }
 
 TEST_CASE("REST gs.device-compliance: 404 uses the A4 envelope (code + correlation_id)",
-          "[rest][guaranteed_state][baseline]") {
+          "[pg][rest][guaranteed_state][baseline]") {
     RestGsHarness h;
     auto res = h.sink.Get(
         "/api/v1/guaranteed-state/device-compliance?baseline=does-not-exist&agent_id=WS-1");
@@ -2476,7 +2534,7 @@ TEST_CASE("REST gs.device-compliance: 404 uses the A4 envelope (code + correlati
 }
 
 TEST_CASE("REST gs.device-compliance: route + schema are in the OpenAPI spec (A1 discoverability)",
-          "[rest][guaranteed_state][baseline][discovery]") {
+          "[pg][rest][guaranteed_state][baseline][discovery]") {
     RestGsHarness h;
     auto res = h.sink.Get("/api/v1/openapi.json");
     REQUIRE(res);
@@ -2492,7 +2550,7 @@ TEST_CASE("REST gs.device-compliance: route + schema are in the OpenAPI spec (A1
 }
 
 TEST_CASE("REST gs.device-compliance: unrecognized stored state folds into pending (invariant holds)",
-          "[rest][guaranteed_state][baseline]") {
+          "[pg][rest][guaranteed_state][baseline]") {
     RestGsHarness h;
     h.seed_rule("r1", "G1");
     h.seed_deployed_baseline("B", {"r1"});
@@ -2525,7 +2583,7 @@ TEST_CASE("REST gs.device-compliance: unrecognized stored state folds into pendi
 }
 
 TEST_CASE("REST gs.device-compliance: snapshot guard with no rule row falls back to rule_id name",
-          "[rest][guaranteed_state][baseline]") {
+          "[pg][rest][guaranteed_state][baseline]") {
     RestGsHarness h;
     h.seed_rule("r1", "Real Guard");
     // r-gone is in the deployed snapshot but its rule row was never created (e.g. the
@@ -2552,7 +2610,7 @@ TEST_CASE("REST gs.device-compliance: snapshot guard with no rule row falls back
 }
 
 TEST_CASE("REST gs.device-compliance: rule_names_for chunks the IN-list past 500 (perf-2/UP-6)",
-          "[rest][guaranteed_state][baseline]") {
+          "[pg][rest][guaranteed_state][baseline]") {
     // A Baseline whose deployed snapshot exceeds the 500-id chunk (and a pre-3.32
     // SQLite's SQLITE_MAX_VARIABLE_NUMBER of 999) must STILL resolve every guard name.
     // An un-chunked IN-list would prepare-fail past the limit and silently drop ALL
