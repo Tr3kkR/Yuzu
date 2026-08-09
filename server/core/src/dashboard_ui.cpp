@@ -207,7 +207,11 @@ extern const char* const kDashboardIndexHtml =
     }
     .form-hint { color: var(--mds-color-theme-text-tertiary); font-size: 0.7rem; }
     .feedback-error { color: var(--mds-color-theme-indicator-error); font-size: 0.75rem; }
-
+)HTM"
+    // Part 1a: CSS continued (split to stay under MSVC's 16380-byte string
+    // limit — this session's degrade-banner/filter-bar CSS additions pushed
+    // Part 1 over it, CI-measured C2026).
+    R"HTM(
     /* Scope section headers */
     .scope-section-header {
       padding: 0.3rem 0.75rem; font-size: 0.6rem; font-weight: 600;
