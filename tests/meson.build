@@ -485,6 +485,8 @@ if build_server
       'unit/server/test_preflight_parse.cpp',
       'unit/server/test_preflight_eval.cpp',
       'unit/server/test_preflight_run_store.cpp',
+      'unit/server/test_preflight_runner.cpp',
+      'unit/server/test_preflight_routes.cpp',
       'unit/server/test_deployment_parse.cpp',
       'unit/server/test_deployment_run_store.cpp',
       'unit/server/test_deployment_engine.cpp',

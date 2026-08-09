@@ -1679,6 +1679,21 @@ void RestApiV1::register_routes(
                  const auto id = req.matches[1].str();
                  auto agg = bundle_orch->collate(id, principal, is_admin);
                  if (!agg) {
+                     // #2691 (Doomgoose finding #3): kDegraded is a real store
+                     // read failure on a bundle that WAS found and owned — a
+                     // retryable 503, never the same terminal 404 (or the
+                     // same false "denied" audit row) a genuinely-absent/
+                     // not-owned bundle gets.
+                     if (agg.error() == CollateError::kDegraded) {
+                         audit_fn(req, "bundle.collate", "failure", "Execution", id,
+                                  "response store degraded");
+                         res.status = 503;
+                         res.set_content(
+                             detail::a4_error(res, "response store degraded",
+                                              {.retry_after_ms = 5000}),
+                             "application/json");
+                         return;
+                     }
                      // not-found and not-owned return the same 404 so existence
                      // isn't an enumeration oracle; the real reason is audited.
                      audit_fn(req, "bundle.collate", "denied", "Execution", id,
@@ -6017,7 +6032,17 @@ void RestApiV1::register_routes(
             // governance C-2 row-cap drift.
             static constexpr int kRowCap = 10000;
             q.limit = kRowCap;
-            auto responses = response_store->query(execution_id, q);
+            auto responses_opt = response_store->query(execution_id, q);
+            if (!responses_opt) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "response store degraded",
+                                                 {.retry_after_ms = 5000}),
+                                "application/json");
+                audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
+                         definition_id + " reason=response_store_degraded");
+                return;
+            }
+            auto responses = std::move(*responses_opt);
             // rows_capped is computed on the RAW (pre-scope-filter) result, so it
             // still signals "more rows existed past the 10000 cap" independent of
             // the scope drop below (#1634 keyset follow-up). NOTE (#1634): the scope
@@ -8690,7 +8715,9 @@ void RestApiV1::register_routes(
                 std::string output, error_detail;
                 int terminal = -1;
                 bool have_output = false;
-                for (const auto& r : response_store->query(command_id)) {
+                // Degrade → empty this iteration; the bounded poll loop retries
+                // (deny-or-benign, ADR-0039).
+                for (const auto& r : response_store->query(command_id).value_or(std::vector<StoredResponse>{})) {
                     if (r.agent_id != agent_id)
                         continue; // never render another agent's row
                     if (!r.output.empty()) {

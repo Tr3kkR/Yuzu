@@ -467,8 +467,14 @@ void PolicyEvaluator::collect_ready() {
     }
 
     for (auto& f : ready) {
-        auto rows = d_.response_store ? d_.response_store->query_by_execution(f.execution_id)
-                                      : std::vector<StoredResponse>{};
+        // Degrade → empty (ADR-0039 deny-or-benign): a transient read failure
+        // reads as "no terminal response yet", the same as a genuinely slow
+        // agent — verdict_for() below already treats an unmatched target as
+        // "unknown", never a fabricated compliant/drifted verdict.
+        auto rows = d_.response_store
+                        ? d_.response_store->query_by_execution(f.execution_id)
+                              .value_or(std::vector<StoredResponse>{})
+                        : std::vector<StoredResponse>{};
         auto best = latest_per_agent(rows);
 
         if (f.phase == Phase::Check) {
