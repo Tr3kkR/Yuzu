@@ -1096,15 +1096,19 @@ in a tight loop — the cap is protecting the worker pool that also serves your 
 > **Checked during admission itself, after that budget was already available**
 > (`error.message`: "Streamed request capacity reached"):
 >
-> - a server-wide ceiling on the total count of in-flight progress-tracked
->   calls (streamed or not, across every session and principal) is full. This
->   is an internal capacity limit, not adjustable by any flag. Remediation:
->   retry shortly, or resend without an SSE-capable `Accept`.
-> - this session's own streamed-call slots are all held by results that have
->   not reached a client yet. Admission first tries to reclaim a slot from an
->   undelivered final before refusing — see "A pin released to admit a new
->   call" in `docs/mcp-server.md` — so reaching this refusal means the reclaim
->   found nothing takeable. The `remediation` text distinguishes two states:
+> - a server-wide ceiling on the total count of progress-tracked calls the
+>   server is still holding open (executing, or finished with results not
+>   yet delivered; streamed or not, across every session and principal) is
+>   full. This is an internal capacity limit, not adjustable by any flag.
+>   Remediation: retry shortly, or resend without an SSE-capable `Accept`.
+> - this session's own streamed-call slots are full — held either by results
+>   that have not reached a client yet, or by calls still executing with no
+>   result yet at all. For the former, admission first tries to reclaim a
+>   slot from an undelivered final before refusing — see "A pin released to
+>   admit a new call" in `docs/mcp-server.md` — so reaching this refusal
+>   while an undelivered final exists means the reclaim found nothing
+>   takeable; for the latter, there was nothing pinned to reclaim from in
+>   the first place. The `remediation` text distinguishes the two states:
 >   - if slots are held by results still being written, retry — a result
 >     still being written frees its slot as it lands. If this persists across
 >     several retries, resume the `GET` channel with `Last-Event-ID` set to
