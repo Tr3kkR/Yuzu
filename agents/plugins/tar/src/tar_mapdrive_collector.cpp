@@ -222,9 +222,10 @@ std::string word_after(const std::string& line, const std::string& marker) {
 // cpp-conventions.md §Shell/process boundaries: this is a popen/_popen shell
 // site. DOCUMENTED EXCEPTION (a shell is used rather than argv-style
 // CreateProcess/posix_spawn):
-//   1. Every command passed here is a COMPILE-TIME CONSTANT literal — no value
-//      from the network, registry, filesystem, or operator is ever interpolated,
-//      so there is no command-injection surface.
+//   1. Every command passed here is either a COMPILE-TIME CONSTANT literal, or
+//      built at runtime from an OS-derived System32 path (system32_path, below)
+//      that is quoted for the shell — never from the network, registry,
+//      filesystem, or operator, so there is no command-injection surface.
 //   2. The Linux tools (smbstatus/journalctl) live at distro-varying paths and we
 //      parse their line-oriented text output; an argv helper would still need a
 //      PATH lookup. The one Windows tool (wevtutil) is invoked by its ABSOLUTE
