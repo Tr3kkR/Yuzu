@@ -1079,16 +1079,19 @@ in a tight loop — the cap is protecting the worker pool that also serves your 
 >
 > - the shared `--max-sse-streams` budget — every streaming surface on this
 >   server draws from one pool (MCP GET, MCP streamed POST, `/api/v1/events`,
->   dashboard, legacy `/events`) — is exhausted; or
-> - this principal's own streamed-POST allowance is exhausted. This is a
->   **fixed 4 concurrent calls**, twinned to the replay ring's per-session
->   pin-slot count — it is **not** governed by `--mcp-max-streams-per-principal`.
->   That flag affects only the GET channel; a principal's total held-open
->   ceiling across both channels is that value + 4.
->
->   Remediation for either: wait for one of your streamed calls to finish, or
->   retry shortly, or resend the same request without an SSE-capable `Accept`
->   for a plain (non-streamed) response.
+>   dashboard, legacy `/events`) — is exhausted. Remediation: retry shortly, or
+>   resend the same request without an SSE-capable `Accept` for a plain
+>   (non-streamed) response.
+> - this principal's own streamed-POST allowance, summed across every session
+>   that principal holds open, is exhausted. This is a **fixed 4 concurrent
+>   calls per principal** — numerically the same as, but counted and enforced
+>   separately from, any single session's own replay-ring pin-slot count (the
+>   next checkpoint below) — and it is **not** governed by
+>   `--mcp-max-streams-per-principal`. That flag affects only the GET channel;
+>   a principal's total held-open ceiling across both channels is that value +
+>   4. Remediation: wait for one of your streamed calls to finish, or resend
+>   the same request without an SSE-capable `Accept` for a plain
+>   (non-streamed) response.
 >
 > **Checked during admission itself, after that budget was already available**
 > (`error.message`: "Streamed request capacity reached"):
