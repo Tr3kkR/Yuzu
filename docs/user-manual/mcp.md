@@ -962,6 +962,21 @@ oracle). Sessions are in-memory, so a **server restart** also drops them.
 **Fix**: Re-run `initialize` to mint a fresh `Mcp-Session-Id` and retry. Sessions
 are never required — a client may also simply omit the header and use plain POST.
 
+> **A live session can also end up here (streamed POST, `--mcp-enable-streamed-post`).**
+> A `GET` resume presenting `Last-Event-ID` for a frame no longer in the replay
+> ring terminates the session server-side rather than answering with a gap:
+> `-32007` / HTTP 404, `error.message` "Replay window exceeded", audited as
+> `mcp.session.close` with `reason=replay_window_exceeded`. This is the same
+> ring-eviction mechanism as any other aged-out frame, but streamed POST gives a
+> client's own behavior a new way to reach it sooner: repeated disconnects on one
+> session can trigger the admission reclaim (see "A pin released to admit a new
+> call" in `docs/mcp-server.md`), which releases an undelivered final's eviction
+> exemption — after that, ordinary ring eviction can reach it like any other
+> unpinned frame. The session is gone once this fires, same as the causes above —
+> re-initialize. Nothing about the underlying result is lost: it stays fetchable
+> by `execution_id` (`get_execution_status` / `query_responses`), which is what
+> this error's own remediation already points at.
+
 ### -32008: Origin not allowed (HTTP 403)
 
 **Symptom**: A request carrying an `Origin` header returns `-32008` / HTTP `403`.
@@ -1046,6 +1061,35 @@ second).
 **Fix**: Honour `retry_after_ms`. Close a stream you no longer need (drop the GET
 connection, or `DELETE /mcp/v1/` the session), or raise the cap. Do **not** blind-retry
 in a tight loop — the cap is protecting the worker pool that also serves your POSTs.
+
+> **Same code, three more causes (streamed POST, `--mcp-enable-streamed-post`).**
+> A `POST` to `/mcp/v1/` requesting an SSE-capable stream (`_meta.progressToken`
+> plus an SSE-capable `Accept`) can also return `-32012` / HTTP `429`, with
+> `retry_after_ms` fixed at 30s — longer than the GET-channel figure above,
+> since none of these three causes is likely to clear within a second or two.
+> Distinguish them by `error.data.remediation`:
+>
+> - **The shared stream budget is exhausted** — the same `--max-sse-streams` /
+>   `--mcp-max-streams-per-principal` cap the GET channel draws from above,
+>   checked before the call is even accepted. Remediation: wait for one of your
+>   streamed calls to finish (per-principal cap) or retry shortly (global cap) —
+>   or resend the same request without an SSE-capable `Accept` for a plain
+>   response.
+> - **This session's own streamed-call slots are all held by results that
+>   have not reached a client yet.** Admission first tries to reclaim a slot
+>   from an undelivered final before refusing — see "A pin released to admit a
+>   new call" in `docs/mcp-server.md` — so reaching this refusal means the
+>   reclaim found nothing takeable. Remediation: retry (a result still being
+>   written frees its slot as it lands); if this persists across several
+>   retries, resume the `GET` channel with `Last-Event-ID` set to one below the
+>   lowest id you still need — replay starts strictly above the cursor, and the
+>   cursor releases every pinned final at or below it on this session. A gap on
+>   that resume, or having no cursor to send, means re-initializing for a fresh
+>   session and fetching results by `execution_id` (see `-32007` above for what
+>   a gap on this session's own reclaimed results looks like).
+> - **This session already has the maximum streamed calls genuinely in
+>   flight** — not a stuck slot, just the concurrency limit. Remediation: wait
+>   for one to finish.
 
 ### -32014: Streamed result no longer buffered
 
