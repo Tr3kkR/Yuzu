@@ -606,6 +606,8 @@ if build_server
       'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
       'unit/server/test_authz_model.cpp', # PR1.4: registry-independent authz model + #1788 per-device visibility (all four arms)
       'unit/server/test_authz_topology_floor.cpp', # #2376: the RBAC-off legacy-fallback topology floor (AccessReview/UserManagement/EnginePrincipal Read)
+      'unit/server/test_body_cap_policy.cpp', # #2407: pre-auth request-body cap policy table (method+segment-boundary path -> cap/requires_measurable/metric label)
+      'unit/server/test_body_cap_route_inventory.cpp', # #2407: architect-mandated route-inventory coverage — every ACTUALLY REGISTERED POST/PUT/PATCH route resolves to a deliberate class, mechanically scanned from server/core/src at test run time
       'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',
@@ -739,7 +741,22 @@ if build_server
     # MSVC's C1128 limit is a hard 65,279 - so the gap is a build-time cliff on one
     # platform only, with no runtime component. Free on every other compiler.
     cpp_args: https_cpp_args + test_partial_init_args +
-              ['-DCPPHTTPLIB_LISTEN_BACKLOG=128', '-DYUZU_TEST_ENABLE_PG'] +
+              ['-DCPPHTTPLIB_LISTEN_BACKLOG=128', '-DYUZU_TEST_ENABLE_PG',
+               # #2407 route-inventory test (test_body_cap_route_inventory.cpp):
+               # mechanically scans the real server/core/src tree at test run
+               # time rather than hand-copying a route list that would go
+               # stale exactly like the thing it's testing.
+               '-DYUZU_SERVER_SRC_DIR="' +
+               # Backslashes MUST be normalised before this lands in a C string
+               # literal. On Windows meson.project_source_root() is a native path
+               # (D:\ci\work-0\...), and `\c`/`\w` are invalid escape sequences —
+               # the TU either fails to compile or, worse, compiles to a MANGLED
+               # path, scans zero files and the inventory passes vacuously. The
+               # REQUIRE_FALSE(files.empty()) floor in the test catches the second
+               # case, but there is no reason to rely on it. std::filesystem and
+               # the Win32 API both accept forward slashes.
+               (meson.project_source_root() / 'server' / 'core' / 'src').replace('\\', '/') +
+               '"'] +
               (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
     # Server unit tests #include <openssl/...> directly (e.g.
     # test_plugin_signing_helpers.cpp). yuzu_server_core_dep does not
