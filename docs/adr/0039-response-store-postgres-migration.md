@@ -219,7 +219,9 @@ strlen-bound) — but this ADR's own posture claim was the first place the gap w
 as if it didn't exist, which is why it gates here rather than being filed as a standalone
 pre-existing-bug follow-up.
 
-One more byte the plain scrub does NOT catch: **NUL (U+0000)**. `sanitize_utf8_strict` treats
+One more byte the plain scrub does NOT catch, for the two free-text RESULT columns
+(`output`/`error_detail`) — distinct from the identity fields above, which are REJECTED on an
+embedded NUL rather than repaired: **NUL (U+0000)**. `sanitize_utf8_strict` treats
 it as a valid ASCII byte and keeps it, but PostgreSQL `TEXT` cannot store an embedded NUL and
 libpq's text-format bind C-string-**truncates** the value at the first NUL — silently dropping
 everything after it (the same "real output vanishes" regression, on any binary/mis-decoded
