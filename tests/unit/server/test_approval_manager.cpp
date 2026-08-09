@@ -1416,6 +1416,32 @@ TEST_CASE("consume_denial_reason: every kind maps to its own audit token",
 // permanent failure shipped telling the caller to "retry this call unchanged"
 // forever, with an audit row written per attempt.
 
+namespace {
+// #2880 review F1 (fjarvis/Codex/Kimi panel, reproduced on GCC): the concept
+// used to declare its operand as non-const `A4Error a4_error`, but
+// `approval_store_error_body` invokes it through `const A4Error&`. A
+// mutable-only callable satisfied the concept and then failed deep inside
+// template instantiation - exactly the failure mode the concept exists to
+// avoid at the declaration instead. Pin both directions: a const-callable
+// type still satisfies the concept, and a mutable-only-call-operator type
+// does not.
+struct ConstCallableProbe {
+    std::string operator()(int, std::string_view, std::string_view, long = -1,
+                           std::string_view = {}) const {
+        return "body";
+    }
+};
+static_assert(yuzu::server::mcp::ApprovalA4Error<ConstCallableProbe>);
+
+struct MutableOnlyProbe {
+    std::string operator()(int, std::string_view, std::string_view, long = -1,
+                           std::string_view = {}) {
+        return "body";
+    }
+};
+static_assert(!yuzu::server::mcp::ApprovalA4Error<MutableOnlyProbe>);
+} // namespace
+
 TEST_CASE("approval_store_error_body: a permanent failure is not described as temporary",
           "[approval_manager][approval][security]") {
     ApprovalManager closed(nullptr); // store never opened - cannot recover without an operator

@@ -419,17 +419,22 @@ groups:
           description: >-
             reason={{ $labels.reason }}. over_cap = a declared
             Content-Length above 4 MiB, rejected 413 in pre-routing.
-            unmeasurable = a body this server cannot size in advance - any
-            Transfer-Encoding, any non-identity Content-Encoding, or a
-            Content-Length-less POST/PUT/PATCH - rejected 411. NOTE this fires for
+            unmeasurable = a body this server cannot size in advance by FRAMING
+            - any Transfer-Encoding, or a Content-Length-less POST/PUT/PATCH -
+            rejected 411. unsupported_encoding = any non-identity
+            Content-Encoding, rejected 415 by the general pre-routing gate
+            (#2407 D4) on every route class, and counted here as well so this
+            MCP alert does not silently lose that arm. NOTE this fires for
             UNAUTHENTICATED callers too - the cap runs ahead of the auth check -
-            so there is no principal to correlate. The throttled "[#2437]"
+            so there is no principal to correlate. The throttled "[#2407]"
             warn in the server journal carries the sanitized method, path and
             source address (1 line per 100 rejections OF EACH REASON -
-            the two throttles are independent so a noisy reason cannot hide a
-            rare one; the counter records all). reason=unmeasurable means a body this server cannot size in
-            advance (any Transfer-Encoding, any non-identity Content-Encoding,
-            or a Content-Length-less POST/PUT/PATCH) is being refused 411, which is usually a client that needs
+            the three throttles - over_cap, unmeasurable, unsupported_encoding
+            - are independent so a noisy reason cannot hide a rare one; the
+            counter records all). reason=unmeasurable means a body this server cannot size in
+            advance (any Transfer-Encoding, or a Content-Length-less
+            POST/PUT/PATCH) is being refused 411; reason=unsupported_encoding
+            means a compressed body is being refused 415. Either is usually a client that needs
             reconfiguring rather than an attack. Rule out the legitimate cause
             first: an
             execute_bundle call with multi-MiB params, which the MCP transport
@@ -528,35 +533,187 @@ groups:
             Check that the new PEM files are valid, the cert and key match,
             and file permissions are correct (chmod 600 on Unix).
 
-  # DISABLED: response-store write-health alerting requires
-  # `yuzu_server_response_store_writes_total` and
-  # `yuzu_server_response_store_write_failures_total` counters that the server
-  # does not currently export. Re-enable this group once those metrics are
-  # emitted by the response store.
-  #
-  # - name: yuzu-storage
-  #   rules:
-  #     - alert: YuzuResponseStoreWriteFailures
-  #       expr: |
-  #         rate(yuzu_server_response_store_write_failures_total[5m]) > 0
-  #       for: 2m
-  #       labels:
-  #         severity: critical
-  #       annotations:
-  #         summary: "Response store write failures detected"
-  #
-  #     - alert: YuzuResponseStoreWriteFailureRate
-  #       expr: |
-  #         (
-  #           rate(yuzu_server_response_store_write_failures_total[5m])
-  #           /
-  #           rate(yuzu_server_response_store_writes_total[5m])
-  #         ) > 0.01
-  #       for: 5m
-  #       labels:
-  #         severity: warning
-  #       annotations:
-  #         summary: "Response store write failure rate exceeds 1%"
+  # ── yuzu-response-store — LIVE as of the response store's Postgres migration
+  # (ADR-0039) ──────────────────────────────────────────────────────────────
+  # These replace the old (never-emitted) `yuzu_server_response_store_writes_total`
+  # / `_write_failures_total` stub. The shipped metrics are the fail-soft ingest
+  # drop counter, the degrade-distinguishable read counter, and the clock-guarded
+  # reap-pass counter (all zero-seeded at boot, so absence-vs-zero is meaningful).
+  - name: yuzu-response-store
+    rules:
+      # #2691 Gate 8 (security-guardian): malformed_identity_field (added
+      # alongside the embedded-NUL reject guard) is a SECURITY CONTROL WORKING
+      # AS INTENDED, not store unhealth -- a single hostile/misbehaving agent
+      # sending malformed command_ids would otherwise page this "store
+      # degraded"-flavored alert for its own bad input, exactly the false-page
+      # class the inventory sibling's reason!="stale" exclusion exists to
+      # avoid (yuzu_inventory_ingest_dropped_total, above). Excluded here the
+      # same way; by (reason) so a genuine store_not_open/pool_acquire_timeout/
+      # query_error drop stays distinguishable from a benign malformed-input
+      # drop rather than being summed together.
+      - alert: YuzuResponseIngestDrops
+        expr: |
+          sum(rate(yuzu_server_response_ingest_dropped_total{reason!="malformed_identity_field"}[5m])) by (reason) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Response results are being dropped at ingest"
+          description: >-
+            The response store fail-soft-dropped command results for 10m
+            (reason label = store_not_open / pool_acquire_timeout / query_error
+            — malformed_identity_field excluded, that's an agent sending a
+            malformed identity field, not store unhealth; see
+            YuzuResponseMalformedIdentityDrops for that case).
+            The executions ladder still tracks the commands, but drawer/TAR
+            result history is lossy — check PostgreSQL pool saturation / health.
+
+      # Companion, informational: a NUL-byte-guard rejection is the security
+      # control doing its job -- worth knowing about (a hostile/misbehaving
+      # agent is actively sending malformed identity fields), but not a
+      # store-health page. Separate, lower-severity rule rather than folding
+      # into the alert above, matching the "two states want different
+      # remediation" reasoning YuzuAuditRetentionMetricMissing's comment uses
+      # for its own sibling split.
+      - alert: YuzuResponseMalformedIdentityDrops
+        expr: |
+          increase(yuzu_server_response_ingest_dropped_total{reason="malformed_identity_field"}[1h]) > 0
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "An agent sent a response with an embedded NUL in an identity field"
+          description: >-
+            ResponseStore rejected at least one response whose instruction_id/
+            execution_id/plugin/agent_id contained an embedded NUL byte
+            (#2691 UP-5) — the row was dropped, never stored truncated. This
+            is the guard working correctly, not store unhealth; investigate
+            the reporting agent if this recurs (a well-behaved agent never
+            triggers it).
+
+      - alert: YuzuResponseReadDegrade
+        expr: |
+          rate(yuzu_server_response_read_degrade_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Response reads are degrading (nullopt, not empty)"
+          description: >-
+            Response reads returned a degrade rather than a result for 10m —
+            consumers render a degrade banner / 503 rather than a false-empty.
+            Usually PostgreSQL pool saturation; correlate with pool metrics.
+
+      - alert: YuzuResponseReapBacklog
+        expr: |
+          rate(yuzu_server_response_reap_passes_total{result="capped"}[1h]) > 0
+        for: 3h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Response TTL reap is hitting its per-pass cap (backlog growing)"
+          description: >-
+            The TTL reap has hit its 10,000-rows-per-pass cap on every pass for
+            3h, so expiry is outrunning the drain and the responses table is
+            growing. response_retention_days controls how many rows are LIVE,
+            not the per-hour expiry rate a capped reap must drain, so shortening
+            it does not relieve a cap-hitting backlog (the AuditStore sibling
+            alert's framing, not this one, is the honest one to follow here).
+            The cap is a compile-time constant today — this needs an
+            engineering escalation (raise the cap, or shorten the reap cadence
+            after a capped pass) rather than a config change.
+
+      # #2691 Gate 5 (chaos-injector): a reap pass that repeatedly ERRORS
+      # (statement failure / transaction rollback — result="failed") is a
+      # DIFFERENT condition from YuzuResponseReapNotRunning ("hasn't run at
+      # all") — the pass IS running, on schedule, and failing every time,
+      # which is invisible to the liveness rule (a failed pass still
+      # increments the labeled counter, so sum(rate(...)) stays nonzero).
+      # Left uncaught, a wedge where the same backlog re-selects and re-fails
+      # every pass (the exact self-sustaining-wedge risk the chunked-delete +
+      # bounded-facet-drain fix above exists to prevent) pages nobody.
+      - alert: YuzuResponseReapFailing
+        expr: |
+          increase(yuzu_server_response_reap_passes_total{result="failed"}[3h]) >= 2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Response TTL reap is repeatedly failing (not merely idle)"
+          description: >-
+            The response store's TTL reap has failed (statement error or
+            transaction rollback) at least twice in 3h — it is running on
+            schedule and erroring, not simply not running (that's
+            YuzuResponseReapNotRunning). Check the server log for
+            "ResponseStore::reap_expired" error lines and PostgreSQL health
+            (statement_timeout, lock contention, disk pressure).
+
+      # #2691 Gate 6 (sre + enterprise-readiness, independently confirmed via a
+      # live promtool simulation): yuzu_server_response_reap_passes_total is
+      # LABELED by `result` (unlike AuditStore's unlabeled sibling counter), and
+      # is boot-seeded to 0 for every result value (server.cpp) so a healthy
+      # server running ONLY e.g. `noop` passes leaves the other result labels
+      # flat at zero forever. Without `sum()` this expression evaluates PER
+      # SERIES: every quiet-but-healthy result label independently satisfies
+      # `==0`, so this alert fires permanently on every healthy install
+      # (promtool-reproduced: 5 concurrent firing instances against 5h of a
+      # perfectly healthy simulated reap). `sum()` collapses the labels back to
+      # the single "did ANY pass of ANY result happen" question metrics.md
+      # documents this metric for ("alert on the total NOT increasing").
+      - alert: YuzuResponseReapNotRunning
+        expr: |
+          sum(rate(yuzu_server_response_reap_passes_total[2h])) == 0
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Response TTL reap has not run in 2h"
+          description: >-
+            No response reap pass of any result has been recorded for 2h. A
+            reaper that never runs looks identical to a quiet healthy store
+            while the table grows unbounded (the audit-store retention lesson).
+            Check the server's maintenance thread and PostgreSQL health.
+
+      # THIS RULE CANNOT DETECT ITS OWN INPUT GOING MISSING — see
+      # YuzuAuditRetentionMetricMissing's comment above (same reasoning, same
+      # shape): absent(sum(...)) is still absent, so a server build predating
+      # this metric, or a store that failed to open at boot, reports healthy
+      # forever under YuzuResponseReapNotRunning alone.
+      - alert: YuzuResponseReapMetricMissing
+        expr: |
+          absent(yuzu_server_response_reap_passes_total)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Response reap liveness metric is absent - the reaper is unmonitored"
+          description: >-
+            No yuzu_server_response_reap_passes_total series exists in this
+            Prometheus, so YuzuResponseReapNotRunning cannot fire and the
+            response TTL reap is unmonitored. Check `up` for the Yuzu target
+            first — this rule cannot tell "server down" from "server build
+            predates this metric" apart.
+
+      # Mirrors YuzuGuardianReapAnchorNotSurviving (#2663) / the AuditStore
+      # original (#2579): expect AT MOST one declined_no_anchor pass per
+      # database, on the pass that first reaches a verdict — that pass also
+      # settles gc_meta.bootstrap_settled, so a genuine repeat means the
+      # anchor is not surviving between passes (restore from backup, a
+      # replica rehydrated from a template, a disk-level rollback), not that
+      # the clock moved. Nothing is deleted by a declined pass.
+      - alert: YuzuResponseReapAnchorNotSurviving
+        expr: |
+          increase(yuzu_server_response_reap_passes_total{result="declined_no_anchor"}[24h]) > 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Response reap keeps re-bootstrapping - the stored clock reading is not surviving"
+          description: >-
+            The response store's retention guard has declined more than once
+            in a day for having NO stored clock reading. Expect this at most
+            once per database. Repeating means the anchor is being lost
+            between passes, not that the clock moved.
 
   # ── yuzu-secrets — LIVE as of the auth store's Postgres migration ──────
   # The SecretCodec (ADR-0010, #1320 PR 4) counts decrypt failures per store

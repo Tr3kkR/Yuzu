@@ -48,7 +48,7 @@ namespace yuzu::server::mcp {
 /// inside template instantiation.
 template <typename A4Error>
 concept ApprovalA4Error =
-    requires(A4Error a4_error, int code, std::string_view message,
+    requires(const A4Error& a4_error, int code, std::string_view message,
              std::string_view remediation, long retry_after_ms) {
         { a4_error(code, message, remediation) } -> std::convertible_to<std::string>;
         { a4_error(code, message, remediation, retry_after_ms) } -> std::convertible_to<std::string>;
