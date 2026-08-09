@@ -643,3 +643,42 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuResponseReapFailing", alertstate="firing", instance="s1", job="yuzu", result="failed", severity="warning"}'
             value: 1
+
+  # ── YuzuResponseIngestDrops / YuzuResponseMalformedIdentityDrops ───────────
+  #
+  # #2691 Gate 8 (security-guardian): malformed_identity_field is a security
+  # control working as intended (an agent sent a NUL-containing identity
+  # field, correctly rejected), not store unhealth -- it must not page the
+  # store-health alert on its own.
+
+  # CASE 23 -- an agent sending only malformed identity fields must not page
+  # YuzuResponseIngestDrops (the store-health alert), but must page the
+  # informational companion.
+  - interval: 1m
+    name: response ingest drops - malformed identity alone does not page store health
+    input_series:
+      - series: 'yuzu_server_response_ingest_dropped_total{job="yuzu",instance="s1",reason="malformed_identity_field"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuResponseIngestDrops", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuResponseMalformedIdentityDrops", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuResponseMalformedIdentityDrops", alertstate="firing", instance="s1", job="yuzu", reason="malformed_identity_field", severity="info"}'
+            value: 1
+
+  # CASE 24 -- a genuine store-health drop reason (pool_acquire_timeout) still
+  # pages YuzuResponseIngestDrops, unaffected by the exclusion.
+  - interval: 1m
+    name: response ingest drops - a genuine store-health reason still pages
+    input_series:
+      - series: 'yuzu_server_response_ingest_dropped_total{job="yuzu",instance="s1",reason="pool_acquire_timeout"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuResponseIngestDrops", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuResponseIngestDrops", alertstate="firing", reason="pool_acquire_timeout", severity="warning"}'
+            value: 1

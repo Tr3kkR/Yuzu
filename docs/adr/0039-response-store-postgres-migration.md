@@ -205,9 +205,12 @@ land, truncated, as a response indistinguishable from a genuine one for the shor
 `instruction_id "victim-id"` — a forgery via truncation, not the documented fail-soft-drop.
 Fixed: `store()` now explicitly rejects (counted via
 `yuzu_server_response_ingest_dropped_total{reason="malformed_identity_field"}`, never
-truncates) any row whose `instruction_id`/`execution_id`/`plugin` contains an embedded NUL,
-*before* binding — restoring the fail-soft-drop guarantee this paragraph always intended for
-malformed identity fields. Six sibling stores (`auth_db`, `audit_store`, `instruction_store`,
+truncates) any row whose `instruction_id`/`execution_id`/`plugin`/`agent_id` contains an
+embedded NUL, *before* binding — restoring the fail-soft-drop guarantee this paragraph always
+intended for malformed identity fields. `agent_id` was widened in during Gate 8 re-review
+(security-guardian): it shares the identical mechanism (`AgentServiceImpl::Register()`
+validates length and non-emptiness but not embedded-NUL), so a maliciously-enrolled device's
+responses could otherwise land, truncated, under a shorter real device's `agent_id`. Six sibling stores (`auth_db`, `audit_store`, `instruction_store`,
 `instruction_yaml`, `guaranteed_state_store`, `scim_json`, `vuln_finding_store`) already guard
 their own identity-bearing fields this same way (`s.find('\0') != npos`); this store simply
 hadn't been given the guard. The mechanism is not new to this migration — the SQLite-era store

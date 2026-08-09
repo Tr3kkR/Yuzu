@@ -184,6 +184,30 @@ TEST_CASE("ResponseStore: an embedded NUL in execution_id or plugin is also drop
     CHECK(results2->empty());
 }
 
+// #2691 (Gate 8 security-guardian): agent_id shares the identical hazard —
+// Register() validates length/non-emptiness but not embedded-NUL, so a
+// maliciously-enrolled device's responses could otherwise land, truncated,
+// under a shorter real device's agent_id.
+TEST_CASE("ResponseStore: an embedded NUL in agent_id is also dropped, not silently truncated",
+          "[pg][response_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+
+    StoredResponse resp;
+    resp.instruction_id = "cmd-agent-nul";
+    resp.agent_id = std::string("victim-agent") + '\0' + "attacker-payload";
+    resp.status = 1;
+    resp.output = "forged";
+    store.store(resp);
+
+    ResponseQuery q;
+    q.agent_id = "victim-agent";
+    auto results = store.query("cmd-agent-nul", q);
+    REQUIRE(results.has_value());
+    CHECK(results->empty());
+}
+
 TEST_CASE("ResponseStore: multiple responses same instruction", "[pg][response_store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1222,6 +1246,17 @@ TEST_CASE("ResponseStore: reap_expired facet pre-drain spans more than one batch
     store.reap_expired();
     CHECK(store.responses_reaped_total() == kRows);
     CHECK(store.total_count() == 1); // only "facetchunk-live" survives
+
+    // #2691 (Gate 8 architect): the assertions above pass identically
+    // whether the explicit pre-drain loop ran OR was a silent no-op that let
+    // the parent DELETE's ON DELETE CASCADE clean up the (small, 6000-row)
+    // facet set instead — a false-green at this scale, since CASCADE alone
+    // is more than capable of 6000 rows. This assertion is what actually
+    // discriminates: facets_predrained_total() only increments inside the
+    // explicit drain loop itself, so it stays 0 if that loop is broken or
+    // removed, even though the CASCADE fallback would still leave the table
+    // empty and every assertion above still green.
+    CHECK(store.facets_predrained_total() == kRows * kFacetsPerRow);
 
     const auto reaped = [&](const char* result) {
         return metrics.counter("yuzu_server_response_reap_passes_total", {{"result", result}})

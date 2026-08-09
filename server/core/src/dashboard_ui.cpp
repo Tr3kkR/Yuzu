@@ -163,6 +163,14 @@ extern const char* const kDashboardIndexHtml =
       font-family: var(--font-mono);
     }
     .filter-bar select:focus, .filter-bar input:focus { border-color: var(--mds-color-theme-accent-primary-normal); outline: none; }
+    /* #2691 (Gate 8 consistency-auditor): a degraded facet-values() read
+       disables the column filter dropdown — give it the same amber degrade
+       treatment as .result-degrade-banner rather than plain browser-default
+       styling, so it doesn't visually read as an unrelated form quirk. */
+    .filter-bar select:disabled {
+      color: var(--yellow, #ffcc00); border-color: rgba(255, 204, 0, 0.4);
+      background: rgba(255, 204, 0, 0.08); opacity: 1;
+    }
 
     /* Sortable column headers */
     th.sortable { cursor: pointer; user-select: none; }

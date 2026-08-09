@@ -188,19 +188,24 @@ std::string sanitize_pg_text(std::string_view s) {
     return out;
 }
 
-// #2691 (Gate 4 unhappy-path finding UP-5): `instruction_id`/`execution_id`/
-// `plugin` are deliberately NOT run through sanitize_pg_text — ADR-0039's
-// documented rationale is that a malformed value simply fail-soft-drops the
-// whole row at INSERT (SQLSTATE 22021, invalid UTF-8). That rationale covers
-// invalid UTF-8 but not an embedded NUL: NUL is valid UTF-8, so the INSERT
-// does not reject it, but `pg::exec_params` binds every parameter as a
-// NUL-terminated C string (paramLengths=nullptr) — libpq silently TRUNCATES
-// the value at the first NUL instead of failing. An agent-controlled
-// `command_id` containing an embedded NUL (`agent_service_impl.cpp`'s
+// #2691 (Gate 4 unhappy-path finding UP-5, widened to agent_id by Gate 8
+// security-guardian): `instruction_id`/`execution_id`/`plugin`/`agent_id`
+// are deliberately NOT run through sanitize_pg_text — ADR-0039's documented
+// rationale is that a malformed value simply fail-soft-drops the whole row
+// at INSERT (SQLSTATE 22021, invalid UTF-8). That rationale covers invalid
+// UTF-8 but not an embedded NUL: NUL is valid UTF-8, so the INSERT does not
+// reject it, but `pg::exec_params` binds every parameter as a NUL-terminated
+// C string (paramLengths=nullptr) — libpq silently TRUNCATES the value at
+// the first NUL instead of failing. An agent-controlled `command_id`
+// containing an embedded NUL (`agent_service_impl.cpp`'s
 // `sr.instruction_id = resp.command_id()`, unsanitized) could therefore be
 // stored truncated to a shorter, real instruction_id it was never dispatched
-// for — indistinguishable from a genuine response once truncated. Six
-// sibling stores (auth_db, audit_store, instruction_store, instruction_yaml,
+// for — indistinguishable from a genuine response once truncated. The same
+// mechanism applies to `agent_id`: `AgentServiceImpl::Register()` validates
+// length and non-emptiness but not embedded-NUL, so a maliciously-enrolled
+// device could have its responses land, truncated, under a shorter real
+// device's agent_id in both `responses` and `response_facets`. Six sibling
+// stores (auth_db, audit_store, instruction_store, instruction_yaml,
 // guaranteed_state_store, scim_json, vuln_finding_store) already guard their
 // own identity-bearing fields against embedded NUL this same way; this store
 // never got the guard. Reject (fail-soft-drop, counted) rather than
@@ -335,11 +340,22 @@ const std::vector<pg::PgMigration>& migrations() {
             CREATE INDEX idx_resp_execution_ts
                 ON responses(execution_id, timestamp) WHERE execution_id != '';
 
-            -- ON DELETE CASCADE: a facet row never outlives its parent response —
-            -- reap_expired() issues a SINGLE DELETE on `responses`; Postgres
-            -- removes the matching facet rows automatically (the SQLite original
-            -- had no FK and swept orphans with a second NOT-IN scan on every
-            -- cleanup pass; the FK makes that second statement unnecessary).
+            -- ON DELETE CASCADE: a facet row never outlives its parent response
+            -- (the SQLite original had no FK and swept orphans with a second
+            -- NOT-IN scan on every cleanup pass; the FK removes that need).
+            -- #2691 Gate 8 correction: reap_expired() does NOT rely on this
+            -- CASCADE alone for bulk expiry — a single chunked parent DELETE
+            -- left to CASCADE could fan out up to kReapDeleteChunkRows *
+            -- kMaxFacetsPerResponse child-row deletes in one statement
+            -- (measured ~1929ms for the max-cardinality case, chaos Gate 5).
+            -- reap_expired() explicitly PRE-DRAINS response_facets in bounded
+            -- batches before each parent-row chunk delete; by the time the
+            -- parent DELETE runs, this CASCADE has nothing left to do for a
+            -- bulk-reap pass. It still fires normally for any OTHER delete
+            -- path (an operator/API single-row delete, if one is ever added)
+            -- — do not remove it, and do not "simplify" reap_expired() back
+            -- to a bare parent-row DELETE relying on this comment's old
+            -- claim.
             CREATE TABLE response_facets (
                 response_id    BIGINT  NOT NULL REFERENCES responses(id) ON DELETE CASCADE,
                 instruction_id TEXT    NOT NULL,
@@ -422,13 +438,18 @@ void ResponseStore::store(const StoredResponse& resp) {
         return;
     }
 
-    // #2691 (UP-5): reject before binding — see has_embedded_nul's doc
-    // comment. instruction_id/execution_id/plugin are bound unsanitized;
-    // a truncate-on-bind is a silent identity collision, not a safe default.
+    // #2691 (UP-5, widened by Gate 8 security-guardian): reject before
+    // binding — see has_embedded_nul's doc comment. instruction_id/
+    // execution_id/plugin/agent_id are all bound unsanitized; a
+    // truncate-on-bind is a silent identity collision, not a safe default.
+    // agent_id shares the identical hazard: Register() validates length and
+    // non-emptiness but not embedded-NUL, so a maliciously-enrolled agent
+    // could otherwise have its responses land, truncated, under a shorter
+    // real device's agent_id in BOTH `responses` and `response_facets`.
     if (has_embedded_nul(resp.instruction_id) || has_embedded_nul(resp.execution_id) ||
-        has_embedded_nul(resp.plugin)) {
+        has_embedded_nul(resp.plugin) || has_embedded_nul(resp.agent_id)) {
         spdlog::warn("ResponseStore: dropping response with an embedded NUL byte in "
-                     "instruction_id/execution_id/plugin (agent={})",
+                     "instruction_id/execution_id/plugin/agent_id (agent={})",
                      resp.agent_id);
         note_ingest_dropped(metrics_, kReasonMalformedIdentity);
         return;
@@ -1126,6 +1147,11 @@ void ResponseStore::reap_expired() {
     };
 
     int64_t responses_deleted = 0;
+    // #2691 (Gate 8 architect): test-observable proof the explicit facet
+    // pre-drain loop actually deleted rows, distinguishable from the parent
+    // DELETE's ON DELETE CASCADE silently doing the same work — see
+    // facets_predrained_total()'s doc comment.
+    int64_t facets_predrained = 0;
     std::string outcome = "failed";
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         // One sweeping replica at a time.
@@ -1432,7 +1458,9 @@ void ResponseStore::reap_expired() {
                                   PQerrorMessage(conn));
                     return false;
                 }
-                if (affected_rows(fdel) < kReapFacetDeleteBatchRows)
+                const int64_t batch_deleted = affected_rows(fdel);
+                facets_predrained += batch_deleted;
+                if (batch_deleted < kReapFacetDeleteBatchRows)
                     break; // this chunk's facets are fully drained
                 if (std::chrono::steady_clock::now() >= delete_deadline) {
                     // Facets only partially drained — leave the parent rows
@@ -1502,6 +1530,10 @@ void ResponseStore::reap_expired() {
         responses_reaped_.fetch_add(static_cast<uint64_t>(responses_deleted),
                                     std::memory_order_relaxed);
         spdlog::info("ResponseStore: reap swept {} response(s)", responses_deleted);
+    }
+    if (facets_predrained > 0) {
+        facets_predrained_.fetch_add(static_cast<uint64_t>(facets_predrained),
+                                     std::memory_order_relaxed);
     }
 }
 

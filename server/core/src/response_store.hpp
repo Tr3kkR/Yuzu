@@ -329,12 +329,24 @@ public:
         return responses_reaped_.load();
     }
 
+    /// Cumulative `response_facets` rows deleted by reap's EXPLICIT
+    /// pre-drain loop specifically (#2691, Gate 8 architect) — distinct from
+    /// `responses_reaped_total()`, which counts parent rows. Test-observable
+    /// proof that the bounded facet pre-drain actually ran and did the
+    /// deletion work, rather than the parent-row DELETE's `ON DELETE
+    /// CASCADE` silently doing it instead (which a small-scale test cannot
+    /// otherwise distinguish from the pre-drain loop being a no-op).
+    [[nodiscard]] uint64_t facets_predrained_total() const noexcept {
+        return facets_predrained_.load();
+    }
+
 private:
     pg::PgPool& pool_;
     bool open_{false};
     int retention_days_;
     yuzu::MetricsRegistry* metrics_{nullptr};
     std::atomic<uint64_t> responses_reaped_{0};
+    std::atomic<uint64_t> facets_predrained_{0};
     std::function<int64_t()> now_fn_; // test seam only; see ctor doc
 
     int64_t compute_ttl_epoch() const;

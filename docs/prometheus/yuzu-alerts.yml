@@ -536,9 +536,19 @@ groups:
   # reap-pass counter (all zero-seeded at boot, so absence-vs-zero is meaningful).
   - name: yuzu-response-store
     rules:
+      # #2691 Gate 8 (security-guardian): malformed_identity_field (added
+      # alongside the embedded-NUL reject guard) is a SECURITY CONTROL WORKING
+      # AS INTENDED, not store unhealth -- a single hostile/misbehaving agent
+      # sending malformed command_ids would otherwise page this "store
+      # degraded"-flavored alert for its own bad input, exactly the false-page
+      # class the inventory sibling's reason!="stale" exclusion exists to
+      # avoid (yuzu_inventory_ingest_dropped_total, above). Excluded here the
+      # same way; by (reason) so a genuine store_not_open/pool_acquire_timeout/
+      # query_error drop stays distinguishable from a benign malformed-input
+      # drop rather than being summed together.
       - alert: YuzuResponseIngestDrops
         expr: |
-          rate(yuzu_server_response_ingest_dropped_total[5m]) > 0
+          sum(rate(yuzu_server_response_ingest_dropped_total{reason!="malformed_identity_field"}[5m])) by (reason) > 0
         for: 10m
         labels:
           severity: warning
@@ -546,9 +556,35 @@ groups:
           summary: "Response results are being dropped at ingest"
           description: >-
             The response store fail-soft-dropped command results for 10m
-            (reason label = store_not_open / pool_acquire_timeout / query_error).
+            (reason label = store_not_open / pool_acquire_timeout / query_error
+            — malformed_identity_field excluded, that's an agent sending a
+            malformed identity field, not store unhealth; see
+            YuzuResponseMalformedIdentityDrops for that case).
             The executions ladder still tracks the commands, but drawer/TAR
             result history is lossy — check PostgreSQL pool saturation / health.
+
+      # Companion, informational: a NUL-byte-guard rejection is the security
+      # control doing its job -- worth knowing about (a hostile/misbehaving
+      # agent is actively sending malformed identity fields), but not a
+      # store-health page. Separate, lower-severity rule rather than folding
+      # into the alert above, matching the "two states want different
+      # remediation" reasoning YuzuAuditRetentionMetricMissing's comment uses
+      # for its own sibling split.
+      - alert: YuzuResponseMalformedIdentityDrops
+        expr: |
+          increase(yuzu_server_response_ingest_dropped_total{reason="malformed_identity_field"}[1h]) > 0
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "An agent sent a response with an embedded NUL in an identity field"
+          description: >-
+            ResponseStore rejected at least one response whose instruction_id/
+            execution_id/plugin/agent_id contained an embedded NUL byte
+            (#2691 UP-5) — the row was dropped, never stored truncated. This
+            is the guard working correctly, not store unhealth; investigate
+            the reporting agent if this recurs (a well-behaved agent never
+            triggers it).
 
       - alert: YuzuResponseReadDegrade
         expr: |
