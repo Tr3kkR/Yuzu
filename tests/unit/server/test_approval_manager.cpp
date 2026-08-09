@@ -12,6 +12,7 @@
 #include "reserved_definition_id.hpp"
 #include "migration_runner.hpp"
 #include "sqlite_raii.hpp"
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <sqlite3.h>
@@ -828,6 +829,13 @@ TEST_CASE("ApprovalManager: a store failure during the recheck is not reported a
     REQUIRE(!r.has_value());
     CHECK(r.error().kind == ConsumeFailure::kStoreError); // NOT kNotConsumable
     CHECK(!ran); // no row to hand the callback
+    // The fault hit BEFORE the precondition block ever runs: consume_ticket's
+    // unconditional #2442 origin-check read (approval_manager.cpp:665-ish)
+    // sees the dropped table first, and this refusal is exactly what #2786
+    // arm 1 says must never be silently indistinguishable from an ordinary
+    // store error — the flag and a non-zero errcode must ride along.
+    CHECK(r.error().origin_check_unevaluated);
+    CHECK(r.error().extended_errcode != 0);
 
     // And the same read through get_checked directly.
     CHECK(!mgr.get_checked(*id).has_value());
@@ -1410,6 +1418,109 @@ TEST_CASE("consume_denial_reason: every kind maps to its own audit token",
             CHECK(std::string(tokens[i]) != std::string(tokens[j]));
 }
 
+// ── is_permanent_sqlite_error (#2786 "PR 1c") ───────────────────────────────
+
+static_assert(yuzu::server::is_permanent_sqlite_error(SQLITE_CORRUPT));
+static_assert(yuzu::server::is_permanent_sqlite_error(SQLITE_NOTADB));
+static_assert(yuzu::server::is_permanent_sqlite_error(SQLITE_READONLY));
+static_assert(yuzu::server::is_permanent_sqlite_error(SQLITE_FULL));
+// Extended variants classify with their family — primary-code masking, not an
+// exact-code list, so a future SQLite adding a variant does not silently
+// fall through to the transient arm.
+static_assert(yuzu::server::is_permanent_sqlite_error(SQLITE_CORRUPT_VTAB));
+static_assert(yuzu::server::is_permanent_sqlite_error(SQLITE_READONLY_DBMOVED));
+
+static_assert(!yuzu::server::is_permanent_sqlite_error(SQLITE_BUSY));
+static_assert(!yuzu::server::is_permanent_sqlite_error(SQLITE_LOCKED));
+static_assert(!yuzu::server::is_permanent_sqlite_error(SQLITE_ERROR));
+static_assert(!yuzu::server::is_permanent_sqlite_error(SQLITE_AUTH));
+static_assert(!yuzu::server::is_permanent_sqlite_error(SQLITE_IOERR));
+static_assert(!yuzu::server::is_permanent_sqlite_error(SQLITE_CANTOPEN));
+static_assert(!yuzu::server::is_permanent_sqlite_error(0)); // not a SQLite fault
+
+// ── #2786 arm 1: the origin check's own fault must not mask a forgery ──────
+
+TEST_CASE("ApprovalManager: a genuinely transient fault at the origin check is flagged, "
+          "and the forgery signal fires once it clears",
+          "[approval_manager][approval][security]") {
+    // CH-5 (governance Gate 5 chaos design): fault-inject the origin check's
+    // SELECT with a real SQLITE_BUSY, on a NON-MCP-origin ticket, and confirm
+    // the flag/errcode ride along, and that redemption still correctly
+    // reports kForeignOrigin once the fault clears.
+    yuzu::test::TempDbFile dbfile("yuzu_test_2786_ch5_");
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(dbfile.path.string().c_str(), &db) == SQLITE_OK);
+    ApprovalManager mgr(db);
+    mgr.create_tables();
+
+    auto forged = mgr.submit("mcp.quarantine_device", "attacker", "{}", "",
+                             ApprovalOrigin::kInstruction);
+    REQUIRE(forged.has_value());
+    REQUIRE(mgr.approve(*forged, "admin1", "").has_value());
+
+    // A second connection to the SAME file holds an exclusive write lock, so
+    // the first connection's read inside consume_ticket's origin check gets a
+    // real SQLITE_BUSY (rollback-journal default, no busy_timeout set on
+    // either connection — deterministic, no sleep/retry loop needed).
+    sqlite3* locker = nullptr;
+    REQUIRE(sqlite3_open(dbfile.path.string().c_str(), &locker) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(locker, "BEGIN EXCLUSIVE;", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    auto faulted = mgr.consume_ticket(*forged, "attacker", {});
+    REQUIRE(!faulted.has_value());
+    CHECK(faulted.error().kind == ConsumeFailure::kStoreError);
+    CHECK((faulted.error().extended_errcode & 0xff) == SQLITE_BUSY);
+    CHECK(faulted.error().origin_check_unevaluated);
+    CHECK(!yuzu::server::is_permanent_sqlite_error(faulted.error().extended_errcode));
+    // Cannot check "untouched" here: `locker` still holds the exclusive lock,
+    // so a read would fault identically to the write above. Checked below,
+    // once the lock releases.
+
+    REQUIRE(sqlite3_exec(locker, "ROLLBACK;", nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(locker);
+
+    // Untouched: the fault must not have burned the ticket.
+    CHECK(mgr.get(*forged)->consumed_at == 0);
+
+    // Once the fault clears, the forgery signal is NOT lost: the same ticket
+    // now correctly reports kForeignOrigin, not a repeat of kStoreError.
+    auto cleared = mgr.consume_ticket(*forged, "attacker", {});
+    REQUIRE(!cleared.has_value());
+    CHECK(cleared.error().kind == ConsumeFailure::kForeignOrigin);
+    CHECK(!cleared.error().origin_check_unevaluated);
+    CHECK(mgr.get(*forged)->consumed_at == 0);
+
+    sqlite3_close(db);
+}
+
+TEST_CASE("ApprovalManager: a CAS-step fault after a passing origin check does NOT flag "
+          "the origin as unevaluated",
+          "[approval_manager][approval][security]") {
+    // Negative control: origin_check_unevaluated must be scoped to the origin
+    // check's own read, not to "consume_ticket failed for any store reason".
+    // A fault that hits only the consuming UPDATE, after the origin check
+    // already passed, must not trip the masked-denial signal.
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}"); // kUnspecified — grants
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+
+    REQUIRE(sqlite3_exec(tdb.db,
+                         "CREATE TRIGGER approvals_block_update BEFORE UPDATE ON approvals "
+                         "BEGIN SELECT RAISE(ABORT, 'fault injected'); END;",
+                         nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    auto faulted = mgr.consume_ticket(*id, "operator1", {});
+    REQUIRE(!faulted.has_value());
+    CHECK(faulted.error().kind == ConsumeFailure::kStoreError);
+    CHECK(faulted.error().extended_errcode != 0);
+    CHECK(!faulted.error().origin_check_unevaluated); // origin passed before the CAS ran
+    CHECK(mgr.get(*id)->consumed_at == 0);
+}
+
 // ── approval_store_error_body (#2786) ───────────────────────────────────────
 // The branch these pin had ZERO coverage in either direction: a governance
 // reviewer deleted it wholesale once and no assertion moved, which is how a
@@ -1459,7 +1570,7 @@ TEST_CASE("approval_store_error_body: a permanent failure is not described as te
         return std::string("body");
     };
 
-    (void)yuzu::server::mcp::approval_store_error_body(closed, probe);
+    (void)yuzu::server::mcp::approval_store_error_body(closed, probe, /*extended_errcode=*/0);
 
     CHECK(seen_code == yuzu::server::mcp::kInternalError);
     CHECK(seen_message.find("temporarily") == std::string::npos);
@@ -1468,6 +1579,37 @@ TEST_CASE("approval_store_error_body: a permanent failure is not described as te
     // serialises as JSON `null` (present in the body, not a missing key) -
     // this file's encoding for "not retryable". A concrete value here is an
     // instruction to loop on a condition that never clears.
+    CHECK(seen_retry == -1);
+}
+
+TEST_CASE("approval_store_error_body: an OPEN store failing permanently is also not "
+          "described as temporary",
+          "[approval_manager][approval][security]") {
+    // #2786 "PR 1c": the store handle itself is fine, but a read against it is
+    // failing in a way an unchanged retry cannot clear. Same permanent body as
+    // a never-opened store — see mcp_approval_error.hpp's discriminator.
+    TestDb tdb;
+    ApprovalManager open(tdb.db);
+    open.create_tables();
+    REQUIRE(open.is_open());
+
+    int seen_code = 0;
+    std::string seen_message, seen_remediation;
+    long seen_retry = -7;
+    auto probe = [&](int code, std::string_view message, std::string_view remediation = {},
+                     long retry_after_ms = -1, std::string_view = {}) {
+        seen_code = code;
+        seen_message = std::string(message);
+        seen_remediation = std::string(remediation);
+        seen_retry = retry_after_ms;
+        return std::string("body");
+    };
+
+    (void)yuzu::server::mcp::approval_store_error_body(open, probe, SQLITE_CORRUPT);
+
+    CHECK(seen_code == yuzu::server::mcp::kInternalError);
+    CHECK(seen_message.find("temporarily") == std::string::npos);
+    CHECK(seen_remediation.find("retry this call unchanged") == std::string::npos);
     CHECK(seen_retry == -1);
 }
 
@@ -1488,12 +1630,38 @@ TEST_CASE("approval_store_error_body: a transient failure carries a machine-read
         return std::string("body");
     };
 
-    (void)yuzu::server::mcp::approval_store_error_body(open, probe);
+    (void)yuzu::server::mcp::approval_store_error_body(open, probe, /*extended_errcode=*/0);
 
     CHECK(seen_message.find("temporarily") != std::string::npos);
     CHECK(seen_remediation.find("do NOT request a fresh one") != std::string::npos);
     // Invariant A5: the retry directive must be machine metadata, not prose.
     // Pinned EXACT, not `> 0`: a mutant that swaps 5000 for any other
     // positive constant must still be caught (QA-3).
+    CHECK(seen_retry == 5000);
+}
+
+TEST_CASE("approval_store_error_body: a genuinely transient errcode still gets the "
+          "retryable arm",
+          "[approval_manager][approval][security]") {
+    // Negative control for the #2786 "PR 1c" classifier: BUSY must NOT be
+    // swept into the permanent arm alongside CORRUPT/NOTADB/READONLY/FULL.
+    TestDb tdb;
+    ApprovalManager open(tdb.db);
+    open.create_tables();
+    REQUIRE(open.is_open());
+
+    std::string seen_message, seen_remediation;
+    long seen_retry = -1;
+    auto probe = [&](int, std::string_view message, std::string_view remediation = {},
+                     long retry_after_ms = -1, std::string_view = {}) {
+        seen_message = std::string(message);
+        seen_remediation = std::string(remediation);
+        seen_retry = retry_after_ms;
+        return std::string("body");
+    };
+
+    (void)yuzu::server::mcp::approval_store_error_body(open, probe, SQLITE_BUSY);
+
+    CHECK(seen_message.find("temporarily") != std::string::npos);
     CHECK(seen_retry == 5000);
 }

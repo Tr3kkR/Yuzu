@@ -7084,6 +7084,11 @@ TEST_CASE("MCP approval recall: a store fault at the lookup rung is a retryable 
     CHECK(fbody["error"]["data"]["retry_after_ms"] == 5000);
 
     CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
+    // #2786: a lookup-rung fault means the origin check two rungs down never
+    // gets a chance to run either, so the masked-denial counter fires here
+    // exactly as it does for a consume-rung origin-check fault.
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
+              .value() == 1.0);
     REQUIRE(!ts.audit_details.empty());
     CHECK(ts.audit_details.back() == "approval_id=" + approval_id + " refused: store_error (lookup)");
 
@@ -7233,6 +7238,12 @@ TEST_CASE("MCP approval recall: a store fault at the CONSUME rung is caught too,
     REQUIRE(fbody["error"]["data"].contains("retry_after_ms"));
     CHECK(fbody["error"]["data"]["retry_after_ms"] == 5000);
     CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
+    // Negative control: this fault hit only the CAS, AFTER the origin check
+    // already passed (the MCP mint's ticket is kUnspecified, which grants) —
+    // the masked-denial counter must stay at zero, not fire on every
+    // store-error kind indiscriminately.
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
+              .value() == 0.0);
     REQUIRE(!ts.audit_details.empty());
     CHECK(ts.audit_details.back() == "approval_id=" + approval_id + " refused: store_error");
 
@@ -7240,6 +7251,193 @@ TEST_CASE("MCP approval recall: a store fault at the CONSUME rung is caught too,
                         nullptr) == SQLITE_OK);
 
     // Still approved, unconsumed, and still the same ticket → consumes now.
+    auto recovered = ts.call(recall);
+    CHECK(write_tool_payload(recovered)["deleted"] == true);
+}
+
+TEST_CASE("MCP approval recall: a store fault AT the origin check masks a foreign-origin "
+          "ticket's kind — flagged via the masked-denial counter — until the fault clears",
+          "[mcp][integration][approval][security]") {
+    // CH-5 (governance Gate 5 chaos design), origin-check half: fault-inject
+    // the consume rung's own #2442 origin-check SELECT while redeeming a
+    // NON-MCP-origin ticket, and confirm the forgery signal (masked counter +
+    // audit suffix) fires instead of being silently lost to a plain
+    // store_error. The lookup-rung half of CH-5 (SQLITE_BUSY via a real
+    // second-connection lock) is the test above ("a store fault at the
+    // lookup rung..."); that same lock technique cannot isolate THIS read —
+    // rung 1 runs the identical SELECT text first on the same connection, so
+    // it hits the lock first and this test would degenerate into a repeat of
+    // the lookup-rung one. A countdown authorizer denial (SQLITE_AUTH, a
+    // classifier-transient code, same as BUSY) isolates the fault to the
+    // origin check specifically — see the classifier unit tests in
+    // test_approval_manager.cpp for the BUSY case directly.
+    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::server::TagStore tags(tagdb.path);
+    tags.set_tag("agent-1", "role", "web", "server");
+
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("operator");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":256,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+    std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // Declare the ticket as minted on a non-MCP surface — the #2442 forgery
+    // scenario — directly on the row, mirroring what a REST-gate mint under
+    // the reserved `mcp.` prefix would have recorded.
+    {
+        sqlite3_stmt* stmt = nullptr;
+        REQUIRE(sqlite3_prepare_v2(conn.h, "UPDATE approvals SET origin = 'instruction' WHERE id = ?",
+                                   -1, &stmt, nullptr) == SQLITE_OK);
+        sqlite3_bind_text(stmt, 1, approval_id.c_str(), -1, SQLITE_TRANSIENT);
+        REQUIRE(sqlite3_step(stmt) == SQLITE_DONE);
+        sqlite3_finalize(stmt);
+    }
+
+    std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":257,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":")" +
+                         approval_id + R"("}}})";
+
+    // A two-connection lock cannot isolate this to the origin check alone:
+    // rung 1's lookup runs the identical SELECT text FIRST on the same
+    // connection, so it would hit the lock and fault before consume_ticket
+    // is ever reached — exactly the lookup-rung scenario the test above
+    // already covers. A countdown authorizer lets the 1st SELECT (rung 1)
+    // through and denies only the 2nd (the origin check inside
+    // consume_ticket), isolating the fault to the read this test targets.
+    int select_count = 0;
+    REQUIRE(sqlite3_set_authorizer(
+                conn.h,
+                [](void* ctx, int action, const char*, const char*, const char*,
+                   const char*) -> int {
+                    if (action == SQLITE_SELECT && ++(*static_cast<int*>(ctx)) == 2)
+                        return SQLITE_DENY;
+                    return SQLITE_OK;
+                },
+                &select_count) == SQLITE_OK);
+
+    auto faulted = ts.call(recall);
+    auto fbody = nlohmann::json::parse(faulted->body);
+    REQUIRE(fbody.contains("error"));
+    CHECK(fbody["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(fbody["error"]["message"] == "approval store temporarily unavailable");
+    REQUIRE(fbody["error"]["data"].contains("retry_after_ms"));
+    CHECK(fbody["error"]["data"]["retry_after_ms"] == 5000);
+    CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
+              .value() == 1.0);
+    REQUIRE(!ts.audit_details.empty());
+    CHECK(ts.audit_details.back() ==
+          "approval_id=" + approval_id + " refused: store_error (origin unverified)");
+
+    REQUIRE(sqlite3_set_authorizer(conn.h, nullptr, nullptr) == SQLITE_OK);
+
+    // Once the fault clears, the forgery signal is NOT lost: the recall now
+    // correctly reports foreign_origin (the same anti-oracle client message
+    // as an ordinary replay, but a distinct audit token) rather than a
+    // repeat of the masked store_error. The masked counter does not move
+    // again — this refusal was NOT masked.
+    auto cleared = ts.call(recall);
+    auto cbody = nlohmann::json::parse(cleared->body);
+    REQUIRE(cbody.contains("error"));
+    CHECK(cbody["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(cbody["error"]["message"] == "approval already used (one-time ticket)");
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
+              .value() == 1.0);
+    REQUIRE(!ts.audit_details.empty());
+    CHECK(ts.audit_details.back() == "approval_id=" + approval_id + " refused: foreign_origin");
+
+    // Untouched throughout.
+    CHECK(appr.get(approval_id)->consumed_at == 0);
+    CHECK(tags.get_tag("agent-1", "role") == "web");
+}
+
+TEST_CASE("MCP approval recall: an OPEN store failing permanently gets the escalate "
+          "body, not the retry-forever one",
+          "[mcp][integration][approval][security]") {
+    // #2786 "PR 1c": the store handle is fine, but a read against it fails in
+    // a way an unchanged retry cannot clear. PRAGMA query_only is used
+    // because it deterministically yields SQLITE_READONLY on the very next
+    // write, without corrupting the file the test fixture needs.
+    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::server::TagStore tags(tagdb.path);
+    tags.set_tag("agent-1", "role", "web", "server");
+
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":258,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+    std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":259,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":")" +
+                         approval_id + R"("}}})";
+
+    // The lookup rung (SELECT) and the origin check (SELECT) both succeed
+    // under query_only; only the consuming UPDATE fails, isolating this to
+    // the CAS site — same as the transient CAS test above, but permanent.
+    REQUIRE(sqlite3_exec(conn.h, "PRAGMA query_only = 1;", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    auto faulted = ts.call(recall);
+    auto fbody = nlohmann::json::parse(faulted->body);
+    REQUIRE(fbody.contains("error"));
+    CHECK(fbody["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(fbody["error"]["message"] == "approval store unavailable");
+    REQUIRE(fbody["error"]["data"].contains("retry_after_ms"));
+    CHECK(fbody["error"]["data"]["retry_after_ms"].is_null());
+
+    REQUIRE(sqlite3_exec(conn.h, "PRAGMA query_only = 0;", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    // A permanent-classified fault still leaves the ticket redeemable once
+    // cleared — classification changes the RESPONSE, never the store state.
     auto recovered = ts.call(recall);
     CHECK(write_tool_payload(recovered)["deleted"] == true);
 }

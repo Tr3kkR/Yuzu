@@ -120,7 +120,8 @@ struct ApprovalQuery {
 enum class ConsumeFailure {
     kPrecondition,  ///< precondition denied — ticket UNTOUCHED, still recallable
     kNotConsumable, ///< absent / not approved / already consumed (the CAS lost)
-    kStoreError,    ///< store unavailable, missing argument, or a SQLite failure
+    kStoreError,    ///< store unavailable, missing argument, or a SQLite failure —
+                    ///< see ConsumeError::extended_errcode/origin_check_unevaluated
     kForeignOrigin, ///< minted on a surface other than the MCP recall (#2442)
 };
 
@@ -185,9 +186,34 @@ enum class ConsumeFailure {
 inline constexpr const char* kNotConsumableMessage =
     "approval not consumable (already used, not approved, or absent)";
 
+/// A store read's failure, kept apart from the row simply not being there.
+/// `extended_errcode` is `sqlite3_extended_errcode()` at the failing
+/// prepare/step, or 0 when the failure has no SQLite origin (store not open,
+/// missing argument) — see `is_permanent_sqlite_error` (#2786 "PR 1c").
+struct StoreReadError {
+    std::string message;
+    int extended_errcode = 0;
+};
+
 struct ConsumeError {
     ConsumeFailure kind{ConsumeFailure::kStoreError};
     std::string message;
+    /// `sqlite3_extended_errcode()` for a `kStoreError` produced by a SQLite
+    /// read/write failure; 0 otherwise (store not open, missing argument, a
+    /// throwing precondition). See `is_permanent_sqlite_error` (#2786).
+    int extended_errcode = 0;
+    /// True ONLY when the #2442 cross-surface origin check's own read
+    /// (`get_checked` inside `consume_ticket`) is the thing that faulted —
+    /// so the origin comparison never ran and a foreign-origin ticket could
+    /// be hiding behind this refusal exactly as easily as an innocent one.
+    /// #2786 arm 1: without this, a store fault at that specific read
+    /// reports as a plain `kStoreError` and the forgery-detection signal is
+    /// lost for the duration of the fault. False for every other
+    /// `kStoreError` producer (the store-not-open guard, the missing-id/
+    /// missing-principal guards, the CAS itself, the precondition recheck
+    /// read, a throwing precondition) — those never reached the origin
+    /// check, so there is nothing masked to flag.
+    bool origin_check_unevaluated = false;
 };
 
 /// A cheap, read-only recheck of the state a ticket's effect depends on,
@@ -254,7 +280,7 @@ public:
     /// caller that 404s either way, and NOT fine for one deciding whether a
     /// one-time capability is spent — see consume_ticket's pre-consume recheck,
     /// which uses this.
-    std::expected<std::optional<Approval>, std::string> get_checked(const std::string& id) const;
+    std::expected<std::optional<Approval>, StoreReadError> get_checked(const std::string& id) const;
 
     /// Newest PENDING approval matching (definition_id, submitted_by,
     /// scope_expression), or nullopt. The MCP approval-ticket mint dedup key

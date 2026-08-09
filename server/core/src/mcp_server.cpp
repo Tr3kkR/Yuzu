@@ -3327,11 +3327,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     auto appr_read = approval_manager->get_checked(supplied_id);
                     if (!appr_read) {
                         count_denial("yuzu_mcp_approval_refused_total", nullptr);
+                        // A lookup-rung fault means the origin check two rungs
+                        // down never gets a chance to run either — the forgery
+                        // signal is masked here just as surely as at the
+                        // consume rung's own read (#2786 arm 1).
+                        count_denial("yuzu_mcp_approval_masked_denials_total", nullptr);
                         mcp_audit("denied",
                                   "approval_id=" + supplied_id + " refused: " +
                                       consume_denial_reason(ConsumeFailure::kStoreError) +
                                       " (lookup)");
-                        res.set_content(approval_store_error_body(*approval_manager, a4_error),
+                        res.set_content(approval_store_error_body(
+                                            *approval_manager, a4_error,
+                                            appr_read.error().extended_errcode),
                                         "application/json");
                         return;
                     }
@@ -3410,8 +3417,23 @@ McpServer::HandlerFn McpServer::build_handler(
                         // The kind stays in the audit trail, which is genuinely
                         // server-side.
                         count_denial("yuzu_mcp_approval_refused_total", nullptr);
-                        mcp_audit("denied", "approval_id=" + supplied_id +
-                                                " refused: " + consume_denial_reason(kind));
+                        // #2786 arm 1: when the ORIGIN check's own read is what
+                        // faulted, the comparison never ran, so a foreign-origin
+                        // ticket is exactly as likely to be behind this refusal
+                        // as an innocent one — the forgery signal would
+                        // otherwise be lost to a plain "store_error". The
+                        // masked counter (no reason label, same anti-oracle
+                        // rationale below) and the audit suffix are the
+                        // caller-visible half of that signal; ApprovalManager's
+                        // own warn log is the caller-independent half.
+                        if (consumed.error().origin_check_unevaluated)
+                            count_denial("yuzu_mcp_approval_masked_denials_total", nullptr);
+                        mcp_audit("denied",
+                                  "approval_id=" + supplied_id +
+                                      " refused: " + consume_denial_reason(kind) +
+                                      (consumed.error().origin_check_unevaluated
+                                           ? " (origin unverified)"
+                                           : ""));
 
                         // CLIENT message stays uniform for the two that must not
                         // be distinguishable: a foreign-origin refusal reads
@@ -3434,14 +3456,14 @@ McpServer::HandlerFn McpServer::build_handler(
                         // stops THIS site becoming the fail-open one if rung 1's
                         // lookup ever changes.
                         //
-                        // What is NOT covered either way: an OPEN handle whose
-                        // reads fail permanently — CORRUPT, NOTADB, READONLY,
-                        // FULL — takes the transient arm and is told to retry
-                        // forever. That is the real gap, it needs
-                        // sqlite3_extended_errcode carried on ConsumeError,
-                        // and it is not closed here (#2786 PR 1c).
+                        // An OPEN handle whose reads fail permanently — CORRUPT,
+                        // NOTADB, READONLY, FULL — is classified by the shared
+                        // body via `extended_errcode` (#2786 "PR 1c") rather
+                        // than taking the transient "retry forever" arm.
                         if (kind == ConsumeFailure::kStoreError) {
-                            res.set_content(approval_store_error_body(*approval_manager, a4_error),
+                            res.set_content(approval_store_error_body(
+                                                *approval_manager, a4_error,
+                                                consumed.error().extended_errcode),
                                             "application/json");
                             return;
                         }
