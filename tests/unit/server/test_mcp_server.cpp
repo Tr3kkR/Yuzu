@@ -9290,11 +9290,12 @@ TEST_CASE("MCP 2f: presented session validated; unknown → 404 + reject audit",
     SECTION("hostile Mcp-Session-Id sanitized before reaching the audit row (#2917)") {
         // ';'/'=' in the presented id could otherwise forge fields in the flat
         // "k=v;k=v" audit detail a SIEM parses. httplib's own Request::set_header
-        // already rejects any header value containing a control byte (CR/LF
-        // included -- detail::fields::is_field_value, verified: a header value
-        // with an embedded \r\n is silently NOT set at all, so a raw-newline
-        // variant of this test would prove nothing), so ';'/'=' are the
-        // realistically-reachable injection bytes for THIS vector. The header
+        // already rejects any header value containing CR or LF specifically
+        // (detail::fields::is_field_value -- interior space/tab ARE allowed,
+        // so this is narrower than "any control byte"; verified: a header
+        // value with an embedded \r\n is silently NOT set at all), so a
+        // raw-newline variant of this test would prove nothing -- ';'/'=' are
+        // the realistically-reachable injection bytes for THIS vector. The header
         // is attacker-controlled until it validates -- an unknown id never
         // validates, so this exercises exactly that path. Regression for the
         // one call site (of 13 producing mcp.session.* rows) that was missing
