@@ -1092,11 +1092,11 @@ in a tight loop — the cap is protecting the worker pool that also serves your 
 >   the two are separate steady-state allowances that happen to sum to
 >   `--mcp-max-streams-per-principal + 4` — not one combined pool of that
 >   size. During a GET-channel reconnect (a new GET superseding an old one
->   on the same session), that sum can be transiently exceeded: the
->   superseded connection's stream stays counted against the GET-channel
->   allowance until it finishes draining, while the replacement is admitted
->   and counted too — an overshoot bounded by `kMaxProvidersPerStream`
->   (`stream_budget.hpp`). Remediation: wait for one of your streamed calls to finish, or resend
+>   on the same session), that sum can be transiently exceeded: a stream
+>   mid-handover counts twice against the GET-channel allowance — the
+>   superseded connection until it finishes draining, and the replacement
+>   once admitted — and `McpStreamState` allows at most one pending handover
+>   per session, so the overshoot is at most one extra count. Remediation: wait for one of your streamed calls to finish, or resend
 >   the same request without an SSE-capable `Accept` for a plain
 >   (non-streamed) response.
 >
