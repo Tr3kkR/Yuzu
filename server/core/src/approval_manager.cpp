@@ -544,33 +544,43 @@ std::optional<Approval> ApprovalManager::get(const std::string& id) const {
     return r ? std::move(*r) : std::nullopt;
 }
 
-std::expected<std::optional<Approval>, std::string>
+std::expected<std::optional<Approval>, StoreReadError>
 ApprovalManager::get_checked(const std::string& id) const {
     if (!db_)
-        return std::unexpected("database not open");
+        return std::unexpected(StoreReadError{"database not open"});
     if (id.empty())
-        return std::unexpected("approval id is required");
+        return std::unexpected(StoreReadError{"approval id is required"});
 
     std::lock_guard lock(mtx_);
 
     std::string sql = std::string("SELECT ") + kSelectAllCols + " FROM approvals WHERE id = ?";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    // SqliteStmt, not a raw sqlite3_stmt*: row_to_approval() below builds
+    // several std::strings from column data, which is throw-capable, and
+    // that call sits BETWEEN step and any manual finalize — an owner is what
+    // closes that leak window, not call-site ordering (Sol/gpt-5.6-sol
+    // opine review, 2026-08-10: this file's own reordering fix for the
+    // FAILURE branch's std::string build left the SUCCESS branch's
+    // row_to_approval() with the identical exposure).
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, stmt.addr(), nullptr) != SQLITE_OK)
+        return std::unexpected(StoreReadError{std::string("prepare failed: ") + sqlite3_errmsg(db_),
+                                              sqlite3_extended_errcode(db_)});
 
-    sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 1, id.c_str(), -1, SQLITE_TRANSIENT);
 
     std::optional<Approval> out;
-    const auto rc = sqlite3_step(stmt);
+    const auto rc = sqlite3_step(stmt.get());
     if (rc == SQLITE_ROW)
-        out = row_to_approval(stmt);
-    sqlite3_finalize(stmt);
+        out = row_to_approval(stmt.get());
 
     // A read that FAILED is not a read that found nothing. Collapsing the two
     // is what let a store error be reported to the operator as "this one-time
     // capability is spent" — see the pre-consume path in consume_ticket.
-    if (rc != SQLITE_ROW && rc != SQLITE_DONE)
-        return std::unexpected(std::string("read failed: ") + sqlite3_errmsg(db_));
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+        const int extended = sqlite3_extended_errcode(db_);
+        return std::unexpected(
+            StoreReadError{std::string("read failed: ") + sqlite3_errmsg(db_), extended});
+    }
     return out;
 }
 
@@ -634,6 +644,21 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
 std::expected<void, ConsumeError>
 ApprovalManager::consume_ticket(const std::string& id, const std::string& consumed_by,
                                 const ConsumePrecondition& precondition) {
+    // These three guards are NOT store faults — `extended_errcode` stays at
+    // its default 0. For `!db_`, that default is harmless: `!mgr.is_open()`
+    // independently forces `approval_store_error_body`'s PERMANENT arm
+    // regardless of `extended_errcode`, so this guard never reaches the
+    // TRANSIENT wording. For the other two (empty id/consumed_by), `db_` IS
+    // open, so `extended_errcode=0` alone (not one of the four permanent
+    // codes) DOES take the transient arm ("retry this call unchanged") if
+    // this `kStoreError` ever reaches `approval_store_error_body` — and
+    // that's misleading, since these are caller/argument errors, not
+    // conditions that clear on their own. Harmless today: the MCP recall
+    // (the sole production caller) pre-validates a non-empty `supplied_id`
+    // before calling, and `consumed_by` is the session's own username, never
+    // empty for an authenticated caller. A future caller that reaches this
+    // function without that pre-validation should not trust the transient
+    // wording for these two cases.
     if (!db_)
         return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, "database not open"});
     if (id.empty())
@@ -661,10 +686,33 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     //
     // Runs BEFORE the precondition block because that block is conditional —
     // a caller supplying no precondition must not skip this.
+    //
+    // TEST DEPENDENCY: with no precondition supplied (today's only production
+    // caller, the MCP recall), this is the 2nd top-level SELECT this call
+    // issues against the store — the 1st is the caller's own pre-consume
+    // lookup (e.g. mcp_server.cpp's rung-1 get_checked). The MCP integration
+    // test "a store fault AT the origin check masks a foreign-origin ticket's
+    // kind" isolates a fault to THIS read specifically via a countdown
+    // `sqlite3_set_authorizer` that lets the 1st SELECT through and denies
+    // the 2nd. A future read added between the caller's lookup and this one
+    // (on the same connection) would shift that test onto the wrong read
+    // without it failing loudly — update the countdown if you add one.
     {
         auto row = get_checked(id); // takes mtx_ itself — must be outside any lock
-        if (!row)
-            return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, row.error()});
+        if (!row) {
+            // #2786 arm 1: this read failing means the origin comparison below
+            // never runs, so a foreign-origin ticket is exactly as likely to be
+            // sitting behind this refusal as an innocent one — the forgery
+            // signal is masked for the duration of the fault. Flag it and log
+            // it here, at the store, so every consume_ticket caller (today only
+            // the MCP recall) gets the signal without duplicating this check.
+            spdlog::warn("ApprovalManager: origin check for ticket {} could not be evaluated "
+                        "(store fault: {}); refusing closed",
+                        redact_id(id), row.error().message);
+            return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, row.error().message,
+                                                row.error().extended_errcode,
+                                                /*origin_check_unevaluated=*/true});
+        }
         if (*row && declares_non_mcp_surface((*row)->origin))
             return std::unexpected(
                 ConsumeError{ConsumeFailure::kForeignOrigin, kNotConsumableMessage});
@@ -680,7 +728,8 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
         // exists to close, re-entered through the taxonomy.
         auto row = get_checked(id); // takes mtx_ itself — must be outside the lock below
         if (!row)
-            return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, row.error()});
+            return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, row.error().message,
+                                                row.error().extended_errcode});
         // A row that cannot transition is reported WITHOUT running the
         // precondition: the callback may be costly or emit audit, and the CAS
         // below would decline this row anyway. Same message as the CAS decline,
@@ -738,7 +787,8 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
         return std::unexpected(ConsumeError{ConsumeFailure::kStoreError,
-                                            std::string("prepare failed: ") + sqlite3_errmsg(db_)});
+                                            std::string("prepare failed: ") + sqlite3_errmsg(db_),
+                                            sqlite3_extended_errcode(db_)});
 
     sqlite3_bind_int64(stmt, 1, now_epoch());
     sqlite3_bind_text(stmt, 2, consumed_by.c_str(), -1, SQLITE_TRANSIENT);
@@ -756,7 +806,8 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
             ConsumeError{ConsumeFailure::kNotConsumable,
                          kNotConsumableMessage});
     return std::unexpected(ConsumeError{ConsumeFailure::kStoreError,
-                                        std::string("consume failed: ") + sqlite3_errmsg(db_)});
+                                        std::string("consume failed: ") + sqlite3_errmsg(db_),
+                                        sqlite3_extended_errcode(db_)});
 }
 
 // ---------------------------------------------------------------------------
