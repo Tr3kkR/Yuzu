@@ -1686,7 +1686,15 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_audit_retention_last_pass_unixtime",
                           "Wall-clock reading of the most recent audit retention pass WHOSE CLOCK "
-                          "WAS USABLE; 0 if none has run in this process. Read WITH "
+                          "WAS USABLE; 0 if no pass has ever run on this DATABASE (seeded from "
+                          "the durable retention-meta anchor at startup, #2854 — survives a "
+                          "restart, including the first Postgres boot). A value of "
+                          "-9223372036854775808 (INT64_MIN) is a distinct anomaly sentinel — the "
+                          "durable anchor could not be read or trusted as a plausible integer — "
+                          "not a genuine timestamp; self-corrects at the next pass whose own clock "
+                          "reading is plausible — even if that pass then declines or fails for an "
+                          "unrelated reason — but NOT at a pass refusing on its own implausible clock, "
+                          "which skips the stamp entirely (see below). Read WITH "
                           "retention_passes_total: stale here while that RISES means the reaper "
                           "is alive but refusing an implausible clock, which is a different fault "
                           "from stopped",
