@@ -179,7 +179,10 @@ change: a notification POST now answers `202` instead of `204`).
 - **`GET /mcp/v1/`** is the session's server→client **SSE channel**. It requires the
   session's `Mcp-Session-Id` (`400` if absent; `404` if unknown, expired, or another
   principal's) and `Accept: text/event-stream` (`-32011` / `406` otherwise — wildcards
-  like `*/*` do not opt in). The stream sends heartbeats every ~3 s and supports
+  like `*/*` do not opt in). The stream sends a heartbeat on any ~3 s tick that delivers
+  nothing else — a stream busy delivering real frames emits no heartbeat filler, so do
+  not key liveness detection on heartbeat cadence: any delivered frame proves liveness.
+  It supports
   **`Last-Event-ID` resume**: reconnect with the last id you saw and the server replays
   exactly the frames you missed from a bounded per-session ring. If your cursor has
   already been evicted from that ring, the session is terminated and the request `404`s
@@ -191,7 +194,8 @@ change: a notification POST now answers `202` instead of `204`).
   stream. A second `GET` on the same session **takes over** (the older stream closes with
   `superseded`), so a client reconnecting across a dead TCP connection is never locked
   out by its own zombie.
-  The credential that opened a stream is re-checked on every heartbeat. On a
+  The credential that opened a stream is re-checked once per tick (~3 s), whether or
+  not a heartbeat frame is emitted. On a
   single-server deployment, revoking it ends the stream within one tick
   (`credential_revoked`). On a **multi-replica** deployment, revocation of an
   **API token** is not instantaneous: the token cache is per-process, so a revoke
@@ -224,8 +228,14 @@ change: a notification POST now answers `202` instead of `204`).
   to poll (`query_responses` / `get_execution_status`) - a reservation can silently
   degrade to the plain path under load (e.g. the 256-record cap), and zero progress
   frames is indistinguishable from "nothing has happened yet". `execute_bundle` does
-  **not** emit progress (poll `get_bundle_result`). Progress delivery is on the `GET`
-  stream only in this release; SSE-on-`POST` arrives in a later 2f rung.
+  **not** emit progress (poll `get_bundle_result`). Progress can be delivered two
+  ways, and the client chooses per request **on a server that has enabled streamed
+  POST** (`--mcp-enable-streamed-post`, off by default): send an SSE-capable `Accept` alongside
+  the `progressToken` and the POST response itself streams the progress frames and
+  then the result; send the token without an SSE `Accept` and the frames go to the
+  session's `GET` stream after the POST has already answered. See
+  `docs/mcp-server.md` "Streamed POST — SSE on the response" for the response
+  shape, the close reasons, and the recovery rules.
   An engine principal's stream holds its per-principal quota **concurrency**
   slot for the stream's whole lifetime, the same as the other streaming routes
   covered by the PR 4.4 quota cap — so a long-lived stream counts against that
@@ -437,17 +447,17 @@ for the tool to execute.
 | 44 | `approve_request` | Approve a pending approval request by `approval_id` (optional `comment`, audited). The reviewer is the MCP principal and **cannot be the submitter** (store-enforced), and only a **pending** request can be reviewed — a retry on an already-approved/rejected id returns `kInvalidParams` ("approval already reviewed"), **not** a success (approve is a one-shot state transition, not an idempotent write; treat a retry-after-timeout accordingly). Returns `{approved, approval_id}`. Mirrors `POST /api/approvals/{id}/approve`. Requires the **supervised** tier. | `Approval:Approve` |
 | 45 | `reject_request` | Reject a pending approval request by `approval_id` (optional `comment`). Same reviewer≠submitter + pending-only rules as `approve_request`. Returns `{rejected, approval_id}`. Mirrors `POST /api/approvals/{id}/reject`. Requires the **supervised** tier. | `Approval:Approve` |
 | 46 | `quarantine_device` | Isolate a device from the network. **Records** the quarantine (`POST /api/v1/quarantine` parity) **and dispatches** the live quarantine-plugin isolation (`plugin=quarantine`, `action=quarantine`), whitelisting the management server plus any extra IPs in the `whitelist` arg (comma-separated). Destructive — **approval-gated** on the supervised tier (ticket-then-recall). Returns `{command_id, agents_reached, quarantine_record}` (`agents_reached=0` if the agent was offline for the isolation dispatch — the record still persists). Not an executions-drawer producer. **No MCP release counterpart yet** — to lift a quarantine, use REST `DELETE /api/v1/quarantine/{agent_id}` or the dashboard (a `release_quarantine` MCP tool is a tracked follow-up). The live isolation keeps the agent's existing management connection alive (`ESTABLISHED,RELATED`); a device that fully drops and reconnects while quarantined may need out-of-band release. | `Security:Execute` |
-| 47 | `discover_permissions` | A2 discovery (roadmap Issue 17.1): RBAC permission catalog — every `securable_type` × `operation` pair, plus the full role → allowed-operations grid. Mirrors `GET /api/v1/discover/permissions`, same builder function (no drift). | `Infrastructure:Read` |
+| 47 | `discover_permissions` | A2 discovery (roadmap Issue 17.1): RBAC permission catalog — every `securable_type` × `operation` pair, plus the full role → allowed-operations grid **for callers holding `UserManagement:Read`**; without it the tool still succeeds and returns the taxonomy with `roles_omitted: true` and a reason (declared, never silent). Mirrors `GET /api/v1/discover/permissions`, same builder function (no drift). | `Infrastructure:Read` (taxonomy); the `roles[]` grid additionally needs `UserManagement:Read` (#2376) |
 | 48 | `discover_instructions` | A2 discovery: published (`enabled_only=true`) `InstructionDefinition` catalog with `parameter_schema` as a nested JSON Schema object. Mirrors `GET /api/v1/discover/instructions`. | `InstructionDefinition:Read` |
 | 49 | `discover_routes` | A2 discovery: REST route catalog, a subset of the SAME OpenAPI document `GET /api/v1/openapi.json` serves. Carries `source:"openapi"` and a caveat that it is hand-maintained, not generated from the live route table. Mirrors `GET /api/v1/discover/routes`. | `Infrastructure:Read` |
 | 50 | `discover_scope_kinds` | A2 discovery: Scope DSL kinds (`__all__`, `group:<name>`, `from_result_set:<id>`, `ostype`, `hostname`, `arch`, `agent_version`, `tag:<key>`, `props.<key>`), comparison operators, and syntax/examples for building a `scope` expression. Fully static — answers even when every store is down. Mirrors `GET /api/v1/discover/scope-kinds`. | `Infrastructure:Read` |
 | 51 | `discover_plugins` | A2 discovery: plugin/action catalog observed across currently-connected agents. NOT a build-time manifest. Catalog `version: 2`: each action carries an inline `parameter_schema` when it has a published `InstructionDefinition` (matched on plugin+action) **and** the caller holds `InstructionDefinition:Read`; otherwise name+description only (an `Infrastructure:Read`-only caller gets no schemas). A top-level `actions_enriched_with_schema` counts the enriched actions. Mirrors `GET /api/v1/discover/plugins`. | `Infrastructure:Read` |
 | 52 | `assign_engine_role` (PR 4.2) | Grant a fleet-wide RBAC role to an engine principal (arg `principal_id` — the bare slug, WITHOUT the `engine:` prefix — and `role`). Engine principals can never hold `admin`/any built-in system role; such a request is rejected, never silently narrowed. Mirrors `POST /api/v1/engine-principals/{id}/roles`. Not read-only, not destructive (a grant expands, never removes, access). | `Security:Write` |
 | 53 | `unassign_engine_role` (PR 4.2) | Revoke a fleet-wide RBAC role from an engine principal (args `principal_id`, `role`). Destructive — removes standing authority a module may be relying on right now. Mirrors `DELETE /api/v1/engine-principals/{id}/roles/{role}`. | `Security:Write` |
-| 54 | `list_engine_roles` (PR 4.2) | List the fleet-wide roles currently assigned to one engine principal (arg `principal_id`) — the read-only discovery step before assign/unassign, and how to audit what an autonomous module can actually do right now. Mirrors `GET /api/v1/engine-principals/{id}/roles`. | `Security:Read` |
+| 54 | `list_engine_roles` (PR 4.2) | List the fleet-wide roles currently assigned to one engine principal (arg `principal_id`) — the read-only discovery step before assign/unassign, and how to audit what an autonomous module can actually do right now. Mirrors `GET /api/v1/engine-principals/{id}/roles`. | `EnginePrincipal:Read` |
 | 55 | `create_engine_principal` | Create a new engine principal — the durable identity behind an autonomous use-case-engine module (ADR-1005 item 2b). Required args: `principal_id` (**note — unlike REST's `slug` field, this must already be the full `engine:<slug>` id**; the tool does not derive the `engine:` prefix for you, and the store rejects a `principal_id` outside that namespace), `display_name`, `owner_username`, `justification`, and `classification` — all five are checked non-empty at the tool layer (`kInvalidParams` if any is missing/empty), which is **stricter than the REST route**: `POST /api/v1/engine-principals` does not itself require `display_name` non-empty (it accepts and stores an empty one). `owner_username` is FK-validated against the user store; `classification` (`internal`/`external`) is required, no default. Mirrors `POST /api/v1/engine-principals`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
-| 56 | `list_engine_principals` | List engine principals with each principal's active-credential **count** (`active_credentials`, an integer — note the field is named `active_credential_count` on the REST twin). Mirrors `GET /api/v1/engine-principals`. | `Security:Read` |
-| 57 | `get_engine_principal` | Get one engine principal's identity row plus its active-credential **count** (`active_credentials`, an integer). **Transport divergence:** the REST twin `GET /api/v1/engine-principals/{id}` returns a field with the *same name*, `active_credentials`, but as an **array** of full credential objects (token id, name, timestamps, rotation group, overlap-expiry) — a caller switching between the REST and MCP surfaces must not assume the shape carries over; check the type, not just the field name. Mirrors `GET /api/v1/engine-principals/{id}`. | `Security:Read` |
+| 56 | `list_engine_principals` | List engine principals with each principal's active-credential **count** (`active_credentials`, an integer — note the field is named `active_credential_count` on the REST twin). Mirrors `GET /api/v1/engine-principals`. | `EnginePrincipal:Read` |
+| 57 | `get_engine_principal` | Get one engine principal's identity row plus its active-credential **count** (`active_credentials`, an integer). **Transport divergence:** the REST twin `GET /api/v1/engine-principals/{id}` returns a field with the *same name*, `active_credentials`, but as an **array** of full credential objects (token id, name, timestamps, rotation group, overlap-expiry) — a caller switching between the REST and MCP surfaces must not assume the shape carries over; check the type, not just the field name. Mirrors `GET /api/v1/engine-principals/{id}`. | `EnginePrincipal:Read` |
 | 58 | `revoke_engine_principal` | Terminally revoke an engine principal: revokes every active credential first, then flips `lifecycle_state` to revoked. TERMINAL and irreversible — a false-positive response mints a successor principal instead. Mirrors `DELETE /api/v1/engine-principals/{id}`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
 | 59 | `mint_engine_credential` | Mint the FIRST credential for an engine principal (minted credential is hard-locked to MCP tier `readonly`, 90-day ceiling — design doc §7/§8). Returns the raw credential value exactly once; use `rotate_engine_credential` once a credential already exists (a second mint call errors). Mirrors `POST /api/v1/engine-principals/{id}/credentials`. Destructive — live credential issuance; requires the `supervised` tier (approval-gated). | `Security:Write` |
 | 60 | `rotate_engine_credential` | Rotate an engine principal's credential via the overlap-pair workflow (design doc §7): mints a successor (both credentials valid during a default/minimum 7-day overlap, 24h floor — rejected outright, never truncated, below it), auto-revokes the predecessor at window end. BOUNDED-IDEMPOTENT: a re-call within a short grace window after the original mint re-serves the SAME successor secret (each reveal, original or replay, is independently audited as `engine_principal.credential.reveal`); once the grace window lapses a re-call errors. Mirrors `POST /api/v1/engine-principals/{id}/credentials/rotate`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
@@ -507,7 +517,7 @@ for the tool to execute.
 > carries `destructiveHint:true` — the approval gate here keys on the
 > `(Security, Write)` mapping, not the hint (the hint is agentic-worker
 > guidance, not itself an enforcement mechanism). `list_engine_roles` maps to
-> `Security:Read` and works on **every** tier including `readonly`, same as
+> `EnginePrincipal:Read` and works on **every** tier including `readonly`, same as
 > `list_issued_certs` above.
 
 > **Approval-gated tools — ticket-then-recall (#289):** `delete_tag` (operator +
@@ -572,7 +582,10 @@ message names the offending field as a JSON-pointer-style path (e.g.
 `/steps/1`), and `error.data` carries a `correlation_id` plus a `remediation`
 confirming no ticket was created or consumed. Two strictness notes: `integer`
 parameters must be JSON integers (an integral float like `1.0` is rejected),
-and `maxLength` limits are byte counts.
+and `minLength`/`maxLength` limits are byte counts. The two directions are not
+symmetric: bytes are never fewer than codepoints, so a byte-counted `maxLength`
+is stricter than a character count while a byte-counted `minLength` is looser
+above 1 — and exact at `minLength: 1`, the not-empty case.
 
 Targeting arguments are **type-checked and never coerced**, and an empty target
 set is an error rather than a widening:
@@ -758,9 +771,13 @@ proposes.
    an agentic worker cannot approve its own request.
 6. Once approved, the AI assistant **re-calls the same tool with the same
    arguments plus the `approval_id`**. The server validates (approved, matching
-   tool + arguments, not yet consumed) and **atomically consumes** the ticket
-   (one-time — a replay, or a mismatched tool/args, returns `-32003`
-   `PermissionDenied`), then executes.
+   tool + arguments, not yet consumed, and minted through the MCP surface rather
+   than another one — #2442) and **atomically consumes** the ticket (one-time —
+   a replay, a mismatched tool/args, or a ticket from another surface, returns
+   `-32003` `PermissionDenied`), then executes. A `-32603` means the store
+   failed at either the lookup or the consume step, not that the ticket is
+   spent — see the error-code reference below for the fix, which is the
+   opposite of `-32003`'s.
 
 ### What requires approval
 
@@ -1040,10 +1057,12 @@ in a tight loop — the cap is protecting the worker pool that also serves your 
 before it could be delivered on the stream (the buffered-result population hit its cap).
 The real result was never lost - only its *streamed* copy was dropped.
 
-**Fix**: Fetch the result durably with the supplied `execution_id`
-(`get_execution_status` / `query_responses`). This code cannot occur for
-`execute_instruction` progress in the current release (the parked-result path activates
-with the later SSE-on-`POST` rung); it is documented here for forward compatibility.
+**Fix**: Fetch the result durably with the `execution_id` this very frame carries (`get_execution_status` / `query_responses`). Do NOT re-resume the GET channel: this error IS the answer to a resume, and per the Cause above only the *streamed* copy was dropped - re-attaching cannot conjure a final the server already force-expired. (GET + `Last-Event-ID` resume is the right first move for a *different* case — a stream that died before any frame reached you, so you never learned an `execution_id` at all.)
+The parked-result path this arises from is reachable only under
+`--mcp-enable-streamed-post`, which ships off; with it on, it activates whenever a
+streamed POST is parked without having delivered its final (the client
+disconnected, the response cap elapsed, or the server could not complete the
+stream).
 
 ### A streamed final can be dropped entirely
 
@@ -1062,9 +1081,10 @@ timeout and the `execution_id` you were given at dispatch, and fall back to
 supported recovery path for every streamed-result failure mode on this surface, not just
 this one.
 
-Like the `-32014` case above, this cannot occur for `execute_instruction` progress in the
-current release - the parked-result path it arises from activates with the later
-SSE-on-`POST` rung. It is documented here for forward compatibility.
+Like the `-32014` case above, this arises from the parked-result path, which is
+reachable only under `--mcp-enable-streamed-post`: a streamed POST parked before
+delivering its final leaves the terminal to be collected by a `GET` resume or
+fetched durably by `execution_id`.
 
 **A related case**: if the failure happens while the server is publishing rather than
 building the frame, the session may additionally be left *poisoned* - every later attach
@@ -1125,12 +1145,60 @@ expired, or mismatched ticket returns `-32003` (below).
 permission check (the token creator lacks the required RBAC permission for the
 securable type), **or** an approval-ticket recall supplied an `approval_id` that
 is no longer usable — already consumed (one-time ticket / replay), rejected,
-expired, or for a different tool/arguments than the current call (#289).
+expired, for a different tool/arguments than the current call (#289), **or**
+minted through a different Yuzu surface than the one recalling it (#2442).
+
+The last of those is deliberately indistinguishable from a replay in this
+response: reporting it separately would turn the recall into a probe for which
+surface minted a ticket. Server-side it is distinguishable — the audit row
+records `refused: foreign_origin`. The `yuzu_mcp_approval_refused_total` counter
+does **not** break the refusals down by reason: a store failure is already
+exposed via the response code (`-32603` vs `-32003`), and what stays withheld
+is the split *within* a `-32003` denial — foreign-origin vs an ordinary
+replay — which is exactly what this response refuses to make, and `/metrics`
+is not a stronger reader than the caller — so alert on the refusal rate and
+read the audit trail for the kind.
 
 **Fix**: For an RBAC denial — grant the permission to the token creator's
 principal, or use an account with the required permissions. For a ticket recall —
 submit the call **without** `approval_id` to obtain a fresh approval ticket, then
 recall once it is approved.
+
+> **Do not apply that fix to a `-32603`.** A store failure at the lookup or the
+> consume step returns `-32603`, and its remediation is the opposite of this
+> one's. See below.
+
+### -32603: Approval store unavailable
+
+**Symptom**: An approval-ticket recall returns error code `-32603` rather than
+`-32003`. This can come from either step of a recall: the ticket lookup or the
+consume.
+
+**Cause**: The approval store could not be read (or, at the consume step,
+written) while handling the ticket. The ticket was **not** consumed.
+
+It is not necessarily still usable, and the difference matters: the 7-day
+approval window keeps running during an outage, so an outage that outlasts the
+ticket's remaining window ends with it expired like any other.
+
+**Fix**: Check `retry_after_ms` in the response body — two distinct bodies
+share this code:
+
+- **`retry_after_ms` is a number (currently 5000)**: the store is open but the
+  read or write failed, most likely transiently. Retry after the hint.
+  Retrying indefinitely is not safe, and this body alone cannot tell you when
+  to stop: a store that is open but failing permanently (corruption,
+  read-only, disk full) still takes this arm and will honour a client that
+  retries forever. Bound your own retries — a handful of attempts, then
+  escalate to an operator. Distinguishing that case from a genuinely
+  transient one is a follow-up change.
+- **`retry_after_ms` is `null`**: the store never opened. This will not clear
+  on retry; escalate to an operator immediately.
+
+Do **not** re-submit without `approval_id` while the approval
+window is still open: the ticket was not consumed, and minting a fresh one asks
+a human to approve a capability you already hold. If the window has since
+elapsed, treat it as a `-32003` and request a fresh ticket.
 
 ### -32602: Invalid params
 

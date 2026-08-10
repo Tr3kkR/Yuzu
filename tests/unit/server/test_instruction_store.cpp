@@ -142,6 +142,35 @@ TEST_CASE("InstructionStore: explicit id is bounded to a safe charset", "[instru
     }
 }
 
+TEST_CASE("InstructionStore: the mcp. definition-id namespace is reserved",
+          "[instruction_store][security]") {
+    // #2442: the MCP approval gate mints tickets under `mcp.<tool>` and its
+    // recall matches on (definition_id, scope_expression) without binding the
+    // submitter. A definition authored under that prefix is what would let an
+    // approval raised on the instruction surface line up with an MCP tool's
+    // canonical arguments — so the prefix is refused at the authoring
+    // chokepoint as well as at the mint.
+    InstructionStore store(":memory:");
+
+    InstructionDefinition def;
+    def.name = "Namespace Probe";
+    def.type = "question";
+    def.plugin = "test";
+    def.action = "test";
+    def.version = "1.0";
+
+    SECTION("an mcp.-prefixed id is rejected") {
+        def.id = "mcp.quarantine_device";
+        auto result = store.create_definition(def);
+        REQUIRE(!result.has_value());
+        CHECK(result.error().find("reserved") != std::string::npos);
+    }
+    SECTION("only the exact prefix is reserved") {
+        def.id = "mcpx.thing"; // no dot boundary — not the MCP namespace
+        CHECK(store.create_definition(def).has_value());
+    }
+}
+
 TEST_CASE("InstructionStore: NUL in yaml_source is rejected at the store chokepoint",
           "[instruction_store]") {
     // sqlite3_bind_text(-1) truncates at the first NUL, so a NUL-bearing

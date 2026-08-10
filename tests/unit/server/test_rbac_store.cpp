@@ -99,7 +99,8 @@ TEST_CASE("RbacStore: seed data — system roles exist", "[rbac_store][pg]") {
 TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto types = store.list_securable_types();
-    REQUIRE(types.size() == 22); // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2)
+    REQUIRE(types.size() == 23); // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2)
+                                 // +EnginePrincipal (#2376, cut away from Security:Read)
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -120,6 +121,8 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     CHECK(has("Inventory"));
     CHECK(has("SoftwareLicensing")); // SLE securable (ADR-0024 Decision 9) — NOT `License`
     CHECK(has("AccessReview")); // Periodic Access Reviews (SOC 2 CC6.2), dedicated + narrow
+    CHECK(has("EnginePrincipal")); // Engine-principal inventory + grant-graph reads (#2376),
+                                   // cut away from the over-broad Security:Read
 }
 
 TEST_CASE("RbacStore: seed data — operations", "[rbac_store][pg]") {
@@ -152,13 +155,13 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Administrator");
-    // 22 types * 5 CRUD ops = 110 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 111), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2) = 112 permissions total. Push and Attest
+    // 23 types * 5 CRUD ops = 115 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 116), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2) = 117 permissions total. Push and Attest
     // are deliberately NOT cross-seeded on other securables — see the rationale
-    // in rbac_store.cpp seed_defaults(). (22nd type: AccessReview, SOC 2 CC6.2;
-    // 21st: SoftwareLicensing, ADR-0024.)
-    CHECK(perms.size() == 112);
+    // in rbac_store.cpp seed_defaults(). (23rd type: EnginePrincipal, #2376;
+    // 22nd: AccessReview, SOC 2 CC6.2; 21st: SoftwareLicensing, ADR-0024.)
+    CHECK(perms.size() == 117);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
@@ -176,9 +179,9 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
 TEST_CASE("RbacStore: seed data — Viewer has read-only", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Viewer");
-    // 20 types * Read only (everything except Infrastructure; incl. Inventory +
-    // SoftwareLicensing, ADR-0024)
-    CHECK(perms.size() == 20);
+    // 21 types * Read only (everything except Infrastructure; incl. Inventory +
+    // SoftwareLicensing, ADR-0024, + EnginePrincipal, #2376)
+    CHECK(perms.size() == 21);
     for (auto& p : perms) {
         CHECK(p.operation == "Read");
         CHECK(p.effect == "allow");
@@ -889,19 +892,22 @@ TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rb
 // ── check_scoped_permission ──────────────────────────────────────────────────
 
 namespace {
-// Per-test SQLite temp file for the on-disk ManagementGroupStore — the fixed
-// "test_scoped_rbac.db" name was a cross-JOB shared resource on the
-// shared-identity CI pools (#1883); TempDbFile also picks up the -wal/-shm
-// cleanup the old fixture missed.
-struct ScopedTestDb : yuzu::test::TempDbFile {
-    ScopedTestDb() : TempDbFile("yuzu_test_scoped_rbac-") {}
-};
+// The ManagementGroupStore is now a Postgres store (ADR-0042); the scoped-
+// permission tests below wire the SQLite RbacStore to a PG-backed mgmt store.
+// Pre-migrated template cloned per test (see PgTestTemplate in test_helpers.hpp).
+yuzu::test::PgTestTemplate scoped_mgmt_tpl{"rbacscopedmgmt", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    ManagementGroupStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("rbacscopedmgmt template: mgmt store failed to migrate");
+}};
 } // namespace
 
 TEST_CASE("RbacStore: check_scoped_permission global allow bypasses scoping", "[rbac_store][pg]") {
     RBAC_STORE(rbac);
-    ScopedTestDb tmp;
-    ManagementGroupStore mgmt(tmp.path);
+    YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore mgmt{pool};
 
     rbac.assign_role({"user", "admin_user", "Administrator"});
     CHECK(rbac.check_scoped_permission("admin_user", "Tag", "Write", "agent-1", &mgmt));
@@ -909,8 +915,9 @@ TEST_CASE("RbacStore: check_scoped_permission global allow bypasses scoping", "[
 
 TEST_CASE("RbacStore: check_scoped_permission group-scoped allow", "[rbac_store][pg]") {
     RBAC_STORE(rbac);
-    ScopedTestDb tmp;
-    ManagementGroupStore mgmt(tmp.path);
+    YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore mgmt{pool};
 
     // Create a management group and add agent to it
     ManagementGroup g;
@@ -935,8 +942,9 @@ TEST_CASE("RbacStore: check_scoped_permission group-scoped allow", "[rbac_store]
 
 TEST_CASE("RbacStore: check_scoped_permission denied without scope", "[rbac_store][pg]") {
     RBAC_STORE(rbac);
-    ScopedTestDb tmp;
-    ManagementGroupStore mgmt(tmp.path);
+    YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore mgmt{pool};
 
     // alice has ITServiceOwner on CRM group, but agent-other is not in it
     ManagementGroup g;

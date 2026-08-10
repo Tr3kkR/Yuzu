@@ -56,7 +56,7 @@ Specialized agents live in `.claude/agents/` (each declares its role, triggers, 
 Pipeline (8 gates, convention-enforced): Change Summary + Resource Ledger → security-guardian + docs-writer → domain-triggered (`cpp-expert` + `cpp-safety` on any C++) → happy-path + unhappy-path + consistency-auditor → chaos-injector (skipped if no findings) → compliance-officer + sre + enterprise-readiness → findings addressed → iterate. Use `/governance <range>`, not hand-running - waves 1–4 shipped 4 CRITICAL command-injection vulns without it.
 
 Four standing rules the skill enforces (#2604), all catastrophic-if-violated:
-1. **Routed-concern triggers are UNCONDITIONAL.** Step 0 and Gate 8 must *open* `.claude/routed-concerns.md` and match it row by row against the changed paths - never work from recall. **Diff size never gates a routed concern**: the matrix decides WHICH agents, never WHETHER.
+1. **Routed-concern triggers are UNCONDITIONAL.** Step 0 and Gate 8 must *open* `.claude/routed-concerns.md` + `.claude/routed-concerns-access-control.md` and match them row by row against the changed paths - never work from recall. **Diff size never gates a routed concern**: the matrix decides WHICH agents, never WHETHER.
 2. **Severity is DERIVED, not chosen.** Every finding states four INDEPENDENT facts — a TRIGGER, an IMPACT (`I1`–`I9`, gives the base band), an EXPOSURE (**every** applicable `E0`–`E6` — `E0` = no actor required, e.g. a timer or boot path; strongest RAISE applies first, then any CAP, and `E6` is applied last and dominates) and an EPISTEMIC STATUS — and **BLOCKING = the derived band is CRITICAL or HIGH**. Agents keep their OWN vocabulary, but where a brief's criteria disagree with the derived band **the derived band governs the gate**. Separately, **policy floors** gate as CONTRACT violations and bypass the derivation — most derive at or below MEDIUM on an ordinary path — several floor at INFO outright — which is exactly why they are not run through it: Resource Ledger omission; a direct `CHANGELOG.md` edit or missing mandated fragment; a build/test leg on any supported platform broken **by this change**; non-RAII manual cleanup in **new** C++; a **false-green test offered as closure evidence** for a blocking finding; an ownership/lifetime defect of the kind `cpp-safety` blocks (leak, UAF, unjoined thread, unsafe shell construction); and **violation of any explicit MUST / never / catastrophic-if-violated invariant** — closed to three sources: a routed-concern row's catastrophic clause, a CLAUDE.md standing-rule/invariant block, or an accepted ADR's normative requirements (narrative prose does not qualify) (a second copy of a single-chokepoint rule has no wrong outcome *today* — that is exactly why the derivation cannot see it). Both `/governance` runners (`.claude/` and `.codex/`) apply this one rule; neither carries its own copy. Unresolved EXPOSURE **gates** pending adjudication (never defaults to no-change). Weak evidence is expressed as EPISTEMIC STATUS, never as a falsely-lowered IMPACT — and only `speculative` (neither code path nor candidate trigger nameable) is exempt from the gate; `likely` is the normal case and gates normally.
 3. **Prose: `docs-writer` owns WORDING** (including in-code comments and log/error strings, scoped to lines the diff changes); **the DOMAIN agent owns TRUTH**. A comment that *contradicts* the code is a truth finding at native severity and any agent may raise it; wording-only is capped at NICE and **only `docs-writer` files it** — routing prose to one reviewer only consolidates if the others stop. **Absence is a third category** — a required doc that is MISSING contradicts nothing, so it is a truth finding derived as `I7`, never capped at NICE. "Required" is defined, not judged — a closed six-item list in the skill (REST reference, user-manual section, changelog fragment, CLAUDE.md/routed-concern row for a new invariant, contract table, or a doc a routed-concern row names as an **update obligation** for the changed surface, never merely as its reading list). Never in-code prose (#2620).
 4. **Gate 8 re-runs every gate whose DOMAIN THE FIX DIFF TOUCHES**, not only those whose findings prompted the fix - the old rule shipped a broken macOS leg on #2580.
@@ -122,9 +122,19 @@ The script runs `vcpkg install` then `meson setup` automatically.
 ### Manual configure
 ```bash
 vcpkg install --triplet x64-linux --x-manifest-root=.
-meson setup build-linux --buildtype=debug -Dcmake_prefix_path=$VCPKG_ROOT/installed/x64-linux -Dbuild_tests=true
+meson setup build-linux --buildtype=debug -Dbuild_tests=true \
+  -Dcmake_prefix_path=$PWD/vcpkg_installed/x64-linux \
+  -Dpkg_config_path=$PWD/vcpkg_installed/x64-linux/lib/pkgconfig,/usr/lib/x86_64-linux-gnu/pkgconfig
 meson compile -C build-linux
 ```
+**Both paths are load-bearing, and both point INTO THE TREE.** `--x-manifest-root=.` is vcpkg
+*manifest* mode, which installs to `<repo>/vcpkg_installed/<triplet>` — **not** to
+`$VCPKG_ROOT/installed/<triplet>`, which stays near-empty (measured: 7 packages vs 237) and
+makes `meson setup` fail on `Dependency PostgreSQL not found`. `pkg_config_path` is separately
+required because spdlog/fmt resolve via pkg-config, not cmake: with the prefix alone the
+headers are found and the link then fails on `undefined reference to fmt::v12::…`. An
+out-of-tree build dir (a review worktree, a scratch checkout) needs the same two flags
+pointing at a populated `vcpkg_installed`.
 
 ### Build options
 `-Dbuild_agent` / `-Dbuild_server` / `-Dbuild_examples` (default true), `-Dbuild_tests` (default false), and the Meson built-ins `-Db_lto`, `-Db_sanitize=address,undefined` (ASan+UBSan) or `-Db_sanitize=thread` (TSan).
@@ -207,9 +217,10 @@ The `release:` job (`.github/workflows/release.yml`) runs `scripts/check-compose
 
 ## Routed concerns (read the doc, not this file)
 
-One row per concern — catastrophic-if-violated invariants, routed doc, loading agents — imported from `.claude/routed-concerns.md` (same authority as this file; split out only for the 40k-per-file ceiling):
+One row per concern — catastrophic-if-violated invariants, routed doc, loading agents — imported from `.claude/routed-concerns.md` + `.claude/routed-concerns-access-control.md` (same authority as this file; split across two files solely for the 40k-per-file ceiling — the former holds platform/product/data/observability concerns, the latter auth, access-control, and request-admission chokepoints):
 
 @.claude/routed-concerns.md
+@.claude/routed-concerns-access-control.md
 
 ## Guardian engine — stores
 
@@ -227,6 +238,8 @@ For server tests that need a live `ExecutionTracker` in `AgentServiceImpl`, use 
 
 For server tests needing live **PostgreSQL**, use `PostgresTestDb` + `YUZU_REQUIRE_PG_DB(var)` from `test_helpers.hpp` (behind `YUZU_TEST_ENABLE_PG`, server suite only). Creates an ephemeral `yuzu_test_<epoch>_<salt>_<n>` DB on `YUZU_TEST_POSTGRES_DSN`, drops it `WITH (FORCE)`; the name-embedded epoch drives a suite-start sweep of databases leaked by killed runs. Skip-vs-fail: env **unset** → skip (local dev); **set but broken** → FAIL (`scripts/ci/ensure-postgres.sh` guarantees a reachable instance on every CI server-test leg). **Store-behaviour tests use the pre-migrated template variant** `YUZU_REQUIRE_PG_DB_TPL(var, tpl)` + a file-local `PgTestTemplate` (clones an already-migrated DB — per-test migration DDL drove the 2026-07-12 Windows server-suite timeout; recipe: `docs/postgres-store-playbook.md` step 7); plain `YUZU_REQUIRE_PG_DB` is only for migration / fresh-DB / pg-substrate behaviour tests. Local: run `postgres:18` on `:5433`, then `export YUZU_TEST_POSTGRES_DSN=postgresql://yuzu:yuzu@localhost:5433/yuzu`.
 
+**Prometheus alert rules are PARSE-checked by `promtool` for all rules, BEHAVIOUR-checked only for the alerts that have cases** in `tests/prometheus/yuzu-alerts.test.yml` (today: the `YuzuAuditRetention*` liveness pair). Nothing enforces that a rule change ships a case, so a green check on an edit to any other rule proves parseability only — and `prometheus-rules` is **not a required status check**, so a red one merges until branch protection says otherwise. The run does refuse to report success vacuously: no rules, no cases, no assertions, a stale `rule_files:` glob, or a behaviour suite that stays green against a deliberately broken copy of the rules file all fail it — `check rules` and `test rules` are handed DIFFERENT paths and otherwise disagree silently while printing a rule count (#2553). The opt-in `YUZU_TEST_ENABLE_PROMTOOL_DOCKER` (**presence-checked, so `=0` also enables it** — matching `YUZU_TEST_ENABLE_PG`) exists because `scripts/ci/flake-retry.py` runs `meson test` with **no `--suite` filter** on three REQUIRED legs, so any docker-dependent `docs`-suite test would put a container registry on all three — that shape was shipped once and reverted (#2553). **A new test here that pulls an image must be opt-in gated the same way.** Everything else — the skip-vs-fail contract, the check name, alert-authoring conventions — is in `tests/prometheus/run_promtool_tests.py`'s docstring and `docs/observability-conventions.md`.
+
 ## Agent skills
 
 The Matt Pocock engineering skills are **user-global**, not committed — they follow the operator. Re-run `/setup-matt-pocock-skills` to change.
@@ -241,8 +254,8 @@ The `frontend-design` plugin is **marketing / sales / demo surfaces only** — i
 
 ### Issue tracker, triage labels, domain docs
 
-Issues follow `docs/agents/issue-standard.md`: dedupe before filing; automation never closes `security`/`do-not-close` issues. Commands: `docs/agents/issue-tracker.md`; labels: `docs/agents/triage-labels.md`. Domain docs: `CONTEXT.md`, ADRs in `docs/adr/` (`docs/agents/domain.md`).
+Issues follow `docs/agents/issue-standard.md`: dedupe before filing; automation never closes `security`/`do-not-close` issues. Commands: `docs/agents/issue-tracker.md`; labels: `docs/agents/triage-labels.md`. Domain docs: `CONTEXT.md`, ADRs in `docs/adr/` (`docs/agents/domain.md`). ADR numbers are **author-namespaced** and `0016`/`0031` each host two accepted ADRs — cite those by filename, never number alone: `docs/adr/README.md`.
 
 ## CLAUDE.md updates
 
-Architectural decisions, new stores, churning subsystems, and cross-cutting concerns belong here; stable reference material an agent already loads belongs in `docs/` with a pointer here (heuristic: memory `feedback_claude_md_scope.md`; precedent: the Erlang gateway section → `docs/erlang-gateway-build.md`). Keep this file AND each file it imports (the routed-concerns table, `.claude/routed-concerns.md`) under 40k characters each — routed-concern rows hold only the catastrophic-if-violated invariants + doc pointers; the detail goes in the routed doc.
+Architectural decisions, new stores, churning subsystems, and cross-cutting concerns belong here; stable reference material an agent already loads belongs in `docs/` with a pointer here (heuristic: memory `feedback_claude_md_scope.md`; precedent: the Erlang gateway section → `docs/erlang-gateway-build.md`). Keep this file AND each file it imports (the routed-concerns tables, `.claude/routed-concerns.md` + `.claude/routed-concerns-access-control.md`) under 40k characters each — routed-concern rows hold only the catastrophic-if-violated invariants + doc pointers; the detail goes in the routed doc.

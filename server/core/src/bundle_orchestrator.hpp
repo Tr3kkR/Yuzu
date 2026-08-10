@@ -1,9 +1,11 @@
 #pragma once
 
+#include "authz_model.hpp"    // #1788: VisibleSet — DispatchFn confinement param
 #include "bundle_service.hpp" // BundleStepSpec, DispatchedStep, BundleAggregate
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -42,6 +44,17 @@ namespace yuzu::server {
 
 class ResponseStore; // collate reads responses by correlation id
 
+/// `collate()`'s error channel (#2691, Doomgoose finding #3). `kNotFoundOrDenied`
+/// deliberately conflates "unknown/expired correlation id" with "known but not
+/// owned by this principal" — existence must not become an enumeration oracle,
+/// so both map to the same caller-facing 404. `kDegraded` is a DISTINCT signal:
+/// the underlying ResponseStore read failed (store/pool/query error), which the
+/// caller must map to a retryable 503/kInternalError, never the same 404 a
+/// genuinely-absent bundle gets — conflating the two previously meant a poll
+/// hitting a transient store blip saw a terminal "not found" (and, on REST, a
+/// false "denied" audit row) instead of a signal to retry.
+enum class CollateError { kNotFoundOrDenied, kDegraded };
+
 class BundleOrchestrator {
 public:
     /// Per-command dispatcher — the SAME shape REST/MCP already use:
@@ -51,7 +64,12 @@ public:
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope,
         const std::unordered_map<std::string, std::string>& params,
-        const std::string& correlation_id)>;
+        const std::string& correlation_id,
+        // #1788: kept identical to McpServer::DispatchFn (the SAME lambda feeds
+        // both). The orchestrator never derives or re-decides this set itself
+        // (governance UP-8) — it threads through whatever `dispatch()`'s caller
+        // supplied unchanged; see that method's doc comment below.
+        const yuzu::server::authz::VisibleSet& exec_visible)>;
 
     /// Per-step audit sink, request-bound by the wrapper (so the core stays
     /// req-free). Called once per step with a transport-agnostic verb.
@@ -87,14 +105,28 @@ public:
     /// `bundle-…` correlation id, dispatches each step under it, records the
     /// step↔command_id map (with per-step dispatch outcome), audits each step,
     /// and returns immediately. `principal` owns the bundle (collate checks it).
+    ///
+    /// `exec_visible` is the CALLER's already-derived Execution:Execute visible
+    /// set (governance UP-8) — this method threads it into `DispatchFn`
+    /// unchanged for every step, it never derives or narrows it itself. The
+    /// wrapper (REST/MCP) has ALREADY confined `agent_id` before calling this
+    /// (the per-target scope gate — `scoped_perm_fn` on REST, `in_scope` on
+    /// MCP), so a defaulted `{}` (nullopt/unfiltered) preserves that model:
+    /// this orchestrator is not itself the confinement chokepoint, only a
+    /// faithful conduit for whichever caller-derived set the wrapper already
+    /// checked `agent_id` against.
     DispatchResult dispatch(const std::string& agent_id, const std::vector<BundleStepSpec>& steps,
-                            const std::string& principal, const AuditSink& audit);
+                            const std::string& principal, const AuditSink& audit,
+                            const yuzu::server::authz::VisibleSet& exec_visible = {});
 
-    /// Collate the bundle's responses. Returns nullopt when the correlation id
-    /// is unknown/expired OR not owned by `principal` (and not `is_admin`) — the
-    /// caller maps nullopt to a 404 so existence isn't an enumeration oracle;
-    /// the real reason is audited by the wrapper.
-    [[nodiscard]] std::optional<BundleAggregate>
+    /// Collate the bundle's responses. Returns `unexpected(kNotFoundOrDenied)`
+    /// when the correlation id is unknown/expired OR not owned by `principal`
+    /// (and not `is_admin`) — the caller maps this to a 404 so existence isn't
+    /// an enumeration oracle; the real reason is audited by the wrapper.
+    /// Returns `unexpected(kDegraded)` when the manifest was found and owned
+    /// but the underlying ResponseStore read failed — the caller maps THIS to
+    /// a retryable 503/kInternalError, distinct from the terminal 404 above.
+    [[nodiscard]] std::expected<BundleAggregate, CollateError>
     collate(const std::string& correlation_id, const std::string& principal, bool is_admin);
 
     /// Correlation-id prefix. `notify_exec_tracker` skips ids with this prefix

@@ -3,12 +3,14 @@
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
+#include "mcp_approval_error.hpp" // shared approval-store failure body (#2786)
 #include "mcp_input_schema.hpp" // input-schema subset compiler (#2405 C8 pre-approval gate)
 #include "mcp_jsonrpc.hpp"
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
 #include "mcp_policy.hpp"
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "mcp_transport.hpp"     // Streamable HTTP transport pre-checks (2f)
+#include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (streamed POST, 3b)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
@@ -282,7 +284,10 @@ std::string lower_copy(std::string v) {
     return v;
 }
 
-// All 26 Phase 1 read-only tools.
+// EVERY published tool, all phases - not just the read-only ones. The count has
+// moved with every rung and a stale one here reads as a completeness claim, so it
+// is deliberately not restated: kToolCount is computed from this array, and the
+// tier/securable rows in kToolSecurityRows are cross-checked against it at boot.
 //
 // SCHEMA AUTHORING (#2405): every input_schema_json below must compile under
 // the CLOSED keyword catalogue in mcp_input_schema.cpp — an unsupported
@@ -300,7 +305,7 @@ static const ToolDef kTools[] = {
 
     {"query_audit_log",
      "Query the audit log with filters. Returns timestamped entries showing who did what, when.",
-     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"maximum":500}}})"},
+     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500}}})"},
 
     {"list_definitions",
      "List available instruction definitions (commands that can be dispatched to agents).",
@@ -585,8 +590,22 @@ static const ToolDef kTools[] = {
      "+ execution_id + agents_reached; the agents run the action and report back separately. "
      "LIVE PROGRESS: on a Streamable HTTP session, include _meta.progressToken (string|int) in "
      "the tools/call params and notifications/progress frames (agents responded / targeted, with "
-     "the execution_id in _meta under \"yuzu.execution_id\") arrive on this session's GET SSE "
-     "stream as the fleet responds. Progress is always BEST-EFFORT: even after supplying a "
+     "the execution_id in _meta under \"yuzu.execution_id\") are delivered as the fleet "
+     "responds. WHERE they arrive is your choice, per request: send an SSE-capable Accept "
+     "(text/event-stream) with the token and - IF the server has streamed POST enabled "
+     "(--mcp-enable-streamed-post; OFF by default, so assume not unless you have "
+     "confirmed it) - THIS POST response is held open as the stream. Otherwise you get "
+     "a normal complete JSON answer and progress arrives on the session GET channel - "
+     "progress frames first, the JSON-RPC result last, then EOF; send the token WITHOUT an SSE "
+     "Accept and this POST answers immediately in JSON while the frames go to the session's GET "
+     "SSE stream. Streaming refusals are answered, not silent: 429 (stream/session cap, "
+     "Retry-After), 409 (this request id is already in flight), 404 (session expired). If a "
+     "stream ends early there are TWO recovery paths and you may need the first: resume the "
+     "session's GET channel with Last-Event-ID, which replays the ring including the final "
+     "even if you never received a frame; or fetch by execution_id if you already have one. "
+     "If that GET returns 410 the session is poisoned - its terminal could not be committed - "
+     "so the stream cannot deliver it; use a durable read instead (get_execution_status or "
+     "query_responses by execution_id, or list_executions if you never learned one). NEVER re-send this call, which would run the action a second time. Progress is always BEST-EFFORT: even after supplying a "
      "token you MUST still be prepared to poll (a reservation can silently degrade under load "
      "and zero progress frames is indistinguishable from 'nothing has happened yet'). "
      "FALLBACK when not streaming: poll query_responses with the "
@@ -701,7 +720,7 @@ static const ToolDef kTools[] = {
 
     {"list_engine_principals",
      "List engine principals with each principal's active-credential count (admin/auditor "
-     "surface). Mirrors GET /api/v1/engine-principals. Requires Security:Read.",
+     "surface). Mirrors GET /api/v1/engine-principals. Requires EnginePrincipal:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("include_revoked":{"type":"boolean","default":true,"description":"false restricts to lifecycle_state=active only"})j"
      R"j(}})j",
@@ -709,7 +728,7 @@ static const ToolDef kTools[] = {
 
     {"get_engine_principal",
      "Get one engine principal's identity row plus its active-credential count. Mirrors GET "
-     "/api/v1/engine-principals/{id}. Requires Security:Read.",
+     "/api/v1/engine-principals/{id}. Requires EnginePrincipal:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"})j"
      R"j(},"required":["principal_id"]})j",
@@ -912,7 +931,7 @@ static const ToolDef kTools[] = {
      "List the fleet-wide RBAC roles currently assigned to one engine principal — the "
      "read-only discovery step before assign_engine_role/unassign_engine_role, and the way "
      "to audit what an autonomous module can actually do right now. Mirrors GET "
-     "/api/v1/engine-principals/{id}/roles. Requires Security:Read.",
+     "/api/v1/engine-principals/{id}/roles. Requires EnginePrincipal:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix"})j"
      R"j(},"required":["principal_id"]})j",
@@ -1263,8 +1282,8 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"mint_engine_credential", {"Security", "Write"}},
     {"rotate_engine_credential", {"Security", "Write"}},
     {"confirm_engine_rotation", {"Security", "Write"}},
-    {"list_engine_principals", {"Security", "Read"}},
-    {"get_engine_principal", {"Security", "Read"}},
+    {"list_engine_principals", {"EnginePrincipal", "Read"}},
+    {"get_engine_principal", {"EnginePrincipal", "Read"}},
     {"audit_engine_no_admin", {"AuditLog", "Read"}},
     // PR 4.2 (design §4.1) — engine-principal role-assignment MCP twins of
     // /api/v1/engine-principals/{id}/roles. Mutations map to Security:Write
@@ -1274,7 +1293,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // note above on why this invariant matters).
     {"assign_engine_role", {"Security", "Write"}},
     {"unassign_engine_role", {"Security", "Write"}},
-    {"list_engine_roles", {"Security", "Read"}},
+    {"list_engine_roles", {"EnginePrincipal", "Read"}},
     // Agentic demo/read helpers.
     {"get_fleet_posture_fast", {"Infrastructure", "Read"}},
     {"classify_operational_question", {"Infrastructure", "Read"}},
@@ -1409,7 +1428,7 @@ constexpr std::string_view kRbacSecurables[] = {
     "AuditLog",       "Response",           "ManagementGroup",       "ApiToken",
     "Security",       "Policy",             "DeviceToken",           "SoftwareDeployment",
     "License",        "FileRetrieval",      "GuaranteedState",       "Inventory",
-    "AccessReview",   "SoftwareLicensing"};
+    "AccessReview",   "SoftwareLicensing",  "EnginePrincipal"};
 
 // Borrowed (name, input_schema_json) row for the registration validator's
 // 4th sequence (#2405). Views are valid only for the duration of the call.
@@ -2144,9 +2163,12 @@ McpServer::HandlerFn McpServer::build_handler(
     QuarantineStore* quarantine_store, TagPushFn tag_push_fn,
     yuzu::server::detail::AgentRegistry* agent_registry, ScopedPermFn scoped_perm_fn,
     McpSessionRegistry* sessions, const bool* mcp_streaming_disabled,
+    const bool* mcp_streamed_post_enabled,
     std::vector<std::string> allowed_origins, SoftwareLicensingStore* software_licensing_store,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
-    AuthDB* auth_db, DirectorySync* directory_sync) {
+    AuthDB* auth_db, DirectorySync* directory_sync, ExecVisibleFn exec_visible_fn,
+    yuzu::server::detail::StreamBudget* stream_budget, StreamRevalidateFn revalidate_fn,
+    StreamPrincipalAuditFn principal_audit_fn) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -2168,6 +2190,8 @@ McpServer::HandlerFn McpServer::build_handler(
     // the stale copy a [=] capture of a const bool& alias produces.
     McpSessionRegistry* const mcp_sessions = sessions;
     const bool* const p_streaming_off = mcp_streaming_disabled;
+    // Same live-pointer discipline: captured by pointer, never by a stale alias.
+    const bool* const p_streamed_post_on = mcp_streamed_post_enabled;
     const std::vector<std::string> mcp_allowed_origins = std::move(allowed_origins);
 
     // Live-query bundle orchestrator (ADR-0011) — backs execute_bundle /
@@ -2303,6 +2327,70 @@ McpServer::HandlerFn McpServer::build_handler(
 
         // ── Notification (no id → no response) ───────────────────────────
         if (!rpc.id.has_value()) {
+            // notifications/cancelled (2f PR 3b, C9): the client asking us to stop
+            // caring about a request it already sent. Only reachable here - a
+            // cancellation is a NOTIFICATION, so it never has an id of its own and
+            // every id-bearing request keeps its existing path untouched.
+            //
+            // The id is taken VERBATIM. JSON-RPC ids are opaque: 1 and "1" are
+            // different requests, and the bridge keys on the exact value, so any
+            // coercion here would cancel the wrong one or nothing at all.
+            //
+            // What this does depends on how far the request has got. Pre-arm it
+            // records INTENT and arm()/abandon() arbitrate, which is what keeps
+            // cancellation honest under the race that matters: a cancel landing
+            // mid-dispatch cannot half-cancel a command already on the wire. Once
+            // the request is streaming there is nothing left to arbitrate, so the
+            // cancel applies immediately - it closes the response and is audited at
+            // that site. Either way a row is written only when something happened.
+            if (rpc.method == "notifications/cancelled" && streaming_on &&
+                stream_bridge_ != nullptr) {
+                const auto cancel_sid = req.get_header_value("Mcp-Session-Id");
+                if (!cancel_sid.empty() && rpc.params.is_object() &&
+                    rpc.params.contains("requestId")) {
+                    McpStreamBridge::CancelOutcome outcome =
+                        McpStreamBridge::CancelOutcome::kNoOp;
+                    try {
+                        // The authenticated caller, so a streamed detach is
+                        // attributable to the client that asked for it rather than
+                        // to "system" (Decision 15(j) non-repudiation).
+                        outcome = stream_bridge_->request_cancel(cancel_sid,
+                                                                 rpc.params["requestId"],
+                                                                 session->username);
+                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                        // A cancel we could not record must not fail the
+                        // notification: the client is owed 202 either way, and the
+                        // request it wanted cancelled simply runs to completion.
+                    }
+                    if (metrics != nullptr) {
+                        try {
+                            // CLOSED three-value outcome, and the three are worth
+                            // telling apart: `detached` means a live streamed
+                            // response was actually ended BY THIS cancel,
+                            // `accepted` means intent was recorded pre-arm for
+                            // arm()/abandon() to arbitrate, and `noop` is otherwise
+                            // invisible - it is how you see clients cancelling ids
+                            // that already finished, cancelling into the wrong
+                            // session, or retrying a cancel that already landed.
+                            //
+                            // The label comes from the bridge, beside the enum, so
+                            // this site cannot drift from the startup seed.
+                            metrics
+                                ->counter(
+                                    "yuzu_mcp_cancel_notifications_total",
+                                    {{"outcome",
+                                      McpStreamBridge::cancel_outcome_label(outcome)}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                        }
+                    }
+                }
+            }
+            // 202 REGARDLESS, including for a cancel that matched nothing: a
+            // notification has no response to carry an outcome, and answering
+            // differently would turn this into an oracle for which request ids are
+            // live on a session.
+            //
             // notifications/initialized — acknowledge (MCP Streamable HTTP spec:
             // an accepted notification/response POST answers 202, not 204).
             res.status = 202;
@@ -2621,9 +2709,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 AuditQuery aq;
                 aq.limit = 50;
+                // ADR-0040: degrade-distinguishable read — nullopt on a
+                // store/pool failure. Surface an error, never a false-empty
+                // resource (an audit blip must not read as "no activity").
                 auto events = audit_store->query(aq);
+                if (!events) {
+                    res.set_content(error_response(id, kInternalError, "Audit store degraded"),
+                                    "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& e : events) {
+                for (const auto& e : *events) {
                     arr.add(JObj()
                                 .add("timestamp", e.timestamp)
                                 .add("principal", e.principal)
@@ -2865,6 +2961,28 @@ McpServer::HandlerFn McpServer::build_handler(
                     // json_quoted_string returns a fully-quoted, escaped JSON string.
                     data += json_quoted_string(remediation);
                 }
+                data += "}";
+                return error_response(id, code, message, data);
+            };
+
+            // A4 envelope that also carries the durable execution handle. Used by
+            // the two streamed-POST 500s, which are the only refusals raised AFTER
+            // dispatch - the work is running, so the client needs the id to find it
+            // rather than retry a mutating fleet command blind (Decision 15(g)).
+            auto a4_error_exec = [&id](int code, std::string_view message,
+                                       std::string_view remediation,
+                                       const std::string& execution_id,
+                                       std::string_view cid_override = {}) {
+                const std::string cid = cid_override.empty()
+                                            ? yuzu::server::detail::make_correlation_id()
+                                            : std::string(cid_override);
+                std::string data = R"({"correlation_id":")" + cid +
+                                   R"(","retry_after_ms":null,"execution_id":)" +
+                                   (execution_id.empty() ? std::string("null")
+                                                         : json_quoted_string(execution_id)) +
+                                   R"(,"remediation":)";
+                data += remediation.empty() ? std::string("null")
+                                            : json_quoted_string(remediation);
                 data += "}";
                 return error_response(id, code, message, data);
             };
@@ -3198,7 +3316,26 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
 
                     // Recall path → validate the supplied ticket.
-                    auto appr = approval_manager->get(supplied_id);
+                    // get_checked, NOT get: a store read that FAILED is not a
+                    // read that found nothing. `get` collapsed the two, so a
+                    // transient SQLite failure here read as "no such ticket"
+                    // and the branch below told the caller to submit a fresh
+                    // request, discarding a live human-approved capability on
+                    // a failure a retry may clear. Same burn class the
+                    // consume-side guard below closes, on the same request
+                    // path, reached FIRST.
+                    auto appr_read = approval_manager->get_checked(supplied_id);
+                    if (!appr_read) {
+                        count_denial("yuzu_mcp_approval_refused_total", nullptr);
+                        mcp_audit("denied",
+                                  "approval_id=" + supplied_id + " refused: " +
+                                      consume_denial_reason(ConsumeFailure::kStoreError) +
+                                      " (lookup)");
+                        res.set_content(approval_store_error_body(*approval_manager, a4_error),
+                                        "application/json");
+                        return;
+                    }
+                    auto appr = std::move(*appr_read);
                     if (!appr || appr->definition_id != definition_id ||
                         appr->scope_expression != canon) {
                         // Absent, or for a different tool / different arguments.
@@ -3224,7 +3361,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     if (appr->status != "approved") {
                         // rejected / expired.
-                        mcp_audit("denied", "approval " + supplied_id + " status=" + appr->status);
+                        mcp_audit("denied",
+                                  "approval_id=" + supplied_id + " status=" + appr->status);
                         res.set_content(
                             a4_error(kPermissionDenied, "approval was " + appr->status,
                                      "submit a new request without approval_id to obtain a fresh "
@@ -3238,10 +3376,75 @@ McpServer::HandlerFn McpServer::build_handler(
                     // most once per ticket).
                     // H3/N2 (SOC-2 CC7.2): stamp WHO consumed the ticket — the
                     // authenticated principal recalling the tool.
-                    if (auto consumed =
-                            approval_manager->consume_ticket(supplied_id, session->username);
+                    if (auto consumed = approval_manager->consume_ticket(
+                            supplied_id, session->username, {});
                         !consumed) {
-                        mcp_audit("denied", "approval " + supplied_id + " already used");
+                        const ConsumeFailure kind = consumed.error().kind;
+                        // AUDIT names the kind. This row is server-side and is
+                        // never returned to the caller, so the anti-oracle
+                        // argument below does not reach it. Auditing every
+                        // refusal as "already used" recorded a cross-surface
+                        // forgery attempt — the event #2442 exists to detect —
+                        // identically to a benign replay, and said it about a
+                        // row whose consumed_at is still 0.
+                        //
+                        // The METRIC is a separate instrument from the audit
+                        // row: the row is the forensic record, one per event
+                        // and its write unchecked, so nothing can alert on it.
+                        // The counter gives an operator a refusal RATE.
+                        //
+                        // It deliberately carries NO reason label. A store
+                        // failure is already exposed via the response code
+                        // (-32603 vs -32003); what the audit token carries
+                        // and this counter withholds is the split WITHIN a
+                        // -32003 denial - foreign_origin vs an ordinary
+                        // replay - which is the distinction the client
+                        // response below refuses to make. `/metrics` is not a
+                        // stronger reader than the caller: it is exempt for
+                        // localhost and otherwise needs only a resolved
+                        // session — the same credential the MCP caller already
+                        // holds. A `reason` label would therefore let a token
+                        // holder recall a suspect ticket, read the series
+                        // either side, and recover which surface minted it,
+                        // reopening the oracle this handler exists to close.
+                        // The kind stays in the audit trail, which is genuinely
+                        // server-side.
+                        count_denial("yuzu_mcp_approval_refused_total", nullptr);
+                        mcp_audit("denied", "approval_id=" + supplied_id +
+                                                " refused: " + consume_denial_reason(kind));
+
+                        // CLIENT message stays uniform for the two that must not
+                        // be distinguishable: a foreign-origin refusal reads
+                        // exactly like an ordinary replay, or the recall becomes
+                        // a probe for which surface minted a ticket.
+                        //
+                        // kStoreError is NOT one of those. It leaves the ticket
+                        // UNTOUCHED, so telling the caller it was "already used"
+                        // and to fetch a fresh one would burn a live human
+                        // approval on a failure a retry may clear. The shared
+                        // body below (also used by rung 1's lookup failure,
+                        // above) carries this remediation and the conditional
+                        // retry directive A5 requires.
+                        //
+                        // The `!is_open()` arm inside that shared body is
+                        // defence in depth here, NOT the live discriminator for
+                        // a closed store: rung 1's lookup is `get_checked` now,
+                        // so a closed store is refused there and never reaches
+                        // this line. It is kept because it costs nothing and
+                        // stops THIS site becoming the fail-open one if rung 1's
+                        // lookup ever changes.
+                        //
+                        // What is NOT covered either way: an OPEN handle whose
+                        // reads fail permanently — CORRUPT, NOTADB, READONLY,
+                        // FULL — takes the transient arm and is told to retry
+                        // forever. That is the real gap, it needs
+                        // sqlite3_extended_errcode carried on ConsumeError,
+                        // and it is not closed here (#2786 PR 1c).
+                        if (kind == ConsumeFailure::kStoreError) {
+                            res.set_content(approval_store_error_body(*approval_manager, a4_error),
+                                            "application/json");
+                            return;
+                        }
                         res.set_content(
                             a4_error(kPermissionDenied,
                                      "approval already used (one-time ticket)",
@@ -3368,10 +3571,29 @@ McpServer::HandlerFn McpServer::build_handler(
                 aq.target_type = param_str(args, "target_type");
                 aq.since = param_int(args, "since");
                 aq.until = param_int(args, "until");
-                aq.limit = std::min(param_int32(args, "limit", 50), 500);
+                // Clamp BOTH bounds, in 64-bit BEFORE narrowing — the
+                // query_responses idiom (`:3660`). Upper alone left a
+                // negative or zero `limit` reaching `AuditStore::query`,
+                // which clamps a non-positive limit to `LIMIT 0` at its own
+                // sink (`std::max(q.limit, 0)`) — a caller-supplied bad
+                // limit therefore came back as an EMPTY page, not an error,
+                // for the one query this store's ADR explicitly promises
+                // never reads false-empty. `param_int32`'s int64->int32 cast
+                // also wraps a limit above INT_MAX negative before `std::min`
+                // ever saw it; clamping the raw int64 first avoids that.
+                aq.limit = static_cast<int>(
+                    std::clamp<std::int64_t>(param_int(args, "limit", 50), 1, 500));
+                // ADR-0040: degrade-distinguishable read — nullopt on a
+                // store/pool failure. Surface an error, never a false-empty
+                // result (an audit blip must not read as "no activity").
                 auto events = audit_store->query(aq);
+                if (!events) {
+                    res.set_content(error_response(id, kInternalError, "Audit store degraded"),
+                                    "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& e : events) {
+                for (const auto& e : *events) {
                     arr.add(JObj()
                                 .add("id", e.id)
                                 .add("timestamp", e.timestamp)
@@ -3542,14 +3764,24 @@ McpServer::HandlerFn McpServer::build_handler(
                 // freshly minted by execute_instruction on this server cannot
                 // have pre-PR-2 untagged rows, so a fallback would only risk
                 // folding in another execution's responses.
-                auto responses = !exec_id.empty() ? response_store->query_by_execution(exec_id, rq)
-                                                   : response_store->query(instr_id, rq);
+                auto responses_opt = !exec_id.empty()
+                                         ? response_store->query_by_execution(exec_id, rq)
+                                         : response_store->query(instr_id, rq);
                 // Audit target is the primary correlation key actually used:
                 // execution_id when present (the exact-correlation path), else
                 // instruction_id. When both are supplied execution_id wins, so
                 // a dual-id call is recorded under the execution_id it served —
                 // deliberate (execution_id is the agentic-dispatch unit).
                 const std::string& key = !exec_id.empty() ? exec_id : instr_id;
+                if (!responses_opt) {
+                    mcp_audit("failure", "store degraded; " + key);
+                    res.set_content(
+                        a4_error(kInternalError, "Response store degraded — query failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                auto responses = std::move(*responses_opt);
 
                 // Did the raw query hit the row cap BEFORE scope filtering? If so the
                 // result is incomplete (more rows exist past the LIMIT). Capture this
@@ -3797,6 +4029,20 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto instr_id = param_str(args, "instruction_id");
                 AggregationQuery aq;
                 aq.group_by = param_str(args, "group_by");
+                // Validate against aggregate()'s own allow-list BEFORE calling
+                // in (#2691, Doomgoose finding #2): an allow-list miss inside
+                // aggregate() returns nullopt, which this handler otherwise
+                // maps unconditionally to kInternalError below — a typo'd
+                // group_by would read as store degradation for a healthy
+                // database. Bad client input is kInvalidParams, not
+                // kInternalError.
+                if (std::find(ResponseStore::allowed_group_by().begin(),
+                              ResponseStore::allowed_group_by().end(),
+                              aq.group_by) == ResponseStore::allowed_group_by().end()) {
+                    res.set_content(error_response(id, kInvalidParams, "invalid group_by"),
+                                    "application/json");
+                    return;
+                }
                 auto agg_str = param_str(args, "aggregate", "count");
                 if (agg_str == "sum")
                     aq.op = AggregateOp::Sum;
@@ -3836,8 +4082,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         // #1634 sre review). Audit the degraded access for CC7.2 parity.
                         mcp_audit("failure", "store degraded; " + instr_id);
                         res.set_content(
-                            error_response(id, kInternalError,
-                                           "Response store degraded — aggregate failed"),
+                            a4_error(kInternalError,
+                                     "Response store degraded — aggregate failed", {},
+                                     /*retry_after_ms=*/5000),
                             "application/json");
                         return;
                     }
@@ -3853,7 +4100,17 @@ McpServer::HandlerFn McpServer::build_handler(
                         agg_scope = std::move(in_scope);
                 }
 
-                auto results = response_store->aggregate(instr_id, aq, {}, agg_scope);
+                auto results_opt = response_store->aggregate(instr_id, aq, {}, agg_scope);
+                if (!results_opt) {
+                    mcp_audit("failure", "store degraded; " + instr_id);
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "Response store degraded — aggregate failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                const auto& results = *results_opt;
                 JArr arr;
                 for (const auto& r : results) {
                     arr.add(JObj()
@@ -5732,6 +5989,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto bridge_sid = req.get_header_value("Mcp-Session-Id");
                 auto bridge_token = extract_progress_token(rpc.params);
                 bool bridge_active = false;
+                // 2f PR 3b (C8): true once THIS request owns a streamed record.
+                // Distinct from bridge_active - every streamed record is a bridge
+                // record, but a GET-only bridge record must never take the SSE arm.
+                bool streamed_active = false;
+                // Held from admission until the provider install moves it into the
+                // releaser. Move-only, so a plain optional (not a captured copy);
+                // ~Lease returns the slot on EVERY early return between here and
+                // the install, which is what makes the failure paths leak-free
+                // without a guard at each one.
+                std::optional<yuzu::server::detail::StreamBudget::Lease> stream_lease;
                 const auto bridge_degrade = [&](const char* reason) {
                     if (metrics != nullptr) {
                         try {
@@ -5743,8 +6010,79 @@ McpServer::HandlerFn McpServer::build_handler(
                         }
                     }
                 };
-                if (streaming_on && bridge != nullptr && execution_tracker != nullptr &&
-                    !bridge_sid.empty() && bridge_token.has_value()) {
+                // Answers a streamed-POST admission denial. ONE place, because the
+                // three things a denial owes - the CLOSED-set reject metric, the
+                // denial audit row, and the A4 body - drifted apart every time a
+                // sibling surface hand-rolled them. Mirrors the GET tail's `deny`.
+                //
+                // Nothing was dispatched and no execution row exists at any call
+                // site (reserve runs before create_execution precisely so this is
+                // truthful), so the detail says so rather than leaving the reader
+                // to infer it.
+                const auto streamed_reject = [&](int status, int code, std::string_view message,
+                                                 const char* metric_reason,
+                                                 std::string_view remediation,
+                                                 std::int64_t retry_after_ms = -1) {
+                    const auto cid = yuzu::server::detail::make_correlation_id();
+                    if (metrics != nullptr) {
+                        try {
+                            metrics
+                                ->counter("yuzu_mcp_stream_rejects_total",
+                                          {{"reason", metric_reason}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                        }
+                    }
+                    session_audit("mcp.session.reject", "failure",
+                                  yuzu::server::detail::sanitize_detail_value(
+                                      bridge_sid.substr(0, 8)),
+                                  std::string("reason=") + metric_reason + " cid=" + cid +
+                                      " surface=post dispatched=false");
+                    res.status = status;
+                    if (retry_after_ms > 0) {
+                        // Whole seconds, rounded up - the platform 429 convention is
+                        // BOTH the header and the A4 body field.
+                        res.set_header("Retry-After", std::to_string((retry_after_ms + 999) / 1000));
+                    }
+                    res.set_content(a4_error(code, message, remediation,
+                                            static_cast<long>(retry_after_ms), cid),
+                                    "application/json");
+                };
+                const bool bridge_eligible = streaming_on && bridge != nullptr &&
+                                             execution_tracker != nullptr && !bridge_sid.empty() &&
+                                             bridge_token.has_value();
+                // S0 vs S1. Evaluated HERE because reserve() below MOVES
+                // bridge_token, so anything derived from it must be read first.
+                //
+                // `Accept` is the client's half of the opt-in and _meta.progressToken
+                // is the real gate (a plain tool call never streams). Note
+                // accept_wants_sse treats `;q=0` as opting IN - pinned deliberately
+                // in test_mcp_transport.cpp; a client that sends a progressToken AND
+                // q=0 is contradicting itself, and honouring the token is the useful
+                // reading.
+                //
+                // The three wiring deps are part of eligibility, not assertions: a
+                // build_handler caller that omits any of them (every pre-3b test)
+                // gets today's plain path rather than a stream it cannot service.
+                // 3b still ships DORMANT, but no longer because it is unsound: the
+                // four defects that gated the flip are fixed - #2739 (the response
+                // cap now fires on a busy execution: the drain-then-settle state in
+                // mcp_stream_bridge.cpp's project_record), #2740 (an undelivered
+                // final no longer holds a session slot for good: the reclaim in
+                // McpStreamBridge::reserve), #2785 (POST frames carry the ring event
+                // id) and #2789 (per-principal reject coverage). Turning the default
+                // on is a SEPARATE rung, so this flag stays off here.
+                //
+                // nullptr reads as OFF, so every caller that does not opt in - incl.
+                // every pre-3b test - gets the plain path, matching the wiring-deps
+                // rule above rather than adding a second convention.
+                const bool streamed_post_enabled =
+                    p_streamed_post_on != nullptr && *p_streamed_post_on;
+                const bool streamed_mode =
+                    bridge_eligible && streamed_post_enabled && stream_budget != nullptr &&
+                    mcp_sessions != nullptr &&
+                    mcp::transport::accept_wants_sse(req.get_header_value("Accept"));
+                if (bridge_eligible) {
                     // The session id was validated (principal-bound) at handler
                     // entry; reserve re-checks it against the registry anyway
                     // (no TOCTOU widening - a dead session just degrades).
@@ -5752,11 +6090,136 @@ McpServer::HandlerFn McpServer::build_handler(
                     // bad_alloc here must degrade to the plain path, not turn a
                     // dispatchable command into a 500 (byte-identical contract).
                     try {
+                        // Admission BEFORE reservation, and only for streamed
+                        // intent: a streamed POST pins an HTTP worker for its whole
+                        // life, so it is subject to the same shared budget as a GET
+                        // SSE stream. Ordered first because a budget rejection must
+                        // not leave a bridge record behind to unwind.
+                        if (streamed_mode) {
+                            auto acquired = stream_budget->try_acquire(
+                                mcp::sse_bus::SseSurface::kMcpPost, session->username,
+                                mcp::sse_bus::kPerPrincipalMcpPost);
+                            if (!acquired.lease) {
+                                // Capacity, and honestly retryable: name the reason
+                                // in the CLOSED label set, tell the client how long
+                                // to wait, and dispatch NOTHING. Reserve was never
+                                // called, so there is no record and no execution row.
+                                const char* const why =
+                                    acquired.reject_reason != nullptr
+                                        ? acquired.reject_reason
+                                        : yuzu::server::detail::StreamBudget::kRejectGlobal;
+                                const bool per_principal =
+                                    std::string_view(why) ==
+                                    yuzu::server::detail::StreamBudget::kRejectPerPrincipal;
+                                streamed_reject(
+                                    429, mcp::kMcpStreamCap, "Concurrent stream cap reached",
+                                    per_principal ? "post_per_principal_cap" : "post_global_cap",
+                                    per_principal
+                                        ? "wait for one of your streamed calls to finish, or "
+                                          "retry without an SSE Accept for a plain response"
+                                        : "retry shortly, or retry without an SSE Accept for a "
+                                          "plain response",
+                                    mcp::kMcpStreamedPostRetryAfterMs);
+                                return;
+                            }
+                            stream_lease.emplace(std::move(acquired.lease));
+                        }
                         auto rr = bridge->reserve(bridge_sid, session->username, id,
                                                   std::move(bridge_token),
-                                                  /*streamed_intent=*/false);
+                                                  /*streamed_intent=*/streamed_mode);
                         if (rr.ok) {
                             bridge_active = true;
+                            streamed_active = streamed_mode;
+                        } else if (streamed_mode) {
+                            // The streamed arm ANSWERS a rejection instead of
+                            // degrading: the client asked for a stream and must
+                            // learn it is not getting one. Every reject reason is
+                            // mapped explicitly - a new one added to reserve()
+                            // without a mapping here falls to the default and is
+                            // still answered honestly rather than silently.
+                            //
+                            // NO abandon() on any of these: the reservation did not
+                            // succeed, and on duplicate_request_id the key belongs
+                            // to the OLDER live request, which abandon would erase.
+                            const std::string_view why =
+                                rr.reject_reason != nullptr ? rr.reject_reason : "";
+                            if (why == "disabled" || why == "shutdown") {
+                                // Not the client's doing and not retry-shaped: the
+                                // server is withdrawing the capability. The plain
+                                // response is self-sufficient, so degrade to it.
+                                bridge_degrade("reserve_rejected");
+                                stream_lease.reset();
+                            } else if (why == "duplicate_request_id") {
+                                // A protocol error, not capacity - retrying cannot
+                                // help while the older request is live, so no
+                                // Retry-After. 409 over 429 for the same reason.
+                                streamed_reject(409, mcp::kInvalidRequest,
+                                                "Request id already in flight on this session",
+                                                "post_duplicate_request_id",
+                                                "resume the in-flight request on the GET stream, "
+                                                "or issue this call with a fresh id");
+                                return;
+                            } else if (why == "unknown_session") {
+                                // The session died between the entry check and here.
+                                // Same shape the entry gate uses, so a client sees
+                                // one consistent answer for one condition.
+                                streamed_reject(404, mcp::kMcpUnknownSession,
+                                                "Unknown or expired session",
+                                                "post_unknown_session",
+                                                "re-initialize: send an initialize request to "
+                                                "obtain a fresh Mcp-Session-Id");
+                                return;
+                            } else {
+                                // global_cap | pin_slots - capacity, retryable.
+                                //
+                                // #2740: the pin_slots remediation is chosen by what
+                                // was actually holding the slots, because ONE sentence
+                                // cannot be true of both states. "Wait for one to
+                                // finish" is sound advice while charges are
+                                // outstanding (calls that reserved and have not
+                                // settled a terminal), and was actively misleading
+                                // when every slot held a COMMITTED final no wire had
+                                // taken delivery of - a conforming client honouring
+                                // retry_after_ms slid the session TTL on every retry,
+                                // so it never idled out either.
+                                //
+                                // Admission now reclaims such a final - parked or
+                                // orphaned - rather than refusing, so reaching this arm
+                                // means the reclaim found nothing to take. Three states
+                                // do that, and the text must be true of ALL of them:
+                                // a final still being WRITTEN by a live pump (which a
+                                // short wait does clear), and a transient decline while
+                                // one of the session's records is mid-projection (which
+                                // a retry clears) - so "waiting will not help" would be
+                                // false. Retrying is honest for both; only the third,
+                                // a genuinely stuck slot, needs a fresh session, and
+                                // the client cannot tell which it is from here.
+                                const char* pin_remediation =
+                                    rr.pin_slots_held == McpStreamBridge::PinSlotsHeld::kPins
+                                        ? "this session's streamed slots are held by results "
+                                          "that have not yet reached a client. Retry: a result "
+                                          "still being written frees its slot as it lands. If "
+                                          "this persists across several retries, collect the "
+                                          "outstanding results by resuming the GET channel with "
+                                          "ONE BELOW the lowest id you still need: replay "
+                                          "starts strictly ABOVE the cursor, and the cursor "
+                                          "releases every pinned final at or below it on this "
+                                          "session. If the resume answers with a gap, or you have no "
+                                          "cursor to send, re-initialize for a "
+                                          "fresh session and fetch results by "
+                                          "execution_id"
+                                        : "this session already has the maximum streamed calls "
+                                          "in flight; wait for one to finish";
+                                streamed_reject(
+                                    429, mcp::kMcpStreamCap, "Streamed request capacity reached",
+                                    why == "pin_slots" ? "post_pin_slots" : "post_global_cap",
+                                    why == "pin_slots"
+                                        ? pin_remediation
+                                        : "retry shortly, or retry without an SSE Accept for a "
+                                          "plain response",
+                                    mcp::kMcpStreamedPostRetryAfterMs);
+                                return;
+                            }
                         } else {
                             // L1: a coarse single degrade reason - reserve()
                             // already counted the FINE reject reason into
@@ -5768,7 +6231,17 @@ McpServer::HandlerFn McpServer::build_handler(
                             bridge_degrade("reserve_rejected");
                         }
                     } catch (...) {
+                        // A THROW is not a REJECT. A rejection is the server saying
+                        // "no" and is answered; an allocation failure is answered by
+                        // doing LESS - degrade to the plain path, which is exactly
+                        // what this request would have got without an SSE Accept.
+                        // Never 429 (retry advice into an OOM is worse than useless)
+                        // and never 500 (the command is still perfectly dispatchable).
+                        // The lease unwinds with the optional.
                         bridge_degrade("reserve_threw");
+                        bridge_active = false;
+                        streamed_active = false;
+                        stream_lease.reset();
                     }
                 }
 
@@ -5829,6 +6302,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (bridge_active && execution_id.empty()) {
                     bridge->abandon(bridge_sid, id);
                     bridge_active = false;
+                    // Keep the declared invariant (streamed_active => bridge_active).
+                    // Leaving it set let the streamed arm below run against an
+                    // abandoned record, fall through to arm_not_armed, and count a
+                    // SECOND degrade for one request - while the budget lease sat
+                    // unreleased until the handler returned.
+                    streamed_active = false;
+                    stream_lease.reset();
                     bridge_degrade("no_execution_row");
                 }
                 if (bridge_active) {
@@ -5841,6 +6321,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!subscribed) {
                         bridge->abandon(bridge_sid, id);
                         bridge_active = false;
+                        streamed_active = false;  // same invariant as above
+                        stream_lease.reset();
                         bridge_degrade("subscribe_failed");
                     }
                 }
@@ -5854,11 +6336,24 @@ McpServer::HandlerFn McpServer::build_handler(
                 // forever AND the JSON-RPC client sees a connection
                 // drop instead of a structured error envelope. Mirrors
                 // the REST sibling at workflow_routes.cpp:1427-1444.
+                // #1788: confine the dispatch to the caller's Execution:Execute
+                // visible device set, mirroring /api/command. Fail closed when
+                // the derivation is unwired (CDX-R6-02, see below).
+                auto exec_visible =
+                    exec_visible_fn ? exec_visible_fn(*session)
+                                    // CDX-R6-02: unwired == FAIL CLOSED. A present EMPTY set
+                                    // (not nullopt) means "no target visible" -> nothing
+                                    // dispatched. ADR-0033 §1 forbids inferring unfiltered
+                                    // authority from an omitted applicable filter (same
+                                    // posture as the tag ScopedPermFn, K-06). Production
+                                    // always wires it (server.cpp); a test wanting unfiltered
+                                    // wires a callback that returns nullopt.
+                                    : yuzu::server::authz::deny_all();
                 std::string command_id;
                 int agents_reached = 0;
                 try {
-                    std::tie(command_id, agents_reached) =
-                        dispatch_fn(plugin, action, agent_ids, scope, params, execution_id);
+                    std::tie(command_id, agents_reached) = dispatch_fn(
+                        plugin, action, agent_ids, scope, params, execution_id, exec_visible);
                 } catch (const std::exception& e) {
                     spdlog::error("MCP execute_instruction: dispatch failed: {}", e.what());
                     // 2f PR 3a: unwind the bridge record FIRST (unsubscribe waits
@@ -5926,6 +6421,22 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
 
+                // ── Post-dispatch containment envelope (2f PR 3b, C8) ─────────
+                // From here the command IS RUNNING on real agents. Everything
+                // below can throw - set_agents_targeted and refresh_counts each
+                // lock, and refresh_counts also allocates JSON and publishes bus
+                // events; the result strings allocate; arm, bind, the pump and the
+                // header work all allocate. An escaped throw here is a naked 500
+                // for a command that will keep running and keep reporting, which
+                // tells the client nothing it can act on and loses the execution_id
+                // it needs to recover.
+                //
+                // The catch is STREAMED-ONLY and RETHROWS otherwise: the plain path
+                // keeps today's behaviour byte-for-byte, including its 500. Fixing
+                // that for the plain path is a real but separate change (#2408's
+                // siblings have the same shape), and C8 does not get to alter the
+                // stop-ship surface in passing.
+                try {
                 // Update agents_targeted on the execution row now that
                 // dispatch confirmed how many agents the command went to.
                 // Mirrors workflow_routes.cpp:1461-1463.
@@ -5972,7 +6483,415 @@ McpServer::HandlerFn McpServer::build_handler(
                 // The plain JSON below answers this POST either way - GET-only
                 // mode NEVER emits a second final response (no pin, no final
                 // frame; the H2/G9-class byte test pins this).
-                if (bridge_active) {
+                // ── S6 (2f PR 3b, C8): arm STREAMING and install the SSE provider ──
+                // The POST response itself becomes the progress channel: frames as
+                // they happen, the JSON-RPC result LAST, then EOF. Any outcome
+                // other than a clean arm falls through to the plain JSON below -
+                // the request is still perfectly answerable, and a degraded answer
+                // beats an error.
+                if (streamed_active) {
+                    const auto outcome =
+                        bridge->arm(bridge_sid, id, McpStreamBridge::ArmMode::kStreaming, result);
+                    if (outcome == McpStreamBridge::ArmOutcome::kArmed) {
+                        // The sink is a WAKE CHANNEL, not a frame queue: a streamed
+                        // record publishes ring-only, so the pump asks the bridge
+                        // what to write and the projector pokes this to say "now".
+                        // CONTAINED (safe-1): arm() has ALREADY moved the record to
+                        // kStreaming, and both calls below allocate - make_shared
+                        // obviously, bind_post_sink through make_key. A throw from
+                        // either landed in the OUTER catch, whose
+                        // park_after_dispatch_failure CASes from kArming and so
+                        // returns false for a kStreaming record: the record was
+                        // stranded kStreaming with no sink and no provider until the
+                        // 600 s streaming_park_after backstop, holding a global
+                        // record slot and one of the session's four streamed charges,
+                        // with NO audit row for a 500 on a dispatched, still-running
+                        // MUTATING fleet command. The comment below already named
+                        // that failure as the reason the cid mint moved inside its
+                        // try; these two siblings were left outside it.
+                        //
+                        // A throw here is the same EVENT as bind returning nullopt -
+                        // no sink was installed - so it takes the identical degrade
+                        // path rather than inventing a second one.
+                        std::shared_ptr<mcp::sse_bus::SseSinkState> sink;
+                        std::optional<std::string> key;
+                        try {
+                            sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+                            key = bridge->bind_post_sink(bridge_sid, id, sink);
+                        } catch (...) { // NOLINT(bugprone-empty-catch) - degrade below
+                            key.reset();
+                        }
+                        if (!key.has_value()) {
+                            // Nothing was installed, so the record must not stay
+                            // kStreaming waiting for a closer that will never come.
+                            // Contained: this is cleanup, and a cleanup failure must
+                            // not replace the answer we can still give.
+                            try {
+                                (void)bridge->on_post_closed(bridge_sid, id);
+                            } catch (...) { // NOLINT(bugprone-empty-catch)
+                            }
+                            bridge_degrade("bind_post_sink_failed");
+                            stream_lease.reset();
+                        } else {
+                            // Everything from here to the install is fallible and
+                            // runs with the record already kStreaming, so its own
+                            // catch owns BOTH the park and the answer. Two arms are
+                            // needed because the key exists only inside this branch:
+                            // before bind there is no key to close by.
+                            // A REFERENCE, not a copy (safe-1): a copy allocates, and
+                            // it allocated here - outside the try below, with the
+                            // record already kStreaming. `key` outlives every use, so
+                            // binding by reference removes the hazard outright rather
+                            // than containing it.
+                            const std::string& record_key = *key;
+                            // DECLARED outside the try so the catch can stamp the
+                            // same id into its audit row and its A4 body; MINTED
+                            // inside it, because minting allocates and by this point
+                            // arm() has already moved the record to kStreaming. A
+                            // throw from the mint out here would miss this branch's
+                            // catch and land in the outer one, whose
+                            // park_after_dispatch_failure CASes from kArming and so
+                            // returns false for a kStreaming record: no park, and NO
+                            // audit row for a 500 on a dispatched, still-running
+                            // MUTATING fleet command. (The lease IS released on that
+                            // path - stream_lease.reset() below, and ~optional
+                            // regardless - so this used to overclaim, safe-2.) The
+                            // catch reads an empty cid only in the single case where
+                            // no id was ever stamped anywhere.
+                            std::string cid;
+                            try {
+                                cid = yuzu::server::detail::make_correlation_id();
+                                // Stamped on the response HERE rather than with the
+                                // SSE headers further down: every throw between the
+                                // two would otherwise answer 500 with a body and an
+                                // audit row carrying a cid the response header does
+                                // not, which is exactly the unjoinable-identifiers
+                                // problem this id exists to prevent. Set once only -
+                                // httplib EMPLACES headers into a multimap, so the
+                                // catch must not set it a second time.
+                                res.set_header("X-Correlation-Id", cid);
+                                // Built BEFORE the install: once the provider is
+                                // attached the headers are sealed and a throw can no
+                                // longer be answered, so nothing that allocates may
+                                // remain after it.
+                                const std::string attach_detail =
+                                    "cid=" + cid + " surface=post execution_id=" + execution_id;
+                                // Built BEFORE the install too, for the same reason:
+                                // once the content provider is set httplib IGNORES
+                                // res.body, so a throw from a post-install allocation
+                                // would hand the peer a 500 status AND a live SSE
+                                // stream from a record the catch has already parked.
+                                // Nothing after set_chunked_content_provider may
+                                // allocate.
+                                const std::string success_detail =
+                                    std::string("command_id=") + command_id +
+                                    " execution_id=" + execution_id + " surface=post";
+                                const std::string audit_sid =
+                                    yuzu::server::detail::sanitize_detail_value(
+                                        bridge_sid.substr(0, 8));
+                                // Stamped, not re-derived: this row is written from
+                                // ~Response, by which time a revoked credential can
+                                // no longer be resolved - and a revocation close is
+                                // exactly the row that must still name its actor.
+                                // Derived EXACTLY as the GET handler derives it, so
+                                // the two surfaces cannot disagree about who acted.
+                                mcp::StreamAuditPrincipal audit_principal{
+                                    .id = session->username,
+                                    .role = auth::role_to_string(auth::effective_role(*session)),
+                                    .cls = session->principal_kind == "engine"
+                                               ? std::string("engine")
+                                               : std::string{}};
+                                auto req_copy = std::make_shared<httplib::Request>(req);
+                                // Headers only from here on: revalidate reads the
+                                // credential headers, the close audit reads remote_addr
+                                // and User-Agent. The BODY can be up to
+                                // kMcpMaxRequestBodyBytes and httplib already keeps the
+                                // original alive for the provider's life, so retaining a
+                                // second copy for up to the response cap is pure
+                                // duplicate footprint at fleet scale.
+                                req_copy->body.clear();
+                                req_copy->body.shrink_to_fit();
+
+                                auto revalidate = [req_copy, principal = session->username,
+                                                   revalidate_fn]() -> mcp::StreamRevalidate {
+                                    if (!revalidate_fn) {
+                                        return mcp::StreamRevalidate::kValid; // test seam
+                                    }
+                                    return revalidate_fn(*req_copy, principal);
+                                };
+                                // Also the TTL slide: a live streamed POST keeps its
+                                // session alive exactly as a GET tick does.
+                                auto session_alive = [mcp_sessions, bridge_sid,
+                                                      principal = session->username] {
+                                    return mcp_sessions->validate_and_touch(bridge_sid, principal) ==
+                                           McpSessionRegistry::ValidateResult::kValid;
+                                };
+                                auto take_batch = [bridge, record_key](bool cap_expired) {
+                                    return bridge->take_post_batch(record_key, cap_expired);
+                                };
+                                auto on_final_written = [bridge, record_key] {
+                                    (void)bridge->on_final_written(record_key);
+                                };
+
+                                mcp::McpPostPump::Config pump_cfg{};
+                                pump_cfg.revalidate_grace_jitter_max =
+                                    pump_cfg.revalidate_grace / 2;
+                                pump_cfg.revalidate_max_staleness =
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        EnginePrincipalStore::kAuthCacheTtl);
+                                // Restated at the second install site for the same
+                                // reason it is stated at the first (#2367): raising
+                                // the cache TTL past the grace window would leave a
+                                // fully-aged entry with no grace at all. #2447: this
+                                // reads the engine-liveness half ONLY - never touch
+                                // the token half.
+                                static_assert(
+                                    EnginePrincipalStore::kAuthCacheTtl * 4 <=
+                                        mcp::kMcpRevalidateGraceDefault,
+                                    "engine liveness cache TTL must stay well under the "
+                                    "revalidate grace window (#2367) - otherwise a fully-aged "
+                                    "entry leaves no grace at all");
+                                auto pump = std::make_shared<mcp::McpPostPump>(
+                                    sink, std::move(take_batch), std::move(on_final_written),
+                                    std::move(revalidate), std::move(session_alive), pump_cfg,
+                                    mcp::McpPostPump::ClockFn{}, metrics, cid, execution_id);
+
+                                // Resolved once, here, so the releaser never has to
+                                // look a metric up in a destructor. Nullable: metrics
+                                // is an optional dependency and streaming does not
+                                // require it.
+                                yuzu::Gauge* const post_gauge =
+                                    metrics != nullptr
+                                        ? &metrics->gauge("yuzu_mcp_post_streams_active")
+                                        : nullptr;
+                                // Gauge::increment locks and is NOT noexcept, so the
+                                // releaser must only undo an increment that actually
+                                // happened - otherwise a throw here leaves the gauge
+                                // permanently negative.
+                                auto incremented = std::make_shared<bool>(false);
+                                // The lease is move-only and httplib's releaser is a
+                                // copyable std::function, so it cannot be captured
+                                // directly. The GET path dodges this by keeping the
+                                // lease inside its sink; a streamed POST sink has no
+                                // such home, so give it one here.
+                                auto lease_home =
+                                    std::make_shared<yuzu::server::detail::StreamBudget::Lease>(
+                                        std::move(*stream_lease));
+                                stream_lease.reset();
+
+                                // httplib emplaces this header rather than replacing
+                                // it, so the application/json set at handler entry
+                                // would ride along as a SECOND Content-Type (see the
+                                // note at the DELETE handler). Drop it first.
+                                res.headers.erase("Content-Type");
+                                // X-Correlation-Id was set at the mint, above.
+                                res.set_header("Cache-Control", "no-cache");
+                                res.set_header("X-Accel-Buffering", "no");
+                                res.set_header("X-Content-Type-Options", "nosniff");
+
+                                auto releaser = [bridge, record_key, pump, lease_home, post_gauge,
+                                                 incremented, req_copy, audit_principal, audit_sid,
+                                                 execution_id, cid, principal_audit_fn,
+                                                 audit_fn](bool) noexcept {
+                                    // Ordered by what is owed to whom: the record's
+                                    // lifecycle and the admission slot FIRST, because
+                                    // they gate other requests, and only then the
+                                    // observability, which can fail without harming
+                                    // anyone. Runs inside ~Response - a throw from
+                                    // here is std::terminate (#2037's class).
+                                    try {
+                                        (void)bridge->on_post_closed_keyed(record_key);
+                                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                                    }
+                                    lease_home->release();
+                                    try {
+                                        if (post_gauge != nullptr && *incremented) {
+                                            post_gauge->decrement();
+                                        }
+                                        auto reason = pump->close_reason();
+                                        if (reason == mcp::McpStreamClose::kNone) {
+                                            // The modal case: httplib checks peer
+                                            // liveness BEFORE each tick, so a client
+                                            // that goes away is often never seen by
+                                            // the pump at all. `none` is also outside
+                                            // the closed label set.
+                                            reason = mcp::McpStreamClose::kClientGone;
+                                        }
+                                        // cid joins this row to the attach row and to
+                                        // the client's X-Correlation-Id; role_as_of
+                                        // records that the actor was captured at
+                                        // attach, not re-derived now (it may no longer
+                                        // resolve). The GET close row carries both.
+                                        const std::string detail =
+                                            std::string("reason=") + mcp::to_string(reason) +
+                                            " cid=" + cid + " surface=post execution_id=" +
+                                            execution_id + " role_as_of=attach";
+                                        if (principal_audit_fn) {
+                                            (void)yuzu::server::detail::
+                                                try_persist_audit_for_principal(
+                                                    principal_audit_fn, *req_copy,
+                                                    "mcp.stream.close", "success", audit_principal,
+                                                    "McpSession", audit_sid, detail);
+                                        } else {
+                                            (void)yuzu::server::detail::try_persist_audit(
+                                                audit_fn, *req_copy, "mcp.stream.close", "success",
+                                                "McpSession", audit_sid, detail);
+                                        }
+                                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                                        // The slot and the record are already home.
+                                    }
+                                };
+
+                                res.set_chunked_content_provider(
+                                    "text/event-stream",
+                                    [pump](std::size_t, httplib::DataSink& s) {
+                                        return pump->pump_once(
+                                            [&s](const char* d, std::size_t n) {
+                                                return s.write(d, n);
+                                            });
+                                    },
+                                    yuzu::server::detail::adopt_quota_slot_into_stream(
+                                        std::move(releaser)));
+
+                                // EVERYTHING FROM HERE TO THE `return` IS CONTAINED
+                                // (sec-S1). The rule stated above the pre-built
+                                // strings - "Nothing after
+                                // set_chunked_content_provider may allocate" - was
+                                // violated three times right here: Gauge::increment
+                                // takes a lock_guard and is not noexcept, the attach
+                                // audit passes a 17-char literal into a std::string
+                                // parameter (past libstdc++'s 15-char SSO), and
+                                // mcp_audit builds "mcp." + tool_name. A throw from
+                                // any of them reached the outer catch, which parks
+                                // the record, audits FAILURE for a stream that is
+                                // live and correct, and writes a 500 whose A4 body
+                                // httplib DISCARDS because the content provider is
+                                // already installed - so the client got a bare 500
+                                // plus a chunked SSE body and no execution_id for a
+                                // mutating fleet command that is still running, and
+                                // the parked record then answered on_final_written
+                                // false, leaking a pin and one of the session's four
+                                // streamed slots until session death.
+                                //
+                                // The stream is live and correct at this point. None
+                                // of the bookkeeping below is worth destroying a
+                                // correct response over: the attach-audit failure
+                                // already has its own counter, and a lost success
+                                // row is an evidence gap, not a wrong answer.
+                                try {
+                                    if (post_gauge != nullptr) {
+                                        post_gauge->increment();
+                                        *incremented = true;
+                                    }
+                                // AFTER the install, deliberately - an attach
+                                // audited before a failed install records a stream
+                                // that never existed. The cost is that the headers
+                                // are already sealed, so unlike the GET tail this
+                                // cannot answer a failed audit with Sec-Audit-Failed;
+                                // set-and-proceed is the only posture left, and the
+                                // stream is real either way.
+                                    if (!yuzu::server::detail::try_persist_audit(
+                                        audit_fn, req, "mcp.stream.attach", "success",
+                                        "McpSession", audit_sid, attach_detail)) {
+                                    // Its OWN counter, not a bridge_degrade reason:
+                                    // that family means "this request fell back to the
+                                    // plain path", and this one did not - the stream is
+                                    // live and correct, only its evidence is missing.
+                                    // The headers are sealed by the install, so unlike
+                                    // GET there is no Sec-Audit-Failed to set; this
+                                    // counter is the only signal.
+                                        if (metrics != nullptr) {
+                                            try {
+                                                metrics
+                                                    ->counter(
+                                                        "yuzu_mcp_stream_attach_audit_failures_"
+                                                        "total")
+                                                    .increment();
+                                            } catch (...) { // NOLINT(bugprone-empty-catch)
+                                            }
+                                        }
+                                    }
+                                    mcp_audit("success", success_detail);
+                                } catch (...) { // NOLINT(bugprone-empty-catch) - deliberate
+                                    // The response is already committed and the stream
+                                    // is live. There is nothing to answer a throw WITH,
+                                    // which is exactly why it must not propagate.
+                                }
+                                return; // the provider IS the response
+                            } catch (...) {
+                                // Post-dispatch: park (the record keeps its
+                                // subscription and its latched terminal, so a GET
+                                // resume still gets the answer) and tell the client
+                                // where to find the result. Both cleanup calls are
+                                // contained - neither may replace the answer.
+                                try {
+                                    (void)bridge->on_post_closed_keyed(record_key);
+                                } catch (...) { // NOLINT(bugprone-empty-catch)
+                                }
+                                stream_lease.reset();
+                                bridge_degrade("stream_install_failed");
+                                // A durable row, not just a counter. The command IS
+                                // dispatched and running, and `on_post_closed_keyed`
+                                // is a bare state transition that audits nothing - so
+                                // without this a mutating fleet command could fail
+                                // here and leave no evidence beyond an anonymous
+                                // metric. Its sibling 500 (post_dispatch_threw) has
+                                // always audited via park_after_dispatch_failure;
+                                // the two must be evidence-equivalent.
+                                mcp_audit("failure",
+                                          std::string("stream_install_failed cid=") + cid +
+                                              " execution_id=" + execution_id +
+                                              " command_id=" + command_id);
+                                res.status = 500;
+                                // The remediation names execution_id, so the body must
+                                // CARRY it - a 500 on a MUTATING fleet command that is
+                                // still running is exactly the case where "go look it
+                                // up" is useless without the handle, and a client that
+                                // cannot locate the work retries it (governance UP-3;
+                                // the C8 commit message claimed this already worked).
+                                // The SAME cid the response header and the audit row
+                                // carry - minting a fresh one here left a 500 on a
+                                // still-running mutating command with three
+                                // identifiers that could not be joined.
+                                res.set_content(
+                                    a4_error_exec(kInternalError,
+                                                  "streamed response could not be established",
+                                                  "the command IS running - fetch the result by "
+                                                  "execution_id (get_execution_status), or retry "
+                                                  "without an SSE Accept",
+                                                  execution_id, cid),
+                                    "application/json");
+                                return;
+                            }
+                        }
+                    } else {
+                        // Not armed, so nothing streams. Each outcome means
+                        // something different and only one of them is routine.
+                        if (outcome == McpStreamBridge::ArmOutcome::kAlreadyArmed) {
+                            // A caller-invariant violation: some other path armed
+                            // this key. It may already be kStreaming with no sink
+                            // and no provider, which nothing would close - park it
+                            // rather than leave it to the 600s backstop.
+                            try {
+                                (void)bridge->on_post_closed(bridge_sid, id);
+                            } catch (...) { // NOLINT(bugprone-empty-catch)
+                            }
+                            bridge_degrade("arm_already_armed");
+                        } else if (outcome == McpStreamBridge::ArmOutcome::kDegradedGetOnly) {
+                            // A cancel arrived while arming and arm consumed it. The
+                            // record is GET-only now and released its own charge;
+                            // the plain response below still answers the call.
+                            bridge_degrade("arm_cancelled");
+                        } else {
+                            // kAborted | kNotFound - abandon won, or the record is
+                            // already gone. Nothing to clean up.
+                            bridge_degrade("arm_not_armed");
+                        }
+                        streamed_active = false;
+                        stream_lease.reset();
+                    }
+                }
+                if (bridge_active && !streamed_active) {
                     // GUARD (Sol code-review finding, 2026-07-23): passing the
                     // lvalue `result` to arm()'s by-value result_base copies it,
                     // and arm() builds a fallback string, both BEFORE the phase
@@ -6005,6 +6924,36 @@ McpServer::HandlerFn McpServer::build_handler(
                                          " execution_id=" + execution_id);
                 res.set_content(success_response(id, result), "application/json");
                 return;
+                } catch (...) {
+                    // Close of the post-dispatch containment envelope opened above.
+                    if (!streamed_active) {
+                        throw; // plain path keeps today's behaviour exactly
+                    }
+                    // The record never reached kStreaming (the install branch owns
+                    // that window and answers its own failures), so it is still
+                    // kArming with the command running. Park it: the subscription
+                    // and any latched terminal survive, so a GET resume still
+                    // delivers the answer. NOT abandon, which would erase them, and
+                    // NOT mark_cancelled - unlike the dispatch-throw and zero-agents
+                    // paths above, this command was dispatched and is still going.
+                    try {
+                        (void)bridge->park_after_dispatch_failure(bridge_sid, id,
+                                                                  session->username);
+                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                    }
+                    stream_lease.reset();
+                    bridge_degrade("post_dispatch_threw");
+                    res.status = 500;
+                    res.set_content(
+                        a4_error_exec(kInternalError,
+                                      "the command was dispatched but the response could not be "
+                                      "completed",
+                                      "the command IS running - fetch the result by execution_id "
+                                      "(get_execution_status)",
+                                      execution_id),
+                        "application/json");
+                    return;
+                }
             }
 
             // ── set_tag (#289) ────────────────────────────────────────────
@@ -6035,14 +6984,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // H1 (PR #1796): per-device scope gate — a management-group-
                 // confined operator may tag only devices inside their groups.
-                // Runs AFTER agent_id parse (the scope needs the target); falls
-                // back to the global perm_fn when unwired (test harness).
-                if (scoped_perm_fn) {
-                    if (!scoped_perm_fn(req, res, "Tag", "Write", agent_id))
-                        return;
-                } else if (!perm_fn(req, res, "Tag", "Write")) {
+                // Runs AFTER agent_id parse (the scope needs the target).
+                // K-06/CDX-R4-09: fail CLOSED when unwired (never widen to the
+                // global perm_fn), matching the SoftwareLicensing tool above and
+                // the REST tag twins (ADR-0033 §1).
+                if (!scoped_perm_fn) {
+                    res.set_content(error_response(id, kInternalError, "scope gate not configured"),
+                                    "application/json");
                     return;
                 }
+                if (!scoped_perm_fn(req, res, "Tag", "Write", agent_id))
+                    return;
                 auto set_res = tag_store->set_tag_checked(agent_id, key, value, "mcp");
                 if (!set_res) {
                     mcp_audit("failure", agent_id + ":" + key);
@@ -6088,12 +7040,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 // H1 (PR #1796): per-device scope gate (see set_tag above).
-                if (scoped_perm_fn) {
-                    if (!scoped_perm_fn(req, res, "Tag", "Delete", agent_id))
-                        return;
-                } else if (!perm_fn(req, res, "Tag", "Delete")) {
+                // K-06/CDX-R4-09: fail CLOSED when unwired, never widen to perm_fn.
+                if (!scoped_perm_fn) {
+                    res.set_content(error_response(id, kInternalError, "scope gate not configured"),
+                                    "application/json");
                     return;
                 }
+                if (!scoped_perm_fn(req, res, "Tag", "Delete", agent_id))
+                    return;
                 bool deleted = tag_store->delete_tag(agent_id, key);
                 if (!deleted) {
                     // 404-equivalent (mirror the REST 404 on a missing tag).
@@ -6174,13 +7128,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // H1 (PR #1796): per-device scope gate — a management-group-
                 // confined operator may isolate only devices inside their groups.
-                // Falls back to the global perm_fn when unwired (test harness).
-                if (scoped_perm_fn) {
-                    if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
-                        return;
-                } else if (!perm_fn(req, res, "Security", "Execute")) {
+                // governance UP-9: FAILS CLOSED when unwired (K-06/CDX-R4-09),
+                // matching set_tag/delete_tag above — this was the last write tool
+                // still widening to the global perm_fn on an unwired scope gate.
+                if (!scoped_perm_fn) {
+                    mcp_audit("failure", "scope gate not configured");
+                    res.set_content(error_response(id, kInternalError, "scope gate not configured"),
+                                    "application/json");
                     return;
                 }
+                if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
+                    return;
                 // Server-side input validation BEFORE any store write or dispatch
                 // (governance cppsafety-SHOULD-1 / UP-7). The whitelist ultimately
                 // reaches the agent's netsh/iptables/pf sink; the agent already
@@ -6266,9 +7224,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!whitelist.empty())
                         qparams["whitelist_ips"] = whitelist;
                     try {
+                        // governance UP-9: thread a set CONFINED to the single
+                        // scope-gate-checked target, not an unfiltered VisibleSet{} —
+                        // defense in depth matching the bundle/execute_instruction
+                        // dispatch arms (this was the last arm still passing
+                        // unfiltered on a single already-authorized target).
                         std::tie(command_id, agents_reached) = dispatch_fn(
                             "quarantine", "quarantine", {agent_id}, /*scope=*/"", qparams,
-                            /*execution_id=*/"");
+                            /*execution_id=*/"",
+                            yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{agent_id}});
                     } catch (const std::exception& e) {
                         spdlog::error("MCP quarantine_device: isolation dispatch failed: {}",
                                       e.what());
@@ -6301,10 +7265,21 @@ McpServer::HandlerFn McpServer::build_handler(
             // device. Thin wrapper over the shared BundleOrchestrator — the SAME
             // transport-agnostic core as POST /api/v1/bundles. Tier + approval are
             // already enforced by the C8 generic block (execute_bundle ∈
-            // kToolSecurity); this mirrors execute_instruction (perm_fn only here).
+            // kToolSecurity).
+            //
+            // governance C4/sec-4: a bundle targets ONE device, so authorization is
+            // the per-target confinement below (exec_visible_fn + in_scope) — NOT
+            // ALSO a targetless global Execution:Execute perm_fn gate. Keeping both
+            // (as this handler previously did) is STRICTER than REST's
+            // /api/v1/bundles twin (scoped_perm_fn only, no global gate), so a
+            // management-group-scoped operator with no GLOBAL Execution:Execute
+            // grant was admitted by REST and 403'd here — the twins must agree.
+            // Dropping the global gate matches REST's per-target-only posture; a
+            // caller with neither a global grant NOR a scoped one for this agent
+            // still gets denied below by `in_scope` (compose_exec_visible resolves
+            // to a present-empty set when the caller holds no Execution:Execute
+            // grant at all, scoped or global — see authz_model.hpp).
             if (tool_name == "execute_bundle") {
-                if (!perm_fn(req, res, "Execution", "Execute"))
-                    return;
                 if (!bundle_orch) {
                     res.set_content(
                         error_response(id, kInternalError, "Command dispatch unavailable"),
@@ -6339,9 +7314,34 @@ McpServer::HandlerFn McpServer::build_handler(
                                         const std::string& detail) {
                     audit_fn(req, verb, result_status, type, tid, detail);
                 };
+                // #1788: a bundle targets ONE device, so confine it HERE (not in the
+                // orchestrator) — the single target must be in the caller's
+                // Execution:Execute visible set. Fail closed when unwired (CDX-R6-02).
+                auto exec_visible =
+                    exec_visible_fn ? exec_visible_fn(*session)
+                                    // CDX-R6-02: unwired == FAIL CLOSED. A present EMPTY set
+                                    // (not nullopt) means "no target visible" -> nothing
+                                    // dispatched. ADR-0033 §1 forbids inferring unfiltered
+                                    // authority from an omitted applicable filter (same
+                                    // posture as the tag ScopedPermFn, K-06). Production
+                                    // always wires it (server.cpp); a test wanting unfiltered
+                                    // wires a callback that returns nullopt.
+                                    : yuzu::server::authz::deny_all();
+                if (!yuzu::server::authz::in_scope(exec_visible, agent_id)) {
+                    mcp_audit("failure", "agent_id=" + agent_id + " out_of_scope");
+                    res.set_content(
+                        error_response(id, kInvalidParams, "target agent not in your visible scope"),
+                        "application/json");
+                    return;
+                }
                 BundleOrchestrator::DispatchResult r;
                 try {
-                    r = bundle_orch->dispatch(agent_id, *specs, session->username, bundle_audit);
+                    // governance UP-8: thread the exec_visible ALREADY derived +
+                    // checked above through to the orchestrator, rather than let it
+                    // default to unfiltered — defense in depth if a future dispatch_fn
+                    // starts consulting it itself.
+                    r = bundle_orch->dispatch(agent_id, *specs, session->username, bundle_audit,
+                                              exec_visible);
                 } catch (const std::exception& e) {
                     spdlog::error("MCP execute_bundle: dispatch failed: {}", e.what());
                     mcp_audit("failure", std::string("dispatch_exception: ") + e.what());
@@ -6387,6 +7387,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 const bool is_admin = session->role == auth::Role::admin;
                 auto agg = bundle_orch->collate(bundle_id, session->username, is_admin);
                 if (!agg) {
+                    // #2691 (Doomgoose finding #3): kDegraded is a real store
+                    // read failure on a bundle that WAS found and owned — a
+                    // retryable kInternalError, never the same terminal
+                    // "not found" (or false "denied" audit row) a genuinely-
+                    // absent/not-owned bundle gets.
+                    if (agg.error() == CollateError::kDegraded) {
+                        mcp_audit("failure", "response store degraded: " + bundle_id);
+                        res.set_content(
+                            a4_error(kInternalError, "Response store degraded", {},
+                                     /*retry_after_ms=*/5000),
+                            "application/json");
+                        return;
+                    }
                     mcp_audit("denied", "not found or not owned: " + bundle_id);
                     res.set_content(error_response(id, kInvalidParams, "bundle not found"),
                                     "application/json");
@@ -7220,13 +8233,13 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "list_engine_roles") {
-                if (!tier_allows(tier, "Security", "Read")) {
+                if (!tier_allows(tier, "EnginePrincipal", "Read")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Security", "Read"))
+                if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                     return;
                 if (!rbac_store || !rbac_store->is_open()) {
                     res.set_content(error_response(id, kInternalError, "RBAC store not available"),
@@ -7386,13 +8399,13 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "list_engine_principals") {
-                if (!tier_allows(tier, "Security", "Read")) {
+                if (!tier_allows(tier, "EnginePrincipal", "Read")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Security", "Read"))
+                if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                     return;
                 if (deny_if_engine_session())
                     return;
@@ -7433,13 +8446,13 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "get_engine_principal") {
-                if (!tier_allows(tier, "Security", "Read")) {
+                if (!tier_allows(tier, "EnginePrincipal", "Read")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Security", "Read"))
+                if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                     return;
                 if (deny_if_engine_session())
                     return;
@@ -8531,7 +9544,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto doc = yuzu::server::build_permissions_catalog(*rbac_store);
+                // #2376: same split as the REST twin — probe for the grid
+                // permission, never deny the whole tool over it.
+                httplib::Response perm_probe;
+                const bool include_roles =
+                    perm_fn(req, perm_probe, "UserManagement", "Read");
+                auto doc =
+                    yuzu::server::build_permissions_catalog(*rbac_store, include_roles);
                 auto result = tool_result(doc.json, kObjectOutputSchema);
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");
@@ -8641,11 +9660,13 @@ McpServer::HandlerFn McpServer::build_handler(
     };
 }
 
-// ── GET / DELETE handlers (Streamable HTTP transport, 2f PR 1) ──────────────
+// ── GET / DELETE handlers (Streamable HTTP transport, 2f) ───────────────────
 // mcp_disabled / streaming_disabled are captured by pointer (live cfg_ reads),
-// mirroring build_handler's kill-switch treatment. GET is a 405 placeholder this
-// rung (the SSE channel lands in 2f PR 2); DELETE terminates a principal-bound
-// session (200) or 404s an unknown/foreign one (no cross-principal oracle).
+// mirroring build_handler's kill-switch treatment. GET is the session's live
+// server->client SSE channel - attach, replay, heartbeat, per-tick credential
+// revalidation (it was a 405 placeholder in PR 1 only; the 405 now survives just
+// under --mcp-no-streaming). DELETE terminates a principal-bound session (200)
+// or 404s an unknown/foreign one (no cross-principal oracle).
 
 McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_fn,
                                                   const bool* mcp_disabled,
@@ -8834,6 +9855,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 yuzu::server::detail::AgentRegistry* agent_registry,
                                 ScopedPermFn scoped_perm_fn, McpSessionRegistry* sessions,
                                 const bool* mcp_streaming_disabled,
+                                const bool* mcp_streamed_post_enabled,
                                 std::vector<std::string> allowed_origins,
                                 SoftwareLicensingStore* software_licensing_store,
                                 EnginePrincipalStore* engine_principal_store,
@@ -8842,7 +9864,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 yuzu::server::detail::StreamBudget* stream_budget,
                                 StreamRevalidateFn revalidate_fn,
                                 std::size_t mcp_max_streams_per_principal,
-                                StreamPrincipalAuditFn principal_audit_fn) {
+                                StreamPrincipalAuditFn principal_audit_fn,
+                                ExecVisibleFn exec_visible_fn) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
@@ -8865,9 +9888,16 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            std::move(inventory_scope_fn), metrics,
                            std::move(app_perf_providers), quarantine_store,
                            std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
-                           sessions, mcp_streaming_disabled, std::move(allowed_origins),
+                           sessions, mcp_streaming_disabled, mcp_streamed_post_enabled,
+                           std::move(allowed_origins),
                            software_licensing_store, engine_principal_store, access_review_store,
-                           auth_db, directory_sync));
+                           auth_db, directory_sync, std::move(exec_visible_fn),
+                           // 2f PR 3b: the streamed-POST arm leases from the SAME
+                           // budget as the GET channel above (which COPIED these, so
+                           // moving here is safe) - one arithmetic for every
+                           // held-open worker, whichever verb pinned it.
+                           stream_budget, std::move(revalidate_fn),
+                           std::move(principal_audit_fn)));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).

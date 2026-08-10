@@ -328,6 +328,8 @@ Every issue carries exactly one type label; every non-`roadmap` issue also carri
 
 Single-context layout — `CONTEXT.md` at the repo root, ADRs under `docs/adr/`. See `docs/agents/domain.md`.
 
+**Numbering a new ADR:** the number space is author-namespaced — `0xxx` platform · `1xxx` Dave Rae · `2xxx` Fraser Jarvis · `3xxx` Alex Young · `4xxx` Andy Younie. Take the next free number **in your own block**, not the next free number overall. Two numbers currently host two accepted ADRs each (`0016`, `0031`), so cite those by filename rather than number. Full convention + the collision table: `docs/adr/README.md`.
+
 ## AGENTS.md updates
 
 Architectural decisions, new stores, new plugin patterns, churning subsystems, and cross-cutting concerns belong here so future Codex sessions read them before touching code. Stable reference material that an agent already loads belongs in `docs/` with a one-line pointer here. See memory `feedback_claude_md_scope.md` for the heuristic — Build / Release stay resident because the work is unstable or local-host-specific; mature areas route to `docs/` with a short "read this first" statement once an agent/skill/hook carries the load (precedent: the Erlang gateway build/quality section moved to `docs/erlang-gateway-build.md`).

@@ -11,6 +11,8 @@
  * SQLite table names (process_live, tcp_hourly) via a whitelist translation.
  */
 
+#include <yuzu/plugin.h>
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -53,7 +55,39 @@ struct GranularityDef {
 // `kUnsupported`         -- platform cannot supply the data at all (e.g.,
 //                           `services` on a kernel that has no service
 //                           manager)
-enum class OsSupportStatus { kSupported, kSupportedConstrained, kPlanned, kUnsupported };
+//
+// Unified with the ABI4 plugin descriptor's per-OS support enum (#2204):
+// TAR is the first adopter, so these four values are pinned 1:1 to
+// YuzuSupportLevel's four declared values (YUZU_SUPPORT_UNDECLARED is
+// deliberately never used here — every registry row always declares one of
+// the other four). This is the single source of truth both the `compatibility`
+// action (tar_plugin.cpp's do_compatibility()) and any future capability-matrix
+// consumer derive their output from, rather than each maintaining its own copy.
+enum class OsSupportStatus {
+    kSupported           = YUZU_SUPPORT_SUPPORTED,
+    kSupportedConstrained = YUZU_SUPPORT_CONSTRAINED,
+    kPlanned             = YUZU_SUPPORT_PLANNED,
+    kUnsupported         = YUZU_SUPPORT_UNSUPPORTED,
+};
+
+/**
+ * Convert an OsSupportStatus to the shared ABI4 descriptor enum. Since the
+ * two are pinned 1:1 by value, this is a plain reinterpretation — but going
+ * through a named function keeps the "single source of truth" claim
+ * mechanically checkable rather than relying on every call site getting the
+ * cast right.
+ */
+[[nodiscard]] constexpr YuzuSupportLevel to_yuzu_support_level(OsSupportStatus status) noexcept {
+    return static_cast<YuzuSupportLevel>(status);
+}
+
+/**
+ * Human-readable name for a support level, as surfaced by the `compatibility`
+ * action. The one place that maps YuzuSupportLevel to the operator-facing
+ * string — do_compatibility() derives its output from this rather than
+ * keeping its own switch.
+ */
+[[nodiscard]] std::string_view support_level_name(OsSupportStatus status);
 
 struct OsSupport {
     std::string_view os;             // "windows", "linux", "macos"

@@ -15,11 +15,15 @@
 
 #include "management_group_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp" // PgConn/PgResult for the mid-flight degrade injection
 #include "rbac_store.hpp"
+#include "test_mgmt_group_pg_helper.hpp" // PG-backed ManagementGroupStore (ADR-0042)
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <libpq-fe.h>
 
 #include <algorithm>
 #include <stdexcept>
@@ -60,8 +64,11 @@ yuzu::test::PgTestTemplate rbac_tpl{"rbacstore", [](const std::string& dsn) {
 struct Rig {
     PgPool pool;
     RbacStore rbac;
-    yuzu::test::TempDbFile mgmt_db{"yuzu_test_lrc_mgmt-"};
-    ManagementGroupStore mgmt{mgmt_db.path};
+    // ManagementGroupStore is a PG store (ADR-0042); the bundle SKIPs the
+    // TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset — so every case that
+    // constructs a Rig carries the [pg] tag.
+    yuzu::test::ManagementGroupStorePg mgmt_bundle;
+    ManagementGroupStore& mgmt = *mgmt_bundle;
     std::string gP, gC1, gC2, gS;
 
     explicit Rig(const std::string& dsn) : pool{{.conninfo = dsn, .size = 4}}, rbac{pool} {
@@ -212,8 +219,8 @@ TEST_CASE("authorize_list_read: RBAC disabled ⇒ AdmitAll (legacy-open)", "[lis
     REQUIRE(rbac_pool_.valid());
     RbacStore rbac{rbac_pool_}; // is_open() && !is_rbac_enabled() → legacy-open
     REQUIRE(rbac.is_open());
-    yuzu::test::TempDbFile mgmt_db{"yuzu_test_lrc_legacy-"};
-    ManagementGroupStore mgmt{mgmt_db.path};
+    yuzu::test::ManagementGroupStorePg mgmt_bundle;
+    ManagementGroupStore& mgmt = *mgmt_bundle;
 
     auto d = rbac.authorize_list_read("anyone", "Response", "Read", &mgmt);
     CHECK(d.decision == ListReadDecision::AdmitAll);
@@ -244,8 +251,8 @@ TEST_CASE("authorize_list_read: corrupt rbac.db ⇒ DenyAll, never AdmitAll (INV
     RbacStore bad{bad_pool};
     REQUIRE(!bad.is_open()); // precondition: migrations failed → store not open
 
-    yuzu::test::TempDbFile mgmt_db{"yuzu_test_lrc_corrupt_mgmt-"};
-    ManagementGroupStore mgmt{mgmt_db.path};
+    yuzu::test::ManagementGroupStorePg mgmt_bundle;
+    ManagementGroupStore& mgmt = *mgmt_bundle;
 
     // rbac_enforcement_in_effect(!is_open()) == true (enforce), so this must NOT
     // take the legacy-open AdmitAll branch — a corrupt store fails CLOSED.
@@ -372,4 +379,33 @@ TEST_CASE("authorize_list_read: same group allow+deny roles ⇒ AdmitScoped empt
     // Per-row gate agrees: deny wins for every member of the group.
     CHECK(!r.rbac.check_scoped_permission("split", "Response", "Read", "a_p", &r.mgmt));
     CHECK(!r.rbac.check_scoped_permission("split", "Response", "Read", "a_c1", &r.mgmt));
+}
+
+// Gate 3 QE BLOCKING: prove RbacStore's confinement gate DENIES when the
+// ManagementGroupStore degrades mid-flight — the seam ADR-0042 exists to close.
+// A CONFINED operator (group-scoped grant, no global short-circuit) whose
+// visible-set resolution hits a degraded mgmt store must fail closed (DenyAll),
+// never fall through to an unfiltered admit or a silent under-deny.
+TEST_CASE("authorize_list_read: a degraded mgmt store denies a confined operator (fail-closed)",
+          "[list_read][rbac][degrade][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    Rig r{rbac_db_.dsn()};
+    r.group_assign(r.gP, "alice", "RespReader"); // group-scoped allow → confined, no #1715(b)
+    // Healthy baseline: alice is confined (AdmitScoped), NOT DenyAll — so the
+    // DenyAll below is caused by the degrade, not by an absent grant.
+    REQUIRE(r.rbac.authorize_list_read("alice", "Response", "Read", &r.mgmt).decision !=
+            ListReadDecision::DenyAll);
+    // Break the mgmt store mid-flight: drop a confinement table so the
+    // subtree/member reads return a genuine query error.
+    {
+        yuzu::server::pg::PgConn c{PQconnectdb(r.mgmt_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult dr{PQexec(
+            c.get(), "DROP TABLE management_group_store.management_group_members CASCADE")};
+        REQUIRE(dr.ok());
+    }
+    CHECK(r.rbac.authorize_list_read("alice", "Response", "Read", &r.mgmt).decision ==
+          ListReadDecision::DenyAll);
+    // The per-agent scoped check on the same degraded store also fails closed.
+    CHECK_FALSE(r.rbac.check_scoped_permission("alice", "Response", "Read", "a_p", &r.mgmt));
 }

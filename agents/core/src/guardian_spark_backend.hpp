@@ -73,10 +73,20 @@ public:
         // around that firewall (reconcile treats a returned attach error as a plain
         // `return false`, which apply_rules does not count -> generation advanced ->
         // silent enforcement hole; Fable B4->B1 finding). The propagating throw is
-        // terminate-safe (GuardianRollback) and cannot corrupt the index (strong-guarantee
-        // add). What it CANNOT do is repair the engine's partial arm_impl state - that
-        // strong-guarantee gap, and the durable reconcile-side transient-vs-permanent
-        // generation-hold distinction, are tracked as PR-2 flip blockers in #2270.
+        // terminate-safe (GuardianRollback), cannot corrupt the index (strong-guarantee
+        // add), and since #2270 leaves no partial arm_impl state in the engine either.
+        // Precisely: a bad_alloc can escape arm_impl only from its pre-commit/in-lock
+        // phase, whose rollback restores armed_/sub_keys_ exactly, because past the
+        // commit every allocating statement left is inside a catch-all. The residuals
+        // are enumerated in arm_impl and deliberately not restated here. That is a
+        // statement about engine state, NOT a
+        // claim that the arm succeeded or that siblings are unaffected: a watch that
+        // fails to arm still fails for everyone sharing the key (#2270 UP-9, pre-existing).
+        // STILL OPEN (#2797): the returned-error arm of that same sentence. apply_rules
+        // discards reconcile_rule_locked's bool, so the generation-hold described above
+        // fires ONLY on a throw - a returned arm failure still advances the generation
+        // and strands the rule. Fixing it needs a transient-vs-permanent classification,
+        // which this std::string error channel cannot carry.
         return engine_->arm(consumer_, spec);
     }
 

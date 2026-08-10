@@ -219,6 +219,16 @@ const std::vector<pg::PgMigration>& migrations() {
                 value TEXT NOT NULL
             );
         )"},
+        // NOTE (#2376 task A, and any future securable addition): adding the
+        // `EnginePrincipal` securable deliberately did NOT get a migration
+        // here. `seed_defaults()` runs unconditionally on every construction
+        // and its `types[]` / Viewer-read-loop / Administrator-CRUD inserts
+        // are all ON CONFLICT DO NOTHING, so an EXISTING deployment picks up
+        // the new securable and its grants on the next boot with no
+        // migration at all — the same idempotent-additive-reseed path
+        // `AccessReview` and `SoftwareLicensing` used. A migration is needed
+        // only when a change cannot be expressed as an idempotent additive
+        // re-seed (e.g. deleting rows).
     };
     return kMigrations;
 }
@@ -312,7 +322,7 @@ void RbacStore::seed_defaults() {
          "ON CONFLICT (key) DO NOTHING");
 
     // Securable types.
-    const std::array<std::string_view, 22> types = {
+    const std::array<std::string_view, 23> types = {
         "Infrastructure",  "UserManagement",  "InstructionDefinition",
         "InstructionSet",  "Execution",       "Schedule",
         "Approval",        "Tag",             "AuditLog",
@@ -320,7 +330,16 @@ void RbacStore::seed_defaults() {
         "Security",        "Policy",          "DeviceToken",
         "SoftwareDeployment", "License",      "FileRetrieval",
         "GuaranteedState", "Inventory",       "AccessReview",
-        "SoftwareLicensing"};
+        // #2376 (task A) — engine-principal INVENTORY + grant-graph reads
+        // (list/get engine principals, list their fleet-wide roles) cut away
+        // from the over-broad Security:Read, which also gates unrelated
+        // operational reads (quarantine visibility, CA issued-certs, KEK
+        // status) that a follow-up change floors to admin-only when RBAC is
+        // disabled — flooring all of Security:Read would sweep those in too.
+        // Seeded to Administrator (CRUD via the loop below) + Viewer (Read,
+        // below) — the same two roles that reached the migrated routes via
+        // Security:Read before this cut.
+        "SoftwareLicensing", "EnginePrincipal"};
     for (auto t : types)
         exec("INSERT INTO rbac_store.securable_types (name, is_system) VALUES ($1, TRUE) "
              "ON CONFLICT (name) DO NOTHING",
@@ -427,11 +446,14 @@ void RbacStore::seed_defaults() {
     grant("ITServiceOwner", "GuaranteedState", "Push");
 
     // Viewer: read on all except Infrastructure.
+    // #2376 (task A) — Viewer held Security:Read (the only non-Administrator
+    // role that did), so it keeps equivalent access on the new
+    // EnginePrincipal securable.
     for (std::string_view t : {"UserManagement", "InstructionDefinition", "InstructionSet",
                                "Execution", "Schedule", "Approval", "Tag", "AuditLog", "Response",
                                "ManagementGroup", "ApiToken", "Security", "Policy", "DeviceToken",
                                "SoftwareDeployment", "License", "FileRetrieval", "GuaranteedState",
-                               "Inventory", "SoftwareLicensing"})
+                               "Inventory", "SoftwareLicensing", "EnginePrincipal"})
         grant("Viewer", t, "Read");
 
     // Reviewer.
@@ -1637,11 +1659,21 @@ bool RbacStore::check_scoped_permission(const std::string& username,
     if (!pg)
         return false;
 
+    // CONFINEMENT reads are now degrade-distinguishable (ADR-0042): a `nullopt`
+    // means the mgmt-store degraded (store-not-open / pool-acquire timeout /
+    // query error), NOT a genuine empty. Treat it as DenyAll (fail-closed) — a
+    // silent empty here would drop the agent's reachable groups and could admit
+    // a scoped grant that a DENY assignment should have blocked (fail-open).
     auto groups = mgmt_store->get_agent_groups(agent_id);
+    if (!groups)
+        return false; // mgmt-store degrade → deny
     std::unordered_set<std::string> reachable;
-    for (const auto& gid : groups) {
+    for (const auto& gid : *groups) {
         reachable.insert(gid);
-        for (const auto& aid : mgmt_store->get_ancestor_ids(gid))
+        auto ancestors = mgmt_store->get_ancestor_ids(gid);
+        if (!ancestors)
+            return false; // mgmt-store degrade → deny
+        for (const auto& aid : *ancestors)
             reachable.insert(aid);
     }
     if (reachable.empty())
