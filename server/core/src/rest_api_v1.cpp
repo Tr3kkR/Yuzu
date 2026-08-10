@@ -5,6 +5,7 @@
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
 #include "directory_sync.hpp"      // access-review read-model optional email enrichment
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
+#include "token_rotation_lookup.hpp"    // shared REST/MCP human-token rotation successor lookup (P2 #11)
 #include "baseline_store.hpp" // baseline-anchored per-device Guardian status route
 #include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
@@ -721,7 +722,7 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Revoke an API token", "tags": ["API Tokens"], "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Token revoked"}, "503": {"description": "Token store unavailable (service unavailable)"}}}
     },
     "/tokens/{token_id}/rotate": {
-      "post": {"summary": "Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3)", "tags": ["API Tokens"], "description": "Mints a successor token alongside the still-valid predecessor for the overlap window; requires ApiToken:Write and step-up on EVERY call (including an idempotent re-serve within the grace window). Self-service only — the caller must own the token; no admin override. The successor always inherits the predecessor's expires_at verbatim (rotation is lifetime-neutral).", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The token_id of the token being rotated (the predecessor)"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires ApiToken:Write"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, or no active credential to rotate (ambiguous with a transient store read failure — retry, or mint a new token if genuinely absent)"}}}
+      "post": {"summary": "Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3)", "tags": ["API Tokens"], "description": "Mints a successor token alongside the still-valid predecessor for the overlap window; requires ApiToken:Write and step-up on EVERY call (including an idempotent re-serve within the grace window). Self-service only — the caller must own the token; no admin override. The successor always inherits the predecessor's expires_at verbatim (rotation is lifetime-neutral).", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The token_id of the token being rotated (the predecessor)"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token/token_id/expires_at describe the successor (found structurally, scoped to THIS predecessor's token_id); overlap_expires_at describes the PREDECESSOR (echoed for convenience — the epoch it is auto-revoked). token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs present but not an integer, overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires ApiToken:Write"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, no active credential to rotate (ambiguous with a transient store read failure — retry, or mint a new token if genuinely absent), or the rotation succeeded but the successor could not be read back for the response (fails closed rather than return an uncorrelatable secret)"}}}
     },
     "/tokens/{token_id}/confirm": {
       "post": {"summary": "Confirm receipt of a rotated API token's successor secret (P2 #11 maker-checker)", "tags": ["API Tokens"], "description": "token_id in the path is the SUCCESSOR token_id the rotate response returned — no request body. Requires ApiToken:Write and step-up. Self-service only.", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The successor token_id returned by the rotate call"}], "responses": {"200": {"description": "Confirmed; predecessor token revoked"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires ApiToken:Write"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry)"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, or no in-flight rotation to confirm"}}}
@@ -2766,11 +2767,25 @@ void RestApiV1::register_routes(
 
             // Parsed AFTER the whole gate belt (perm/store/auth/deny/step-up/
             // owner) so body validation can never become an unauthenticated
-            // or ownership-enumeration oracle.
+            // or ownership-enumeration oracle. Defensive against a type
+            // mismatch — `body.value<int64_t>("overlap_secs", ...)` THROWS
+            // json::type_error.302 on e.g. `{"overlap_secs":"7d"}`, and this
+            // route has no exception handler installed, so an unguarded
+            // `.value()` call would surface as a bare httplib 500 with no A4
+            // envelope on a route whose OpenAPI promises 400 (round-3 review
+            // finding).
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             int64_t overlap_secs = 7 * 24 * 3600; // 7-day default overlap window
-            if (!body.is_discarded() && body.is_object() && body.contains("overlap_secs"))
-                overlap_secs = body.value("overlap_secs", overlap_secs);
+            if (!body.is_discarded() && body.is_object() && body.contains("overlap_secs")) {
+                if (!body["overlap_secs"].is_number_integer()) {
+                    res.status = 400;
+                    res.set_content(
+                        detail::a4_error(res, "overlap_secs must be an integer (seconds)"),
+                        "application/json");
+                    return;
+                }
+                overlap_secs = body["overlap_secs"].get<int64_t>();
+            }
 
             const int64_t now = static_cast<int64_t>(std::time(nullptr));
             // requesting_user is the AUTHENTICATED session's own username —
@@ -2787,36 +2802,70 @@ void RestApiV1::register_routes(
                                result.error());
                 return;
             }
+
+            // Locate the successor via the SHARED, DB-free lookup
+            // (token_rotation_lookup.hpp) — scoped exactly to THIS
+            // predecessor, never "any linked row of this principal"
+            // (round-3 BLOCKING finding: a human principal routinely holds N
+            // unrelated active tokens, so an unscoped match can return a
+            // DIFFERENT in-flight rotation's successor — its raw secret
+            // paired with the wrong token_id, so confirming that id revokes
+            // the WRONG predecessor). One shared helper, not an inline loop,
+            // so the MCP twin of this route calls the SAME derivation rather
+            // than re-deriving its own copy — a second copy of this exact
+            // loop is how the bug happened the first time (copied from the
+            // engine rotate route, whose OWN per-principal <=2-active
+            // ceiling licensed the loop shape that is unsound here). The
+            // route owns the store read (round-4: the helper takes a plain
+            // vector so its derivation logic is unit-testable without Postgres).
+            auto active_after = token_store->list_active_for_principal(tok->principal_id);
+            auto successor =
+                yuzu::server::detail::derive_rotation_successor(active_after, token_id);
+            if (!successor.found) {
+                // rotate_token above already succeeded — a real successor
+                // row exists in the database and `result` holds its live raw
+                // secret — but the underlying list_active_for_principal read
+                // is best-effort and swallows a lease/query failure into an
+                // empty vector rather than propagating (api_token_store.hpp),
+                // so a successor genuinely minted moments ago failing to
+                // show up here is never a legitimate "no rotation" case,
+                // only an ambiguous read failure. Fail CLOSED rather than
+                // hand the caller a one-time secret with no token_id to ever
+                // confirm it against — this is the ROTATE-side meaning of
+                // `found == false` documented in token_rotation_lookup.hpp;
+                // it does NOT apply after a successful confirm (round-4
+                // clarification): audit as a failure, 503, and never place
+                // the secret in the response body.
+                res.status = 503;
+                res.set_header("Retry-After", "2");
+                res.set_content(
+                    detail::a4_error(res, "rotation succeeded but the successor could not be "
+                                          "read back — retry, or check GET /api/v1/tokens"),
+                    "application/json");
+                (void)audit_fn(req, "api_token.rotate", "failure", "ApiToken", token_id,
+                               "successor lookup failed after mint");
+                return;
+            }
             // The reveal IS the success audit for this route (mirrors the
             // engine rotate route) — one row per reveal, mint or re-serve,
-            // never folded into a generic "rotation succeeded" event.
+            // never folded into a generic "rotation succeeded" event. Fired
+            // only once the successor is confirmed findable, so a 503 above
+            // is never ALSO recorded as a success.
             (void)audit_fn(req, "api_token.reveal", "success", "ApiToken", token_id, "rotate");
 
-            // Find the successor STRUCTURALLY (the row whose
-            // supersedes_token_id links back to the predecessor) — never
-            // newest created_at, which is second-resolution and ties on a
-            // same-second mint->rotate.
-            std::string successor_token_id;
-            int64_t successor_expires_at = 0;
-            int64_t successor_overlap_expires_at = 0;
-            for (const auto& t : token_store->list_active_for_principal(tok->principal_id)) {
-                if (!t.supersedes_token_id.empty()) {
-                    successor_token_id = t.token_id;
-                    successor_expires_at = t.expires_at;
-                    successor_overlap_expires_at = t.overlap_expires_at;
-                    break;
-                }
-            }
             // G5 (secret hygiene) — same no-store contract as the engine
             // mint/rotate routes: the response body carries a raw one-time
-            // credential.
+            // credential. `overlap_expires_at` is the PREDECESSOR's own
+            // stamp (see token_rotation_lookup.hpp) — the successor row
+            // never carries one.
             res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
             res.set_header("Pragma", "no-cache");
             res.set_content(ok_json(JObj()
                                         .add("token", *result)
-                                        .add("token_id", successor_token_id)
-                                        .add("expires_at", successor_expires_at)
-                                        .add("overlap_expires_at", successor_overlap_expires_at)
+                                        .add("token_id", successor.successor_token_id)
+                                        .add("expires_at", successor.successor_expires_at)
+                                        .add("overlap_expires_at",
+                                             successor.predecessor_overlap_expires_at)
                                         .str()),
                             "application/json");
         });

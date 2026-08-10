@@ -843,7 +843,9 @@ Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6
 }
 ```
 
-`token_id` and `expires_at`/`overlap_expires_at` describe the **successor**, found structurally (the active row whose `supersedes_token_id` links back to `{token_id}`), never by "most recently created" (which is second-resolution and can tie).
+`token_id` and `expires_at` describe the **successor**, found structurally — the active row whose `supersedes_token_id` equals `{token_id}` (the predecessor being rotated), never merely "any linked row of this principal's active set" and never by "most recently created" (which is second-resolution and can tie). A human principal routinely holds several unrelated tokens with independent in-flight rotations, so the match must be scoped to the exact predecessor in the path — a broader match can return a *different* rotation's successor.
+
+`overlap_expires_at`, by contrast, describes the **predecessor** — consistent with the `GET /api/v1/tokens` field of the same name above (§"Rotation fields"): it is stamped on the predecessor row, not the successor, and is echoed here purely for the caller's convenience (the epoch at which the predecessor this call just rotated is auto-revoked). There is no separate `overlap_expires_at` on the successor row itself; do not expect one from `GET /api/v1/tokens` until the successor is itself rotated in turn.
 
 **Success audit:** `action=api_token.reveal` — the reveal itself is the success event, mirroring the engine-principal route's `engine_principal.credential.reveal`; a grace-window re-serve gets its own row too, since every time the raw secret leaves the server is independently on the audit chain.
 
@@ -852,6 +854,7 @@ Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6
 | Condition | Response |
 |---|---|
 | No such token, or the token exists but is not owned by the caller | `404` — `token not found` (identical body; not an enumeration oracle) |
+| `overlap_secs` present in the body but not an integer (e.g. a string) | `400` — `overlap_secs must be an integer (seconds)` |
 | Overlap window below the 24h floor, or above the 10-year ceiling | `400` |
 | Overlap window would outlive the predecessor's or the successor's own expiry | `400` |
 | The token is not a human-owned credential (an engine-principal credential somehow reached this route) | `400` — `token is not a human-owned credential` |
@@ -861,6 +864,7 @@ Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6
 | A rotation already in flight, initiated by a **different** operator | `409` |
 | Grace window elapsed with no confirm | `409` — `grace window elapsed; confirm or revoke` |
 | No active credential found to rotate | `503` — deliberately conflated with a transient read failure, same rationale as the engine-principal rotate route above |
+| The rotation itself succeeded (a successor token now exists) but the follow-up read that locates it for the response came back empty | `503` — fails CLOSED rather than return a raw one-time secret with no `token_id` to ever confirm it against; retry, or check `GET /api/v1/tokens` |
 | Advisory-lock acquire failure, CSPRNG failure, or a mint/stamp write that did not persist | `503` — retryable store failure |
 | MFA step-up not satisfied | `401` |
 | Missing `ApiToken:Write`, or the caller's own session is engine-classed (structural deny belt) | `403` |
