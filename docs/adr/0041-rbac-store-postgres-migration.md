@@ -100,8 +100,10 @@ residual risk**, not an open question. LISTEN/NOTIFY remains the named follow-up
 
 RBAC state is authoritative operator-authored config that **cannot be re-derived**: custom roles,
 every principal→role grant, groups, and membership. Losing them silently reverts the fleet to the
-seeded defaults — an authorization change nobody authorized. So a one-time streamed, idempotent,
-resumable, reconciled, **fail-CLOSED** backfill from the legacy `rbac.db` (the ADR-0040 shape),
+seeded defaults — an authorization change nobody authorized. So a one-time, single-shot, idempotent
+(retried from scratch on interruption — not a cursor-resumed stream, unlike AuditStore's larger
+dataset), reconciled, **fail-CLOSED** backfill from the legacy `rbac.db` (the ADR-0040 marker+
+fingerprint pattern, right-sized for a small non-resumable dataset — governance re-review, #2703),
 seeding defaults first then backfilling operator rows via `ON CONFLICT DO NOTHING`. A built-in
 default the operator explicitly revoked before upgrading is **deleted** post-seed — matching legacy
 exactly, a plain absent row — scoped to (role, securable_type) pairs the legacy catalogue actually

@@ -201,8 +201,11 @@ groups:
             closed rather than running on a partial authorization config. It
             retries on the next start. Check Postgres availability, the
             rbac_store schema, and the presence/readability of the legacy
-            rbac.db backfill source in the server log.
-          runbook_url: "https://docs.yuzu.io/runbooks/rbac-read-degraded"
+            rbac.db backfill source in the server log — including a
+            HOLDER-SIDE VERIFICATION FAILED line, which means this replica's
+            own legacy rbac.db does not match what the fleet already
+            migrated (see the runbook).
+          runbook_url: "docs/ops-runbooks/rbac-store-backfill-recovery.md"
 
   - name: yuzu-mcp
     rules:

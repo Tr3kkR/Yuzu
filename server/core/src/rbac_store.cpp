@@ -2559,9 +2559,26 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
     // same file on every future boot forever, never converging on the
     // playbook's one-release retention policy.
     const auto move_legacy_aside = [](const std::filesystem::path& path) {
+        // cpp-safety (governance re-review, #2703, LOW — empirically
+        // confirmed in this round's own test run): a bare now_secs() suffix
+        // collides within the same wall-clock second (a fresh migration's
+        // move immediately followed by a later verified-match retry against
+        // a recreated file at the same path, both within one second), and
+        // std::filesystem::rename SILENTLY REPLACES an existing destination
+        // on both POSIX and Windows — the first archive is overwritten, not
+        // preserved alongside the second. Probe for an unused destination
+        // rather than trusting the clock alone to be unique.
+        std::filesystem::path aside;
+        for (int suffix = 0;; ++suffix) {
+            aside = path;
+            aside += ".migrated-" + std::to_string(now_secs());
+            if (suffix > 0)
+                aside += "-" + std::to_string(suffix);
+            std::error_code exists_ec;
+            if (!std::filesystem::exists(aside, exists_ec))
+                break;
+        }
         std::error_code mv_ec;
-        auto aside = path;
-        aside += ".migrated-" + std::to_string(now_secs());
         std::filesystem::rename(path, aside, mv_ec);
         if (mv_ec)
             spdlog::warn("RbacStore: migrate_from_sqlite: could not move legacy {} aside ({}); "
