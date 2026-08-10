@@ -554,35 +554,33 @@ ApprovalManager::get_checked(const std::string& id) const {
     std::lock_guard lock(mtx_);
 
     std::string sql = std::string("SELECT ") + kSelectAllCols + " FROM approvals WHERE id = ?";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+    // SqliteStmt, not a raw sqlite3_stmt*: row_to_approval() below builds
+    // several std::strings from column data, which is throw-capable, and
+    // that call sits BETWEEN step and any manual finalize — an owner is what
+    // closes that leak window, not call-site ordering (Sol/gpt-5.6-sol
+    // opine review, 2026-08-10: this file's own reordering fix for the
+    // FAILURE branch's std::string build left the SUCCESS branch's
+    // row_to_approval() with the identical exposure).
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, stmt.addr(), nullptr) != SQLITE_OK)
         return std::unexpected(StoreReadError{std::string("prepare failed: ") + sqlite3_errmsg(db_),
                                               sqlite3_extended_errcode(db_)});
 
-    sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 1, id.c_str(), -1, SQLITE_TRANSIENT);
 
     std::optional<Approval> out;
-    const auto rc = sqlite3_step(stmt);
+    const auto rc = sqlite3_step(stmt.get());
     if (rc == SQLITE_ROW)
-        out = row_to_approval(stmt);
+        out = row_to_approval(stmt.get());
 
     // A read that FAILED is not a read that found nothing. Collapsing the two
     // is what let a store error be reported to the operator as "this one-time
     // capability is spent" — see the pre-consume path in consume_ticket.
-    //
-    // Only the primitive `int` is captured before `sqlite3_finalize` — the
-    // throw-capable std::string build is deferred until after, matching this
-    // file's own CAS-site convention (finalize doesn't clear a connection's
-    // error state; `sqlite3_errmsg`/`sqlite3_extended_errcode` read the same
-    // before or after). A std::string built ahead of finalize would leak
-    // `stmt` on a bad_alloc between the two.
     if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
         const int extended = sqlite3_extended_errcode(db_);
-        sqlite3_finalize(stmt);
         return std::unexpected(
             StoreReadError{std::string("read failed: ") + sqlite3_errmsg(db_), extended});
     }
-    sqlite3_finalize(stmt);
     return out;
 }
 
