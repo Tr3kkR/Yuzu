@@ -624,6 +624,17 @@ public:
                           "carries NO reason label, and /metrics is not a stronger reader "
                           "than the caller. Read the audit trail for the kind",
                           "counter");
+        metrics_.describe("yuzu_mcp_approval_masked_denials_total",
+                          "MCP approval-ticket recalls refused by a store fault at a point "
+                          "where the #2442 cross-surface origin check could not run — the "
+                          "lookup step, or the consume step's own origin-check read (#2786 "
+                          "arm 1). A foreign-origin ticket is exactly as likely to be behind "
+                          "one of these refusals as an innocent one while the fault holds, so "
+                          "this is the signal that the forgery-detection event is not simply "
+                          "absent. No reason label, same anti-oracle posture as "
+                          "yuzu_mcp_approval_refused_total: what this counter withholds is "
+                          "already withheld there",
+                          "counter");
         // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
         // degrade reason is a static literal inside the bridge, never derived
         // from caller input.
@@ -898,6 +909,8 @@ public:
             // place — so pre-seed it here too, or an absent() alert on a fleet
             // that has never had a refusal cannot fire.
             metrics_.counter("yuzu_mcp_approval_refused_total", {{"tool", tool}});
+            // Same closed set again for the #2786 masked-denial counter.
+            metrics_.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", tool}});
         }
         // #2437 handler-side bound denials. The label set is closed on BOTH
         // axes: `tool` is execute_instruction alone (the only tool that EMITS
@@ -1673,7 +1686,15 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_audit_retention_last_pass_unixtime",
                           "Wall-clock reading of the most recent audit retention pass WHOSE CLOCK "
-                          "WAS USABLE; 0 if none has run in this process. Read WITH "
+                          "WAS USABLE; 0 if no pass has ever run on this DATABASE (seeded from "
+                          "the durable retention-meta anchor at startup, #2854 — survives a "
+                          "restart, including the first Postgres boot). A value of "
+                          "-9223372036854775808 (INT64_MIN) is a distinct anomaly sentinel — the "
+                          "durable anchor could not be read or trusted as a plausible integer — "
+                          "not a genuine timestamp; self-corrects at the next pass whose own clock "
+                          "reading is plausible — even if that pass then declines or fails for an "
+                          "unrelated reason — but NOT at a pass refusing on its own implausible clock, "
+                          "which skips the stamp entirely (see below). Read WITH "
                           "retention_passes_total: stale here while that RISES means the reaper "
                           "is alive but refusing an implausible clock, which is a different fault "
                           "from stopped",

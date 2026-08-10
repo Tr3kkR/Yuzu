@@ -3327,11 +3327,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     auto appr_read = approval_manager->get_checked(supplied_id);
                     if (!appr_read) {
                         count_denial("yuzu_mcp_approval_refused_total", nullptr);
+                        // A lookup-rung fault means the origin check two rungs
+                        // down never gets a chance to run either — the forgery
+                        // signal is masked here just as surely as at the
+                        // consume rung's own read (#2786 arm 1).
+                        count_denial("yuzu_mcp_approval_masked_denials_total", nullptr);
                         mcp_audit("denied",
                                   "approval_id=" + supplied_id + " refused: " +
                                       consume_denial_reason(ConsumeFailure::kStoreError) +
                                       " (lookup)");
-                        res.set_content(approval_store_error_body(*approval_manager, a4_error),
+                        res.set_content(approval_store_error_body(
+                                            *approval_manager, a4_error,
+                                            appr_read.error().extended_errcode),
                                         "application/json");
                         return;
                     }
@@ -3410,8 +3417,23 @@ McpServer::HandlerFn McpServer::build_handler(
                         // The kind stays in the audit trail, which is genuinely
                         // server-side.
                         count_denial("yuzu_mcp_approval_refused_total", nullptr);
-                        mcp_audit("denied", "approval_id=" + supplied_id +
-                                                " refused: " + consume_denial_reason(kind));
+                        // #2786 arm 1: when the ORIGIN check's own read is what
+                        // faulted, the comparison never ran, so a foreign-origin
+                        // ticket is exactly as likely to be behind this refusal
+                        // as an innocent one — the forgery signal would
+                        // otherwise be lost to a plain "store_error". The
+                        // masked counter (no reason label, same anti-oracle
+                        // rationale below) and the audit suffix are the
+                        // caller-visible half of that signal; ApprovalManager's
+                        // own warn log is the caller-independent half.
+                        if (consumed.error().origin_check_unevaluated)
+                            count_denial("yuzu_mcp_approval_masked_denials_total", nullptr);
+                        mcp_audit("denied",
+                                  "approval_id=" + supplied_id +
+                                      " refused: " + consume_denial_reason(kind) +
+                                      (consumed.error().origin_check_unevaluated
+                                           ? " (origin unverified)"
+                                           : ""));
 
                         // CLIENT message stays uniform for the two that must not
                         // be distinguishable: a foreign-origin refusal reads
@@ -3434,14 +3456,14 @@ McpServer::HandlerFn McpServer::build_handler(
                         // stops THIS site becoming the fail-open one if rung 1's
                         // lookup ever changes.
                         //
-                        // What is NOT covered either way: an OPEN handle whose
-                        // reads fail permanently — CORRUPT, NOTADB, READONLY,
-                        // FULL — takes the transient arm and is told to retry
-                        // forever. That is the real gap, it needs
-                        // sqlite3_extended_errcode carried on ConsumeError,
-                        // and it is not closed here (#2786 PR 1c).
+                        // An OPEN handle whose reads fail permanently — CORRUPT,
+                        // NOTADB, READONLY, FULL — is classified by the shared
+                        // body via `extended_errcode` (#2786 "PR 1c") rather
+                        // than taking the transient "retry forever" arm.
                         if (kind == ConsumeFailure::kStoreError) {
-                            res.set_content(approval_store_error_body(*approval_manager, a4_error),
+                            res.set_content(approval_store_error_body(
+                                                *approval_manager, a4_error,
+                                                consumed.error().extended_errcode),
                                             "application/json");
                             return;
                         }
@@ -6212,7 +6234,23 @@ McpServer::HandlerFn McpServer::build_handler(
                                           "in flight; wait for one to finish";
                                 streamed_reject(
                                     429, mcp::kMcpStreamCap, "Streamed request capacity reached",
-                                    why == "pin_slots" ? "post_pin_slots" : "post_global_cap",
+                                    // #2918: reserve()'s own server-wide record cap
+                                    // (cfg_.global_record_cap) is a distinct cause from
+                                    // the pre-admission StreamBudget global cap above
+                                    // (post_global_cap) - same metric family, its own
+                                    // label, so the two are discriminable in the
+                                    // Prometheus counter and audit detail.
+                                    //
+                                    // This else is exhaustive TODAY (reserve()'s only
+                                    // remaining reject_reason values reaching this arm
+                                    // are "global_cap" and "pin_slots" - every other
+                                    // value returns earlier, above). It is a fallthrough,
+                                    // not a switch: a reject_reason reserve() gains in the
+                                    // future silently reports here as post_record_cap
+                                    // unless a matching why== arm is added alongside it
+                                    // (Gate 4, #2918 - the same shape the #2918 fix
+                                    // itself closed for "global_cap").
+                                    why == "pin_slots" ? "post_pin_slots" : "post_record_cap",
                                     why == "pin_slots"
                                         ? pin_remediation
                                         : "retry shortly, or retry without an SSE Accept for a "

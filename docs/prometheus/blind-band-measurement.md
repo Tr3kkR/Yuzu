@@ -48,13 +48,27 @@ latch. The upper bound is where uptime finally clears 10800 for long enough.
 ## Why it is not closed here
 
 The natural fix is a freshness rule on
-`yuzu_server_audit_retention_last_pass_unixtime`, and it does not work as
-shipped: that gauge is seeded 0 and never reloaded from the persisted
-`audit_retention_meta` anchor, so it zeroes on every process restart, and a
-freshness rule built on it goes silent on the 30-minute crash loop the current
-rule already catches — a regression, not a fix. Closing the band needs the
-server to seed that value at construction, which is a C++ change to `AuditStore`
-and out of scope for a rules-and-CI branch.
+`yuzu_server_audit_retention_last_pass_unixtime`, and it did not work as
+shipped when this was first measured: that gauge was seeded 0 and never
+reloaded from the persisted `audit_retention_meta` anchor, so it zeroed on
+every process restart, and a freshness rule built on it went silent on the
+30-minute crash loop the current rule already catches — a regression, not a
+fix. Closing the band needed the server to seed that value at construction —
+a C++ change to `AuditStore`, out of scope for a rules-and-CI branch.
+
+**As of #2854, the server half is done**: the gauge is now seeded from the
+durable anchor at construction and again after the legacy backfill, so it
+survives a restart (including the first PostgreSQL boot). A value of INT64_MIN
+(-9223372036854775808) is a distinct anomaly sentinel — the durable anchor
+could not be read or trusted as a plausible integer — not a genuine
+timestamp, and self-corrects at the next pass whose own clock reading is
+plausible — even if that pass then declines or fails for an unrelated
+reason — but NOT at a pass that itself refuses on an implausible clock,
+which skips the stamp entirely; a future rule must exclude it
+explicitly, same as the dead-CMOS negative case below. What remains open
+is the RULE that consumes it — the redesigned rule family, gated by a sweep
+against a committed manifest of silent cadences, still needs to land. The
+second trap below (the dead-CMOS negative stamp) still constrains its design.
 
 A second trap for whoever picks this up: any `time() - <server stamp>` shape is
 denominated in the server's own wall clock, which is the one input this
