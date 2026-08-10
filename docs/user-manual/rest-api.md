@@ -7045,7 +7045,7 @@ even considered — that is a property of every non-`initialize` method on this
 endpoint, not specific to progress tracking, and is covered above under `GET /mcp/v1/`.
 The table below assumes a valid session or none at all; where progress *is* tracked,
 delivery depends on the request's `Accept` header and whether the server has
-`--mcp-enable-streamed-post` enabled (off by default):
+`--mcp-enable-streamed-post` enabled (on by default; opt out with `--no-mcp-streamed-post`):
 
 | `_meta.progressToken` | `Mcp-Session-Id` | `Accept: text/event-stream` | Server answers |
 |---|---|---|---|

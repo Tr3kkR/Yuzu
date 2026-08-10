@@ -130,6 +130,7 @@ results.
 | `--mcp-disable` | `YUZU_MCP_DISABLE` | `false` | Disable the MCP endpoint entirely. All requests to `/mcp/v1/` (POST/GET/DELETE) return an error. |
 | `--mcp-read-only` | `YUZU_MCP_READ_ONLY` | `false` | Restrict MCP to read-only tools only. Write and execute operations are rejected regardless of the token's tier. |
 | `--mcp-no-streaming` | `YUZU_MCP_NO_STREAMING` | `false` | Disable the Streamable HTTP transport: no `Mcp-Session-Id` minting, `GET`/`DELETE /mcp/v1/` → `405`, plain JSON-RPC POST only. The `202`-on-notification status still applies. |
+| `--mcp-enable-streamed-post` / `--no-mcp-streamed-post` | `YUZU_MCP_ENABLE_STREAMED_POST` | `true` | Enable SSE-on-POST (streamed POST) for `execute_instruction` callers that send `_meta.progressToken` with an SSE-capable `Accept`. Pass `--no-mcp-streamed-post` to opt out and fall back to the pre-flip plain-POST-only behavior. |
 | `--mcp-allowed-origin` | `YUZU_MCP_ALLOWED_ORIGINS` | *(none)* | **Repeatable.** Allowed `Origin` header value (`scheme://host:port`, exact match) for `/mcp/v1/`. An absent `Origin` is always allowed (the endpoint requires a credential); an empty allowlist rejects any *present* `Origin` — browser-based MCP clients must be listed explicitly. |
 
 ### Examples
@@ -230,7 +231,7 @@ change: a notification POST now answers `202` instead of `204`).
   frames is indistinguishable from "nothing has happened yet". `execute_bundle` does
   **not** emit progress (poll `get_bundle_result`). Progress can be delivered two
   ways, and the client chooses per request **on a server that has enabled streamed
-  POST** (`--mcp-enable-streamed-post`, off by default): send an SSE-capable `Accept` alongside
+  POST** (`--mcp-enable-streamed-post`, on by default): send an SSE-capable `Accept` alongside
   the `progressToken` and the POST response itself streams the progress frames and
   then the result; send the token without an SSE `Accept` and the frames go to the
   session's `GET` stream after the POST has already answered. See
@@ -967,10 +968,10 @@ are never required — a client may also simply omit the header and use plain PO
 > ring terminates the session server-side rather than answering with a gap:
 > `-32007` / HTTP 404, `error.message` "Replay window exceeded", audited as
 > `mcp.session.close` with `reason=replay_window_exceeded`. This is ordinary
-> ring eviction, reachable today — with `--mcp-enable-streamed-post` off — by
-> any GET-channel client that falls behind the ring's own capacity.
-> `--mcp-enable-streamed-post` adds a second, faster way to reach the same
-> state: a session whose client disconnects and retries repeatedly can hit a
+> ring eviction, reachable by any GET-channel client that falls behind the
+> ring's own capacity, independent of the streamed-POST flag.
+> `--mcp-enable-streamed-post` (on by default) adds a second, faster way to
+> reach the same state: a session whose client disconnects and retries repeatedly can hit a
 > further streamed call's admission reclaim (see "A pin released to admit a
 > new call" in `docs/mcp-server.md`) — each reclaim releases one undelivered
 > final's eviction exemption, after which ordinary ring eviction can reach it
@@ -1088,8 +1089,14 @@ in a tight loop — the cap is protecting the worker pool that also serves your 
 >   separately from, any single session's own replay-ring pin-slot count (the
 >   next checkpoint below) — and it is **not** governed by
 >   `--mcp-max-streams-per-principal`. That flag affects only the GET channel;
->   a principal's total held-open ceiling across both channels is that value +
->   4. Remediation: wait for one of your streamed calls to finish, or resend
+>   the two are separate steady-state allowances that happen to sum to
+>   `--mcp-max-streams-per-principal + 4` — not one combined pool of that
+>   size. During a GET-channel reconnect (a new GET superseding an old one
+>   on the same session), that sum can be transiently exceeded: the
+>   superseded connection's stream stays counted against the GET-channel
+>   allowance until it finishes draining, while the replacement is admitted
+>   and counted too — an overshoot bounded by `kMaxProvidersPerStream`
+>   (`stream_budget.hpp`). Remediation: wait for one of your streamed calls to finish, or resend
 >   the same request without an SSE-capable `Accept` for a plain
 >   (non-streamed) response.
 >
@@ -1132,11 +1139,11 @@ before it could be delivered on the stream (the buffered-result population hit i
 The real result was never lost - only its *streamed* copy was dropped.
 
 **Fix**: Fetch the result durably with the `execution_id` this very frame carries (`get_execution_status` / `query_responses`). Do NOT re-resume the GET channel: this error IS the answer to a resume, and per the Cause above only the *streamed* copy was dropped - re-attaching cannot conjure a final the server already force-expired. (GET + `Last-Event-ID` resume is the right first move for a *different* case — a stream that died before any frame reached you, so you never learned an `execution_id` at all.)
-The parked-result path this arises from is reachable only under
-`--mcp-enable-streamed-post`, which ships off; with it on, it activates whenever a
+The parked-result path this arises from is reachable whenever
+`--mcp-enable-streamed-post` is on, which is the default: it activates whenever a
 streamed POST is parked without having delivered its final (the client
 disconnected, the response cap elapsed, or the server could not complete the
-stream).
+stream). Pass `--no-mcp-streamed-post` to rule this path out entirely.
 
 ### A streamed final can be dropped entirely
 
@@ -1156,7 +1163,7 @@ supported recovery path for every streamed-result failure mode on this surface, 
 this one.
 
 Like the `-32014` case above, this arises from the parked-result path, which is
-reachable only under `--mcp-enable-streamed-post`: a streamed POST parked before
+reachable whenever `--mcp-enable-streamed-post` is on (the default): a streamed POST parked before
 delivering its final leaves the terminal to be collected by a `GET` resume or
 fetched durably by `execution_id`.
 
