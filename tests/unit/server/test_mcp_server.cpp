@@ -10321,6 +10321,11 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
         // Refused at admission: reserve was never called for it, nothing dispatched.
         CHECK(tracker.query_executions({}).size() == rows_before);
         CHECK(audit_has("mcp.session.reject|failure"));
+        // `capped_bridge` is SECTION-local and about to go out of scope, but
+        // `ts` (TEST_CASE-scoped) outlives it - null the borrowed pointer
+        // rather than leave it dangling, matching this file's other
+        // borrowed-pointer fixtures (Gate 3 cpp-expert, #2918).
+        ts.mcp.set_stream_bridge(nullptr);
     }
 
     SECTION("per-principal cap hit by CONCURRENT streams -> 429 naming "
