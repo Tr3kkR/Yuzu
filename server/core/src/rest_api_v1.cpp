@@ -24,6 +24,7 @@
 #include "rest_a4_envelope.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
+#include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
 #include "software_inventory_store.hpp" // ADR-0016: typed installed-software fleet read
@@ -2842,7 +2843,7 @@ void RestApiV1::register_routes(
             const auto confirm_metric = [metrics_registry](const char* result) {
                 if (metrics_registry)
                     metrics_registry
-                        ->counter("yuzu_api_token_confirm_total",
+                        ->counter(kApiTokenConfirmTotalMetric,
                                   {{"surface", "rest"}, {"result", result}})
                         .increment();
             };
