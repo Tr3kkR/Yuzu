@@ -2313,9 +2313,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     // #2917: the session id is an attacker-controlled HEADER until
                     // it validates, so the prefix that reaches an audit row is
                     // sanitised — raw bytes could inject the `;`/`=` field
-                    // separators audit tooling parses, or CR/LF. The GET and
-                    // DELETE siblings already do this (DELETE's own comment notes
-                    // it was fixed to match GET); this POST path was passing it
+                    // separators audit tooling parses. The GET and DELETE
+                    // siblings already do this (DELETE's own comment notes it
+                    // was fixed to match GET); this POST path was passing it
                     // through raw.
                     session_audit("mcp.session.reject", "failure",
                                   yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8)),
