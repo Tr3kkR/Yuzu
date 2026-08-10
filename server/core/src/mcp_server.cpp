@@ -794,9 +794,15 @@ static const ToolDef kTools[] = {
      "no state change, so a blind retry can never confirm a later rotation. Replaying a confirm "
      "after this rotation already resolved (a network-dropped success, a double-submit) returns a "
      "TERMINAL already-confirmed/already-resolved error (not a retryable one) - do not retry; "
-     "re-rotate if a fresh rotation is needed. Note: an exact supervised replay carrying the same "
-     "consumed approval_id is denied earlier at the approval gate ('approval already used') before "
-     "this logic runs. Mirrors POST "
+     "re-rotate if a fresh rotation is needed. Note: the approval gate applies two independent "
+     "checks before this logic runs. (1) An exact replay carrying an already-consumed "
+     "approval_id is denied ('approval already used'; submit a new request for a fresh ticket). "
+     "(2) Even a never-consumed, still-valid approval_id can be denied if the rotation's state "
+     "has already moved on since the ticket was minted (confirmed, resolved, revoked, an "
+     "anomalous credential count, or a newer rotation's mismatched successor) - that denial "
+     "leaves the ticket UNCONSUMED and recallable, with a distinct message directing the caller "
+     "to check get_engine_principal for the rotation's current state rather than retry blindly. "
+     "Mirrors POST "
      "/api/v1/engine-principals/{id}/credentials/confirm. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
@@ -3402,7 +3408,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // here never asserts AUTHORITY, only that the state the ticket's
                     // effect depends on has moved on.
                     //
-                    // NOT closed by this precondition: a restart evicting the
+                    // NOT closed by this precondition: (1) a restart evicting the
                     // Hermes F4/F5 initiator (grace-cache) binding. `active` alone
                     // cannot see that state - it lives in an in-process cache that is
                     // private to ApiTokenStore (see rotation_confirm_state.hpp's
@@ -3410,6 +3416,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     // in-transaction check remains the only thing that catches it,
                     // so that specific drift still burns the ticket. Tracked: #2946
                     // (read-only initiator-binding accessor would close it here too).
+                    // (2) two independently-approved tickets pinned to the SAME
+                    // successor token_id (an operator double-approval mistake): both
+                    // preconditions read the identical kPair/pin-matches state
+                    // concurrently, both pass, both CAS-consume (different approval
+                    // rows), and only one confirm_rotation call wins the advisory
+                    // lock - the loser's ticket is already burned before its own
+                    // confirm fails. Known and accepted (the loser was always going
+                    // to lose one way or another), not yet regression-tested: #2952.
                     // Also tracked: #2947, chaos-scenario coverage for this
                     // precondition's read pinning an httplib worker (CH-4).
                     ConsumePrecondition precondition;
@@ -3425,12 +3439,39 @@ McpServer::HandlerFn McpServer::build_handler(
                             using yuzu::server::detail::classify_confirm_state;
                             using yuzu::server::detail::pair_matches_pin;
                             using yuzu::server::detail::RotationConfirmState;
+                            // Same pragma-error idiom as approval_manager.hpp's
+                            // consume_denial_reason: a future RotationConfirmState
+                            // enumerator with no arm here becomes a compile ERROR
+                            // (meson.build sets werror=false, so the bare warning
+                            // alone would not stop it) rather than silently falling
+                            // through to the trailing `return {}`.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(1 : 4062) // off by default; `error:` alone does NOT enable it
+#pragma warning(error : 4062)
+#endif
                             switch (classify_confirm_state(active, rot_token_id)) {
                             case RotationConfirmState::kNoneActive:
                                 // Empty read is ambiguous with a swallowed store fault
-                                // (positive-read contract, rotation_confirm_state.hpp),
-                                // never deny on it; let the CAS + handler decide.
-                                return {};
+                                // (positive-read contract, rotation_confirm_state.hpp) -
+                                // it could mean a genuine revoke-to-zero between mint
+                                // and recall, or an unlogged read failure. That
+                                // ambiguity is why confirm_rotation's OWN kNoneActive
+                                // stays transient/retryable there: a CONSUME on a
+                                // masked failure would be destructive. It does NOT
+                                // carry over here: this precondition's denial never
+                                // consumes the ticket - it stays valid and the retry
+                                // is free - so "deny, don't guess" costs nothing under
+                                // either cause and is strictly safer than passing an
+                                // ambiguous read through to burn the ticket on what
+                                // may be a resolved rotation.
+                                return std::unexpected(
+                                    "no active credential found for this principal; the "
+                                    "rotation may have already resolved, or the read "
+                                    "could not be verified");
                             case RotationConfirmState::kPair:
                                 // Two active credentials is necessary but not
                                 // sufficient: without also checking linkage and the
@@ -3462,7 +3503,17 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "no rotation in flight for this token_id; the rotation was "
                                     "already resolved");
                             }
-                            return {}; // unreachable; classify_confirm_state is total
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+                            // Not reachable today: the switch above has an arm per
+                            // RotationConfirmState value, and the pragma makes a
+                            // missing arm a compile ERROR rather than a warning.
+                            // Present so the function still returns on a compiler
+                            // that does not honour the pragma.
+                            return {};
                         };
                     }
                     // H3/N2 (SOC-2 CC7.2): stamp WHO consumed the ticket — the
@@ -3512,6 +3563,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         // own warn log is the caller-independent half.
                         if (consumed.error().origin_check_unevaluated)
                             count_denial("yuzu_mcp_approval_masked_denials_total", nullptr);
+                        // Unlike the masked/refused counters above, kPrecondition is
+                        // NOT one of the kinds the anti-oracle argument covers (see
+                        // the client-message branch below) - the client response
+                        // already tells the caller this is a precondition denial, so
+                        // a dedicated counter reveals nothing a `reason` label on
+                        // the shared counter would not also reveal, without the
+                        // shared counter's cross-kind oracle risk.
+                        if (kind == ConsumeFailure::kPrecondition)
+                            count_denial("yuzu_mcp_approval_precondition_denied_total", nullptr);
                         // kPrecondition carries its own specific fact (which
                         // RotationConfirmState triggered it) in .message. That
                         // detail is deliberately NOT sent to the client (see the
@@ -3519,12 +3579,16 @@ McpServer::HandlerFn McpServer::build_handler(
                         // own RBAC check, so a specific answer here would be a
                         // credential-state oracle for a tier-eligible, RBAC-less
                         // caller). The audit row is server-side only, so it is
-                        // the one place the specific fact belongs.
+                        // the one place the specific fact belongs. The "(ticket
+                        // not consumed)" suffix is redundant with consume_at
+                        // staying 0 on the approval row, but makes it readable
+                        // without a second query when an operator scans this log.
                         mcp_audit("denied",
                                   "approval_id=" + supplied_id +
                                       " refused: " + consume_denial_reason(kind) +
                                       (kind == ConsumeFailure::kPrecondition
-                                           ? (": " + consumed.error().message)
+                                           ? (": " + consumed.error().message +
+                                              " (ticket not consumed)")
                                            : "") +
                                       (consumed.error().origin_check_unevaluated
                                            ? " (origin unverified)"
@@ -3591,16 +3655,33 @@ McpServer::HandlerFn McpServer::build_handler(
                         // fix's own remediation steering the caller into a
                         // burn a newer rotation's mismatched pin would still
                         // catch, but only after consuming the ticket.
+                        //
+                        // "check the current state" alone forced a first-time
+                        // operator to guess which tool answers that (enterprise-
+                        // readiness Gate 6). confirm_engine_rotation is the only
+                        // wired precondition caller today, so naming its own
+                        // read twin is accurate now; a future #2939 caller with a
+                        // different diagnostic tool needs its own arm here rather
+                        // than inheriting this string unmodified.
                         if (kind == ConsumeFailure::kPrecondition) {
+                            const std::string remediation =
+                                tool_name == "confirm_engine_rotation"
+                                    ? "the approval_id is still valid and was NOT consumed; call "
+                                      "get_engine_principal (mirrors GET "
+                                      "/api/v1/engine-principals/{id}) to check the rotation's "
+                                      "current state before deciding whether to recall it again "
+                                      "with the same approval_id, or submit a new request if a "
+                                      "fresh approval is needed"
+                                    : "the approval_id is still valid and was NOT consumed; "
+                                      "check the current state of the operation this approval "
+                                      "authorizes before deciding whether to recall it again "
+                                      "with the same approval_id, or submit a new request if a "
+                                      "fresh approval is needed";
                             res.set_content(
                                 a4_error(kPermissionDenied,
                                          "approval cannot be redeemed right now: a precondition "
                                          "on the underlying operation was not met",
-                                         "the approval_id is still valid and was NOT consumed; "
-                                         "check the current state of the operation this approval "
-                                         "authorizes before deciding whether to recall it again "
-                                         "with the same approval_id, or submit a new request if a "
-                                         "fresh approval is needed"),
+                                         remediation),
                                 "application/json");
                             return;
                         }

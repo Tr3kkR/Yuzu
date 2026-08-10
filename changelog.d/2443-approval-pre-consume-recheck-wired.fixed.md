@@ -8,18 +8,32 @@
   additionally verifies the active-credential pair is actually linked to and pinned by the
   ticket's own `token_id` (not just "two active credentials exist" - a newer, unrelated rotation
   would otherwise pass the same count check and still burn the ticket at `confirm_rotation`'s own
-  pin check). If the rotation already resolved (confirmed, revoked, cut over, an anomalous
-  credential count, or a pin mismatch against a newer rotation), the recall denies WITHOUT
-  consuming: the ticket stays approved and recallable, instead of the pre-#2443 "approval already
-  used" wording that would have misdescribed a still-good ticket. The client-facing denial is
-  deliberately generic (no rotation-state specifics) because this precondition runs before the
-  tool's own RBAC check; the specific reason is still recorded in the audit row, which - along
-  with the existing refusal-rate counter - already covers every consume-failure kind via the
-  shared recall path, so this needed no new metric/audit plumbing, only the message split.
+  pin check). If the rotation already resolved (confirmed, revoked, cut over to zero active
+  credentials, an anomalous credential count, or a pin mismatch against a newer rotation), the
+  recall denies WITHOUT consuming: the ticket stays approved and recallable, instead of the
+  pre-#2443 "approval already used" wording that would have misdescribed a still-good ticket. An
+  empty active-credential read (ambiguous with a masked store fault) also denies rather than
+  passing through - denying never consumes, so treating that ambiguity conservatively costs
+  nothing under either cause. The client-facing denial is deliberately generic (no rotation-state
+  specifics, and points the caller at `get_engine_principal` to check current state) because this
+  precondition runs before the tool's own RBAC check; the specific reason is still recorded in the
+  audit row. A new `yuzu_mcp_approval_precondition_denied_total` counter breaks this denial class
+  out from the shared refusal-rate counter - safe to label by kind (unlike the shared counter)
+  because a precondition denial is already distinguishable to the caller from the response body.
+  `ApiTokenStore::list_active_for_principal`'s two previously-silent failure branches (pool-lease
+  timeout, query failure) now log a warning, closing the "zero log lines" gap a persistent read
+  fault would otherwise leave for on-call.
 
-  **Not closed by this change:** a process restart evicting the rotation's initiator (grace-cache)
-  binding. That state lives in an in-process cache private to `ApiTokenStore` and isn't visible
-  to the precondition's read; a ticket recalled after that specific drift still gets consumed and
-  then fails at `confirm_rotation`'s own in-transaction check. Tracked as #2946 (a read-only
-  accessor for the initiator binding would close it here too). Chaos-scenario coverage for this
-  precondition's read pinning an httplib worker is tracked as #2947.
+  **Not closed by this change:**
+  - A process restart evicting the rotation's initiator (grace-cache) binding. That state lives in
+    an in-process cache private to `ApiTokenStore` and isn't visible to the precondition's read; a
+    ticket recalled after that specific drift still gets consumed and then fails at
+    `confirm_rotation`'s own in-transaction check. Tracked as #2946 (a read-only accessor for the
+    initiator binding would close it here too).
+  - Two independently-approved tickets pinned to the same successor `token_id` (an operator
+    double-approval mistake): both preconditions read the identical linked/pinned state
+    concurrently, both pass, both consume (different approval rows), and only one `confirm_rotation`
+    call wins the advisory lock - the loser's ticket is already burned before its own confirm fails.
+    Known and accepted; deterministic regression-test coverage tracked as #2952.
+  - Chaos-scenario coverage for this precondition's read pinning an httplib worker under a
+    black-holed database connection is tracked as #2947.

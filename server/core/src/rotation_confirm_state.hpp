@@ -100,6 +100,14 @@ classify_confirm_state(const std::vector<ApiToken>& active, const std::string& p
 /// to `ApiTokenStore` and is not visible from active-row data alone. A `true`
 /// here still leaves the initiator-binding check as the authoritative
 /// in-transaction gate; it only closes the LINKAGE/PIN half of the gap.
+///
+/// `ApiTokenStore::confirm_rotation`'s own inline linkage+pin check
+/// (api_token_store.cpp, right after its `kPair` arm) does the SAME check
+/// inline rather than calling this - deliberately NOT deduplicated. That
+/// block reports "not linked" and "linked but wrong pin" as two different
+/// client-visible error classes (retryable vs terminal); this function
+/// collapses both to one bool, so swapping it in would silently merge them.
+/// A shared helper would need a reason enum, not a bool. Tracked: #2953.
 [[nodiscard]] inline bool pair_matches_pin(const std::vector<ApiToken>& active,
                                            const std::string& pin_token_id) {
     if (active.size() != 2)

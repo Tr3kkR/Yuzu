@@ -82,7 +82,13 @@ JSON-RPC error responses from the denial paths (read-only mode, tier policy, app
 > lets the call through to the handler. A recall against a still-**pending**
 > ticket returns the same `kApprovalRequired` envelope (keep polling
 > `status_url`); a rejected/expired/mismatched/consumed ticket returns
-> `kPermissionDenied` (-32003). This generic gate governs every approval-gated
+> `kPermissionDenied` (-32003). `confirm_engine_rotation`'s recall additionally
+> runs a pre-consume precondition (#2443) that rechecks live rotation state
+> before consuming the ticket; a precondition failure also returns
+> `kPermissionDenied` (-32003) but with a distinct, deliberately generic
+> message ("approval cannot be redeemed right now...") and — unlike the four
+> causes above — leaves the ticket UNCONSUMED and still recallable. This
+> generic gate governs every approval-gated
 > tool — the supervised tier's `execute_instruction` / `revoke_certificate` /
 > `execute_bundle`, plus `delete_tag` (operator + supervised) and
 > `quarantine_device` (supervised). **Degraded path:** if the server has no
