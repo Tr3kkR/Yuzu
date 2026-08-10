@@ -962,6 +962,24 @@ oracle). Sessions are in-memory, so a **server restart** also drops them.
 **Fix**: Re-run `initialize` to mint a fresh `Mcp-Session-Id` and retry. Sessions
 are never required — a client may also simply omit the header and use plain POST.
 
+> **A live session can also end up here — not only via streamed POST.** A
+> `GET` resume presenting `Last-Event-ID` for a frame no longer in the replay
+> ring terminates the session server-side rather than answering with a gap:
+> `-32007` / HTTP 404, `error.message` "Replay window exceeded", audited as
+> `mcp.session.close` with `reason=replay_window_exceeded`. This is ordinary
+> ring eviction, reachable today — with `--mcp-enable-streamed-post` off — by
+> any GET-channel client that falls behind the ring's own capacity.
+> `--mcp-enable-streamed-post` adds a second, faster way to reach the same
+> state: a session whose client disconnects and retries repeatedly can hit a
+> further streamed call's admission reclaim (see "A pin released to admit a
+> new call" in `docs/mcp-server.md`) — each reclaim releases one undelivered
+> final's eviction exemption, after which ordinary ring eviction can reach it
+> like any other unpinned frame. Either way, the session is gone once this
+> fires, same as the causes above —
+> re-initialize. Nothing about the underlying result is lost: it stays fetchable
+> by `execution_id` (`get_execution_status` / `query_responses`), which is what
+> this error's own remediation already points at.
+
 ### -32008: Origin not allowed (HTTP 403)
 
 **Symptom**: A request carrying an `Origin` header returns `-32008` / HTTP `403`.
@@ -1046,6 +1064,62 @@ second).
 **Fix**: Honour `retry_after_ms`. Close a stream you no longer need (drop the GET
 connection, or `DELETE /mcp/v1/` the session), or raise the cap. Do **not** blind-retry
 in a tight loop — the cap is protecting the worker pool that also serves your POSTs.
+
+> **Same code, four more causes (streamed POST, `--mcp-enable-streamed-post`).**
+> A `POST` to `/mcp/v1/` requesting an SSE-capable stream (`_meta.progressToken`
+> plus an SSE-capable `Accept`) can also return `-32012` / HTTP `429`, with
+> `retry_after_ms` fixed at 30s — longer than the GET-channel figure above,
+> since none of these causes is likely to clear within a second or two.
+> `error.data` carries no machine-readable cause label, only `remediation`
+> text — read it in full, since more than one cause can share the same
+> `error.message`. Two checkpoints, in order:
+>
+> **Checked before the call is even accepted** (`error.message`: "Concurrent
+> stream cap reached"; no record is created, so nothing to clean up):
+>
+> - the shared `--max-sse-streams` budget — every streaming surface on this
+>   server draws from one pool (MCP GET, MCP streamed POST, `/api/v1/events`,
+>   dashboard, legacy `/events`) — is exhausted. Remediation: retry shortly, or
+>   resend the same request without an SSE-capable `Accept` for a plain
+>   (non-streamed) response.
+> - this principal's own streamed-POST allowance, summed across every session
+>   that principal holds open, is exhausted. This is a **fixed 4 concurrent
+>   calls per principal** — numerically the same as, but counted and enforced
+>   separately from, any single session's own replay-ring pin-slot count (the
+>   next checkpoint below) — and it is **not** governed by
+>   `--mcp-max-streams-per-principal`. That flag affects only the GET channel;
+>   a principal's total held-open ceiling across both channels is that value +
+>   4. Remediation: wait for one of your streamed calls to finish, or resend
+>   the same request without an SSE-capable `Accept` for a plain
+>   (non-streamed) response.
+>
+> **Checked during admission itself, after that budget was already available**
+> (`error.message`: "Streamed request capacity reached"):
+>
+> - a server-wide ceiling on the total count of progress-tracked calls the
+>   server is still holding open (executing, or finished with results not
+>   yet delivered; streamed or not, across every session and principal) is
+>   full. This is an internal capacity limit, not adjustable by any flag.
+>   Remediation: retry shortly, or resend without an SSE-capable `Accept`.
+> - this session's own streamed-call slots are full — some held by results
+>   that have not reached a client yet, some by calls still executing with
+>   no result yet at all, or both. Admission first tries to reclaim a slot
+>   from an undelivered final before refusing — see "A pin released to
+>   admit a new call" in `docs/mcp-server.md` — so reaching this refusal
+>   means either no undelivered final existed to reclaim, or one did and
+>   couldn't be taken. The `remediation` text distinguishes two states:
+>   - if slots are held by results still being written, retry — a result
+>     still being written frees its slot as it lands. If this persists across
+>     several retries, resume the `GET` channel with `Last-Event-ID` set to
+>     one below the lowest id you still need — replay starts strictly above
+>     the cursor, and the cursor releases every pinned final at or below it on
+>     this session. A gap on that resume, or having no cursor to send, means
+>     re-initializing for a fresh session and fetching results by
+>     `execution_id` (see `-32007` above for what a gap on this session's own
+>     reclaimed results looks like);
+>   - if slots are held by calls genuinely still in flight (not a stuck slot,
+>     just the concurrency limit), the remediation is simply to wait for one
+>     to finish.
 
 ### -32014: Streamed result no longer buffered
 

@@ -108,7 +108,15 @@ CLOSED and pre-seeded at boot, so `absent()` alerting stays meaningful.
 
 | Metric | Type | Description |
 |---|---|---|
-| `yuzu_mcp_body_too_large_total{reason}` | counter | `/mcp/v1/` requests rejected at the transport before the body was read (#2437). `reason=over_cap` is a declared `Content-Length` above 4 MiB (`413`); `reason=unmeasurable` is a body this server will not admit because it cannot size it in advance — any `Transfer-Encoding`, any non-`identity` `Content-Encoding` (httplib decompresses before its size check), or a POST/PUT/PATCH with no `Content-Length` (`411`). Pre-auth, so there is no principal and no audit row: the throttled `[#2437]` warn in the journal carries the sanitized method/path/source address. |
+| `yuzu_mcp_body_too_large_total{reason}` | counter | `/mcp/v1/` requests rejected at the transport before the body was read (#2437). `reason=over_cap` is a declared `Content-Length` above 4 MiB (`413`); `reason=unmeasurable` is a body this server will not admit because it cannot size it **by framing** in advance — any `Transfer-Encoding`, or a POST/PUT/PATCH with no `Content-Length` (`411`). **Does NOT cover a non-`identity` `Content-Encoding`** (D4 hardening, #2407) — httplib decompresses before its size check, but that rejection is now a `415` handled by the GENERAL pre-routing gate (every route, not just `/mcp/`) and counted by `yuzu_body_cap_rejected_total{path_class="mcp",reason="unsupported_encoding"}` below **and**, so the #2437 alert keeps an arm for it, by this counter's own `reason=unsupported_encoding` series. A `/mcp/` compressed-body rejection therefore increments both, deliberately: the general counter is the fleet-wide view and this one is the MCP-specific series `docs/prometheus/yuzu-alerts.yml` already pages on. Note the status is `415`, not the `411` the `unmeasurable` reason carries. Pre-auth, so there is no principal and no audit row: the throttled `[#2407]` warn in the journal carries the sanitized method/path/source address — that tag, not the `[#2437]` the #2437 implementation emitted, since the general gate now owns every rejection on this path. |
+
+## Pre-auth body-cap metrics (#2407)
+
+Request-body rejections at the general pre-routing chokepoint, **every route and every method — including `GET`/`HEAD`** (D2 hardening, #2407: the earlier GET/HEAD exclusion was removed because it was factually wrong — a GET declaring a `Content-Length` still buffers a body regardless of method) — not just `/mcp/`, which keeps emitting the metric above too, for compatibility. Seeded per table entry at boot from `body_cap_policy.hpp`'s `kBodyCapTable`, so the label set is CLOSED and `absent()` alerting stays meaningful.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_body_cap_rejected_total{path_class,reason}` | counter | A request rejected before its body was read because it failed the resolved route class's cap policy (#2407). `path_class` is always one of `body_cap_policy.hpp`'s fixed table labels (e.g. `mcp`, `bundles`, `scim`, `default`) — **never the raw request path**, which is attacker-controlled and would be an unbounded-cardinality label on a pre-auth metric. `reason=over_cap` is a declared `Content-Length` above the class's cap (`413`); `reason=unmeasurable` is a chunked/undeclared body refused outright for a class whose policy entry sets `requires_measurable` (`411`) — only `mcp` sets that bit today, so `reason="unmeasurable"` is seeded only for `path_class="mcp"` and is not yet reachable for any other class. `reason=unsupported_encoding` (D4 hardening) is a `Content-Encoding` other than `identity` (`415`) — refused UNCONDITIONALLY on every class regardless of `requires_measurable`, so unlike `unmeasurable` this reason IS seeded, and reachable, for every `path_class` in the table. `resolve_body_cap` also defines a fail-closed sentinel label, `path_class="unmatched"`, returned if `kBodyCapTable`'s always-matching catch-all entry were ever removed or mis-scoped so no row matches. It is deliberately **not** pre-seeded by the boot-time loop that seeds every real table row to 0 — a `static_assert` in `body_cap_policy.hpp` requires the table to carry a `{kBodyCapAnyMethod, ""}` catch-all row, so `best` in `resolve_body_cap` can never be null and this sentinel can never be returned: it is unreachable **by construction**, not merely on the shipped table, and there is no gap to pre-seed against. Pre-auth, so there is no principal and no audit row: the throttled `[#2407]` warn in the journal carries the sanitized method/path/source address. See `docs/user-manual/rest-api.md` "Pre-Auth Request Body Caps" for the per-class cap table. |
 
 ## MCP input-bounds metrics
 
@@ -156,6 +164,24 @@ The skips and failed counters must be alerted on separately and never collapsed:
 both leave rows undeleted, so an audit table that never shrinks looks identical
 either way. Only the pair distinguishes "the guard is protecting the table" from
 "cleanup is broken".
+
+## Response-store metrics
+
+The response store (PostgreSQL schema `response_store`, ADR-0039) persists agentic
+command/instruction results for the executions drawer and the `/tar` dashboard. Its
+ingest is **fail-soft** (a dropped result is re-derivable operational telemetry — the
+executions ladder still tracks the command), its reads are **degrade-distinguishable**
+(nullopt on a store/pool failure, never a false-empty), and its TTL retention runs the
+same clock-guarded sweep the audit store uses.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_server_response_ingest_dropped_total{reason}` | counter | Response result rows that did not persist, by `reason` (`store_not_open` / `pool_acquire_timeout` / `query_error` / `malformed_identity_field`). Fail-soft by design — the command is still tracked on the executions ladder — but a sustained non-zero rate means drawer/TAR result history is silently lossy. `malformed_identity_field` is a distinct case: `instruction_id`/`execution_id`/`plugin`/`agent_id` are bound unsanitized (see ADR-0039 "Ingest bounds") — a value containing an embedded NUL byte is rejected outright rather than silently truncated at the NUL, so a non-zero rate here means an agent sent a malformed identity field, not a store health problem. See `YuzuResponseMalformedIdentityDrops` (informational, not store-health) vs. `YuzuResponseIngestDrops` (excludes this reason). |
+| `yuzu_server_response_read_degrade_total{reason,source}` | counter | Response reads that returned a **degrade** (nullopt, not empty), by `reason` (`store_not_open` / `pool_acquire_timeout` / `query_error` — the same three as the row above, excluding `malformed_identity_field`, which is write-path only) and `source` (`response_store`). The store seam distinguishes empty from degraded so a consumer renders a degrade banner rather than misreading a blip as "no responses". |
+| `yuzu_server_response_reap_passes_total{result}` | counter | TTL reap passes, by `result`: `swept` (deleted the full expired set), `capped` (hit the per-pass row cap of 10,000 OR the delete-time budget — a backlog likely remains either way; a sustained non-zero rate means expiry is outrunning the drain on this high-write store. Since the reap chunk-cascade fix (#2691 Gate 5), the delete-time budget can be hit before any row in a chunk is actually deleted, so `capped` no longer guarantees rows were removed this pass — it guarantees a backlog probe found one), `noop` (nothing expired), `declined` (the retention classifier vetoed a would-wipe or implausible-clock pass), `declined_no_anchor` (first pass ever against a store with expired rows present — declines once, the next pass drains), `skipped_lock` (another replica held the advisory lock), `failed` (the pass errored). As with the audit reaper, alert on the total NOT increasing — a reaper that never runs leaves every result flat at 0, identical to a quiet healthy store while the table grows — **and** alert on a sustained `capped` rate. |
+
+All reason/result dimensions are seeded to zero at boot, so absent-series alerting stays
+distinguishable from a scrape failure.
 
 ## MCP progress-bridge metrics
 

@@ -63,8 +63,19 @@ using yuzu::server::StoredResponse;
 using yuzu::server::detail::AgentRegistry;
 using yuzu::server::detail::AgentServiceImpl;
 using yuzu::server::detail::EventBus;
+using yuzu::server::pg::PgPool;
+namespace pg = yuzu::server::pg;
 
 namespace {
+
+// ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
+// "responsestore" template key with test_response_store.cpp (identical setup).
+yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("responsestore template: store failed to migrate");
+}};
 
 namespace apb = ::yuzu::agent::v1;
 
@@ -96,12 +107,10 @@ struct GatewayResponseHarness {
     AgentRegistry registry{bus, metrics};
     yuzu::server::auth::AuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
-    ResponseStore responses{":memory:"};
+    ResponseStore responses;
     // AuditStore ported to Postgres (ADR-0006): a template-cloned ephemeral
-    // database + pool. This harness has no other PG-backed member, so it
-    // self-skips explicitly (mirrors yuzu::test::AuthDbPg's own posture) —
-    // SKIPs the enclosing TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset,
-    // FAILs when set but broken.
+    // database + pool. This harness's ResponseStore is now also PG-backed
+    // (ADR-0039), so both share the caller-supplied pool below.
     std::optional<yuzu::test::PostgresTestDb> audit_db;
     std::optional<yuzu::server::pg::PgPool> audit_pool;
     std::unique_ptr<AuditStore> audit;
@@ -113,7 +122,7 @@ struct GatewayResponseHarness {
                          metrics,
                          /*gateway_mode=*/false};
 
-    GatewayResponseHarness() {
+    explicit GatewayResponseHarness(pg::PgPool& pool) : responses(pool) {
         REQUIRE(responses.is_open());
 
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
@@ -147,14 +156,18 @@ struct GatewayResponseHarness {
 
 TEST_CASE("record_execution_id: terminal response stamps mapped execution_id",
           "[pg][agent_service][executions][pr2]") {
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     h.svc.record_execution_id("cmd-A", "exec-42");
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS,
                                                       /*output=*/"", /*exit_code=*/0);
     h.svc.process_gateway_response("agent-1", resp);
 
-    auto rows = h.responses.query_by_execution("exec-42");
+    auto rows_opt = h.responses.query_by_execution("exec-42");
+    REQUIRE(rows_opt.has_value());
+    const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
     CHECK(rows[0].execution_id == "exec-42");
     CHECK(rows[0].agent_id == "agent-1");
@@ -164,7 +177,9 @@ TEST_CASE("record_execution_id: terminal response stamps mapped execution_id",
 
 TEST_CASE("record_execution_id: empty execution_id removes the mapping",
           "[pg][agent_service][executions][pr2]") {
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     h.svc.record_execution_id("cmd-A", "exec-42");
     h.svc.record_execution_id("cmd-A", ""); // documented clear semantics
 
@@ -172,8 +187,11 @@ TEST_CASE("record_execution_id: empty execution_id removes the mapping",
     h.svc.process_gateway_response("agent-1", resp);
 
     auto by_exec = h.responses.query_by_execution("exec-42");
-    CHECK(by_exec.empty()); // mapping cleared → row not tagged
-    auto by_cmd = h.responses.get_by_instruction("cmd-A");
+    REQUIRE(by_exec.has_value());
+    CHECK(by_exec->empty()); // mapping cleared → row not tagged
+    auto by_cmd_opt = h.responses.get_by_instruction("cmd-A");
+    REQUIRE(by_cmd_opt.has_value());
+    const auto& by_cmd = *by_cmd_opt;
     REQUIRE(by_cmd.size() == 1);
     CHECK(by_cmd[0].execution_id.empty());
 }
@@ -185,7 +203,9 @@ TEST_CASE("process_gateway_response: RUNNING streaming row carries execution_id"
     // The RUNNING branch lives at agent_service_impl.cpp:597-655 — it both
     // stores a streaming row and stamps execution_id from the same map.
     // Pin both halves: the row exists AND it carries the tag.
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     h.svc.record_execution_id("cmd-stream", "exec-stream");
 
     auto running =
@@ -193,7 +213,9 @@ TEST_CASE("process_gateway_response: RUNNING streaming row carries execution_id"
                                               /*output=*/"row-1");
     h.svc.process_gateway_response("agent-1", running);
 
-    auto rows = h.responses.query_by_execution("exec-stream");
+    auto rows_opt = h.responses.query_by_execution("exec-stream");
+    REQUIRE(rows_opt.has_value());
+    const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
     CHECK(rows[0].status == static_cast<int>(apb::CommandResponse::RUNNING));
     CHECK(rows[0].output == "row-1");
@@ -201,7 +223,9 @@ TEST_CASE("process_gateway_response: RUNNING streaming row carries execution_id"
 
 TEST_CASE("process_gateway_response: FAILURE preserves error_detail and execution_id",
           "[pg][agent_service][executions][pr2]") {
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     h.svc.record_execution_id("cmd-fail", "exec-fail");
 
     auto resp = GatewayResponseHarness::make_response("cmd-fail", apb::CommandResponse::FAILURE,
@@ -210,7 +234,9 @@ TEST_CASE("process_gateway_response: FAILURE preserves error_detail and executio
     resp.mutable_error()->set_message("plugin returned non-zero");
     h.svc.process_gateway_response("agent-1", resp);
 
-    auto rows = h.responses.query_by_execution("exec-fail");
+    auto rows_opt = h.responses.query_by_execution("exec-fail");
+    REQUIRE(rows_opt.has_value());
+    const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
     CHECK(rows[0].error_detail == "plugin returned non-zero");
     CHECK(rows[0].execution_id == "exec-fail");
@@ -222,11 +248,15 @@ TEST_CASE("process_gateway_response: unmapped command_id stamps empty execution_
     // Out-of-band dispatch (CLI / direct gRPC) bypasses the dispatch path
     // that calls record_execution_id. The receipt path must degrade to an
     // empty execution_id rather than crashing or inventing a value.
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     auto resp = GatewayResponseHarness::make_response("cmd-orphan", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", resp);
 
-    auto by_cmd = h.responses.get_by_instruction("cmd-orphan");
+    auto by_cmd_opt = h.responses.get_by_instruction("cmd-orphan");
+    REQUIRE(by_cmd_opt.has_value());
+    const auto& by_cmd = *by_cmd_opt;
     REQUIRE(by_cmd.size() == 1);
     CHECK(by_cmd[0].execution_id.empty());
 }
@@ -252,7 +282,9 @@ TEST_CASE("process_gateway_response: terminal branch does NOT erase mapping "
     // agents (#4) past the smallest fan-out width still stamp correctly,
     // closing the off-by-one window where a regression could erase after
     // exactly N=3 calls.
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     h.svc.record_execution_id("cmd-fan", "exec-fan");
 
     struct AgentTerminal {
@@ -270,7 +302,9 @@ TEST_CASE("process_gateway_response: terminal branch does NOT erase mapping "
         h.svc.process_gateway_response(t.agent, r);
     }
 
-    auto rows = h.responses.query_by_execution("exec-fan");
+    auto rows_opt = h.responses.query_by_execution("exec-fan");
+    REQUIRE(rows_opt.has_value());
+    const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 4);
     for (const auto& row : rows) {
         CHECK(row.execution_id == "exec-fan");
@@ -288,15 +322,21 @@ TEST_CASE("process_gateway_response: __timing__ sentinel takes the early-return 
     // Without this pin, a refactor that hoists the store block above the
     // sentinel guard would silently start persisting timing rows under the
     // execution_id, which the drawer would then surface as bogus output.
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     h.svc.record_execution_id("cmd-time", "exec-time");
 
     auto timing = GatewayResponseHarness::make_response("cmd-time", apb::CommandResponse::RUNNING,
                                                         /*output=*/"__timing__|elapsed=42");
     h.svc.process_gateway_response("agent-1", timing);
 
-    CHECK(h.responses.query_by_execution("exec-time").empty());
-    CHECK(h.responses.get_by_instruction("cmd-time").empty());
+    auto time_by_exec = h.responses.query_by_execution("exec-time");
+    REQUIRE(time_by_exec.has_value());
+    CHECK(time_by_exec->empty());
+    auto time_by_cmd = h.responses.get_by_instruction("cmd-time");
+    REQUIRE(time_by_cmd.has_value());
+    CHECK(time_by_cmd->empty());
 }
 
 TEST_CASE("process_gateway_response: terminal SUCCESS folds into existing RUNNING rows",
@@ -308,7 +348,9 @@ TEST_CASE("process_gateway_response: terminal SUCCESS folds into existing RUNNIN
     // happened "before" the data row. Two streaming RUNNING rows + a
     // terminal SUCCESS = 2 rows, both updated to SUCCESS, both still
     // tagged with the same execution_id.
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     h.svc.record_execution_id("cmd-mix", "exec-mix");
 
     auto r1 = GatewayResponseHarness::make_response("cmd-mix", apb::CommandResponse::RUNNING,
@@ -320,7 +362,9 @@ TEST_CASE("process_gateway_response: terminal SUCCESS folds into existing RUNNIN
     auto r3 = GatewayResponseHarness::make_response("cmd-mix", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", r3);
 
-    auto rows = h.responses.query_by_execution("exec-mix");
+    auto rows_opt = h.responses.query_by_execution("exec-mix");
+    REQUIRE(rows_opt.has_value());
+    const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 2);
     for (const auto& row : rows) {
         CHECK(row.status == static_cast<int>(apb::CommandResponse::SUCCESS));
@@ -334,13 +378,17 @@ TEST_CASE("process_gateway_response: terminal frame WITH output still inserts",
     // (rather than streaming via RUNNING + sentinel terminal) should
     // still produce a row, since finalize_terminal_status only fires
     // when the terminal output is empty.
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     h.svc.record_execution_id("cmd-direct", "exec-direct");
     auto only = GatewayResponseHarness::make_response("cmd-direct", apb::CommandResponse::SUCCESS,
                                                       /*output=*/"final-data");
     h.svc.process_gateway_response("agent-1", only);
 
-    auto rows = h.responses.query_by_execution("exec-direct");
+    auto rows_opt = h.responses.query_by_execution("exec-direct");
+    REQUIRE(rows_opt.has_value());
+    const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 1);
     CHECK(rows[0].status == static_cast<int>(apb::CommandResponse::SUCCESS));
     CHECK(rows[0].output == "final-data");
@@ -358,7 +406,9 @@ TEST_CASE("process_gateway_response: re-mapping a command_id updates the stamp",
     // does NOT fold back onto the old execution's row. With no RUNNING
     // row under exec-new, finalize matches zero rows and falls through
     // to insert (preserving the re-mapping invariant).
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     h.svc.record_execution_id("cmd-re", "exec-old");
     auto first = GatewayResponseHarness::make_response("cmd-re", apb::CommandResponse::RUNNING,
                                                        /*output=*/"old");
@@ -368,11 +418,15 @@ TEST_CASE("process_gateway_response: re-mapping a command_id updates the stamp",
     auto second = GatewayResponseHarness::make_response("cmd-re", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", second);
 
-    auto old_rows = h.responses.query_by_execution("exec-old");
+    auto old_rows_opt = h.responses.query_by_execution("exec-old");
+    REQUIRE(old_rows_opt.has_value());
+    const auto& old_rows = *old_rows_opt;
     REQUIRE(old_rows.size() == 1);
     CHECK(old_rows[0].status == static_cast<int>(apb::CommandResponse::RUNNING));
 
-    auto new_rows = h.responses.query_by_execution("exec-new");
+    auto new_rows_opt = h.responses.query_by_execution("exec-new");
+    REQUIRE(new_rows_opt.has_value());
+    const auto& new_rows = *new_rows_opt;
     REQUIRE(new_rows.size() == 1);
     CHECK(new_rows[0].status == static_cast<int>(apb::CommandResponse::SUCCESS));
 }
@@ -583,7 +637,9 @@ TEST_CASE("AgentRegistry::note_trusted_gateway_peer round-trips, refuses empty",
     // gateway-mode Subscribe is allowed if the peer IP was previously
     // noted via ProxyRegister. Empty IP must NEVER round-trip (would
     // recreate the bypass).
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     CHECK_FALSE(h.registry.is_trusted_gateway_peer("10.0.0.1"));
     h.registry.note_trusted_gateway_peer("10.0.0.1");
     CHECK(h.registry.is_trusted_gateway_peer("10.0.0.1"));
@@ -602,7 +658,9 @@ TEST_CASE("AgentRegistry::is_trusted_gateway_peer holds multiple gateways",
     // A fleet may have multiple gateway nodes (load-balanced cluster).
     // Each gateway noted via ProxyRegister joins the trusted set; none
     // of them displaces another.
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     h.registry.note_trusted_gateway_peer("10.0.0.1");
     h.registry.note_trusted_gateway_peer("10.0.0.2");
     h.registry.note_trusted_gateway_peer("::1");
@@ -620,7 +678,9 @@ TEST_CASE("AgentRegistry::is_trusted_gateway_peer evicts entries past TTL "
     // UP-3: a stale entry (TTL elapsed) is no longer trusted. The lookup
     // returns false; the next note_trusted_gateway_peer sweeps it out of
     // the map.
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     h.registry.note_trusted_gateway_peer("10.0.0.1");
     REQUIRE(h.registry.is_trusted_gateway_peer("10.0.0.1"));
     REQUIRE(h.registry.trusted_gateway_peer_count() == 1);
@@ -648,7 +708,9 @@ TEST_CASE("AgentRegistry::note_trusted_gateway_peer refreshes last_seen on repea
     // entry alive indefinitely. Test: insert → age to JUST shy of TTL →
     // re-insert → age another half-TTL → still trusted (would have
     // expired without the refresh).
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     h.registry.note_trusted_gateway_peer("10.0.0.1");
 
     // Age to 45 min (still within 1 h TTL).
@@ -672,7 +734,9 @@ TEST_CASE("AgentRegistry::note_trusted_gateway_peer caps map at kTrustedGatewayC
     // grow unboundedly. The cap (1024) prevents memory DoS; oldest-first
     // eviction preserves trust for the most recent gateways.
     using yuzu::server::detail::AgentRegistry;
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
 
     // Fill to cap. We use distinct IPs to avoid the in-place refresh path.
     // Each insert is one steady_clock tick newer than the previous, so
@@ -698,7 +762,9 @@ TEST_CASE("AgentRegistry::note_trusted_gateway_peer updates the Prometheus gauge
     // The yuzu_trusted_gateway_peer_set_size gauge reflects current map
     // size on every note + every sweep, so dashboards see real-time
     // health (rising under churn, falling as entries expire).
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
 
     auto current_gauge = [&]() {
         return h.metrics.gauge("yuzu_trusted_gateway_peer_set_size").value();
@@ -745,7 +811,9 @@ TEST_CASE("ProxyRegister: failed enrollment (no token, no auto-approve) does NOT
     // "AgentRegistry::note_trusted_gateway_peer round-trips, refuses empty"
     // which proves the helper itself is wired and reachable.
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
 
@@ -777,7 +845,9 @@ TEST_CASE("ProxyRegister: invalid enrollment token does NOT add the peer to the 
     // the trust-noting code. Pre-fix this branch would have already
     // recorded the peer.
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
 
@@ -834,7 +904,9 @@ TEST_CASE("Register: rejects oversize agent_id with INVALID_ARGUMENT (W1.4 R2 / 
     // checked BEFORE any audit emission, mTLS check, or auth-mgr lookup
     // so attack traffic costs ~one strlen + counter increment.
     using yuzu::server::auth::kMaxAgentIdLength;
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
 
     apb::RegisterRequest req;
     req.mutable_info()->set_agent_id(std::string(kMaxAgentIdLength + 1, 'A'));
@@ -856,7 +928,9 @@ TEST_CASE("Register: rejects empty agent_id with INVALID_ARGUMENT (W1.4 R2 / UP-
     // Empty agent_id is structurally invalid — every downstream code path
     // assumes a non-empty key (registry, audit principal, pending lookup).
     // Same metric / status as the oversize case.
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
 
     apb::RegisterRequest req;
     req.mutable_info()->set_agent_id("");
@@ -881,7 +955,9 @@ TEST_CASE("ProxyRegister: rejects oversize agent_id with INVALID_ARGUMENT (W1.4 
     // discriminates gateway-proxied attacks from direct-connect ones.
     using yuzu::server::auth::kMaxAgentIdLength;
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
 
@@ -930,7 +1006,9 @@ apb::RegisterRequest make_gw_register(yuzu::server::auth::AuthManager& auth_mgr,
 TEST_CASE("ProxyRegister: a wired signer issues a per-agent cert for a gateway-enrolled agent",
           "[pg][agent_service][register][gateway][pki][pr5d]") {
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
 
@@ -987,9 +1065,13 @@ TEST_CASE("ProxyInventory: device_ci is NOT double-stored into the generic Inven
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
     using yuzu::server::InventoryStore;
     YUZU_REQUIRE_PG_DB_TPL(db, inventory_h1_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    // Shared pool: both InventoryStore (schema inventory_store, migrated by the
+    // template above) and ResponseStore (schema response_store, migrated by its
+    // own constructor below — schemas coexist in one Postgres database) reuse
+    // this one connection pool rather than standing up a second ephemeral DB.
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
-    GatewayResponseHarness h;
+    GatewayResponseHarness h(pool);
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
 
@@ -1034,9 +1116,11 @@ TEST_CASE("ProxyInventory: software_licensing is NOT double-stored into the gene
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
     using yuzu::server::InventoryStore;
     YUZU_REQUIRE_PG_DB_TPL(db, inventory_h1_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    // Shared pool: both InventoryStore and ResponseStore reuse this one
+    // connection pool (see the H1 device_ci test above for why that's safe).
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
-    GatewayResponseHarness h;
+    GatewayResponseHarness h(pool);
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
 
@@ -1075,9 +1159,11 @@ TEST_CASE("ProxyInventory: over-cap source maps are rejected before generic writ
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
     using yuzu::server::InventoryStore;
     YUZU_REQUIRE_PG_DB_TPL(db, inventory_h1_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    // Shared pool: both InventoryStore and ResponseStore reuse this one
+    // connection pool (see the H1 device_ci test above for why that's safe).
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
-    GatewayResponseHarness h;
+    GatewayResponseHarness h(pool);
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
     InventoryStore inv{pool};
@@ -1111,7 +1197,9 @@ TEST_CASE("ProxyRegister: no signer wired → enrolls but issues no cert (gracef
     // The pre-PR5d behavior, now the explicit fallback: a CSR with no signer
     // (CA inactive) must still enroll the agent, just without a cert.
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
 
@@ -1128,7 +1216,9 @@ TEST_CASE("ProxyRegister: no signer wired → enrolls but issues no cert (gracef
 TEST_CASE("ProxyRegister: signer wired but no CSR → signer not called, no cert",
           "[pg][agent_service][register][gateway][pki][pr5d]") {
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
 
@@ -1153,7 +1243,9 @@ TEST_CASE("ProxyRegister: signer wired but no CSR → signer not called, no cert
 TEST_CASE("ProxyRegister: signing failure is non-fatal (agent still enrolled)",
           "[pg][agent_service][register][gateway][pki][pr5d]") {
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
 
@@ -1176,7 +1268,9 @@ TEST_CASE("Register (direct): a wired signer issues a per-agent cert — parity 
     // Locks the direct-path issuance block (agent_service_impl.cpp:539) that
     // ProxyRegister mirrors. Without this, a future edit to the direct block
     // would silently break the parity PR5d depends on (consistency Gate-4 SHOULD).
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     int calls = 0;
     std::string seen_csr, seen_id;
     auto seen_src = yuzu::server::CertIssuanceSource::GatewayProxy; // sentinel ≠ expected
@@ -1223,7 +1317,9 @@ TEST_CASE("ProxyRegister: the signer is called with the RELAYED agent_id, never 
     // enrolled id, not the CSR's. (X509_REQ_verify proves key-ownership only; this
     // pins that the service layer ignores CSR-asserted identity.)
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
     std::string seen_id;
@@ -1253,7 +1349,9 @@ TEST_CASE("ProxyRegister: a THROWING signer cannot crash the gateway handler (#1
     // shared signer is wrapped in try/catch — this pins that a throwing signer
     // degrades to "enrolled, no cert" rather than taking the process down.
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
     gateway_svc.set_agent_cert_signer(
@@ -1276,7 +1374,9 @@ TEST_CASE("Register (direct): a THROWING signer cannot crash the handler either 
           "[pg][agent_service][register][pki][pr5d][security]") {
     // Parity: the direct Register path shares the same try/catch crash-safety as
     // ProxyRegister (both signer sites are now exception-contained).
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     h.svc.set_agent_cert_signer(
         [&](const std::string&, const std::string&, yuzu::server::CertIssuanceSource)
             -> std::optional<std::pair<std::string, std::string>> {
@@ -1369,7 +1469,9 @@ TEST_CASE("notify_exec_tracker: RUNNING maps to status='running' with "
     // first_response_at but leaves completed_at zero. A regression that
     // unifies the RUNNING and terminal branches (treating RUNNING as
     // completed) would flip executions to "done" on their first chunk.
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc};
     auto exec_id = ts.make_exec();
     h.svc.record_execution_id("cmd-A", exec_id);
@@ -1389,7 +1491,9 @@ TEST_CASE("notify_exec_tracker: RUNNING maps to status='running' with "
 TEST_CASE("notify_exec_tracker: SUCCESS maps to status='success' and stamps "
           "completed_at",
           "[pg][agent_service][executions][issue872]") {
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc};
     auto exec_id = ts.make_exec();
     h.svc.record_execution_id("cmd-A", exec_id);
@@ -1408,7 +1512,9 @@ TEST_CASE("notify_exec_tracker: SUCCESS maps to status='success' and stamps "
 
 TEST_CASE("notify_exec_tracker: FAILURE preserves error_detail and exit_code",
           "[pg][agent_service][executions][issue872]") {
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc};
     auto exec_id = ts.make_exec();
     h.svc.record_execution_id("cmd-A", exec_id);
@@ -1428,7 +1534,9 @@ TEST_CASE("notify_exec_tracker: FAILURE preserves error_detail and exit_code",
 
 TEST_CASE("notify_exec_tracker: TIMEOUT maps to status='timeout'",
           "[pg][agent_service][executions][issue872]") {
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc};
     auto exec_id = ts.make_exec();
     h.svc.record_execution_id("cmd-A", exec_id);
@@ -1459,7 +1567,9 @@ TEST_CASE("notify_exec_tracker: REJECTED maps to status='rejected'",
     // `s.first_response_at > 0 ? s.first_response_at : now`
     // (execution_tracker.cpp:363), making the struct-field zero invisible
     // to consumers.
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc};
     auto exec_id = ts.make_exec();
     h.svc.record_execution_id("cmd-A", exec_id);
@@ -1492,7 +1602,9 @@ TEST_CASE("notify_exec_tracker: unmapped command_id is a no-op",
     // tracker query (all filter by execution_id) but would still bloat the
     // table and break the documented "out-of-band = no tracker side effect"
     // contract referenced in agent_service_impl.cpp:1146.
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc};
     auto exec_id = ts.make_exec();
     // Deliberately do NOT call record_execution_id — cmd-orphan is unmapped.
@@ -1512,7 +1624,9 @@ TEST_CASE("notify_exec_tracker: null tracker pointer is a no-op (shutdown contra
     // tracker stays non-null once set) would crash in the shutdown window.
     // Pinned explicitly via the set→unset path, not just the never-set path
     // every other GatewayResponseHarness test exercises implicitly.
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     {
         TrackerScope ts{h.svc};
         // ~TrackerScope calls set_execution_tracker(nullptr) before destroying
@@ -1533,7 +1647,9 @@ TEST_CASE("Register: admin-denied agent does not consume the enrollment token (#
     // attacker burned a use of the token on every attempt — depleting a
     // max_uses=1 token until the legitimate agent could no longer enroll. The
     // early PendingStatus::denied check pre-empts the consume.
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     auto raw =
         h.auth_mgr.create_enrollment_token("dos-test", /*max_uses=*/1, std::chrono::hours(1));
 
@@ -1577,7 +1693,9 @@ TEST_CASE("Register: admin-denied agent does not consume the enrollment token (#
 
 TEST_CASE("Register: successful token enrollment emits a success audit row (#1065)",
           "[pg][agent_service][register][enrollment][audit][issue1065]") {
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     auto raw =
         h.auth_mgr.create_enrollment_token("ok-test", /*max_uses=*/1, std::chrono::hours(1));
 
@@ -1615,7 +1733,9 @@ TEST_CASE("ProxyRegister: admin-denied agent does not consume the enrollment tok
     // consume-before-deny ordering — so the token-depletion DoS was equally
     // reachable here until the early PendingStatus::denied check was mirrored.
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
     gateway_svc.set_audit_store(h.audit.get());
@@ -1656,7 +1776,9 @@ TEST_CASE("ProxyRegister: admin-denied agent does not consume the enrollment tok
 TEST_CASE("ProxyRegister: audit attributes the agent origin IP, not the gateway IP (#1064)",
           "[pg][agent_service][register][enrollment][gateway][issue1064]") {
     using yuzu::server::detail::GatewayUpstreamServiceImpl;
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
     gateway_svc.set_audit_store(h.audit.get());
@@ -1776,7 +1898,9 @@ void install_match_all_auto_approve(GatewayResponseHarness& h) {
 
 TEST_CASE("Register: approved CSR reaches the signer with the authenticated agent_id (B-2)",
           "[pg][agent_service][pki][pr3]") {
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     install_match_all_auto_approve(h);
 
     std::string seen_csr, seen_agent_id;
@@ -1809,7 +1933,9 @@ TEST_CASE("Register: approved CSR reaches the signer with the authenticated agen
 
 TEST_CASE("Register: signer returning nullopt leaves the agent accepted but cert-less (B-2)",
           "[pg][agent_service][pki][pr3]") {
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     install_match_all_auto_approve(h);
     int signer_calls = 0;
     h.svc.set_agent_cert_signer(
@@ -1833,7 +1959,9 @@ TEST_CASE("Register: signer returning nullopt leaves the agent accepted but cert
 
 TEST_CASE("Register: a pending (unapproved) enrollment never reaches the CSR signer (B-2)",
           "[pg][agent_service][pki][pr3][security]") {
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     // No auto-approve rule + no token → the agent lands in the pending queue and
     // Register returns BEFORE the signing block. A CSR must NOT be signed for an
     // agent the operator has not approved.
@@ -1859,7 +1987,9 @@ TEST_CASE("Register: a pending (unapproved) enrollment never reaches the CSR sig
 
 TEST_CASE("Register: no CSR → signer is not invoked even when wired (B-2)",
           "[pg][agent_service][pki][pr3]") {
-    GatewayResponseHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
     install_match_all_auto_approve(h);
     bool signer_called = false;
     h.svc.set_agent_cert_signer(
