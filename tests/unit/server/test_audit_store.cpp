@@ -216,6 +216,9 @@ TEST_CASE("AuditStore: open against a fresh template clone", "[pg][audit_store][
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     AuditStore store(pool);
     REQUIRE(store.is_open());
+    // #2854: no durable anchor exists yet on a freshly-migrated database — `0`
+    // is the correct seed, not an anomaly.
+    CHECK(store.last_pass_unixtime() == 0);
 }
 
 TEST_CASE("AuditStore: bad-path constructor (unroutable DSN) is closed and fails hard/degrades",
@@ -228,6 +231,10 @@ TEST_CASE("AuditStore: bad-path constructor (unroutable DSN) is closed and fails
     CHECK(store.emit_failed_count() == 1);
     CHECK_FALSE(store.query().has_value());
     CHECK_FALSE(store.total_count().has_value());
+    // #2854: the lease-acquire failure returns before the liveness seed ever
+    // runs, same as it returns before schema migration ever runs — a store
+    // that never opened stays at the `0` default, not the anomaly sentinel.
+    CHECK(store.last_pass_unixtime() == 0);
 }
 
 // ── Logging + queries ───────────────────────────────────────────────────────
@@ -550,6 +557,48 @@ TEST_CASE("AuditStore: backfill streams the legacy audit.db and reconciles",
     // A live log() must NOT collide with a backfilled id (sequence advanced).
     CHECK(store.log(mk("admin", "post.backfill")));
     CHECK(row_count(db.dsn()) == 2501);
+}
+
+TEST_CASE("AuditStore #2854: the liveness gauge is seeded from a legacy anchor without a "
+          "restart",
+          "[pg][audit_store][backfill]") {
+    // The ORDERING bug #2854 fixes: a seed placed only in the constructor reads
+    // before this backfill has a chance to run, so on the FIRST Postgres boot —
+    // the exact upgrade the feature exists for — the gauge would stay at 0
+    // forever. `migrate_from_sqlite`'s success chokepoint (`backfill_ok`) must
+    // re-seed after copying the legacy anchor, on the SAME store instance,
+    // with no restart in between.
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_seed_"}};
+    auto legacy = dir.path / "audit.db";
+    build_legacy_audit_db(legacy, /*count=*/5); // seeds legacy last_pass_now=1699000000
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    // Pre-backfill: no durable anchor on this (fresh) Postgres database yet —
+    // the constructor's own seed correctly finds nothing.
+    CHECK(store.last_pass_unixtime() == 0);
+
+    REQUIRE(store.migrate_from_sqlite(legacy));
+    // Post-backfill, same instance: the copied legacy anchor is now visible
+    // without a process restart.
+    CHECK(store.last_pass_unixtime() == 1699000000);
+}
+
+TEST_CASE("AuditStore #2854: an ordinary restart seeds the liveness gauge from the "
+          "existing anchor",
+          "[pg][audit_store][retention][clock-guard]") {
+    // The case the constructor-only seed DOES correctly handle: a database
+    // that already has an anchor from a previous pass, restarted as a new
+    // process. No backfill involved.
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    exec_sql(db.dsn(), "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES "
+                       "('last_pass_now', '1700000000')");
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    CHECK(store.last_pass_unixtime() == 1700000000);
 }
 
 TEST_CASE("AuditStore: backfill is idempotent (second call is a no-op)",
@@ -1972,6 +2021,75 @@ TEST_CASE("AuditStore #2360: the clock-step guard survives a restart via durable
     seed_rows_with_ttl(db.dsn(), now + kWindow + 10, 1); // survivor
     CHECK(second.cleanup_once(now) == 0);
     CHECK(second.clock_anomaly_skips_count() == 1);
+}
+
+TEST_CASE("AuditStore #2854: a negative anchor is seeded unclamped, not laundered to 0",
+          "[pg][audit_store][retention][clock-guard]") {
+    // The anti-clamp pin. A negative `last_pass_now` is the legitimate
+    // dead-CMOS case the clock guard exists for (`cleanup_once` writes it
+    // straight from PostgreSQL's own `now()`, unclamped, when THAT server's
+    // clock is behind 1970). A `> 0` filter anywhere on the seed path would
+    // silently re-merge this with `0` ("no pass has ever run"), handing a
+    // permanent grace to exactly the machine the guard exists to catch.
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    exec_sql(db.dsn(), "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES "
+                       "('last_pass_now', '-100')");
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    CHECK(store.last_pass_unixtime() == -100);
+}
+
+TEST_CASE("AuditStore #2854: a non-integer anchor seeds the anomaly sentinel, never 0",
+          "[pg][audit_store][retention][clock-guard]") {
+    // Corrupt/hand-edited durable state is an anomaly, not a clean slate —
+    // laundering it into `0` would silently hand it the liveness family's
+    // "never ran" grace instead of surfacing it. Mirrors the same standing
+    // invariant `migrate_from_sqlite`'s legacy-meta copy already enforces for
+    // exactly this reason (a non-INTEGER legacy value is carried across as
+    // text rather than coerced to 0).
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    exec_sql(db.dsn(), "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES "
+                       "('last_pass_now', 'not-a-number')");
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    const auto seeded = store.last_pass_unixtime();
+    CHECK(seeded != 0);
+    CHECK(seeded == std::numeric_limits<std::int64_t>::min());
+}
+
+TEST_CASE("AuditStore #2854: an implausibly large anchor seeds the anomaly sentinel, never 0",
+          "[pg][audit_store][retention][clock-guard]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    const auto huge = std::numeric_limits<std::int64_t>::max(); // past kMaxPlausibleNow (max/4)
+    exec_sql(db.dsn(), "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES "
+                       "('last_pass_now', '" + std::to_string(huge) + "')");
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    const auto seeded = store.last_pass_unixtime();
+    CHECK(seeded != 0);
+    CHECK(seeded == std::numeric_limits<std::int64_t>::min());
+}
+
+TEST_CASE("AuditStore #2854: a live retention pass overwrites the seeded anchor with the "
+          "caller's clock",
+          "[pg][audit_store][retention][clock-guard]") {
+    // The two-clock contract: the SEED reads PostgreSQL's clock (via the
+    // durable anchor); every SUBSEQUENT pass overwrites the gauge with the
+    // CALLER's clock (`cleanup_once`), which drives no decision.
+    YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
+    exec_sql(db.dsn(), "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES "
+                       "('last_pass_now', '1700000000')");
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool, kGuardRetentionDays, 0);
+    REQUIRE(store.is_open());
+    CHECK(store.last_pass_unixtime() == 1700000000); // seeded from the durable anchor
+
+    const std::int64_t caller_now = pg_now(db.dsn()) + 5; // deliberately not the seeded value
+    store.cleanup_once(caller_now);
+    CHECK(store.last_pass_unixtime() == caller_now); // overwritten by the CALLER's clock
 }
 
 TEST_CASE("AuditStore #2360: a closed store counts a failed pass, not silence",
