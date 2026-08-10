@@ -1946,10 +1946,14 @@ this section does not restate them.
   `Viewer`-role user who owns a token has **no** RBAC-on path to rotate it
   themselves, and no admin can do it on their behalf either — the token
   cannot be rotated by anyone until its owner is separately granted
-  `ApiToken:Write`. This is unchanged by this work (the same gate already
-  governed `POST /api/v1/tokens` and `DELETE /api/v1/tokens/{id}`); it is
-  stated here because "self-service" throughout this section means
-  *self-service subject to holding `ApiToken:Write`*, never *available to
+  `ApiToken:Write`. This is unchanged by this work — `POST /api/v1/tokens`
+  is already gated the same way; `DELETE /api/v1/tokens/{id}` is gated on
+  the sibling `ApiToken:Delete` operation (`rest_api_v1.cpp:2624`), not
+  `Write` — but the RBAC seed data grants both operations to the same two
+  roles (`Administrator`, `ApiTokenManager`) and to no others, so the
+  admin-only conclusion holds identically for delete. It is stated here
+  because "self-service" throughout this section means *self-service
+  subject to holding the relevant `ApiToken:*` grant*, never *available to
   any authenticated owner*.
 - **Not an ownership-enumeration oracle.** The non-owner rejection is folded
   into the exact same wording the genuinely-nonexistent-token case uses

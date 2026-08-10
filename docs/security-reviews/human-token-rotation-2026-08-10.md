@@ -107,10 +107,14 @@ decision below for why the two cannot share one invariant.
   token has no RBAC-on path to rotate it themselves, and no admin can do it
   for them either — the token cannot be rotated by anyone until its owner is
   separately granted `ApiToken:Write`. This is **pre-existing and unchanged
-  by this work** — the same gate already governed `POST /api/v1/tokens` and
-  `DELETE /api/v1/tokens/{id}` — recorded here because every "self-service"
-  claim elsewhere in this record means *self-service subject to holding
-  `ApiToken:Write`*, not *available to any authenticated owner*.
+  by this work** — `POST /api/v1/tokens` is already gated the same way;
+  `DELETE /api/v1/tokens/{id}` is gated on the sibling `ApiToken:Delete`
+  operation (`rest_api_v1.cpp:2624`), not `Write` — but the RBAC seed data
+  grants both operations to the same two roles (`Administrator`,
+  `ApiTokenManager`) and to no others, so the admin-only conclusion holds
+  identically for delete. Recorded here because every "self-service" claim
+  elsewhere in this record means *self-service subject to holding the
+  relevant `ApiToken:*` grant*, not *available to any authenticated owner*.
 - **A wrong-owner rejection is indistinguishable from a nonexistent token —
   the surface is not an enumeration oracle.** Both the store-level rejection
   and the REST route's own 404 use identical wording/status for "this token
@@ -246,10 +250,10 @@ which is evidence the change *was* narrow, not evidence it was safe: the
 defect's severity comes from what else is gated on that one cell
 (`ApiToken:Write`), not from the cell count changing. The defect was
 instead found by **enumerating the call sites that consult the
-`(ApiToken, Write)` pair** — `POST /api/v1/tokens`, `POST
-/api/settings/api-tokens`, and the rotate/confirm routes all resolved — and
-recognising that the proposed allowance widened every one of them at once,
-not just the two rotate/confirm tools it was written for.
+`(ApiToken, Write)` pair** — exactly **four**: `POST /api/v1/tokens`, `POST
+/api/settings/api-tokens`, and the REST rotate/confirm routes — and
+recognising that the proposed allowance widened all four at once, not just
+the two rotate/confirm MCP tools it was written for.
 
 The suite claim is narrower than first stated: `tests/unit/server/test_auth_routes.cpp`
 does exercise the REST-path tier predicate (`require_permission`/
@@ -265,11 +269,21 @@ tiering at all.
 The durable lesson: **a one-cell change to a shared permission predicate
 inherits the union of every route consulting that `(securable, operation)`
 pair — enumerate the call graph behind the chokepoint, not the grid of
-possible values the predicate can take.** A grid sweep is the right tool for
+possible values the predicate can take.** The vulnerable proposal itself
+moved exactly **one** cell (the `operator`-tier allowance on
+`ApiToken:Write`); the remedy's own delta is **two** (splitting the gate
+into `ApiToken:Write` and the new `ApiToken:Rotate`). A one-cell delta is
+precisely why a grid sweep could not have found this: the grid a sweep
+compares before/after is a snapshot of the predicate's OUTPUT (which values
+it returns per input), and a single narrow cell changing looks identical
+whether that cell is inert or, as here, the single most consequential grant
+in the table — severity lives in what else consults that cell, information
+the grid does not encode at all. A grid sweep is the right tool for
 verifying a remedy's blast radius *after* the operation vocabulary is
-final; it is the wrong tool for finding a defect in a proposal that hasn't
-shipped its own new operation yet, because the grid it would sweep doesn't
-exist yet either.
+final (it correctly proved the two-cell remedy's narrowness above); it is
+the wrong tool for finding a defect in a proposal that hasn't shipped its
+own new operation yet, because the grid it would sweep doesn't exist yet
+either.
 
 ## Open risks (pre-existing, surfaced by this work)
 

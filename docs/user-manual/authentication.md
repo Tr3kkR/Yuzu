@@ -657,6 +657,37 @@ the token's sole active credential. If you skip it, a 60-second background
 sweep auto-revokes the predecessor once the overlap window elapses on its
 own — a longer-running but hands-off path to the same end state.
 
+**MFA step-up is required on every call, if you have MFA enrolled — and
+that includes a repeat call.** Unlike most session activity, `rotate` and
+`confirm` re-validate a *fresh* step-up proof **every time**, including a
+same-caller retry that just re-serves the same successor secret within the
+grace window — a repeat `rotate` is not treated as "already proved" just
+because the first call succeeded. If your last MFA proof is stale (or you
+haven't stepped up this session yet), you get a `401`:
+
+```json
+{
+  "error": {
+    "code": 401,
+    "message": "MFA step-up required",
+    "correlation_id": "req-..."
+  },
+  "meta": {
+    "api_version": "v1",
+    "mfa_step_up_required": true,
+    "challenge_url": "/login/mfa/stepup"
+  }
+}
+```
+
+Follow `challenge_url` to present a fresh TOTP code (or recovery code) —
+`/login/mfa/stepup` for a local session, `/auth/oidc/start` for an OIDC
+session — then retry the `rotate`/`confirm` call. This only applies to the
+interactive (cookie) session these examples use; a caller authenticated
+with a bearer API/MCP token is exempt, since minting that token already
+required MFA. See [Multi-Factor Authentication (TOTP)](#multi-factor-authentication-totp)
+for enrollment and the step-up window.
+
 **Self-service only — no admin override, and no delegate.** You can rotate
 or confirm only a token **you own**; there is no admin bypass (a human
 token's raw successor secret authenticates *as its owner*, so an admin
@@ -668,8 +699,11 @@ doesn't exist. **Under RBAC-on, this composes to effectively admin-only**:
 `ApiToken:Write` is granted only to the `Administrator` and
 `ApiTokenManager` roles, so an `Operator`- or `Viewer`-role user who owns a
 token has no path to rotate it themselves under RBAC-on, and no admin can
-do it for them either — that pre-existing property of `ApiToken:Write`
-(shared with token creation and deletion above) is unchanged by rotation.
+do it for them either — the same pre-existing property already applies to
+creating a token (also `ApiToken:Write`) and to
+[deleting one](#revoking-a-token) (the sibling `ApiToken:Delete`
+operation, held by the same two roles and no others); rotation does not
+change it.
 
 **Lifetime-neutral by design.** The successor token always inherits the
 predecessor's expiry exactly — a non-expiring token stays non-expiring, a
