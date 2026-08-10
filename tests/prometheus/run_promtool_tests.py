@@ -427,8 +427,9 @@ def gate(promtool_argv: list[str], rules: str, tests: str, canary_for=None) -> i
     # it, a `FAILED` from the suite is about the mutation rather than about I/O.
     #
     # The sweep instrument (blind_band_sweep.py) had the root form of this bug
-    # and its `silent()` states the rule this keeps re-learning: an instrument
-    # that cannot run must say so, never return a value.
+    # in its own now-renamed `silent()`/`measure()`, and the `CouldNotMeasure`
+    # exception it raises states the rule this keeps re-learning: an
+    # instrument that cannot run must say so, never return a value.
     loaded = re.search(r"SUCCESS:\s*(\d+)\s+rules found", canary_check_out)
     if canary_check_rc != 0 or not loaded or int(loaded.group(1)) == 0:
         sys.exit(
@@ -536,9 +537,19 @@ def pull_with_retry() -> bool:
     # added to prevent (#2553, Gate 5). Worst case is now 2x90 + 15 = 195s here,
     # ~30s for the daemon probe and 2x120s for the two promtool runs: ~465s.
     # That is comfortable against meson's 600s, which starts at script launch.
-    # It is NOT comfortable against the workflow's `timeout-minutes: 10`, which
-    # is a JOB budget covering checkout too - ~495-555s of 600. Size any
-    # addition against the job budget, not this number.
+    # `timeout-minutes` on the `prometheus-rules` job is now 20 (1200s), not
+    # 10 - #2854 rung B added a second promtool-driven step
+    # (`blind_band_sweep.py --check`) to the SAME job, sharing this budget
+    # rather than getting its own. Sized to the WORST-CASE SUM of both steps'
+    # own documented ceilings (~465-495s here, ~555s for the second step
+    # after its own Gate 3 review found and fixed an under-sized per-call
+    # timeout - see `docs-lint.yml`'s comment on this job for the full
+    # arithmetic), not to either step's typical measured runtime - sizing to
+    # typical runtime is exactly what let the second step ship with a
+    # per-call ceiling the shared budget could not actually survive if
+    # promtool ever genuinely wedges. Size any FURTHER addition the same way:
+    # against the job's total worst-case budget, not this comment's number
+    # alone - two consumers now draw from it.
     #
     # Two attempts, not three: a transient blip clears in seconds and a second
     # try covers it. This still does not pretend to outlast an anonymous Docker

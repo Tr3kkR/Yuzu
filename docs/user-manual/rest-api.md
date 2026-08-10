@@ -6866,8 +6866,10 @@ The MCP endpoint enables AI models and automation tools to interact with Yuzu vi
 #### `GET /mcp/v1/`
 
 The MCP Streamable HTTP **SSE channel** — the server→client half of a session minted by
-`initialize`. Carries heartbeats and, on reconnect, replayed frames; producers
-(`notifications/progress`) arrive with the next 2f rung.
+`initialize`. Carries heartbeats, replayed frames on reconnect, and
+`notifications/progress` frames for any `POST /mcp/v1/` call on this session that
+requested progress tracking and isn't being delivered as a streamed POST instead (see
+below).
 
 **Permission:** the same credential as `POST /mcp/v1/`, plus the session's
 `Mcp-Session-Id` header. The credential is re-checked once per tick (~3 s), whether or
@@ -7031,6 +7033,54 @@ The first three gate `GuaranteedState:Read` and are not audited (cohort posture)
 |---|---|
 | `--mcp-disable` | Reject all `/mcp/v1/` requests |
 | `--mcp-read-only` | Allow only read-only tools regardless of token tier |
+
+**Streamed responses (progress tracking).** A `tools/call` for `execute_instruction`
+carrying `_meta.progressToken` (see `docs/user-manual/mcp.md`'s `progressToken`
+definition for the type/length contract; an out-of-spec value is silently treated as
+absent — no error, no progress) opts into progress tracking — **this requires an
+active session**: a non-empty `Mcp-Session-Id` header from a prior `initialize`. A
+`Mcp-Session-Id` that is present but invalid (unknown, expired, or another
+principal's) fails the **entire call** with `404`/`-32007` before progress tracking is
+even considered — that is a property of every non-`initialize` method on this
+endpoint, not specific to progress tracking, and is covered above under `GET /mcp/v1/`.
+The table below assumes a valid session or none at all; where progress *is* tracked,
+delivery depends on the request's `Accept` header and whether the server has
+`--mcp-enable-streamed-post` enabled (off by default):
+
+| `_meta.progressToken` | `Mcp-Session-Id` | `Accept: text/event-stream` | Server answers |
+|---|---|---|---|
+| present | sent, valid | present, streamed POST enabled | this POST response held open as an SSE stream — `notifications/progress` frames, then the JSON-RPC result last, then EOF |
+| present | sent, valid | absent, or streamed POST disabled | plain JSON now; progress frames go to the session's `GET /mcp/v1/` stream instead |
+| present | not sent | any | plain JSON, byte-identical to a call with no progress tracking |
+| absent | any | any | plain JSON, byte-identical to a call with no progress tracking |
+
+A streamed POST's response headers are `Content-Type: text/event-stream`,
+`Cache-Control: no-cache`, `X-Accel-Buffering: no` (nginx only — Envoy/HAProxy/ALB/
+Cloudflare need their own response-buffering opt-out, or the proxy will buffer the
+whole stream and the server cannot detect that the client has gone), `X-Correlation-Id`,
+and `X-Content-Type-Options: nosniff`. **Capacity** denials reuse `-32012` / HTTP `429`
+— the same code and `retry_after_ms`/`Retry-After` A4 shape as the `GET` channel above,
+but a longer fixed value (30s vs. the `GET` channel's 5s: none of these causes is
+likely to clear within a second or two) and a distinct set of causes (a shared
+cross-surface budget, this principal's own streamed-call allowance, a server-wide
+capacity ceiling, or this session's own slots). A duplicate request id or an unknown
+session get their own codes (`409`/`-32600`, `404`/`-32007`) instead — see
+`docs/user-manual/mcp.md` "`-32012`: Stream limit reached" for the full cause-by-cause
+remediation, and `docs/mcp-server.md` "Streamed POST — SSE on the response" for the
+admission/refusal table, close reasons, and resume/recovery rules. A denial
+caused by the server disabling/shutting down streaming, or an allocation failure,
+degrades silently to the plain (non-streamed) response instead of erroring — see the
+same admission table for which causes degrade vs. answer. Every session open, close,
+and denial is recorded in the audit log under `mcp.session.open` / `mcp.session.close`
+/ `mcp.session.reject` (`target_type = McpSession`) — see `docs/user-manual/mcp.md`
+"Audit". Progress is best-effort regardless of delivery mode: admission (the same
+`reserve()` call this table describes) runs whether or not the request is a streamed
+POST, but only the streamed-POST arm answers a capacity rejection with an explicit
+`429` — the identical causes silently degrade to a plain response, with no progress
+delivered anywhere and no error surfaced, when progress is being delivered on the
+`GET` channel instead (streamed POST not requested, or not enabled). A caller must
+therefore still be prepared to poll (`query_responses` / `get_execution_status`)
+regardless of which delivery mode it used.
 
 ---
 

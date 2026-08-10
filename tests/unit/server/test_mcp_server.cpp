@@ -636,6 +636,7 @@ struct McpTestServer {
     bool mock_auth_enabled{true};       // false -> auth_fn returns nullopt (401)
     std::vector<std::string> audit_log; // records "action|result" pairs
     std::vector<std::string> audit_details; // records the detail string per audit call (M2)
+    std::vector<std::string> audit_target_ids; // records the target_id string per audit call (#2917)
     bool audit_succeeds_{true};         // false → AuditFn returns false (dropped row)
     bool audit_throws_{false};          // true → AuditFn throws (bad_alloc-class) (#1647)
     bool read_only_mode_{false};        // captured by ref by build_handler
@@ -927,10 +928,11 @@ private:
         // a dropped audit row (#1240: AuditFn is bool; revoke surfaces the gap).
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& /*target_type*/,
-                               const std::string& /*target_id*/,
+                               const std::string& target_id,
                                const std::string& detail) -> bool {
             audit_log.push_back(action + "|" + result);
             audit_details.push_back(detail);
+            audit_target_ids.push_back(target_id);
             if (audit_throws_)
                 throw std::runtime_error("audit DB write blew up"); // bad_alloc-class (#1647)
             return audit_succeeds_;
@@ -9823,6 +9825,30 @@ TEST_CASE("MCP 2f: presented session validated; unknown → 404 + reject audit",
         CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
         CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") !=
               ts.audit_log.end());
+    }
+    SECTION("hostile Mcp-Session-Id sanitized before reaching the audit row (#2917)") {
+        // ';'/'=' in the presented id could otherwise forge fields in the flat
+        // "k=v;k=v" audit detail a SIEM parses. httplib's own Request::set_header
+        // already rejects any header value containing CR or LF specifically
+        // (detail::fields::is_field_value -- interior space/tab ARE allowed,
+        // so this is narrower than "any control byte"; verified: a header
+        // value with an embedded \r\n is silently NOT set at all), so a
+        // raw-newline variant of this test would prove nothing -- ';'/'=' are
+        // the realistically-reachable injection bytes for THIS vector. The header
+        // is attacker-controlled until it validates -- an unknown id never
+        // validates, so this exercises exactly that path. Regression for the
+        // one call site (of 13 producing mcp.session.* rows) that was missing
+        // the sanitize_detail_value() wrap every sibling already has.
+        const std::string hostile_sid = "a;b=c;d=e-genuinely-unknown-session-id";
+        auto bad = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"tools/list","id":2})",
+                               {{"Mcp-Session-Id", hostile_sid}});
+        CHECK(bad->status == 404);
+        REQUIRE_FALSE(ts.audit_target_ids.empty());
+        // Only the first 8 bytes reach the audit row (session-id prefixes are
+        // truncated everywhere in this file); each dangerous byte replaced 1:1.
+        CHECK(ts.audit_target_ids.back() == "a_b_c_d_");
+        CHECK(ts.audit_target_ids.back().find(';') == std::string::npos);
+        CHECK(ts.audit_target_ids.back().find('=') == std::string::npos);
     }
 }
 
