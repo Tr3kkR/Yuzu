@@ -1998,7 +1998,7 @@ public:
         // text was amended so it no longer implies engine-only scope.
         metrics_.describe("yuzu_engine_principal_rotation_sweep_failures_total",
                           "Cumulative rotation-sweep ticks that failed with an exception "
-                          "(predecessor auto-revocation skipped for that tick) — the sweep is "
+                          "(predecessor auto-revocation skipped for that tick) - the sweep is "
                           "shared across BOTH engine-credential and human API-token rotation "
                           "pairs; this counter is not split by principal_kind",
                           "counter");
@@ -2040,12 +2040,12 @@ public:
         // never drift from what the driver actually increments.
         metrics_.describe(kHumanRotationSweepNames.metric_events,
                           "Cumulative human API-token rotation sweep events, by reason (bounded "
-                          "label set) — the human-owned twin of "
+                          "label set) - the human-owned twin of "
                           "yuzu_engine_principal_rotation_events_total",
                           "counter");
         metrics_.describe(kHumanRotationSweepNames.metric_auto_revoked,
                           "Cumulative human API-token predecessors auto-revoked at overlap "
-                          "window end — the human-owned twin of "
+                          "window end - the human-owned twin of "
                           "yuzu_engine_principal_rotation_auto_revoked_total",
                           "counter");
         metrics_.counter(kHumanRotationSweepNames.metric_auto_revoked);
@@ -2063,7 +2063,7 @@ public:
         metrics_.describe("yuzu_api_token_confirm_total",
                           "Human API-token rotation confirm outcomes by surface (rest|mcp) and "
                           "result (success|conflict|client_error|transient); store-reaching calls "
-                          "only, pre-store denials excluded — the human-owned twin of "
+                          "only, pre-store denials excluded - the human-owned twin of "
                           "yuzu_engine_principal_confirm_total",
                           "counter");
         for (auto surface : {"rest", "mcp"}) {
