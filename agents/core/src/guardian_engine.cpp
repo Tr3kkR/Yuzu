@@ -1236,6 +1236,15 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         spark_reader_ = std::make_shared<GuardianStateReader>();
         spark_backend_ = std::make_shared<GuardianSparkEngineBackend>(*engine);
         spark_runtime_ = std::make_shared<GuardianSparkRuntime>(spark_reader_, spark_backend_);
+        // Provider captures a COPY of agent_id_, never `this` (#2237): the runtime is the
+        // object built to survive the agent via a detached SparkEngine handler, so a
+        // provider that reached back into GuardianEngine would be the same class of
+        // dormant UAF the journal's "own everything, borrow nothing" rule exists for.
+        // agent_id_ is set once in the constructor and never reassigned, so a value
+        // capture is exactly as current as the legacy path's own direct read of it
+        // (guardian_engine.cpp's emit_guard_event) - same source, same lifetime, no new
+        // dependency on Register completing first.
+        spark_runtime_->set_agent_id_provider([id = agent_id_] { return id; });
         // The durable journal is engine-owned and borrows kv_ (may be null → it durably
         // writes nothing). Constructed whenever spark is wired; persist stays gated on
         // prefer_spark_ in persist_lifecycle_journal_locked, so it is inert at 7.7a.
