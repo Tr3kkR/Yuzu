@@ -1233,6 +1233,15 @@ replay — which is exactly what this response refuses to make, and `/metrics`
 is not a stronger reader than the caller — so alert on the refusal rate and
 read the audit trail for the kind.
 
+If a store fault happens to coincide with this exact check — the recall's
+lookup step, or the consume step's own cross-surface origin comparison — a
+foreign-origin ticket cannot be told apart from an innocent one for the
+duration of the fault, and the refusal comes back as `-32603` (below), not
+this `-32003`. `yuzu_mcp_approval_masked_denials_total` counts those refusals
+specifically, and the audit row carries a `(lookup)` or `(origin unverified)`
+suffix, so the event is not silently indistinguishable from ordinary store
+contention.
+
 **Fix**: For an RBAC denial — grant the permission to the token creator's
 principal, or use an account with the required permissions. For a ticket recall —
 submit the call **without** `approval_id` to obtain a fresh approval ticket, then
@@ -1258,16 +1267,16 @@ ticket's remaining window ends with it expired like any other.
 **Fix**: Check `retry_after_ms` in the response body — two distinct bodies
 share this code:
 
-- **`retry_after_ms` is a number (currently 5000)**: the store is open but the
-  read or write failed, most likely transiently. Retry after the hint.
-  Retrying indefinitely is not safe, and this body alone cannot tell you when
-  to stop: a store that is open but failing permanently (corruption,
-  read-only, disk full) still takes this arm and will honour a client that
-  retries forever. Bound your own retries — a handful of attempts, then
-  escalate to an operator. Distinguishing that case from a genuinely
-  transient one is a follow-up change.
-- **`retry_after_ms` is `null`**: the store never opened. This will not clear
-  on retry; escalate to an operator immediately.
+- **`retry_after_ms` is a number (currently 5000)**: the store is open and the
+  read or write failure is classified transient — retry after the hint.
+  Retrying indefinitely is still not unconditionally safe (an operator-side
+  escalation is always a reasonable backstop), but this body no longer
+  conflates "failing right now" with "failing permanently": a store that is
+  open but failing in a way an unchanged retry cannot clear (corruption,
+  not-a-database, read-only, disk full) takes the other arm below instead.
+- **`retry_after_ms` is `null`**: either the store never opened, or it is open
+  but failing permanently (corruption, not-a-database, read-only, disk full).
+  Neither will clear on retry; escalate to an operator immediately.
 
 Do **not** re-submit without `approval_id` while the approval
 window is still open: the ticket was not consumed, and minting a fresh one asks
