@@ -2334,7 +2334,8 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                         PQerrorMessage(c));
                     return false;
                 }
-                if (std::string(PQcmdTuples(fp.get())) == "0") {
+                if (std::string(PQcmdTuples(fp.get())) == "0" &&
+                    source_fingerprint != kSourcelessFingerprint) {
                     spdlog::error(
                         "RbacStore: migrate_from_sqlite: lost the race to record this backfill's "
                         "own source fingerprint — another writer already stamped "
@@ -2343,6 +2344,12 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                         "present and go through holder-side fingerprint verification instead.");
                     return false;
                 }
+                // A sourceless stamp losing this same race is NOT an error (matches
+                // AuditStore's stamp_complete, audit_store.cpp): whichever writer's
+                // "sourceless" value won is the same value this call would have
+                // written, so there is nothing this replica's boot needs to refuse
+                // over — refusing here would fail an ordinary simultaneous
+                // multi-replica fresh install for no security benefit.
                 return true;
             });
     };
@@ -2408,6 +2415,17 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                     legacy_db_path.string());
                 backfill_metric("failed");
                 return false;
+            }
+            if (*verify_fp == kSourcelessFingerprint) {
+                // This replica's own local file has no `roles` table — nothing
+                // to lose regardless of who stamped the marker or why (matches
+                // AuditStore's `legacy_fp->count == 0` short-circuit,
+                // audit_store.cpp). Refusing here would penalize a replica for
+                // holding a schema-less file it never had operator content in,
+                // with no data at risk to justify the boot failure.
+                spdlog::debug("RbacStore: migrate_from_sqlite already completed; this replica's "
+                             "own legacy db has no roles table (nothing to lose), skipping");
+                return true;
             }
             if (stored_fingerprint != *verify_fp) {
                 spdlog::error(
