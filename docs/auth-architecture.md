@@ -707,7 +707,9 @@ unchanged; if that value is later rendered into HTML, the render layer's
 own escaping (`html_escape`) is what neutralises it. See the docstring on
 `detail::sanitize_detail_value` in `auth_routes.hpp` for the full contract.
 
-**Migration.** `RbacStore` schema v3 deletes every `group_members` row
+**Migration.** `RbacStore` **legacy SQLite** schema v3 (distinct from the PG
+schema's own v3, ADR-0041 — different migration sequences, same file)
+deletes every `group_members` row
 belonging to an IdP-sourced group (`groups.source != 'local'`) on
 upgrade — those rows were keyed on the OLD display-name principal and
 would otherwise be BOTH orphaned (never re-referenced by the new
@@ -880,8 +882,9 @@ sweep described at the top of this bullet, for every `auth_source`.
 Implementation: `Session::username`/`display_name`
 (`auth.hpp`), `AuthManager::create_oidc_session` (`auth.cpp`), the
 stable-id construction and per-audit-row `display=`/`email=` detail
-attachment in `auth_routes.cpp` `/auth/callback`, `RbacStore` migration
-v3 (`rbac_store.cpp`). Tests: `tests/unit/server/test_oidc_principal_key.cpp`.
+attachment in `auth_routes.cpp` `/auth/callback`, `RbacStore` legacy SQLite
+migration v3 (`rbac_store.cpp`; distinct from the PG schema's own v3,
+ADR-0041). Tests: `tests/unit/server/test_oidc_principal_key.cpp`.
 
 ## SAML 2.0 SP
 
@@ -1643,8 +1646,9 @@ existing deployment picks up the `EnginePrincipal` securable and its grants
 on the next boot with no migration required — the same mechanism that
 introduced `AccessReview` and `SoftwareLicensing`. A migration is needed
 only when a change cannot be expressed as an idempotent additive re-seed
-(`rbac_store.cpp`'s v4 migration *deletes* rows, which is why it needed
-one).
+(`rbac_store.cpp`'s legacy SQLite v4 migration *deletes* rows, which is why
+it needed one — distinct from the PG schema's own migration sequence,
+ADR-0041, currently at v3).
 
 ## On-behalf-of assertions rejected (ADR-1005 Interim rules)
 

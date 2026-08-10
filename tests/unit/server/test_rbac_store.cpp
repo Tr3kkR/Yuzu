@@ -406,15 +406,37 @@ TEST_CASE("RbacStore: seed_defaults()'s grant() cannot resurrect a permission mi
     // (production) seed_defaults()/grant() code, not a hand-copy of its SQL.
     // Its grant() call for Operator/AuditLog/Read must BLOCK on connection
     // A's held lock, and once unblocked, must see the marker and insert
-    // NOTHING.
+    // NOTHING. No REQUIRE/CHECK runs on this background thread — a Catch2
+    // assertion macro throwing off the main thread has no handler and calls
+    // std::terminate() immediately; the outcome is captured in a plain
+    // atomic and asserted on the main thread after join() instead.
     std::atomic<bool> b_started{false};
     std::atomic<bool> b_done{false};
+    std::atomic<bool> b_open{false};
     std::thread grant_thread([&] {
         b_started = true;
         RbacStore reopened{rbac_pool_fx_};
-        REQUIRE(reopened.is_open());
+        b_open = reopened.is_open();
         b_done = true;
     });
+    // cpp-safety (Gate 8, #2703, BLOCKING): join-on-unwind guard. A REQUIRE
+    // between thread construction and the explicit .join() below throws on
+    // failure, and a joinable std::thread destroyed mid-unwind calls
+    // std::terminate() (test_approval_manager.cpp:888-954 hit this same
+    // hazard class). Detaching instead of joining would NOT be safe here
+    // (unlike that file's case): this lambda captures rbac_pool_fx_/
+    // b_started/b_done/b_open BY REFERENCE — stack locals of this
+    // TEST_CASE — so a detached thread outliving them would be a
+    // use-after-free, not a fix. The background thread's only blocking
+    // wait is the advisory lock, server-side bounded by the pool's
+    // lock_timeout, so join() here cannot hang indefinitely.
+    struct ThreadJoiner {
+        std::thread& t;
+        ~ThreadJoiner() {
+            if (t.joinable())
+                t.join();
+        }
+    } joiner{grant_thread};
 
     // Give the grant thread time to start and genuinely block on connection
     // A's held lock — proves this is a real blocked-then-unblocked
@@ -423,10 +445,13 @@ TEST_CASE("RbacStore: seed_defaults()'s grant() cannot resurrect a permission mi
     CHECK(b_started.load());
     CHECK_FALSE(b_done.load());
 
-    REQUIRE(pg::exec_params(lease_a.get(), "COMMIT", std::vector<std::string>{}).ok());
+    const bool commit_ok =
+        pg::exec_params(lease_a.get(), "COMMIT", std::vector<std::string>{}).ok();
     lease_a.reset();
     grant_thread.join();
+    CHECK(commit_ok);
     CHECK(b_done.load());
+    CHECK(b_open.load());
 
     // THE FIX: the permission must stay revoked.
     CHECK_FALSE(store.check_role_has_permission("Operator", "AuditLog", "Read"));

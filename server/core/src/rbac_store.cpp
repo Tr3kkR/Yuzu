@@ -508,12 +508,20 @@ void RbacStore::seed_defaults() {
         pg::PgTxn txn(c);
         if (!exec(kRevokeCoordLockSql))
             return; // txn destructor rolls back
-        exec("INSERT INTO rbac_store.role_permissions (role_name, securable_type, operation, "
-             "effect) SELECT $1, $2, $3, 'allow' WHERE NOT EXISTS ("
-             "  SELECT 1 FROM rbac_store.revoked_seed_defaults "
-             "  WHERE role_name = $1 AND securable_type = $2 AND operation = $3"
-             ") ON CONFLICT DO NOTHING",
-             {std::string(role), std::string(type), std::string(op)});
+        // security-guardian (Gate 8, #2703): check the INSERT's result before
+        // committing, matching the UP-3 discipline PgPool::run_in_txn enforces
+        // centrally for every OTHER write path in this store — a failed
+        // statement must not be followed by commit() (PgTxn::commit() on an
+        // aborted transaction still returns PGRES_COMMAND_OK while silently
+        // performing a rollback; calling it unconditionally would have been
+        // correct-by-accident, not by contract).
+        if (!exec("INSERT INTO rbac_store.role_permissions (role_name, securable_type, "
+                  "operation, effect) SELECT $1, $2, $3, 'allow' WHERE NOT EXISTS ("
+                  "  SELECT 1 FROM rbac_store.revoked_seed_defaults "
+                  "  WHERE role_name = $1 AND securable_type = $2 AND operation = $3"
+                  ") ON CONFLICT DO NOTHING",
+                  {std::string(role), std::string(type), std::string(op)}))
+            return; // txn destructor rolls back
         txn.commit();
     };
 
