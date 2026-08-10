@@ -184,6 +184,50 @@ sustained write rate genuinely exceeds the backlog-recovery ceiling — open an
 engineering ticket; both the per-pass cap and the re-arm floor are
 compile-time constants with no runtime lever).
 
+## YuzuServerRestartLoop
+
+The server process has restarted more than 3 times in the last 3 hours
+(`resets(yuzu_server_uptime_seconds[3h]) > 3`, `for: 15m`). This is a
+process-health signal, not evidence of any specific subsystem fault — it fired
+before this alert existed too, but only as a silent grace-exclusion buried
+inside `YuzuAuditRetentionNotRunning` below (#2854). It stands alone now so
+that rule's own crash-loop handling can eventually simplify without losing
+this detection.
+
+**See restart history directly** rather than trusting only the alert:
+`journalctl --list-boots`, the orchestrator's restart count, or graph
+`yuzu_server_uptime_seconds` — a sawtooth is the signature; each drop back
+near zero is a restart.
+
+**Likely causes, roughly in order of frequency:** an unhandled exception or
+crash during startup or under load (check the process log / systemd journal /
+container log around each restart timestamp for the crash signature); an
+OOM-kill (check `dmesg` / the orchestrator's eviction events); a failed boot
+precondition that causes the process to exit deliberately rather than serve
+with a known-bad state (`AuditStore` backfill failure is one such precondition
+— see `YuzuAuditBackfillFailing` below — but any fail-closed startup check can
+produce this same restart signature); or a supervisor/orchestrator
+misconfiguration causing healthy-but-unwanted restarts (an aggressive
+liveness-probe timeout, a config-reload path that restarts instead of
+reloading).
+
+**Quiet is not the same as "not restarting."** The threshold is deliberately
+placed so an install followed by a couple of config-fix restarts, or a steady
+hourly restart cadence, does not page — see the threshold derivation comment
+above the rule in `docs/prometheus/yuzu-alerts.yml`. A server restarting once
+an hour is not covered by this alert at all; if that cadence itself is a
+concern, it needs its own investigation, not a lowered threshold here (a
+lower threshold pages the ordinary install-plus-fix case too — see the
+promtool cases pinning that trade).
+
+**Unstable target identity silences this alert entirely.** `resets()` needs
+one continuous series per server. If a restart changes the `instance` label —
+dynamic-port or IP-based service discovery, a rescheduled pod — every restart
+starts a fresh series with no resets, and this alert (and the retention
+grace below, which reads the same series) goes silent exactly where a crash
+loop is most likely. That is a scrape-configuration problem, not a rule
+problem: target a stable identity.
+
 ## YuzuAuditRetentionNotRunning
 
 No retention pass has been ATTEMPTED for three hours. This is the one failure the
