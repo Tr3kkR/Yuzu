@@ -1663,7 +1663,13 @@ TEST_CASE("MCP rotate_api_token/confirm_api_token_rotation: self-service round t
 
     const auto now = static_cast<int64_t>(std::time(nullptr));
     const int64_t predecessor_expiry = now + 90 * 24 * 3600;
-    REQUIRE(store.create_token("my-key", "test-user", predecessor_expiry).has_value());
+    // Predecessor carries mcp_tier="operator" to match the session's own
+    // tier below — the authority-inheritance guard (governance Gate 7)
+    // refuses rotation unless the caller's own tier/scope equal the
+    // predecessor's, so this round-trip test's session and predecessor must
+    // agree on tier (empty scope_service on both sides too).
+    REQUIRE(store.create_token("my-key", "test-user", predecessor_expiry, "", "operator")
+                .has_value());
     auto listing = store.list_tokens("test-user").value();
     REQUIRE(!listing.empty());
     const std::string token_id = listing.front().token_id;
@@ -1750,8 +1756,14 @@ TEST_CASE("MCP rotate_api_token: successor lookup is scoped to the predecessor b
     REQUIRE(pool.valid());
     yuzu::server::ApiTokenStore store{pool};
     REQUIRE(store.is_open());
-    REQUIRE(store.create_token("token-a", "test-user").has_value());
-    REQUIRE(store.create_token("token-b", "test-user").has_value());
+    // mcp_tier="operator" on both predecessors, matching the session's own
+    // tier below — the authority-inheritance guard (governance Gate 7)
+    // refuses rotation on a tier mismatch, so an MCP-tiered session can only
+    // rotate a like-tiered predecessor.
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    const int64_t expiry = now + 89 * 24 * 3600;
+    REQUIRE(store.create_token("token-a", "test-user", expiry, "", "operator").has_value());
+    REQUIRE(store.create_token("token-b", "test-user", expiry, "", "operator").has_value());
     auto listing = store.list_tokens("test-user").value();
     REQUIRE(listing.size() == 2);
     // list_tokens orders newest-first; token-b was created after token-a.

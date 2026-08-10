@@ -231,11 +231,15 @@ MCP allowance (once it lands) can be granted without also widening
 holder. **The remedy is not REST-scope-neutral: it also re-gates this
 branch's own `POST /api/v1/tokens/{id}/rotate`/`.../confirm` routes from
 `ApiToken:Write` onto the new `ApiToken:Rotate`, for parity across
-transports.** Neither the operator-tier MCP allowance, the `ApiToken:Rotate`
-operation, nor the REST re-gating is present in this branch — the finding
-and its full remedy belong to the MCP-twins piece, which has not merged;
-this record exists so the whole decision — including the REST-side
-re-gating — is not re-litigated or silently dropped when that piece lands.
+transports.** **UPDATE (2026-08-10, MCP-twins merge):** the operator-tier
+MCP allowance, the `ApiToken:Rotate` operation (`rbac_store.cpp:397`, seeded
+to `Administrator`+`ApiTokenManager` at `rbac_store.cpp:480,662`), and the
+REST re-gating (`rest_api_v1.cpp`'s rotate + confirm route `perm_fn(req, res,
+"ApiToken", "Rotate")` gates) are now **all present in this
+branch** — the MCP-twins piece merged (`98b0b084`) and this record was
+stale until this pass corrected it; the whole decision recorded above,
+including the REST-side re-gating, shipped as adjudicated, not
+re-litigated or silently dropped.
 
 **Detection mechanism — corrected. The 920-cell sweep verified the remedy;
 it did not detect the defect.** 920 = 5 tiers × 23 securables × **8**
@@ -360,11 +364,34 @@ Owner: **unassigned** for all three — filed, not yet triaged to an owner.
   the RAII `ScopeExit` guard.
 - **Cross-transport privilege widening via a shared securable.** Caught
   before any code shipped (MCP-twins review); remedy decided (including a
-  REST-side re-gate), not yet implemented — see "Privilege-escalation
-  finding" above.
+  REST-side re-gate) and **implemented and merged** — see
+  "Privilege-escalation finding" above (updated 2026-08-10).
 - **Tiered-token self-de-confinement via `ApiToken:Write` minting (`#2945`).**
   OPEN, no compensating control identified, pre-existing (not introduced or
   fixed by this feature) — see "Open risks" above.
+- **Rotation authority inheritance (governance Gate 7, CRITICAL — caught
+  before merge, not shipped).** `rotate_token` copied a caller-chosen
+  predecessor's `mcp_tier`/`scope_service`/`expires_at` verbatim into the
+  successor with no check that the CALLER's own current authority matched
+  the predecessor's — so an operator-tier caller could pick their own
+  untiered sibling token as the predecessor and receive an untiered,
+  perpetual, full-authority successor: rotation as a self-service
+  privilege-escalation lever, distinct from `#2945`'s minting-side escape
+  (that one needs `ApiToken:Write`/admin already; this one needed only
+  `ApiToken:Rotate` on the caller's OWN, lesser-tiered token). Closed in the
+  same governance pass that surfaced it (never shipped to a merged branch):
+  `rotate_token`/`confirm_token_rotation` now take `caller_mcp_tier`/
+  `caller_scope_service` and refuse — inside the advisory-locked
+  transaction, against a fresh predecessor re-read, folded into the same
+  "no such token to rotate" wording as the ownership/absence cases — unless
+  they are EQUAL (not "no broader than") to the predecessor's own values.
+  Both REST and MCP thread the caller's server-synthesized
+  `session->mcp_tier`/`token_scope_service` (`synthesize_token_session`,
+  never client-controllable) through to the store. Pinned by store-level
+  tests (refusal + row-count non-insertion; matching-tier success with an
+  explicit inheritance assertion; scope mismatch) tagged `[pg][token]
+  [rotation]` in `test_api_token_store.cpp`, plus route-level tests
+  asserting the threading for both REST and MCP.
 
 ## Validation
 

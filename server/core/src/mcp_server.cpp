@@ -11,6 +11,7 @@
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "mcp_transport.hpp"     // Streamable HTTP transport pre-checks (2f)
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (streamed POST, 3b)
+#include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric (shared REST/MCP metric symbol)
 #include "token_rotation_lookup.hpp" // shared REST/MCP human-token rotation successor lookup (P2 #11)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
@@ -817,12 +818,13 @@ static const ToolDef kTools[] = {
      "/api/v1/tokens/{id}/rotate's owner-vs-nonexistent posture (an unknown token_id and a "
      "not-owned token_id are indistinguishable — not an enumeration oracle). The successor "
      "ALWAYS inherits the predecessor's expires_at verbatim — rotation is lifetime-neutral, "
-     "never accepted as a caller argument. Requires ApiToken:Write (self-service, not an admin "
-     "operation — unlike the engine credential arm's Security:Write). The returned token_id is "
+     "never accepted as a caller argument. Requires ApiToken:Rotate (self-service, not an admin "
+     "operation — unlike the engine credential arm's Security:Write, and deliberately distinct "
+     "from the create/list/revoke ApiToken:Write axis). The returned token_id is "
      "the SUCCESSOR's (scoped exactly to the predecessor rotated, never any other in-flight "
      "rotation of the caller's — a caller may have several at once); overlap_expires_at is the "
      "PREDECESSOR's own stamp (the successor row never carries one). Mirrors POST "
-     "/api/v1/tokens/{id}/rotate. Destructive — requires ApiToken:Write.",
+     "/api/v1/tokens/{id}/rotate. Destructive — requires ApiToken:Rotate.",
      R"j({"type":"object","properties":{)j"
      R"j("token_id":{"type":"string","maxLength":64,"description":"The token_id of the predecessor token being rotated — must be owned by the calling principal"},)j"
      R"j("overlap_days":{"type":"integer","default":7,"minimum":1,"maximum":3650,"description":"Overlap window before the predecessor auto-revokes; rejected outright (never truncated) if it would fall below the 24h floor"})j"
@@ -833,7 +835,7 @@ static const ToolDef kTools[] = {
      "Explicit maker-checker confirmation that a rotated API token's successor secret has been "
      "received/installed by its consumer (P2 #11, SOC 2 CC6.3 maker-checker). Distinct from "
      "rotate_api_token itself — rotate is the 'here is the secret' reveal step; confirm is a "
-     "SEPARATE attestation that closes the loop, gated behind its own ApiToken:Write check "
+     "SEPARATE attestation that closes the loop, gated behind its own ApiToken:Rotate check "
      "rather than being inferred from a successful rotate call. token_id here is the SUCCESSOR "
      "token_id the rotate call returned — the confirm is pinned to that exact rotation and a "
      "stale or mismatched id is rejected with no state change, so a blind retry can never "
@@ -841,7 +843,7 @@ static const ToolDef kTools[] = {
      "network-dropped success, a double-submit) returns a TERMINAL already-confirmed/already-"
      "resolved error (not a retryable one) — do not retry; rotate again if a fresh rotation is "
      "needed. Self-service ONLY, same owner-vs-nonexistent posture as rotate_api_token. Mirrors "
-     "POST /api/v1/tokens/{id}/confirm. Destructive — requires ApiToken:Write.",
+     "POST /api/v1/tokens/{id}/confirm. Destructive — requires ApiToken:Rotate.",
      R"j({"type":"object","properties":{)j"
      R"j("token_id":{"type":"string","maxLength":64,"description":"Successor token_id returned by rotate_api_token (pins the exact rotation being confirmed) — must be owned by the calling principal"})j"
      R"j(},"required":["token_id"]})j",
@@ -9004,9 +9006,11 @@ McpServer::HandlerFn McpServer::build_handler(
             // ── Human API-token rotation (P2 #11, SOC 2 CC6.3) ────────────
             //
             // MCP twins of POST /api/v1/tokens/{id}/rotate and /confirm
-            // (rest_api_v1.cpp). Self-service on the ApiToken:Write axis, NOT
-            // the engine arm's admin Security:Write — see the mcp_policy.hpp
-            // tier_allows() extension and the kToolSecurityRows comment above.
+            // (rest_api_v1.cpp). Self-service on the ApiToken:Rotate axis, NOT
+            // the engine arm's admin Security:Write, and deliberately distinct
+            // from the create/list/revoke ApiToken:Write axis — see the
+            // mcp_policy.hpp tier_allows() extension and the kToolSecurityRows
+            // comment above.
             // requesting_user is ALWAYS session->username (server-derived
             // from the authenticated principal), never a tool argument — the
             // store's ownership gate (rotate_token/confirm_token_rotation
@@ -9087,8 +9091,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 // Parsed/resolved after the whole gate belt (tier/perm/store/
                 // engine-session/owner) so nothing above can become an
                 // unauthenticated or ownership-enumeration oracle.
+                // session->mcp_tier/token_scope_service are the caller's OWN
+                // server-synthesized authority — threaded through so the
+                // store's authority-inheritance guard can refuse a rotation
+                // that would mint authority the caller does not already
+                // hold (governance Gate 7 CRITICAL fix; REST twin is
+                // rest_api_v1.cpp's POST /api/v1/tokens/{id}/rotate).
                 auto result = engine_credential_store_->rotate_token(
-                    token_id, overlap_secs, now_epoch(), session->username);
+                    token_id, overlap_secs, now_epoch(), session->username, std::nullopt,
+                    session->mcp_tier, session->token_scope_service);
                 if (!result) {
                     const bool denied_audit_ok = audit_fn(req, "api_token.rotate", "failure",
                                                           "ApiToken", token_id, result.error());
@@ -9207,23 +9218,23 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // G7-equivalent: separate maker-checker confirmation tool — the
             // MCP twin of POST /api/v1/tokens/{id}/confirm. Own
-            // ApiToken:Write gate (not inferred from a successful rotate
+            // ApiToken:Rotate gate (not inferred from a successful rotate
             // call).
             if (tool_name == "confirm_api_token_rotation") {
                 // #2404-equivalent confirm-outcome counter (surface=mcp),
-                // sibling to REST's yuzu_api_token_confirm_total{surface=rest}.
-                // NOTE: kApiTokenConfirmTotalMetric
-                // (rotation_sweep_naming.hpp) is not yet in this tree — the
-                // literal below matches the REST handler's own literal and
-                // will be converted to the shared symbol at integration.
-                // Scope contract identical to the engine confirm tool:
-                // store-reaching calls only (the store-open guard below, or a
-                // real confirm_token_rotation result) — never a tier,
-                // permission, or ownership early-out.
+                // sibling to REST's yuzu_api_token_confirm_total{surface=rest}
+                // (rest_api_v1.cpp). Shares the SAME `kApiTokenConfirmTotalMetric`
+                // symbol (rotation_sweep_naming.hpp) as the REST handler —
+                // never a second literal, which is exactly the shadow-series
+                // drift the shared symbol exists to prevent. Scope contract
+                // identical to the engine confirm tool: store-reaching calls
+                // only (the store-open guard below, or a real
+                // confirm_token_rotation result) — never a tier, permission,
+                // or ownership early-out.
                 const auto confirm_metric = [metrics](const char* result) {
                     if (metrics)
                         metrics
-                            ->counter("yuzu_api_token_confirm_total",
+                            ->counter(kApiTokenConfirmTotalMetric,
                                       {{"surface", "mcp"}, {"result", result}})
                             .increment();
                 };
@@ -9279,8 +9290,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
 
-                auto confirmed =
-                    engine_credential_store_->confirm_token_rotation(token_id, session->username);
+                // caller_mcp_tier/caller_scope_service threaded for the SAME
+                // reason as the rotate handler above — defence-in-depth
+                // re-check of the authority-inheritance guard (governance
+                // Gate 7).
+                auto confirmed = engine_credential_store_->confirm_token_rotation(
+                    token_id, session->username, session->mcp_tier, session->token_scope_service);
                 if (!confirmed) {
                     // Increment BEFORE the audit emission so an audit-store
                     // failure cannot suppress the operational counter.

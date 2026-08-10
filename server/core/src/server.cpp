@@ -2056,13 +2056,14 @@ public:
         // same scope contract — counts only calls that reached the credential
         // store or found it unavailable at the store-open guard, `result`
         // mirrors the same taxonomy plus success, no principal_id label
-        // (bounded cardinality only). NOT wired to an increment site by this
-        // change — the human confirm-rotation REST/MCP handlers are a sibling
-        // piece (P1); this registers + pre-seeds the family they will
-        // increment. The name is the `kApiTokenConfirmTotalMetric` symbol
+        // (bounded cardinality only). Both transports increment this family —
+        // rest_api_v1.cpp's POST /api/v1/tokens/{id}/confirm handler and
+        // mcp_server.cpp's confirm_api_token_rotation tool — this registers +
+        // pre-seeds it so absent() alerts stay meaningful before the first
+        // real confirm. The name is the `kApiTokenConfirmTotalMetric` symbol
         // (rotation_sweep_naming.hpp), not a repeated string literal, so the
-        // sibling's increment call site and this registration can never
-        // silently diverge into a shadow series.
+        // two increment call sites and this registration can never silently
+        // diverge into a shadow series.
         metrics_.describe(kApiTokenConfirmTotalMetric,
                           "Human API-token rotation confirm outcomes by surface (rest|mcp) and "
                           "result (success|conflict|client_error|transient); store-reaching calls "

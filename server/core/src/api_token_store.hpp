@@ -393,10 +393,33 @@ public:
     /// find fused into rotation). The (possibly-overridden) value is validated
     /// through `validate_human_mint`, the same policy gate `create_token`
     /// uses for a fresh human mint.
+    ///
+    /// AUTHORITY-INHERITANCE GUARD (governance Gate 7 CRITICAL fix): the
+    /// predecessor is caller-chosen (any of a human's own tokens, resolved
+    /// only by `predecessor_token_id`) and `mcp_tier`/`scope_service` are
+    /// copied VERBATIM into the successor — so without this guard an
+    /// operator-tier caller could rotate their OWN untiered/perpetual
+    /// sibling token and mint a fresh untiered credential with full
+    /// authority, no tier gate. `caller_mcp_tier`/`caller_scope_service`
+    /// are the CALLER's own current, server-synthesized authority
+    /// (`auth::Session::mcp_tier`/`token_scope_service` from
+    /// `synthesize_token_session` — never client-controllable); rotation is
+    /// refused unless they are EQUAL (not "no broader than" — an ordering
+    /// needs a tier-lattice assumption a future tier could break) to the
+    /// freshly-read predecessor's own `mcp_tier`/`scope_service`. A cookie
+    /// or JIT-elevated interactive caller carries empty tier/scope, which
+    /// matches an untiered predecessor naturally — no special-casing. The
+    /// refusal is folded into the SAME "no such token to rotate" wording
+    /// used for absent/not-owned so this is not an authority-probing
+    /// oracle. Enforced authoritatively under the advisory-locked
+    /// transaction against a FRESH re-read of the predecessor row; the
+    /// pre-txn check below is an early-rejection mirror only.
     [[nodiscard]] std::expected<std::string, std::string>
     rotate_token(const std::string& predecessor_token_id, int64_t overlap_secs, int64_t now,
                 const std::string& requesting_user,
-                std::optional<int64_t> successor_expires_at = std::nullopt);
+                std::optional<int64_t> successor_expires_at = std::nullopt,
+                const std::string& caller_mcp_tier = "",
+                const std::string& caller_scope_service = "");
 
     /// Operator-confirmed cutover for a human token-keyed rotation — same
     /// contract as `confirm_rotation` (immediate predecessor revoke +
@@ -413,9 +436,19 @@ public:
     /// (`rotation_confirm_state.hpp`'s `classify_confirm_state_in_group`) —
     /// see that header for why a group-scoped filter needs its own positive-
     /// read reasoning, distinct from the principal-scoped original.
+    ///
+    /// `caller_mcp_tier`/`caller_scope_service` re-check the SAME
+    /// authority-inheritance invariant `rotate_token` enforces, as DEFENCE
+    /// IN DEPTH ONLY — a successor's tier/scope are fixed at mint time and
+    /// cannot legitimately diverge from what the caller who initiated the
+    /// rotation already held, so `rotate_token`'s own guard is the
+    /// load-bearing one; this catches only a hypothetical future bypass of
+    /// it, never a live path today.
     [[nodiscard]] std::expected<void, std::string>
     confirm_token_rotation(const std::string& successor_token_id,
-                           const std::string& requesting_user);
+                           const std::string& requesting_user,
+                           const std::string& caller_mcp_tier = "",
+                           const std::string& caller_scope_service = "");
 
     /// One rotation pair currently in flight, as read by the T12 maintenance
     /// sweep (design doc §7). `predecessor.supersedes_token_id` is always

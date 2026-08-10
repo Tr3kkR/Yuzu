@@ -541,15 +541,14 @@ excluding pre-store denials (permission, input validation, an MCP
 approval-gate replay) so the label set stays a fact about store outcomes.
 `result` mirrors the same store-error taxonomy as the engine family.
 
-**Currently dormant — no increment site yet.** This family is registered and
+**Live — both transports increment this family.** It is registered and
 pre-seeded (`rotation_sweep_naming.hpp`'s `kApiTokenConfirmTotalMetric`
-symbol, shared by the registration site and every increment call site so a
-typo can't silently create a second, uncounted shadow series) ahead of the
-human confirm-rotation REST/MCP handlers, which are a sibling piece to this
-metric's introduction. Until that piece lands and wires the increment, every
-series here reads `0` — that is expected startup behaviour, not a broken
-scrape or a stuck confirm route. Once wired, treat it exactly like the engine
-family: `increase(yuzu_api_token_confirm_total{result="conflict"}[15m]) > <n>`
+symbol, shared by the registration site and both increment call sites so a
+typo can't silently create a second, uncounted shadow series) at
+`rest_api_v1.cpp`'s `POST /api/v1/tokens/{id}/confirm` handler
+(`surface="rest"`) and `mcp_server.cpp`'s `confirm_api_token_rotation` tool
+handler (`surface="mcp"`). Treat it exactly like the engine family:
+`increase(yuzu_api_token_confirm_total{result="conflict"}[15m]) > <n>`
 for a client stuck replaying a resolved confirm, paired with whatever audit
 action the confirm-rotation piece emits for per-principal forensics — the
 metric is the signal, the audit row is the evidence. See

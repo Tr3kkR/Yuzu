@@ -619,8 +619,10 @@ Rotation replaces a token's secret without a hard cutover, using the same
 stays valid for an overlap window, so whatever consumes the old secret has
 time to pick up the new one.
 
-Requires `ApiToken:Write` RBAC permission. `{token_id}` is the
-**predecessor's** id:
+Requires `ApiToken:Rotate` RBAC permission — a dedicated operation, distinct
+from `ApiToken:Write` (which gates creating/listing/revoking a token; see
+[Creating a Token](#creating-a-token) and [Revoking a Token](#revoking-a-token)
+above). `{token_id}` is the **predecessor's** id:
 
 ```bash
 curl -s -b cookies.txt -X POST \
@@ -696,14 +698,14 @@ administrative convenience — an admin who needs to act on someone else's
 token has [revoke](#revoking-a-token) instead). Rotating/confirming a token
 you don't own returns the same `404 token not found` as a token that
 doesn't exist. **Under RBAC-on, this composes to effectively admin-only**:
-`ApiToken:Write` is granted only to the `Administrator` and
+`ApiToken:Rotate` is granted only to the `Administrator` and
 `ApiTokenManager` roles, so an `Operator`- or `Viewer`-role user who owns a
 token has no path to rotate it themselves under RBAC-on, and no admin can
 do it for them either — the same pre-existing property already applies to
-creating a token (also `ApiToken:Write`) and to
+creating a token ([`ApiToken:Write`](#creating-a-token)) and to
 [deleting one](#revoking-a-token) (the sibling `ApiToken:Delete`
-operation, held by the same two roles and no others); rotation does not
-change it.
+operation) — all three operations are held by the same two roles and no
+others; rotation does not change it.
 
 **Lifetime-neutral by design.** The successor token always inherits the
 predecessor's expiry exactly — a non-expiring token stays non-expiring, a
@@ -907,6 +909,8 @@ HTTP status codes:
 | `POST` | `/api/v1/tokens` | RBAC `ApiToken:Write` | Create a new API token |
 | `GET` | `/api/v1/tokens` | RBAC `ApiToken:Read` | List tokens owned by the authenticated user |
 | `DELETE` | `/api/v1/tokens/{id}` | RBAC `ApiToken:Delete` | Revoke (soft-delete) an API token |
+| `POST` | `/api/v1/tokens/{id}/rotate` | RBAC `ApiToken:Rotate`, self-service | Mint an overlap-pair successor for a token you own (see [Rotating a Token](#rotating-a-token)) |
+| `POST` | `/api/v1/tokens/{id}/confirm` | RBAC `ApiToken:Rotate`, self-service | Maker-checker confirmation closing an in-flight rotation |
 | `POST` | `/mcp/v1/` | Bearer token with MCP tier | MCP JSON-RPC 2.0 endpoint (22 read-only tools, 3 resources, 4 prompts) |
 
 ## Planned Features

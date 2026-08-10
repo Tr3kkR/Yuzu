@@ -767,7 +767,7 @@ void ApiTokenStore::resolve_rotation_pair_after_revoke(const std::string& princi
     // clear is identical whether it is the predecessor or the successor: it
     // becomes a plain standalone credential and (crucially) drops out of the
     // sweep's predecessor scan (overlap_expires_at -> 0).
-    (void)pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         pg::PgResult lock_res =
             pg::exec_params(conn, "SELECT pg_advisory_xact_lock(hashtext($1))",
                             std::vector<std::string>{principal_id});
@@ -784,6 +784,28 @@ void ApiTokenStore::resolve_rotation_pair_after_revoke(const std::string& princi
         // execution failure rolls back.
         return r.status() == PGRES_COMMAND_OK;
     });
+    // MEDIUM fail-visibility fix (governance Gate 7): a swallowed failure here
+    // leaves the surviving partner still stamped with its `rotation_group`/
+    // `overlap_expires_at` — the T12 sweep then treats it as an unresolved
+    // predecessor and auto-revokes it once that (already-elapsed, since we
+    // are mid-revoke) overlap window trips, which can leave the principal
+    // with ZERO active credentials. Pre-existing on the engine arm too, but
+    // newly load-bearing here: for a human operator the outcome is lockout,
+    // not an engine-consumer restart. Logged only — never surfaced as a hard
+    // failure to the caller, since the revoke that triggered this call has
+    // already committed and there is no compensating action left to take
+    // here; this is diagnostic breadcrumb only, matching the
+    // `list_rotations_nearing_expiry_unused` swallowed-scan-failure log
+    // above.
+    if (!ok) {
+        spdlog::error(
+            "[{}] resolve_rotation_pair_after_revoke: failed to clear rotation state on the "
+            "surviving partner of rotation_group='{}' after revoking token_id='{}' "
+            "(principal_id='{}') — the partner may still be stamped as an unresolved "
+            "predecessor and could be auto-revoked by the next sweep pass, leaving this "
+            "principal with zero active credentials; inspect manually",
+            kStoreName, rotation_group, revoked_token_id, principal_id);
+    }
     evict_rotation_raw(rotation_group);
 }
 
@@ -1237,7 +1259,9 @@ ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::stri
 std::expected<std::string, std::string>
 ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t overlap_secs,
                             int64_t now, const std::string& requesting_user,
-                            std::optional<int64_t> successor_expires_at) {
+                            std::optional<int64_t> successor_expires_at,
+                            const std::string& caller_mcp_tier,
+                            const std::string& caller_scope_service) {
     if (!open_)
         return std::unexpected("database not open");
     if (predecessor_token_id.empty())
@@ -1273,6 +1297,15 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
         // is not an ownership-enumeration oracle — same posture the human
         // DELETE route takes for a non-owner (rest_api_v1.cpp).
         if (!lookup.token || lookup.token->principal_id != requesting_user)
+            return std::unexpected("no such token to rotate");
+        // Authority-inheritance guard (governance Gate 7 CRITICAL fix) —
+        // early-rejection MIRROR only, against this pre-lock snapshot; the
+        // fresh re-read under the advisory lock below is authoritative. See
+        // the header doc comment for the full rationale. Folded into the
+        // SAME "no such token to rotate" wording so this is not an
+        // authority-probing oracle.
+        if (lookup.token->mcp_tier != caller_mcp_tier ||
+            lookup.token->scope_service != caller_scope_service)
             return std::unexpected("no such token to rotate");
         if (lookup.token->principal_kind != "human")
             return std::unexpected("token is not a human-owned credential");
@@ -1390,6 +1423,22 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
         // because this is the AUTHORITATIVE read (never trust the pre-lock
         // snapshot for the write decision).
         if (!lookup.token || lookup.token->principal_id != requesting_user) {
+            error_msg = "no such token to rotate";
+            return false;
+        }
+        // Authority-inheritance guard (governance Gate 7 CRITICAL fix,
+        // AUTHORITATIVE — see the header doc comment): rotation must never
+        // mint authority the caller does not already hold. mcp_tier/
+        // scope_service are copied VERBATIM into the successor, and the
+        // predecessor is caller-chosen, so without this an operator-tier
+        // caller could rotate their own untiered sibling token into a
+        // fresh untiered/perpetual credential. Equality against the FRESH
+        // under-lock read, never a "no-broader-than" ordering (deliberate
+        // — needs no tier-lattice assumption). Folded into the SAME
+        // "no such token to rotate" wording as the absence/ownership
+        // checks above so this is not an authority-probing oracle.
+        if (lookup.token->mcp_tier != caller_mcp_tier ||
+            lookup.token->scope_service != caller_scope_service) {
             error_msg = "no such token to rotate";
             return false;
         }
@@ -1566,7 +1615,9 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
 
 std::expected<void, std::string>
 ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
-                                      const std::string& requesting_user) {
+                                      const std::string& requesting_user,
+                                      const std::string& caller_mcp_tier,
+                                      const std::string& caller_scope_service) {
     if (!open_)
         return std::unexpected("database not open");
     if (successor_token_id.empty())
@@ -1621,6 +1672,18 @@ ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
         // same rationale + same indistinguishable-from-absent wording as
         // the pre-txn check above.
         if (!lookup.token || lookup.token->principal_id != requesting_user) {
+            error_msg = "no such token to confirm";
+            return false;
+        }
+        // DEFENCE IN DEPTH ONLY (governance Gate 7 fix) — mirrors
+        // rotate_token's authority-inheritance guard, but the successor's
+        // tier/scope are fixed at mint time and cannot legitimately
+        // diverge from what the caller who initiated the rotation already
+        // held, so rotate_token's own guard is the load-bearing one; this
+        // catches only a hypothetical future bypass of it, never a live
+        // path today. Same "no such token" wording for the same reason.
+        if (lookup.token->mcp_tier != caller_mcp_tier ||
+            lookup.token->scope_service != caller_scope_service) {
             error_msg = "no such token to confirm";
             return false;
         }

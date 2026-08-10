@@ -734,15 +734,15 @@ private:
 
 // P2 #11: manually wires two already-created tokens into the overlap-pair
 // rotation shape `rotate_engine_credential` (and, for a human principal, the
-// P1 sibling `rotate_token` — not yet in this tree) would leave behind:
+// sibling `rotate_token`, both present in this tree) would leave behind:
 // predecessor gets `rotation_group` + `overlap_expires_at`; successor gets
 // the SAME `rotation_group` + `supersedes_token_id == predecessor's
-// token_id`. There is no public store API to mint a HUMAN rotation pair
-// today (create_token's principal_kind defaults to "human", but nothing
-// wires the rotation columns for it outside the not-yet-landed rotate_token),
-// so store-level coverage of the human sweep path goes through this direct-
-// SQL seam, matching the file's existing direct-SQL precedent (raw_hash_column
-// above, the F3 trigger seam below).
+// token_id`. `rotate_token` itself always produces a well-formed pair
+// through its own validation, so this direct-SQL seam exists ONLY for tests
+// that need an arbitrary/malformed pair shape (e.g. an orphaned or
+// mismatched group) `rotate_token`'s own validation would refuse to create —
+// matching the file's existing direct-SQL precedent (raw_hash_column above,
+// the F3 trigger seam below).
 void wire_manual_rotation_pair(PgPool& pool, const std::string& rotation_group,
                                const std::string& predecessor_id, const std::string& successor_id,
                                int64_t overlap_expires_at) {
@@ -2080,9 +2080,12 @@ TEST_CASE("ApiTokenStore: rotate_token rejects an engine-kind token — human ar
     // human requesting_user could never own an "engine:"-namespaced row in
     // practice, but this proves the kind guard fires as a defense-in-depth
     // backstop on the (structurally unreachable in production) case where it
-    // does.
+    // does. caller_mcp_tier is passed matching the row's own "readonly" tier
+    // so the authority-inheritance guard (checked earlier in the sequence)
+    // clears and this test reaches — and isolates — the kind check it
+    // targets.
     auto rotated = store.rotate_token(active[0].token_id, kDefaultOverlapSecs, now,
-                                      "engine:human-arm-guard");
+                                      "engine:human-arm-guard", std::nullopt, "readonly", "");
     REQUIRE_FALSE(rotated.has_value());
     CHECK(rotated.error().find("human-owned") != std::string::npos);
 }
@@ -2119,6 +2122,112 @@ TEST_CASE("ApiTokenStore: rotate_token rejects a non-owner even with a valid tok
     // The genuine owner can still rotate normally afterward.
     auto real = store.rotate_token(token_id, kDefaultOverlapSecs, now, "alice");
     CHECK(real.has_value());
+}
+
+// ── Authority-inheritance guard (governance Gate 7 CRITICAL fix) ───────────
+//
+// `rotate_token` used to copy the predecessor's `mcp_tier`/`scope_service`
+// verbatim into the successor with no check that the CALLER's own current
+// authority matched — so an operator-tier caller could pick their own
+// untiered sibling token as the predecessor and receive an untiered,
+// perpetual, full-authority successor. These three cases pin the fix.
+
+TEST_CASE("ApiTokenStore: rotate_token refuses when the caller's own mcp_tier does not match "
+          "the predecessor's — authority-inheritance guard, no successor row inserted",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    using yuzu::server::detail::classify_engine_store_error;
+    using E = yuzu::server::detail::EngineStoreErrorClass;
+
+    auto now = test_now_epoch();
+    // Predecessor is UNTIERED, no scope_service, perpetual — the classic
+    // full-authority credential the finding traces.
+    auto raw = store.create_token("alices-untiered-pat", "alice", 0);
+    REQUIRE(raw.has_value());
+    const std::string token_id = store.list_active_for_principal("alice")[0].token_id;
+    REQUIRE(store.list_active_for_principal("alice").size() == 1);
+
+    // Caller presents an operator-tier authority the predecessor does NOT
+    // carry — without the guard this would mint a fresh untiered/perpetual
+    // successor for an operator-tier caller: exactly the escalation this
+    // fix closes.
+    auto rotated = store.rotate_token(token_id, kDefaultOverlapSecs, now, "alice", std::nullopt,
+                                      "operator", "");
+    REQUIRE_FALSE(rotated.has_value());
+    CHECK(rotated.error() == "no such token to rotate"); // same wording as absent/not-owned —
+                                                          // not an authority-probing oracle
+    CHECK(classify_engine_store_error(rotated.error()) == E::ClientValidation);
+
+    // No successor minted — row count for the principal is unchanged, and
+    // the predecessor was never stamped into a rotation pair either.
+    auto active = store.list_active_for_principal("alice");
+    REQUIRE(active.size() == 1);
+    CHECK(active[0].token_id == token_id);
+    CHECK(active[0].rotation_group.empty());
+}
+
+TEST_CASE("ApiTokenStore: rotate_token succeeds when the caller's tier/scope match the "
+          "predecessor's, and the successor inherits both verbatim",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto now = test_now_epoch();
+    auto raw = store.create_token("alices-operator-pat", "alice", now + k90Days, "svc-a",
+                                  "operator");
+    REQUIRE(raw.has_value());
+    const std::string token_id = store.list_active_for_principal("alice")[0].token_id;
+
+    auto rotated = store.rotate_token(token_id, kDefaultOverlapSecs, now, "alice", std::nullopt,
+                                      "operator", "svc-a");
+    REQUIRE(rotated.has_value());
+
+    // Pins inheritance itself — nothing else in this suite asserts the
+    // minted successor's mcp_tier/scope_service against the predecessor's.
+    std::string successor_id;
+    for (const auto& t : store.list_active_for_principal("alice"))
+        if (t.token_id != token_id)
+            successor_id = t.token_id;
+    REQUIRE_FALSE(successor_id.empty());
+    auto successor = store.get_token(successor_id);
+    REQUIRE(successor.has_value());
+    REQUIRE(successor->has_value());
+    CHECK((*successor)->mcp_tier == "operator");
+    CHECK((*successor)->scope_service == "svc-a");
+}
+
+TEST_CASE("ApiTokenStore: rotate_token refuses on a scope_service mismatch even when the tier "
+          "matches — the guard checks BOTH dimensions",
+          "[pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto now = test_now_epoch();
+    auto raw = store.create_token("alices-scoped-pat", "alice", now + k90Days, "svc-a",
+                                  "operator");
+    REQUIRE(raw.has_value());
+    const std::string token_id = store.list_active_for_principal("alice")[0].token_id;
+    REQUIRE(store.list_active_for_principal("alice").size() == 1);
+
+    // Same tier as the predecessor, DIFFERENT scope_service — the caller's
+    // own token is scoped to a different service than the one being
+    // rotated.
+    auto rotated = store.rotate_token(token_id, kDefaultOverlapSecs, now, "alice", std::nullopt,
+                                      "operator", "svc-b");
+    REQUIRE_FALSE(rotated.has_value());
+    CHECK(rotated.error() == "no such token to rotate");
+
+    auto active = store.list_active_for_principal("alice");
+    REQUIRE(active.size() == 1);
+    CHECK(active[0].token_id == token_id);
 }
 
 TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a non-owner even with the correct "

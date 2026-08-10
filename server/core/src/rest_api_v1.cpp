@@ -2799,9 +2799,17 @@ void RestApiV1::register_routes(
             // never a body/query field (security crux, task spec: the
             // store-level self-service ownership gate is only as strong as
             // this). successor_expires_at is deliberately left std::nullopt
-            // per the SENIOR RULING above.
-            auto result =
-                token_store->rotate_token(token_id, overlap_secs, now, session->username);
+            // per the SENIOR RULING above. caller_mcp_tier/
+            // caller_scope_service are the session's OWN server-synthesized
+            // authority (synthesize_token_session, auth_routes.cpp — never
+            // client-controllable) — threaded through so the store's
+            // authority-inheritance guard can refuse a rotation that would
+            // mint authority the caller does not already hold (governance
+            // Gate 7 CRITICAL fix).
+            auto result = token_store->rotate_token(token_id, overlap_secs, now,
+                                                     session->username, std::nullopt,
+                                                     session->mcp_tier,
+                                                     session->token_scope_service);
             if (!result) {
                 res.status = engine_store_error_status(result.error());
                 res.set_content(detail::a4_error(res, result.error()), "application/json");
@@ -2948,7 +2956,11 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            auto confirmed = token_store->confirm_token_rotation(token_id, session->username);
+            // caller_mcp_tier/caller_scope_service threaded for the SAME
+            // reason as the rotate route above — defence-in-depth re-check
+            // of the authority-inheritance guard (governance Gate 7).
+            auto confirmed = token_store->confirm_token_rotation(
+                token_id, session->username, session->mcp_tier, session->token_scope_service);
             if (!confirmed) {
                 // Increment BEFORE the audit emission so an audit-store
                 // failure cannot suppress the operational counter (#2404).

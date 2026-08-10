@@ -1938,23 +1938,27 @@ this section does not restate them.
   path, by design.
 - **Under RBAC-on, this composes into an effectively admin-only rotation
   path — a pre-existing property of the surface, not a new caveat.** REST
-  rotate/confirm gate on `ApiToken:Write`, which the RBAC seed data
-  (`rbac_store.cpp`) grants only to `Administrator` and `ApiTokenManager` —
-  no other built-in role (`Operator`, `PlatformEngineer`, `Viewer`,
-  `ITServiceOwner`) holds it. Composed with the self-service-only
-  requirement immediately above (no admin override), an `Operator`- or
-  `Viewer`-role user who owns a token has **no** RBAC-on path to rotate it
-  themselves, and no admin can do it on their behalf either — the token
-  cannot be rotated by anyone until its owner is separately granted
-  `ApiToken:Write`. This is unchanged by this work — `POST /api/v1/tokens`
-  is already gated the same way; `DELETE /api/v1/tokens/{id}` is gated on
-  the sibling `ApiToken:Delete` operation (`rest_api_v1.cpp:2624`), not
-  `Write` — but the RBAC seed data grants both operations to the same two
-  roles (`Administrator`, `ApiTokenManager`) and to no others, so the
-  admin-only conclusion holds identically for delete. It is stated here
-  because "self-service" throughout this section means *self-service
-  subject to holding the relevant `ApiToken:*` grant*, never *available to
-  any authenticated owner*.
+  rotate/confirm gate on `ApiToken:Rotate` — deliberately its own operation,
+  distinct from `ApiToken:Write`'s create/list/revoke axis (round-3 security
+  finding; see the `mcp_policy.hpp` `tier_allows()` operator-tier comment for
+  the full narrative on why a shared op string was rejected) — which the
+  RBAC seed data (`rbac_store.cpp:397,480,662`) grants only to
+  `Administrator` and `ApiTokenManager` — no other built-in role (`Operator`,
+  `PlatformEngineer`, `Viewer`, `ITServiceOwner`) holds it. Composed with the
+  self-service-only requirement immediately above (no admin override), an
+  `Operator`- or `Viewer`-role user who owns a token has **no** RBAC-on path
+  to rotate it themselves, and no admin can do it on their behalf either —
+  the token cannot be rotated by anyone until its owner is separately
+  granted `ApiToken:Rotate`. This mirrors the posture of the surface's other
+  operations — `POST /api/v1/tokens` (create) is gated on `ApiToken:Write`;
+  `DELETE /api/v1/tokens/{id}` is gated on the sibling `ApiToken:Delete`
+  operation (`rest_api_v1.cpp:2624`) — and the RBAC seed data grants all
+  three operations to the same two roles (`Administrator`,
+  `ApiTokenManager`) and to no others, so the admin-only conclusion holds
+  identically across create, delete, and rotate. It is stated here because
+  "self-service" throughout this section means *self-service subject to
+  holding the relevant `ApiToken:*` grant*, never *available to any
+  authenticated owner*.
 - **Not an ownership-enumeration oracle.** The non-owner rejection is folded
   into the exact same wording the genuinely-nonexistent-token case uses
   (`"no such token to rotate"` / `"no such token to confirm"`) — a caller
@@ -1999,7 +2003,8 @@ this section does not restate them.
   (`docs/user-manual/rest-api.md` "API Tokens" for the REST reference,
   `docs/user-manual/authentication.md` "Rotating a Token" for the operator
   walkthrough) — self-service, gated on
-  `ApiToken:Write` (the human permission axis; **not** `Security:Write`,
+  `ApiToken:Rotate` (the human permission axis, distinct from
+  `ApiToken:Write`'s create/list/revoke axis; **not** `Security:Write`,
   which gates the engine admin surface), MFA step-up re-validated on every
   call including an idempotent grace-window re-serve. Telemetry:
   `docs/observability-conventions.md` + `docs/user-manual/metrics.md`
@@ -2009,23 +2014,25 @@ this section does not restate them.
   `rotation_sweep_naming.hpp`). Audit:
   `docs/user-manual/audit-log.md` (`api_token.rotate`, `api_token.confirm`,
   `api_token.reveal`, `api_token.rotation.auto_revoke`,
-  `api_token.rotation.successor_unused`). **MCP tool twins are a separate,
-  still-in-review piece — not yet shipped as of this section** and will add
-  their own `docs/mcp-server.md` / `docs/user-manual/mcp.md` entries when
-  they land; do not infer MCP parity for human token rotation from this
-  section.
+  `api_token.rotation.successor_unused`). **MCP tool twins
+  (`rotate_api_token` / `confirm_api_token_rotation`) have shipped as of
+  this section** — see `docs/mcp-server.md` "Human API-token rotation
+  tools" and `docs/user-manual/mcp.md` rows 70–71 for the MCP-side
+  reference; REST and MCP now have full parity on this surface.
 - **Known residual gaps, tracked, not fixed by this capability:** three
   pre-existing issues were surfaced while building this feature and filed
   rather than folded in silently — `#2943` (a confirm-path fallthrough
   shared by both arms that the human arm inherits), `#2944` (an
   engine-only defect; this feature's own REST route does not have it), and
   `#2945` (security-labelled, an open credential-**minting** escalation on
-  the same `ApiToken:Write` chokepoint this feature's rotate/confirm routes
-  also gate on). None is a defect *in* the shipped rotation code itself. Full
+  the `ApiToken:Write` chokepoint — distinct from this feature's own
+  rotate/confirm routes, which now gate on the separate `ApiToken:Rotate`
+  operation seeded to the SAME two roles). None is a defect *in* the shipped
+  rotation code itself. Full
   detail, mechanism, and compensating-control status — `#2945` in
-  particular is **not** merely "unrelated and tracked separately"; it shares
-  this feature's chokepoint and is recorded as an open risk — are in the
-  security review's "Open risks" section:
+  particular is **not** merely "unrelated and tracked separately"; it is
+  recorded as an open risk against the sibling `ApiToken:Write` mint
+  surface — are in the security review's "Open risks" section:
   `docs/security-reviews/human-token-rotation-2026-08-10.md`.
 
 ## Agent enrollment (3 tiers)

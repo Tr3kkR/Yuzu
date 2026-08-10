@@ -75,6 +75,13 @@ struct RestTokenRotationHarness {
     auth::Role session_role{auth::Role::user};
     std::string session_principal_kind; // "" (human) by default
     std::string session_auth_source{"local"};
+    // Authority-inheritance guard threading (governance Gate 7): the
+    // session's OWN mcp_tier/token_scope_service, mirroring the real
+    // server-synthesized session (auth_routes.cpp's
+    // synthesize_token_session) — empty by default (cookie/JIT-elevated
+    // interactive session posture).
+    std::string session_mcp_tier;
+    std::string session_scope_service;
     bool session_present{true};
     bool perm_allow{true};
     bool step_up_allow{true};
@@ -97,6 +104,8 @@ struct RestTokenRotationHarness {
             s.role = session_role;
             s.principal_kind = session_principal_kind;
             s.auth_source = session_auth_source;
+            s.mcp_tier = session_mcp_tier;
+            s.token_scope_service = session_scope_service;
             return s;
         };
 
@@ -153,8 +162,9 @@ struct RestTokenRotationHarness {
     }
 
     std::string create_token_for(const std::string& owner, const std::string& name,
-                                 int64_t expires_at = 0) {
-        auto raw = token_store->create_token(name, owner, expires_at);
+                                 int64_t expires_at = 0, const std::string& scope_service = {},
+                                 const std::string& mcp_tier = {}) {
+        auto raw = token_store->create_token(name, owner, expires_at, scope_service, mcp_tier);
         REQUIRE(raw.has_value());
         auto listing = token_store->list_tokens(owner).value();
         // Match by NAME, never `.front()` on `created_at DESC` — created_at
@@ -367,6 +377,59 @@ TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: unknown token id returns 404 wi
     REQUIRE(res);
     CHECK(res->status == 404);
     CHECK(h.audit_log.empty());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Authority-inheritance guard THREADING (governance Gate 7 CRITICAL fix): a
+// store-only test stays green even if this route silently passed empty
+// strings instead of the real session tier/scope — that is the exact
+// false-green this pair of tests guards against. `RestTokenRotationHarness`'s
+// `session_mcp_tier`/`session_scope_service` feed the SAME `auth::Session`
+// fields `rest_api_v1.cpp`'s rotate handler reads (`session->mcp_tier`/
+// `session->token_scope_service`) and threads into `rotate_token`.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: an operator-tier session is refused "
+          "rotating its owner's UNTIERED sibling token — proves the route threads the "
+          "REAL session tier, not empty strings",
+          "[pg][rest][token][rotation][security]") {
+    RestTokenRotationHarness h;
+    // Predecessor is untiered/perpetual — the classic full-authority
+    // credential the finding traces.
+    auto token_id = h.create_token_for("alice", "alices-untiered-key");
+    h.session_user = "alice";
+    h.session_mcp_tier = "operator"; // caller's OWN authority, distinct from the token's
+
+    auto res = h.rotate(token_id);
+    REQUIRE(res);
+    // The route's OWN pre-check (existence + ownership) passes here — this
+    // IS alice's own token — so the request reaches the store, and the
+    // rejection comes back as the STORE's own "no such token to rotate"
+    // wording (ClientValidation -> 400), distinct from the route's
+    // pre-check "token not found" 404 used for absent/non-owner. If the
+    // route passed empty strings instead of the real session tier, this
+    // would 200 and hand back a fresh untiered/perpetual successor (the
+    // escalation this fix closes).
+    CHECK(res->status == 400);
+    CHECK(res->body.find("no such token to rotate") != std::string::npos);
+
+    auto looked_up = h.token_store->get_token(token_id).value();
+    REQUIRE(looked_up.has_value());
+    CHECK(looked_up->rotation_group.empty()); // no successor minted
+}
+
+TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: an operator-tier session CAN rotate its "
+          "own LIKE-TIERED token — the guard admits a genuine tier/scope match",
+          "[pg][rest][token][rotation][security]") {
+    RestTokenRotationHarness h;
+    auto token_id = h.create_token_for("alice", "alices-operator-key", now_epoch() + 86400 * 30,
+                                       /*scope_service=*/"", /*mcp_tier=*/"operator");
+    h.session_user = "alice";
+    h.session_mcp_tier = "operator"; // matches the token's own tier
+
+    auto res = h.rotate(token_id);
+    REQUIRE(res);
+    CHECK(res->status == 200);
 }
 
 TEST_CASE("REST POST /api/v1/tokens/{id}/confirm: non-owner gets 404 (no oracle), "
