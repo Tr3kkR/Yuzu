@@ -93,7 +93,14 @@ import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-import yaml
+# yaml is imported LOCALLY, inside extract()/measure(), not at module scope -
+# `--selftest` runs on all three REQUIRED build legs with no toolchain
+# promised at all, and `run_promtool_tests.py` (imported below) documents this
+# exact defect as measured: its own first-cut fix put the yaml import at
+# module scope, and "measured, `--selftest` exited 1 with the import blocked"
+# on a leg without PyYAML - "a fix that survives only by luck is not a fix",
+# per that file's own words, even though every CI leg today happens to
+# install PyYAML via requirements-ci.txt.
 
 # Same directory as this file - Python puts the launching script's own
 # directory on sys.path[0], so this needs no path surgery whether invoked
@@ -149,6 +156,7 @@ def extract(text: str, alert: str) -> tuple[dict, bool]:
     future reader who "fixes" this back to fail-fast breaks every `fresh`
     manifest entry the moment this rung merges.
     """
+    import yaml  # noqa: PLC0415 - kept out of module scope, see the top-of-file note
     doc = yaml.safe_load(text)
     rules = [r for g in doc["groups"] for r in g.get("rules", [])
              if r.get("alert") == alert]
@@ -267,6 +275,7 @@ def measure(mode: str, native_argv: list[str] | None, tmp_root: Path,
     `CouldNotMeasure` rather than returning a guess on anything short of full
     evidence - see the module docstring's RUNTIME section for the junit
     write-mount and the exact-name-match rationale."""
+    import yaml  # noqa: PLC0415 - kept out of module scope, see the top-of-file note
     d = tmp_root / f"{scenario}-{interval_s}"
     for sub in ("rules", "tests", "out"):
         (d / sub).mkdir(parents=True, exist_ok=True)
@@ -428,6 +437,26 @@ def compare(committed: dict, measured: dict, scenarios: list[str],
     return mismatches
 
 
+def provenance_mismatches(committed: dict, measured: dict) -> list[str]:
+    """Catches a manifest whose cadence sets still happen to match but whose
+    PROVENANCE has drifted - the image pin bumped, or `--low/--high/--step`/
+    `--intervals` changed - so the recorded grid no longer describes how the
+    committed cadence sets were actually measured. Separate from `compare()`
+    so its existing (scenario, interval, unexpected, stale) contract - and the
+    selftest pinning it - stays untouched by this addition."""
+    reasons = []
+    if committed.get("promtool_image") != measured["promtool_image"]:
+        reasons.append(f"promtool_image: committed={committed.get('promtool_image')!r} "
+                       f"measured={measured['promtool_image']!r}")
+    if committed.get("grid") != measured["grid"]:
+        reasons.append(f"grid: committed={committed.get('grid')!r} "
+                       f"measured={measured['grid']!r}")
+    if committed.get("intervals_s") != measured["intervals_s"]:
+        reasons.append(f"intervals_s: committed={committed.get('intervals_s')!r} "
+                       f"measured={measured['intervals_s']!r}")
+    return reasons
+
+
 def selftest() -> int:
     """Pure logic only - no promtool, no docker, no network. Mirrors
     `run_promtool_tests.py --selftest`'s pattern and registers the same way in
@@ -470,16 +499,24 @@ def selftest() -> int:
     check("fresh scenario stamps flat 0", fresh_stamp.startswith("0+0x"), True)
 
     # extract(): present vs absent must not raise, and absence must not be
-    # mistaken for an empty-but-loaded ruleset.
-    present_doc = ("groups:\n  - name: g\n    rules:\n"
-                  "      - alert: A\n        expr: up\n")
-    rules, found = extract(present_doc, "A")
-    check("extract() finds a present alert", found, True)
-    check("extract() returns its rule", len(rules["groups"][0]["rules"]), 1)
-    rules, found = extract(present_doc, "DoesNotExist")
-    check("extract() reports absence rather than raising", found, False)
-    check("extract() returns an empty (not missing) ruleset on absence",
-          rules["groups"][0]["rules"], [])
+    # mistaken for an empty-but-loaded ruleset. Behind a PyYAML try, same
+    # posture as `run_promtool_tests.py`'s `inspect_test_file(strict=False)` -
+    # `--selftest` promises no toolchain at all, so a missing parser must not
+    # make it not-ok; it just skips the checks that need one.
+    try:
+        import yaml  # noqa: PLC0415
+    except ImportError:
+        print("note: PyYAML unavailable; skipping extract() checks", flush=True)
+    else:
+        present_doc = ("groups:\n  - name: g\n    rules:\n"
+                      "      - alert: A\n        expr: up\n")
+        rules, found = extract(present_doc, "A")
+        check("extract() finds a present alert", found, True)
+        check("extract() returns its rule", len(rules["groups"][0]["rules"]), 1)
+        rules, found = extract(present_doc, "DoesNotExist")
+        check("extract() reports absence rather than raising", found, False)
+        check("extract() returns an empty (not missing) ruleset on absence",
+              rules["groups"][0]["rules"], [])
 
     # compare(): the set-difference logic that drives the exit-1 path.
     committed = {"uncovered": {"anchored": {"by_interval": {"30": [165, 170]}}}}
@@ -499,6 +536,18 @@ def selftest() -> int:
                   {"uncovered": {"anchored": {"by_interval": {"30": [1]}}}},
                   ["anchored"], (30,)),
           [])
+
+    # provenance_mismatches(): a stale manifest whose cadence sets still
+    # happen to match must not be waved through on that coincidence alone.
+    base = {"promtool_image": "img:v1", "grid": {"low": 30}, "intervals_s": [30]}
+    check("provenance_mismatches() finds nothing when identical",
+          provenance_mismatches(base, dict(base)), [])
+    check("provenance_mismatches() catches an image pin bump",
+          len(provenance_mismatches(base, {**base, "promtool_image": "img:v2"})), 1)
+    check("provenance_mismatches() catches a grid change",
+          len(provenance_mismatches(base, {**base, "grid": {"low": 25}})), 1)
+    check("provenance_mismatches() catches an intervals_s change",
+          len(provenance_mismatches(base, {**base, "intervals_s": [30, 60]})), 1)
 
     for f in failures:
         print(f"SELFTEST FAIL: {f}", flush=True)
@@ -583,11 +632,17 @@ def main() -> int:
                  f"Not a verdict.", flush=True)
             return 2
 
+        provenance = provenance_mismatches(committed, manifest)
+        for reason in provenance:
+            print(f"STALE MANIFEST PROVENANCE: {reason}", flush=True)
+
         mismatches = compare(committed, manifest, scenarios, intervals)
         if mismatches:
             for scenario, interval_s, unexpected, stale in mismatches:
                 print(f"{scenario}@{interval_s}s: unexpected={unexpected} stale={stale}",
                      flush=True)
+
+        if provenance or mismatches:
             print(f"FAIL: measured coverage does not match {args.manifest}. Re-run "
                  f"with --emit and commit the result if this change is intended.",
                  flush=True)

@@ -536,9 +536,14 @@ def pull_with_retry() -> bool:
     # added to prevent (#2553, Gate 5). Worst case is now 2x90 + 15 = 195s here,
     # ~30s for the daemon probe and 2x120s for the two promtool runs: ~465s.
     # That is comfortable against meson's 600s, which starts at script launch.
-    # It is NOT comfortable against the workflow's `timeout-minutes: 10`, which
-    # is a JOB budget covering checkout too - ~495-555s of 600. Size any
-    # addition against the job budget, not this number.
+    # `timeout-minutes` on the `prometheus-rules` job is now 15 (900s), not 10 -
+    # #2854 rung B added a second promtool-driven step (`blind_band_sweep.py
+    # --check`) to the SAME job, sharing this budget rather than getting its
+    # own. This script's own worst case is still ~465-495s of that 900s
+    # covering checkout too; the second step measured 12-17s warm against a
+    # real registry pull in this session, comfortably inside what remains.
+    # Size any FURTHER addition against the job's total budget, not this
+    # number alone - two consumers now draw from it.
     #
     # Two attempts, not three: a transient blip clears in seconds and a second
     # try covers it. This still does not pretend to outlast an anonymous Docker
