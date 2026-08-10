@@ -1836,10 +1836,17 @@ walkthrough.
   overlap window elapses — **unless the successor was never presented at
   all** (governance UP-5): a dropped/lost successor secret must never leave
   the principal at zero usable credentials, so that predecessor is left
-  active and the operational, non-security `successor_unused` warning keeps
-  firing every tick past the window's own end (not deduplicated to one, the
-  way the pre-elapse lead-time warning is) until an operator resolves it
-  explicitly. The sweep's per-tick auto-revoke is bounded
+  active and the operational, non-security `successor_unused` warning is
+  raised again past the window's own end. Note the three signals do NOT
+  share a cadence (`rotation_warn_dedup.hpp`): the **log line** repeats
+  every tick for as long as the pair stays stuck, while the **audit row and
+  its metric** fire once per pair per state — once pre-elapse, once more on
+  crossing into elapsed. The row records that the decline happened; an
+  un-throttled row would be ~1440/day per stuck pair into the audit store,
+  which is itself a retention hazard. Do not build a stuck-pair alert on
+  `increase(...{reason="successor_unused"})` — it will fire once and never
+  again; the alertable signal is tracked in #2969. The sweep's per-tick
+  auto-revoke is bounded
   (`kMaxAutoRevokesPerTick`) so a clock jump degrades to a multi-tick drain
   rather than a fleet-wide cutover in one tick.
   **Confirm replay classification (#2404):**

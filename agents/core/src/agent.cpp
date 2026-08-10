@@ -302,14 +302,20 @@ private:
 // would run `fn()` TWICE. Deliberately NOT `= delete`d — a user-declared
 // (even deleted) special member function disqualifies a class from being
 // an aggregate, and every construction here goes through the deduction
-// guide's aggregate-init form (`ScopeExit cleanup{lambda}`), which would
-// then fail to compile (no converting constructor exists to take its
-// place — confirmed: attempting this locally breaks every call site in
-// both this file and its sibling below). Every use in this file is a
+// guide's aggregate-init form (`ScopeExit cleanup{lambda}`).
+//
+// An earlier revision of this comment claimed no converting constructor
+// could take the aggregate's place, and that this had been "confirmed
+// locally". A reviewer disproved it by compiling the counter-example:
+// `explicit ScopeExit(F f) : fn(std::move(f)) {}` alongside deleted
+// copy/move preserves the exact `ScopeExit name{lambda}` form at every
+// call site. So the honest reason to stay aggregate is not impossibility
+// — it is that there is no hazard to prevent: every use in this file is a
 // single local RAII variable, never copied or moved out of its declaring
-// scope. Same reasoning applies to the byte-identical sibling in
-// `server/core/src/api_token_store.cpp`; keep both aggregate, not just
-// this one.
+// scope, so the double-fire the deletion would guard against cannot
+// occur. Same reasoning, and the same corrected justification, apply to
+// the byte-identical sibling in `server/core/src/api_token_store.cpp`;
+// keep both aggregate, not just this one.
 template <typename F> struct ScopeExit {
     F fn;
     ~ScopeExit() { fn(); }

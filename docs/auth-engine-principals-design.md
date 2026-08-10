@@ -609,9 +609,19 @@ for non-HTTP writers is unaffected).
      dropped rotate response or an operator who never picked up the new
      credential must not end with zero usable credentials, unattended. In
      that case both credentials stay active past the window and the warning
-     keeps firing every tick (no longer deduplicated once elapsed) until an
-     operator resolves it explicitly (confirm or revoke) — loud and
-     indefinite, rather than a silent auto-revoke. A successor that WAS
+     is raised again on crossing into the elapsed state, until an operator
+     resolves it explicitly (confirm or revoke), rather than a silent
+     auto-revoke. **Cadence, and it is NOT uniform across the three
+     signals** (`rotation_warn_dedup.hpp`): the **log line** repeats every
+     tick while the pair stays stuck; the **audit row and the metric** named
+     above fire ONCE per pair per state — once pre-elapse, once more on
+     elapsing — and the state is process-local, so a restart re-emits once.
+     An earlier revision of this paragraph said they were "no longer
+     deduplicated once elapsed"; that held only briefly, and the
+     un-throttled row was itself the defect (~1440/day per stuck pair into
+     the SOC 2 audit store, whose retention pass caps at 25 000 deletions).
+     Indefinite loudness lives on the log channel; the alertable
+     current-state signal is tracked in #2969. A successor that WAS
      presented at least once is unaffected by this carve-out — auto-revoke
      still fires for it at window end exactly as before;
   3. predecessor **auto-revokes** at window end (or immediately on operator

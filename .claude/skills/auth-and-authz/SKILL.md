@@ -141,9 +141,13 @@ branch off `origin/dev`, not yet on `dev`), by reading
 `api_token_store.{hpp,cpp}`, `rest_api_v1.cpp`, and `mcp_server.cpp`
 directly (the human arm's REST routes exist; `grep`ing `mcp_server.cpp` for
 `rotate_token`/`confirm_token_rotation` **now finds** the `rotate_api_token`
-(`mcp_server.cpp:9107`) and `confirm_api_token_rotation`
-(`mcp_server.cpp:9316`) tool handlers — the MCP twins have merged code, per
-the SHIPPED status on this surface below). This does **not** re-verify the
+and `confirm_api_token_rotation` tool handlers calling into the store — the
+MCP twins have merged code, per the SHIPPED status on this surface below).
+Cited by SYMBOL, deliberately not by line number: this stamp has now been
+stale twice — once claiming the grep returned nothing after the twins
+shipped, then once citing line numbers the named grep does not return — and
+a citation that rots on every unrelated edit above it is worse than no
+citation, because it reads as verified. This does **not** re-verify the
 other items in this section — their last wholesale check remains the
 `ef4582be` stamp above.
 

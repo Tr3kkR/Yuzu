@@ -291,11 +291,34 @@ either.
 
 ## Open risks (pre-existing, surfaced by this work)
 
-Seven issues were opened while building this feature. None is a defect *in*
-this feature's own new rotate/confirm code, but `#2945` shares this record's
-central chokepoint (`ApiToken:Write`) and the shipped-default (RBAC-off)
-configuration, so it is recorded here as a live open risk, not a footnote.
-Owner: **unassigned** for all seven — filed, not yet triaged to an owner.
+Ten issues were opened while building this feature, in two groups, and the
+distinction matters when reading this record.
+
+**Seven are pre-existing or deferred behaviour** — the entries listed below.
+None of those is a defect *in* this feature's own new rotate/confirm code,
+but `#2945` shares this record's central chokepoint (`ApiToken:Write`) and
+the shipped-default (RBAC-off) configuration, so it is recorded as a live
+open risk, not a footnote.
+
+**Three more (`#2969`, `#2970`, `#2971`) were filed from the eight-gate
+governance pass on this same range**, after this section was last revised,
+and they break the premise above: `#2970` A and B *are* defects in this
+feature's own new surface (the embedded OpenAPI under-declares `400` on both
+rotation routes; the MCP twin silently coerces a wrongly-typed
+`overlap_days` to the 7-day default). `#2969` covers the sweep's
+silent-failure path and the absence of an alertable stuck-pair signal;
+`#2971` covers two engine-arm principal-keyed premises surviving in a
+token-keyed arm. They are listed after the seven, under their own heading,
+rather than folded in.
+
+Owner: **unassigned** for all ten — filed, not yet triaged to an owner.
+
+This count has now been wrong twice, in opposite directions, which is worth
+stating rather than quietly fixing: it read "Three" while four more were
+open, was corrected to "Seven", and three further issues were filed from the
+same governance run hours later. A count is a claim about a moving set; when
+revising this section, re-derive it (`gh issue list --search "rotation"`)
+rather than incrementing.
 
 - **`#2943`** (Owner: unassigned) — `confirm_rotation` (engine arm) **and**
   `confirm_token_rotation` (human arm, this feature) share a structural
@@ -408,6 +431,44 @@ Owner: **unassigned** for all seven — filed, not yet triaged to an owner.
   multi-replica deployment the process-local `successor_unused` dedup state
   would duplicate audit rows and counters N-way. `unhappy-path` findings
   UP-6, UP-14, UP-16.
+
+### Filed by the eight-gate governance pass (defects in this feature's own surface)
+
+These three postdate the section above and are listed separately because two
+of them break its "no defect in this feature's own new code" premise.
+
+- **`#2969`** (Owner: unassigned) — the sweep's successor-unused scan
+  (`list_rotations_nearing_expiry_unused`) has no failure-signalling path at
+  all: on a pool-lease timeout or a failed `SELECT` it logs and returns an
+  empty vector, indistinguishable from "nothing nearing expiry", and the
+  enclosing `try/catch` cannot catch what is never thrown. Second-order, a
+  failed scan then feeds `warn_dedup.prune({})` and wipes every tracked
+  pair's de-dup state, so previously-audited stuck pairs re-fire once the
+  fault clears. Also carries the alertable-signal gap: `sre` ratified
+  holding the counter to once-per-state but recommended publishing
+  `RotationWarnDedup::tracked_elapsed()` as a **gauge**, which the dedup
+  already computes. `sre` F2 + the cadence adjudication,
+  `consistency-auditor` F6, `architect` A-1.
+
+- **`#2970`** (Owner: unassigned) — **two of these are in this feature's own
+  new surface.** (A) the embedded OpenAPI declares no `400` at all on
+  `/tokens/{id}/confirm` and enumerates three of at least eight `400` causes
+  on `/rotate`, so the machine-readable contract served via
+  `/api/v1/discover/routes` disagrees with `rest-api.md`, which is correct.
+  (B) MCP `rotate_api_token` silently coerces a wrongly-typed `overlap_days`
+  (a JSON float, or a string) to the 7-day default while the REST twin 400s
+  on the same shape. (C) `api_token.reveal` and `.confirm` share no
+  correlation key. (D) no operator runbook for the stuck-pair state.
+  `consistency-auditor` F3/F4, `compliance-officer` F4/F5, `sre` F3.
+
+- **`#2971`** (Owner: unassigned) — two engine-arm premises survive in the
+  token-keyed human arm: both new arms abort on a **principal-wide**
+  property (any active `principal_kind='engine'` row under the principal),
+  and `read_active_for_principal_on_conn` is an unbounded principal-wide
+  read inside the advisory-locked write transaction, on a cost model
+  inherited from a set that was bounded at 2 by construction. Neither is
+  reachable today (`E6`); both are recorded so the next reader does not have
+  to re-derive that this arm is token-keyed. `architect` A-2, A-3.
 
 ## Threats considered
 
