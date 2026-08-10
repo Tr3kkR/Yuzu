@@ -22,6 +22,7 @@
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
 #include "rotation_sweep_naming.hpp"
+#include "rotation_warn_dedup.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "body_cap_policy.hpp" // #2407: pre-auth request-body cap policy table
@@ -5387,7 +5388,7 @@ public:
                 // its slot for a future rotation on the same principal. A
                 // process restart forfeits the pre-elapse de-dup state and
                 // re-warns once more — acceptable for an operational signal.
-                std::unordered_set<std::string> warned_rotation_groups;
+                RotationWarnDedup warn_dedup;
                 // Warn once the predecessor's overlap window has this much
                 // time left — matches the 24h overlap floor: the operator
                 // gets a full floor-window's notice before auto-revoke, the
@@ -5465,7 +5466,7 @@ public:
                         // under (rotation_group == successor's token_id,
                         // never the predecessor's) is pruned below anyway,
                         // but drop it here too for clarity/promptness.
-                        warned_rotation_groups.erase(predecessor.rotation_group);
+                        warn_dedup.resolve(predecessor.rotation_group);
                     }
 
                     // Half 2: successor-unused warning — an OPERATIONAL
@@ -5483,19 +5484,25 @@ public:
                         // ALREADY elapsed — sweep_expired_rotations
                         // deliberately declines to auto-revoke it while the
                         // successor stays unused, so this is the only
-                        // remaining signal for it. De-dup to one warning per
-                        // rotation attempt ONLY for the pre-elapse lead-time
-                        // heads-up (the original, still-fine behavior below);
-                        // once elapsed, warn on EVERY tick instead — a
-                        // one-time warning that then goes silent for the
-                        // rest of an indefinite stuck-open window is exactly
-                        // the "keep warning loudly" gap this closes.
+                        // remaining signal for it. The signals do NOT share a
+                        // cadence — `RotationWarnDedup` owns which fire on this
+                        // tick, and its header states why (an un-throttled
+                        // audit row on an indefinitely-stuck pair is ~1440/day
+                        // into the SOC 2 evidence store).
                         const bool elapsed = pair.predecessor.overlap_expires_at <= now;
-                        if (!elapsed) {
-                            if (warned_rotation_groups.contains(pair.successor.rotation_group))
-                                continue; // already warned this attempt's lead-in — don't re-spam
-                            warned_rotation_groups.insert(pair.successor.rotation_group);
+                        const auto signals =
+                            warn_dedup.observe(pair.successor.rotation_group, elapsed);
+
+                        if (signals.log) {
+                            spdlog::warn(
+                                "Rotation predecessor {} (principal {}) is past its overlap "
+                                "window but the successor has never been used — auto-revoke "
+                                "was declined to avoid leaving zero usable credentials; both "
+                                "stay active until an operator confirms or revokes explicitly",
+                                pair.predecessor.token_id, pair.predecessor.principal_id);
                         }
+                        if (!signals.record_event)
+                            continue; // already counted and audited for this state
 
                         // P2 #11: same per-row discrimination as Half 1,
                         // keyed on the predecessor (the pair shares one
@@ -5506,14 +5513,6 @@ public:
                         metrics_
                             .counter(names.metric_events, {{"reason", "successor_unused"}})
                             .increment();
-                        if (elapsed) {
-                            spdlog::warn(
-                                "Rotation predecessor {} (principal {}) is past its overlap "
-                                "window but the successor has never been used — auto-revoke "
-                                "was declined to avoid leaving zero usable credentials; both "
-                                "stay active until an operator confirms or revokes explicitly",
-                                pair.predecessor.token_id, pair.predecessor.principal_id);
-                        }
                         if (audit_store_ && audit_store_->is_open()) {
                             (void)audit_store_->log(
                                 {.timestamp = now,
@@ -5535,9 +5534,7 @@ public:
                     // (resolved via revoke, confirm, or the successor
                     // finally being used) so a later rotation on the same
                     // principal can warn again.
-                    std::erase_if(warned_rotation_groups, [&](const std::string& group) {
-                        return !still_nearing.contains(group);
-                    });
+                    warn_dedup.prune(still_nearing);
                     } catch (const std::exception& e) {
                         spdlog::error("Rotation sweep tick failed: {}",
                                      e.what());
