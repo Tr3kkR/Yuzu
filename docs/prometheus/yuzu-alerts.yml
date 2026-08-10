@@ -1158,11 +1158,31 @@ groups:
       # flagship cadence also pages the benign one; widening to a 3h window is what
       # separates them.
       #
-      # SAMPLING BOUND. `yuzu_server_uptime_seconds` is written once per periodic
-      # metrics-sweep tick (server.cpp), not on every scrape, so `resets()` can
-      # undercount restarts faster than that tick interval. `> 3` in a 3h window (one
-      # reset per 45 minutes) sits comfortably above it; do not lower the threshold
-      # without re-checking the sweep interval.
+      # SAMPLING BOUND, and it is not merely a delay. `yuzu_server_uptime_seconds` is
+      # written once per periodic metrics-sweep tick (server.cpp), not on every
+      # scrape, so `resets()` can undercount restarts faster than that tick interval.
+      # `> 3` in a 3h window (one reset per 45 minutes) sits comfortably above an
+      # ordinary crash loop's cadence; do not lower the threshold without
+      # re-checking the sweep interval. But a loop faster than the tick itself --
+      # `Restart=always` with no `RestartSec` crashing before the first tick fires,
+      # every time -- writes the gauge AT MOST once per boot no matter how long the
+      # loop runs, so `resets()` can never observe more than a handful of
+      # transitions and this rule stays PERMANENTLY silent, not just delayed. No
+      # rule in this file is a dead-man's-switch for the server process itself (an
+      # `up == 0` / `absent_over_time()` companion would be); tracked as #2956, not
+      # closed here.
+      #
+      # `resets()` FALSE-NEGATIVES ON A PARTIAL RANGE, the mirror of
+      # YuzuAuditRetentionNotRunning's documented `increase()` false-POSITIVE below.
+      # The same four causes -- a Prometheus restart, a fresh TSDB, a new HA
+      # replica, or applying this file for the first time -- clip the trailing [3h]
+      # window from the LEFT, so an actively ongoing crash loop that started before
+      # the clip can show fewer than 4 resets in-window and stay quiet for up to
+      # roughly `4 x cadence + 15m` after the clip (~2h15m at the flagship 30-minute
+      # cadence) before enough fresh resets accumulate to fire. Where the sibling
+      # rule's clipped `increase()` reads as "broken" when it is not, this rule's
+      # clipped `resets()` reads as "healthy" when it may not be -- do not trust a
+      # quiet YuzuServerRestartLoop in the ~3h after any of those four events.
       #
       # KNOWN LIMIT, and it bites hardest where crash loops live. `resets()` needs
       # ONE CONTINUOUS SERIES per server. If a restart changes the `instance`
@@ -1186,9 +1206,12 @@ groups:
             the server's process log / systemd journal / container restart history for a
             crash signature (unhandled exception, OOM-kill, failed boot precondition)
             around each reset. This is a process-health signal, not evidence of a specific
-            subsystem fault -- YuzuAuditRetentionNotRunning and related rules below cover
-            what a dead reaper causes DURING a loop like this one. Runbook:
-            docs/ops-runbooks/audit-store-clock-guard.md.
+            subsystem fault -- YuzuAuditRetentionNotRunning and the rest of the yuzu-audit
+            group cover what a dead reaper causes DURING a loop like this one. Note: at
+            exactly 2 resets in the window this alert stays quiet while
+            YuzuAuditRetentionNotRunning's own grace does NOT excuse a stalled reaper --
+            seeing that alert alone is not evidence this one should also be firing.
+            Runbook: docs/ops-runbooks/audit-store-clock-guard.md.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/audit-store-clock-guard.md"
 
       # THE ABSENCE ALERT. Every other COUNTER-driven rule in this group fires on
@@ -1223,6 +1246,15 @@ groups:
       # it has a reset. Excusing one is a deliberate trade, and it is NOT free.
       # Both halves are pinned in the test file: the single-restart case must
       # stay quiet, the 30-minute crash loop must still fire.
+      #
+      # THIS GRACE AND YuzuServerRestartLoop CAN DISAGREE, and that is expected.
+      # At exactly 2 resets in the window this rule's grace does NOT excuse (only
+      # `<= 1` does), so a stalled reaper still fires here -- while
+      # YuzuServerRestartLoop's `> 3` stays quiet at 2 resets. An operator seeing
+      # THIS alert alone, with no corroborating restart-loop alert, should not
+      # read that as ruling out a restart-related cause; check
+      # `resets(yuzu_server_uptime_seconds[3h])` directly rather than inferring it
+      # from which alerts fired.
       #
       # WHAT THE TRADE COSTS, MEASURED (#2553, governance pass 13). An earlier
       # revision of this comment argued it cost NO coverage -- "to complete zero

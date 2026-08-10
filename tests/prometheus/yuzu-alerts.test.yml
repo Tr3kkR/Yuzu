@@ -99,7 +99,10 @@ tests:
     promql_expr_test:
       # 3h20m: trailing [3h] window is (20m,200m], which holds all three resets
       # (at 60m, 120m, 180m) without yet losing the first one off the back
-      # edge (that happens only once eval - 180 >= 60, i.e. eval >= 240m).
+      # edge. That reset is the sample PAIR (t=59m,t=60m); it rolls off once
+      # the window excludes its PREDECESSOR sample (t=59m), i.e. once
+      # eval - 180 >= 59, eval >= 239m -- not 240m, which is one minute late
+      # (the pair's own later timestamp, not its earlier one).
       - expr: 'ALERTS{alertname="YuzuServerRestartLoop"}'
         eval_time: 3h20m
         exp_samples: []
@@ -146,8 +149,11 @@ tests:
   # CASE 30 -- the 15m `for:`. The crash loop starts at t=0; the fourth reset
   # (the one that first pushes the count past `> 3`) lands at t=120m, so the
   # condition first becomes true AT 120m, not later -- `for: 15m` from there
-  # puts the firing transition at 135m. RED if `for:` is shortened (already
-  # firing at 134m) or lengthened (still not firing at 136m).
+  # puts the firing transition EXACTLY at 135m. RED if `for:` is shortened
+  # (already firing at 134m) or lengthened (still not firing at 135m -- pinned
+  # at the transition itself, not a minute past it, so a `for: 15m` -> `16m`
+  # drift cannot hide between two checkpoints that both straddle the wrong
+  # side of the true boundary).
   - interval: 1m
     name: restart loop - the 15m for is pinned
     input_series:
@@ -168,12 +174,39 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuServerRestartLoop", alertstate="pending", instance="s1", job="yuzu", severity="warning"}'
             value: 1
-      # 136m: 16m elapsed since 120m -- firing.
+      # 135m: exactly 15m elapsed since 120m -- firing. RED against `for: 16m`
+      # (134m still shows quiet under both 15m and 16m, but 135m only fires
+      # under 15m; a 136m checkpoint would still show firing under 16m too,
+      # missing that mutation entirely).
       - expr: 'ALERTS{alertname="YuzuServerRestartLoop", alertstate="firing"}'
-        eval_time: 136m
+        eval_time: 135m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuServerRestartLoop", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
+
+  # CASE 31 -- the two rules legitimately DISAGREE at exactly 2 resets: same
+  # series as CASE 26 (install plus two config-fix restarts), but with the
+  # reaper also stalled. YuzuAuditRetentionNotRunning's grace excuses only
+  # `<= 1` reset, so it fires here; YuzuServerRestartLoop's `> 3` stays quiet
+  # at 2. Pins the disagreement as a known, tested contract -- documented in
+  # both rules' comments and the runbook -- rather than an accidental drift
+  # target for a future threshold edit on either rule.
+  - interval: 1m
+    name: restart loop - disagrees with a stalled retention reaper at exactly 2 resets
+    input_series:
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
+        values: "60+60x29 60+60x29 60+60x29"
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "0x89"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning"}'
+        eval_time: 89m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuServerRestartLoop"}'
+        eval_time: 89m
+        exp_samples: []
 
   # ── YuzuAuditRetentionNotRunning ──────────────────────────────────────────
   #

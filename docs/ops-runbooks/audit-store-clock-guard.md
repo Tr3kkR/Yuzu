@@ -230,6 +230,32 @@ grace below, which reads the same series) goes silent exactly where a crash
 loop is most likely. That is a scrape-configuration problem, not a rule
 problem: target a stable identity.
 
+**Two more silences worth knowing about, neither fixable in PromQL:**
+
+- **After a Prometheus restart, a fresh TSDB, a new HA replica, or applying
+  this rules file for the first time,** an *actively ongoing* crash loop can
+  stay quiet for up to roughly `4 x cadence + 15m` (~2h15m at the 30-minute
+  flagship cadence) before enough fresh resets accumulate in the trailing
+  window to fire again. Don't read a quiet alert in the ~3h after any of
+  those events as evidence the loop stopped — check restart history directly
+  (above) instead.
+- **A crash loop faster than the metrics-sweep tick that writes
+  `yuzu_server_uptime_seconds`** can leave this alert **permanently** silent,
+  not just delayed — the gauge is written at most once per boot, so
+  `resets()` never sees more than a handful of transitions no matter how long
+  the loop runs. There is no dead-man's-switch (`up == 0`) rule for the
+  server process in this file today (tracked: #2956); if the process is
+  unreachable outright, rely on `up{job="yuzu"}` / your scrape-health
+  dashboard, not this alert.
+
+**This alert and `YuzuAuditRetentionNotRunning` can legitimately disagree.**
+At exactly 2 resets in the window, the retention rule's own grace (`<= 1`)
+does *not* excuse a stalled reaper — it fires — while this alert (`> 3`)
+stays quiet. Seeing `YuzuAuditRetentionNotRunning` fire alone is not evidence
+that a restart loop isn't the cause; check
+`resets(yuzu_server_uptime_seconds[3h])` yourself rather than inferring it
+from which alerts are firing.
+
 ## YuzuAuditRetentionNotRunning
 
 No retention pass has been ATTEMPTED for three hours. This is the one failure the
