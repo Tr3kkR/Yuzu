@@ -7070,9 +7070,17 @@ remediation, and `docs/mcp-server.md` "Streamed POST — SSE on the response" fo
 admission/refusal table, close reasons, and resume/recovery rules. A denial
 caused by the server disabling/shutting down streaming, or an allocation failure,
 degrades silently to the plain (non-streamed) response instead of erroring — see the
-same admission table for which causes degrade vs. answer. Progress is best-effort either way —
-a reservation can silently degrade to the plain path under load, so a caller must still
-be prepared to poll (`query_responses` / `get_execution_status`).
+same admission table for which causes degrade vs. answer. Every session open, close,
+and denial is recorded in the audit log under `mcp.session.open` / `mcp.session.close`
+/ `mcp.session.reject` (`target_type = McpSession`) — see `docs/user-manual/mcp.md`
+"Audit". Progress is best-effort regardless of delivery mode: admission (the same
+`reserve()` call this table describes) runs whether or not the request is a streamed
+POST, but only the streamed-POST arm answers a capacity rejection with an explicit
+`429` — the identical causes silently degrade to a plain response, with no progress
+delivered anywhere and no error surfaced, when progress is being delivered on the
+`GET` channel instead (streamed POST not requested, or not enabled). A caller must
+therefore still be prepared to poll (`query_responses` / `get_execution_status`)
+regardless of which delivery mode it used.
 
 ---
 
