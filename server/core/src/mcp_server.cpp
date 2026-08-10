@@ -3408,9 +3408,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     // private to ApiTokenStore (see rotation_confirm_state.hpp's
                     // pair_matches_pin doc comment). confirm_rotation's own
                     // in-transaction check remains the only thing that catches it,
-                    // so that specific drift still burns the ticket (tracked
-                    // separately as a follow-up: a read-only accessor for the
-                    // initiator binding would close it here too).
+                    // so that specific drift still burns the ticket. Tracked: #2946
+                    // (read-only initiator-binding accessor would close it here too).
+                    // Also tracked: #2947, chaos-scenario coverage for this
+                    // precondition's read pinning an httplib worker (CH-4).
                     ConsumePrecondition precondition;
                     if (tool_name == "confirm_engine_rotation") {
                         const auto rot_principal_id = param_str(args, "principal_id");

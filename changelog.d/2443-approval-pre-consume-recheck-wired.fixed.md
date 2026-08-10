@@ -20,5 +20,6 @@
   **Not closed by this change:** a process restart evicting the rotation's initiator (grace-cache)
   binding. That state lives in an in-process cache private to `ApiTokenStore` and isn't visible
   to the precondition's read; a ticket recalled after that specific drift still gets consumed and
-  then fails at `confirm_rotation`'s own in-transaction check. Tracked as a follow-up (a read-only
-  accessor for the initiator binding would close it here too).
+  then fails at `confirm_rotation`'s own in-transaction check. Tracked as #2946 (a read-only
+  accessor for the initiator binding would close it here too). Chaos-scenario coverage for this
+  precondition's read pinning an httplib worker is tracked as #2947.
