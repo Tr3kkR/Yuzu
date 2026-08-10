@@ -726,6 +726,8 @@ List the current user's API tokens. Raw token values are never returned.
 }
 ```
 
+**Rotation fields (P2 #11):** `rotation_group`, `supersedes_token_id`, `overlap_expires_at`, and `confirmed_at` appear on an item **only** while a rotation is (or was) in flight for that token — a token that has never been rotated omits all four. `rotation_group` is present on **both** the predecessor and the successor row of an in-flight pair (it links them); `supersedes_token_id` is present only on the successor and equals the predecessor's `token_id`; `overlap_expires_at` is present on the predecessor while the overlap window is open (the epoch it is auto-revoked); `confirmed_at` is present once an explicit `credentials/confirm`-style confirmation (below) has closed the rotation. A caller that only checks for the absence of these fields on a fresh token needs no code change — they were not serialized before P2 #11 either.
+
 ---
 
 #### `POST /api/v1/tokens`
@@ -806,6 +808,87 @@ The same ownership constraint applies to the HTMX dashboard path `DELETE /api/se
   "meta": { "api_version": "v1" }
 }
 ```
+
+---
+
+#### `POST /api/v1/tokens/{token_id}/rotate`
+
+Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3): mints a successor token while the existing (predecessor) token stays valid for an overlap window — at most **two** active tokens in the rotation group during the overlap. `{token_id}` in the path is the **predecessor's** id. The raw successor secret is returned exactly once per reveal (see the grace-window re-serve note below), the same discipline the engine-principal `credentials/rotate` route above uses. MFA step-up runs on **every** call to this route, including an idempotent re-serve.
+
+**Permission:** `ApiToken:Write`
+
+**Ownership constraint — self-service only, no admin bypass:** unlike `DELETE /api/v1/tokens/{token_id}` above, there is **no** admin override here. A human token's raw successor secret authenticates *as that user*, so an admin rotating or confirming someone else's token would hand out (or complete the cutover of) a credential that impersonates them — identity takeover, not a permission gap an admin role could legitimately cross. An admin who needs to act on another user's token still has `DELETE` (revoke). Attempting to rotate a token you do not own returns `404 token not found` — identical to the response for a token that does not exist, closing the same enumeration-oracle gap the DELETE route closes. Denied attempts are recorded in the audit log with `action=api_token.rotate`, `result=denied`, and `detail=owner=<real owner>`.
+
+**Request body (optional):**
+
+```json
+{ "overlap_secs": 604800 }
+```
+
+`overlap_secs` defaults to 7 days (`604800`), with the same 24-hour floor / 10-year ceiling as the engine-principal rotate route — a value outside that range is rejected (`400`), never silently clamped.
+
+**Lifetime-neutral by design (SOC 2 CC6.3):** the successor token **always inherits the predecessor's `expires_at` verbatim** — a perpetual (never-expiring) token stays perpetual, a 30-day token stays a 30-day token measured from its *own* original grant, never recomputed as "90 days from now". There is **no request field** to override this; the store-level `successor_expires_at` override that exists internally for the engine-principal arm is deliberately not exposed on this route. Rotating a credential must never silently extend its authorization lifetime — an auditor reviewing rotation evidence for CC6.3 must be able to trust that rotation and grant renewal are two separate, independently-audited actions, never one fused into the other. A caller that genuinely needs a longer-lived replacement token should mint a fresh one via `POST /api/v1/tokens` instead.
+
+**Response:** same `Cache-Control: no-store, no-cache, must-revalidate` + `Pragma: no-cache` headers as `POST /api/v1/tokens`, since the body carries a raw one-time secret.
+
+```json
+{
+  "data": {
+    "token": "yzt_...",
+    "token_id": "...",
+    "expires_at": 1742385600,
+    "overlap_expires_at": 1710936000
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`token_id` and `expires_at` describe the **successor**, found structurally — the active row whose `supersedes_token_id` equals `{token_id}` (the predecessor being rotated), never merely "any linked row of this principal's active set" and never by "most recently created" (which is second-resolution and can tie). A human principal routinely holds several unrelated tokens with independent in-flight rotations, so the match must be scoped to the exact predecessor in the path — a broader match can return a *different* rotation's successor.
+
+`overlap_expires_at`, by contrast, describes the **predecessor** — consistent with the `GET /api/v1/tokens` field of the same name above (§"Rotation fields"): it is stamped on the predecessor row, not the successor, and is echoed here purely for the caller's convenience (the epoch at which the predecessor this call just rotated is auto-revoked). There is no separate `overlap_expires_at` on the successor row itself; do not expect one from `GET /api/v1/tokens` until the successor is itself rotated in turn.
+
+**Success audit:** `action=api_token.reveal` — the reveal itself is the success event, mirroring the engine-principal route's `engine_principal.credential.reveal`; a grace-window re-serve gets its own row too, since every time the raw secret leaves the server is independently on the audit chain.
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| No such token, or the token exists but is not owned by the caller | `404` — `token not found` (identical body; not an enumeration oracle) |
+| `overlap_secs` present in the body but not an integer (e.g. a string) | `400` — `overlap_secs must be an integer (seconds)` |
+| Overlap window below the 24h floor, or above the 10-year ceiling | `400` |
+| Overlap window would outlive the predecessor's or the successor's own expiry | `400` |
+| The token is not a human-owned credential (an engine-principal credential somehow reached this route) | `400` — `token is not a human-owned credential` |
+| The token is revoked or already expired | `400` — `credential is not currently active — nothing to rotate` |
+| Two active tokens in the rotation group exist but are not a recognized predecessor/successor pair | `400` — resolve via revoke, not rotate |
+| More than two active tokens in the rotation group | `400` — resolve manually before rotating |
+| A rotation already in flight, initiated by a **different** operator | `409` |
+| Grace window elapsed with no confirm | `409` — `grace window elapsed; confirm or revoke` |
+| No active credential found to rotate | `503` — deliberately conflated with a transient read failure, same rationale as the engine-principal rotate route above |
+| The rotation itself succeeded (a successor token now exists) but the follow-up read that locates it for the response came back empty | `503` — fails CLOSED rather than return a raw one-time secret with no `token_id` to ever confirm it against; retry, or check `GET /api/v1/tokens` |
+| Advisory-lock acquire failure, CSPRNG failure, or a mint/stamp write that did not persist | `503` — retryable store failure |
+| MFA step-up not satisfied | `401` |
+| Missing `ApiToken:Write`, or the caller's own session is engine-classed (structural deny belt) | `403` |
+
+---
+
+#### `POST /api/v1/tokens/{token_id}/confirm`
+
+Explicit maker-checker confirmation that a rotation's successor secret has been received and installed. `{token_id}` in the path is the **successor's** id — the value the `rotate` response above returned — so, unlike the engine-principal confirm route, **no request body is needed at all**: the id in the URL pins the exact rotation being confirmed. On success, the predecessor token is revoked and the successor becomes the sole active token in the rotation group.
+
+**Permission:** `ApiToken:Write`
+
+**Ownership constraint:** the same self-service-only posture as `rotate` above — no admin bypass, `404 token not found` for both a nonexistent successor id and one owned by someone else, and the same `action=api_token.confirm`/`result=denied`/`detail=owner=<real owner>` audit row on a denied attempt.
+
+**Response:**
+
+```json
+{
+  "data": { "confirmed": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:** the same state matrix as the engine-principal `credentials/confirm` route above (replay-after-success is a terminal `409`, an ambiguous empty/malformed-pair read is a retryable `503`, unresolved rotation metadata on the sole survivor is a terminal `409`), substituting `token is not a human-owned credential` / `principal has a non-human active credential` for the engine-kind equivalents. `401`/`403` follow the same step-up and permission rules as `rotate`.
 
 ---
 

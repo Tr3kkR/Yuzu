@@ -80,6 +80,10 @@ struct RestTokenRotationHarness {
     bool step_up_allow{true};
 
     std::vector<AuditRecord> audit_log;
+    // Round-3 review fix: records every (securable, action) pair perm_fn was
+    // actually invoked with, so a test can pin ApiToken:Write vs
+    // Security:Write rather than the mock silently accepting anything.
+    std::vector<std::pair<std::string, std::string>> perm_checks;
 
     RestTokenRotationHarness() {
         auto auth_fn = [this](const httplib::Request&,
@@ -96,8 +100,9 @@ struct RestTokenRotationHarness {
             return s;
         };
 
-        auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
-                              const std::string&) -> bool {
+        auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
+                              const std::string& securable, const std::string& action) -> bool {
+            perm_checks.emplace_back(securable, action);
             if (!perm_allow) {
                 res.status = 403;
                 return false;
@@ -152,8 +157,20 @@ struct RestTokenRotationHarness {
         auto raw = token_store->create_token(name, owner, expires_at);
         REQUIRE(raw.has_value());
         auto listing = token_store->list_tokens(owner).value();
-        REQUIRE(!listing.empty());
-        return listing.front().token_id; // list_tokens orders newest-first
+        // Match by NAME, never `.front()` on `created_at DESC` — created_at
+        // is second-resolution, so two tokens minted for the same owner
+        // inside one test (e.g. the round-3 two-token overlapping-rotation
+        // regression below) can tie, and `.front()` is then whichever the
+        // database happens to return first — this is exactly the same
+        // "never newest created_at" hazard the production successor lookup
+        // (token_rotation_lookup.hpp) exists to avoid, just on the test
+        // fixture's own read instead of the route's. Every call site in
+        // this file uses a distinct name per harness instance.
+        for (const auto& t : listing)
+            if (t.name == name)
+                return t.token_id;
+        FAIL("create_token_for: no token named '" << name << "' found for " << owner);
+        return {};
     }
 
     auto rotate(const std::string& token_id, std::optional<int64_t> overlap_secs = std::nullopt) {
@@ -437,6 +454,159 @@ TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: successor inherits the predeces
 
     auto data = nlohmann::json::parse(res->body)["data"];
     CHECK(data["expires_at"].get<int64_t>() == predecessor_expiry);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Round-3 review fixes: the successor lookup must be scoped to the exact
+// predecessor being rotated (BLOCKING — reproduced end-to-end against live
+// Postgres), overlap_expires_at must describe the predecessor with a real
+// value, and overlap_secs must be parsed defensively.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: successor lookup is scoped to the "
+          "predecessor being rotated, not any linked row of the principal "
+          "(round-3 BLOCKING regression — cross-token secret/id mismatch)",
+          "[pg][rest][token][rotation][blocking]") {
+    RestTokenRotationHarness h;
+    auto token_a = h.create_token_for("alice", "token-a");
+    auto token_b = h.create_token_for("alice", "token-b");
+    h.session_user = "alice";
+
+    // Rotate A first — alice now has an in-flight rotation group for A.
+    auto rotate_a = h.rotate(token_a);
+    REQUIRE(rotate_a);
+    REQUIRE(rotate_a->status == 200);
+    auto successor_a =
+        nlohmann::json::parse(rotate_a->body)["data"]["token_id"].get<std::string>();
+
+    // Rotate B while A's rotation is still inside its overlap window — alice
+    // now has TWO unrelated in-flight rotation groups simultaneously, which
+    // is legal (the <=2-active ceiling is per ROTATION GROUP, never per
+    // principal — api_token_store.hpp's "Human arm" design note).
+    auto rotate_b = h.rotate(token_b);
+    REQUIRE(rotate_b);
+    REQUIRE(rotate_b->status == 200);
+    auto data_b = nlohmann::json::parse(rotate_b->body)["data"];
+    auto successor_b = data_b["token_id"].get<std::string>();
+
+    // The BLOCKING bug: an unscoped scan over list_active_for_principal
+    // matches "any" linked row — deterministically A's successor here, since
+    // it was minted first — even though B is the token actually rotated.
+    CHECK(successor_b != successor_a);
+
+    // Ground truth: ask the store directly which token B's response should
+    // have described.
+    auto b_row = h.token_store->get_token(successor_b).value();
+    REQUIRE(b_row.has_value());
+    CHECK(b_row->supersedes_token_id == token_b);
+
+    // A's rotation is untouched by rotating B.
+    auto a_pred = h.token_store->get_token(token_a).value();
+    REQUIRE(a_pred.has_value());
+    CHECK_FALSE(a_pred->revoked);
+    auto a_succ = h.token_store->get_token(successor_a).value();
+    REQUIRE(a_succ.has_value());
+    CHECK(a_succ->supersedes_token_id == token_a);
+
+    // The exploit path the reviewers reproduced: confirming B's successor id
+    // must revoke ONLY B's predecessor. Under the bug, the response to
+    // rotate(B) carried B's raw secret paired with A's successor token_id,
+    // so confirming that id revoked A while B (the token whose secret the
+    // caller actually holds) stayed live and unconfirmed.
+    auto confirm_b = h.confirm(successor_b);
+    REQUIRE(confirm_b);
+    REQUIRE(confirm_b->status == 200);
+
+    auto b_pred_after = h.token_store->get_token(token_b).value();
+    REQUIRE(b_pred_after.has_value());
+    CHECK(b_pred_after->revoked); // B's predecessor is now revoked
+
+    auto a_pred_after = h.token_store->get_token(token_a).value();
+    REQUIRE(a_pred_after.has_value());
+    CHECK_FALSE(a_pred_after->revoked); // A's predecessor must still be LIVE
+}
+
+TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: overlap_expires_at describes the "
+          "PREDECESSOR, is non-zero, and matches the store's stamped value "
+          "(round-3 review — was structurally always 0, read off the successor row)",
+          "[pg][rest][token][rotation]") {
+    RestTokenRotationHarness h;
+    auto token_id = h.create_token_for("alice", "alice-key");
+    h.session_user = "alice";
+
+    const int64_t before = now_epoch();
+    auto res = h.rotate(token_id, /*overlap_secs=*/86400);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto data = nlohmann::json::parse(res->body)["data"];
+    auto reported = data["overlap_expires_at"].get<int64_t>();
+
+    CHECK(reported > 0);
+    CHECK(reported >= before + 86400);
+    CHECK(reported <= now_epoch() + 86400 + 5); // small clock-skew tolerance
+
+    // Ground truth: the PREDECESSOR row's own overlap_expires_at column —
+    // never the successor's, which the store never stamps.
+    auto pred = h.token_store->get_token(token_id).value();
+    REQUIRE(pred.has_value());
+    CHECK(reported == pred->overlap_expires_at);
+
+    auto succ_id = data["token_id"].get<std::string>();
+    auto succ = h.token_store->get_token(succ_id).value();
+    REQUIRE(succ.has_value());
+    CHECK(succ->overlap_expires_at == 0); // confirms the response is NOT this
+}
+
+TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: overlap_secs of the wrong JSON type "
+          "returns a documented 400 (A4 envelope), never an unhandled exception "
+          "(round-3 review — body.value<int64_t> throws json::type_error.302)",
+          "[pg][rest][token][rotation]") {
+    RestTokenRotationHarness h;
+    auto token_id = h.create_token_for("alice", "alice-key");
+    h.session_user = "alice";
+
+    auto res = h.sink.Post("/api/v1/tokens/" + token_id + "/rotate", R"({"overlap_secs":"7d"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->body.find("overlap_secs must be an integer") != std::string::npos);
+    // A4 envelope, not a bare httplib error page.
+    CHECK(res->body.find("\"code\":400") != std::string::npos);
+
+    // No rotation happened.
+    auto pred = h.token_store->get_token(token_id).value();
+    REQUIRE(pred.has_value());
+    CHECK(pred->rotation_group.empty());
+}
+
+TEST_CASE("REST tokens rotate/confirm: pin ApiToken:Write, never Security:Write "
+          "(round-3 review — the test mock previously ignored perm_fn's own arguments)",
+          "[pg][rest][token][rotation][gate]") {
+    RestTokenRotationHarness h;
+    auto token_id = h.create_token_for("alice", "alice-key");
+    h.session_user = "alice";
+
+    SECTION("rotate") {
+        h.perm_checks.clear();
+        auto res = h.rotate(token_id);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        REQUIRE(h.perm_checks.size() == 1);
+        CHECK(h.perm_checks[0].first == "ApiToken");
+        CHECK(h.perm_checks[0].second == "Write");
+    }
+    SECTION("confirm") {
+        auto rotate_res = h.rotate(token_id);
+        REQUIRE(rotate_res);
+        auto successor_id =
+            nlohmann::json::parse(rotate_res->body)["data"]["token_id"].get<std::string>();
+        h.perm_checks.clear();
+        auto res = h.confirm(successor_id);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        REQUIRE(h.perm_checks.size() == 1);
+        CHECK(h.perm_checks[0].first == "ApiToken");
+        CHECK(h.perm_checks[0].second == "Write");
+    }
 }
 
 TEST_CASE("REST POST /api/v1/tokens/{id}/confirm: successor id in the path — 200, "
