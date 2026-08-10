@@ -447,8 +447,18 @@ of them break its "no defect in this feature's own new code" premise.
   fault clears. Also carries the alertable-signal gap: `sre` ratified
   holding the counter to once-per-state but recommended publishing
   `RotationWarnDedup::tracked_elapsed()` as a **gauge**, which the dedup
-  already computes. `sre` F2 + the cadence adjudication,
-  `consistency-auditor` F6, `architect` A-1.
+  already computes. Two further sections bear directly on this record's own
+  telemetry claims: the engine-side `describe()` calls are string literals
+  not bound to `kEngineRotationSweepNames`, and the engine `auto_revoked` /
+  `events` families are **not** pre-seeded while their human twins now are —
+  so two families this document repeatedly calls "twins" behave
+  asymmetrically under `absent()` / `increase()`. The fourth records the
+  deliberate naming asymmetry: `yuzu_rotation_sweep_capped_total` was
+  renamed kind-neutral because it had never shipped, while
+  `yuzu_engine_principal_rotation_sweep_failures_total` keeps its engine
+  name because renaming a shipped series breaks existing alerts.
+  `sre` F1 (pre-seeding half fixed), F2 and the cadence adjudication;
+  `consistency-auditor` F6; `architect` A-1.
 
 - **`#2970`** (Owner: unassigned) — **two of these are in this feature's own
   new surface.** (A) the embedded OpenAPI declares no `400` at all on
@@ -466,9 +476,14 @@ of them break its "no defect in this feature's own new code" premise.
   property (any active `principal_kind='engine'` row under the principal),
   and `read_active_for_principal_on_conn` is an unbounded principal-wide
   read inside the advisory-locked write transaction, on a cost model
-  inherited from a set that was bounded at 2 by construction. Neither is
-  reachable today (`E6`); both are recorded so the next reader does not have
-  to re-derive that this arm is token-keyed. `architect` A-2, A-3.
+  inherited from a set that was bounded at 2 by construction. The two differ
+  in reachability and the issue is explicit about it: **A** is `E6` — engine
+  credentials are only minted against `engine:`-prefixed principal ids, so
+  the wrong outcome is proven unable to occur. **B is live today**, on every
+  rotate and confirm; what is bounded is the blast radius (the advisory lock
+  is per-principal, `statement_timeout` bounds the query), and the point of
+  recording it is that a cost premise changed silently when the arm went
+  token-keyed. `architect` A-2, A-3.
 
 ## Threats considered
 

@@ -5394,13 +5394,18 @@ public:
                 // cache precedent) — keyed on rotation_group, so the SAME
                 // pair isn't re-audited/re-counted every tick during its
                 // PRE-elapse lead-time window (a heads-up ahead of the
-                // scheduled auto-revoke). This de-dup deliberately does NOT
-                // apply once the window has elapsed (UP-5): a never-used
-                // successor's predecessor is no longer auto-revoked past its
-                // window, so it can sit stuck-open indefinitely, and a
-                // single warning that then goes silent for the rest of that
-                // window would defeat the point of warning at all — see the
-                // `elapsed` branch below, which re-warns every tick instead.
+                // scheduled auto-revoke). Crossing INTO the elapsed state
+                // (UP-5: a never-used successor's predecessor is no longer
+                // auto-revoked, so the pair can sit stuck-open indefinitely)
+                // is a distinct fact and gets its own warning, tracked in a
+                // second set — but the three signals do NOT share a cadence,
+                // and `rotation_warn_dedup.hpp` is the ONLY authority on
+                // which fires when. In short: the LOG LINE repeats every
+                // tick while the pair stays stuck; the AUDIT ROW and the
+                // METRIC fire once per pair per state. Do not restore
+                // per-tick emission of the row from this comment — an
+                // un-throttled row is ~1440/day per stuck pair into the SOC 2
+                // audit store, which is what it did once already.
                 // Pruned each tick to whatever
                 // list_rotations_nearing_expiry_unused still returns, so a
                 // resolved pair (revoked, confirmed, or finally used) frees

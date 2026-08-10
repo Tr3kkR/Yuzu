@@ -497,8 +497,10 @@ public:
     /// applied to a per-principal availability floor rather than a bulk
     /// delete). The pair stays fully live past its overlap window in that
     /// case; `list_rotations_nearing_expiry_unused` keeps surfacing it as an
-    /// operational warning (undeduplicated once elapsed) until an operator
-    /// resolves it explicitly (confirm or revoke).
+    /// operational warning until an operator resolves it explicitly (confirm
+    /// or revoke). Cadence of the three signals is NOT uniform and is owned
+    /// solely by `rotation_warn_dedup.hpp` — the log line repeats per tick,
+    /// the audit row and metric fire once per pair per state.
     ///
     /// Bounded per tick at `kMaxAutoRevokesPerTick` (a defensible cap, not a
     /// tuned one — see the constant's own comment) — the routed
@@ -562,12 +564,23 @@ public:
     /// successor_unused` audit row plus a bounded `reason="successor_unused"`
     /// Prometheus counter — deliberately NOT `event="security"` (this is an
     /// operational health signal, not a theft signal, per the design doc).
-    /// The caller de-duplicates a not-yet-elapsed pair to one warning per
-    /// rotation attempt (a lead-time heads-up), but — since a pair still
-    /// returned here past its own `overlap_expires_at` is one
-    /// `sweep_expired_rotations` is deliberately NOT resolving — re-warns it
-    /// on every tick once elapsed, not once ever, so a stuck pair cannot go
-    /// silent for the rest of its (indefinite) lifetime.
+    /// A pair still returned here past its own `overlap_expires_at` is one
+    /// `sweep_expired_rotations` is deliberately NOT resolving, and that is
+    /// a distinct fact from the lead-time heads-up, so the caller warns
+    /// again on crossing into it.
+    ///
+    /// CADENCE IS NOT UNIFORM, and `rotation_warn_dedup.hpp` is the single
+    /// authority — do not infer it from this contract. The **log line**
+    /// repeats every tick while the pair stays stuck; the **audit row and
+    /// the counter named above** fire ONCE per pair per state (once
+    /// pre-elapse, once on elapsing), process-local, so a restart re-emits
+    /// once. An earlier revision of this comment said they re-fired on
+    /// every tick "so a stuck pair cannot go silent" — that shipped, and
+    /// was the defect: ~1440 audit rows/day for ONE stuck pair, into a
+    /// store whose retention pass caps at 25 000 deletions per run.
+    /// Indefinite loudness lives on the log channel; an alertable
+    /// current-state signal is tracked in #2969 and does not exist yet, so
+    /// do not build a stuck-pair alert on the counter.
     /// Best-effort, mirrors `list_all`: a lease/query failure logs at warn
     /// and returns an empty vector rather than propagating — this is a
     /// maintenance-loop read, not an authorization chokepoint.

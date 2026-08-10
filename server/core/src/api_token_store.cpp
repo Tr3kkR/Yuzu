@@ -2065,8 +2065,10 @@ std::vector<ApiToken> ApiTokenStore::sweep_expired_rotations(int64_t now, bool* 
             // necessarily zero for the principal as a whole, who may hold
             // other unrelated active tokens). The pair
             // stays live past its window; `list_rotations_nearing_expiry_
-            // unused` keeps warning about it every tick until an operator
-            // resolves it explicitly.
+            // unused` keeps surfacing it until an operator resolves it
+            // explicitly. Cadence is owned by `rotation_warn_dedup.hpp`:
+            // the log line repeats per tick, the audit row and metric fire
+            // once per pair per state.
             pg::PgResult r1 = pg::exec_params(
                 conn,
                 "UPDATE api_token_store.api_tokens SET revoked = TRUE "
