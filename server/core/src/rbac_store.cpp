@@ -2585,6 +2585,8 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
     }
 
     // 2. Idempotency marker (short-lived lease released before any legacy I/O).
+    bool marker_present = false;
+    std::optional<std::string> stored_fingerprint;
     {
         auto lease = pool_.acquire();
         if (!lease) {
@@ -2604,8 +2606,6 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
             backfill_metric("failed");
             return false;
         }
-        bool marker_present = false;
-        std::optional<std::string> stored_fingerprint;
         for (int i = 0; i < PQntuples(mk.get()); ++i) {
             const std::string key = text_col(mk.get(), i, 0);
             if (key == "backfill_complete")
@@ -2613,115 +2613,122 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
             else if (key == "backfill_source_fingerprint")
                 stored_fingerprint = text_col(mk.get(), i, 1);
         }
-        if (marker_present) {
-            if (!legacy_exists) {
-                spdlog::debug("RbacStore: migrate_from_sqlite already completed, skipping");
-                return true;
-            }
-            // This replica still holds a local legacy file even though the
-            // fleet marker is already set — verify it was actually the file
-            // that got migrated before trusting the marker. A sourceless
-            // writer's placeholder can never match a real file's fingerprint,
-            // which is exactly what catches the anti-pattern this fix closes.
-            const auto verify_fp = legacy_rbac_fingerprint(legacy_db_path);
-            if (!verify_fp) {
-                spdlog::error(
-                    "RbacStore: migrate_from_sqlite: backfill_complete is already set, and this "
-                    "replica's own legacy db {} exists but is unreadable/corrupt while being "
-                    "fingerprint-verified against it — refusing (fail-closed; never silently "
-                    "trust a marker over an unverifiable local file)",
-                    legacy_db_path.string());
-                backfill_metric("failed");
-                return false;
-            }
-            if (*verify_fp == kSourcelessFingerprint) {
-                // This replica's own local file has no `roles` table — nothing
-                // to lose regardless of who stamped the marker or why (matches
-                // AuditStore's `legacy_fp->count == 0` short-circuit,
-                // audit_store.cpp). Refusing here would penalize a replica for
-                // holding a schema-less file it never had operator content in,
-                // with no data at risk to justify the boot failure.
-                spdlog::debug("RbacStore: migrate_from_sqlite already completed; this replica's "
-                             "own legacy db has no roles table (nothing to lose), skipping");
-                return true;
-            }
-            if (!stored_fingerprint) {
-                // governance re-review (PR #2703, HIGH — chaos-injector/
-                // unhappy-path, unhappy-path's finding EMPIRICALLY reproduced):
-                // no `backfill_source_fingerprint` row at all means this marker
-                // predates the fingerprint mechanism (31273f288) — it could be
-                // THIS replica's own genuine prior migration (in which case
-                // this file is redundant and safe to move aside), or a
-                // different replica's completion this file was never proven
-                // part of. Unlike the sourceless case below, this is NOT safe
-                // to auto-retry: a real migration DID happen under the old
-                // marker-only scheme, and this replica may have accepted live
-                // operator changes since (new roles, revoked grants) that a
-                // fresh re-migration would clobber (see the destructive-under-
-                // live-mutation reasoning on step 4/5's DO UPDATE + revoke
-                // CTE). Sol/Fable: the message must not assert more than this
-                // is actually known, and must not copy AuditStore's wording
-                // verbatim (their pre-fingerprint-upgrade population differs).
-                spdlog::error(
-                    "RbacStore: migrate_from_sqlite: backfill_complete is already set with NO "
-                    "recorded source fingerprint (this marker predates the fingerprint-"
-                    "verification mechanism), and this replica's own legacy db {} still holds "
-                    "real content (fingerprint '{}'). This marker's provenance was never "
-                    "recorded, so it cannot be told apart from this replica's OWN completed "
-                    "migration before fingerprints existed (redundant, safe to move aside) vs. a "
-                    "different replica's completion this file was never proven part of. "
-                    "Refusing to guess either way — see "
-                    "docs/ops-runbooks/rbac-store-backfill-recovery.md.",
-                    legacy_db_path.string(), *verify_fp);
-                backfill_metric("failed");
-                return false;
-            }
-            if (*stored_fingerprint == kSourcelessFingerprint) {
-                // governance re-review (PR #2703, HIGH — chaos-injector's
-                // Finding A / unhappy-path's Finding 2): no real migration has
-                // EVER happened for this fleet yet — a fileless sibling merely
-                // stamped first. That is the SAME safety class as a fresh
-                // install (nothing real to clobber), so unlike the two cases
-                // above, this one does NOT refuse: fall through to a normal
-                // migration attempt below. Step 7's stamp_complete will
-                // correctly PROMOTE this stored sourceless value to this
-                // replica's own real fingerprint (the monotonic-promotion
-                // upsert), closing the race without operator intervention.
-                spdlog::info(
-                    "RbacStore: migrate_from_sqlite: backfill_complete is set with a sourceless "
-                    "source fingerprint (no real legacy data has been migrated for this fleet "
-                    "yet) and this replica's own legacy db {} holds real content — proceeding "
-                    "with a normal migration; success will promote the shared marker to this "
-                    "replica's real fingerprint",
-                    legacy_db_path.string());
-            } else if (*stored_fingerprint != *verify_fp) {
-                spdlog::error(
-                    "RbacStore: migrate_from_sqlite: HOLDER-SIDE VERIFICATION FAILED — "
-                    "backfill_complete is already set with a DIFFERENT recorded source "
-                    "fingerprint ('{}') than this replica's own legacy db {} ('{}') — some "
-                    "other replica's legacy data was migrated, not this one's "
-                    "(docs/postgres-store-playbook.md anti-pattern 'Local source absence never "
-                    "creates terminal migration state on its own', #2697). Refusing to silently "
-                    "accept a completion this replica's roles/grants/groups were never part of "
-                    "— see docs/ops-runbooks/rbac-store-backfill-recovery.md.",
-                    *stored_fingerprint, legacy_db_path.string(), *verify_fp);
-                backfill_metric("failed");
-                return false;
-            } else {
-                spdlog::debug("RbacStore: migrate_from_sqlite already completed (fingerprint "
-                             "verified), skipping");
-                // governance re-review (Fable): retry the move-aside here too,
-                // not only on the fresh-migration path — a verified match
-                // means this IS the file a prior boot on this replica already
-                // migrated, and a once-failed move-aside (the only way it
-                // could still be here) deserves the same retry, or it re-
-                // verifies against this same file forever and never converges
-                // on the playbook's one-release retention policy.
-                // legacy_rbac_fingerprint() above opened and closed its own
-                // connection, so nothing holds this path open.
-                move_legacy_aside(legacy_db_path);
-                return true;
-            }
+        // lease released HERE (end of scope) — governance re-review
+        // (cpp-safety, MEDIUM): the verification work below is a SQLite file
+        // read + SHA-256 hash, which used to run with this Postgres lease
+        // still checked out, contradicting the very comment this step
+        // carries. legacy_exists is already hoisted above this block for the
+        // same reason (step 1's comment); marker_present/stored_fingerprint
+        // now get the same treatment.
+    }
+    if (marker_present) {
+        if (!legacy_exists) {
+            spdlog::debug("RbacStore: migrate_from_sqlite already completed, skipping");
+            return true;
+        }
+        // This replica still holds a local legacy file even though the
+        // fleet marker is already set — verify it was actually the file
+        // that got migrated before trusting the marker. A sourceless
+        // writer's placeholder can never match a real file's fingerprint,
+        // which is exactly what catches the anti-pattern this fix closes.
+        const auto verify_fp = legacy_rbac_fingerprint(legacy_db_path);
+        if (!verify_fp) {
+            spdlog::error(
+                "RbacStore: migrate_from_sqlite: backfill_complete is already set, and this "
+                "replica's own legacy db {} exists but is unreadable/corrupt while being "
+                "fingerprint-verified against it — refusing (fail-closed; never silently "
+                "trust a marker over an unverifiable local file)",
+                legacy_db_path.string());
+            backfill_metric("failed");
+            return false;
+        }
+        if (*verify_fp == kSourcelessFingerprint) {
+            // This replica's own local file has no `roles` table — nothing
+            // to lose regardless of who stamped the marker or why (matches
+            // AuditStore's `legacy_fp->count == 0` short-circuit,
+            // audit_store.cpp). Refusing here would penalize a replica for
+            // holding a schema-less file it never had operator content in,
+            // with no data at risk to justify the boot failure.
+            spdlog::debug("RbacStore: migrate_from_sqlite already completed; this replica's "
+                         "own legacy db has no roles table (nothing to lose), skipping");
+            return true;
+        }
+        if (!stored_fingerprint) {
+            // governance re-review (PR #2703, HIGH — chaos-injector/
+            // unhappy-path, unhappy-path's finding EMPIRICALLY reproduced):
+            // no `backfill_source_fingerprint` row at all means this marker
+            // predates the fingerprint mechanism (31273f288) — it could be
+            // THIS replica's own genuine prior migration (in which case
+            // this file is redundant and safe to move aside), or a
+            // different replica's completion this file was never proven
+            // part of. Unlike the sourceless case below, this is NOT safe
+            // to auto-retry: a real migration DID happen under the old
+            // marker-only scheme, and this replica may have accepted live
+            // operator changes since (new roles, revoked grants) that a
+            // fresh re-migration would clobber (see the destructive-under-
+            // live-mutation reasoning on step 4/5's DO UPDATE + revoke
+            // CTE). Sol/Fable: the message must not assert more than this
+            // is actually known, and must not copy AuditStore's wording
+            // verbatim (their pre-fingerprint-upgrade population differs).
+            spdlog::error(
+                "RbacStore: migrate_from_sqlite: backfill_complete is already set with NO "
+                "recorded source fingerprint (this marker predates the fingerprint-"
+                "verification mechanism), and this replica's own legacy db {} still holds "
+                "real content (fingerprint '{}'). This marker's provenance was never "
+                "recorded, so it cannot be told apart from this replica's OWN completed "
+                "migration before fingerprints existed (redundant, safe to move aside) vs. a "
+                "different replica's completion this file was never proven part of. "
+                "Refusing to guess either way — see "
+                "docs/ops-runbooks/rbac-store-backfill-recovery.md.",
+                legacy_db_path.string(), *verify_fp);
+            backfill_metric("failed");
+            return false;
+        }
+        if (*stored_fingerprint == kSourcelessFingerprint) {
+            // governance re-review (PR #2703, HIGH — chaos-injector's
+            // Finding A / unhappy-path's Finding 2): no real migration has
+            // EVER happened for this fleet yet — a fileless sibling merely
+            // stamped first. That is the SAME safety class as a fresh
+            // install (nothing real to clobber), so unlike the two cases
+            // above, this one does NOT refuse: fall through to a normal
+            // migration attempt below. Step 7's stamp_complete will
+            // correctly PROMOTE this stored sourceless value to this
+            // replica's own real fingerprint (the monotonic-promotion
+            // upsert), closing the race without operator intervention.
+            spdlog::info(
+                "RbacStore: migrate_from_sqlite: backfill_complete is set with a sourceless "
+                "source fingerprint (no real legacy data has been migrated for this fleet "
+                "yet) and this replica's own legacy db {} holds real content — proceeding "
+                "with a normal migration; success will promote the shared marker to this "
+                "replica's real fingerprint",
+                legacy_db_path.string());
+        } else if (*stored_fingerprint != *verify_fp) {
+            spdlog::error(
+                "RbacStore: migrate_from_sqlite: HOLDER-SIDE VERIFICATION FAILED — "
+                "backfill_complete is already set with a DIFFERENT recorded source "
+                "fingerprint ('{}') than this replica's own legacy db {} ('{}') — some "
+                "other replica's legacy data was migrated, not this one's "
+                "(docs/postgres-store-playbook.md anti-pattern 'Local source absence never "
+                "creates terminal migration state on its own', #2697). Refusing to silently "
+                "accept a completion this replica's roles/grants/groups were never part of "
+                "— see docs/ops-runbooks/rbac-store-backfill-recovery.md.",
+                *stored_fingerprint, legacy_db_path.string(), *verify_fp);
+            backfill_metric("failed");
+            return false;
+        } else {
+            spdlog::debug("RbacStore: migrate_from_sqlite already completed (fingerprint "
+                         "verified), skipping");
+            // governance re-review (Fable): retry the move-aside here too,
+            // not only on the fresh-migration path — a verified match
+            // means this IS the file a prior boot on this replica already
+            // migrated, and a once-failed move-aside (the only way it
+            // could still be here) deserves the same retry, or it re-
+            // verifies against this same file forever and never converges
+            // on the playbook's one-release retention policy.
+            // legacy_rbac_fingerprint() above opened and closed its own
+            // connection, so nothing holds this path open.
+            move_legacy_aside(legacy_db_path);
+            return true;
         }
     }
 

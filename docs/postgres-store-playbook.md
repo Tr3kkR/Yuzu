@@ -183,8 +183,19 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   boot that still finds it) and refuse to serve on a mismatch, rather than silently reporting
   success over a trail nobody streamed. `ManagementGroupStore` and `ResultSetStore` share the
   first-generation `if (!legacy_exists) → mark complete` shape this closes; porting the
-  holder-side check to them is tracked, not yet done (#2697 deferred this ladder-wide — the fix
-  landed for AuditStore only, as the mandatory-evidence case).
+  holder-side check to them is tracked, not yet done. `RbacStore` independently discovered and
+  fixed the identical shape (#2703, git-blamed to its original migration commit, not caught by
+  that migration's own governance pass or two rounds of external review — only surfaced by a
+  wider-scope adversarial review) — it is now a SECOND reference implementation, right-sized for
+  a small, non-resumable, single-transaction legacy dataset rather than `AuditStore`'s larger
+  resumable-streaming one. **Trap a future port hits if it works from this paragraph's prose
+  instead of the actual code:** `AuditStore::stamp_complete` has two exemptions this description
+  doesn't spell out and `RbacStore`'s own first port missed both — (1) a **sourceless** writer
+  losing the trust-anchor race is NOT an error (it has no evidence worth protecting, so whichever
+  writer's `"sourceless"` value won is fine); (2) a **real** writer's content that fingerprints as
+  having nothing to protect (an empty/schema-less local file) should trust the marker rather than
+  refuse. Port the REFERENCE CODE (`audit_store.cpp`'s `stamp_complete`, or `rbac_store.cpp`'s
+  post-#2703 version) and diff your port against it line by line — not this summary.
 - **Long-lived migration branches accumulate test-file drift against the pre-migration API —
   budget for it on every `dev`-merge, not just the first.** Any test file that constructs the
   store via its old constructor fails to compile once the branch merges current `origin/dev` —
@@ -220,7 +231,19 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   #2697) is the worked example: checking only statement status let a real backfill that lost this
   exact race report success while a different writer's value sat at the trust anchor — the same
   silent-discard shape as the `sqlite3_changes()` pitfall above, just on `ON CONFLICT DO NOTHING`
-  rather than a mutate-then-count.
+  rather than a mutate-then-count. **When "first writer wins" is too strict** — some values carry
+  no evidence worth protecting (a sourceless placeholder) or two writers can legitimately agree
+  (identical content from a shared volume) — plain `DO NOTHING` can't express that; use `DO
+  UPDATE ... WHERE <promotable-condition> RETURNING <col>` instead, and read success via
+  `PQntuples() == 1` (the WHERE matched: fresh insert, a promotion, or an already-equal value),
+  never `PQcmdTuples()` on a `DO UPDATE` (it reports rows affected by the WHOLE statement,
+  conflating "this row was promoted" with "this row already held my value" — both fine, but
+  neither is a `DO NOTHING`'s simple insert/no-op binary). `RbacStore::stamp_complete` (#2703) is
+  the worked example: a real fingerprint may promote a stored `"sourceless"` value; a stored real
+  value is never overwritten by anyone; a writer whose value already equals what's stored counts
+  as success rather than a spurious lost-race failure. Verify the exact upsert against a live
+  Postgres instance before shipping it — `ON CONFLICT ... DO UPDATE ... WHERE` semantics are easy
+  to get subtly wrong by reasoning alone.
 - A plaintext secret column. Use `SecretCodec` / verify-only hash.
 - A new server **SQLite** store (ADR-0006 forbids it without an exception ADR).
 - A `CREATE INDEX CONCURRENTLY` / `VACUUM` / `ALTER TYPE ADD VALUE` smuggled into a

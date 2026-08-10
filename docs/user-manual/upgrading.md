@@ -614,8 +614,18 @@ server `PgPool`).
   = 'false' WHERE key = 'rbac_enabled'`, or `'true'` if RBAC was genuinely
   enabled) before restarting.
 - The legacy `rbac.db` file is **moved aside** only after the backfill is
-  verified. It is never read again; keep the moved-aside copy until you have
-  confirmed RBAC behaves as expected, then remove it.
+  verified — but a once-failed move-aside can leave it in place, and in that
+  case it **is** read again: every subsequent boot that still finds it
+  fingerprints its content (a SHA-256 content hash, stamped alongside the
+  completion marker) and re-verifies it against what was actually migrated,
+  refusing to boot rather than silently trust a marker this replica's own
+  file was never proven part of. This closes a multi-replica anti-pattern
+  (a fileless replica could otherwise foreclose migration for a sibling
+  genuinely holding the real file) but means an operator on a mixed-fleet
+  first boot or a retained legacy file may see one of two distinct refusals
+  — `docs/ops-runbooks/rbac-store-backfill-recovery.md` covers both and how
+  to tell them apart. Keep the moved-aside copy until you have confirmed
+  RBAC behaves as expected, then remove it.
 
 **What to expect / do:**
 
