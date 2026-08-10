@@ -4373,8 +4373,8 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
         // publish()'s pin-full LRU branch, which is what actually increments this
         // counter (#2795's acceptance criteria named this assertion explicitly).
         // Not a claim that the ring branch can never fire from a LATER event on
-        // this same session (docs/mcp-server.md's admission table says it can) —
-        // only that THIS reclaim, here, does not reach it.
+        // this same session (docs/mcp-server.md's "Terminal durability" prose
+        // says it can) — only that THIS reclaim, here, does not reach it.
         out.ring_displaced = fx.reg.counter("yuzu_mcp_stream_pin_displaced_total").value();
         out.audits = fx.audit_count("mcp.bridge.pin_displaced_for_admission");
         // POSITIVELY confirm the over-admission rather than inferring it from the absence
