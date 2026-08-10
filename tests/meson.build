@@ -907,6 +907,29 @@ test('prometheus harness selftest',
   timeout: 30,
 )
 
+# Audit-retention alert coverage manifest gate (#2854 rung B). Same
+# SKIP-vs-FAIL contract as the entry above -- no CI leg here sets
+# YUZU_TEST_ENABLE_PROMTOOL_DOCKER and none carries a 3.x native promtool, so
+# the realistic local/CI-matrix outcome is SKIP (77); the authoritative run is
+# the docs-lint.yml `prometheus-rules` job, which does set the opt-in.
+# Timeout matches the workflow step's own budget for the same work.
+test('audit retention alert coverage manifest',
+  _python3_test,
+  args: [files('prometheus/blind_band_sweep.py'), '--check'],
+  suite: 'docs',
+  timeout: 900,
+)
+
+# Pure-logic selftest for the sweep (cycles_for, the seconds-resolution grid,
+# extract()'s present/absent handling, the manifest compare()). No promtool,
+# no docker, no network.
+test('audit retention coverage sweep selftest',
+  _python3_test,
+  args: [files('prometheus/blind_band_sweep.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Tracker close-automation regression corpus (ADR-3001 A1 §11-§12): the frozen
 # parser fixtures (incl. PR #1711, the canonical negated close) + the decision
 # ladder's never-close/fail-closed/cap contracts. No network. scripts/ changes
