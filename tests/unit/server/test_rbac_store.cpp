@@ -11,7 +11,9 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "rbac_generation_rules.hpp"
 #include "rbac_store.hpp"
+#include "sqlite_raii.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -366,6 +368,20 @@ TEST_CASE("RbacStore: remove permission upserts an explicit deny (survives a res
                     .ok());
     }
     CHECK_FALSE(store.check_role_has_permission("TestRole", "Tag", "Write"));
+}
+
+// quality-engineer (#2703): remove_permission() now upserts via set_permission,
+// so it inherits set_permission's FK checks on all three columns
+// (role_permissions.role_name/securable_type/operation each REFERENCE a
+// catalogue table) — an unrecognized triple must fail, not silently
+// "succeed" by upserting a deny row nothing can ever match.
+TEST_CASE("RbacStore: remove permission on an unrecognized triple fails", "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    CHECK_FALSE(store.remove_permission("NoSuchRole", "Tag", "Read").has_value());
+
+    store.create_role({"TestRole", "", false, 0});
+    CHECK_FALSE(store.remove_permission("TestRole", "NoSuchType", "Read").has_value());
+    CHECK_FALSE(store.remove_permission("TestRole", "Tag", "NoSuchOp").has_value());
 }
 
 TEST_CASE("RbacStore: deleting role cascades permissions", "[rbac_store][pg]") {
@@ -1150,6 +1166,25 @@ TEST_CASE("RbacStore: a revoke invalidates a cached allow (generation token)",
     CHECK_FALSE(store.check_permission("cacheuser", "Execution", "Execute"));
 }
 
+// quality-engineer (#2703): the F3 staleness predicate, pinned with synthetic
+// timestamps — no DB, no real clock. rbac_generation_rules.hpp.
+TEST_CASE("rbac_generation::is_stale_beyond_bound", "[rbac_store]") {
+    using yuzu::server::rbac_generation::is_stale_beyond_bound;
+
+    // Fresh: last success just now, bound not yet reached.
+    CHECK_FALSE(is_stale_beyond_bound(/*now_ms=*/1000, /*last_successful_refresh_ms=*/1000,
+                                       /*bound_ms=*/1000));
+    CHECK_FALSE(is_stale_beyond_bound(1500, 1000, 1000));
+    // Exactly at the bound counts as stale (>=, not >).
+    CHECK(is_stale_beyond_bound(2000, 1000, 1000));
+    // Past the bound.
+    CHECK(is_stale_beyond_bound(5000, 1000, 1000));
+    // A refresh that has never succeeded (last_successful_refresh_ms_ still at
+    // its zero-init) is stale from the first ms once the bound has elapsed.
+    CHECK(is_stale_beyond_bound(1000, 0, 1000));
+    CHECK_FALSE(is_stale_beyond_bound(999, 0, 1000));
+}
+
 // R2 (Gate 4 unhappy, CONFIRMED fail-open): the backfill must preserve an
 // operator's edit to a SEEDED system-role permission (e.g. flipping a default
 // 'allow' to 'deny'), which collides on the (role,type,op) key with the seed.
@@ -1164,13 +1199,14 @@ TEST_CASE("RbacStore: backfill preserves an operator's deny-override on a seeded
     make_legacy_rbac_db(legacy.path, /*enabled=*/false);
     // The operator had revoked Viewer's AuditLog/Read in the legacy DB (deny).
     {
-        sqlite3* db = nullptr;
-        REQUIRE(sqlite3_open(legacy.path.string().c_str(), &db) == SQLITE_OK);
-        REQUIRE(sqlite3_exec(db,
+        // cpp-safety (Gate 3, #2703): RAII throughout — see the F1 test below
+        // for the same fix and rationale.
+        SqliteDb db;
+        REQUIRE(sqlite3_open(legacy.path.string().c_str(), db.addr()) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(db.get(),
                              "INSERT INTO role_permissions VALUES "
                              "('Viewer','AuditLog','Read','deny');",
                              nullptr, nullptr, nullptr) == SQLITE_OK);
-        sqlite3_close(db);
     }
     REQUIRE(store.migrate_from_sqlite(legacy.path));
     // The legacy 'deny' must win over the seeded 'allow' (DO UPDATE, not DO NOTHING).
@@ -1203,17 +1239,19 @@ TEST_CASE("RbacStore: backfill deletes a seeded default permission the operator 
     std::filesystem::remove(legacy.path);
     make_legacy_rbac_db(legacy.path, /*enabled=*/false);
     {
-        sqlite3* db = nullptr;
-        REQUIRE(sqlite3_open(legacy.path.string().c_str(), &db) == SQLITE_OK);
+        // cpp-safety (Gate 3, #2703): RAII throughout, matching production
+        // migrate_from_sqlite's own SqliteDb usage — a REQUIRE failure
+        // between open and close must not leak the handle.
+        SqliteDb db;
+        REQUIRE(sqlite3_open(legacy.path.string().c_str(), db.addr()) == SQLITE_OK);
         // Legacy KNOWS about role "Viewer" and securable_type "AuditLog"
         // (both existed pre-upgrade) — this is exactly what scopes the
         // delete. Deliberately NO ('Viewer','AuditLog','Read') row: the
         // operator called remove_permission() to revoke it before upgrading.
-        REQUIRE(sqlite3_exec(db,
+        REQUIRE(sqlite3_exec(db.get(),
                              "INSERT INTO roles VALUES ('Viewer', 'seeded', 1, 0);"
                              "INSERT INTO securable_types VALUES ('AuditLog', '', 1);",
                              nullptr, nullptr, nullptr) == SQLITE_OK);
-        sqlite3_close(db);
     }
     REQUIRE(store.migrate_from_sqlite(legacy.path));
 

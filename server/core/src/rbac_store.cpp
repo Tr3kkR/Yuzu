@@ -6,6 +6,7 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "rbac_generation_rules.hpp"
 #include "sqlite_raii.hpp"
 #include "utf8_sanitize.hpp"
 
@@ -572,9 +573,12 @@ bool RbacStore::load_enabled_flag() {
 void RbacStore::maybe_refresh_generation() const {
     if (!open_)
         return;
+    bool gated = false;
+    bool beyond_bound = false;
     {
         std::lock_guard lock(cache_mtx_);
-        if ((now_ms() - refresh_started_ms_) < kRbacGenerationRefreshMs) {
+        gated = (now_ms() - refresh_started_ms_) < kRbacGenerationRefreshMs;
+        if (gated) {
             // fjarvis F3 (#2703): a refresh recently started (or is still in
             // flight) elsewhere, so THIS thread must not also fire a query —
             // that's the stampede this gate exists to prevent. But "someone
@@ -585,28 +589,45 @@ void RbacStore::maybe_refresh_generation() const {
             // refresh under load is COUNTED rather than silently trusted: the
             // accepted ~kRbacGenerationRefreshMs bound stays honest instead of
             // being falsified by whichever thread happens to check first.
-            if ((now_ms() - last_successful_refresh_ms_) >= kRbacGenerationRefreshMs) {
-                static DegradeSampler sampler;
-                if (note_read_degrade(metrics_, kReasonStaleBeyondBound, sampler))
-                    spdlog::warn(
-                        "RbacStore: cache read while a generation refresh is in flight AND "
-                        "already past the accepted {}ms staleness bound — serving the "
-                        "pre-refresh cache regardless (no cache to fail over to); this "
-                        "replica's rbac view may be stale beyond the accepted bound",
-                        kRbacGenerationRefreshMs);
-            }
-            return;
+            // Computed here (still under the lock, a plain read of another
+            // `mutable` member) but the degrade FIRES after the lock is
+            // released — see below.
+            beyond_bound = rbac_generation::is_stale_beyond_bound(
+                now_ms(), last_successful_refresh_ms_, kRbacGenerationRefreshMs);
+        } else {
+            // Claim the refresh for THIS thread by advancing refresh_started_ms_
+            // ATOMICALLY under the SAME lock as the gate check above (Gate 3
+            // perf — this is what makes exactly one thread win per interval).
+            // Otherwise every concurrent authz thread that crosses the interval
+            // boundary at once fires the SELECT + grabs a pool lease — an N-way
+            // refresh stampede once per interval under load, competing with
+            // real permission queries. NOT last_successful_refresh_ms_ — that
+            // one earns its update on actual completion, below.
+            refresh_started_ms_ = now_ms();
         }
-        // Claim the refresh for THIS thread by advancing refresh_started_ms_
-        // inside the gate before releasing the lock (Gate 3 perf). Otherwise
-        // every concurrent authz thread that crosses the interval boundary at
-        // once fires the SELECT + grabs a pool lease — an N-way refresh
-        // stampede once per interval under load, competing with real
-        // permission queries. Now exactly one thread refreshes per interval;
-        // the rest see the fresh started-stamp and return (fjarvis F3: NOT
-        // last_successful_refresh_ms_ — that one earns its update on actual
-        // completion, below).
-        refresh_started_ms_ = now_ms();
+    }
+    if (gated) {
+        // performance (Gate 3, #2703): note_read_degrade()'s metrics-counter
+        // call acquires MetricsRegistry's own multi-level lock chain and can
+        // block for the duration of a Prometheus scrape (`serialize()` holds
+        // the same registry lock). This branch is reachable by EVERY losing
+        // thread on the fast/early-return path, not just the one thread per
+        // interval that wins the refresh — so it must NOT run while holding
+        // `cache_mtx_`, the sole authz-check serialization point, or a scrape
+        // colliding with a degraded window could stall every check_permission
+        // fleet-wide. Matches the existing pattern at check_permission's
+        // pool-timeout branch (note_read_degrade called outside any lock).
+        if (beyond_bound) {
+            static DegradeSampler sampler;
+            if (note_read_degrade(metrics_, kReasonStaleBeyondBound, sampler))
+                spdlog::warn(
+                    "RbacStore: cache read while a generation refresh is in flight AND "
+                    "already past the accepted {}ms staleness bound — serving the "
+                    "pre-refresh cache regardless (no cache to fail over to); this "
+                    "replica's rbac view may be stale beyond the accepted bound",
+                    kRbacGenerationRefreshMs);
+        }
+        return;
     }
     // Read the durable generation + enabled flag WITHOUT holding cache_mtx_.
     std::optional<std::uint64_t> durable_gen;

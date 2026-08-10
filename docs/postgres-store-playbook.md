@@ -260,6 +260,17 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   already-available `pool.with_txn` + `pg::PgTxn` RAII guard before a second review round caught
   it. `SoftwareLicensingStore::count_stale_agents` is the clean reference implementation of the
   correct shape.
+- A hard `DELETE` to revoke a row that an unconditional reseed pass (a `seed_defaults()`-style
+  step re-run on every construction, `ON CONFLICT DO NOTHING`) can silently reinsert. A deleted
+  row leaves nothing for the reseed's conflict target to match, so the very next restart
+  resurrects the seeded default — the operator's revocation is undone on ordinary
+  restart/redeploy, no attacker required. `RbacStore::remove_permission` (#2703, fjarvis) is the
+  reference case: it now upserts an explicit `deny` row instead of deleting, so the reseed's `ON
+  CONFLICT DO NOTHING` correctly no-ops against the existing row. The authorization OUTCOME is
+  identical either way (no matching allow → deny); only the row's presence changes, from absent to
+  an explicit, durable tombstone of the revocation. Any store with the same shape — a seed pass
+  that reruns unconditionally, plus an operator-facing "remove this" operation — needs the same
+  tombstone-via-deny (or equivalent explicit-marker) treatment, not a bare `DELETE`.
 
 ## Non-transactional migrations (the deferred kind)
 
