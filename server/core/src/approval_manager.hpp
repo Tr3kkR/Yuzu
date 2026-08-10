@@ -200,7 +200,12 @@ struct ConsumeError {
     std::string message;
     /// `sqlite3_extended_errcode()` for a `kStoreError` produced by a SQLite
     /// read/write failure; 0 otherwise (store not open, missing argument, a
-    /// throwing precondition). See `is_permanent_sqlite_error` (#2786).
+    /// throwing precondition). See `is_permanent_sqlite_error` (#2786). The 0
+    /// default is safe for those non-SQLite producers specifically because
+    /// `approval_store_error_body`'s permanent-arm check is `!is_open() ||
+    /// is_permanent_sqlite_error(extended_errcode)` — the `is_open()` disjunct
+    /// alone correctly classifies the store-not-open case, and the others
+    /// never reach that body at all (they deny before any store call).
     int extended_errcode = 0;
     /// True ONLY when the #2442 cross-surface origin check's own read
     /// (`get_checked` inside `consume_ticket`) is the thing that faulted —

@@ -569,12 +569,18 @@ ApprovalManager::get_checked(const std::string& id) const {
     // A read that FAILED is not a read that found nothing. Collapsing the two
     // is what let a store error be reported to the operator as "this one-time
     // capability is spent" — see the pre-consume path in consume_ticket.
-    // sqlite3_extended_errcode read BEFORE finalize — finalize can reset it.
+    //
+    // Only the primitive `int` is captured before `sqlite3_finalize` — the
+    // throw-capable std::string build is deferred until after, matching this
+    // file's own CAS-site convention (finalize doesn't clear a connection's
+    // error state; `sqlite3_errmsg`/`sqlite3_extended_errcode` read the same
+    // before or after). A std::string built ahead of finalize would leak
+    // `stmt` on a bad_alloc between the two.
     if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
         const int extended = sqlite3_extended_errcode(db_);
-        const std::string msg = std::string("read failed: ") + sqlite3_errmsg(db_);
         sqlite3_finalize(stmt);
-        return std::unexpected(StoreReadError{msg, extended});
+        return std::unexpected(
+            StoreReadError{std::string("read failed: ") + sqlite3_errmsg(db_), extended});
     }
     sqlite3_finalize(stmt);
     return out;
@@ -667,6 +673,17 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     //
     // Runs BEFORE the precondition block because that block is conditional —
     // a caller supplying no precondition must not skip this.
+    //
+    // TEST DEPENDENCY: with no precondition supplied (today's only production
+    // caller, the MCP recall), this is the 2nd top-level SELECT this call
+    // issues against the store — the 1st is the caller's own pre-consume
+    // lookup (e.g. mcp_server.cpp's rung-1 get_checked). The MCP integration
+    // test "a store fault AT the origin check masks a foreign-origin ticket's
+    // kind" isolates a fault to THIS read specifically via a countdown
+    // `sqlite3_set_authorizer` that lets the 1st SELECT through and denies
+    // the 2nd. A future read added between the caller's lookup and this one
+    // (on the same connection) would shift that test onto the wrong read
+    // without it failing loudly — update the countdown if you add one.
     {
         auto row = get_checked(id); // takes mtx_ itself — must be outside any lock
         if (!row) {

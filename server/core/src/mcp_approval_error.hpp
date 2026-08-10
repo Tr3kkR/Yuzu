@@ -22,8 +22,9 @@ namespace yuzu::server::mcp {
 /// an audit row, so a degraded approval store turns into an audit-write loop
 /// on the substrate already failing to serve it.
 ///
-/// Permanent has TWO discriminators, both required: `!mgr.is_open()` (a null
-/// handle does not recover without an operator restarting the server) OR
+/// Permanent has TWO independent discriminators — either alone classifies the
+/// failure permanent: `!mgr.is_open()` (a null handle does not recover
+/// without an operator restarting the server), or
 /// `is_permanent_sqlite_error(extended_errcode)` (an OPEN handle whose reads
 /// fail permanently — CORRUPT, NOTADB, READONLY, FULL; #2786 "PR 1c"). The
 /// caller passes `extended_errcode` rather than this function defaulting it,

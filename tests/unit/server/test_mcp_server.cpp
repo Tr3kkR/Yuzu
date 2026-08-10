@@ -7166,6 +7166,100 @@ TEST_CASE("MCP approval recall: a store fault at the lookup rung is a retryable 
     CHECK(tags.get_tag("agent-1", "role").empty());
 }
 
+TEST_CASE("MCP approval masked-denial counter: accumulates per refusal and stays "
+          "per-tool, not a shared/latched series",
+          "[mcp][integration][approval][security]") {
+    // Governance quality-engineer finding: prior tests only ever checked the
+    // masked counter at 0.0 or 1.0, which a "set to 1" mutant would survive,
+    // and only ever exercised a single tool, which a mislabeled-series mutant
+    // would survive. This test drives TWO refusals for the SAME tool (proving
+    // accumulation, not a latch) and one refusal for a DIFFERENT tool (proving
+    // the `tool` label actually separates the series rather than sharing one).
+    yuzu::test::TempDbFile tagdb{std::string_view{"yuzu_test_mcp_tag_"}};
+    yuzu::server::TagStore tags(tagdb.path);
+    tags.set_tag("agent-1", "role", "web", "server");
+
+    yuzu::test::TempDbFile qdb{std::string_view{"yuzu_test_mcp_quar_"}};
+    yuzu::server::QuarantineStore quar(qdb.path);
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.quarantine_store_for_test = &quar;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("supervised"); // both delete_tag and quarantine_device are approval-gated here
+
+    auto mint_delete = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":260,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+    std::string delete_id =
+        nlohmann::json::parse(mint_delete->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!delete_id.empty());
+    REQUIRE(appr.approve(delete_id, "reviewer-bob", "ok"));
+
+    auto mint_quar = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":261,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-1"}}})");
+    std::string quar_id =
+        nlohmann::json::parse(mint_quar->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!quar_id.empty());
+    REQUIRE(appr.approve(quar_id, "reviewer-bob", "ok"));
+
+    std::string recall_delete = R"({"jsonrpc":"2.0","method":"tools/call","id":262,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":")" +
+                                delete_id + R"("}}})";
+    std::string recall_quar = R"({"jsonrpc":"2.0","method":"tools/call","id":263,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-1","approval_id":")" +
+                              quar_id + R"("}}})";
+
+    // Reversible: BEGIN + DROP TABLE + ROLLBACK, same technique as the lookup-
+    // fault test above — masks EVERY recall's lookup rung regardless of which
+    // tool or ticket it names.
+    REQUIRE(sqlite3_exec(conn.h, "BEGIN;", nullptr, nullptr, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(conn.h, "DROP TABLE approvals;", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    ts.call(recall_delete);
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
+              .value() == 1.0);
+
+    // Second refusal for the SAME tool: the counter must ACCUMULATE, not
+    // latch at 1 — a mutant that sets-to-1 instead of increments survives an
+    // assertion that only ever checks 0 vs 1.
+    ts.call(recall_delete);
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
+              .value() == 2.0);
+
+    // A refusal for a DIFFERENT tool must land on its OWN series — a mutant
+    // that dropped the `tool` label (or hardcoded one) would make this bump
+    // delete_tag's counter to 3, or leave quarantine_device's at 0.
+    ts.call(recall_quar);
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "quarantine_device"}})
+              .value() == 1.0);
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
+              .value() == 2.0); // unchanged by the quarantine_device refusal
+
+    REQUIRE(sqlite3_exec(conn.h, "ROLLBACK;", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    // Both original tickets survive the fault.
+    CHECK(write_tool_payload(ts.call(recall_delete))["deleted"] == true);
+}
+
 TEST_CASE("MCP approval recall: a genuinely absent ticket stays -32003, not -32603",
           "[mcp][integration][approval][security]") {
     yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
