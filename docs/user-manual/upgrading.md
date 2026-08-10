@@ -623,6 +623,17 @@ server `PgPool`).
   roles / grants / groups will see a longer first-boot while the backfill
   streams; this is one-time. Budget for it in the maintenance window and do not
   kill the server mid-backfill (it is resumable, but let it finish).
+- **Routine (not just one-time) boot-time cost, every deployment.** Every
+  server boot's `seed_defaults()` reseed now coordinates its built-in-default
+  grants against any concurrent revoke via a cluster-wide advisory lock
+  (closes a rare Postgres race where a revoked permission could otherwise be
+  silently resurrected mid-boot). This adds a small, ordinarily negligible
+  amount of boot time on every restart, not just first boot — but if you
+  bulk-restart or scale out MANY replicas of the same RBAC-on-Postgres
+  deployment **simultaneously**, their reseed passes serialize against each
+  other and against any in-flight legacy backfill, which can add up at large
+  replica counts. Prefer a rolling (not all-at-once) restart/redeploy
+  strategy for this reason, as you likely already do for other reasons.
 - **Reads now FAIL CLOSED (deny-on-degrade).** A degraded or unreachable
   `rbac_store` (pool-acquire timeout, query error) now **denies** authorization
   rather than falling through to an allow — this **closes** the prior

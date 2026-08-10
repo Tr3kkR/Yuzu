@@ -2349,19 +2349,33 @@ helper, never by any authorization-decision code path — so `seed_defaults()`'s
 unconditional every-boot reseed cannot silently resurrect the revoked default
 without ever making it a real authorization fact again. This mirrors
 `remove_permission()`'s own permanent mechanism for the identical hazard
-beyond the one-time cutover. Two earlier versions of this fix each
-reintroduced a hazard, both caught by Gate 4 review before merge: a plain
-`DELETE` with no marker resurrects on the very next restart (verified
-empirically — a second `RbacStore` construction against the same database
-brought the revoked permission back); an `effect='deny'` tombstone avoids
-that but is a REAL authorization fact — `check_permission()` /
-`check_scoped_permission()` / `authorize_list_read()` all apply "deny
-overrides everything, across ALL of a principal's held roles" (pre-existing,
-identical in the legacy store), so the tombstone silently changed the
-authorization OUTCOME for any principal holding a second role that
-independently grants the same permission — on both the global and the
-management-group-scoped read paths (verified empirically both ways).
-Reconciliation counts roles + grants + groups +
+beyond the one-time cutover. THREE earlier versions of this fix each
+reintroduced a hazard, all caught by governance before merge (none ever
+pushed to `origin`): a plain `DELETE` with no marker resurrects on the very
+next restart (verified empirically — a second `RbacStore` construction
+against the same database brought the revoked permission back); an
+`effect='deny'` tombstone avoids that but is a REAL authorization fact —
+`check_permission()` / `check_scoped_permission()` / `authorize_list_read()`
+all apply "deny overrides everything, across ALL of a principal's held
+roles" (pre-existing, identical in the legacy store), so the tombstone
+silently changed the authorization OUTCOME for any principal holding a
+second role that independently grants the same permission — on both the
+global and the management-group-scoped read paths (verified empirically
+both ways); the DELETE+marker design that fixes both has its own
+concurrency hazard (**CHAOS-1**) — `seed_defaults()`'s `grant()` fixes its
+READ COMMITTED snapshot at statement start, so if a concurrent revoke's
+marker-insert commits WHILE `grant()` is blocked on the `ON CONFLICT`
+arbiter waiting for that same revoke's uncommitted `DELETE`, Postgres only
+re-checks the conflict target after unblocking — never the `WHERE NOT
+EXISTS` subquery — and `grant()`'s already-computed row lands anyway,
+resurrecting the permission with the marker present but ineffective. Most
+likely during a fleet-wide rolling restart (many replicas' `seed_defaults()`
+calls racing another replica's one-time backfill). Closed with a
+`pg_advisory_xact_lock`, acquired in its own statement strictly BEFORE the
+check-and-mutate statement, in an explicit transaction, in all three writers
+(`grant()`, `remove_permission()`, the backfill's own revoke step) —
+verified empirically with two real Postgres connections, and safe for any
+replica boot ordering. Reconciliation counts roles + grants + groups +
 members and refuses the completion marker on any shortfall (fail-closed →
 refuse boot, retry next start). **The `rbac_enabled` flag is migrated first
 and read-back-verified** before the store is considered open (losing it is

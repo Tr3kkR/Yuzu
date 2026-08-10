@@ -2461,6 +2461,26 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
             }
             return true;
         };
+        // sre (Gate 6, #2703, MEDIUM — lock-ordering inversion): must be the
+        // FIRST statement in this transaction, before this loop's R2 upsert
+        // below ever touches a role_permissions row. grant() and
+        // remove_permission() both acquire this SAME lock before touching
+        // role_permissions; acquiring it here only at the F1 block further
+        // down (after the R2 upsert already holds row locks) would let this
+        // transaction hold row locks while WANTING the advisory lock, at the
+        // same time a concurrent grant()/remove_permission() holds the
+        // advisory lock while WANTING one of those row locks — a genuine
+        // wait-for cycle. Postgres's deadlock detector resolves that (never
+        // hangs), but consistent "lock strictly first, everywhere" avoids
+        // manufacturing an avoidable deadlock at all.
+        {
+            pg::PgResult lk = pg::exec_params(c, kRevokeCoordLockSql, std::vector<std::string>{});
+            if (lk.status() != PGRES_TUPLES_OK) {
+                spdlog::error("RbacStore: migrate_from_sqlite: revoke-coordination lock failed: {}",
+                             PQerrorMessage(c));
+                return false;
+            }
+        }
         for (const auto& t : types)
             if (!run("INSERT INTO rbac_store.securable_types (name, description, is_system) "
                      "VALUES ($1, $2, $3::boolean) ON CONFLICT (name) DO NOTHING",
@@ -2574,18 +2594,14 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                     out.push_back(s);
                 return out;
             };
-            // chaos-injector (Gate 5, #2703, HIGH — CHAOS-1): must be its own
-            // statement, strictly BEFORE the CTE below — see
-            // kRevokeCoordLockSql's comment. Serializes this bulk revoke
-            // against a concurrent seed_defaults() grant() or
-            // remove_permission() call on another connection/replica for any
-            // of the triples this CTE is about to touch.
-            pg::PgResult lk = pg::exec_params(c, kRevokeCoordLockSql, std::vector<std::string>{});
-            if (lk.status() != PGRES_TUPLES_OK) {
-                spdlog::error("RbacStore: migrate_from_sqlite: revoke-coordination lock failed: {}",
-                             PQerrorMessage(c));
-                return false;
-            }
+            // chaos-injector (Gate 5, #2703, HIGH — CHAOS-1) + sre (Gate 6,
+            // MEDIUM — lock ordering): kRevokeCoordLockSql is already held,
+            // acquired as the FIRST statement of this transaction (see the
+            // top of this with_txn_for callback) — strictly before the R2
+            // upsert above ever touches a role_permissions row, so this
+            // transaction never holds a row lock while wanting the advisory
+            // lock (the exact shape that could deadlock against a concurrent
+            // grant()/remove_permission()). No re-acquisition needed here.
             pg::PgResult revoked = pg::exec_params(
                 c,
                 "WITH revoked AS ("

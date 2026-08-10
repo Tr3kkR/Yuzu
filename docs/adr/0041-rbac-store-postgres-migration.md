@@ -111,15 +111,29 @@ revocation is recorded SEPARATELY, as pure reseed-suppression bookkeeping in a d
 authorization-decision code path — so the idempotent every-boot reseed cannot silently resurrect it
 without the deleted row ever becoming a real authorization fact again. This mirrors
 `remove_permission()`'s own permanent mechanism for the identical hazard beyond the one-time cutover
-(fjarvis #2703 F1). Two earlier versions of this fix each reintroduced a hazard, both caught by Gate
-4 review before merge: a plain DELETE with no marker resurrects on the very next restart (the
-idempotent reseed has nothing left to suppress it); an `effect='deny'` tombstone avoids that but is
-a REAL authorization fact — `check_permission()`/`check_scoped_permission()`/`authorize_list_read()`
-all apply "deny overrides everything, across ALL of a principal's held roles" (pre-existing,
-identical in the legacy store), so the tombstone silently changed the OUTCOME for any principal
-holding a second role that independently grants the same permission, on both the global and the
-management-group-scoped read paths. The `revoked_seed_defaults` table closes both: absence on the
-read path restores exact legacy semantics, and the marker survives every future reseed.
+(fjarvis #2703 F1). THREE earlier versions of this fix each reintroduced a hazard, all caught by
+governance before merge (none ever pushed to `origin`): a plain DELETE with no marker resurrects on
+the very next restart (the idempotent reseed has nothing left to suppress it); an `effect='deny'`
+tombstone avoids that but is a REAL authorization fact — `check_permission()`/
+`check_scoped_permission()`/`authorize_list_read()` all apply "deny overrides everything, across ALL
+of a principal's held roles" (pre-existing, identical in the legacy store), so the tombstone
+silently changed the OUTCOME for any principal holding a second role that independently grants the
+same permission, on both the global and the management-group-scoped read paths; the DELETE+marker
+design that fixes both of those has its own concurrency hazard (CHAOS-1, found by chaos-injector
+governance) — `seed_defaults()`'s grant() (`INSERT ... WHERE NOT EXISTS(marker) ... ON CONFLICT DO
+NOTHING`) fixes its READ COMMITTED snapshot at statement start; if that snapshot predates a
+concurrent revoke's marker commit, but grant() then blocks on the `ON CONFLICT` arbiter waiting for
+that revoke's uncommitted DELETE, Postgres only re-checks the conflict target after unblocking —
+never the `WHERE NOT EXISTS` subquery — so grant()'s already-computed row lands anyway once the
+revoke commits, resurrecting the permission with the marker present but ineffective. Most likely to
+fire during a fleet-wide rolling restart, where many replicas' `seed_defaults()` calls run
+concurrently with another replica's one-time backfill. Closed with a `pg_advisory_xact_lock`,
+acquired in its own statement strictly BEFORE the check-and-mutate statement, in an explicit
+transaction, in all three writers (`grant()`, `remove_permission()`, the backfill's own revoke
+step) — verified empirically with two real Postgres connections. The `revoked_seed_defaults` table
+plus this lock close all three: absence on the read path restores exact legacy semantics, the
+marker survives every future reseed, and the lock makes the marker-then-reseed sequencing safe
+under concurrent writers.
 
 **The `rbac_enabled` flag is the single most dangerous row to lose.** If an operator ENABLED RBAC
 and the flag is not carried across, the fleet silently boots RBAC-**off** — every confined
