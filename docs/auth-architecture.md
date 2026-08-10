@@ -1918,18 +1918,25 @@ this section does not restate them.
   exist. On the human arm, with several independent in-flight rotations
   possible per principal, that loop matches the *first* linked row it finds,
   not necessarily the one belonging to the predecessor actually rotated.
-  Reproduced end-to-end against live Postgres by two specialists (round-3
-  review): rotating token A then token B (same owner) inside A's overlap
-  window returned **B's raw secret paired with A's successor `token_id`** —
-  confirming that id would have revoked A while B, the token whose secret
-  the caller actually held, stayed live and unconfirmed. Fixed by extracting
-  the derivation into one shared,
-  DB-free, unit-testable seam — `derive_rotation_successor`
+  Reproduced end-to-end against live Postgres by **three** independent
+  reviewers with different briefs (round-3 review): `consistency-auditor`
+  and `security-guardian` each returned their own empirical reproduction
+  first; `architect` then returned a third, independent reproduction of the
+  same defect, plus the ruling that the fix belonged at a shared seam rather
+  than as a patched inline loop. Rotating token A then token B (same owner)
+  inside A's overlap window returned **B's raw secret paired with A's
+  successor `token_id`** — confirming that id would have revoked A while B,
+  the token whose secret the caller actually held, stayed live and
+  unconfirmed. Fixed by extracting the derivation into one shared, DB-free,
+  unit-testable seam — `derive_rotation_successor`
   (`server/core/src/token_rotation_lookup.hpp`) — scoped exactly to the
   predecessor's own `supersedes_token_id`, so both the REST route today and
   the MCP twin landing separately call the SAME function rather than
   re-deriving their own copy. A second inline copy is exactly the drift that
-  produced the bug the first time.
+  produced the bug the first time; the seam extraction itself is the
+  evidence the third review's ruling was acted on — an inline patch on the
+  REST route would have been the cheaper change and was explicitly
+  rejected.
 - **Self-service only, enforced at the store seam — not merely the route.**
   Both `rotate_token` and `confirm_token_rotation` reject unless
   `requesting_user` equals the resolved token row's own `principal_id`,

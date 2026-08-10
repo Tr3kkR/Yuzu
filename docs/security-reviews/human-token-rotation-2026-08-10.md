@@ -58,9 +58,15 @@ decision below for why the two cannot share one invariant.
   row can exist. On the human arm, with several independent in-flight
   rotations possible per principal, the copied loop matched the *first*
   linked row, not necessarily the one belonging to the predecessor actually
-  rotated. **Two specialists independently reproduced this end-to-end
-  against live Postgres**: rotating token A then token B (same owner) inside
-  A's overlap window returned B's raw secret paired with A's successor
+  rotated. **Three independent reviewers, with different briefs, each
+  reproduced this end-to-end against live Postgres.** `consistency-auditor`
+  and `security-guardian` each returned their own empirical reproduction
+  first; `architect` then returned a third, independent reproduction of the
+  same defect — and the ruling that the fix belonged at a shared seam, not
+  as a patched inline loop, which is why `derive_rotation_successor` exists
+  at all rather than a corrected copy of the original loop. The
+  reproduction: rotating token A then token B (same owner) inside A's
+  overlap window returned B's raw secret paired with A's successor
   `token_id` — confirming that id would have revoked A while B, the token
   whose secret the caller actually held, stayed live and unconfirmed. Fixed
   (`c1325015`) by extracting the derivation into one shared, DB-free,
@@ -68,7 +74,10 @@ decision below for why the two cannot share one invariant.
   (`token_rotation_lookup.hpp`) — so the REST route today and the MCP twin
   landing separately both call the same function. A second inline copy of
   this loop is exactly the drift that produced the bug the first time; see
-  the header's own doc comment for the full reproduction writeup.
+  the header's own doc comment for the full reproduction writeup. The seam
+  extraction is itself the evidence the architectural ruling was acted on
+  — an inline fix on the REST route would have been the cheaper change and
+  was explicitly rejected in favour of the shared seam.
 - **Ownership is enforced at the store seam, not merely at the route.**
   `rotate_token`/`confirm_token_rotation` reject unless `requesting_user`
   equals the resolved token row's own `principal_id` — checked in a
@@ -194,6 +203,31 @@ decision is not re-litigated or silently re-broken when that piece lands.
 The REST routes documented above gate on the existing `ApiToken:Write`
 only, as designed for a self-service human surface, and are not implicated
 by this finding.
+
+**Detection mechanism — the part with lasting value for future audits of
+this kind of gate.** Two specialists found this independently, and neither
+found it by reading the diff. The proposed change was a **single line**
+(the new `operator`-tier allowance on the shared `ApiToken:Write`
+predicate) that read correctly in its own context — nothing about the diff
+itself signalled the cross-transport consequence. Both reviewers instead
+built a **compiled before/after probe of the tier predicate itself**,
+rather than trusting a source read: one ran an **exhaustive 5 tiers × 23
+securables × 8 operations (920-cell) sweep** comparing the predicate's
+output before and after the proposed change, and proved that **exactly two
+cells changed** — the direct evidence that the allowance was not as narrow
+as its diff line suggested. The existing test suite was, and remains,
+green throughout — not because the gate is safe, but because **nothing in
+the suite exercises this predicate from the REST transport**; the suite's
+greenness was never evidence against this class of defect, and citing "the
+suite is green" as reassurance for a shared cross-transport securable
+predicate would have been exactly wrong here. The generalizable lesson:
+**a securable-scoped permission predicate consulted by a shared
+cross-transport chokepoint (REST and MCP admitting through the same
+`(securable, operation)` check) cannot be safety-reviewed by reading the
+change that touches it** — it has to be reviewed by exhaustively comparing
+its own before/after behaviour across the full grant surface it governs,
+because the blast radius lives in what the predicate is *shared with*, not
+in the lines that changed.
 
 ## Follow-up issues filed (pre-existing, surfaced by this work)
 
