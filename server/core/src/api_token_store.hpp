@@ -511,6 +511,18 @@ public:
     /// Current number of distinct tokens cached in memory.
     std::size_t cache_size() const;
 
+    /// Current number of in-flight rotation-pair entries held in the RAM-only
+    /// grace cache (`rotation_grace_cache_`, keyed by `rotation_group`) —
+    /// mirrors `cache_size()`'s role for the validated-token cache. Exists so
+    /// a test can assert the cache is EMPTY after a rejected rotate/confirm
+    /// (in particular a mint whose transaction failed to commit AFTER the
+    /// callback itself returned true — `store_rotation_raw` must never run
+    /// ahead of that outcome being known, see `rotate_token`'s ordering
+    /// comment) — a leaked entry here is invisible to LeakSanitizer (it stays
+    /// reachable from this live member map), so this accessor is the only
+    /// detector.
+    std::size_t rotation_grace_cache_size() const;
+
     // Test-only seams (#2179) for the revoke/validate TOCTOU regression test.
     // Null in production (zero overhead). Let a test deterministically
     // interleave a concurrent revoke at the exact cache-poisoning point.
@@ -535,6 +547,20 @@ public:
     /// threads, so it may only be assigned before the store is shared across
     /// threads (single-threaded test setup, never a live-traffic toggle).
     std::function<void(pg_conn*)> test_hook_before_rotate_group_read_;
+
+    /// Fired in `rotate_token`'s MINT arm, right before `return true` — after
+    /// the successor INSERT and the predecessor's overlap-window UPDATE have
+    /// both already succeeded, but before `with_txn_for` attempts `COMMIT`.
+    /// Same borrow contract as `test_hook_before_rotate_group_read_` above.
+    /// Exists so a test can force the COMMIT itself (or the
+    /// aborted/idle-transaction refusal ahead of it — `PgPool::run_in_txn`,
+    /// `pg/pg_pool.cpp`) to fail AFTER this callback has returned `true`, and
+    /// assert `store_rotation_raw` never ran for that attempt — the ordering
+    /// bug class this hook exists to catch (a cache write racing ahead of
+    /// the commit outcome leaves a permanently unevictable grace-cache entry,
+    /// invisible to LeakSanitizer since it stays reachable from
+    /// `rotation_grace_cache_`).
+    std::function<void(pg_conn*)> test_hook_before_mint_commit_;
 
     /// Injects the engine-principal referential-integrity check used by
     /// `create_token`'s engine block (design doc §6). Unset by default —

@@ -39,6 +39,39 @@ enum class EngineStoreErrorClass {
     if (has("CSPRNG"))
         return EngineStoreErrorClass::Transient;
 
+    // 1b. ApiTokenStore::confirm_token_rotation (human token-keyed arm,
+    //     P2 #11, round 4) — "no rotation currently pending ... nothing to
+    //     confirm". EXPLICIT, deliberate entry, not relying on fall-through
+    //     (step 7's default happens to be Transient too, but an explicit
+    //     check is the fix for the class of bug this file exists to prevent
+    //     — see the next paragraph). Genuinely retryable-in-spirit: nothing
+    //     about this token_id's state changes on a bare retry of the SAME
+    //     confirm call, but the message's own guidance is "call rotate
+    //     again", not "this is a dead end" — so unlike step 3's #2404
+    //     confirm-replay strings (below), a client is told to take a
+    //     DIFFERENT follow-up action, which the Transient wire contract
+    //     (retry-shaped, REST 503 / MCP kInternalError) fits better than a
+    //     hard 409 telling it never to retry.
+    //
+    //     LOAD-BEARING WHY THIS MUST BE ITS OWN CHECK, NOT REUSED WORDING:
+    //     the human arm's two emission sites (`pinned.rotation_group.empty()`
+    //     and `GroupRotationConfirmState::kGroupEmpty`, api_token_store.cpp)
+    //     originally reused the ENGINE arm's kSoleOtherToken string
+    //     byte-for-byte (a DIFFERENT fact pattern — a pin mismatch against a
+    //     DIFFERENT surviving credential, not "nothing pending") and so
+    //     silently inherited THAT string's Conflict classification via the
+    //     "the rotation was resolved" substring below (step 3) — a client
+    //     polling confirm on a never-rotated or already-resolved token got a
+    //     409 "don't retry" answer whose own text said to retry. Two
+    //     byte-identical strings can never carry two different
+    //     classifications through this substring matcher, so closing the gap
+    //     required BOTH a new, deliberately-distinct string at the emission
+    //     sites AND this explicit check — reusing the engine wording here
+    //     would have reintroduced the exact collision this entry exists to
+    //     avoid.
+    if (has("no rotation currently pending for the supplied token_id"))
+        return EngineStoreErrorClass::Transient;
+
     // 2. Conflict strings that ALSO contain a broad transient substring —
     //    must win before the broad "unavailable" check below.
     if (has("rotation confirmation unavailable")) // grace binding gone (restart / already-resolved)
