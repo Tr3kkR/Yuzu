@@ -322,16 +322,50 @@ TEST_CASE("RbacStore: set and get permission", "[rbac_store][pg]") {
     CHECK(perms[0].effect == "allow");
 }
 
-TEST_CASE("RbacStore: remove permission", "[rbac_store][pg]") {
+// security-guardian (#2703, HIGH): remove_permission() upserts an explicit
+// 'deny' row rather than deleting, so the revocation survives a reseed on
+// the NEXT restart (seed_defaults() runs unconditionally on every
+// construction; a genuinely absent row has nothing to collide with and a
+// seeded default silently returns). The row therefore still EXISTS after
+// removal — this is deliberate, not a leftover.
+TEST_CASE("RbacStore: remove permission upserts an explicit deny (survives a reseed)",
+          "[rbac_store][pg]") {
     RBAC_STORE(store);
     store.create_role({"TestRole", "", false, 0});
     store.set_permission({"TestRole", "Tag", "Read", "allow"});
     store.set_permission({"TestRole", "Tag", "Write", "allow"});
 
-    store.remove_permission("TestRole", "Tag", "Write");
+    REQUIRE(store.remove_permission("TestRole", "Tag", "Write").has_value());
     auto perms = store.get_role_permissions("TestRole");
-    REQUIRE(perms.size() == 1);
-    CHECK(perms[0].operation == "Read");
+    REQUIRE(perms.size() == 2); // the row is DENY, not absent
+    std::string write_effect, read_effect;
+    for (const auto& p : perms) {
+        if (p.operation == "Write")
+            write_effect = p.effect;
+        if (p.operation == "Read")
+            read_effect = p.effect;
+    }
+    CHECK(write_effect == "deny");
+    CHECK(read_effect == "allow");
+    // The authorization OUTCOME: denied, same as if the row were absent.
+    CHECK_FALSE(store.check_role_has_permission("TestRole", "Tag", "Write"));
+
+    // THE REGRESSION THIS CLOSES: simulate what seed_defaults() does on
+    // every construction — an idempotent re-grant attempt for the same
+    // (role,type,op) — and confirm it does NOT resurrect the allow. This is
+    // exactly ON CONFLICT DO NOTHING's behavior against an existing row.
+    {
+        auto lease = rbac_pool_fx_.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "INSERT INTO rbac_store.role_permissions (role_name, "
+                                "securable_type, operation, effect) VALUES ('TestRole', 'Tag', "
+                                "'Write', 'allow') ON CONFLICT (role_name, securable_type, "
+                                "operation) DO NOTHING",
+                                std::vector<std::string>{})
+                    .ok());
+    }
+    CHECK_FALSE(store.check_role_has_permission("TestRole", "Tag", "Write"));
 }
 
 TEST_CASE("RbacStore: deleting role cascades permissions", "[rbac_store][pg]") {

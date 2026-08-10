@@ -2300,20 +2300,36 @@ mutation (`assign_role`, `unassign_role`, `set_permission`, role/group changes,
 at most once per `kRbacGenerationRefreshMs` (1000 ms — one cheap indexed
 single-row `SELECT`, not a permission re-query) and clears `perm_cache_` on a
 change; a local mutation bumps the counter and clears its own cache immediately.
-This bounds cross-replica staleness to the refresh interval: a revoke on replica
-A is visible on replica B within ≤1 s. A failed generation refresh does NOT
-extend trust — it is treated as "assume changed" (clear cache) and counted as a
-`generation_refresh_failed` degrade. **The `rbac_enabled` flag propagates on the
-same durable path.** The ~1 s bounded stale-allow window is an **accepted,
-gate-recorded residual risk** (well inside the fleet's minutes-scale
-revocation-latency envelope); `LISTEN/NOTIFY` (window → 0) is the named
-follow-up.
+This bounds cross-replica staleness to the refresh interval under normal
+conditions: a revoke on replica A is typically visible on replica B within
+~1 s. **That bound is a target the refresh loop aims for, not a hard
+guarantee**: the interval-gating timestamp is claimed BEFORE the query runs
+(deliberately, to prevent a refresh stampede), so a concurrent reader that
+lands while a refresh is genuinely slow (pool saturation, a Postgres blip)
+can observe staleness beyond the interval. That condition is now measured,
+not silently assumed: a durable-completion timestamp tracks only actual
+refresh successes (separately from the stampede-gating timestamp), and a
+reader who misses the gate while already past the bound counts a
+`stale_beyond_accepted_bound` degrade (fjarvis #2703 F3) — the read still
+proceeds from the existing cache; nothing is denied. A failed generation
+refresh does NOT extend trust — it is treated as "assume changed" (clear
+cache) and counted as a `generation_refresh_failed` degrade. **The
+`rbac_enabled` flag propagates on the same durable path.** The ~1 s bounded
+stale-allow window is an **accepted, gate-recorded residual risk** (well
+inside the fleet's minutes-scale revocation-latency envelope); `LISTEN/NOTIFY`
+(window → 0) is the named follow-up.
 
 **Fail-closed BOOT on the `rbac_enabled` flag.** The `rbac_enabled` flag is
-durable in `rbac_meta`. An unreadable flag at boot **refuses to start** — the
-server never serves RBAC-**off** on a fleet that had enabled it (which would
-silently make every confined operator fleet-wide-authorized: a catastrophic
-fail-open).
+durable in `rbac_meta`. An unreadable OR non-canonical flag at boot **refuses
+to start** — the server never serves RBAC-**off** on a fleet that had enabled
+it (which would silently make every confined operator fleet-wide-authorized:
+a catastrophic fail-open). "Non-canonical" means any value other than the
+exact strings `"true"`/`"false"` (fjarvis #2703 F2) — a query error or a
+missing row was always fail-closed, but a *readable* value that wasn't
+exactly one of those two strings previously coerced silently to `false`. A
+schema-level `CHECK` constraint on `rbac_meta.value` for this key rejects a
+non-canonical write outright as defense in depth; the application-level
+strict parse is what refuses to boot if a bad value ever lands regardless.
 
 **Mandatory backfill (ADR-0009/0041).** Unlike the AuthDB fresh-start cutover,
 RBAC state is irreducible operator-authored config that **cannot be
@@ -2321,21 +2337,37 @@ re-derived** — custom roles, every principal→role grant, groups, and
 membership — so the migration performs a one-time streamed, idempotent,
 resumable, reconciled, **fail-CLOSED** backfill from the legacy `rbac.db`
 (seed defaults first, then backfill operator rows via `ON CONFLICT DO NOTHING`;
-operator edits to seeded permissions are preserved via `DO UPDATE`).
-Reconciliation counts roles + grants + groups + members and refuses the
-completion marker on any shortfall (fail-closed → refuse boot, retry next
-start). **The `rbac_enabled` flag is migrated first and read-back-verified**
-before the store is considered open (losing it is the single most dangerous
-outcome); a flag-backfill failure fails the whole backfill closed. The legacy
-`rbac.db` is moved aside only after a verified backfill.
+operator edits to seeded permissions are preserved via `DO UPDATE`). A
+built-in default permission the operator explicitly revoked (`remove_permission`)
+before upgrading is **deleted**, not resurrected — scoped to (role,
+securable_type) pairs legacy's own catalogue actually knew about, so a
+securable a later `seed_defaults()` adds (e.g. `EnginePrincipal`, #2376) is
+untouched (fjarvis #2703 F1). Beyond the one-time cutover, `remove_permission()`
+itself now upserts an explicit `deny` row rather than deleting — `seed_defaults()`
+runs unconditionally on every server construction, so a genuinely absent row
+would have nothing to collide with and a seeded default would silently return
+on the next restart; an explicit deny row is what `ON CONFLICT DO NOTHING`
+correctly leaves alone. Reconciliation counts roles + grants + groups +
+members and refuses the completion marker on any shortfall (fail-closed →
+refuse boot, retry next start). **The `rbac_enabled` flag is migrated first
+and read-back-verified** before the store is considered open (losing it is
+the single most dangerous outcome); a flag-backfill failure fails the whole
+backfill closed. The legacy `rbac.db` is moved aside only after a verified
+backfill.
 
-**Metrics.** `yuzu_server_rbac_read_degrade_total{reason}` (reason ∈
-`pool_acquire_timeout` / `query_error` / `generation_refresh_failed`) — a
-degrade denies authz fleet-wide, so a non-zero rate is a fleet-wide
-authorization-availability event; and `yuzu_server_rbac_backfill_total{result}`
-(result ∈ `fresh` / `completed` / `failed`). See
-`docs/user-manual/metrics.md` and the `YuzuRbacReadDegraded` alert in
-`docs/prometheus/yuzu-alerts.yml`.
+**Metrics.** `yuzu_server_rbac_read_degrade_total{reason}` — three
+DENYING reasons (`pool_acquire_timeout` / `query_error` /
+`generation_refresh_failed`): a degrade denies authz fleet-wide, so a
+non-zero rate on one of these is a fleet-wide authorization-availability
+event, and the `YuzuRbacReadDegraded` alert pages on exactly this subset.
+Two OBSERVE-ONLY reasons share the same metric but deny nothing — the read
+still proceeds — and are deliberately excluded from that alert:
+`rbac_enabled_non_canonical` (a periodic refresh saw a non-canonical value;
+the cached enabled-state is left unchanged rather than coerced) and
+`stale_beyond_accepted_bound` (see the cross-replica coherence paragraph
+above). Also `yuzu_server_rbac_backfill_total{result}` (result ∈ `fresh` /
+`completed` / `failed`). See `docs/user-manual/metrics.md` and the
+`YuzuRbacReadDegraded` alert in `docs/prometheus/yuzu-alerts.yml`.
 
 **Read split for reviewers.** The plain `bool` authz checks fail closed
 (deny-on-error) so no chokepoint can regress to fail-open; the tri-state

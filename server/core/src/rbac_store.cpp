@@ -995,25 +995,23 @@ std::expected<void, std::string> RbacStore::remove_permission(const std::string&
                                                               const std::string& operation) {
     if (!open_)
         return std::unexpected("database not open");
-    std::optional<std::uint64_t> new_gen;
-    std::string err;
-    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
-        pg::PgResult r = pg::exec_params(
-            c,
-            "DELETE FROM rbac_store.role_permissions WHERE role_name = $1 AND securable_type = $2 "
-            "AND operation = $3",
-            std::vector<std::string>{role_name, securable_type, operation});
-        if (r.status() != PGRES_COMMAND_OK) {
-            err = PQerrorMessage(c);
-            return false;
-        }
-        new_gen = bump_generation_in_txn(c);
-        return new_gen.has_value();
-    });
-    if (!ok)
-        return std::unexpected(err.empty() ? "remove_permission failed" : err);
-    apply_local_generation(*new_gen);
-    return {};
+    // security-guardian (#2703, HIGH — the F1 disease recurring outside the
+    // one-time backfill): a hard DELETE here does not stick against a
+    // built-in default. seed_defaults() runs UNCONDITIONALLY on every
+    // RbacStore construction (every server boot/restart — that is the
+    // documented mechanism new securables rely on to reseed with no
+    // migration) and its grant() calls are `ON CONFLICT DO NOTHING`. A
+    // deleted row leaves nothing to conflict with, so the very next restart
+    // silently re-inserts the seeded 'allow' — the operator's revocation is
+    // undone forever, on ordinary restart/redeploy, no attacker required.
+    // Fix: upsert an explicit 'deny' row instead of deleting. seed_defaults()'s
+    // ON CONFLICT DO NOTHING then correctly no-ops against the EXISTING deny
+    // row on every future boot — the same mechanism R2 (rbac_store.cpp
+    // migrate_from_sqlite's perms upsert) already relies on to make a legacy
+    // deny win over a seeded allow. The authorization OUTCOME is identical
+    // either way (no matching allow row -> deny); only the row's presence
+    // changes, from absent to an explicit, durable record of the revocation.
+    return set_permission({role_name, securable_type, operation, "deny"});
 }
 
 // ── Principal-role assignments ───────────────────────────────────────────────
@@ -2341,6 +2339,16 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
         // to the INSERT above so a legacy string with invalid UTF-8/embedded
         // NUL matches its own already-stored (equally sanitized) row instead
         // of spuriously mismatching and deleting a row legacy still has.
+        // INVARIANT (security-guardian, #2703): this scoping is safe only
+        // because every default grant added to an EXISTING (role,
+        // securable_type) pair since the legacy schema was frozen has, so
+        // far, ridden a brand-new securable_type (EnginePrincipal, #2376).
+        // A future default grant added to an EXISTING role+type pair before
+        // a cutover would be deleted by this same logic, since legacy would
+        // know about both the role and the type but not (yet) have the new
+        // grant. That failure direction is a lockout (access denial), not
+        // an escalation, so it stays safe — but revisit this scoping if
+        // that pattern ever changes.
         {
             std::vector<std::string> legacy_role_names, legacy_type_names, perm_roles, perm_types,
                 perm_ops;
@@ -2388,6 +2396,12 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                     PQerrorMessage(c));
                 return false;
             }
+            const char* deleted = PQcmdTuples(del.get());
+            if (deleted != nullptr && deleted[0] != '\0' && std::strcmp(deleted, "0") != 0)
+                spdlog::info(
+                    "RbacStore: migrate_from_sqlite: removed {} seeded permission(s) absent "
+                    "from legacy (operator-revoked defaults)",
+                    deleted);
         }
         for (const auto& p : principals)
             if (!run("INSERT INTO rbac_store.principal_roles (principal_type, principal_id, "

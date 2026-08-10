@@ -76,10 +76,15 @@ DURABLE generation:
 - A local mutation bumps the durable counter and clears the local cache immediately (so the
   writing replica is always coherent with itself).
 
-This bounds cross-replica staleness to the refresh interval: a revoke on replica A is visible to
-replica B within ≤`kRbacGenerationRefreshMs`. Deny-on-error on the generation read itself is
-mandatory (a failed generation refresh must NOT extend trust — treat as "assume changed" → clear
-cache, and count a `generation_refresh_failed` degrade).
+This bounds cross-replica staleness to the refresh interval under normal conditions: a revoke on
+replica A is typically visible to replica B within `kRbacGenerationRefreshMs`. That bound is a
+target, not a hard guarantee — the interval-gating timestamp is claimed before the refresh query
+runs (deliberately, to prevent a stampede), so a reader racing a genuinely slow in-flight refresh
+can observe staleness beyond it. That condition is measured via a separate completion-only
+timestamp and a `stale_beyond_accepted_bound` degrade (fjarvis #2703 F3) rather than silently
+assumed; the read still proceeds from the existing cache. Deny-on-error on the generation read
+itself is mandatory (a failed generation refresh must NOT extend trust — treat as "assume changed"
+→ clear cache, and count a `generation_refresh_failed` degrade).
 
 **Gate decision (2026-08-01) — ACCEPTED: the generation-token interval, ~1s bounded stale-allow.**
 The security, architect, performance, and compliance gates converged: dropping the cache (option
@@ -97,7 +102,13 @@ RBAC state is authoritative operator-authored config that **cannot be re-derived
 every principal→role grant, groups, and membership. Losing them silently reverts the fleet to the
 seeded defaults — an authorization change nobody authorized. So a one-time streamed, idempotent,
 resumable, reconciled, **fail-CLOSED** backfill from the legacy `rbac.db` (the ADR-0040 shape),
-seeding defaults first then backfilling operator rows via `ON CONFLICT DO NOTHING`.
+seeding defaults first then backfilling operator rows via `ON CONFLICT DO NOTHING`. A built-in
+default the operator explicitly revoked before upgrading is **deleted** post-seed rather than
+silently restored, scoped to (role, securable_type) pairs the legacy catalogue actually knew
+about — a securable a later seed adds (e.g. `EnginePrincipal`, #2376) is untouched. Beyond the
+one-time cutover, revoking a built-in default now records an explicit deny rather than deleting
+the row, since the idempotent reseed runs on every boot and a genuinely absent row would
+otherwise have nothing to block it from returning (fjarvis #2703 F1).
 
 **The `rbac_enabled` flag is the single most dangerous row to lose.** If an operator ENABLED RBAC
 and the flag is not carried across, the fleet silently boots RBAC-**off** — every confined

@@ -1045,29 +1045,32 @@ a silent partial outage.
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `yuzu_server_rbac_read_degrade_total` | counter | `reason` | An authorization read could not resolve against `rbac_store` and therefore **denied**. `reason` ∈ `pool_acquire_timeout` (no PG connection available in time), `query_error` (the authz query failed), `generation_refresh_failed` (the durable cross-replica cache-coherence token could not be re-read — treated as "assume changed", cache cleared). A non-zero rate means callers are being denied because the substrate is unhealthy. |
+| `yuzu_server_rbac_read_degrade_total` | counter | `reason` | An authorization-cache read against `rbac_store` was affected by a degrade. **Three reasons DENY**: `pool_acquire_timeout` (no PG connection available in time), `query_error` (the authz query failed), `generation_refresh_failed` (the durable cross-replica cache-coherence token could not be re-read — treated as "assume changed", cache cleared) — a non-zero rate on these means callers are being denied because the substrate is unhealthy. **Two reasons are OBSERVE-ONLY and deny nothing** (fjarvis #2703 F2/F3): `rbac_enabled_non_canonical` (a periodic refresh read a durable `rbac_enabled` value that wasn't exactly `"true"`/`"false"`; the cached enabled-state is left unchanged rather than coerced) and `stale_beyond_accepted_bound` (a reader landed inside an in-flight generation refresh that was already past the accepted ~1s staleness bound; the read still proceeds from the pre-refresh cache). The `YuzuRbacReadDegraded` alert is scoped to the three denying reasons only. |
 | `yuzu_server_rbac_backfill_total` | counter | `result` | Outcome of the one-time legacy-`rbac.db` → PostgreSQL backfill at boot. `result` ∈ `fresh` (empty legacy store — nothing to migrate), `completed` (backfill reconciled and committed), `failed` (backfill could not complete — the server **fails the boot closed** and retries on the next start). |
 
 **Example output:**
 
 ```
-# HELP yuzu_server_rbac_read_degrade_total RBAC authorization reads that denied due to a store degrade
+# HELP yuzu_server_rbac_read_degrade_total RBAC authorization-cache reads affected by a degrade (see label docs — not all reasons deny)
 # TYPE yuzu_server_rbac_read_degrade_total counter
 yuzu_server_rbac_read_degrade_total{reason="pool_acquire_timeout"} 0
 yuzu_server_rbac_read_degrade_total{reason="query_error"} 0
 yuzu_server_rbac_read_degrade_total{reason="generation_refresh_failed"} 0
+yuzu_server_rbac_read_degrade_total{reason="rbac_enabled_non_canonical"} 0
+yuzu_server_rbac_read_degrade_total{reason="stale_beyond_accepted_bound"} 0
 
 # HELP yuzu_server_rbac_backfill_total Outcome of the RbacStore Postgres backfill at boot
 # TYPE yuzu_server_rbac_backfill_total counter
 yuzu_server_rbac_backfill_total{result="completed"} 1
 ```
 
-**Suggested alert (a degrade denies authz fleet-wide):**
+**Suggested alert (a degrade on one of the three denying reasons denies authz fleet-wide):**
 
 ```promql
-# Any RBAC read degrade is a fleet-wide authorization-availability event:
-# every affected call is being DENIED because the store cannot answer.
-sum(rate(yuzu_server_rbac_read_degrade_total[5m])) by (reason) > 0
+# Scoped to the three DENYING reasons only — rbac_enabled_non_canonical and
+# stale_beyond_accepted_bound share this metric but deny nothing, so folding
+# them into this expression would page a false "callers denied fleet-wide".
+sum(rate(yuzu_server_rbac_read_degrade_total{reason=~"pool_acquire_timeout|query_error|generation_refresh_failed"}[5m])) by (reason) > 0
 ```
 
 The shipped rule is `YuzuRbacReadDegraded` (plus the optional

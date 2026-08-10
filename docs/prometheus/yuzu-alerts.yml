@@ -152,8 +152,18 @@ groups:
         # green under pure pool saturation (it trips only on connection failure,
         # to avoid false LB evictions), so this is otherwise dashboard-invisible.
         # reason = pool_acquire_timeout | query_error | generation_refresh_failed.
+        #
+        # DELIBERATELY excludes two other reason values on this same metric
+        # (#2703 fjarvis F2/F3 fix): rbac_enabled_non_canonical and
+        # stale_beyond_accepted_bound are OBSERVE-ONLY — the read still
+        # PROCEEDS (served from cache / the last-known-good enabled value),
+        # nothing is denied. Folding them into this alert's reason=~match
+        # would page "callers being denied fleet-wide" for a condition that
+        # denies nobody — a false alarm during exactly the kind of incident
+        # this alert exists to page accurately for. If either ever needs its
+        # own alert, it must NOT claim fleet-wide denial.
         expr: |
-          sum(rate(yuzu_server_rbac_read_degrade_total[5m])) by (reason) > 0
+          sum(rate(yuzu_server_rbac_read_degrade_total{reason=~"pool_acquire_timeout|query_error|generation_refresh_failed"}[5m])) by (reason) > 0
         for: 5m
         labels:
           severity: critical

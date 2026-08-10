@@ -585,15 +585,24 @@ server `PgPool`).
 
 - A one-time, idempotent, **fail-closed** backfill copies every role, grant,
   group, and membership out of the legacy `rbac.db` into `rbac_store`. Operator
-  edits to seeded permissions are preserved. The backfill reconciles counts
-  (roles + grants + groups + members) and **refuses the completion marker on any
-  shortfall** — if it cannot complete, the server **fails the boot closed** and
-  retries on the next start (it never boots on a partial authorization config).
+  edits to seeded permissions are preserved — including a revoked built-in
+  default (`remove_permission`), which is **deleted** rather than silently
+  restored. Beyond this one-time cutover, `remove_permission()` itself now
+  records an explicit deny rather than deleting the row outright, so a
+  revocation made after upgrading also survives every future restart (a
+  built-in default is otherwise re-seeded, harmlessly, on every boot). The
+  backfill reconciles counts (roles + grants + groups + members) and **refuses
+  the completion marker on any shortfall** — if it cannot complete, the server
+  **fails the boot closed** and retries on the next start (it never boots on a
+  partial authorization config).
 - **CRITICAL — the `rbac_enabled` flag is preserved and read-back-verified.** It
   is migrated first, so an operator who had RBAC **enabled** stays enabled after
   upgrade. (Losing this flag would silently boot the fleet RBAC-**off**, making
   every confined operator fleet-wide-authorized — the migration is engineered
-  specifically to prevent that.) An unreadable durable flag also refuses boot.
+  specifically to prevent that.) An unreadable **or non-canonical** durable
+  flag also refuses boot — a value other than exactly `true`/`false` is
+  rejected both by a schema-level constraint on write and by a strict parse on
+  every read, rather than being silently treated as `false`.
 - The legacy `rbac.db` file is **moved aside** only after the backfill is
   verified. It is never read again; keep the moved-aside copy until you have
   confirmed RBAC behaves as expected, then remove it.
@@ -611,12 +620,17 @@ server `PgPool`).
   `yuzu_server_rbac_read_degrade_total` metric and the `YuzuRbacReadDegraded`
   alert after upgrade; a degrade denies authz fleet-wide.
 - **Multi-replica staleness caveat.** If you run multiple server replicas, a
-  role/permission/enabled-flag change on one replica is visible on the others
-  within a bounded **~1 s** window (a durable generation token, refreshed at most
-  once per second). A revoke is therefore not strictly instantaneous
-  cross-replica — well inside the fleet's existing revocation-latency envelope
-  (heartbeat + session/token TTLs measured in minutes), and an accepted residual
-  risk (`LISTEN/NOTIFY` is the named follow-up).
+  role/permission/enabled-flag change on one replica is typically visible on
+  the others within a **~1 s** window under normal conditions (a durable
+  generation token, refreshed at most once per second) — this is a target the
+  refresh loop aims for, not a hard guarantee: a replica whose refresh is
+  genuinely slow (pool saturation, a Postgres blip) can observe staleness
+  beyond the window, now counted via a `stale_beyond_accepted_bound` degrade
+  rather than silently assumed. A revoke is therefore not strictly
+  instantaneous cross-replica — well inside the fleet's existing
+  revocation-latency envelope (heartbeat + session/token TTLs measured in
+  minutes), and an accepted residual risk (`LISTEN/NOTIFY` is the named
+  follow-up).
 - Confirm on first boot: the backfill completion log line, no `RbacStore`
   open/migrate errors, and that RBAC is still enabled if you had enabled it
   (Settings → RBAC, or check that confined operators still see only their

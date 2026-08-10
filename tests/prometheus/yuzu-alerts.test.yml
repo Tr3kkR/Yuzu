@@ -682,3 +682,40 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuResponseIngestDrops", alertstate="firing", reason="pool_acquire_timeout", severity="warning"}'
             value: 1
+
+  # ── YuzuRbacReadDegraded ────────────────────────────────────────────────
+  #
+  # #2703 fjarvis F2/F3 fix: rbac_enabled_non_canonical and
+  # stale_beyond_accepted_bound share the yuzu_server_rbac_read_degrade_total
+  # metric with the three genuine-denial reasons but do NOT deny anything --
+  # the read still proceeds (served from cache / the last-known-good value).
+  # This alert's expr is scoped to exclude them by name; these cases prove
+  # that scoping, both directions.
+
+  # CASE 25 -- the two observe-only reasons alone must not page
+  # YuzuRbacReadDegraded ("callers being denied fleet-wide" would be false).
+  - interval: 1m
+    name: rbac read degraded - observe-only reasons do not page fleet-wide-denial
+    input_series:
+      - series: 'yuzu_server_rbac_read_degrade_total{job="yuzu",instance="s1",reason="rbac_enabled_non_canonical"}'
+        values: "0+1x20"
+      - series: 'yuzu_server_rbac_read_degrade_total{job="yuzu",instance="s1",reason="stale_beyond_accepted_bound"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # CASE 26 -- a genuine denial reason (query_error) still pages, unaffected
+  # by the exclusion added alongside the two observe-only reasons.
+  - interval: 1m
+    name: rbac read degraded - a genuine denial reason still pages
+    input_series:
+      - series: 'yuzu_server_rbac_read_degrade_total{job="yuzu",instance="s1",reason="query_error"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRbacReadDegraded", alertstate="firing", reason="query_error", severity="critical"}'
+            value: 1
