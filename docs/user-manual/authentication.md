@@ -610,6 +610,111 @@ Returns `200 OK` with:
 
 Returns `404` if the token ID is not found. Returns `503 service unavailable` if the server's token store database failed to open at startup — a storage outage is never reported as `404` (see the API Tokens section of the [REST API reference](rest-api.md)).
 
+### Rotating a Token
+
+Rotation replaces a token's secret without a hard cutover, using the same
+**overlap-pair** model as engine-principal credential rotation (see
+[Engine Principals](engine-principals.md) "Rotate the credential"): a
+**successor** token is minted while the existing (**predecessor**) token
+stays valid for an overlap window, so whatever consumes the old secret has
+time to pick up the new one.
+
+Requires `ApiToken:Write` RBAC permission. `{token_id}` is the
+**predecessor's** id:
+
+```bash
+curl -s -b cookies.txt -X POST \
+  http://localhost:8080/api/v1/tokens/a1b2c3d4e5f6/rotate \
+  -H "Content-Type: application/json" \
+  -d '{ "overlap_secs": 604800 }'
+```
+
+```json
+{
+  "data": {
+    "token": "yuzu_Nm7pQ2z...",
+    "token_id": "f6e5d4c3b2a1",
+    "expires_at": 1750185000,
+    "overlap_expires_at": 1742990600
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+The raw successor secret is returned exactly once, the same as at creation.
+`overlap_secs` defaults to 7 days if omitted (24-hour floor, 10-year
+ceiling). Once the new secret is installed wherever it's consumed, close
+the loop explicitly instead of waiting on the auto-revoke sweep — `{token_id}`
+here is the **successor's** id, from the `rotate` response above:
+
+```bash
+curl -s -b cookies.txt -X POST \
+  http://localhost:8080/api/v1/tokens/f6e5d4c3b2a1/confirm
+```
+
+`confirm` revokes the predecessor immediately and promotes the successor to
+the token's sole active credential. If you skip it, a 60-second background
+sweep auto-revokes the predecessor once the overlap window elapses on its
+own — a longer-running but hands-off path to the same end state.
+
+**MFA step-up is required on every call, if you have MFA enrolled — and
+that includes a repeat call.** Unlike most session activity, `rotate` and
+`confirm` re-validate a *fresh* step-up proof **every time**, including a
+same-caller retry that just re-serves the same successor secret within the
+grace window — a repeat `rotate` is not treated as "already proved" just
+because the first call succeeded. If your last MFA proof is stale (or you
+haven't stepped up this session yet), you get a `401`:
+
+```json
+{
+  "error": {
+    "code": 401,
+    "message": "MFA step-up required",
+    "correlation_id": "req-..."
+  },
+  "meta": {
+    "api_version": "v1",
+    "mfa_step_up_required": true,
+    "challenge_url": "/login/mfa/stepup"
+  }
+}
+```
+
+Follow `challenge_url` to present a fresh TOTP code (or recovery code) —
+`/login/mfa/stepup` for a local session, `/auth/oidc/start` for an OIDC
+session — then retry the `rotate`/`confirm` call. This only applies to the
+interactive (cookie) session these examples use; a caller authenticated
+with a bearer API/MCP token is exempt, since minting that token already
+required MFA. See [Multi-Factor Authentication (TOTP)](#multi-factor-authentication-totp)
+for enrollment and the step-up window.
+
+**Self-service only — no admin override, and no delegate.** You can rotate
+or confirm only a token **you own**; there is no admin bypass (a human
+token's raw successor secret authenticates *as its owner*, so an admin
+completing someone else's rotation would be identity takeover, not an
+administrative convenience — an admin who needs to act on someone else's
+token has [revoke](#revoking-a-token) instead). Rotating/confirming a token
+you don't own returns the same `404 token not found` as a token that
+doesn't exist. **Under RBAC-on, this composes to effectively admin-only**:
+`ApiToken:Write` is granted only to the `Administrator` and
+`ApiTokenManager` roles, so an `Operator`- or `Viewer`-role user who owns a
+token has no path to rotate it themselves under RBAC-on, and no admin can
+do it for them either — the same pre-existing property already applies to
+creating a token (also `ApiToken:Write`) and to
+[deleting one](#revoking-a-token) (the sibling `ApiToken:Delete`
+operation, held by the same two roles and no others); rotation does not
+change it.
+
+**Lifetime-neutral by design.** The successor token always inherits the
+predecessor's expiry exactly — a non-expiring token stays non-expiring, a
+30-day token stays a 30-day token from its *original* grant. There is no
+request field to extend it; rotating a credential is a lateral swap, never
+a way to renew a grant. If you need a longer-lived replacement, create a
+new token instead.
+
+See the [REST API reference](rest-api.md) `POST /api/v1/tokens/{token_id}/rotate`
+and `.../confirm` for the full error matrix.
+
 ## JIT Admin Elevation
 
 To reduce **standing** privilege (SOC 2 CC6.3/CC6.6), an operator can hold a non-admin role day-to-day and **activate** admin **just-in-time** for a short, justified window — so a compromised everyday session is not a standing admin session. Two steps:
