@@ -631,13 +631,16 @@ Whichever PR flips `prefer_spark` MUST also:
      headroom-blocked in this regime; any `evicted_no_send_evidence` increment here is a
      defect, not an accepted risk.
    - **Sustained starvation (>=94% occupancy held for the full 7-day retention
-     window):** loss is accepted ONLY when every lost batch is attributable -
-     `evicted_no_send_evidence` may increment for a batch iff that batch's
-     `guardian_journal_headroom_blocked_seconds` episode reached the full retention
-     window at time of eviction. An increment against a batch with no corroborating
-     headroom-blocked episode (zero or absent) is NOT covered by this risk-acceptance
-     and must be investigated as a distinct defect, not counted against the accepted
-     loss.
+     window):** loss is accepted ONLY when attributable to that starvation - on the
+     AFFECTED AGENT, `evicted_no_send_evidence` incrementing is covered by this
+     risk-acceptance only while that agent's `guardian_journal_headroom_blocked_seconds`
+     episode is concurrently live (nonzero). **Attribution is per-agent, not
+     per-batch**: the gauge is a single episode age per agent (it "can start from
+     already-delivered batches", per its own doc comment), so it cannot name which
+     specific batch a given eviction belongs to - it can only confirm the agent was,
+     in fact, in a starvation episode at the time. `evicted_no_send_evidence`
+     incrementing on an agent with NO concurrent headroom-blocked episode is NOT
+     covered by this risk-acceptance and must be investigated as a distinct defect.
    - **Capacity-reject classes (`stage_dropped`, `write_capacity_rejected`) are
      transient-only:** must clear within one maintenance-tick cycle (30 s page /
      120 s prune, `kGuardianJournalPageInterval`/`kGuardianJournalPruneInterval`) once
@@ -647,12 +650,22 @@ Whichever PR flips `prefer_spark` MUST also:
      `key_collisions`, `gauge_underflow`) carry zero tolerance** - any nonzero reading
      on a production endpoint is an incident (hardware fault or a bug), never an
      accepted-loss statistic; #2364's risk-acceptance does not cover them.
-   - **For CH-11 specifically:** "no more than the true loss" becomes a testable
-     equality under the above - the count of `_evicted_no_send_evidence` increments
-     during the scenario must equal the count of batches whose
-     `headroom_blocked_seconds` episode reached the full retention window at time of
-     eviction; any excess is a defect the scenario should fail on, not a magnitude to
-     eyeball.
+   - **For CH-11 specifically:** because attribution is per-agent (above), "no more
+     than the true loss" is testable at agent granularity in CH-11's own
+     single-cause setup (a controlled 500-agent SIGKILL cohort, not mixed causes):
+     every agent that shows `_evicted_no_send_evidence` incrementing must ALSO show
+     a concurrent (or immediately-prior) `headroom_blocked_seconds` episode: an
+     evicting agent with no corresponding episode is a defect the scenario should
+     fail on. This is an agent-count check, not a batch-count equality - CH-11's
+     scenario doesn't (and per the gauge's shape, can't) support asserting an exact
+     per-batch count.
+   **Open question, flagged rather than resolved here:** item 7 above says to run
+   CH-5 at "the journal's HARD ceiling (2000 batches / 64 MiB)", double the shipped
+   caps this threshold section derives from (1000 batches / 32 MiB,
+   `kMaxJournalBatches`/`kMaxJournalBytes`). Unclear from the code alone whether
+   2000/64 MiB is a deliberate 2x stress margin for the chaos run or stale text from
+   before the caps were finalized - flagging for confirmation before CH-5 runs
+   rather than silently picking one reading.
    Posted for confirmation: issue #2364 and the #2340 chaos-campaign issue (CH-11).
 10. ~~**Make the replay pass lazy-parse** (Gate 3 performance, measured). `page_into_window` and
     `prune` both parse the ENTIRE journal before applying the 128-candidate cap: ~680 ms and
