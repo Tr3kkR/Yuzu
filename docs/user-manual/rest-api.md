@@ -7032,6 +7032,36 @@ The first three gate `GuaranteedState:Read` and are not audited (cohort posture)
 | `--mcp-disable` | Reject all `/mcp/v1/` requests |
 | `--mcp-read-only` | Allow only read-only tools regardless of token tier |
 
+**Streamed responses (progress tracking).** A `tools/call` for `execute_instruction`
+carrying `_meta.progressToken` (a string ≤512 bytes, or an integer) opts into progress
+tracking — **this requires an active session** (a non-empty `Mcp-Session-Id` header
+from a prior `initialize`; without one, progress tracking is skipped entirely and the
+call answers as if no token had been sent). Where progress is then *delivered* depends
+on the request's `Accept` header and whether the server has `--mcp-enable-streamed-post`
+enabled (off by default):
+
+| `_meta.progressToken` | Session | `Accept: text/event-stream` | Server answers |
+|---|---|---|---|
+| present | active | present, streamed POST enabled | this POST response held open as an SSE stream — `notifications/progress` frames, then the JSON-RPC result last, then EOF |
+| present | active | absent, or streamed POST disabled | plain JSON now; progress frames go to the session's `GET /mcp/v1/` stream instead |
+| present | none | (either) | plain JSON, byte-identical to a call with no progress tracking |
+| absent | (either) | (either) | plain JSON, byte-identical to a call with no progress tracking |
+
+A streamed POST's response headers are `Content-Type: text/event-stream`,
+`Cache-Control: no-cache`, `X-Accel-Buffering: no` (nginx only — Envoy/HAProxy/ALB/
+Cloudflare need their own no-buffering opt-out, same caveat as `GET /mcp/v1/` above),
+and `X-Correlation-Id`. Admission denials reuse `-32012` / HTTP `429` — the same code
+and the same `retry_after_ms`/`Retry-After` A4 shape as the `GET` channel above, but a
+longer fixed value (30s vs. the `GET` channel's 5s: none of these causes is likely to
+clear within a second or two) and a distinct set of causes (a shared cross-surface
+budget, this principal's own streamed-call allowance, a server-wide capacity ceiling,
+or this session's own slots) — see `docs/user-manual/mcp.md`
+"`-32012`: Stream limit reached" for the full cause-by-cause remediation, and
+`docs/mcp-server.md` "Streamed POST — SSE on the response" for the wire-level response
+shape, close reasons, and resume/recovery rules. Progress is best-effort either way —
+a reservation can silently degrade to the plain path under load, so a caller must still
+be prepared to poll (`query_responses` / `get_execution_status`).
+
 ---
 
 ## Authentication Endpoints
