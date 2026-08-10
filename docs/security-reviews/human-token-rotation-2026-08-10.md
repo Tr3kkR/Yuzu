@@ -34,7 +34,7 @@ decision below for why the two cannot share one invariant.
 | REST routes | `server/core/src/rest_api_v1.cpp` (`POST /api/v1/tokens/{id}/rotate`, `.../confirm`) |
 | T12 maintenance sweep (shared engine+human) | `server/core/src/server.cpp` (`engine_rotation_sweep_thread_`) |
 | Tests | `tests/unit/server/test_api_token_store.cpp` (33 `[human]`-tagged cases) |
-| Docs | `docs/auth-architecture.md` "Human API-token rotation" (this feature's design record), `docs/user-manual/rest-api.md` "API Tokens", `docs/user-manual/metrics.md`, `docs/observability-conventions.md`, `docs/user-manual/audit-log.md` |
+| Docs | `docs/auth-architecture.md` "Human API-token rotation" (this feature's design record), `docs/user-manual/rest-api.md` "API Tokens" (REST reference), `docs/user-manual/authentication.md` "Rotating a Token" (user-manual walkthrough), `docs/user-manual/metrics.md`, `docs/observability-conventions.md`, `docs/user-manual/audit-log.md` |
 
 ## Design decisions with security rationale
 
@@ -58,26 +58,29 @@ decision below for why the two cannot share one invariant.
   row can exist. On the human arm, with several independent in-flight
   rotations possible per principal, the copied loop matched the *first*
   linked row, not necessarily the one belonging to the predecessor actually
-  rotated. **Three independent reviewers, with different briefs, each
-  reproduced this end-to-end against live Postgres.** `consistency-auditor`
-  and `security-guardian` each returned their own empirical reproduction
-  first; `architect` then returned a third, independent reproduction of the
-  same defect — and the ruling that the fix belonged at a shared seam, not
-  as a patched inline loop, which is why `derive_rotation_successor` exists
-  at all rather than a corrected copy of the original loop. The
-  reproduction: rotating token A then token B (same owner) inside A's
-  overlap window returned B's raw secret paired with A's successor
-  `token_id` — confirming that id would have revoked A while B, the token
-  whose secret the caller actually held, stayed live and unconfirmed. Fixed
-  (`c1325015`) by extracting the derivation into one shared, DB-free,
-  unit-testable seam — `derive_rotation_successor`
+  rotated. **Two independent reproductions against live Postgres, plus an
+  architectural ruling that the fix belonged at a shared seam rather than
+  inline.** The reproduction: rotating token A then token B (same owner)
+  inside A's overlap window returned B's raw secret paired with A's
+  successor `token_id` — confirming that id would have revoked A while B,
+  the token whose secret the caller actually held, stayed live and
+  unconfirmed. Fixed (`c1325015`) by extracting the derivation into one
+  shared, DB-free, unit-testable seam — `derive_rotation_successor`
   (`token_rotation_lookup.hpp`) — so the REST route today and the MCP twin
   landing separately both call the same function. A second inline copy of
   this loop is exactly the drift that produced the bug the first time; see
   the header's own doc comment for the full reproduction writeup. The seam
-  extraction is itself the evidence the architectural ruling was acted on
-  — an inline fix on the REST route would have been the cheaper change and
-  was explicitly rejected in favour of the shared seam.
+  extraction is itself the evidence the architectural ruling was acted on —
+  an inline fix on the REST route would have been the cheaper change and was
+  explicitly rejected in favour of the shared seam.
+  **Attribution note:** `c1325015`'s own commit message is the only
+  artifact this record can cite for "two specialists" plus "per the
+  coordinator's correction" — no `governance.d/` ledger fragment exists for
+  this work, and an independence claim in a compliance record should not
+  rest on a recollection routed through the party being reviewed (the
+  coordinator, here). If per-round/per-reviewer attribution is needed for
+  audit purposes, cite it from a governance ledger fragment once one is
+  produced for this work, not from this paragraph or from memory.
 - **Ownership is enforced at the store seam, not merely at the route.**
   `rotate_token`/`confirm_token_rotation` reject unless `requesting_user`
   equals the resolved token row's own `principal_id` — checked in a
@@ -92,6 +95,22 @@ decision below for why the two cannot share one invariant.
   permission gap an admin override could legitimately cross. There is no
   rotate-as-admin path; an admin acting on another user's token has
   `revoke_token`/`revoke_for_principal` instead.
+- **"Self-service" is qualified, not absolute — under RBAC-on this composes
+  to effectively admin-only, and that is true of the shipped surface, not a
+  future caveat.** REST rotate/confirm gate on `ApiToken:Write`. Verified
+  against this branch's RBAC seed data (`rbac_store.cpp`): `ApiToken:Write`
+  is granted only to `Administrator` (full-CRUD loop) and `ApiTokenManager`
+  (explicit grant); `Operator`, `PlatformEngineer`, `Viewer` (read-only), and
+  `ITServiceOwner` (explicitly excluded, per its own seeding comment) do not
+  hold it. Composed with the store-seam ownership requirement above (no
+  admin override, ever): an `Operator`- or `Viewer`-role user who **owns** a
+  token has no RBAC-on path to rotate it themselves, and no admin can do it
+  for them either — the token cannot be rotated by anyone until its owner is
+  separately granted `ApiToken:Write`. This is **pre-existing and unchanged
+  by this work** — the same gate already governed `POST /api/v1/tokens` and
+  `DELETE /api/v1/tokens/{id}` — recorded here because every "self-service"
+  claim elsewhere in this record means *self-service subject to holding
+  `ApiToken:Write`*, not *available to any authenticated owner*.
 - **A wrong-owner rejection is indistinguishable from a nonexistent token —
   the surface is not an enumeration oracle.** Both the store-level rejection
   and the REST route's own 404 use identical wording/status for "this token
@@ -183,60 +202,84 @@ each commit message, not repeated here:
 
 During review of the (separate, still-in-review) MCP tool twins, a proposed
 `operator`-tier MCP allowance on the `ApiToken:Write` securable was found to
-be exploitable: because REST's `POST /api/v1/tokens/{id}/rotate` and
-`.../confirm` gate on the same `ApiToken:Write` permission MCP tooling would
-have shared, an `operator`-tier token would have been able to reach the
-rotate/confirm surface via REST — and, per the pre-existing chain `#2945`
-below, use adjacent token-minting behaviour to escape its own tier
-confinement. A first attempted fix scoped the allowance narrowly to the
-rotate/confirm MCP *tools themselves* and was found structurally
-unreachable — RBAC evaluates on the shared REST/MCP `(securable, operation)`
-pair, not per-tool, so a tool-scoped carve-out cannot exist without
-duplicating the permission model. The adjudicated remedy is a **new,
-narrower RBAC operation — `ApiToken:Rotate`** — separate from
-`ApiToken:Write`, so the MCP allowance (once it lands) can be granted
-without also widening REST rotate/confirm access to every `ApiToken:Write`
-holder. **Neither the operator-tier allowance nor the `ApiToken:Rotate`
-operation is present in this branch** — the finding and its remedy belong to
-the MCP-twins piece, which has not merged; this record exists so the
-decision is not re-litigated or silently re-broken when that piece lands.
-The REST routes documented above gate on the existing `ApiToken:Write`
-only, as designed for a self-service human surface, and are not implicated
-by this finding.
+be directly exploitable — not via a downstream hop through rotate/confirm.
+`ApiToken:Write` is the gate on `POST /api/v1/tokens` (mint, `rest_api_v1.cpp`)
+**and** its settings twin `POST /api/settings/api-tokens`
+(`settings_routes.cpp`), and **both accept a caller-chosen `mcp_tier`**
+(including empty/untiered). An `operator`-tier token minting a token with no
+`mcp_tier` set produces a credential that then skips `tier_allows` entirely
+on every later call (an empty `mcp_tier` is the untiered/interactive case).
+So the proposed allowance would have let an `operator`-tier token directly
+mint itself an untiered, unconfined credential — a **first-order**
+consequence of the one-line change, present the moment the allowance
+existed, with no rotate/confirm call required. `#2945` below is the
+**pre-existing** instance of this identical escape at the `supervised` tier;
+the proposed allowance would have extended it to `operator`.
 
-**Detection mechanism — the part with lasting value for future audits of
-this kind of gate.** Two specialists found this independently, and neither
-found it by reading the diff. The proposed change was a **single line**
-(the new `operator`-tier allowance on the shared `ApiToken:Write`
-predicate) that read correctly in its own context — nothing about the diff
-itself signalled the cross-transport consequence. Both reviewers instead
-built a **compiled before/after probe of the tier predicate itself**,
-rather than trusting a source read: one ran an **exhaustive 5 tiers × 23
-securables × 8 operations (920-cell) sweep** comparing the predicate's
-output before and after the proposed change, and proved that **exactly two
-cells changed** — the direct evidence that the allowance was not as narrow
-as its diff line suggested. The existing test suite was, and remains,
-green throughout — not because the gate is safe, but because **nothing in
-the suite exercises this predicate from the REST transport**; the suite's
-greenness was never evidence against this class of defect, and citing "the
-suite is green" as reassurance for a shared cross-transport securable
-predicate would have been exactly wrong here. The generalizable lesson:
-**a securable-scoped permission predicate consulted by a shared
-cross-transport chokepoint (REST and MCP admitting through the same
-`(securable, operation)` check) cannot be safety-reviewed by reading the
-change that touches it** — it has to be reviewed by exhaustively comparing
-its own before/after behaviour across the full grant surface it governs,
-because the blast radius lives in what the predicate is *shared with*, not
-in the lines that changed.
+A first attempted fix scoped the allowance narrowly to the rotate/confirm
+MCP *tools themselves* and was found structurally unreachable — RBAC
+evaluates on the shared REST/MCP `(securable, operation)` pair, not
+per-tool, so a tool-scoped carve-out cannot exist without duplicating the
+permission model. The adjudicated remedy is a **new, narrower RBAC
+operation — `ApiToken:Rotate`** — separate from `ApiToken:Write`, so the
+MCP allowance (once it lands) can be granted without also widening
+`POST /api/v1/tokens`(-equivalent) mint access to every `ApiToken:Write`
+holder. **The remedy is not REST-scope-neutral: it also re-gates this
+branch's own `POST /api/v1/tokens/{id}/rotate`/`.../confirm` routes from
+`ApiToken:Write` onto the new `ApiToken:Rotate`, for parity across
+transports.** Neither the operator-tier MCP allowance, the `ApiToken:Rotate`
+operation, nor the REST re-gating is present in this branch — the finding
+and its full remedy belong to the MCP-twins piece, which has not merged;
+this record exists so the whole decision — including the REST-side
+re-gating — is not re-litigated or silently dropped when that piece lands.
 
-## Follow-up issues filed (pre-existing, surfaced by this work)
+**Detection mechanism — corrected. The 920-cell sweep verified the remedy;
+it did not detect the defect.** 920 = 5 tiers × 23 securables × **8**
+operations — but this branch's own RBAC operation set
+(`rbac_store.cpp`'s `ops[]`) has **7** (`Read`, `Write`, `Execute`,
+`Delete`, `Approve`, `Push`, `Attest`); the eighth, `Rotate`, exists only on
+the remedy commit. The sweep therefore necessarily ran against the
+**post-fix** operation vocabulary. A before/after sweep of the *vulnerable
+proposal* (the one-line `operator`-tier allowance on `ApiToken:Write`,
+against the 7-operation pre-fix vocabulary) changes exactly **one** cell —
+which is evidence the change *was* narrow, not evidence it was safe: the
+defect's severity comes from what else is gated on that one cell
+(`ApiToken:Write`), not from the cell count changing. The defect was
+instead found by **enumerating the call sites that consult the
+`(ApiToken, Write)` pair** — `POST /api/v1/tokens`, `POST
+/api/settings/api-tokens`, and the rotate/confirm routes all resolved — and
+recognising that the proposed allowance widened every one of them at once,
+not just the two rotate/confirm tools it was written for.
 
-Three issues were opened for defects found while building this feature, none
-of which are defects *in* this feature's own new code (the human arm's
-rotate/confirm surface does not reproduce #2944, and #2945 is unrelated to
-rotation):
+The suite claim is narrower than first stated: `tests/unit/server/test_auth_routes.cpp`
+does exercise the REST-path tier predicate (`require_permission`/
+`require_scoped_permission`) — ten call sites across its `[mcp]`-tagged
+cases, against the `Execution`, `Infrastructure`, `Security`, and `Tag`
+securables (verified by grep; none against `ApiToken`). The defensible
+statement: **no test exercised the tier predicate for the `ApiToken`
+securable specifically on the REST transport, and there is no
+per-`(securable, operation)` REST tier coverage matrix** — so this class of
+defect had a real, specific blind spot, not a suite that never tests
+tiering at all.
 
-- **`#2943`** — `confirm_rotation` (engine arm) **and**
+The durable lesson: **a one-cell change to a shared permission predicate
+inherits the union of every route consulting that `(securable, operation)`
+pair — enumerate the call graph behind the chokepoint, not the grid of
+possible values the predicate can take.** A grid sweep is the right tool for
+verifying a remedy's blast radius *after* the operation vocabulary is
+final; it is the wrong tool for finding a defect in a proposal that hasn't
+shipped its own new operation yet, because the grid it would sweep doesn't
+exist yet either.
+
+## Open risks (pre-existing, surfaced by this work)
+
+Three issues were opened while building this feature. None is a defect *in*
+this feature's own new rotate/confirm code, but `#2945` shares this record's
+central chokepoint (`ApiToken:Write`) and the shipped-default (RBAC-off)
+configuration, so it is recorded here as a live open risk, not a footnote.
+Owner: **unassigned** for all three — filed, not yet triaged to an owner.
+
+- **`#2943`** (Owner: unassigned) — `confirm_rotation` (engine arm) **and**
   `confirm_token_rotation` (human arm, this feature) share a structural
   fallthrough after their respective "exactly one pair matched" case:
   when the matched rows' linkage doesn't resolve to a clean
@@ -247,23 +290,41 @@ rotation):
   direction; not fixed by this branch — the human arm inherits it because
   both arms share the fallthrough shape, and the fix (a dedicated terminal
   string classified `Conflict`) is scoped to touch both arms together.
-- **`#2944`** — the **engine** rotate response's `overlap_expires_at` is
-  read off the successor row at both the engine REST and MCP call sites;
-  the store never stamps that column on a successor (only the predecessor
-  UPDATE sets it), so it reports a structural `0`. Surfaced while building
-  this feature's `token_rotation_lookup.hpp`, whose
-  `RotationSuccessorInfo::predecessor_overlap_expires_at` sources the field
-  from the predecessor row precisely to avoid this — the human REST route
-  (this feature) does **not** have this defect. The engine call sites are
-  unmigrated and tracked separately.
-- **`#2945`** (security-labelled) — pre-existing and unrelated to rotation:
-  a `supervised`-tier API/MCP token can mint itself a tier-less, perpetual
-  token via the existing `POST /api/v1/tokens` route, escaping its own tier
-  confinement (RBAC off, the shipped default, and step-up is out of scope
-  for API-token principals). Surfaced while reviewing the proposed
-  `operator`-tier MCP allowance above, whose extension of the same class of
-  gap to `operator` tokens was caught and not shipped. Tracked and gated
-  separately from this feature's rotation surface.
+- **`#2944`** (Owner: unassigned) — the **engine** rotate response's
+  `overlap_expires_at` is read off the successor row at both the engine
+  REST and MCP call sites; the store never stamps that column on a
+  successor (only the predecessor UPDATE sets it), so it reports a
+  structural `0`. Surfaced while building this feature's
+  `token_rotation_lookup.hpp`, whose `RotationSuccessorInfo::
+  predecessor_overlap_expires_at` sources the field from the predecessor row
+  precisely to avoid this — the human REST route (this feature) does
+  **not** have this defect. The engine call sites are unmigrated and
+  tracked separately.
+- **`#2945`** (Owner: unassigned; **security-labelled, open**) — a
+  `supervised`-tier API/MCP token can mint itself a tier-less, perpetual
+  token via `POST /api/v1/tokens` (and its settings twin `POST
+  /api/settings/api-tokens`), escaping its own tier confinement — the same
+  chokepoint (`ApiToken:Write`) and the same first-order minting mechanism
+  the "Privilege-escalation finding" above traces in detail for the
+  `operator`-tier proposal that was caught before shipping. **Compensating
+  control: none identified.** Traced `auth_routes.cpp`'s tiered-token
+  fall-through: after `tier_allows` passes, the request still needs to
+  clear either the RBAC-on `check_permission(username, ApiToken, Write)`
+  check or the RBAC-off legacy-floor `effective_role == admin` check — but
+  in every reachable path, the principal who can exploit this already holds
+  `ApiToken:Write` outright (`Administrator`/`ApiTokenManager` under
+  RBAC-on, or a legacy `admin`-role account under RBAC-off — legacy `Role`
+  is binary `{user, admin}`, `auth.hpp:29`), which is the SAME grant needed
+  to mint the narrowed token in the first place. So enabling RBAC changes
+  *which* mechanism gates the fall-through but does not remove the
+  exploit's precondition — a Write-privileged principal can de-confine
+  their own deliberately-narrowed token under either configuration. This is
+  a confinement-escape (an already-privileged principal defeating their own
+  blast-radius reduction), not a vertical low-to-high privilege escalation
+  — but it is real, open, and shares this feature's chokepoint. Surfaced
+  while reviewing the proposed `operator`-tier MCP allowance above, whose
+  extension of the same class of gap to `operator` tokens was caught and
+  not shipped.
 
 ## Threats considered
 
@@ -284,8 +345,12 @@ rotation):
 - **Grace-cache leak on a Postgres commit failure.** Closed (round 4) via
   the RAII `ScopeExit` guard.
 - **Cross-transport privilege widening via a shared securable.** Caught
-  before any code shipped (MCP-twins review); remedy decided, not yet
-  implemented — see "Privilege-escalation finding" above.
+  before any code shipped (MCP-twins review); remedy decided (including a
+  REST-side re-gate), not yet implemented — see "Privilege-escalation
+  finding" above.
+- **Tiered-token self-de-confinement via `ApiToken:Write` minting (`#2945`).**
+  OPEN, no compensating control identified, pre-existing (not introduced or
+  fixed by this feature) — see "Open risks" above.
 
 ## Validation
 
@@ -303,8 +368,16 @@ rotation):
   group-scoped >2-active defensive reject, and a
   `classify_engine_store_error` round-trip. Two cases had their asserted
   contract corrected post-merge (`035099e8`) against the final shape.
-- Reviewer statement: full `--suite server` reported green on integration
-  commit `e1bf2d86`.
+- **Directly verified, 2026-08-10** (not sourced from
+  `~/.local/share/yuzu/test-runs.db` — this was an ad hoc binary invocation,
+  not a `/test`-skill run, so it has no ledger entry there): built
+  `tests-build-server-linux_x64/yuzu_server_tests` from this branch (`e1bf2d86`
+  plus this record's own doc-only commits on top) and ran against live
+  Postgres (`localhost:5433`, `YUZU_TEST_ENABLE_PG=1`). `"[human]"` →
+  **33 test cases, 404 assertions, all passed**. `"[token]"` (broader
+  API-token sanity check) → **161 test cases, 1804 assertions, all passed**.
+  Reproducible via `./tests-build-server-linux_x64/yuzu_server_tests
+  "[human]"` with `YUZU_TEST_POSTGRES_DSN` set.
 
 ## Reviewer
 

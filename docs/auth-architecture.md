@@ -1909,34 +1909,18 @@ this section does not restate them.
   tokens. See `docs/security-reviews/human-token-rotation-2026-08-10.md` for
   the review record.
 - **The identical class of defect then recurred one layer up, in the REST
-  route, and was caught a second time.** The route needs to locate the
-  successor row a `rotate` call just minted in order to return its
-  `token_id`/`expires_at`. The first cut copied the engine rotate route's
-  inline "find the active row whose `supersedes_token_id` is set" loop
-  verbatim — sound on the engine route, because that route's own store arm
-  enforces the per-principal ≤2 ceiling, so at most one linked row can ever
-  exist. On the human arm, with several independent in-flight rotations
-  possible per principal, that loop matches the *first* linked row it finds,
-  not necessarily the one belonging to the predecessor actually rotated.
-  Reproduced end-to-end against live Postgres by **three** independent
-  reviewers with different briefs (round-3 review): `consistency-auditor`
-  and `security-guardian` each returned their own empirical reproduction
-  first; `architect` then returned a third, independent reproduction of the
-  same defect, plus the ruling that the fix belonged at a shared seam rather
-  than as a patched inline loop. Rotating token A then token B (same owner)
-  inside A's overlap window returned **B's raw secret paired with A's
-  successor `token_id`** — confirming that id would have revoked A while B,
-  the token whose secret the caller actually held, stayed live and
-  unconfirmed. Fixed by extracting the derivation into one shared, DB-free,
-  unit-testable seam — `derive_rotation_successor`
-  (`server/core/src/token_rotation_lookup.hpp`) — scoped exactly to the
-  predecessor's own `supersedes_token_id`, so both the REST route today and
-  the MCP twin landing separately call the SAME function rather than
-  re-deriving their own copy. A second inline copy is exactly the drift that
-  produced the bug the first time; the seam extraction itself is the
-  evidence the third review's ruling was acted on — an inline patch on the
-  REST route would have been the cheaper change and was explicitly
-  rejected.
+  route, and was caught a second time.** The route's successor lookup
+  (needed to return the freshly-minted token's `token_id`/`expires_at`)
+  initially copied the engine rotate route's inline "linked-row" loop —
+  sound only under that route's own per-principal ≤2 ceiling, unsound here,
+  where several independent in-flight rotations can exist per principal.
+  Reproduced against live Postgres and fixed by extracting the derivation
+  into one shared, DB-free, unit-testable seam — `derive_rotation_successor`
+  (`server/core/src/token_rotation_lookup.hpp`) — so the REST route today
+  and the MCP twin landing separately both call the same function, rather
+  than each risking its own copy of the same defect. Full reproduction
+  narrative and reviewer attribution:
+  `docs/security-reviews/human-token-rotation-2026-08-10.md`.
 - **Self-service only, enforced at the store seam — not merely the route.**
   Both `rotate_token` and `confirm_token_rotation` reject unless
   `requesting_user` equals the resolved token row's own `principal_id`,
@@ -1952,6 +1936,21 @@ this section does not restate them.
   legitimately cross. An admin who needs to act on another user's token has
   `revoke_token`/`revoke_for_principal` instead; there is no rotate-as-admin
   path, by design.
+- **Under RBAC-on, this composes into an effectively admin-only rotation
+  path — a pre-existing property of the surface, not a new caveat.** REST
+  rotate/confirm gate on `ApiToken:Write`, which the RBAC seed data
+  (`rbac_store.cpp`) grants only to `Administrator` and `ApiTokenManager` —
+  no other built-in role (`Operator`, `PlatformEngineer`, `Viewer`,
+  `ITServiceOwner`) holds it. Composed with the self-service-only
+  requirement immediately above (no admin override), an `Operator`- or
+  `Viewer`-role user who owns a token has **no** RBAC-on path to rotate it
+  themselves, and no admin can do it on their behalf either — the token
+  cannot be rotated by anyone until its owner is separately granted
+  `ApiToken:Write`. This is unchanged by this work (the same gate already
+  governed `POST /api/v1/tokens` and `DELETE /api/v1/tokens/{id}`); it is
+  stated here because "self-service" throughout this section means
+  *self-service subject to holding `ApiToken:Write`*, never *available to
+  any authenticated owner*.
 - **Not an ownership-enumeration oracle.** The non-owner rejection is folded
   into the exact same wording the genuinely-nonexistent-token case uses
   (`"no such token to rotate"` / `"no such token to confirm"`) — a caller
@@ -1993,7 +1992,9 @@ this section does not restate them.
   classifier both transports read through.
 - **Store-layer scope only in this branch.** REST:
   `POST /api/v1/tokens/{id}/rotate` / `.../confirm`
-  (`docs/user-manual/rest-api.md` "API Tokens") — self-service, gated on
+  (`docs/user-manual/rest-api.md` "API Tokens" for the REST reference,
+  `docs/user-manual/authentication.md` "Rotating a Token" for the operator
+  walkthrough) — self-service, gated on
   `ApiToken:Write` (the human permission axis; **not** `Security:Write`,
   which gates the engine admin surface), MFA step-up re-validated on every
   call including an idempotent grace-window re-serve. Telemetry:
@@ -2009,24 +2010,18 @@ this section does not restate them.
   their own `docs/mcp-server.md` / `docs/user-manual/mcp.md` entries when
   they land; do not infer MCP parity for human token rotation from this
   section.
-- **Known residual gaps, tracked, not fixed by this capability:** two
-  pre-existing defects on the sibling **engine** arm were surfaced while
-  building this feature's shared helpers and filed rather than folded in
-  silently — `#2943` (a post-pair-match fallthrough in both arms'
-  `confirm_*` functions reuses the ambiguous-empty string on a positive,
-  terminal state, so a conforming client would retry forever; **the human
-  arm inherits this bug too**, since both arms share the same fallthrough
-  shape) and `#2944` (the engine rotate response's `overlap_expires_at` is
-  read off the successor row, which the store never stamps, so it reports a
-  structural `0`; the human arm does not have this defect — see
-  `token_rotation_lookup.hpp`'s `RotationSuccessorInfo::
-  predecessor_overlap_expires_at` doc comment for why it reads the
-  predecessor instead). A third, broader, pre-existing issue —
-  `#2945` (security-labelled): a `supervised`-tier bearer can mint itself an
-  unconfined token via the existing `POST /api/v1/tokens` route (unrelated
-  to rotation, surfaced while reviewing a proposed tier allowance for the
-  rotation MCP tools) — is tracked separately and is **not** a defect in the
-  rotation capability itself. Full detail in
+- **Known residual gaps, tracked, not fixed by this capability:** three
+  pre-existing issues were surfaced while building this feature and filed
+  rather than folded in silently — `#2943` (a confirm-path fallthrough
+  shared by both arms that the human arm inherits), `#2944` (an
+  engine-only defect; this feature's own REST route does not have it), and
+  `#2945` (security-labelled, an open credential-**minting** escalation on
+  the same `ApiToken:Write` chokepoint this feature's rotate/confirm routes
+  also gate on). None is a defect *in* the shipped rotation code itself. Full
+  detail, mechanism, and compensating-control status — `#2945` in
+  particular is **not** merely "unrelated and tracked separately"; it shares
+  this feature's chokepoint and is recorded as an open risk — are in the
+  security review's "Open risks" section:
   `docs/security-reviews/human-token-rotation-2026-08-10.md`.
 
 ## Agent enrollment (3 tiers)
