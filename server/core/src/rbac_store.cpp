@@ -40,6 +40,11 @@ constexpr const char* kStoreName = "rbac_store";
 // construction before serving, so a wide deadline is fine.
 constexpr std::chrono::milliseconds kReadTimeout{2000};
 constexpr std::chrono::milliseconds kWriteTimeout{4000};
+// sre (Gate 6, #2703): bounds `with_txn_for`'s connection ACQUIRE only
+// (`try_acquire_for`) — not the transaction's own duration once a connection
+// is held. The advisory lock this backfill now takes first (kRevokeCoordLockSql)
+// can block for longer than this if contended; that block is inside the held
+// connection and is not counted against this deadline.
 constexpr std::chrono::milliseconds kBackfillTxnTimeout{60000};
 
 // chaos-injector (Gate 5, #2703, HIGH — CHAOS-1, verified against live PG):

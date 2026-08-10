@@ -192,6 +192,13 @@ public:
     /// legacy store never did (see the implementation comment, #2703).
     /// `role_name`/`securable_type`/`operation` must already be valid FK
     /// targets (an unrecognised triple fails with `unexpected`).
+    ///
+    /// Has NO REST/MCP route today (#2703). Whoever wires one MUST audit
+    /// both outcomes exactly as `assign_role`'s route wiring does — see
+    /// `rest_api_v1.cpp`'s `engine_principal.role.assigned` denied/success
+    /// pair (~line 2277-2299) for the precedent: audit the denial with its
+    /// specific reason before the uniform client-facing error, then audit
+    /// success separately.
     std::expected<void, std::string> remove_permission(const std::string& role_name,
                                                        const std::string& securable_type,
                                                        const std::string& operation);
