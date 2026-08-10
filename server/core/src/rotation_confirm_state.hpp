@@ -89,17 +89,29 @@ classify_confirm_state(const std::vector<ApiToken>& active, const std::string& p
 /// single credential), so the states it needs to discriminate are counted
 /// within one `rotation_group`, never across the whole principal. Mapped 1:1
 /// to a store error string by the caller exactly like `RotationConfirmState`
-/// above; the strings then classify via `engine_store_error_class.hpp`
-/// (`kAmbiguousEmpty` -> Transient; every terminal state below -> Conflict —
-/// this arm has no ClientValidation state, since arriving here already
-/// implies a well-formed, owned, existing token: round 5 adjudication,
-/// arm-parity with `kSoleOtherToken` above is decisive for `kGroupEmpty`).
+/// above; the strings then classify via `engine_store_error_class.hpp`'s TRUE
+/// contract — every terminal state below maps to Conflict OR ClientValidation
+/// (never a blanket "this arm has no ClientValidation state": `kOverfullGroup`
+/// IS one — see its own line below; an earlier round of this comment asserted
+/// the blanket claim and was wrong, per round-6 review. Per-state, as classified
+/// by the store error string each one is mapped to in `api_token_store.cpp`,
+/// not decided here):
+///   kAmbiguousEmpty        -> Transient  (ambiguous with a swallowed read failure).
+///   kOverfullGroup         -> ClientValidation ("more than two active credentials...").
+///   kGroupEmpty            -> Conflict   (positive fact; #2404 exemption, round 5).
+///   kUnresolvedSoleInGroup -> Conflict   ("...unresolved rotation metadata...").
+///   kPairInGroup           -> not itself terminal; falls through to further
+///                             pin/initiator checks in `confirm_token_rotation`,
+///                             each with its own class (Transient or Conflict).
 enum class GroupRotationConfirmState {
     kAmbiguousEmpty,        //!< The PRINCIPAL-WIDE active read was empty — ambiguous with a
                              //!< swallowed SELECT failure (same UP-6 premise as kNoneActive
                              //!< above) -> stays retryable/Transient.
     kOverfullGroup,          //!< >2 active rows share this rotation_group -> defensive,
-                             //!< manual resolution (mirrors kOverfull) -> Conflict.
+                             //!< manual resolution (mirrors kOverfull) -> ClientValidation
+                             //!< (a permanent input/state condition, NOT a rotation-state
+                             //!< conflict — matches the ClientValidation-keyed "more than
+                             //!< two active credentials" substring the emitted string uses).
     kGroupEmpty,             //!< The principal-wide read was NON-empty, but zero of those rows
                              //!< carry this rotation_group. Unlike kAmbiguousEmpty this IS a
                              //!< positive fact, not ambiguous — see the group-filtering note

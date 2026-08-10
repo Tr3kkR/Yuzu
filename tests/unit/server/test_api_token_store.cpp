@@ -700,28 +700,35 @@ std::string raw_hash_column(PgPool& pool, const std::string& token_id) {
     return PQgetvalue(res.get(), 0, 0);
 }
 
-// RAII reset for ApiTokenStore::test_hook_before_rotate_group_read_. A manual
+// RAII reset for any ApiTokenStore `std::function<void(pg_conn*)>` test-only
+// hook member (test_hook_before_rotate_group_read_,
+// test_hook_before_mint_commit_, and any future sibling of the same shape —
+// takes the member BY REFERENCE rather than hardcoding one, so a second
+// hook never needs its own hand-rolled copy of this class). A manual
 // set/clear pair leaves the hook armed for the rest of the TEST_CASE if a
 // REQUIRE/CHECK inside the guarded scope fails (Catch2 throws on assertion
 // failure) — exactly the non-RAII cleanup shape this repo blocks in
-// production code; this guard exists so no future test copies that pattern.
+// production code; this guard exists so no test needs to hand-roll that
+// pattern for a new hook (round 6: a test doing exactly that for
+// test_hook_before_mint_commit_, four REQUIREs deep in the hook body, was
+// the defect this generalisation closes).
 // SAVES AND RESTORES the prior value (rather than resetting to `nullptr`) —
 // today the prior value is always null (the store is otherwise unhooked), but
 // a save/clear-to-null guard would silently corrupt a nested or sequenced use
 // (this exact class re-armed inside another guarded scope, or two of these in
 // the same TEST_CASE), which its own doc comment above invites.
-class ScopedRotateGroupReadHook {
+class ScopedPgConnHook {
 public:
-    ScopedRotateGroupReadHook(ApiTokenStore& store, std::function<void(pg_conn*)> hook)
-        : store_(store), prior_(std::move(store_.test_hook_before_rotate_group_read_)) {
-        store_.test_hook_before_rotate_group_read_ = std::move(hook);
+    ScopedPgConnHook(std::function<void(pg_conn*)>& slot, std::function<void(pg_conn*)> hook)
+        : slot_(slot), prior_(std::move(slot_)) {
+        slot_ = std::move(hook);
     }
-    ~ScopedRotateGroupReadHook() { store_.test_hook_before_rotate_group_read_ = std::move(prior_); }
-    ScopedRotateGroupReadHook(const ScopedRotateGroupReadHook&) = delete;
-    ScopedRotateGroupReadHook& operator=(const ScopedRotateGroupReadHook&) = delete;
+    ~ScopedPgConnHook() { slot_ = std::move(prior_); }
+    ScopedPgConnHook(const ScopedPgConnHook&) = delete;
+    ScopedPgConnHook& operator=(const ScopedPgConnHook&) = delete;
 
 private:
-    ApiTokenStore& store_;
+    std::function<void(pg_conn*)>& slot_;
     std::function<void(pg_conn*)> prior_;
 };
 
@@ -2270,7 +2277,7 @@ TEST_CASE("ApiTokenStore: rotate_token — a query failure in the conflict arm's
     // throws, so it can never leak armed into the rest of this TEST_CASE.
     std::expected<std::string, std::string> retry;
     {
-        ScopedRotateGroupReadHook hook_guard(store, [](pg_conn* conn) {
+        ScopedPgConnHook hook_guard(store.test_hook_before_rotate_group_read_, [](pg_conn* conn) {
             (void)pg::exec_params(conn, "SELECT 1/0", std::vector<std::string>{});
         });
         retry = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice");
@@ -2326,37 +2333,49 @@ TEST_CASE("ApiTokenStore: rotate_token — a COMMIT failure after the mint arm r
 
     REQUIRE(store.rotation_grace_cache_size() == 0);
 
-    store.test_hook_before_mint_commit_ = [&pool](pg_conn* conn) {
-        const int victim_pid = PQbackendPID(conn);
-        REQUIRE(victim_pid > 0);
-        {
-            // A second, independent connection sends the kill — pool size 4
-            // easily covers holding the txn's own lease plus this one.
-            auto axe = pool.acquire();
-            REQUIRE(static_cast<bool>(axe));
-            const std::string kill =
-                "SELECT pg_terminate_backend(" + std::to_string(victim_pid) + ")";
-            PgResult res{PQexec(axe.get(), kill.c_str())};
-            REQUIRE(res.status() == PGRES_TUPLES_OK);
-        }
-        // pg_terminate_backend returns when the signal is SENT, not when the
-        // backend has actually exited (same pattern as test_pg_pool.cpp's
-        // "PgPool discards a connection lost mid-use") — poll on the VICTIM
-        // connection until the client side observes the loss, so the
-        // COMMIT that follows this hook's return genuinely fails rather
-        // than racing a connection that hasn't died yet.
-        bool severed = false;
-        for (int i = 0; i < 100 && !severed; ++i) {
-            PgResult ping{PQexec(conn, "SELECT 1")};
-            severed = ping.status() != PGRES_TUPLES_OK && PQstatus(conn) != CONNECTION_OK;
-            if (!severed)
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-        REQUIRE(severed);
-    };
-
-    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice");
-    store.test_hook_before_mint_commit_ = nullptr;
+    // Scoped (RAII): the hook clears itself even if one of the several
+    // REQUIREs inside its body throws (Catch2 assertion-failure semantics),
+    // so it can never leak armed into the rest of this TEST_CASE — same
+    // discipline as the conflict-arm hook above, via the same guard class.
+    std::expected<std::string, std::string> rotated;
+    {
+        ScopedPgConnHook hook_guard(store.test_hook_before_mint_commit_, [&pool](pg_conn* conn) {
+            const int victim_pid = PQbackendPID(conn);
+            REQUIRE(victim_pid > 0);
+            {
+                // A second, independent connection sends the kill. Bounded
+                // acquire + REQUIRE rather than a bare `pool.acquire()`: this
+                // re-enters the pool from inside a live txn callback while
+                // already holding the txn's own lease — safe today at
+                // size = 4, but a bare acquire would hang CI forever (a
+                // silent self-deadlock) if the pool size were ever reduced.
+                // A bounded wait turns that into a loud, fast test failure
+                // instead.
+                auto axe = pool.try_acquire_for(std::chrono::seconds(5));
+                REQUIRE(static_cast<bool>(axe));
+                const std::string kill =
+                    "SELECT pg_terminate_backend(" + std::to_string(victim_pid) + ")";
+                PgResult res{PQexec(axe.get(), kill.c_str())};
+                REQUIRE(res.status() == PGRES_TUPLES_OK);
+            }
+            // pg_terminate_backend returns when the signal is SENT, not when
+            // the backend has actually exited (same pattern as
+            // test_pg_pool.cpp's "PgPool discards a connection lost
+            // mid-use") — poll on the VICTIM connection until the client
+            // side observes the loss, so the COMMIT that follows this
+            // hook's return genuinely fails rather than racing a connection
+            // that hasn't died yet.
+            bool severed = false;
+            for (int i = 0; i < 100 && !severed; ++i) {
+                PgResult ping{PQexec(conn, "SELECT 1")};
+                severed = ping.status() != PGRES_TUPLES_OK && PQstatus(conn) != CONNECTION_OK;
+                if (!severed)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            REQUIRE(severed);
+        });
+        rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice");
+    }
 
     // The transaction never committed, so rotate_token must report failure...
     REQUIRE_FALSE(rotated.has_value());
