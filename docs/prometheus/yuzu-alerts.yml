@@ -1208,7 +1208,7 @@ groups:
             around each reset. This is a process-health signal, not evidence of a specific
             subsystem fault -- YuzuAuditRetentionNotRunning and the rest of the yuzu-audit
             group cover what a dead reaper causes DURING a loop like this one. Note: at
-            exactly 2 resets in the window this alert stays quiet while
+            2 or 3 resets in the window this alert stays quiet while
             YuzuAuditRetentionNotRunning's own grace does NOT excuse a stalled reaper --
             seeing that alert alone is not evidence this one should also be firing.
             Runbook: docs/ops-runbooks/audit-store-clock-guard.md.
@@ -1248,9 +1248,10 @@ groups:
       # stay quiet, the 30-minute crash loop must still fire.
       #
       # THIS GRACE AND YuzuServerRestartLoop CAN DISAGREE, and that is expected.
-      # At exactly 2 resets in the window this rule's grace does NOT excuse (only
+      # At 2 OR 3 resets in the window this rule's grace does NOT excuse (only
       # `<= 1` does), so a stalled reaper still fires here -- while
-      # YuzuServerRestartLoop's `> 3` stays quiet at 2 resets. An operator seeing
+      # YuzuServerRestartLoop's `> 3` stays quiet at both 2 and 3 resets (the
+      # boundary is exclusive; pinned by the test file). An operator seeing
       # THIS alert alone, with no corroborating restart-loop alert, should not
       # read that as ruling out a restart-related cause; check
       # `resets(yuzu_server_uptime_seconds[3h])` directly rather than inferring it

@@ -249,12 +249,12 @@ problem: target a stable identity.
   dashboard, not this alert.
 
 **This alert and `YuzuAuditRetentionNotRunning` can legitimately disagree.**
-At exactly 2 resets in the window, the retention rule's own grace (`<= 1`)
+At 2 or 3 resets in the window, the retention rule's own grace (`<= 1`)
 does *not* excuse a stalled reaper — it fires — while this alert (`> 3`)
-stays quiet. Seeing `YuzuAuditRetentionNotRunning` fire alone is not evidence
-that a restart loop isn't the cause; check
-`resets(yuzu_server_uptime_seconds[3h])` yourself rather than inferring it
-from which alerts are firing.
+stays quiet at both counts (the boundary is exclusive). Seeing
+`YuzuAuditRetentionNotRunning` fire alone is not evidence that a restart
+loop isn't the cause; check `resets(yuzu_server_uptime_seconds[3h])`
+yourself rather than inferring it from which alerts are firing.
 
 ## YuzuAuditRetentionNotRunning
 

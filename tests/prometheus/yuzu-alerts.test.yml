@@ -184,15 +184,18 @@ tests:
           - labels: 'ALERTS{alertname="YuzuServerRestartLoop", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
 
-  # CASE 31 -- the two rules legitimately DISAGREE at exactly 2 resets: same
-  # series as CASE 26 (install plus two config-fix restarts), but with the
-  # reaper also stalled. YuzuAuditRetentionNotRunning's grace excuses only
-  # `<= 1` reset, so it fires here; YuzuServerRestartLoop's `> 3` stays quiet
-  # at 2. Pins the disagreement as a known, tested contract -- documented in
-  # both rules' comments and the runbook -- rather than an accidental drift
-  # target for a future threshold edit on either rule.
+  # CASE 31 -- the two rules legitimately DISAGREE in the 2-3 reset band (grace
+  # excuses only `<= 1`; the loop alert fires only above `3`). This case pins
+  # one representative point, 2 resets: same series as CASE 26 (install plus
+  # two config-fix restarts), but with the reaper also stalled.
+  # YuzuAuditRetentionNotRunning's grace excuses only `<= 1` reset, so it
+  # fires here; YuzuServerRestartLoop's `> 3` stays quiet at 2 (CASE 27
+  # separately pins the same quiet result at 3, the other point in the band).
+  # Pins the disagreement as a known, tested contract -- documented in both
+  # rules' comments and the runbook -- rather than an accidental drift target
+  # for a future threshold edit on either rule.
   - interval: 1m
-    name: restart loop - disagrees with a stalled retention reaper at exactly 2 resets
+    name: restart loop - disagrees with a stalled retention reaper at 2 resets (band also covers 3)
     input_series:
       - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
         values: "60+60x29 60+60x29 60+60x29"
