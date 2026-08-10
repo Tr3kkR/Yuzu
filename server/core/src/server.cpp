@@ -5352,7 +5352,8 @@ public:
         // decision, keyed on the predecessor's `principal_kind`.
         if (api_token_store_ && api_token_store_->is_open()) {
             engine_rotation_sweep_thread_ = std::thread([this]() {
-                spdlog::info("Engine-credential rotation sweep thread started (interval=60s)");
+                spdlog::info("Rotation sweep thread started (engine-credential + human "
+                             "API-token, interval=60s)");
                 // Successor-unused warnings are process-local, best-effort
                 // de-duplication (mirrors ApiTokenStore's own rotation-grace
                 // cache precedent) — keyed on rotation_group, so the SAME
@@ -5402,7 +5403,7 @@ public:
                     bool sweep_tick_failed = false;
                     auto revoked = api_token_store_->sweep_expired_rotations(now, &sweep_tick_failed);
                     if (sweep_tick_failed) {
-                        spdlog::warn("Engine-credential rotation sweep tick could not run (pool "
+                        spdlog::warn("Rotation sweep tick could not run (pool "
                                      "contention / query failure) — predecessor auto-revoke deferred "
                                      "to the next tick");
                         metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
@@ -5481,18 +5482,18 @@ public:
                         return !still_nearing.contains(group);
                     });
                     } catch (const std::exception& e) {
-                        spdlog::error("Engine-credential rotation sweep tick failed: {}",
+                        spdlog::error("Rotation sweep tick failed: {}",
                                      e.what());
                         metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
                             .increment();
                     } catch (...) {
-                        spdlog::error("Engine-credential rotation sweep tick failed: unknown "
+                        spdlog::error("Rotation sweep tick failed: unknown "
                                       "exception");
                         metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
                             .increment();
                     }
                 }
-                spdlog::info("Engine-credential rotation sweep thread stopped");
+                spdlog::info("Rotation sweep thread stopped");
             });
         }
 

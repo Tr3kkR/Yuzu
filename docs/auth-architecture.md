@@ -1876,6 +1876,152 @@ walkthrough.
     `principal_type='engine'` credential and never derived authority from the
     owner, so the departed user gains nothing. Alert on the metric.
 
+## Human API-token rotation (P2 #11, SOC 2 CC6.3)
+
+Self-service overlap-pair rotation for **human-owned** API tokens —
+`ApiTokenStore::rotate_token`/`confirm_token_rotation`
+(`server/core/src/api_token_store.hpp`), the human-arm sibling of
+`rotate_engine_credential`/`confirm_rotation` documented under "Engine
+principals & delegation" → "Overlap-pair credential rotation" above. This
+section covers the capability's design rationale; the wire surface, error
+matrix, and telemetry are documented once each, cross-referenced below —
+this section does not restate them.
+
+- **Token-keyed, not principal-keyed — because a human is not an engine
+  principal.** The engine arm arbitrates on a **≤2-active-credentials-PER-
+  PRINCIPAL** ceiling, which is sound because an engine principal has
+  exactly one credential by design. That invariant is **false** for a human:
+  `principal_id` is a username, and one person routinely holds several
+  unrelated named tokens at once (a CI token, a personal automation token, an
+  MCP token). A principal-wide ceiling would therefore block rotating *any*
+  one of those tokens the moment the user held a third, unrelated one — a
+  defensive rejection that has nothing to do with the token actually being
+  rotated. `rotate_token`/`confirm_token_rotation` instead key on the TOKEN
+  being rotated and enforce the ≤2 ceiling **per `rotation_group`** — a
+  human's other, unrelated active tokens never count against it
+  (`api_token_store.hpp` "Human arm" doc block). The advisory lock is still
+  taken on `hashtext(principal_id)`, the same key the engine arm and the
+  T12 maintenance sweep use, so all rotation activity for one principal
+  — human or engine — still serializes.
+- **This distinction was caught at plan review, before any code existed** —
+  a copy of the engine arm's principal-keyed ceiling would have shipped a
+  control that silently blocked rotation for any user with more than two
+  tokens. See `docs/security-reviews/human-token-rotation-2026-08-10.md` for
+  the review record.
+- **The identical class of defect then recurred one layer up, in the REST
+  route, and was caught a second time.** The route needs to locate the
+  successor row a `rotate` call just minted in order to return its
+  `token_id`/`expires_at`. The first cut copied the engine rotate route's
+  inline "find the active row whose `supersedes_token_id` is set" loop
+  verbatim — sound on the engine route, because that route's own store arm
+  enforces the per-principal ≤2 ceiling, so at most one linked row can ever
+  exist. On the human arm, with several independent in-flight rotations
+  possible per principal, that loop matches the *first* linked row it finds,
+  not necessarily the one belonging to the predecessor actually rotated.
+  Reproduced end-to-end against live Postgres by two specialists (round-3
+  review): rotating token A then token B (same owner) inside A's overlap
+  window returned **B's raw secret paired with A's successor `token_id`** —
+  confirming that id would have revoked A while B, the token whose secret
+  the caller actually held, stayed live and unconfirmed. Fixed by extracting
+  the derivation into one shared,
+  DB-free, unit-testable seam — `derive_rotation_successor`
+  (`server/core/src/token_rotation_lookup.hpp`) — scoped exactly to the
+  predecessor's own `supersedes_token_id`, so both the REST route today and
+  the MCP twin landing separately call the SAME function rather than
+  re-deriving their own copy. A second inline copy is exactly the drift that
+  produced the bug the first time.
+- **Self-service only, enforced at the store seam — not merely the route.**
+  Both `rotate_token` and `confirm_token_rotation` reject unless
+  `requesting_user` equals the resolved token row's own `principal_id`,
+  checked inside the store itself (both in a pre-transaction lookup and
+  again, authoritatively, on the fresh re-read under the advisory lock — the
+  route-level ownership check that runs first is defense-in-depth on top of
+  this, not a substitute for it). This is a deliberate asymmetry with the
+  engine arm, where the requesting caller is a third-party admin by design:
+  a **human** token's raw successor secret authenticates *as that user*, so
+  an admin re-serving or confirming another user's rotation would be handed
+  (or would complete the cutover of) a credential that impersonates someone
+  else — identity takeover, not a permission gap an admin override could
+  legitimately cross. An admin who needs to act on another user's token has
+  `revoke_token`/`revoke_for_principal` instead; there is no rotate-as-admin
+  path, by design.
+- **Not an ownership-enumeration oracle.** The non-owner rejection is folded
+  into the exact same wording the genuinely-nonexistent-token case uses
+  (`"no such token to rotate"` / `"no such token to confirm"`) — a caller
+  cannot distinguish "this token doesn't exist" from "this token exists but
+  isn't yours" from the error text alone. Mirrors the posture the human
+  `DELETE /api/v1/tokens/{id}` route already takes for a non-owner.
+- **Lifetime-neutral by deliberate choice — rotation cannot be used to
+  extend a grant.** The successor's absolute `expires_at` always inherits
+  the predecessor's verbatim (a perpetual token stays perpetual; a 30-day
+  token stays a 30-day token measured from its own original grant) — never
+  recomputed as `now + 90d`, which would silently extend authorization
+  lifetime through what should be a lateral credential swap. The store-level
+  API retains an internal `successor_expires_at` override parameter (reused
+  by the engine arm's own successor-TTL logic), but the REST route
+  deliberately does not expose it — a senior-architecture ruling, recorded
+  in the security review, that rotation must read as lifetime-neutral in
+  CC6.3 evidence with no caller-controlled escape hatch. A caller that
+  genuinely needs a longer-lived replacement mints a fresh token via `POST
+  /api/v1/tokens` instead, which is a distinct, separately-audited action.
+- **Confirm error taxonomy is adjudicated, not ad hoc** — the state
+  classifier (`rotation_confirm_state.hpp`'s
+  `classify_confirm_state_in_group`, the group-scoped sibling of the
+  engine arm's `classify_confirm_state`) distinguishes a POSITIVE fact
+  (`kGroupEmpty` — the principal-wide active read succeeded and returned
+  rows, but none carry the pinned `rotation_group`: the rotation has
+  already resolved) from a genuinely AMBIGUOUS one (`kAmbiguousEmpty` — the
+  principal-wide read came back empty, indistinguishable from a swallowed
+  `SELECT` failure). `kGroupEmpty` classifies `Conflict` (REST `409` / MCP
+  `kInvalidParams`, terminal — "rotate again if a new rotation is needed",
+  never retry the same confirm); `kAmbiguousEmpty` stays `Transient` (REST
+  `503`, retryable). An earlier round had this backwards — `kGroupEmpty` as
+  `Transient` — which independent architect adjudication corrected before
+  merge: reusing a retryable classification on a permanently-failing state
+  would make a conforming agentic client (one that honours the tool's
+  `idempotentHint`) retry that exact call forever. See the "Confirm replay
+  classification (#2404)" bullet under the engine arm above for the
+  precedent this decision follows, and
+  `engine_store_error_class.hpp`'s file-level doc comment for the shared
+  classifier both transports read through.
+- **Store-layer scope only in this branch.** REST:
+  `POST /api/v1/tokens/{id}/rotate` / `.../confirm`
+  (`docs/user-manual/rest-api.md` "API Tokens") — self-service, gated on
+  `ApiToken:Write` (the human permission axis; **not** `Security:Write`,
+  which gates the engine admin surface), MFA step-up re-validated on every
+  call including an idempotent grace-window re-serve. Telemetry:
+  `docs/observability-conventions.md` + `docs/user-manual/metrics.md`
+  "Human API-token confirm metric (P2 #11)" (`yuzu_api_token_rotation_*`,
+  `yuzu_api_token_confirm_total`, both kind-discriminated from the engine
+  family at the one `rotation_sweep_names_for_kind` chokepoint,
+  `rotation_sweep_naming.hpp`). Audit:
+  `docs/user-manual/audit-log.md` (`api_token.rotate`, `api_token.confirm`,
+  `api_token.reveal`, `api_token.rotation.auto_revoke`,
+  `api_token.rotation.successor_unused`). **MCP tool twins are a separate,
+  still-in-review piece — not yet shipped as of this section** and will add
+  their own `docs/mcp-server.md` / `docs/user-manual/mcp.md` entries when
+  they land; do not infer MCP parity for human token rotation from this
+  section.
+- **Known residual gaps, tracked, not fixed by this capability:** two
+  pre-existing defects on the sibling **engine** arm were surfaced while
+  building this feature's shared helpers and filed rather than folded in
+  silently — `#2943` (a post-pair-match fallthrough in both arms'
+  `confirm_*` functions reuses the ambiguous-empty string on a positive,
+  terminal state, so a conforming client would retry forever; **the human
+  arm inherits this bug too**, since both arms share the same fallthrough
+  shape) and `#2944` (the engine rotate response's `overlap_expires_at` is
+  read off the successor row, which the store never stamps, so it reports a
+  structural `0`; the human arm does not have this defect — see
+  `token_rotation_lookup.hpp`'s `RotationSuccessorInfo::
+  predecessor_overlap_expires_at` doc comment for why it reads the
+  predecessor instead). A third, broader, pre-existing issue —
+  `#2945` (security-labelled): a `supervised`-tier bearer can mint itself an
+  unconfined token via the existing `POST /api/v1/tokens` route (unrelated
+  to rotation, surfaced while reviewing a proposed tier allowance for the
+  rotation MCP tools) — is tracked separately and is **not** a defect in the
+  rotation capability itself. Full detail in
+  `docs/security-reviews/human-token-rotation-2026-08-10.md`.
+
 ## Agent enrollment (3 tiers)
 
 - **Tier 1 (manual approval)** — agents without a token enter a pending queue; admin approves/denies via Settings page. Agents retry and are accepted once approved.
