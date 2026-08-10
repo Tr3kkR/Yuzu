@@ -340,29 +340,42 @@ TEST_CASE("AuthRoutes::require_permission — readonly MCP tier allows Read with
 }
 
 // ---------------------------------------------------------------------------
-// Round-3 security regression guard (P2 #11): an operator-tier MCP token must
-// stay blocked from ApiToken:Write on EVERY transport, including REST — this
-// is the exact chokepoint (`AuthRoutes::require_permission`) that
-// POST /api/v1/tokens (rest_api_v1.cpp, create_token) and its HTMX settings
-// twin POST /api/settings/api-tokens (settings_routes.cpp) both call with
-// (securable_type="ApiToken", operation="Write") and nothing else — there is
-// no route-specific logic downstream of this call for either route, so one
-// test at this seam covers both. A prior round widened this by adding an
-// `ApiToken:Write` case to `tier_allows()`'s operator branch
-// (mcp_policy.hpp) so the two MCP rotation tools could self-service — but
-// that function is keyed on (securable_type, operation), not on the calling
-// tool/route, and is THE function this call reaches, so the same rule
-// admitted every OTHER ApiToken:Write surface: an operator-tier token could
-// then mint a brand-new, CALLER-CHOSEN-TIER (including untiered/perpetual)
-// token bound to the same principal via REST create_token — a privilege
-// escalation, since an untiered token skips tier_allows() entirely on every
-// subsequent call. The fix keeps `tier_allows()` itself supervised-only for
-// ApiToken:Write and instead special-cases `tier == "operator"` at the two
-// rotation tools' own MCP dispatch call sites
-// (`api_token_rotation_tier_allows()` in mcp_server.cpp) — this test locks
-// the shared chokepoint's ANSWER, so a future re-introduction of a
-// securable-keyed exception here fails immediately, on the REST transport,
-// not just in an MCP-only test.
+// Round-3/round-4 security regression guard (P2 #11): an operator-tier MCP
+// token must stay blocked from ApiToken:Write on EVERY transport, including
+// REST — this is the exact chokepoint (`AuthRoutes::require_permission`)
+// that POST /api/v1/tokens (rest_api_v1.cpp, create_token) and its HTMX
+// settings twin POST /api/settings/api-tokens (settings_routes.cpp) both
+// call with (securable_type="ApiToken", operation="Write") and nothing else
+// — there is no route-specific logic downstream of this call for either
+// route, so one test at this seam covers both.
+//
+// A first fix attempt widened THIS EXACT PATH by adding an `ApiToken:Write`
+// case to `tier_allows()`'s operator branch (mcp_policy.hpp) so the two MCP
+// rotation tools could self-service — but that function is keyed on
+// (securable_type, operation), not on the calling tool/route, and is THE
+// function this call reaches, so the same rule admitted every OTHER
+// ApiToken:Write surface: an operator-tier token could then mint a
+// brand-new, CALLER-CHOSEN-TIER (including untiered/perpetual) token bound
+// to the same principal via REST create_token — a privilege escalation,
+// since an untiered token skips tier_allows() entirely on every subsequent
+// call. A second attempt tried to keep `tier_allows()` itself
+// supervised-only for ApiToken:Write and instead special-case
+// `tier == "operator"` at the two rotation tools' own MCP dispatch call
+// sites; that never ran either — mcp_server.cpp's generic tier+approval gate
+// resolves admission from the tool's registered (securable_type, operation)
+// pair thousands of lines before any per-tool branch, so a call-site-local
+// exception was dead code, always pre-empted.
+//
+// The SHIPPED fix maps rotate_api_token/confirm_api_token_rotation (and the
+// REST rotate/confirm routes) onto a DISTINCT operation, `ApiToken:Rotate`,
+// and grants operator-tier `ApiToken:Rotate` in `tier_allows()` — never
+// `ApiToken:Write`. This test locks the shared chokepoint's ANSWER for
+// `ApiToken:Write` specifically, so a future re-introduction of an
+// operator-tier `ApiToken:Write` allowance (securable-scoped OR a
+// resurrected tool-scoped attempt that somehow reaches this path) fails
+// immediately, on the REST transport, not just in an MCP-only test. See
+// "operator MCP tier IS allowed ApiToken:Rotate" below for the positive half
+// — proof that self-service rotation still works via the distinct operation.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("AuthRoutes::require_permission — operator MCP tier is BLOCKED from ApiToken:Write "

@@ -100,6 +100,7 @@ TEST_CASE("authz_model: default_mcp_tier_class matches mcp_policy.hpp's Executio
     CHECK(default_mcp_tier_class(Operation::Approve) == McpTierClass::Write);
     CHECK(default_mcp_tier_class(Operation::Push) == McpTierClass::Write);
     CHECK(default_mcp_tier_class(Operation::Attest) == McpTierClass::Write);
+    CHECK(default_mcp_tier_class(Operation::Rotate) == McpTierClass::Write);
 }
 
 // ── is_valid(): "undeclared means the capability does not exist" ────────
@@ -233,6 +234,7 @@ TEST_CASE("authz_model: min_risk_tier_for never floors below Low, never above Hi
     CHECK(min_risk_tier_for(Operation::Write) == RiskTier::Medium);
     CHECK(min_risk_tier_for(Operation::Execute) == RiskTier::Medium);
     CHECK(min_risk_tier_for(Operation::Attest) == RiskTier::Medium);
+    CHECK(min_risk_tier_for(Operation::Rotate) == RiskTier::Medium);
     CHECK(min_risk_tier_for(Operation::Delete) == RiskTier::High);
     CHECK(min_risk_tier_for(Operation::Approve) == RiskTier::High);
     CHECK(min_risk_tier_for(Operation::Push) == RiskTier::High);

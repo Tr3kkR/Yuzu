@@ -248,26 +248,65 @@ TEST_CASE("MCP Policy: operator tier allows Read + Tag Write + Execute", "[mcp][
     CHECK(!tier_allows("operator", "ManagementGroup", "Write"));
 }
 
-// Round-3 security finding regression guard (P2 #11): tier_allows() itself
-// must NEVER admit operator-tier ApiToken:Write — that rule, once added
-// here, silently widened EVERY ApiToken:Write route/tool on every transport
-// (REST POST /api/v1/tokens create, its settings twin), not just the two
-// rotation tools. AuthRoutes::require_permission/require_scoped_permission
-// (auth_routes.cpp) consult this SAME function for REST, so a securable-
-// keyed rule here is a transport-wide widening, never a tool-scoped one. The
-// two rotation tools' operator-tier admission is intentionally NOT expressed
-// through this function — see api_token_rotation_tier_allows() in
-// mcp_server.cpp and the "MCP rotate_api_token/confirm_api_token_rotation
-// tool-scoped tier check" tests below, which exercise the actual dispatch
-// path instead.
-TEST_CASE("MCP Policy: operator tier does NOT allow ApiToken:Write (round-3 "
-          "security regression guard — must stay tool-scoped, never securable-scoped)",
+// Round-3/round-4 security finding regression guard (P2 #11): tier_allows()
+// must NEVER admit operator-tier ApiToken:Write. An earlier attempt added
+// exactly that rule here to self-service-enable rotate_api_token/
+// confirm_api_token_rotation at the operator tier; it silently widened EVERY
+// ApiToken:Write route/tool on every transport too — REST POST
+// /api/v1/tokens (create) and its settings twin — because
+// AuthRoutes::require_permission/require_scoped_permission (auth_routes.cpp)
+// consult this SAME function for REST. A second attempt tried a tool-scoped
+// exception at the two tools' own mcp_server.cpp call sites instead of
+// touching this function; that was ALSO wrong, but for a different reason —
+// it never ran. mcp_server.cpp's generic "C8" tier+approval gate resolves
+// tier admission from the tool's registered (securable_type, operation) pair
+// for EVERY known-registered tool, ~5,900 lines before any per-tool
+// `if (tool_name == ...)` branch — a call-site-local exception inside that
+// later branch is dead code, always pre-empted by the generic gate's denial.
+//
+// The SHIPPED fix (mcp_policy.hpp's operator branch) is
+// securable×operation-scoped, like every other rule in this function — it
+// grants operator-tier `ApiToken:Rotate`, a DISTINCT RBAC operation from
+// `ApiToken:Write`, never expressed as a tool-name check anywhere. The
+// narrowness that keeps this safe comes from the NEW OPERATION, not from
+// which call site evaluates it: `ApiToken:Rotate` is mapped ONLY by
+// rotate_api_token/confirm_api_token_rotation's kToolSecurityRows entries and
+// the REST rotate/confirm routes' perm_fn calls, so an operator-tier
+// allowance on it cannot reach `POST /api/v1/tokens` or its settings twin,
+// which stay on plain `ApiToken:Write` — supervised-tier-only, completely
+// unaffected by the rule this test pins. See the sibling test below
+// ("... IS allowed ApiToken:Rotate ...") for the positive half, and
+// mcp_server.cpp's kToolSecurityRows / mcp_policy.hpp's tier_allows() for
+// the shipped mechanism.
+TEST_CASE("MCP Policy: operator tier does NOT allow ApiToken:Write (round-3/4 "
+          "security regression guard — ApiToken:Write stays supervised-only; "
+          "self-service rotation is admitted via the DISTINCT ApiToken:Rotate "
+          "operation, never a tool-scoped exception, which is structurally "
+          "unreachable given where the generic C8 tier gate runs)",
           "[mcp][policy][security]") {
     CHECK_FALSE(tier_allows("operator", "ApiToken", "Write"));
     // Confirm this isn't accidentally exempted by the same route/op the two
     // rotation tools' RBAC check separately consults — Read stays allowed by
     // the ordinary operator "Read on everything" rule, but Write must not be.
     CHECK(tier_allows("operator", "ApiToken", "Read"));
+}
+
+// The positive half of the same finding: operator tier DOES allow the new,
+// distinct ApiToken:Rotate operation — this is the actual mechanism that
+// admits rotate_api_token/confirm_api_token_rotation at the operator tier
+// (mcp_server.cpp's generic C8 gate resolves this SAME tier_allows() call
+// from the tools' kToolSecurityRows entries), and it is what gives the REST
+// rotate/confirm routes true parity too (rest_api_v1.cpp maps them onto
+// ApiToken:Rotate as well). See the dispatch-level round trip further below
+// ("self-service round trip at the operator tier ...") for coverage of the
+// actual tool handlers, and test_auth_routes.cpp's
+// "operator MCP tier IS allowed ApiToken:Rotate" for the REST-transport twin
+// of this exact check.
+TEST_CASE("MCP Policy: operator tier DOES allow the distinct ApiToken:Rotate "
+          "operation (the shipped self-service mechanism for "
+          "rotate_api_token/confirm_api_token_rotation)",
+          "[mcp][policy][security]") {
+    CHECK(tier_allows("operator", "ApiToken", "Rotate"));
 }
 
 TEST_CASE("MCP Policy: supervised tier allows everything", "[mcp][policy]") {

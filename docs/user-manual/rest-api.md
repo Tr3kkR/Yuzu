@@ -3865,7 +3865,7 @@ API-token caller's representation to another.
   "version": 1,
   "description": "RBAC permission catalog: ...",
   "securable_types": ["Infrastructure", "InstructionDefinition", "Execution", "..."],
-  "operations": ["Read", "Write", "Execute", "Delete", "Approve", "Push", "Attest"],
+  "operations": ["Read", "Write", "Execute", "Delete", "Approve", "Push", "Attest", "Rotate"],
   "roles": [
     {
       "name": "Administrator",
