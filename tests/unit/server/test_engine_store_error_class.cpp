@@ -152,18 +152,32 @@ TEST_CASE("classify_engine_store_error: human token-keyed arm (P2 #11) new strin
 TEST_CASE("classify_engine_store_error: round-trip over every error string "
           "rotate_token/confirm_token_rotation can emit (round 4 coverage)",
           "[engine_store_error]") {
-    // Every literal error_msg/std::unexpected string reachable from
-    // ApiTokenStore::rotate_token and ApiTokenStore::confirm_token_rotation
-    // (api_token_store.cpp), transcribed verbatim, paired with its expected
-    // class. This is the gap three separate reviewers — including two who
-    // walked the error strings specifically looking for collisions — missed:
-    // a new string that ACQUIRES an existing keyed substring by accident
-    // (the round-4 "no rotation currently pending" defect) is invisible to a
-    // test that only checks the individual new strings in isolation, because
-    // the isolated check doesn't re-verify every OTHER string the same
-    // classifier call must still get right. A future string addition that
-    // silently changes ANY of these results — in either direction — fails
-    // here first.
+    // HONEST SCOPE (round 6 correction — a round-5 report described this as
+    // "extracted programmatically"; it is not, and that claim should not be
+    // repeated). This is a HAND-WRITTEN, HAND-MAINTAINED literal table,
+    // transcribed to match `ApiTokenStore::rotate_token`/`confirm_token_rotation`
+    // (api_token_store.cpp) AT THE TIME OF WRITING — nothing here scans the
+    // source. What it DOES catch: a classifier change (a keyed substring
+    // added/removed/reordered in engine_store_error_class.hpp) that silently
+    // perturbs the class of any string ALREADY LISTED here — e.g. exactly the
+    // round-4 defect, where "no rotation currently pending" acquired an
+    // existing "the rotation was resolved" key by accident, would have shown
+    // up as a flipped CHECK the moment that string was added to this table.
+    // What it does NOT catch: a BRAND NEW error string added to
+    // rotate_token/confirm_token_rotation without a corresponding entry here —
+    // there is no mechanism tying this table's membership to the source, so
+    // an unlisted emission site is silently absent from this test, not
+    // merely unclassified by it. Mitigating factor, not a fix: an
+    // unrecognized string falls through to classify_engine_store_error's
+    // step-7 Transient default, so the blast radius of a missed entry is
+    // over-retry, never a false terminal 400/409.
+    //
+    // The count below is pinned to a security-review-confirmed independent
+    // extraction (round 6) — 38 cases. It does NOT verify this table still
+    // matches the source (see above); it only makes an ACCIDENTAL edit to
+    // THIS table (an entry dropped or duplicated by a future change here)
+    // loud instead of silent. Bump deliberately alongside a real audit of
+    // the two functions' emission sites, never to silence a failing count.
     using E = EngineStoreErrorClass;
     struct Case {
         std::string message;
@@ -231,6 +245,10 @@ TEST_CASE("classify_engine_store_error: round-trip over every error string "
         {"failed to clear successor rotation state on confirm", E::Transient},
         {"confirm failed", E::Transient}, // generic with_txn_for-failed fallback
     };
+
+    // See the TEST_CASE-level comment: this pins accidental drift in THIS
+    // table, not drift between this table and the source.
+    REQUIRE(cases.size() == 38);
 
     for (const auto& c : cases) {
         CAPTURE(c.message);

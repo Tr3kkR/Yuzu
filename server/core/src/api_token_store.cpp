@@ -192,19 +192,21 @@ TokenLookup read_token_by_id_on_conn(PGconn* conn, const std::string& token_id) 
 // file: every use here guards `yuzu::secure_zero` calls, which are noexcept,
 // so — unlike agents/core's `GuardianRollback` — no swallow-on-throwing-
 // cleanup complexity is needed.
-class ScopeExit {
-public:
-    explicit ScopeExit(std::function<void()> fn) : fn_(std::move(fn)) {}
-    ~ScopeExit() {
-        if (fn_)
-            fn_();
-    }
-    ScopeExit(const ScopeExit&) = delete;
-    ScopeExit& operator=(const ScopeExit&) = delete;
-
-private:
-    std::function<void()> fn_;
+//
+// TEMPLATE, not `std::function`-erased (round 6 review): the closures this
+// guards capture 3+ references, which exceeds libstdc++'s small-object
+// buffer, so a `std::function`-typed member would make CONSTRUCTING the
+// guard itself capable of allocating — a `bad_alloc` there would skip past
+// the guard's own construction and leave `candidate_raw` (already generated
+// moments earlier) unscrubbed, the one exit path a heap-allocating guard
+// cannot cover. This template shape is allocation-free (the closure is
+// stored by value, inline, no type erasure) — mirrors
+// `agents/core/src/agent.cpp`'s own `ScopeExit`.
+template <typename F> struct ScopeExit {
+    F fn;
+    ~ScopeExit() { fn(); }
 };
+template <typename F> ScopeExit(F) -> ScopeExit<F>;
 
 } // namespace
 
@@ -1317,11 +1319,10 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
     // the lambda returns, before any function-scope guard could run.
     std::string cached_raw, cached_user;
 
-    // Scrub every local plaintext secret copy that is NOT the value being
-    // returned, unconditionally, on EVERY exit from this function from this
-    // point on — including a thrown exception, which a manual
-    // call-before-every-`return` pair (a prior round of this diff used
-    // exactly that shape) cannot cover.
+    // Scrub every local plaintext secret copy, unconditionally, on EVERY
+    // exit from this function from this point on — including a thrown
+    // exception, which a manual call-before-every-`return` pair (a prior
+    // round of this diff used exactly that shape) cannot cover.
     //   `candidate_raw`  — always speculatively generated before the txn
     //                      opens (Hermes F2); dead/unreturned on the
     //                      re-serve arm or any rejection, and redundant
@@ -1333,8 +1334,23 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
     //   `cached_raw`     — the re-serve arm's local copy of the SAME secret
     //                      already assigned into raw_out — redundant from
     //                      that point on.
-    // `raw_out` itself is deliberately NOT scrubbed here — on success it is
-    // the one-time-reveal value the caller must still receive.
+    //   `raw_out`        — SAFE to scrub unconditionally too (round 6
+    //                      review), not excluded: on the success path
+    //                      `return raw_out;` below moves its contents into
+    //                      the return slot before any local — including
+    //                      this guard — is destroyed, so by the time this
+    //                      fires raw_out is already empty (moved-from) and
+    //                      the scrub is a harmless no-op (secure_zero
+    //                      short-circuits on an empty string). On a
+    //                      FAILURE path it can still hold a live secret —
+    //                      concretely the re-serve arm's cached raw,
+    //                      assigned into raw_out before `with_txn_for`'s
+    //                      OWN commit can still fail on a read-only
+    //                      transaction (the re-serve arm writes nothing) —
+    //                      and that copy must not sit unscrubbed in this
+    //                      frame just because the function is about to
+    //                      discard it (the underlying cache entry / minted
+    //                      row, if any, is untouched either way).
     // NOTE: rotate_engine_credential's own candidate_raw (this file, engine
     // arm) has the same pre-existing gap — out of scope for this diff; a
     // future sweep should close both together.
@@ -1342,6 +1358,7 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
         yuzu::secure_zero(candidate_raw);
         yuzu::secure_zero(grace_raw_out);
         yuzu::secure_zero(cached_raw);
+        yuzu::secure_zero(raw_out);
     }};
 
     // The entire check -> mint -> stamp sequence runs inside ONE transaction
