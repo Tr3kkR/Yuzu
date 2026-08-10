@@ -427,8 +427,9 @@ def gate(promtool_argv: list[str], rules: str, tests: str, canary_for=None) -> i
     # it, a `FAILED` from the suite is about the mutation rather than about I/O.
     #
     # The sweep instrument (blind_band_sweep.py) had the root form of this bug
-    # and its `silent()` states the rule this keeps re-learning: an instrument
-    # that cannot run must say so, never return a value.
+    # in its own now-renamed `silent()`/`measure()`, and the `CouldNotMeasure`
+    # exception it raises states the rule this keeps re-learning: an
+    # instrument that cannot run must say so, never return a value.
     loaded = re.search(r"SUCCESS:\s*(\d+)\s+rules found", canary_check_out)
     if canary_check_rc != 0 or not loaded or int(loaded.group(1)) == 0:
         sys.exit(

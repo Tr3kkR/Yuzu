@@ -128,6 +128,13 @@ jobs:
     # locally, which is what the original 10->15 bump did and is exactly the
     # gap that let step 2 ship with a per-call ceiling the job budget could
     # not actually survive.
+    #
+    # THIS MARGIN IS TEMPORARY. Step 2 only makes 3 (scenario, interval)
+    # `measure()` calls today because its `fresh` scenario's alert
+    # (`YuzuAuditRetentionNeverRan`) doesn't exist yet - see the timeout
+    # warning next to `SCENARIO_ALERTS` in `blind_band_sweep.py`. The rung
+    # that ships it doubles step 2 to 6 calls (~915s alone) and must
+    # re-derive this number, not inherit it.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

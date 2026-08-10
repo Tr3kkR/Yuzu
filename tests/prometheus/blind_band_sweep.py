@@ -129,6 +129,19 @@ SCENARIO_ALERTS = {
     "fresh": "YuzuAuditRetentionNeverRan",
 }
 
+# TIMEOUT BUDGET WARNING (Gate 4 consistency-auditor + Gate 6 sre, both
+# independently, same review wave). `full_sweep()` skips `measure()` entirely
+# for any scenario whose alert isn't in the rules file yet - today that's
+# `fresh`, so only 3 real (scenario, interval) pairs run. The moment a rung D
+# PR adds `YuzuAuditRetentionNeverRan` to `docs/prometheus/yuzu-alerts.yml`,
+# `fresh` becomes real too and this doubles to 6 pairs - roughly doubling
+# step 2's worst-case ceiling in `docs-lint.yml`'s `prometheus-rules` job
+# (see that file's own timeout-minutes comment for the current arithmetic).
+# RE-DERIVE both `docs-lint.yml`'s `timeout-minutes` and
+# `tests/meson.build`'s `'audit retention alert coverage manifest'` `timeout:`
+# in the SAME PR that ships a second scenario's alert - don't leave the old
+# numbers sized for 3 pairs while 6 now run.
+
 DEFAULT_INTERVALS_S = (30, 60, 300)
 DEFAULT_LOW, DEFAULT_HIGH, DEFAULT_STEP = 30, 240, 5
 DEFAULT_MANIFEST = REPO_ROOT / "tests" / "prometheus" / "blind_band_manifest.json"
@@ -137,10 +150,23 @@ SETTLE_MIN = 3 * 60 + 20   # past the [3h] window plus the 15m `for:`
 
 
 def rules_text(ref: str | None) -> str:
+    """The rules file's text, from the worktree or from `--rules <ref>` via
+    `git show`. A bad ref raises `CouldNotMeasure` (caught by `main()`'s
+    existing try/except, giving exit 2 - "could not measure", not a verdict)
+    rather than an uncaught `CalledProcessError`, which would exit 1 - the
+    same code `--check` uses for a genuine coverage mismatch, making the two
+    indistinguishable to anything reading only the exit status (Gate 4
+    unhappy-path review, UP-3). `--rules` is a local/manual flag only; CI
+    never passes it."""
     if ref is None:
         return (REPO_ROOT / RULES).read_text(encoding="utf-8")
-    out = subprocess.run(["git", "show", f"{ref}:{RULES}"], cwd=REPO_ROOT,
-                         capture_output=True, text=True, check=True)
+    try:
+        out = subprocess.run(["git", "show", f"{ref}:{RULES}"], cwd=REPO_ROOT,
+                             capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as ex:
+        raise CouldNotMeasure(
+            f"`git show {ref}:{RULES}` failed (rc {ex.returncode}): "
+            f"{ex.stderr.strip()[:300]}")
     return out.stdout
 
 
@@ -460,22 +486,36 @@ def build_manifest(uncovered: dict, low: int, high: int, step: int,
 
 
 def compare(committed: dict, measured: dict, scenarios: list[str],
-           intervals: tuple[int, ...]) -> list[tuple[str, int, list[int], list[int]]]:
+           intervals: tuple[int, ...]
+           ) -> tuple[list[tuple[str, int, list[int], list[int]]], list[str]]:
+    """`(mismatches, missing_keys)`. A scenario or interval key ABSENT from the
+    committed manifest is reported in `missing_keys` regardless of whether the
+    two sides' cadence sets happen to be equal - a bare set-diff would compare
+    `set()` against `set()` and report nothing wrong if the manifest is
+    missing a key AND that slot's true current measurement is empty (fully
+    covered today), silently defeating the whole gate for that slot (found in
+    Gate 4 unhappy-path review, UP-4)."""
     mismatches = []
+    missing_keys = []
     c_uncovered = committed.get("uncovered", {})
     m_uncovered = measured["uncovered"]
     for scenario in scenarios:
+        if scenario not in c_uncovered:
+            missing_keys.append(f"scenario {scenario!r} absent from the committed manifest")
         c_by = c_uncovered.get(scenario, {}).get("by_interval", {})
         m_by = m_uncovered[scenario]["by_interval"]
         for interval_s in intervals:
             key = str(interval_s)
+            if key not in c_by:
+                missing_keys.append(
+                    f"{scenario}@{interval_s}s absent from the committed manifest's by_interval")
             c_set = set(c_by.get(key, []))
             m_set = set(m_by.get(key, []))
             unexpected = sorted(m_set - c_set)
             stale = sorted(c_set - m_set)
             if unexpected or stale:
                 mismatches.append((scenario, interval_s, unexpected, stale))
-    return mismatches
+    return mismatches, missing_keys
 
 
 def provenance_mismatches(committed: dict, measured: dict) -> list[str]:
@@ -562,9 +602,10 @@ def selftest() -> int:
     # compare(): the set-difference logic that drives the exit-1 path.
     committed = {"uncovered": {"anchored": {"by_interval": {"30": [165, 170]}}}}
     measured = {"uncovered": {"anchored": {"by_interval": {"30": [170, 175]}}}}
-    mismatches = compare(committed, measured, ["anchored"], (30,))
+    mismatches, missing = compare(committed, measured, ["anchored"], (30,))
     check("compare() finds exactly one mismatching (scenario, interval)",
           len(mismatches), 1)
+    check("compare() reports no missing keys when both sides have the key", missing, [])
     if mismatches:
         _, interval_s, unexpected, stale = mismatches[0]
         check("compare() interval", interval_s, 30)
@@ -576,7 +617,20 @@ def selftest() -> int:
           compare({"uncovered": {"anchored": {"by_interval": {"30": [1]}}}},
                   {"uncovered": {"anchored": {"by_interval": {"30": [1]}}}},
                   ["anchored"], (30,)),
-          [])
+          ([], []))
+
+    # UP-4 (Gate 4 unhappy-path): a manifest key ABSENT entirely must be
+    # flagged even when the coincidentally-empty measured set would otherwise
+    # make the comparison look clean - the exact silent-pass this check exists
+    # to close.
+    empty_mismatches, empty_missing = compare(
+        {"uncovered": {}}, {"uncovered": {"anchored": {"by_interval": {"30": []}}}},
+        ["anchored"], (30,))
+    check("compare() flags a missing scenario key even with an empty measured set",
+          empty_missing, ["scenario 'anchored' absent from the committed manifest",
+                          "anchored@30s absent from the committed manifest's by_interval"])
+    check("compare() raises no cadence mismatch for the empty-vs-empty set itself",
+          empty_mismatches, [])
 
     # provenance_mismatches(): a stale manifest whose cadence sets still
     # happen to match must not be waved through on that coincidence alone.
@@ -704,13 +758,15 @@ def main() -> int:
         for reason in provenance:
             print(f"STALE MANIFEST PROVENANCE: {reason}", flush=True)
 
-        mismatches = compare(committed, manifest, scenarios, intervals)
+        mismatches, missing_keys = compare(committed, manifest, scenarios, intervals)
+        for reason in missing_keys:
+            print(f"STALE MANIFEST STRUCTURE: {reason}", flush=True)
         if mismatches:
             for scenario, interval_s, unexpected, stale in mismatches:
                 print(f"{scenario}@{interval_s}s: unexpected={unexpected} stale={stale}",
                      flush=True)
 
-        if provenance or mismatches:
+        if provenance or mismatches or missing_keys:
             print(f"FAIL: measured coverage does not match {args.manifest}. Re-run "
                  f"with --emit and commit the result if this change is intended.",
                  flush=True)
