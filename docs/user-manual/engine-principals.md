@@ -109,11 +109,14 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
   from under you (a dropped rotate response, or simply never picking up the
   new secret, must not end in zero usable credentials). The sweep separately
   warns (an operational signal, not a security alert) whenever the
-  *successor* looks unused — as its own window nears expiry, and again on
-  every tick after the window has elapsed if it is still unused — a sign the
-  new secret was never actually picked up; once that warning is firing past
-  the window's own end, resolve it explicitly (confirm or revoke) rather
-  than assume the sweep will eventually clean it up.
+  *successor* looks unused — once as its own window nears expiry, and once
+  more on crossing into the elapsed state if it is still unused (that row
+  and its metric fire once per pair per state, process-local — a restart
+  re-emits once; the underlying log line, by contrast, repeats every tick
+  once elapsed) — a sign the new secret was never actually picked up; once
+  that warning has fired for the elapsed state, resolve it explicitly
+  (confirm or revoke) rather than assume the sweep will eventually clean it
+  up.
 
 ### 4. Confirm the rotation (optional but recommended)
 

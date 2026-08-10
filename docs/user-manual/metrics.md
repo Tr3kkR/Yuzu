@@ -517,17 +517,21 @@ never closes, so a confirm surfaces the `unresolved rotation metadata` state) �
 **inspect the credential before revoking**, since in that state the sole active
 credential is the good survivor.
 
-**`yuzu_engine_principal_rotation_sweep_capped_total`** (governance UP-5/UP-6, no labels,
-shared across engine-credential and human API-token rotation pairs like
-`..._sweep_failures_total` above): a rotation sweep tick found MORE eligible
-predecessors than its per-tick auto-revoke cap (`kMaxAutoRevokesPerTick`,
-`api_token_store.cpp`) and processed only the cap's worth, deferring the rest to
-later ticks — the clock-guarded-retention routed concern's mandatory
-unconditional cap, applied here (a single forward NTP step must degrade to a
-bounded multi-tick drain, never a fleet-wide cutover in one tick). A sustained
-non-zero rate means the fleet has more concurrent in-flight rotations than the
-cap comfortably drains — raise the cap, or find out why so many rotations are
-in flight at once, rather than ignore it.
+**`yuzu_rotation_sweep_capped_total`** (governance UP-5/UP-6, no labels,
+shared across engine-credential and human API-token rotation pairs — deliberately
+kind-neutral naming, unlike `yuzu_engine_principal_rotation_sweep_failures_total`
+above, because a capped tick is a tick-level property, not attributable to one
+kind's rows; the sibling failures counter keeps its engine-scoped name only
+because renaming an already-shipped series would break existing alerts): a
+rotation sweep tick found MORE eligible predecessors than its per-tick
+auto-revoke cap (`kMaxAutoRevokesPerTick`, `api_token_store.cpp`) and processed
+only the cap's worth, deferring the rest to later ticks — the
+clock-guarded-retention routed concern's mandatory unconditional cap, applied
+here (a single forward NTP step must degrade to a bounded multi-tick drain,
+never a fleet-wide cutover in one tick). A sustained non-zero rate means the
+fleet has more concurrent in-flight rotations than the cap comfortably drains
+— raise the cap, or find out why so many rotations are in flight at once,
+rather than ignore it.
 
 ## Human API-token confirm metric (P2 #11)
 

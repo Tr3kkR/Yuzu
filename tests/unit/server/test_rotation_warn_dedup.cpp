@@ -7,7 +7,7 @@
 // std::unordered_set: each one names a tick sequence and the signals that must
 // come out of it.
 
-#include "../../../server/core/src/rotation_warn_dedup.hpp"
+#include "rotation_warn_dedup.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 

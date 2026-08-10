@@ -2003,6 +2003,12 @@ public:
                           "shared across BOTH engine-credential and human API-token rotation "
                           "pairs; this counter is not split by principal_kind",
                           "counter");
+        // describe() alone does not publish the family — serialize() emits
+        // nothing until counter() has been called at least once, so without
+        // this the series is ABSENT from /metrics (not present-at-zero)
+        // until the first failed tick, and an increase()>0 alert can miss
+        // the first (possibly only) failure.
+        metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total");
         // UP-6 (clock-guarded-retention routed concern, part 5): the sweep's
         // per-tick auto-revoke cap (kMaxAutoRevokesPerTick,
         // api_token_store.cpp) was hit — more eligible predecessors existed
@@ -2011,12 +2017,25 @@ public:
         // property, not attributable to one kind's rows) — makes an
         // in-progress multi-tick drain (deliberate degradation, e.g. after a
         // clock jump) visible/alertable rather than log-only.
-        metrics_.describe("yuzu_engine_principal_rotation_sweep_capped_total",
+        //
+        // Deliberately kind-neutral NAME (`yuzu_rotation_sweep_capped_total`,
+        // not `yuzu_engine_principal_rotation_sweep_capped_total`): a capped
+        // tick is a tick-level property, not attributable to one kind's
+        // rows, so an `engine_principal`-scoped name would be dishonest
+        // naming under this file's own rule (see the "Deliberately a
+        // SEPARATE, parallel family" note in rotation_sweep_naming.hpp) even
+        // though the counter carries no per-kind label. Its sibling
+        // `..._sweep_failures_total` above keeps the engine-scoped name it
+        // shipped under — renaming an already-shipped series would break
+        // existing alerts, so only THIS series (new in this branch, never
+        // shipped) gets the honest name.
+        metrics_.describe("yuzu_rotation_sweep_capped_total",
                           "Cumulative rotation-sweep ticks that hit the per-tick auto-revoke cap "
                           "and deferred the remainder to later ticks - shared across BOTH "
                           "engine-credential and human API-token rotation pairs, not split by "
                           "principal_kind",
                           "counter");
+        metrics_.counter("yuzu_rotation_sweep_capped_total");
         // #2404: confirm-rotation endpoint outcomes, so a 409-conflict or
         // 503-transient retry storm on confirm is alertable instead of
         // invisible (yuzu_http_requests_total has no per-route label). SCOPE
@@ -5439,8 +5458,7 @@ public:
                     // processed counts inside the store — the counter here is
                     // the alertable signal that a drain is in progress.
                     if (sweep_tick_capped) {
-                        metrics_.counter("yuzu_engine_principal_rotation_sweep_capped_total")
-                            .increment();
+                        metrics_.counter("yuzu_rotation_sweep_capped_total").increment();
                     }
                     for (const auto& predecessor : revoked) {
                         // P2 #11: route to the engine or human family/audit

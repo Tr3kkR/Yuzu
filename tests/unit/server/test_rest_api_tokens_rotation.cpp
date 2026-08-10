@@ -25,6 +25,7 @@
 #include "api_token_store.hpp"
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePgShared
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp" // PgConn/PgResult — UP-11 partial-audit REST regression
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
 
@@ -35,6 +36,7 @@
 #include <nlohmann/json.hpp>
 
 #include <httplib.h>
+#include <libpq-fe.h> // PGconn/PQexec/PQconnectdb — UP-11 partial-audit REST regression
 
 #include "../test_helpers.hpp"
 
@@ -671,6 +673,118 @@ TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: overlap_expires_at describes th
     auto succ = h.token_store->get_token(succ_id).value();
     REQUIRE(succ.has_value());
     CHECK(succ->overlap_expires_at == 0); // confirms the response is NOT this
+}
+
+TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: a committed mint whose successor "
+          "read-back fails is audited 'partial', never 'failure' (UP-11) — REST twin of "
+          "the MCP regression in test_mcp_server.cpp, rest_api_v1.cpp:2875",
+          "[pg][rest][token][rotation]") {
+    // UP-11: before this fix, the `!successor.found` branch (successor lookup
+    // fails AFTER rotate_token already succeeded and committed) wrote
+    // `api_token.rotate|failure` — a compliance record claiming no credential
+    // exists when one plainly does. Reproduced deterministically via
+    // `test_hook_before_mint_commit_` (same technique as the MCP twin above):
+    // it hands the mint's OWN connection, still mid-transaction, right before
+    // COMMIT, so poisoning the schema there survives the commit and breaks
+    // every later read on that connection without any threading/wall-clock
+    // race. This needs a DEDICATED database (ApiTokenStorePg-shaped, built by
+    // hand here), NOT the shared-clone RestTokenRotationHarness — a DDL
+    // saboteur poisons the shared clone for every later [pg] test in this
+    // binary (test_api_token_pg_helper.hpp's own warning on
+    // ApiTokenStorePgShared).
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto now = now_epoch();
+    REQUIRE(store.create_token("up11-rest-key", "alice", now + 90 * 24 * 3600, "", "")
+                .has_value());
+    auto listing = store.list_tokens("alice").value();
+    REQUIRE(!listing.empty());
+    const std::string token_id = listing.front().token_id;
+
+    store.test_hook_before_mint_commit_ = [&](PGconn* conn) {
+        pg::PgResult r{PQexec(
+            conn, "ALTER TABLE api_token_store.api_tokens RENAME COLUMN name TO up11_rest_gone")};
+        REQUIRE(r.ok());
+    };
+
+    yuzu::server::test::TestRouteSink sink;
+    yuzu::MetricsRegistry metrics;
+    RestApiV1 api;
+    std::vector<AuditRecord> audit_log;
+
+    auto auth_fn = [](const httplib::Request&,
+                      httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "alice";
+        s.role = auth::Role::user;
+        return s;
+    };
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) -> bool { return true; };
+    auto audit_fn = [&audit_log](const httplib::Request&, const std::string& action,
+                                 const std::string& result, const std::string& target_type,
+                                 const std::string& target_id, const std::string& detail) -> bool {
+        audit_log.push_back({action, result, target_type, target_id, detail});
+        return true;
+    };
+    auto step_up_fn = [](const httplib::Request&, httplib::Response&, const auth::Session&,
+                         const std::string&) -> bool { return true; };
+
+    api.register_routes(sink, auth_fn, perm_fn, audit_fn,
+                        /*rbac_store=*/nullptr,
+                        /*mgmt_store=*/nullptr, &store,
+                        /*quarantine_store=*/nullptr,
+                        /*response_store=*/nullptr,
+                        /*instruction_store=*/nullptr,
+                        /*execution_tracker=*/nullptr,
+                        /*schedule_engine=*/nullptr,
+                        /*approval_manager=*/nullptr,
+                        /*tag_store=*/nullptr,
+                        /*audit_store=*/nullptr,
+                        /*service_group_fn=*/{},
+                        /*tag_push_fn=*/{},
+                        /*inventory_store=*/nullptr,
+                        /*product_pack_store=*/nullptr,
+                        /*sw_deploy_store=*/nullptr,
+                        /*device_token_store=*/nullptr,
+                        /*license_store=*/nullptr,
+                        /*guaranteed_state_store=*/nullptr,
+                        /*metrics_registry=*/&metrics,
+                        /*session_revoke_fn=*/{},
+                        /*execution_event_bus=*/nullptr,
+                        /*result_set_store=*/nullptr,
+                        /*command_dispatch_fn=*/{}, step_up_fn);
+
+    auto res = sink.Post("/api/v1/tokens/" + token_id + "/rotate", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+
+    // THE ASSERTION THIS TEST EXISTS FOR: "partial", never "failure".
+    REQUIRE(!audit_log.empty());
+    const auto& row = audit_log.back();
+    CHECK(row.action == "api_token.rotate");
+    CHECK(row.result == "partial");
+    CHECK(row.detail.find("successor") != std::string::npos);
+
+    // Ground truth: rotate_token really did mint and commit a live successor
+    // — the audit outcome above must match the database, not contradict it.
+    // Queried through a SECOND, independent connection (the pool's own
+    // connections all carry the renamed schema).
+    {
+        pg::PgConn side{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(side.get()) == CONNECTION_OK);
+        pg::PgResult r{PQexec(side.get(),
+                              ("SELECT count(*) FROM api_token_store.api_tokens "
+                               "WHERE supersedes_token_id = '" +
+                               token_id + "' AND revoked = FALSE")
+                                  .c_str())};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "1");
+    }
 }
 
 TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: overlap_secs of the wrong JSON type "

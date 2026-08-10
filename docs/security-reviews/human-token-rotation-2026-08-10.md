@@ -291,11 +291,11 @@ either.
 
 ## Open risks (pre-existing, surfaced by this work)
 
-Three issues were opened while building this feature. None is a defect *in*
+Seven issues were opened while building this feature. None is a defect *in*
 this feature's own new rotate/confirm code, but `#2945` shares this record's
 central chokepoint (`ApiToken:Write`) and the shipped-default (RBAC-off)
 configuration, so it is recorded here as a live open risk, not a footnote.
-Owner: **unassigned** for all three — filed, not yet triaged to an owner.
+Owner: **unassigned** for all seven — filed, not yet triaged to an owner.
 
 - **`#2943`** (Owner: unassigned) — `confirm_rotation` (engine arm) **and**
   `confirm_token_rotation` (human arm, this feature) share a structural
@@ -343,6 +343,71 @@ Owner: **unassigned** for all three — filed, not yet triaged to an owner.
   while reviewing the proposed `operator`-tier MCP allowance above, whose
   extension of the same class of gap to `operator` tokens was caught and
   not shipped.
+- **`#2961`** (Owner: unassigned; **P1, security**) — the rotation
+  **consent record** (the maker-checker attestation that `confirm`
+  produces) is stored durably for its *state* (Postgres: `rotation_group`,
+  `supersedes_token_id`, `overlap_expires_at`, `confirmed_at`) but the
+  operator's *consent to cut over* lives only in a process-local RAM map
+  (`rotation_grace_cache_`). A single server restart inside the overlap
+  window (default 7 days — no unusual configuration required) silently
+  destroys that attestation: `confirm_token_rotation` can never succeed for
+  the pair afterward, `confirmed_at` is never written, and the sweep cuts
+  over on the timer instead with no error surfaced at cutover time — the
+  advertised operator-confirmed-cutover control silently degrades to
+  timer-based cutover, and the compliance record shows nothing amiss.
+  Affects both arms (engine + this feature's human arm); the human arm's
+  consequence is sharper (operator lockout, not just an engine restart). A
+  second-order consequence is that confirm cannot succeed on a replica that
+  did not itself serve the rotate, and that grace entries leak across
+  replicas (never evicted cross-process, including by `revoke_for_principal`
+  deactivation/sign-out-everywhere). Filed by the `unhappy-path` reviewer
+  (UP-1, UP-2, UP-3, UP-13); durability requires new persistent state, which
+  is why it is a separate re-cut rather than a fold into this branch.
+- **`#2962`** (Owner: unassigned) — two unrecoverable terminals in the
+  rotation state machine, both reachable single-instance. (A) `confirm` has
+  no time bound on the grace *entry* itself (only the raw-secret re-serve
+  window is bounded, 120s) and does not consult the successor's
+  `last_used_at`, so an operator whose rotate response was lost in transit
+  can still call confirm on the never-received successor — revoking the
+  predecessor they actually hold and leaving themselves with a token whose
+  secret nobody has. (B) a failed `resolve_rotation_pair_after_revoke`
+  (after an out-of-band revoke/delete of one half of a pair) is logged and
+  dropped with no counter or alert; the survivor keeps its stale
+  `rotation_group` forever, rotate/confirm on it error permanently, and
+  nothing heals it short of a manual DB edit. `unhappy-path` findings UP-4,
+  UP-7; related to `#2961` (the durability root cause) and `#2943`.
+- **`#2963`** (Owner: unassigned; **decision, not a defect**) — the
+  shipped default configuration composes two independently-correct controls
+  (RBAC-off legacy fallback requires `effective_role == admin` for any
+  non-`Read` operation; the store enforces self-service-only rotation with
+  no admin override) into a narrower population than either control
+  describes on its own: only an admin, and only their own tokens, can
+  rotate — a non-admin token owner cannot rotate their own token, and no
+  admin can do it on their behalf. Separately, the Gate 8
+  authority-inheritance guard's tier/scope equality requirement means an
+  interactive (untiered) session cannot rotate its own MCP-tiered or
+  service-scoped token — backwards precisely when rotation matters most
+  (suspected compromise), since the guard requires holding the secret you
+  are trying to replace. And the 24h overlap floor plus verbatim
+  expiry-inheritance mean a token within 24h of expiry cannot be rotated at
+  all. This issue asks Fraser to decide the intended reachable population
+  and end-of-life path, not to implement a fix — `unhappy-path` findings
+  UP-8, UP-9, UP-10, corroborated by the Gate 8 `security-guardian`
+  re-review.
+- **`#2964`** (Owner: unassigned) — the rotation sweep is a bulk
+  wall-clock-driven mutation with none of the seven-part clock-guard shape
+  the routed clock-guarded-retention concern mandates for that class of
+  pass (only the per-tick cap ships in this branch, the "half that always
+  applies"); a forward NTP step would cut over every in-flight rotation
+  fleet-wide in one tick. Separately, the new rotation failure modes are
+  unalertable today: there is no rotate-side metric at all (only confirm
+  has one), `resolve_rotation_pair_after_revoke` failure is uncounted (see
+  `#2962`), `docs/prometheus/yuzu-alerts.yml` was not touched so the four
+  pre-seeded human rotation metric families and `yuzu_api_token_confirm_
+  total` sit at zero with no rule referencing them, and under a future
+  multi-replica deployment the process-local `successor_unused` dedup state
+  would duplicate audit rows and counters N-way. `unhappy-path` findings
+  UP-6, UP-14, UP-16.
 
 ## Threats considered
 

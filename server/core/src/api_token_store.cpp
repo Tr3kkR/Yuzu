@@ -245,17 +245,20 @@ TokenLookup read_token_by_id_on_conn(PGconn* conn, const std::string& token_id) 
 // `agents/core/src/agent.cpp`'s own `ScopeExit`.
 // COPY/MOVE (governance Gate 8, considered and left alone): this is an
 // AGGREGATE, so it has the implicit copy/move constructors, and a copy
-// would run `fn()` TWICE. Deliberately NOT `= delete`d — a user-declared
-// (even deleted) special member function disqualifies a class from being
-// an aggregate, and every construction here goes through the deduction
-// guide's aggregate-init form (`ScopeExit scrub_secrets{lambda}`), which
-// would then fail to compile (no converting constructor exists to take
-// its place). Every use in this file is a single local RAII variable,
-// never copied or moved out of its declaring scope, and a double-fire
-// here is idempotent (`yuzu::secure_zero` on an already-scrubbed/empty
-// string is a no-op) — so the theoretical hazard has no live path. Same
-// reasoning applies to the byte-identical sibling in
-// `agents/core/src/agent.cpp`; keep both aggregate, not just this one.
+// would run `fn()` TWICE. Deliberately NOT `= delete`d. A reviewer verified
+// that deleting copy/move would NOT in fact break the existing call sites —
+// an explicit converting constructor (`explicit ScopeExit(F f) :
+// fn(std::move(f)) {}`) compiles fine alongside deleted copy/move against
+// every `ScopeExit scrub_secrets{lambda}` construction here, so "no
+// converting constructor could take its place" is not the reason to leave
+// this aggregate and copyable. The actual reason: every use in this file is
+// a single local RAII variable, never copied or moved out of its declaring
+// scope, and a double-fire here is idempotent (`yuzu::secure_zero` on an
+// already-scrubbed/empty string is a no-op) — so the theoretical
+// double-fire hazard has no live path, and there is no defect this
+// guard needs deleted copy/move to close. Same reasoning applies to the
+// byte-identical sibling in `agents/core/src/agent.cpp`; keep both
+// aggregate, not just this one.
 template <typename F> struct ScopeExit {
     F fn;
     ~ScopeExit() { fn(); }
@@ -1948,8 +1951,13 @@ std::vector<ApiToken> ApiTokenStore::sweep_expired_rotations(int64_t now, bool* 
                                 // Only auto-revoke a predecessor that still has a
                                 // LIVE successor to cut over to (design §7). If the
                                 // successor was manually revoked/deleted, the
-                                // predecessor is now the principal's ONLY credential
-                                // — auto-revoking it here would leave zero. This
+                                // predecessor is now the ONLY credential for THIS
+                                // ROTATION GROUP — auto-revoking it here would
+                                // leave zero usable credentials for this rotation
+                                // group (not necessarily zero for the principal —
+                                // a human may hold other, unrelated active
+                                // tokens; the guard is scoped to the pair, not the
+                                // principal's whole credential set). This
                                 // races-closes the window before
                                 // resolve_rotation_pair_after_revoke clears the
                                 // predecessor's overlap_expires_at.
@@ -2037,8 +2045,10 @@ std::vector<ApiToken> ApiTokenStore::sweep_expired_rotations(int64_t now, bool* 
             // successor to cut over to. Without this, a successor manually
             // revoked in that window — whose resolve_rotation_pair_after_revoke
             // cleared this predecessor's overlap_expires_at — would still be
-            // revoked here, dropping the principal to ZERO credentials (the
-            // exact §7 invariant). The `overlap_expires_at > 0` check makes
+            // revoked here, dropping THIS ROTATION GROUP to zero usable
+            // credentials (the exact §7 invariant — not necessarily zero for
+            // the principal as a whole, who may hold other unrelated active
+            // tokens). The `overlap_expires_at > 0` check makes
             // resolve's clear authoritative under the lock; the EXISTS is the
             // belt to its suspenders.
             //
@@ -2050,8 +2060,10 @@ std::vector<ApiToken> ApiTokenStore::sweep_expired_rotations(int64_t now, bool* 
             // cheap pre-filter. Never auto-revoke a predecessor whose
             // successor has never been presented — the operator's only copy
             // of that secret may be the one that was lost, and revoking here
-            // would leave the principal with zero usable credentials, the
-            // exact failure this whole guard exists to prevent. The pair
+            // would leave zero usable credentials for this rotation group,
+            // the exact failure this whole guard exists to prevent (not
+            // necessarily zero for the principal as a whole, who may hold
+            // other unrelated active tokens). The pair
             // stays live past its window; `list_rotations_nearing_expiry_
             // unused` keeps warning about it every tick until an operator
             // resolves it explicitly.

@@ -657,7 +657,11 @@ curl -s -b cookies.txt -X POST \
 `confirm` revokes the predecessor immediately and promotes the successor to
 the token's sole active credential. If you skip it, a 60-second background
 sweep auto-revokes the predecessor once the overlap window elapses on its
-own — a longer-running but hands-off path to the same end state.
+own — a longer-running but hands-off path to the same end state — **unless
+the successor was never presented at all, in which case the sweep
+deliberately leaves BOTH credentials active** rather than revoke your only
+working token out from under you (a dropped rotate response, or simply
+never picking up the new secret, must not end in zero usable credentials).
 
 **MFA step-up is required on every call, if you have MFA enrolled — and
 that includes a repeat call.** Unlike most session activity, `rotate` and
