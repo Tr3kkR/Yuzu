@@ -536,14 +536,19 @@ def pull_with_retry() -> bool:
     # added to prevent (#2553, Gate 5). Worst case is now 2x90 + 15 = 195s here,
     # ~30s for the daemon probe and 2x120s for the two promtool runs: ~465s.
     # That is comfortable against meson's 600s, which starts at script launch.
-    # `timeout-minutes` on the `prometheus-rules` job is now 15 (900s), not 10 -
-    # #2854 rung B added a second promtool-driven step (`blind_band_sweep.py
-    # --check`) to the SAME job, sharing this budget rather than getting its
-    # own. This script's own worst case is still ~465-495s of that 900s
-    # covering checkout too; the second step measured 12-17s warm against a
-    # real registry pull in this session, comfortably inside what remains.
-    # Size any FURTHER addition against the job's total budget, not this
-    # number alone - two consumers now draw from it.
+    # `timeout-minutes` on the `prometheus-rules` job is now 20 (1200s), not
+    # 10 - #2854 rung B added a second promtool-driven step
+    # (`blind_band_sweep.py --check`) to the SAME job, sharing this budget
+    # rather than getting its own. Sized to the WORST-CASE SUM of both steps'
+    # own documented ceilings (~465-495s here, ~555s for the second step
+    # after its own Gate 3 review found and fixed an under-sized per-call
+    # timeout - see `docs-lint.yml`'s comment on this job for the full
+    # arithmetic), not to either step's typical measured runtime - sizing to
+    # typical runtime is exactly what let the second step ship with a
+    # per-call ceiling the shared budget could not actually survive if
+    # promtool ever genuinely wedges. Size any FURTHER addition the same way:
+    # against the job's total worst-case budget, not this comment's number
+    # alone - two consumers now draw from it.
     #
     # Two attempts, not three: a transient blip clears in seconds and a second
     # try covers it. This still does not pretend to outlast an anonymous Docker

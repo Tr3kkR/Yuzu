@@ -223,6 +223,35 @@ def case(cadence: int, interval_s: int, scenario: str, alert: str) -> dict:
     }
 
 
+class ArgError(ValueError):
+    """An invalid CLI argument combination, independent of argparse's own
+    type/choice validation."""
+
+
+def resolve_scope(emit: bool, check: bool, alert: str | None, scenario: str,
+                  intervals_str: str) -> tuple[list[str], dict[str, str], tuple[int, ...]]:
+    """Pure validation + derivation of (scenarios, alerts, intervals) from raw
+    CLI values. Raises `ArgError` with a user-facing message on any invalid
+    combination - factored out of `main()` so `--selftest` can exercise these
+    branches with no argparse/toolchain dependency, the same reason
+    `cycles_for`/`case`/`extract`/`compare` are free functions rather than
+    inlined in `main()`."""
+    if emit and check:
+        raise ArgError("--emit and --check are mutually exclusive")
+    scenarios = list(SCENARIO_ALERTS) if scenario == "all" else [scenario]
+    alerts = dict(SCENARIO_ALERTS)
+    if alert:
+        if len(scenarios) != 1:
+            raise ArgError("--alert requires --scenario to name exactly one scenario")
+        alerts[scenarios[0]] = alert
+    try:
+        intervals = tuple(int(x) for x in intervals_str.split(","))
+    except ValueError:
+        raise ArgError(
+            f"--intervals must be a comma-separated list of integers, got {intervals_str!r}")
+    return scenarios, alerts, intervals
+
+
 class CouldNotMeasure(Exception):
     """A run that produced no evidence either way. Never becomes a verdict -
     see the exit-2 arm of `main()`. Named separately from a bare sys.exit so
@@ -311,9 +340,21 @@ def measure(mode: str, native_argv: list[str] | None, tmp_root: Path,
         junit_container = str(d / "out" / "result.xml")
     junit_host = d / "out" / "result.xml"
 
+    # 30s/90s, not 60s/300s. `full_sweep` makes one of these pairs PER
+    # (scenario, interval) - 3 today, more as scenarios gain shipped alerts -
+    # sequentially, so a per-call ceiling compounds into the JOB's ceiling,
+    # not just this call's. Measured warm total for all 3 pairs: ~16s: 90s
+    # already gives >10x headroom per call. Sized this way after build-ci's
+    # Gate 3 review measured that the ORIGINAL 60s/300s pair, summed across 3
+    # sequential calls (1080s), exceeded the 900s `prometheus-rules` job
+    # budget outright if promtool ever genuinely wedges - the exact
+    # opaque-job-timeout failure mode #2553 was fixed to avoid, reopened here
+    # by generous-looking per-call timeouts nobody had summed. Worst case now
+    # 3 x (30+90) = 360s, comfortably inside the budget alongside
+    # pull_with_retry's own documented ~195s ladder.
     try:
         check_p = subprocess.run(base + ["check", "rules", rules_path],
-                                 capture_output=True, text=True, timeout=60)
+                                 capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
         raise CouldNotMeasure(f"{scenario}@{interval_s}s: `check rules` timed out")
     m = re.search(r"SUCCESS:\s*(\d+)\s+rules found", check_p.stdout + check_p.stderr)
@@ -327,7 +368,7 @@ def measure(mode: str, native_argv: list[str] | None, tmp_root: Path,
     try:
         test_p = subprocess.run(
             run_argv + ["test", "rules", "--junit", junit_container, tests_path],
-            capture_output=True, text=True, timeout=300)
+            capture_output=True, text=True, timeout=90)
     except subprocess.TimeoutExpired:
         raise CouldNotMeasure(f"{scenario}@{interval_s}s: `test rules` timed out")
 
@@ -549,6 +590,42 @@ def selftest() -> int:
     check("provenance_mismatches() catches an intervals_s change",
           len(provenance_mismatches(base, {**base, "intervals_s": [30, 60]})), 1)
 
+    # resolve_scope(): the three CLI-validation branches, previously reachable
+    # only by hand-running main() with a specific flag combination.
+    def expect_arg_error(name, fn):
+        try:
+            fn()
+        except ArgError:
+            pass
+        else:
+            failures.append(f"resolve_scope() {name}: expected ArgError, none raised")
+
+    expect_arg_error("--emit and --check together",
+                     lambda: resolve_scope(True, True, None, "all", "30"))
+    expect_arg_error("--alert with --scenario all",
+                     lambda: resolve_scope(False, False, "X", "all", "30"))
+    expect_arg_error("--intervals with a non-integer entry",
+                     lambda: resolve_scope(False, False, None, "all", "30,x"))
+    scenarios, alerts, intervals = resolve_scope(False, False, "Custom", "anchored", "30,60")
+    check("resolve_scope() applies --alert to the one named scenario",
+          alerts["anchored"], "Custom")
+    check("resolve_scope() leaves the other scenario's mapping alone",
+          alerts["fresh"], SCENARIO_ALERTS["fresh"])
+    check("resolve_scope() parses --intervals", intervals, (30, 60))
+
+    # build_manifest(): the shape --emit actually prints, not just its
+    # consumers (compare/provenance_mismatches) against hand-built dicts.
+    m = build_manifest({"anchored": {"alert": "A", "alert_present": True,
+                                     "by_interval": {"30": [1, 2]}}}, 30, 240, 5, (30, 60))
+    check("build_manifest() keys", sorted(m), sorted(
+          ["note", "promtool_image", "grid", "intervals_s", "uncovered"]))
+    check("build_manifest() records the pinned image", m["promtool_image"], PROMTOOL_IMAGE)
+    check("build_manifest() records the grid", m["grid"],
+          {"settle_minutes": SETTLE_MIN, "low": 30, "high": 240, "step": 5})
+    check("build_manifest() records intervals_s as a list", m["intervals_s"], [30, 60])
+    check("build_manifest() passes uncovered through unchanged",
+          m["uncovered"]["anchored"]["by_interval"]["30"], [1, 2])
+
     for f in failures:
         print(f"SELFTEST FAIL: {f}", flush=True)
     print(f"selftest: {'FAIL' if failures else 'ok'}", flush=True)
@@ -577,20 +654,11 @@ def main() -> int:
     ap.add_argument("--step", type=int, default=DEFAULT_STEP)
     args = ap.parse_args()
 
-    if args.emit and args.check:
-        sys.exit("--emit and --check are mutually exclusive")
-
-    scenarios = list(SCENARIO_ALERTS) if args.scenario == "all" else [args.scenario]
-    alerts = dict(SCENARIO_ALERTS)
-    if args.alert:
-        if len(scenarios) != 1:
-            sys.exit("--alert requires --scenario to name exactly one scenario")
-        alerts[scenarios[0]] = args.alert
-
     try:
-        intervals = tuple(int(x) for x in args.intervals.split(","))
-    except ValueError:
-        sys.exit(f"--intervals must be a comma-separated list of integers, got {args.intervals!r}")
+        scenarios, alerts, intervals = resolve_scope(
+            args.emit, args.check, args.alert, args.scenario, args.intervals)
+    except ArgError as ex:
+        sys.exit(str(ex))
     cadences = list(range(args.low, args.high + 1, args.step))
 
     # Every progress/diagnostic print during resolution and measurement goes to

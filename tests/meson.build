@@ -917,7 +917,7 @@ test('audit retention alert coverage manifest',
   _python3_test,
   args: [files('prometheus/blind_band_sweep.py'), '--check'],
   suite: 'docs',
-  timeout: 600,
+  timeout: 900,
 )
 
 # Pure-logic selftest for the sweep (cycles_for, the seconds-resolution grid,

@@ -8,5 +8,5 @@
   (the auto-resolve hole) now shows up as uncovered too, not just a rule that never
   fires at all. A PR that changes `docs/prometheus/yuzu-alerts.yml`'s audit-retention
   rules and widens or narrows that coverage will see this check redden; re-run
-  `python3 tests/prometheus/blind_band_sweep.py --emit` and commit the regenerated
-  manifest alongside the rule change. (#2854)
+  `python3 tests/prometheus/blind_band_sweep.py --emit > tests/prometheus/blind_band_manifest.json`
+  and commit the regenerated manifest alongside the rule change. (#2854)

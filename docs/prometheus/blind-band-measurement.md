@@ -6,9 +6,12 @@ native `promtool` 3.x; the script pins the same image the CI gate uses). `--chec
 `tests/prometheus/blind_band_manifest.json` and is what `.github/workflows/docs-lint.yml`'s
 `prometheus-rules` job runs on every PR as of #2854 rung B — this file is the METHOD, the
 manifest is the RESULT and the gate. A change to `docs/prometheus/yuzu-alerts.yml` that
-widens or narrows coverage shows up as `--check` reddening; the fix is `--emit` again and
-commit the new manifest alongside the rule change, so the diff review sees exactly what
-moved.
+widens or narrows coverage shows up as `--check` reddening; the fix is
+`python3 tests/prometheus/blind_band_sweep.py --emit > tests/prometheus/blind_band_manifest.json`
+(`--emit` only ever prints to stdout — it never writes the file itself) and commit the new
+manifest alongside the rule change, explaining in the PR description which cadences moved
+and why, tied to the rule change — so the diff review sees exactly what moved and why,
+rather than a reflexive regenerate-to-green.
 
 **Read "uncovered" as: a genuinely dead reaper does not produce a continuous alert at this
 restart cadence.** The property inverted from the pre-#2854 version of this script, which
