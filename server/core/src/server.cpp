@@ -1159,6 +1159,52 @@ public:
                           "was held at its prior value — a non-zero rate means that gauge may be "
                           "frozen, not genuinely low",
                           "counter");
+        // ResponseStore observability (ADR-0039). Described + seeded up front so
+        // the HELP/TYPE lines and closed reason/result dimensions export zeros on
+        // an idle server (absent-series alerting stays distinguishable from a
+        // scrape failure).
+        metrics_.describe("yuzu_server_response_ingest_dropped_total",
+                          "Response result rows that did not persist (fail-soft ingest, ADR-0039), "
+                          "by reason (store_not_open/pool_acquire_timeout/query_error/"
+                          "malformed_identity_field) — the executions ladder still tracks the "
+                          "command; a sustained non-zero rate means drawer/TAR result history is "
+                          "silently lossy. malformed_identity_field is distinct: an "
+                          "instruction_id/execution_id/plugin containing an embedded NUL byte was "
+                          "rejected rather than silently truncated (#2691 UP-5) — a non-zero rate "
+                          "here means an agent sent a malformed identity field, not store "
+                          "unhealth",
+                          "counter");
+        metrics_.describe("yuzu_server_response_read_degrade_total",
+                          "Response reads that returned a degrade (nullopt, not empty) rather than "
+                          "a result, by reason (store_not_open/pool_acquire_timeout/query_error) "
+                          "and source (response_store) — the seam distinguishes empty from "
+                          "degraded so a consumer can render a degrade banner, never misread a "
+                          "blip as 'no responses'",
+                          "counter");
+        metrics_.describe("yuzu_server_response_reap_passes_total",
+                          "TTL reap passes (clock-guarded gc_sweep, ADR-0039), by result "
+                          "(swept = deleted the full expired set; capped = deleted the per-pass "
+                          "cap of 10000 and a backlog likely remains — sustained non-zero means "
+                          "expiry is outrunning the drain; noop = nothing expired; declined = "
+                          "retention classifier vetoed a would-wipe/clock-ahead pass; "
+                          "declined_no_anchor = first pass ever against a store with expired rows "
+                          "present, declines once, the next pass drains; skipped_lock = another "
+                          "replica held the advisory lock; failed = pass errored). Alert on the "
+                          "TOTAL (sum across result) not increasing, never on one label alone — "
+                          "see YuzuResponseReapNotRunning.",
+                          "counter");
+        // malformed_identity_field is a write-path-only reason (never a read
+        // degrade) — seeded separately so read_degrade_total doesn't carry a
+        // spurious always-zero series for a reason it can never emit.
+        for (const auto reason :
+             {"store_not_open", "pool_acquire_timeout", "query_error", "malformed_identity_field"})
+            metrics_.counter("yuzu_server_response_ingest_dropped_total", {{"reason", reason}});
+        for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
+            metrics_.counter("yuzu_server_response_read_degrade_total",
+                             {{"reason", reason}, {"source", "response_store"}});
+        for (const auto result : {"swept", "capped", "noop", "declined", "declined_no_anchor",
+                                  "skipped_lock", "failed"})
+            metrics_.counter("yuzu_server_response_reap_passes_total", {{"result", result}});
         // DEX app-perf-over-time (B1/B2) — ingest, rollup, and read-degrade signals.
         // Described up front so the HELP/TYPE lines exist on an idle server (a
         // low-traffic deployment otherwise ships these series invisible until the
@@ -2673,13 +2719,26 @@ public:
             }
         }
 
-        // Initialize response store
-        {
-            auto resp_db = cfg_.db_dir() / "responses.db";
+        // Response store — born-on-SQLite, migrated to Postgres (ADR-0006/0008/0039,
+        // schema `response_store`). Construction fail-CLOSED per ADR-0012 §1 (same
+        // template as ResultSetStore/ScimStore above). NO backfill (ADR-0009
+        // skippable class — ADR-0039): responses are TTL'd operational telemetry,
+        // not authoritative config or compliance evidence, so the legacy
+        // `responses.db` is never read on upgrade. One-time loud boot log records
+        // the deliberate reset.
+        if (pg_pool_ && !startup_failed_) {
             response_store_ =
-                std::make_unique<ResponseStore>(resp_db, cfg_.response_retention_days);
-            if (response_store_->is_open()) {
-                response_store_->start_cleanup();
+                std::make_unique<ResponseStore>(*pg_pool_, cfg_.response_retention_days);
+            if (!response_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: response store migration/open failed "
+                              "(database reachable but the response_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                response_store_->set_metrics(&metrics_);
+                spdlog::warn("[PG] response history reset on Postgres cutover — the legacy "
+                             "responses.db is not migrated (ADR-0039, skippable backfill class); "
+                             "the executions drawer/TAR views self-refill as new commands run");
             }
         }
 
@@ -2764,7 +2823,9 @@ public:
                        seen.size() < dispatched.size()) {
                     ResponseQuery q;
                     q.limit = static_cast<int>(dispatched.size()) + 16;
-                    auto rows = response_store_->query(command_id, q);
+                    // Degrade → empty this iteration; the poll loop retries
+                    // until the deadline (deny-or-benign, not authz — ADR-0039).
+                    auto rows = response_store_->query(command_id, q).value_or(std::vector<StoredResponse>{});
                     for (const auto& r : rows) {
                         if (seen.insert(r.agent_id).second)
                             matched.push_back(r);
@@ -5510,8 +5571,9 @@ public:
         }
         if (analytics_store_)
             analytics_store_->stop_drain();
-        if (response_store_)
-            response_store_->stop_cleanup();
+        // ADR-0039: response_store_ no longer runs an in-process cleanup
+        // thread — reap_expired() piggybacks the result-set maintenance
+        // thread, already joined above. Nothing to stop here.
         if (audit_store_)
             audit_store_->stop_cleanup();
         // GuaranteedStateStore no longer runs its own cleanup thread (ADR-0038):
@@ -5736,6 +5798,12 @@ public:
         // thread that leased it is already joined above; every HTTP/gRPC handler
         // holding the raw pointer is quiesced by the drains above.
         result_set_store_.reset();
+        // ResponseStore (ADR-0039) borrows pg_pool_ — unwire the consumer that
+        // holds the raw pointer (agent_service_'s Subscribe-stream ingest) before
+        // dropping it, then drop before the pool. The maintenance thread that
+        // leased it for reap_expired() is already joined above.
+        agent_service_.set_response_store(nullptr);
+        response_store_.reset();
         // GuaranteedStateStore (ADR-0038): same discipline — null the borrowed
         // pointers in both ingest services (Subscribe loop / gateway
         // ForwardGuardianMessage), then drop the store, BEFORE the pool. The
@@ -10126,10 +10194,38 @@ private:
             else if (op_str == "max")
                 op = AggregateOp::Max;
 
+            // Validate CLIENT input against ResponseStore::aggregate()'s own
+            // allow-lists BEFORE calling in (#2691, Doomgoose finding #2): an
+            // allow-list miss inside aggregate() itself returns nullopt,
+            // which this handler otherwise maps unconditionally to 503 "store
+            // degraded" below — a typo'd group_by/op_column would page the
+            // degrade alert for a healthy database. Bad TARGETED client input
+            // is a 400, not a 503.
+            if (std::find(ResponseStore::allowed_group_by().begin(),
+                          ResponseStore::allowed_group_by().end(),
+                          group_by) == ResponseStore::allowed_group_by().end()) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid group_by"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            auto op_column_param = req.get_param_value("op_column");
+            const std::string effective_op_column = op_column_param.empty() ? "id" : op_column_param;
+            if (std::find(ResponseStore::allowed_op_column().begin(),
+                          ResponseStore::allowed_op_column().end(),
+                          effective_op_column) == ResponseStore::allowed_op_column().end()) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid op_column"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+
             AggregationQuery aq;
             aq.group_by = group_by;
             aq.op = op;
-            aq.op_column = req.get_param_value("op_column");
+            aq.op_column = op_column_param;
 
             ResponseQuery filter;
             if (req.has_param("agent_id"))
@@ -10198,7 +10294,15 @@ private:
                 (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
                                 "scope_dropped=" + std::to_string(agg_dropped) + " surface=aggregate");
 
-            auto results = response_store_->aggregate(instruction_id, aq, filter, agg_scope);
+            auto results_opt = response_store_->aggregate(instruction_id, aq, filter, agg_scope);
+            if (!results_opt) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            const auto& results = *results_opt;
 
             int64_t total_rows = 0;
             nlohmann::json groups = nlohmann::json::array();
@@ -10254,7 +10358,15 @@ private:
                 return;
             }
 
-            auto results = response_store_->query(instruction_id, q);
+            auto results_opt = response_store_->query(instruction_id, q);
+            if (!results_opt) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            auto results = std::move(*results_opt);
 
             // #1634 management-group scope: drop out-of-scope agents' rows before
             // export (mirrors MCP query_responses / the visualization reader). The
@@ -10368,7 +10480,15 @@ private:
                 return;
             }
 
-            auto results = response_store_->query(instruction_id, q);
+            auto results_opt = response_store_->query(instruction_id, q);
+            if (!results_opt) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            auto results = std::move(*results_opt);
 
             // #1634 management-group scope: drop out-of-scope agents' rows before
             // serving (mirrors the export sibling above + MCP query_responses). The
@@ -12895,18 +13015,20 @@ private:
         // gauges. Borrows result_set_store_, execution_tracker_, response_store_
         // and metrics_, so it MUST be joined before any of them are torn down
         // (join sits next to the policy-eval join in stop()).
-        // Started if EITHER store is open (cpp-safety Gate-3 SHOULD / JC-6): the
-        // Guardian retention reap piggybacks this thread, and gating its
-        // existence on result_set_store health would silently stop enforcing
-        // guardian_observations PII TTL if that unrelated store were ever
-        // closed/optional. Both stores fail-closed together at boot today, so
-        // this is defensive against a future refactor; each unit of work below
-        // is independently gated on its own store's is_open().
+        // Started if ANY of the three stores is open (cpp-safety Gate-3 SHOULD /
+        // JC-6): the response and Guardian reaps piggyback this thread, so
+        // gating its existence on result_set_store health alone would silently
+        // stop response-TTL enforcement or guardian_observations PII TTL if
+        // that unrelated store were ever closed/optional. All three stores
+        // fail-closed together at boot today, so this is defensive against a
+        // future refactor; each unit of work below is independently gated on
+        // its own store's is_open().
         if ((result_set_store_ && result_set_store_->is_open()) ||
+            (response_store_ && response_store_->is_open()) ||
             (guaranteed_state_store_ && guaranteed_state_store_->is_open())) {
             result_set_maint_thread_ = std::thread([this]() {
-                spdlog::info("Result-set/Guardian maintenance thread started (cadence=2s, GC=5m, "
-                             "Guardian reap=60m)");
+                spdlog::info("Result-set/response/Guardian maintenance thread started "
+                             "(cadence=2s, GC=5m, response/Guardian reap=60m)");
                 constexpr int kGcEveryNTicks = 150;            // ~5 minutes at 2s/tick
                 // Guardian retention reap (ADR-0038): matches the old SQLite cleanup
                 // thread's 60-minute default cadence (cleanup_interval_min). Piggybacks
@@ -12914,6 +13036,12 @@ private:
                 // guarded/advisory-locked pass regardless of which thread calls it.
                 constexpr int kGuardianReapEveryNTicks = 1800; // ~60 minutes at 2s/tick
                 constexpr int64_t kPendingTimeoutSeconds = 300; // give up waiting after 5m
+                // ADR-0039: response_store_'s reap_expired() piggybacks this same
+                // thread at a ~60-minute cadence (matches the old in-process
+                // cleanup thread's default `cleanup_interval_min`), independently
+                // is_open-gated (JC-6 decoupling — a response-store outage must
+                // not wedge the result-set GC/materialize work above).
+                constexpr int kResponseReapEveryNTicks = 1800; // ~60 minutes at 2s/tick
                 int tick = 0;
                 while (!stop_requested_.load(std::memory_order_acquire)) {
                     for (int i = 0; i < 2 && !stop_requested_.load(std::memory_order_acquire); ++i)
@@ -12925,12 +13053,20 @@ private:
                                                 std::chrono::system_clock::now().time_since_epoch())
                                                 .count();
 
+                        // Each unit of work below is INDEPENDENTLY is_open-gated
+                        // (JC-6): the thread starts if any of the three stores is
+                        // open, so a closed result-set store must not crash the
+                        // response/Guardian reaps (or vice-versa). `tick`
+                        // increments unconditionally so a closed result-set store
+                        // never starves the response/Guardian reap cadences.
+                        const bool rs_ok = result_set_store_ && result_set_store_->is_open();
+                        ++tick;
+
                         // 1) Materialise terminal pending sets (result-set store
-                        // only; the thread may be running solely for the Guardian
-                        // reap — JC-6 decoupling).
-                        for (const auto& p : (result_set_store_ && result_set_store_->is_open())
-                                                 ? result_set_store_->list_pending()
-                                                 : std::vector<yuzu::server::PendingSet>{}) {
+                        // only; the thread may be running solely for the response
+                        // or Guardian reap — JC-6 decoupling).
+                        if (rs_ok)
+                        for (const auto& p : result_set_store_->list_pending()) {
                             if (p.source_execution_id.empty())
                                 continue;
                             bool terminal = false;
@@ -12952,8 +13088,14 @@ private:
                             std::vector<std::string> members;
                             std::unordered_set<std::string> seen;
                             if (response_store_) {
-                                for (const auto& r :
-                                     response_store_->query_by_execution(p.source_execution_id)) {
+                                auto rows = response_store_->query_by_execution(p.source_execution_id);
+                                if (!rows) {
+                                    // Degraded read: skip materializing THIS pending set
+                                    // this tick rather than risk a false-empty membership
+                                    // (ADR-0039) — it retries on the next 2s tick.
+                                    continue;
+                                }
+                                for (const auto& r : *rows) {
                                     if (!rs_matcher::response_matches(p.matcher, r.status, r.output))
                                         continue;
                                     if (seen.insert(r.agent_id).second)
@@ -12978,10 +13120,8 @@ private:
                             }
                         }
 
-                        // 2) GC sweep on the slow cadence (result-set store only).
-                        ++tick;
-                        if (result_set_store_ && result_set_store_->is_open() &&
-                            tick % kGcEveryNTicks == 0) {
+                        // 2) GC sweep on the slow cadence.
+                        if (rs_ok && tick % kGcEveryNTicks == 0) {
                             int swept = result_set_store_->gc_sweep();
                             if (swept > 0) {
                                 metrics_.counter("yuzu_result_set_gc_total")
@@ -12990,7 +13130,14 @@ private:
                             }
                         }
 
-                        // 2b) Guardian retention reap (ADR-0038) on its own, much
+                        // 2b) Response-store retention reap (~60m cadence, ADR-0039) —
+                        // replaces the old in-process cleanup thread.
+                        if (response_store_ && response_store_->is_open() &&
+                            tick % kResponseReapEveryNTicks == 0) {
+                            response_store_->reap_expired();
+                        }
+
+                        // 2c) Guardian retention reap (ADR-0038) on its own, much
                         // slower cadence — piggybacks on this thread's tick counter,
                         // independently gated on the Guardian store's own health.
                         if (guaranteed_state_store_ && guaranteed_state_store_->is_open() &&
@@ -12998,8 +13145,8 @@ private:
                             guaranteed_state_store_->reap_expired();
                         }
 
-                        // 3) Refresh alive gauges (result-set store only).
-                        if (result_set_store_ && result_set_store_->is_open()) {
+                        // 3) Refresh alive gauges.
+                        if (rs_ok) {
                             auto c = result_set_store_->counts();
                             metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "true"}})
                                 .set(static_cast<double>(c.pinned));
@@ -13368,7 +13515,7 @@ private:
                     return out;
                 ResponseQuery q;
                 q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
-                for (const auto& r : response_store_->query(command_id, q))
+                for (const auto& r : response_store_->query(command_id, q).value_or(std::vector<StoredResponse>{}))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
@@ -13590,7 +13737,7 @@ private:
                     return out;
                 ResponseQuery q;
                 q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
-                for (const auto& r : response_store_->query(command_id, q))
+                for (const auto& r : response_store_->query(command_id, q).value_or(std::vector<StoredResponse>{}))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
@@ -13926,8 +14073,11 @@ private:
                     return {};
                 ResponseQuery q;
                 q.limit = 50000; // > cohort cap (20000) with headroom; keyset paging is a follow-up
+                // Degrade → empty (ADR-0039 deny-or-benign): reads as "no agent
+                // has responded yet", never a fabricated stage transition.
                 return deployment::best_response_per_agent(
-                    response_store_->query_by_execution(execution_id, q));
+                    response_store_->query_by_execution(execution_id, q)
+                        .value_or(std::vector<StoredResponse>{}));
             },
             audit_fn, preflight_run_store_.get(), deployment_run_store_.get());
 
@@ -13956,7 +14106,7 @@ private:
                     return out;
                 ResponseQuery q;
                 q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
-                for (const auto& r : response_store_->query(command_id, q))
+                for (const auto& r : response_store_->query(command_id, q).value_or(std::vector<StoredResponse>{}))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
