@@ -646,6 +646,18 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
 std::expected<void, ConsumeError>
 ApprovalManager::consume_ticket(const std::string& id, const std::string& consumed_by,
                                 const ConsumePrecondition& precondition) {
+    // These three guards are NOT store faults — `extended_errcode` stays at
+    // its default 0, which routes `approval_store_error_body` to the
+    // TRANSIENT arm ("retry this call unchanged") for `!db_` too, correctly,
+    // since `!mgr.is_open()` independently forces the permanent arm there.
+    // For the other two (empty id/consumed_by), "retry unchanged" is
+    // misleading — these are caller/argument errors, not conditions that
+    // clear on their own. Harmless today: the MCP recall (the sole
+    // production caller) pre-validates a non-empty `supplied_id` before
+    // calling, and `consumed_by` is the session's own username, never empty
+    // for an authenticated caller. A future caller that reaches this
+    // function without that pre-validation should not trust the transient
+    // wording for these two cases.
     if (!db_)
         return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, "database not open"});
     if (id.empty())
