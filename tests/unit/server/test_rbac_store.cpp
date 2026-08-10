@@ -1186,8 +1186,12 @@ namespace {
 // fixture: one custom role with a grant, a direct user assignment, a local group
 // with a member, and the rbac_config('enabled') row set to `enabled`.
 void make_legacy_rbac_db(const std::filesystem::path& path, bool enabled) {
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open_v2(path.string().c_str(), &db,
+    // adversarial-review (PR #2703, BLOCKER): raw sqlite3* with manual cleanup
+    // leaked the handle on a REQUIRE failure between open and the final
+    // sqlite3_close below — the same pattern already fixed elsewhere in this
+    // file (e.g. the R2/F1 tests above) via SqliteDb RAII, missed here.
+    SqliteDb db;
+    REQUIRE(sqlite3_open_v2(path.string().c_str(), db.addr(),
                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
     const char* ddl =
         "CREATE TABLE securable_types (name TEXT PRIMARY KEY, description TEXT, is_system INTEGER);"
@@ -1207,12 +1211,11 @@ void make_legacy_rbac_db(const std::filesystem::path& path, bool enabled) {
         "INSERT INTO principal_roles VALUES ('user', 'alice', 'CustomRole');"
         "INSERT INTO groups VALUES ('team-a', 'a local team', 'local', '', 7);"
         "INSERT INTO group_members VALUES ('team-a', 'bob');";
-    char* err = nullptr;
-    REQUIRE(sqlite3_exec(db, ddl, nullptr, nullptr, &err) == SQLITE_OK);
+    SqliteErrMsg err;
+    REQUIRE(sqlite3_exec(db.get(), ddl, nullptr, nullptr, err.addr()) == SQLITE_OK);
     std::string cfg = std::string("INSERT INTO rbac_config VALUES ('enabled', '") +
                       (enabled ? "true" : "false") + "');";
-    REQUIRE(sqlite3_exec(db, cfg.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
-    sqlite3_close(db);
+    REQUIRE(sqlite3_exec(db.get(), cfg.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
 }
 } // namespace
 
