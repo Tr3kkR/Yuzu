@@ -604,7 +604,15 @@ server `PgPool`).
   specifically to prevent that.) An unreadable **or non-canonical** durable
   flag also refuses boot — a value other than exactly `true`/`false` is
   rejected both by a schema-level constraint on write and by a strict parse on
-  every read, rather than being silently treated as `false`.
+  every read, rather than being silently treated as `false`. That schema-level
+  constraint is itself a migration, so on the (unexpected) case of a
+  non-canonical value already sitting in the row from before this upgrade — a
+  hand-edit or a bug on an old release — the migration's own `ALTER TABLE ...
+  ADD CONSTRAINT` fails validation and the server refuses to boot with a raw
+  Postgres `23514 check_violation` rather than the app's own message. Recovery:
+  connect directly and correct the row (`UPDATE rbac_meta SET value = 'false'
+  WHERE key = 'rbac_enabled'`, or `'true'` if RBAC was genuinely enabled) before
+  restarting.
 - The legacy `rbac.db` file is **moved aside** only after the backfill is
   verified. It is never read again; keep the moved-aside copy until you have
   confirmed RBAC behaves as expected, then remove it.
