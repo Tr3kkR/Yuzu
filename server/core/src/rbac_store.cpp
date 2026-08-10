@@ -2485,11 +2485,25 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
     // docs/postgres-store-playbook.md "Local source absence never creates
     // terminal migration state on its own", #2697): the marker and its
     // source fingerprint are ALWAYS stamped together, in the SAME
-    // transaction, matching AuditStore's fixed reference. The PQcmdTuples
-    // check on the fingerprint insert is the same anti-pattern rule this
-    // playbook lists separately ("trusting PGRES_COMMAND_OK on ON CONFLICT
-    // DO NOTHING to mean YOUR value won") — a lost race here means some
-    // OTHER writer's fingerprint is now the trust anchor, not this call's.
+    // transaction, matching AuditStore's fixed reference.
+    //
+    // governance re-review (Sol, verified empirically against real Postgres
+    // before shipping — see the promotion table this SQL was checked
+    // against): the fingerprint write is a MONOTONIC PROMOTION, not a plain
+    // first-writer-wins race, because "sourceless" carries no evidence worth
+    // protecting. A real fingerprint may promote a stored "sourceless"
+    // value (a fileless sibling stamped first, then this replica's real
+    // migration lands); a stored REAL value is never overwritten by anyone,
+    // sourceless or real-but-different; a writer whose value already equals
+    // what's stored counts as success, not a lost race (closes a same-
+    // fingerprint lockout the WHERE-less DO NOTHING version had: two
+    // replicas sharing storage, both migrating the identical real file,
+    // simultaneous boot — the loser used to fail even though the values
+    // matched). RETURNING + PQntuples() (not PQcmdTuples on a DO NOTHING) is
+    // the correct read of "did this call's value end up as the stored one":
+    // 1 row means it did (fresh insert, promotion, or already-equal); 0 rows
+    // means a DIFFERENT real value already won and this call's write was
+    // rejected by the WHERE clause.
     const auto stamp_complete = [&](std::string_view source_fingerprint) -> bool {
         return pool_.with_txn_for(
             kBackfillTxnTimeout, [source_fingerprint](PGconn* c) -> bool {
@@ -2506,19 +2520,20 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                 pg::PgResult fp = pg::exec_params(
                     c,
                     "INSERT INTO rbac_store.rbac_meta (key, value) VALUES "
-                    "('backfill_source_fingerprint', $1) ON CONFLICT (key) DO NOTHING",
+                    "('backfill_source_fingerprint', $1) ON CONFLICT (key) DO UPDATE SET "
+                    "value = EXCLUDED.value WHERE rbac_store.rbac_meta.value = 'sourceless' OR "
+                    "rbac_store.rbac_meta.value = EXCLUDED.value RETURNING value",
                     std::vector<std::string>{std::string(source_fingerprint)});
-                if (fp.status() != PGRES_COMMAND_OK) {
+                if (fp.status() != PGRES_TUPLES_OK) {
                     spdlog::error(
                         "RbacStore: migrate_from_sqlite: source-fingerprint stamp failed: {}",
                         PQerrorMessage(c));
                     return false;
                 }
-                if (std::string(PQcmdTuples(fp.get())) == "0" &&
-                    source_fingerprint != kSourcelessFingerprint) {
+                if (PQntuples(fp.get()) == 0 && source_fingerprint != kSourcelessFingerprint) {
                     spdlog::error(
                         "RbacStore: migrate_from_sqlite: lost the race to record this backfill's "
-                        "own source fingerprint — another writer already stamped "
+                        "own source fingerprint — a DIFFERENT real fingerprint already stamped "
                         "backfill_source_fingerprint between this pass's marker-absent check and "
                         "this commit. Refusing to report success; a retry will find the marker "
                         "present and go through holder-side fingerprint verification instead.");

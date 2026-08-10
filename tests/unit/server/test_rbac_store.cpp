@@ -1273,6 +1273,80 @@ TEST_CASE("RbacStore: migrate_from_sqlite's fingerprint does not collide on a de
     CHECK(std::filesystem::exists(legacy_b.path)); // refused, never moved aside
 }
 
+// governance re-review (PR #2703, HIGH — chaos-injector/unhappy-path,
+// independently): the race stamp_complete's fingerprint upsert resolves is
+// only reachable through genuine concurrency between two migrate_from_sqlite
+// callers (a fileless replica's marker-absent check racing a real replica's
+// slower migration) — the public API's own step-2 idempotency check makes a
+// SEQUENTIAL two-call repro of the full end-to-end race impossible (whichever
+// call completes first makes the second see "marker already present" and
+// take the verify branch, never reaching stamp_complete at all). A fixed
+// timing-dependent thread race, forcing the exact interleaving, would need a
+// test-only pause hook inside migrate_from_sqlite — exactly the
+// disproportionate-for-this-round complexity advisor input flagged when this
+// fix was scoped.
+//
+// DISCLOSED LIMITATION: this test therefore verifies the upsert's SQL
+// semantics directly against Postgres (the same three cases checked by hand
+// before this was shipped) using a COPY of stamp_complete's fingerprint
+// query, not a call into stamp_complete itself (a private lambda with no
+// external call site). The copy is NOT auto-synced — if stamp_complete's
+// fingerprint UPSERT in rbac_store.cpp ever changes, this copy must be
+// updated to match or this test silently stops covering the real code.
+TEST_CASE("RbacStore: backfill_source_fingerprint upsert promotes sourceless, protects a real "
+          "value, and accepts a matching value (governance re-review, PR #2703)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    REQUIRE(store.migrate_from_sqlite("/nonexistent/path/rbac.db")); // seeds 'sourceless'
+
+    const auto stamp = [&](const std::string& value) -> int {
+        auto lease = rbac_pool_fx_.acquire();
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "INSERT INTO rbac_store.rbac_meta (key, value) VALUES "
+            "('backfill_source_fingerprint', $1) ON CONFLICT (key) DO UPDATE SET "
+            "value = EXCLUDED.value WHERE rbac_store.rbac_meta.value = 'sourceless' OR "
+            "rbac_store.rbac_meta.value = EXCLUDED.value RETURNING value",
+            std::vector<std::string>{value});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return PQntuples(r.get());
+    };
+    const auto stored_value = [&]() -> std::string {
+        auto lease = rbac_pool_fx_.acquire();
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "SELECT value FROM rbac_store.rbac_meta WHERE key = 'backfill_source_fingerprint'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(r.get()) == 1);
+        return PQgetvalue(r.get(), 0, 0);
+    };
+    REQUIRE(stored_value() == "sourceless");
+
+    // A real fingerprint promotes a stored sourceless placeholder — 1 row.
+    CHECK(stamp("v2:real_A") == 1);
+    CHECK(stored_value() == "v2:real_A");
+
+    // A DIFFERENT real fingerprint may not overwrite the now-real value — 0
+    // rows, and the stored value is untouched.
+    CHECK(stamp("v2:real_B") == 0);
+    CHECK(stored_value() == "v2:real_A");
+
+    // The SAME real fingerprint writing again (two replicas sharing storage,
+    // both migrating identical content, one loses only the INSERT race, not
+    // the content race) counts as success, not a lost race — 1 row.
+    CHECK(stamp("v2:real_A") == 1);
+    CHECK(stored_value() == "v2:real_A");
+
+    // A sourceless writer never overwrites an established real value — 0
+    // rows (non-error for the sourceless caller per stamp_complete's own
+    // exemption, exercised at the migrate_from_sqlite level elsewhere).
+    CHECK(stamp("sourceless") == 0);
+    CHECK(stored_value() == "v2:real_A");
+}
+
 TEST_CASE("RbacStore: migrate_from_sqlite returns false on an unopened store", "[rbac_store][pg]") {
     PgPool bad{{.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1",
                 .size = 1}};
