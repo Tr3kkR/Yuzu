@@ -103,12 +103,15 @@ every principal→role grant, groups, and membership. Losing them silently rever
 seeded defaults — an authorization change nobody authorized. So a one-time streamed, idempotent,
 resumable, reconciled, **fail-CLOSED** backfill from the legacy `rbac.db` (the ADR-0040 shape),
 seeding defaults first then backfilling operator rows via `ON CONFLICT DO NOTHING`. A built-in
-default the operator explicitly revoked before upgrading is **deleted** post-seed rather than
-silently restored, scoped to (role, securable_type) pairs the legacy catalogue actually knew
-about — a securable a later seed adds (e.g. `EnginePrincipal`, #2376) is untouched. Beyond the
-one-time cutover, revoking a built-in default now records an explicit deny rather than deleting
-the row, since the idempotent reseed runs on every boot and a genuinely absent row would
-otherwise have nothing to block it from returning (fjarvis #2703 F1).
+default the operator explicitly revoked before upgrading is **denied** post-seed (an explicit
+`effect='deny'` tombstone, never deleted), scoped to (role, securable_type) pairs the legacy
+catalogue actually knew about — a securable a later seed adds (e.g. `EnginePrincipal`, #2376) is
+untouched. This mirrors `remove_permission()`'s own permanent mechanism for the identical hazard
+beyond the one-time cutover — the idempotent reseed runs on every boot, and a deleted row has
+nothing to block it from being silently reinserted on the very next restart (fjarvis #2703 F1;
+an initial version of this backfill fix used DELETE and reintroduced exactly that hazard for the
+one-time case, caught by Gate 4 happy-path review before merge and closed with the same
+deny-tombstone mechanism).
 
 **The `rbac_enabled` flag is the single most dangerous row to lose.** If an operator ENABLED RBAC
 and the flag is not carried across, the fleet silently boots RBAC-**off** — every confined

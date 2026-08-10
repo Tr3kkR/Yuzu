@@ -657,42 +657,61 @@ void RbacStore::maybe_refresh_generation() const {
             }
         }
     }
-    std::lock_guard lock(cache_mtx_);
-    if (saw_non_canonical_enabled) {
+    // consistency-auditor (Gate 4, #2703): the Gate 3 fix moved the
+    // stale-beyond-bound degrade outside cache_mtx_ specifically because
+    // note_read_degrade()'s metrics-registry lock chain can block for a
+    // whole Prometheus scrape, and cache_mtx_ is the sole authz-check
+    // serialization point — every concurrent check_permission() call (even
+    // a cache HIT) needs it too. That same reasoning applies to these two
+    // sibling branches; only the STATE MUTATIONS stay under the lock, and
+    // which degrade(s) to fire is decided as plain bools first.
+    bool fire_non_canonical_degrade = saw_non_canonical_enabled;
+    bool fire_refresh_failed_degrade = false;
+    {
+        std::lock_guard lock(cache_mtx_);
+        if (!durable_gen) {
+            // Fail toward "assume changed": drop the cache and stop trusting
+            // it. Do NOT touch rbac_enabled_ — flipping it to disabled would
+            // be fail-open.
+            fire_refresh_failed_degrade = true;
+            perm_cache_.clear();
+            generation_valid_ = false;
+        } else {
+            // The refresh genuinely landed — this is the ONLY place (besides
+            // boot and a local write) that earns a last_successful_refresh_ms_
+            // update.
+            last_successful_refresh_ms_ = now_ms();
+            if (durable_enabled)
+                rbac_enabled_.store(*durable_enabled, std::memory_order_relaxed);
+            // Adopt the durable generation only when it moves FORWARD (Gate 3
+            // cpp-safety): the SELECT above ran lock-free, so a concurrent
+            // local apply_local_generation may have advanced cached_generation_
+            // past what we read — never regress it (that would wrongly clear a
+            // just-populated cache and re-anchor to a stale value). Generations
+            // are monotonic, so `>` is the correct adopt test.
+            if (!generation_valid_ || *durable_gen > cached_generation_) {
+                perm_cache_.clear();
+                cached_generation_ = *durable_gen;
+                generation_valid_ = true;
+            }
+        }
+    }
+    if (fire_non_canonical_degrade) {
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonNonCanonicalFlag, sampler))
             spdlog::warn("RbacStore: durable rbac_enabled refresh read a non-canonical value — "
                          "leaving the cached enabled-state unchanged (never coercing to false)");
     }
-    if (!durable_gen) {
-        // Fail toward "assume changed": drop the cache and stop trusting it. Do
-        // NOT touch rbac_enabled_ — flipping it to disabled would be fail-open.
-        // Count the degrade so on-call can see that the cross-replica generation
-        // + enabled-flag refresh is failing (Gate 3 architect / Gate 6 sre): a
-        // persistent refresh failure means this replica's rbac_enabled view can
-        // go stale, the more-sensitive fail-open dimension.
+    if (fire_refresh_failed_degrade) {
+        // Count the degrade so on-call can see that the cross-replica
+        // generation + enabled-flag refresh is failing (Gate 3 architect /
+        // Gate 6 sre): a persistent refresh failure means this replica's
+        // rbac_enabled view can go stale, the more-sensitive fail-open
+        // dimension.
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonRefreshFailed, sampler))
             spdlog::warn("RbacStore: durable generation/enabled-flag refresh failed — cache "
                          "dropped (assume-changed); rbac_enabled view may be stale on this replica");
-        perm_cache_.clear();
-        generation_valid_ = false;
-        return;
-    }
-    // The refresh genuinely landed — this is the ONLY place (besides boot and
-    // a local write) that earns a last_successful_refresh_ms_ update.
-    last_successful_refresh_ms_ = now_ms();
-    if (durable_enabled)
-        rbac_enabled_.store(*durable_enabled, std::memory_order_relaxed);
-    // Adopt the durable generation only when it moves FORWARD (Gate 3 cpp-safety):
-    // the SELECT above ran lock-free, so a concurrent local apply_local_generation
-    // may have advanced cached_generation_ past what we read — never regress it
-    // (that would wrongly clear a just-populated cache and re-anchor to a stale
-    // value). Generations are monotonic, so `>` is the correct adopt test.
-    if (!generation_valid_ || *durable_gen > cached_generation_) {
-        perm_cache_.clear();
-        cached_generation_ = *durable_gen;
-        generation_valid_ = true;
     }
 }
 
@@ -2344,8 +2363,22 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
         // has no positive row to upsert against — the seeded row silently
         // survives, and the row-count reconciliation below can't see it (PG
         // always holds >= legacy counts by design; a missing-in-legacy row
-        // is invisible to a count check). Delete any PG role_permissions row
-        // whose role AND securable_type were BOTH known to legacy (so legacy
+        // is invisible to a count check). happy-path (Gate 4, #2703,
+        // verified empirically — a second RbacStore construction against the
+        // same pool immediately after a completed backfill resurrected the
+        // revoked permission): an UPDATE to an explicit 'deny' tombstone,
+        // not a DELETE — the exact same reason remove_permission() itself
+        // no longer deletes (7420de72). A deleted row leaves nothing for
+        // seed_defaults()'s ON CONFLICT DO NOTHING to conflict with, so the
+        // very next restart after this one-time backfill silently
+        // reinserts the seeded 'allow' and undoes the operator's
+        // revocation forever. Matching PG role_permissions rows always
+        // exist with effect='allow' at this point (seed_defaults() runs in
+        // the constructor before migrate_from_sqlite is ever called, and
+        // grant() only ever inserts 'allow'), so a plain UPDATE against the
+        // same predicate is sufficient — nothing to upsert against a
+        // not-yet-existing row. Update any PG role_permissions row whose
+        // role AND securable_type were BOTH known to legacy (so legacy
         // could have had an opinion about it) but whose exact
         // (role,type,op) triple is absent from legacy's own
         // role_permissions — i.e. explicitly revoked, not merely
@@ -2355,17 +2388,17 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
         // role/type filter excludes it and the newly-seeded grant survives
         // untouched. An empty legacy_role_names/legacy_type_names (a
         // pre-securable_types-table legacy schema) makes both `= ANY`
-        // filters match nothing — degrades to "delete nothing" rather than
+        // filters match nothing — degrades to "touch nothing" rather than
         // guessing. Comparison values are sanitize_pg_text()'d identically
         // to the INSERT above so a legacy string with invalid UTF-8/embedded
         // NUL matches its own already-stored (equally sanitized) row instead
-        // of spuriously mismatching and deleting a row legacy still has.
+        // of spuriously mismatching and denying a row legacy still has.
         // INVARIANT (security-guardian, #2703): this scoping is safe only
         // because every default grant added to an EXISTING (role,
         // securable_type) pair since the legacy schema was frozen has, so
         // far, ridden a brand-new securable_type (EnginePrincipal, #2376).
         // A future default grant added to an EXISTING role+type pair before
-        // a cutover would be deleted by this same logic, since legacy would
+        // a cutover would be denied by this same logic, since legacy would
         // know about both the role and the type but not (yet) have the new
         // grant. That failure direction is a lockout (access denial), not
         // an escalation, so it stays safe — but revisit this scoping if
@@ -2394,11 +2427,12 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                     out.push_back(s);
                 return out;
             };
-            pg::PgResult del = pg::exec_params(
+            pg::PgResult upd = pg::exec_params(
                 c,
-                "DELETE FROM rbac_store.role_permissions rp "
+                "UPDATE rbac_store.role_permissions rp SET effect = 'deny' "
                 "WHERE rp.role_name = ANY($1::text[]) "
                 "AND rp.securable_type = ANY($2::text[]) "
+                "AND rp.effect <> 'deny' "
                 "AND NOT EXISTS ("
                 "  SELECT 1 FROM unnest($3::text[], $4::text[], $5::text[]) "
                 "    AS legacy(role_name, securable_type, operation) "
@@ -2411,18 +2445,19 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                                          pg::to_text_array(to_views(perm_roles)),
                                          pg::to_text_array(to_views(perm_types)),
                                          pg::to_text_array(to_views(perm_ops))});
-            if (del.status() != PGRES_COMMAND_OK) {
+            if (upd.status() != PGRES_COMMAND_OK) {
                 spdlog::error(
-                    "RbacStore: migrate_from_sqlite: revoked-permission cleanup failed: {}",
+                    "RbacStore: migrate_from_sqlite: revoked-permission tombstone failed: {}",
                     PQerrorMessage(c));
                 return false;
             }
-            const char* deleted = PQcmdTuples(del.get());
-            if (deleted != nullptr && deleted[0] != '\0' && std::strcmp(deleted, "0") != 0)
+            const char* denied = PQcmdTuples(upd.get());
+            if (denied != nullptr && denied[0] != '\0' && std::strcmp(denied, "0") != 0)
                 spdlog::info(
-                    "RbacStore: migrate_from_sqlite: removed {} seeded permission(s) absent "
-                    "from legacy (operator-revoked defaults)",
-                    deleted);
+                    "RbacStore: migrate_from_sqlite: denied {} seeded permission(s) absent "
+                    "from legacy (operator-revoked defaults; tombstoned, not deleted, so a "
+                    "future reseed cannot resurrect them)",
+                    denied);
         }
         for (const auto& p : principals)
             if (!run("INSERT INTO rbac_store.principal_roles (principal_type, principal_id, "

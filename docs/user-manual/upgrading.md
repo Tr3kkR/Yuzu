@@ -586,11 +586,12 @@ server `PgPool`).
 - A one-time, idempotent, **fail-closed** backfill copies every role, grant,
   group, and membership out of the legacy `rbac.db` into `rbac_store`. Operator
   edits to seeded permissions are preserved — including a revoked built-in
-  default (`remove_permission`), which is **deleted** rather than silently
-  restored. Beyond this one-time cutover, `remove_permission()` itself now
-  records an explicit deny rather than deleting the row outright, so a
-  revocation made after upgrading also survives every future restart (a
-  built-in default is otherwise re-seeded, harmlessly, on every boot). The
+  default (`remove_permission`), which is recorded as an explicit **deny**
+  rather than silently restored or deleted. This is the same mechanism
+  `remove_permission()` itself uses for a revocation made after upgrading: a
+  deleted row has nothing to stop it being silently re-seeded on the very
+  next restart, so both the one-time backfill and every later revocation
+  record an explicit deny row instead. The
   backfill reconciles counts (roles + grants + groups + members) and **refuses
   the completion marker on any shortfall** — if it cannot complete, the server
   **fails the boot closed** and retries on the next start (it never boots on a

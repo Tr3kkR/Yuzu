@@ -1225,14 +1225,17 @@ TEST_CASE("RbacStore: backfill preserves an operator's deny-override on a seeded
 // permission the operator explicitly removed via remove_permission() before
 // upgrading has no positive row to upsert against. seed_defaults() (which
 // runs in the constructor, before this backfill) already re-added it, and
-// nothing deleted it. The row-count reconciliation can't catch this either
+// nothing touched it. The row-count reconciliation can't catch this either
 // (PG always holds >= legacy counts by design — a missing-in-legacy row is
-// invisible to a count check). The fix scopes a DELETE to (role,type) pairs
-// legacy's OWN catalogue actually knew about, so it never touches a
-// securable a LATER seed_defaults() adds — e.g. EnginePrincipal, #2376 —
-// asserted explicitly below alongside the surgical role/type scoping.
-TEST_CASE("RbacStore: backfill deletes a seeded default permission the operator explicitly "
-          "removed in legacy",
+// invisible to a count check). The fix scopes an UPDATE-to-deny to
+// (role,type) pairs legacy's OWN catalogue actually knew about, so it never
+// touches a securable a LATER seed_defaults() adds — e.g. EnginePrincipal,
+// #2376 — asserted explicitly below alongside the surgical role/type
+// scoping. (An initial version used DELETE, which reintroduces the exact
+// hazard remove_permission() itself was fixed to avoid — the row's own
+// reseed-survival is asserted directly below, mirroring the R2/F1 pairing.)
+TEST_CASE("RbacStore: backfill denies a seeded default permission the operator explicitly "
+          "removed in legacy, and it survives a reseed",
           "[rbac_store][pg]") {
     RBAC_STORE(store);
     yuzu::test::TempDbFile legacy{"yuzu_test_rbac_f1-"};
@@ -1259,19 +1262,31 @@ TEST_CASE("RbacStore: backfill deletes a seeded default permission the operator 
     CHECK_FALSE(store.check_role_has_permission("Viewer", "AuditLog", "Read"));
     // Surgical, not wholesale: an UNRELATED seeded default for the SAME role
     // survives — its securable_type ("Response") is not in legacy's
-    // securable_types, so the type-filter excludes it from the delete.
+    // securable_types, so the type-filter excludes it from the deny.
     CHECK(store.check_role_has_permission("Viewer", "Response", "Read"));
     // A DIFFERENT role's grant on the SAME securable_type ("AuditLog")
     // survives — "Administrator" is not in legacy's roles table, so the
     // role-filter excludes it regardless of the type match.
     CHECK(store.check_role_has_permission("Administrator", "AuditLog", "Read"));
     // A securable that never existed in legacy at all — EnginePrincipal,
-    // #2376 — is never touched by this delete for either role: its type is
+    // #2376 — is never touched by this deny for either role: its type is
     // absent from legacy's securable_types, so the type-filter excludes it
     // outright. This is the assertion that would fail if the fix's scoping
-    // were loosened to "delete anything absent from legacy's perms".
+    // were loosened to "deny anything absent from legacy's perms".
     CHECK(store.check_role_has_permission("Administrator", "EnginePrincipal", "Read"));
     CHECK(store.check_role_has_permission("Viewer", "EnginePrincipal", "Read"));
+
+    // happy-path (Gate 4, #2703, HIGH) — THE REGRESSION THIS CLOSES: a hard
+    // DELETE here has nothing for seed_defaults()'s ON CONFLICT DO NOTHING to
+    // conflict with, so the very next ordinary restart after this one-time
+    // backfill silently reinserts the seeded 'allow' and undoes the
+    // operator's pre-cutover revocation — reproduced empirically by
+    // constructing a second RbacStore against the same pool (simulating a
+    // restart) and observing the revoked permission come back. Fixed by
+    // denying (not deleting) the row, mirroring remove_permission()'s own
+    // fix for the identical hazard post-cutover.
+    RbacStore reopened{rbac_pool_fx_};
+    CHECK_FALSE(reopened.check_role_has_permission("Viewer", "AuditLog", "Read"));
 }
 
 // fjarvis F2 (#2703, HIGH), schema-level layer: `rbac_meta.value` for
