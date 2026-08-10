@@ -64,7 +64,8 @@ inline constexpr RotationSweepNames kHumanRotationSweepNames{
 /// IN ('human','engine'))` bounds the column to exactly those two values —
 /// so anything that isn't literally `"engine"` is safely routed to the
 /// human family, never a silent third bucket.
-constexpr const RotationSweepNames& rotation_sweep_names_for_kind(std::string_view principal_kind) {
+[[nodiscard]] constexpr const RotationSweepNames&
+rotation_sweep_names_for_kind(std::string_view principal_kind) {
     return principal_kind == "engine" ? kEngineRotationSweepNames : kHumanRotationSweepNames;
 }
 

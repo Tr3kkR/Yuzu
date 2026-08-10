@@ -2850,16 +2850,31 @@ void RestApiV1::register_routes(
                 // confirm it against — this is the ROTATE-side meaning of
                 // `found == false` documented in token_rotation_lookup.hpp;
                 // it does NOT apply after a successful confirm (round-4
-                // clarification): audit as a failure, 503, and never place
-                // the secret in the response body.
+                // clarification): 503, and never place the secret in the
+                // response body.
+                //
+                // UP-11: the audit outcome is "partial", never "failure" —
+                // rotate_token above already succeeded and committed. A
+                // successor row exists with a live secret in `*result`; what
+                // failed is reading it back to hand to the caller, not the
+                // mint itself. An audit row reading `api_token.rotate
+                // failure` here would tell a CC6.3 reviewer no credential
+                // exists when one plainly does — the worst direction for a
+                // credential-minting event's compliance record to diverge
+                // from the database. "partial" mirrors the convention the
+                // session-revoke routes use above for "the mutation
+                // committed but a downstream step of it did not". The
+                // caller-facing 503 is unchanged — this is about the audit
+                // row matching the database, not the response.
                 res.status = 503;
                 res.set_header("Retry-After", "2");
                 res.set_content(
                     detail::a4_error(res, "rotation succeeded but the successor could not be "
                                           "read back — retry, or check GET /api/v1/tokens"),
                     "application/json");
-                (void)audit_fn(req, "api_token.rotate", "failure", "ApiToken", token_id,
-                               "successor lookup failed after mint");
+                (void)audit_fn(req, "api_token.rotate", "partial", "ApiToken", token_id,
+                               "successor minted but its secret could not be read back for "
+                               "delivery — retry, or check GET /api/v1/tokens");
                 return;
             }
             // The reveal IS the success audit for this route (mirrors the

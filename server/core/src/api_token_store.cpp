@@ -13,6 +13,7 @@
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -44,6 +45,46 @@ constexpr const char* kStoreName = "api_token_store";
 // but rarer, so they get a little more room. Neither is unbounded.
 constexpr std::chrono::milliseconds kReadTimeout{1500};
 constexpr std::chrono::milliseconds kWriteTimeout{2000};
+
+// Raw token layout: "yuzu_" prefix + 32 random chars = 37 bytes total
+// (generate_raw_token below). The move-based secret-scrub discipline
+// elsewhere in this file (rotate_token's `scrub_secrets` ScopeExit, and
+// every other `std::move`-then-secure_zero site on a raw token) depends on
+// every generated token staying above libstdc++'s small-string-optimisation
+// threshold (15 bytes), libc++'s (22), and MSVC's (15) — a std::string at or
+// below its stdlib's threshold is stored INLINE in the string object itself,
+// so moving it copies the bytes rather than stealing a heap pointer, and the
+// plaintext is left sitting in the (still non-empty, inline-storage) moved-
+// from object — which `secure_zero`, called on THAT object afterward, never
+// reaches because the caller already treats the moved-from string as empty/
+// irrelevant. Below is a static, compile-time pin of that dependency: shrink
+// the token layout and this fails loudly instead of quietly reopening the
+// residual-plaintext gap.
+constexpr std::size_t kRawTokenPrefixLen = 5;  // "yuzu_"
+constexpr std::size_t kRawTokenRandomLen = 32;
+constexpr std::size_t kRawTokenTotalLen = kRawTokenPrefixLen + kRawTokenRandomLen;
+static_assert(kRawTokenTotalLen > 22,
+             "raw API token length must stay above every stdlib's SSO threshold "
+             "(libstdc++ 15 / libc++ 22 / MSVC 15) - the move-based secret scrub "
+             "in this file silently stops zeroing residual plaintext otherwise");
+
+// UP-6 (clock-guarded-retention routed concern, part 5: "cap every accepted
+// pass UNCONDITIONALLY - the cap is the half that always applies, the
+// detectors are best-effort"). `sweep_expired_rotations` is a bulk
+// wall-clock mutation (`overlap_expires_at <= now`) with no persisted clock
+// anchor and no anomaly detector of its own (that full seven-part guard is a
+// separate, larger piece — this cap is the one part that is never optional).
+// Without it, a single forward NTP step cuts over every in-flight rotation
+// fleet-wide in one 60s tick. This number is a defensible choice for THIS
+// sweep, not copied from another store's constant (the routed concern is
+// explicit those are substrate-tuned): the sweep runs every 60s and does one
+// advisory-locked write transaction PER predecessor, so at this cap a
+// worst-case tick still drains in well under a second, and 200/tick still
+// clears 12,000/hour of legitimate churn — rotations are individual
+// admin/self-service actions, not a bulk workload, so that headroom is
+// generous. A clock jump degrades to a several-tick drain (visible via the
+// cap-hit log line + counter below) rather than a single fleet-wide event.
+constexpr std::size_t kMaxAutoRevokesPerTick = 200;
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for
@@ -252,7 +293,7 @@ std::expected<std::string, std::string> ApiTokenStore::generate_raw_token() cons
     // and produced a token derived from zero-initialised bytes (all 'A'
     // chars). secure_random surfaces entropy exhaustion as a hard error so
     // the request becomes a 503 instead of issuing a known-weak token.
-    std::uint8_t buf[32]{};
+    std::uint8_t buf[kRawTokenRandomLen]{};
     auto rc = fill_random(std::span{buf, sizeof(buf)});
     if (!rc.has_value())
         return std::unexpected(std::string{"CSPRNG unavailable (entropy exhausted)"});
@@ -260,7 +301,7 @@ std::expected<std::string, std::string> ApiTokenStore::generate_raw_token() cons
     static constexpr char chars[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     std::string token = "yuzu_";
-    token.reserve(37);
+    token.reserve(kRawTokenTotalLen);
     for (std::uint8_t b : buf)
         token += chars[b % 62];
     return token;
@@ -1865,10 +1906,13 @@ ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
 
 // ── T12: rotation maintenance sweep (design doc §7) ─────────────────────────
 
-std::vector<ApiToken> ApiTokenStore::sweep_expired_rotations(int64_t now, bool* tick_failed) {
+std::vector<ApiToken> ApiTokenStore::sweep_expired_rotations(int64_t now, bool* tick_failed,
+                                                              bool* tick_capped) {
     std::vector<ApiToken> revoked;
     if (tick_failed)
         *tick_failed = false;
+    if (tick_capped)
+        *tick_capped = false;
     if (!open_)
         return revoked;
 
@@ -1890,6 +1934,12 @@ std::vector<ApiToken> ApiTokenStore::sweep_expired_rotations(int64_t now, bool* 
                 *tick_failed = true; // pool contention — the tick did not run
             return revoked;
         }
+        // `LIMIT $2` requests one MORE row than the cap (UP-6) purely to
+        // detect whether more eligible predecessors exist than this tick
+        // will process — trimmed back to the cap below before anything is
+        // touched. `ORDER BY overlap_expires_at ASC` drains the
+        // longest-overdue rows first when a tick is capped, rather than an
+        // unspecified/arbitrary subset.
         const std::string sql = std::string("SELECT token_id, '' AS token_hash, ") +
                                 kTokenColsTail +
                                 " FROM api_token_store.api_tokens "
@@ -1903,21 +1953,53 @@ std::vector<ApiToken> ApiTokenStore::sweep_expired_rotations(int64_t now, bool* 
                                 // races-closes the window before
                                 // resolve_rotation_pair_after_revoke clears the
                                 // predecessor's overlap_expires_at.
+                                //
+                                // UP-5: also require that live successor to have
+                                // actually been PRESENTED at least once
+                                // (`last_used_at <> 0`). A successor that has
+                                // NEVER been used is the "dropped/lost secret"
+                                // case — the operator's own copy of it may not
+                                // exist — and revoking the predecessor here would
+                                // be the same zero-credential outcome the EXISTS
+                                // clause above already guards against, just
+                                // reached a different way. `last_used_at` is read
+                                // fresh here (this is the unlocked SCAN, not the
+                                // authoritative decision — see the per-row locked
+                                // re-assert below, which re-reads it again under
+                                // the advisory lock before actually revoking).
                                 "AND EXISTS (SELECT 1 FROM api_token_store.api_tokens s "
                                 "WHERE s.rotation_group = api_token_store.api_tokens.rotation_group "
                                 "AND s.supersedes_token_id = api_token_store.api_tokens.token_id "
-                                "AND s.revoked = FALSE)";
-        pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(),
-                                           std::vector<std::string>{std::to_string(now)});
+                                "AND s.revoked = FALSE AND s.last_used_at <> 0) "
+                                "ORDER BY overlap_expires_at ASC "
+                                "LIMIT $2::bigint";
+        pg::PgResult res = pg::exec_params(
+            lease.get(), sql.c_str(),
+            std::vector<std::string>{std::to_string(now),
+                                     std::to_string(kMaxAutoRevokesPerTick + 1)});
         if (res.status() != PGRES_TUPLES_OK) {
             if (tick_failed)
                 *tick_failed = true; // predecessor scan failed — the tick did not run
             return revoked;
         }
         const int rows = PQntuples(res.get());
-        expired_predecessors.reserve(static_cast<std::size_t>(rows));
-        for (int i = 0; i < rows; ++i)
-            expired_predecessors.push_back(read_token(res.get(), i));
+        const auto row_count = static_cast<std::size_t>(rows);
+        // UP-6: the cap is unconditional, never best-effort — trim back to
+        // it regardless of why the scan returned more (a genuine clock jump,
+        // or simply more legitimate in-flight rotations than the cap allows
+        // this tick). The next tick(s) pick up the remainder.
+        const std::size_t take = std::min(row_count, kMaxAutoRevokesPerTick);
+        if (row_count > kMaxAutoRevokesPerTick) {
+            if (tick_capped)
+                *tick_capped = true;
+            spdlog::warn("[{}] sweep_expired_rotations: tick hit the "
+                        "auto-revoke cap ({} eligible, processing {}) — draining over "
+                        "subsequent ticks",
+                        kStoreName, row_count, take);
+        }
+        expired_predecessors.reserve(take);
+        for (std::size_t i = 0; i < take; ++i)
+            expired_predecessors.push_back(read_token(res.get(), static_cast<int>(i)));
     }
 
     for (const auto& predecessor : expired_predecessors) {
@@ -1959,6 +2041,20 @@ std::vector<ApiToken> ApiTokenStore::sweep_expired_rotations(int64_t now, bool* 
             // exact §7 invariant). The `overlap_expires_at > 0` check makes
             // resolve's clear authoritative under the lock; the EXISTS is the
             // belt to its suspenders.
+            //
+            // UP-5: `s.last_used_at <> 0` is re-asserted HERE too, under the
+            // lock, against a FRESH read — never trusted from the unlocked
+            // scan above. A successor could have been used for the first
+            // time in the gap between the scan and this transaction; this is
+            // the authoritative check, the scan's copy is only a
+            // cheap pre-filter. Never auto-revoke a predecessor whose
+            // successor has never been presented — the operator's only copy
+            // of that secret may be the one that was lost, and revoking here
+            // would leave the principal with zero usable credentials, the
+            // exact failure this whole guard exists to prevent. The pair
+            // stays live past its window; `list_rotations_nearing_expiry_
+            // unused` keeps warning about it every tick until an operator
+            // resolves it explicitly.
             pg::PgResult r1 = pg::exec_params(
                 conn,
                 "UPDATE api_token_store.api_tokens SET revoked = TRUE "
@@ -1966,7 +2062,7 @@ std::vector<ApiToken> ApiTokenStore::sweep_expired_rotations(int64_t now, bool* 
                 "AND EXISTS (SELECT 1 FROM api_token_store.api_tokens s "
                 "WHERE s.rotation_group = api_token_store.api_tokens.rotation_group "
                 "AND s.supersedes_token_id = api_token_store.api_tokens.token_id "
-                "AND s.revoked = FALSE) "
+                "AND s.revoked = FALSE AND s.last_used_at <> 0) "
                 "RETURNING token_hash",
                 std::vector<std::string>{predecessor.token_id});
             if (r1.status() != PGRES_TUPLES_OK || PQntuples(r1.get()) == 0)
@@ -2019,18 +2115,24 @@ ApiTokenStore::list_rotations_nearing_expiry_unused(int64_t now, int64_t warn_wi
     if (!lease)
         return result;
 
-    // Not-yet-elapsed predecessors whose overlap window ends within the
-    // warn lead time. An already-elapsed window is sweep_expired_rotations's
-    // job, not this half's — the `> $1::bigint` (strictly in the future)
-    // keeps the two halves from double-handling the same row on one tick.
-    const std::string sql =
-        std::string("SELECT token_id, '' AS token_hash, ") + kTokenColsTail +
-        " FROM api_token_store.api_tokens "
-        "WHERE revoked = FALSE AND overlap_expires_at > $1::bigint "
-        "AND overlap_expires_at <= $2::bigint AND supersedes_token_id = ''";
+    // Predecessors whose overlap window ends within the warn lead time —
+    // INCLUDING one that has already elapsed (UP-5). Before the
+    // never-used-successor carve-out in sweep_expired_rotations, an
+    // already-elapsed window was exclusively that function's job and this
+    // query excluded it (`> $1::bigint`, strictly future) to keep the two
+    // halves from double-handling the same row. Now that
+    // sweep_expired_rotations deliberately leaves a never-used-successor
+    // pair alone past its window, THIS half is the only thing left that
+    // keeps surfacing it — dropping the lower bound is what makes that
+    // happen; no double-handling results because the two queries' successor
+    // conditions are now complementary (this one requires `last_used_at = 0`
+    // below, sweep_expired_rotations requires `<> 0`), never the same row.
+    const std::string sql = std::string("SELECT token_id, '' AS token_hash, ") + kTokenColsTail +
+                            " FROM api_token_store.api_tokens "
+                            "WHERE revoked = FALSE AND overlap_expires_at > 0 "
+                            "AND overlap_expires_at <= $1::bigint AND supersedes_token_id = ''";
     pg::PgResult res = pg::exec_params(
-        lease.get(), sql.c_str(),
-        std::vector<std::string>{std::to_string(now), std::to_string(now + warn_within_secs)});
+        lease.get(), sql.c_str(), std::vector<std::string>{std::to_string(now + warn_within_secs)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn("[{}] list_rotations_nearing_expiry_unused: predecessor scan failed",
                     kStoreName);

@@ -2002,6 +2002,20 @@ public:
                           "shared across BOTH engine-credential and human API-token rotation "
                           "pairs; this counter is not split by principal_kind",
                           "counter");
+        // UP-6 (clock-guarded-retention routed concern, part 5): the sweep's
+        // per-tick auto-revoke cap (kMaxAutoRevokesPerTick,
+        // api_token_store.cpp) was hit — more eligible predecessors existed
+        // than this tick processed. Same shared, un-split-by-principal_kind
+        // scope as sweep_failures_total above (the cap is a tick-level
+        // property, not attributable to one kind's rows) — makes an
+        // in-progress multi-tick drain (deliberate degradation, e.g. after a
+        // clock jump) visible/alertable rather than log-only.
+        metrics_.describe("yuzu_engine_principal_rotation_sweep_capped_total",
+                          "Cumulative rotation-sweep ticks that hit the per-tick auto-revoke cap "
+                          "and deferred the remainder to later ticks - shared across BOTH "
+                          "engine-credential and human API-token rotation pairs, not split by "
+                          "principal_kind",
+                          "counter");
         // #2404: confirm-rotation endpoint outcomes, so a 409-conflict or
         // 503-transient retry storm on confirm is alertable instead of
         // invisible (yuzu_http_requests_total has no per-route label). SCOPE
@@ -5358,13 +5372,21 @@ public:
                 // Successor-unused warnings are process-local, best-effort
                 // de-duplication (mirrors ApiTokenStore's own rotation-grace
                 // cache precedent) — keyed on rotation_group, so the SAME
-                // pair isn't re-audited/re-counted every tick while its
-                // window is still open. Pruned each tick to whatever
+                // pair isn't re-audited/re-counted every tick during its
+                // PRE-elapse lead-time window (a heads-up ahead of the
+                // scheduled auto-revoke). This de-dup deliberately does NOT
+                // apply once the window has elapsed (UP-5): a never-used
+                // successor's predecessor is no longer auto-revoked past its
+                // window, so it can sit stuck-open indefinitely, and a
+                // single warning that then goes silent for the rest of that
+                // window would defeat the point of warning at all — see the
+                // `elapsed` branch below, which re-warns every tick instead.
+                // Pruned each tick to whatever
                 // list_rotations_nearing_expiry_unused still returns, so a
                 // resolved pair (revoked, confirmed, or finally used) frees
                 // its slot for a future rotation on the same principal. A
-                // process restart forfeits the de-dup state and re-warns
-                // once — acceptable for an operational signal.
+                // process restart forfeits the pre-elapse de-dup state and
+                // re-warns once more — acceptable for an operational signal.
                 std::unordered_set<std::string> warned_rotation_groups;
                 // Warn once the predecessor's overlap window has this much
                 // time left — matches the 24h overlap floor: the operator
@@ -5402,12 +5424,21 @@ public:
                     // so without this the sweep-failures alert would stay at zero
                     // while rotated-out credentials silently outlive their window.
                     bool sweep_tick_failed = false;
-                    auto revoked = api_token_store_->sweep_expired_rotations(now, &sweep_tick_failed);
+                    bool sweep_tick_capped = false;
+                    auto revoked = api_token_store_->sweep_expired_rotations(
+                        now, &sweep_tick_failed, &sweep_tick_capped);
                     if (sweep_tick_failed) {
                         spdlog::warn("Rotation sweep tick could not run (pool "
                                      "contention / query failure) — predecessor auto-revoke deferred "
                                      "to the next tick");
                         metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
+                            .increment();
+                    }
+                    // UP-6: the per-tick cap already logged the eligible/
+                    // processed counts inside the store — the counter here is
+                    // the alertable signal that a drain is in progress.
+                    if (sweep_tick_capped) {
+                        metrics_.counter("yuzu_engine_principal_rotation_sweep_capped_total")
                             .increment();
                     }
                     for (const auto& predecessor : revoked) {
@@ -5447,9 +5478,24 @@ public:
                     std::unordered_set<std::string> still_nearing;
                     for (const auto& pair : nearing) {
                         still_nearing.insert(pair.successor.rotation_group);
-                        if (warned_rotation_groups.contains(pair.successor.rotation_group))
-                            continue; // already warned this rotation attempt — don't re-spam
-                        warned_rotation_groups.insert(pair.successor.rotation_group);
+                        // UP-5: `list_rotations_nearing_expiry_unused` now
+                        // also returns a pair whose predecessor window has
+                        // ALREADY elapsed — sweep_expired_rotations
+                        // deliberately declines to auto-revoke it while the
+                        // successor stays unused, so this is the only
+                        // remaining signal for it. De-dup to one warning per
+                        // rotation attempt ONLY for the pre-elapse lead-time
+                        // heads-up (the original, still-fine behavior below);
+                        // once elapsed, warn on EVERY tick instead — a
+                        // one-time warning that then goes silent for the
+                        // rest of an indefinite stuck-open window is exactly
+                        // the "keep warning loudly" gap this closes.
+                        const bool elapsed = pair.predecessor.overlap_expires_at <= now;
+                        if (!elapsed) {
+                            if (warned_rotation_groups.contains(pair.successor.rotation_group))
+                                continue; // already warned this attempt's lead-in — don't re-spam
+                            warned_rotation_groups.insert(pair.successor.rotation_group);
+                        }
 
                         // P2 #11: same per-row discrimination as Half 1,
                         // keyed on the predecessor (the pair shares one
@@ -5460,6 +5506,14 @@ public:
                         metrics_
                             .counter(names.metric_events, {{"reason", "successor_unused"}})
                             .increment();
+                        if (elapsed) {
+                            spdlog::warn(
+                                "Rotation predecessor {} (principal {}) is past its overlap "
+                                "window but the successor has never been used — auto-revoke "
+                                "was declined to avoid leaving zero usable credentials; both "
+                                "stay active until an operator confirms or revokes explicitly",
+                                pair.predecessor.token_id, pair.predecessor.principal_id);
+                        }
                         if (audit_store_ && audit_store_->is_open()) {
                             (void)audit_store_->log(
                                 {.timestamp = now,
@@ -5471,7 +5525,9 @@ public:
                                  .detail = "principal_id=" + pair.predecessor.principal_id +
                                            " predecessor_token_id=" + pair.predecessor.token_id +
                                            " overlap_expires_at=" +
-                                           std::to_string(pair.predecessor.overlap_expires_at),
+                                           std::to_string(pair.predecessor.overlap_expires_at) +
+                                           (elapsed ? " status=elapsed_unrevoked_successor_unused"
+                                                    : ""),
                                  .result = "warning"});
                         }
                     }

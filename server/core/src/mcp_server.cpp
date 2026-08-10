@@ -9148,27 +9148,37 @@ McpServer::HandlerFn McpServer::build_handler(
                     // legitimate "no rotation" case, only an ambiguous read
                     // failure. Fail CLOSED rather than hand the caller a
                     // one-time secret with no token_id to ever confirm it
-                    // against: audit as a failure, retryable (kInternalError),
-                    // and never place the secret in the response body.
-                    // Mirrors the REST twin's 503 + Retry-After:2 posture —
-                    // A5: retry_after_ms is machine metadata here, not
-                    // prose-only, matching REST's Retry-After:2 header
-                    // (2000ms). audit_persisted:false is folded into the SAME
-                    // A4 data object (not the sibling !result branch's plain
-                    // error_response — this branch is genuinely retryable and
-                    // needs the retry hint too) if the failure audit itself
-                    // doesn't persist. There is no MCP `list_tokens` tool
-                    // (ADR-1005 parity gap, recorded in docs/mcp-server.md) —
-                    // point at the REST route that actually exists, matching
-                    // the REST twin's own remediation text exactly.
-                    const bool denied_audit_ok =
-                        audit_fn(req, "api_token.rotate", "failure", "ApiToken", token_id,
-                                 "successor lookup failed after mint");
+                    // against: retryable (kInternalError), and never place
+                    // the secret in the response body. Mirrors the REST
+                    // twin's 503 + Retry-After:2 posture — A5: retry_after_ms
+                    // is machine metadata here, not prose-only, matching
+                    // REST's Retry-After:2 header (2000ms). There is no MCP
+                    // `list_tokens` tool (ADR-1005 parity gap, recorded in
+                    // docs/mcp-server.md) — point at the REST route that
+                    // actually exists, matching the REST twin's own
+                    // remediation text exactly.
+                    //
+                    // UP-11: the audit outcome is "partial", never "failure"
+                    // — rotate_token above already succeeded and committed.
+                    // A successor row exists with a live secret in `*result`;
+                    // what failed is reading it back to hand to the caller,
+                    // not the mint itself. An audit row reading
+                    // `api_token.rotate failure` here would tell a CC6.3
+                    // reviewer no credential exists when one plainly does —
+                    // the worst direction for a credential-minting event's
+                    // compliance record to diverge from the database. This
+                    // is genuinely retryable (unlike the sibling !result
+                    // branch above), so the retry hint stays in the SAME A4
+                    // data object whether or not the audit itself persists.
+                    const bool audit_ok = audit_fn(
+                        req, "api_token.rotate", "partial", "ApiToken", token_id,
+                        "successor minted but its secret could not be read back for delivery "
+                        "— retry, or check GET /api/v1/tokens");
                     JObj err_data;
                     err_data.add("correlation_id", yuzu::server::detail::make_correlation_id())
                         .add("retry_after_ms", 2000)
                         .add("remediation", "retry, or check GET /api/v1/tokens");
-                    if (!denied_audit_ok)
+                    if (!audit_ok)
                         err_data.add("audit_persisted", false);
                     res.set_content(
                         error_response(id, kInternalError,
@@ -9176,7 +9186,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                        "back — retry, or check GET /api/v1/tokens",
                                        err_data.str()),
                         "application/json");
-                    mcp_audit("failure", "successor lookup failed after mint");
+                    mcp_audit("partial", "successor minted but secret could not be read back "
+                                          "after mint");
                     return;
                 }
                 // The reveal IS the success audit for this route (mirrors the

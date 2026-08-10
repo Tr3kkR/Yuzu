@@ -49,14 +49,23 @@
 #include <unordered_map>
 #include <vector>
 
+// PGconn is a typedef of libpq's PRIVATE struct tag `pg_conn` — this header
+// includes libpq-fe.h directly rather than forward-declaring `pg_conn`
+// itself (as an earlier revision did) per `pg_migration_runner.hpp`'s
+// documented rule: re-declaring a third party's internal name pins it, and a
+// libpq rename would break the build here last and least legibly. The
+// include costs nothing in practice — every consumer of this header already
+// pulls in the PG store stack (pg_pool.hpp/pg_raii.hpp or this store's own
+// .cpp) which includes it directly, so this is not a new transitive
+// dependency, only an explicit one. Applies even though the only use here is
+// a test-only hook signature (`PGconn*` below) — the rule has no carve-out
+// for that, and adding one would be a second exception to litigate per call
+// site instead of one `#include`.
+#include <libpq-fe.h>
+
 namespace yuzu::server::pg {
 class PgPool;
 }
-
-// libpq's PGconn, forward-declared (matches the PgPool forward-declare
-// above) so this header never pulls in libpq-fe.h. Only used by a
-// test-only hook signature below.
-struct pg_conn;
 
 namespace yuzu::server {
 
@@ -480,6 +489,25 @@ public:
     /// state", §7) so a fresh rotation may begin. `now` is caller-supplied,
     /// same contract as `rotate_engine_credential`.
     ///
+    /// Never revokes a predecessor whose successor has NEVER been presented
+    /// (`last_used_at == 0`, read fresh under THIS row's own locked
+    /// transaction, not the unlocked scan above it) — a lost/dropped
+    /// successor secret must never leave the principal at zero usable
+    /// credentials (the clock-guarded-retention routed concern's spirit,
+    /// applied to a per-principal availability floor rather than a bulk
+    /// delete). The pair stays fully live past its overlap window in that
+    /// case; `list_rotations_nearing_expiry_unused` keeps surfacing it as an
+    /// operational warning (undeduplicated once elapsed) until an operator
+    /// resolves it explicitly (confirm or revoke).
+    ///
+    /// Bounded per tick at `kMaxAutoRevokesPerTick` (a defensible cap, not a
+    /// tuned one — see the constant's own comment) — the routed
+    /// clock-guarded-retention concern requires every accepted bulk
+    /// wall-clock mutation pass to cap unconditionally, even though the
+    /// full seven-part guard shape (persisted anchor, anomaly detection) is
+    /// out of scope here. A single forward clock step degrades to a bounded
+    /// multi-tick drain instead of a fleet-wide cutover in one tick.
+    ///
     /// Idempotent: re-running finds nothing to revoke once every eligible
     /// predecessor is already revoked (the per-row UPDATE is itself
     /// `WHERE revoked = FALSE`, so a race with a concurrent manual revoke
@@ -511,18 +539,35 @@ public:
     /// never checks `overlap_expires_at`), a silently-swallowed failed tick
     /// would let rotated-out credentials outlive their window with the alert at
     /// zero. Left `false` on a clean tick (including one that revoked nothing).
-    std::vector<ApiToken> sweep_expired_rotations(int64_t now, bool* tick_failed = nullptr);
+    /// `tick_capped` (optional out-param): set to `true` when this tick found
+    /// MORE eligible predecessors than `kMaxAutoRevokesPerTick` and processed
+    /// only the cap's worth — the caller logs + counts this so an in-progress
+    /// drain is visible rather than silently taking several ticks. Left
+    /// `false` when every eligible predecessor fit in this tick.
+    std::vector<ApiToken> sweep_expired_rotations(int64_t now, bool* tick_failed = nullptr,
+                                                  bool* tick_capped = nullptr);
 
     /// T12 sweep, half 2 (operational-health signal, design doc §7 bullet 2)
     /// — read-only. Returns every in-flight rotation pair whose predecessor
-    /// overlap window ends within `warn_within_secs` of `now` (but has not
-    /// yet elapsed — an already-elapsed window is `sweep_expired_rotations`'s
-    /// job, not a warning) AND whose successor has never been presented
-    /// (`last_used_at == 0`). The caller (server.cpp's maintenance loop)
+    /// overlap window ends within `warn_within_secs` of `now` — INCLUDING one
+    /// that has already elapsed — AND whose successor has never been
+    /// presented (`last_used_at == 0`). Before the never-used-successor
+    /// carve-out in `sweep_expired_rotations` above, an already-elapsed
+    /// window was exclusively that function's job and never appeared here;
+    /// now that `sweep_expired_rotations` deliberately leaves such a pair
+    /// alone, this half is the ONLY thing that keeps surfacing it, so it
+    /// must keep matching past `now` too (no upper-bound-only pairs are lost
+    /// to the old `> now` floor). The caller (server.cpp's maintenance loop)
     /// turns each returned pair into an `engine_principal.rotation.
     /// successor_unused` audit row plus a bounded `reason="successor_unused"`
     /// Prometheus counter — deliberately NOT `event="security"` (this is an
     /// operational health signal, not a theft signal, per the design doc).
+    /// The caller de-duplicates a not-yet-elapsed pair to one warning per
+    /// rotation attempt (a lead-time heads-up), but — since a pair still
+    /// returned here past its own `overlap_expires_at` is one
+    /// `sweep_expired_rotations` is deliberately NOT resolving — re-warns it
+    /// on every tick once elapsed, not once ever, so a stuck pair cannot go
+    /// silent for the rest of its (indefinite) lifetime.
     /// Best-effort, mirrors `list_all`: a lease/query failure logs at warn
     /// and returns an empty vector rather than propagating — this is a
     /// maintenance-loop read, not an authorization chokepoint.
@@ -592,7 +637,7 @@ public:
     /// `std::function` is read unsynchronized on the store's own request
     /// threads, so it may only be assigned before the store is shared across
     /// threads (single-threaded test setup, never a live-traffic toggle).
-    std::function<void(pg_conn*)> test_hook_before_rotate_group_read_;
+    std::function<void(PGconn*)> test_hook_before_rotate_group_read_;
 
     /// Fired in `rotate_token`'s MINT arm, right before `return true` — after
     /// the successor INSERT and the predecessor's overlap-window UPDATE have
@@ -606,7 +651,7 @@ public:
     /// the commit outcome leaves a permanently unevictable grace-cache entry,
     /// invisible to LeakSanitizer since it stays reachable from
     /// `rotation_grace_cache_`).
-    std::function<void(pg_conn*)> test_hook_before_mint_commit_;
+    std::function<void(PGconn*)> test_hook_before_mint_commit_;
 
     /// Injects the engine-principal referential-integrity check used by
     /// `create_token`'s engine block (design doc §6). Unset by default —

@@ -27,6 +27,7 @@
 /// (or a not-yet-replicated revoke) would make the terminal classification wrong
 /// on a genuinely live rotation. Keep the read primary + in-txn (UP-6, #2404).
 
+#include <cstddef>
 #include <string>
 #include <vector>
 

@@ -1747,6 +1747,89 @@ TEST_CASE("MCP rotate_api_token/confirm_api_token_rotation: self-service round t
               .value() == 1.0);
 }
 
+TEST_CASE("MCP rotate_api_token: a committed mint whose successor read-back fails is audited "
+          "'partial', never 'failure' (UP-11) — rotate_token already committed",
+          "[mcp][pg][token][rotation]") {
+    // UP-11: before this fix, the `!successor.found` branch (successor
+    // lookup fails AFTER rotate_token already succeeded and committed) wrote
+    // `api_token.rotate|failure` — a compliance record claiming no
+    // credential exists when one plainly does. Reproduced deterministically
+    // (no threading, no wall-clock race, no pool-timing dependency) via
+    // `test_hook_before_mint_commit_`, which hands the mint's OWN connection
+    // — still mid-transaction, after the successor INSERT/predecessor UPDATE
+    // have already run, right before COMMIT. Poisoning THAT SAME connection
+    // there (renaming a column `list_active_for_principal`'s SELECT
+    // references, but rotate_token's own now-finished reads never will
+    // again) survives the COMMIT and breaks every later query against it —
+    // sanctioned exactly by this hook's own doc comment ("run an invalid
+    // statement on the same connection").
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("my-key", "test-user", now + 90 * 24 * 3600, "", "operator")
+                .has_value());
+    auto listing = store.list_tokens("test-user").value();
+    REQUIRE(!listing.empty());
+    const std::string token_id = listing.front().token_id;
+
+    store.test_hook_before_mint_commit_ = [&](PGconn* conn) {
+        pg::PgResult r{
+            PQexec(conn, "ALTER TABLE api_token_store.api_tokens RENAME COLUMN name TO up11_gone")};
+        REQUIRE(r.ok());
+    };
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.metrics_for_test = &reg;
+    ts.mock_username = "test-user";
+    ts.start("operator");
+
+    auto rot = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":970,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"("}}})");
+
+    REQUIRE(rot);
+    REQUIRE(rot->status == 200); // MCP: transport-level 200, error lives in the JSON-RPC body
+    auto body = nlohmann::json::parse(rot->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("could not be read back") !=
+          std::string::npos);
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == 2000); // A5: genuinely retryable
+
+    // THE ASSERTION THIS TEST EXISTS FOR: "partial", never "failure" — the
+    // domain-specific row AND the generic MCP gate-level row both reflect
+    // it, matching every other tool's outcome-string discipline.
+    REQUIRE(ts.audit_log.size() >= 2);
+    CHECK(ts.audit_log[0] == "api_token.rotate|partial");
+    CHECK(ts.audit_details[0].find("successor") != std::string::npos);
+    CHECK(ts.audit_log[1] == "mcp.rotate_api_token|partial");
+
+    // Ground truth: rotate_token really did mint and commit a live successor
+    // — the audit outcome above must match the database, not contradict it.
+    // Queried via a column list that does NOT touch the now-renamed `name`
+    // column, through a SECOND, independent connection (the pool's own
+    // connections all carry the renamed schema, but that only matters to
+    // queries that reference the missing name).
+    {
+        pg::PgConn side{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(side.get()) == CONNECTION_OK);
+        pg::PgResult r{PQexec(side.get(),
+                              ("SELECT count(*) FROM api_token_store.api_tokens "
+                               "WHERE supersedes_token_id = '" +
+                               token_id + "' AND revoked = FALSE")
+                                  .c_str())};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "1");
+    }
+}
+
 TEST_CASE("MCP rotate_api_token: successor lookup is scoped to the predecessor being rotated, "
           "not any linked row of the principal (round-3 BLOCKING regression, MCP twin of the "
           "REST reproduction)",

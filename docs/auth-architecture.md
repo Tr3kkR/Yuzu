@@ -1833,8 +1833,16 @@ walkthrough.
   outright, never truncated, below the floor), a ~120-second grace window
   that re-serves the same successor secret on a same-caller retry, and a
   60-second background sweep that auto-revokes the predecessor once its
-  overlap window elapses and warns (an operational, non-security signal) on
-  an unused successor nearing expiry. **Confirm replay classification (#2404):**
+  overlap window elapses — **unless the successor was never presented at
+  all** (governance UP-5): a dropped/lost successor secret must never leave
+  the principal at zero usable credentials, so that predecessor is left
+  active and the operational, non-security `successor_unused` warning keeps
+  firing every tick past the window's own end (not deduplicated to one, the
+  way the pre-elapse lead-time warning is) until an operator resolves it
+  explicitly. The sweep's per-tick auto-revoke is bounded
+  (`kMaxAutoRevokesPerTick`) so a clock jump degrades to a multi-tick drain
+  rather than a fleet-wide cutover in one tick.
+  **Confirm replay classification (#2404):**
   a `confirm` replayed after its own rotation already resolved returns a
   *terminal* conflict (REST `409` / MCP `kInvalidParams`), never a retryable
   `503`, so an agentic client honouring the tool's `idempotentHint` stops

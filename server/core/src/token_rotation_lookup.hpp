@@ -1,10 +1,10 @@
 #pragma once
 
-#include "api_token_store.hpp"
-
 #include <cstdint>
 #include <string>
 #include <vector>
+
+#include "api_token_store.hpp"
 
 /// @file token_rotation_lookup.hpp
 /// Single source of truth for locating a human token-keyed rotation's

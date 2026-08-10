@@ -780,7 +780,8 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: a HUMAN rotation pair's swept
     // triggers the engine-only referent-check block), so the default arm
     // exercised here IS the human path under test.
     REQUIRE(store.create_token("pred", principal, now + k90Days).has_value());
-    REQUIRE(store.create_token("succ", principal, now + k90Days).has_value());
+    auto succ_raw = store.create_token("succ", principal, now + k90Days);
+    REQUIRE(succ_raw.has_value());
 
     auto active = store.list_active_for_principal(principal);
     REQUIRE(active.size() == 2);
@@ -788,6 +789,12 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: a HUMAN rotation pair's swept
     const ApiToken* successor = active[0].name == "succ" ? &active[0] : &active[1];
     REQUIRE(predecessor->principal_kind == "human");
     REQUIRE(successor->principal_kind == "human");
+
+    // UP-5: the sweep only auto-revokes when the successor has been
+    // presented at least once — present it here so this test (which is
+    // about principal_kind routing, not UP-5 itself) still exercises the
+    // auto-revoke path.
+    REQUIRE(store.validate_token(*succ_raw).has_value());
 
     // Overlap window already elapsed — this tick's sweep must pick it up.
     wire_manual_rotation_pair(pool, predecessor->token_id, predecessor->token_id,
@@ -1214,6 +1221,13 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: rolls back the predecessor's 
     const std::string successor_id = successor->token_id;
     const std::string rotation_group = predecessor->rotation_group;
 
+    // UP-5: the sweep only attempts the auto-revoke transaction under test
+    // here (the one whose rollback this test exercises) when the successor
+    // has been presented at least once — present it so the F3 rollback path
+    // is actually reached rather than short-circuited by the never-used
+    // carve-out.
+    REQUIRE(store.validate_token(*rotated).has_value());
+
     // Force the successor's rotation-state clear to fail with a genuine SQL
     // execution error (never merely a zero-row match) — a BEFORE UPDATE
     // trigger that raises only when THIS successor's rotation_group is
@@ -1469,6 +1483,11 @@ TEST_CASE("ApiTokenStore: confirm_rotation after the sweep cuts over is a termin
         if (!t.supersedes_token_id.empty())
             successor_id = t.token_id;
     REQUIRE_FALSE(successor_id.empty());
+
+    // UP-5: present the successor so the sweep below actually auto-revokes
+    // (a never-used successor is now left alone) — this test is about the
+    // #2404 confirm-vs-sweep race, not UP-5 itself.
+    REQUIRE(store.validate_token(*rotated).has_value());
 
     // The overlap sweep auto-revokes the predecessor and clears the successor
     // (which was never confirmed: confirmed_at stays 0).
@@ -2793,6 +2812,11 @@ TEST_CASE("ApiTokenStore: sweep_expired_rotations auto-revokes an elapsed human 
     REQUIRE(rotated.has_value());
     REQUIRE(store.list_active_for_principal("alice").size() == 2);
 
+    // UP-5: present the successor so the sweep actually auto-revokes (a
+    // never-used successor is now left alone — see the dedicated UP-5 test
+    // below); this test is about the human/engine sweep parity, not UP-5.
+    REQUIRE(store.validate_token(*rotated).has_value());
+
     auto swept = store.sweep_expired_rotations(now + kDay + 1);
     REQUIRE(swept.size() == 1);
     CHECK(swept[0].token_id == predecessor_id);
@@ -3044,6 +3068,11 @@ TEST_CASE("ApiTokenStore: sweep_expired_rotations auto-revokes a human "
             successor_id = tok.token_id;
     REQUIRE_FALSE(successor_id.empty());
 
+    // UP-5: present the successor so the sweep actually auto-revokes (this
+    // test is about the sweep's own auto-revoke/clear behavior, not UP-5's
+    // never-used carve-out, which has its own dedicated test).
+    REQUIRE(store.validate_token(*rotated).has_value());
+
     bool tick_failed = false;
     auto swept = store.sweep_expired_rotations(now + kDay + 1, &tick_failed);
     CHECK_FALSE(tick_failed);
@@ -3064,6 +3093,122 @@ TEST_CASE("ApiTokenStore: sweep_expired_rotations auto-revokes a human "
     REQUIRE(pred.has_value());
     REQUIRE(pred->has_value());
     CHECK((*pred)->revoked); // the predecessor was actually revoked
+}
+
+TEST_CASE("ApiTokenStore::sweep_expired_rotations: a NEVER-USED successor's predecessor is "
+          "left active past its overlap window — never auto-revoked to zero usable "
+          "credentials (UP-5)",
+          "[pg][token][rotation][human][sweep][up5]") {
+    // Defect this catches: pre-fix, sweep_expired_rotations auto-revoked the
+    // predecessor purely on `overlap_expires_at <= now` plus "a live
+    // successor row exists" — with no regard for whether that successor's
+    // secret was ever actually delivered/used. A dropped rotate response or
+    // an operator who never picked up the new credential ends the overlap
+    // window with the WORKING credential revoked and the never-presented
+    // one the principal's only (unusable, because unknown to them)
+    // credential — zero usable credentials, unattended.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto now = test_now_epoch();
+    auto t = store.create_token("Lost-successor PAT", "priya-up5", now + k90Days);
+    REQUIRE(t.has_value());
+    const std::string predecessor_id = store.list_active_for_principal("priya-up5")[0].token_id;
+
+    auto rotated = store.rotate_token(predecessor_id, kDay, now, "priya-up5", "", "");
+    REQUIRE(rotated.has_value());
+    std::string successor_id;
+    for (const auto& tok : store.list_active_for_principal("priya-up5"))
+        if (tok.supersedes_token_id == predecessor_id)
+            successor_id = tok.token_id;
+    REQUIRE_FALSE(successor_id.empty());
+
+    // Deliberately never validate the successor — the "secret was lost /
+    // never delivered" case this fix guards against.
+
+    bool tick_failed = false;
+    auto swept = store.sweep_expired_rotations(now + kDay + 1, &tick_failed);
+    CHECK_FALSE(tick_failed);
+    // THE ASSERTION THIS TEST EXISTS FOR: pre-fix this predecessor would be
+    // in `swept` (auto-revoked). Post-fix it must be left alone.
+    CHECK(swept.empty());
+
+    auto pred_after = store.get_token(predecessor_id);
+    REQUIRE(pred_after.has_value());
+    REQUIRE(pred_after->has_value());
+    CHECK_FALSE((*pred_after)->revoked);
+    auto succ_after = store.get_token(successor_id);
+    REQUIRE(succ_after.has_value());
+    REQUIRE(succ_after->has_value());
+    CHECK_FALSE((*succ_after)->revoked);
+    // Both credentials genuinely still active — never zero.
+    CHECK(store.list_active_for_principal("priya-up5").size() == 2);
+
+    // The pair keeps warning even PAST its own overlap window —
+    // list_rotations_nearing_expiry_unused no longer stops surfacing an
+    // unused-successor pair once `overlap_expires_at <= now` (the old
+    // "strictly future" floor this fix removes for exactly this case).
+    auto nearing = store.list_rotations_nearing_expiry_unused(now + kDay + 1, 3600);
+    bool found = false;
+    for (const auto& pair : nearing)
+        if (pair.predecessor.token_id == predecessor_id)
+            found = true;
+    CHECK(found);
+
+    // Idempotent — a much later sweep still declines; this is not a
+    // one-tick reprieve, it is an indefinite hold until an operator acts.
+    auto second = store.sweep_expired_rotations(now + kDay + 100, &tick_failed);
+    CHECK(second.empty());
+}
+
+TEST_CASE("ApiTokenStore::sweep_expired_rotations: caps auto-revokes per tick — a clock jump "
+          "degrades to a multi-tick drain, never a single fleet-wide cutover (UP-6)",
+          "[pg][token][rotation][human][sweep][up6]") {
+    // Defect this catches: pre-fix, the predecessor scan had no LIMIT at
+    // all — every eligible predecessor was processed in one tick,
+    // regardless of count. A single forward clock step (NTP correction,
+    // clock drift fix) would then cut over every in-flight rotation
+    // fleet-wide in that one 60s tick.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto now = test_now_epoch();
+    // kMaxAutoRevokesPerTick (api_token_store.cpp, currently 200) + 1 —
+    // one more pair than the cap allows in a single tick, each on its own
+    // principal so no per-rotation-group ceiling gets in the way.
+    constexpr int kPairs = 201;
+    for (int i = 0; i < kPairs; ++i) {
+        const std::string principal = "cap-test-up6-" + std::to_string(i);
+        REQUIRE(store.create_token("pred", principal, now + k90Days).has_value());
+        const std::string pred_id = store.list_active_for_principal(principal)[0].token_id;
+        auto rotated = store.rotate_token(pred_id, kDay, now, principal, "", "");
+        REQUIRE(rotated.has_value());
+        // UP-5: the successor must be USED, or this pair is excluded from
+        // the cap-eligible set entirely by the never-used carve-out — this
+        // test is about UP-6's cap, not UP-5's carve-out.
+        REQUIRE(store.validate_token(*rotated).has_value());
+    }
+
+    bool tick_failed = false;
+    bool tick_capped = false;
+    auto swept = store.sweep_expired_rotations(now + kDay + 1, &tick_failed, &tick_capped);
+    CHECK_FALSE(tick_failed);
+    // THE ASSERTION THIS TEST EXISTS FOR: pre-fix, `swept.size()` would be
+    // 201 (every eligible row, unconditionally, in one tick). Post-fix it
+    // is capped, and the cap is reported.
+    CHECK(tick_capped);
+    CHECK(swept.size() == 200);
+
+    // The remainder drains on the NEXT tick — nothing is lost, only
+    // deferred, and the second tick reports itself uncapped.
+    auto second = store.sweep_expired_rotations(now + kDay + 2, &tick_failed, &tick_capped);
+    CHECK_FALSE(tick_failed);
+    CHECK_FALSE(tick_capped);
+    CHECK(second.size() == 1);
 }
 
 TEST_CASE("ApiTokenStore: list_rotations_nearing_expiry_unused surfaces a "
