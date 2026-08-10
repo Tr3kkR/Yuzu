@@ -9,6 +9,6 @@
   cadence does not. **Operators wiring Alertmanager routing need to add this
   alertname** alongside the existing `yuzu-audit` group rules; see
   [`ops-runbooks/audit-store-clock-guard.md`](docs/ops-runbooks/audit-store-clock-guard.md#yuzuserverrestartloop)
-  for triage. Like every rule in this family, it needs one continuous
-  `instance`-labelled series per server to detect restarts at all — see the
-  derivation comment above the rule in `docs/prometheus/yuzu-alerts.yml`. (#2854)
+  for triage. Like the retention grace it was extracted from, it needs one
+  continuous `instance`-labelled series per server to detect restarts at all —
+  see the derivation comment above the rule in `docs/prometheus/yuzu-alerts.yml`. (#2854)

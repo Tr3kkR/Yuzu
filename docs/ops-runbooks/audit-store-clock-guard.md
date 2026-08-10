@@ -205,8 +205,10 @@ container log around each restart timestamp for the crash signature); an
 OOM-kill (check `dmesg` / the orchestrator's eviction events); a failed boot
 precondition that causes the process to exit deliberately rather than serve
 with a known-bad state (`AuditStore` backfill failure is one such precondition
-— see `YuzuAuditBackfillFailing` below — but any fail-closed startup check can
-produce this same restart signature); or a supervisor/orchestrator
+— see [`user-manual/upgrading.md`](../user-manual/upgrading.md) and the
+`YuzuAuditBackfillFailing` rule comment in `yuzu-alerts.yml` — but any
+fail-closed startup check can produce this same restart signature); or a
+supervisor/orchestrator
 misconfiguration causing healthy-but-unwanted restarts (an aggressive
 liveness-probe timeout, a config-reload path that restarts instead of
 reloading).
