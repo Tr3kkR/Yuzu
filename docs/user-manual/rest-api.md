@@ -6866,8 +6866,10 @@ The MCP endpoint enables AI models and automation tools to interact with Yuzu vi
 #### `GET /mcp/v1/`
 
 The MCP Streamable HTTP **SSE channel** — the server→client half of a session minted by
-`initialize`. Carries heartbeats and, on reconnect, replayed frames; producers
-(`notifications/progress`) arrive with the next 2f rung.
+`initialize`. Carries heartbeats, replayed frames on reconnect, and
+`notifications/progress` frames for any `POST /mcp/v1/` call on this session that
+requested progress tracking and isn't being delivered as a streamed POST instead (see
+below).
 
 **Permission:** the same credential as `POST /mcp/v1/`, plus the session's
 `Mcp-Session-Id` header. The credential is re-checked once per tick (~3 s), whether or
@@ -7049,16 +7051,21 @@ enabled (off by default):
 
 A streamed POST's response headers are `Content-Type: text/event-stream`,
 `Cache-Control: no-cache`, `X-Accel-Buffering: no` (nginx only — Envoy/HAProxy/ALB/
-Cloudflare need their own no-buffering opt-out, same caveat as `GET /mcp/v1/` above),
-and `X-Correlation-Id`. Admission denials reuse `-32012` / HTTP `429` — the same code
-and the same `retry_after_ms`/`Retry-After` A4 shape as the `GET` channel above, but a
-longer fixed value (30s vs. the `GET` channel's 5s: none of these causes is likely to
-clear within a second or two) and a distinct set of causes (a shared cross-surface
-budget, this principal's own streamed-call allowance, a server-wide capacity ceiling,
-or this session's own slots) — see `docs/user-manual/mcp.md`
-"`-32012`: Stream limit reached" for the full cause-by-cause remediation, and
-`docs/mcp-server.md` "Streamed POST — SSE on the response" for the wire-level response
-shape, close reasons, and resume/recovery rules. Progress is best-effort either way —
+Cloudflare need their own response-buffering opt-out, or the proxy will buffer the
+whole stream and the server cannot detect that the client has gone), `X-Correlation-Id`,
+and `X-Content-Type-Options: nosniff`. **Capacity** denials reuse `-32012` / HTTP `429`
+— the same code and `retry_after_ms`/`Retry-After` A4 shape as the `GET` channel above,
+but a longer fixed value (30s vs. the `GET` channel's 5s: none of these causes is
+likely to clear within a second or two) and a distinct set of causes (a shared
+cross-surface budget, this principal's own streamed-call allowance, a server-wide
+capacity ceiling, or this session's own slots). A duplicate request id or an unknown
+session get their own codes (`409`/`-32600`, `404`/`-32007`) instead — see
+`docs/user-manual/mcp.md` "`-32012`: Stream limit reached" for the full cause-by-cause
+remediation, and `docs/mcp-server.md` "Streamed POST — SSE on the response" for the
+complete admission/refusal table, close reasons, and resume/recovery rules. A denial
+caused by the server disabling/shutting down streaming, or an allocation failure,
+degrades silently to the plain (non-streamed) response instead of erroring — see the
+same admission table for which causes degrade vs. answer. Progress is best-effort either way —
 a reservation can silently degrade to the plain path under load, so a caller must still
 be prepared to poll (`query_responses` / `get_execution_status`).
 
