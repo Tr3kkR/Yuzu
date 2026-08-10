@@ -7532,7 +7532,7 @@ private:
                          ? " - size shutdown grace above the 120s response cap plus a "
                            "drain margin (see the Sizing bullet in "
                            "docs/user-manual/server-admin.md)"
-                         : " - re-enable by dropping --no-mcp-streamed-post");
+                         : " - re-enable with --mcp-enable-streamed-post");
         spdlog::info("HTTP worker pool: {} threads, sized for {} concurrent held-open responses "
                      "(plain-REST reserve {}). EVERY streaming surface leases from one budget: "
                      "GET /mcp/v1/, MCP streamed POST, GET /api/v1/events, the dashboard "
