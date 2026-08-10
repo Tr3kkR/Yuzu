@@ -81,4 +81,75 @@ classify_confirm_state(const std::vector<ApiToken>& active, const std::string& p
                                   : RotationConfirmState::kSoleResolved;
 }
 
+/// The disjoint states the human token-keyed arm's `confirm_token_rotation`
+/// (P2 #11, SOC 2 CC6.3) can observe — the group-aware sibling of
+/// `RotationConfirmState` above. `confirm_token_rotation` enforces the <=2
+/// ceiling PER ROTATION GROUP rather than per principal (a human routinely
+/// holds several unrelated concurrent tokens, unlike an engine principal's
+/// single credential), so the states it needs to discriminate are counted
+/// within one `rotation_group`, never across the whole principal.
+enum class GroupRotationConfirmState {
+    kAmbiguousEmpty,        //!< The PRINCIPAL-WIDE active read was empty — ambiguous with a
+                             //!< swallowed SELECT failure (same UP-6 premise as kNoneActive
+                             //!< above) -> stays retryable/Transient.
+    kOverfullGroup,          //!< >2 active rows share this rotation_group -> defensive,
+                             //!< manual resolution (mirrors kOverfull).
+    kGroupEmpty,             //!< The principal-wide read was NON-empty, but zero of those rows
+                             //!< carry this rotation_group. Unlike kAmbiguousEmpty this IS a
+                             //!< positive fact, not ambiguous — see the group-filtering note
+                             //!< below — so it is terminal: the rotation already resolved.
+    kUnresolvedSoleInGroup,  //!< Exactly 1 active row carries this rotation_group. A resolved
+                             //!< standalone credential's rotation_group is cleared to '' and so
+                             //!< can never match a non-empty filter — so ANY row surviving the
+                             //!< filter is, by construction, still mid-rotation (a best-effort
+                             //!< pair-resolve failed, or the partner naturally expired without
+                             //!< a revoke). Terminal; do not rotate or confirm from here.
+    kPairInGroup,            //!< Exactly 2 active rows share this rotation_group -> the normal
+                             //!< pair-processing path (pin + initiator checked by the caller).
+};
+
+/// Classify the state `confirm_token_rotation` finds for one `rotation_group`,
+/// against the PRINCIPAL-WIDE active set `read_active_for_principal_on_conn`
+/// already returned (never a second, group-scoped SQL query — see below for
+/// why). Pure; total; no I/O.
+///
+/// GROUP-FILTERING NOTE (re-deriving the UP-6 premise above for a filtered
+/// read): a group-scoped SQL query (`WHERE rotation_group = $1 AND ...`)
+/// would reintroduce read_active_for_principal_on_conn's own ambiguity in a
+/// NEW place — its own zero-row result would be indistinguishable between
+/// "the query failed" and "genuinely nothing in this group". This function
+/// avoids that by filtering the ALREADY-FETCHED, already-classified
+/// `principal_active` vector IN MEMORY instead of issuing a second query. A
+/// NON-empty `principal_active` is positive evidence the underlying SELECT
+/// itself succeeded (the header note above: a non-empty vector is never a
+/// masked failure); once that is established, a rotation_group filter over
+/// it that finds zero matching rows is EQUALLY positive — the query worked,
+/// and this specific group simply has nothing active left — never ambiguous
+/// with a swallowed failure the way an empty `principal_active` is.
+///
+/// Callers MUST pass the principal's FULL active set — read on the primary,
+/// inside the same advisory-locked transaction that will act on it, exactly
+/// like `classify_confirm_state`'s callers — never a set already filtered by
+/// rotation_group at the SQL layer (that would silently discard the
+/// evidence this function's positive-read reasoning depends on).
+[[nodiscard]] inline GroupRotationConfirmState
+classify_confirm_state_in_group(const std::vector<ApiToken>& principal_active,
+                                const std::string& rotation_group) {
+    if (principal_active.empty())
+        return GroupRotationConfirmState::kAmbiguousEmpty;
+
+    std::size_t in_group = 0;
+    for (const auto& t : principal_active)
+        if (t.rotation_group == rotation_group)
+            ++in_group;
+
+    if (in_group == 0)
+        return GroupRotationConfirmState::kGroupEmpty;
+    if (in_group > 2)
+        return GroupRotationConfirmState::kOverfullGroup;
+    if (in_group == 2)
+        return GroupRotationConfirmState::kPairInGroup;
+    return GroupRotationConfirmState::kUnresolvedSoleInGroup;
+}
+
 } // namespace yuzu::server::detail

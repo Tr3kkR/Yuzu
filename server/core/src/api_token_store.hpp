@@ -53,6 +53,11 @@ namespace yuzu::server::pg {
 class PgPool;
 }
 
+// libpq's PGconn, forward-declared (matches the PgPool forward-declare
+// above) so this header never pulls in libpq-fe.h. Only used by a
+// test-only hook signature below.
+struct pg_conn;
+
 namespace yuzu::server {
 
 // Forward-declared rather than pulling in engine_principal_store.hpp here —
@@ -323,6 +328,95 @@ public:
     confirm_rotation(const std::string& principal_id, const std::string& token_id,
                      const std::string& requesting_user);
 
+    // ── Human arm: token-keyed overlap-pair rotation (P2 #11, SOC 2 CC6.3) ──
+    //
+    // `rotate_engine_credential`/`confirm_rotation` above arbitrate on a
+    // ≤2-ACTIVE-CREDENTIALS-PER-PRINCIPAL invariant, which is true for an
+    // engine principal (one credential by design) and FALSE for a human
+    // (`principal_id` is their username, and one user routinely holds N
+    // concurrent unrelated named tokens). `rotate_token`/`confirm_token_rotation`
+    // therefore key on the TOKEN being rotated, not the principal, and enforce
+    // the ≤2 ceiling PER ROTATION GROUP — never a principal-wide count. They
+    // reuse the same overlap-window floor/ceiling, grace-cache, and double-bump
+    // TOCTOU machinery as the engine arm; the advisory lock is still taken on
+    // `hashtext(principal_id)` (derived from the resolved token row), the SAME
+    // key `sweep_expired_rotations`/`resolve_rotation_pair_after_revoke` use, so
+    // the two arms still serialize against each other and against the sweep for
+    // a shared principal. Human-only: both reject a non-"human" `principal_kind`
+    // row (the engine arm's own analogous kind guard).
+    //
+    // SELF-SERVICE ONLY (deliberate asymmetry with the engine arm, where
+    // `requesting_user` is a third-party admin by design): both functions
+    // reject unless `requesting_user == <resolved token row>.principal_id` —
+    // enforced HERE, in the store, not merely at a route layer, the same
+    // "store is the chokepoint, route filtering is defense-in-depth only"
+    // posture `ResponsesFn` threading `agent_id` into `ResponseQuery` uses
+    // (#1634). A human token's raw successor secret authenticates AS that
+    // user; an admin re-serving or confirming another user's rotation would
+    // be handed (or complete the cutover of) a credential impersonating
+    // someone else — identity takeover, not a permission gap an admin
+    // override could legitimately cross. Admins already have `revoke_token`
+    // / `revoke_for_principal` as the correct lever for another user's
+    // credential. The rejection is folded into the SAME wording the
+    // genuine-token-does-not-exist case uses (never a distinguishable
+    // "not yours" message) so the surface is not an ownership-enumeration
+    // oracle — the same posture the human `DELETE /api/v1/tokens/{id}`
+    // route takes for a non-owner (`rest_api_v1.cpp`).
+
+    /// Mint (or idempotently re-serve) a successor for `predecessor_token_id`,
+    /// a human-owned credential. `now`/`overlap_secs` carry the same contract
+    /// as `rotate_engine_credential` (caller-supplied instant; window rejected
+    /// — never truncated — below the 24h floor, above the 10y ceiling, or if it
+    /// would outlive either credential's own expiry).
+    ///
+    /// State machine, keyed on the PREDECESSOR ROW's own rotation linkage
+    /// (re-read fresh under the principal-scoped advisory lock, never a
+    /// pre-lock snapshot):
+    ///   `rotation_group` empty  -> mint arm: validates the candidate successor
+    ///       through `validate_human_mint` (candidate prep happens BEFORE the
+    ///       transaction opens, mirroring Hermes F2), inserts it linked via
+    ///       `supersedes_token_id`, and stamps the predecessor's own
+    ///       `rotation_group`/`overlap_expires_at` — both writes commit in the
+    ///       SAME transaction (Hermes F2's "mint and stamp together" guarantee).
+    ///   `rotation_group` non-empty -> re-serve/conflict arm: reads every
+    ///       active row sharing that `rotation_group` (never a principal-wide
+    ///       scan) and, if it is a recognized 2-row pair within the grace
+    ///       window and the SAME `requesting_user` who initiated it (Hermes
+    ///       F4 equivalent), re-serves the cached raw secret; otherwise
+    ///       rejected as a conflict (grace elapsed / different operator /
+    ///       group state not a recognized pair / defensively >2 in-group).
+    ///
+    /// Successor TTL: inherits the predecessor's absolute `expires_at`
+    /// VERBATIM (perpetual stays perpetual) unless `successor_expires_at`
+    /// overrides it — never recomputed as `now + 90d`, which would silently
+    /// extend authorization lifetime (the exact thing a CC6.3 auditor must not
+    /// find fused into rotation). The (possibly-overridden) value is validated
+    /// through `validate_human_mint`, the same policy gate `create_token`
+    /// uses for a fresh human mint.
+    [[nodiscard]] std::expected<std::string, std::string>
+    rotate_token(const std::string& predecessor_token_id, int64_t overlap_secs, int64_t now,
+                const std::string& requesting_user,
+                std::optional<int64_t> successor_expires_at = std::nullopt);
+
+    /// Operator-confirmed cutover for a human token-keyed rotation — same
+    /// contract as `confirm_rotation` (immediate predecessor revoke +
+    /// successor rotation-state clear + grace-cache eviction, all inside one
+    /// advisory-locked transaction; only the initiating `requesting_user` may
+    /// confirm; the double revoke-generation bump around the predecessor's
+    /// revoke UPDATE, same TOCTOU contract as every other revoke path here) —
+    /// but keyed by `successor_token_id` alone rather than
+    /// `principal_id`+`token_id`: the principal (and thus the advisory-lock
+    /// key) and the rotation group are both RESOLVED FROM the pinned row.
+    ///
+    /// State discrimination reuses `confirm_rotation`'s #2404 taxonomy, but
+    /// through the group-aware sibling classifier
+    /// (`rotation_confirm_state.hpp`'s `classify_confirm_state_in_group`) —
+    /// see that header for why a group-scoped filter needs its own positive-
+    /// read reasoning, distinct from the principal-scoped original.
+    [[nodiscard]] std::expected<void, std::string>
+    confirm_token_rotation(const std::string& successor_token_id,
+                           const std::string& requesting_user);
+
     /// One rotation pair currently in flight, as read by the T12 maintenance
     /// sweep (design doc §7). `predecessor.supersedes_token_id` is always
     /// empty; `successor.supersedes_token_id == predecessor.token_id`.
@@ -422,6 +516,25 @@ public:
     // interleave a concurrent revoke at the exact cache-poisoning point.
     std::function<void()> test_hook_after_first_revoke_bump_;   // fired in revoke_token, right after the FIRST generation bump, before the lease/UPDATE
     std::function<void()> test_hook_after_validate_select_;     // fired in validate_token, right after the SELECT (+last_used update), before the generation re-check block
+
+    /// Fired in `rotate_token`'s re-serve/conflict arm, right before the
+    /// principal-wide active-set re-read — receives the transaction's own
+    /// `PGconn*` so a test can deterministically poison it (e.g. run an
+    /// invalid statement on the same connection) and exercise the "the
+    /// active-set read fails mid-transaction" path. That path MUST classify
+    /// Transient/retryable, never the terminal "not a recognized rotation
+    /// pair" conflict below it — see the call site's comment.
+    ///
+    /// BORROW CONTRACT (the only hook here that hands out a resource handle,
+    /// so the shape does not speak for itself): the `PGconn*` is valid ONLY
+    /// for the duration of this call — pool-owned, mid-transaction — and the
+    /// callee must not retain it past return, nor close/commit/rollback it
+    /// (that is `with_txn_for`'s job; a callee that does so races or
+    /// double-frees the connection). As with the two hooks above, this
+    /// `std::function` is read unsynchronized on the store's own request
+    /// threads, so it may only be assigned before the store is shared across
+    /// threads (single-threaded test setup, never a live-traffic toggle).
+    std::function<void(pg_conn*)> test_hook_before_rotate_group_read_;
 
     /// Injects the engine-principal referential-integrity check used by
     /// `create_token`'s engine block (design doc §6). Unset by default —
@@ -626,6 +739,18 @@ private:
     /// (referential integrity against `EnginePrincipalStore`, §6).
     [[nodiscard]] std::expected<void, std::string>
     validate_engine_mint(const std::string& principal_id, const std::string& scope_service,
+                        const std::string& mcp_tier, int64_t expires_at, int64_t now) const;
+
+    /// Human-mint validation shared by `create_token`'s common checks
+    /// (unconditional, both principal_kind values) and `rotate_token`'s
+    /// candidate-successor prep — the exact anti-drift pattern
+    /// `validate_engine_mint` establishes for the engine mint paths. Pure/
+    /// cheap: name non-empty, scope-service requires an expiry, MCP tier
+    /// validity + expiry requirement + 90-day ceiling. No external referent
+    /// check (unlike the engine arm — a human token has no referential
+    /// integrity requirement against another store).
+    [[nodiscard]] std::expected<void, std::string>
+    validate_human_mint(const std::string& name, const std::string& scope_service,
                         const std::string& mcp_tier, int64_t expires_at, int64_t now) const;
 
     /// Generate a fresh `yuzu_` Bearer token from the platform CSPRNG.
