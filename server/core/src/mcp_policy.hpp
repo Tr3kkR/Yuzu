@@ -32,6 +32,21 @@ inline bool tier_allows(std::string_view mcp_tier,
             return true;
         if (securable_type == "Execution" && operation == "Execute")
             return true;  // Operator tier executes without approval (auto-approved)
+        // Self-service human API-token rotation (P2 #11, SOC 2 CC6.3):
+        // deliberately NOT the engine-credential arm's Security:Write (which
+        // stays supervised-tier + approval-gated — a maker-checker rotation
+        // of a shared machine identity). ApiTokenStore::rotate_token/
+        // confirm_token_rotation are self-service-only at the STORE layer
+        // (reject unless requesting_user == the resolved token row's own
+        // principal_id) — the same posture as the Tag Write/Delete case
+        // above, where the caller can only ever touch their own resource.
+        // Operator tier is the right floor: it is the tier every ordinary
+        // human MCP token is expected to hold (readonly can't write
+        // anything; supervised is reserved for destructive fleet-wide ops),
+        // and requires_approval() has no ApiToken rule, so this never
+        // ticket-gates — matching REST, which needs no admin approval either.
+        if (securable_type == "ApiToken" && operation == "Write")
+            return true;
         return false;
     }
 
