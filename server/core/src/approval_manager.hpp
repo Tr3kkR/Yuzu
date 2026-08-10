@@ -108,15 +108,23 @@ struct ApprovalQuery {
 /// kNotConsumable means the one-time capability is spent. Distinguishing them by
 /// parsing the message string would be a fragile seam, so the kind is typed.
 ///
-/// OBLIGATION ON THE FIRST CALLER of the three-argument overload: today the MCP
-/// recall maps every consume failure onto one message — "approval already used
-/// (one-time ticket)", remediating "submit a new request without approval_id".
-/// That is correct only while the two-argument overload is the sole caller.
-/// Wired as-is to a precondition, it would tell the operator to discard a ticket
-/// this code deliberately left recallable — re-entering the very burn class
-/// #2443 exists to close. Map the kinds, and audit a kPrecondition denial: a
-/// refusal to honour a human-approved capability currently leaves nothing but a
-/// log line.
+/// DISCHARGED (#2443, confirm_engine_rotation): the MCP recall's shared consume
+/// failure handling in mcp_server.cpp gives kPrecondition its own client
+/// message (ticket UNTOUCHED, retry-or-re-mint) instead of falling through to
+/// "approval already used" — the fallthrough would have told the operator to
+/// discard a ticket this code deliberately left recallable, re-entering the
+/// very burn class #2443 exists to close. The audit row and the refusal-rate
+/// counter both already fire generically for every ConsumeFailure kind ahead
+/// of that branch (mcp_server.cpp's `mcp_audit("denied", ...)` /
+/// `count_denial("yuzu_mcp_approval_refused_total", ...)`), so kPrecondition
+/// needed no new plumbing there — only the message split. This store method's
+/// own `spdlog::info` on a precondition decline (see the impl) stays a log
+/// line by design; the caller's audit row is the durable record.
+///
+/// A FUTURE second caller of the three-argument overload inherits this same
+/// obligation for its own kind of drift: check that its kPrecondition message
+/// does not fall through to the shared "already used" wording before assuming
+/// this comment's DISCHARGED note still covers it.
 enum class ConsumeFailure {
     kPrecondition,  ///< precondition denied — ticket UNTOUCHED, still recallable
     kNotConsumable, ///< absent / not approved / already consumed (the CAS lost)

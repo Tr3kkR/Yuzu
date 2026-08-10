@@ -1619,6 +1619,125 @@ TEST_CASE("MCP confirm_engine_rotation: replay after success is kInvalidParams +
     CHECK(confirm_metric("success") == 1.0); // unchanged by the replay
 }
 
+TEST_CASE("MCP confirm_engine_rotation: a pre-consume precondition denies a drifted "
+          "ticket WITHOUT consuming it (#2443)",
+          "[mcp][pg][engine_principal][confirm][approval]") {
+    // The scenario #2443's issue body names: an approval ticket for
+    // confirm_engine_rotation is minted and approved, then — before it is
+    // recalled — the SAME rotation resolves through a different path (here:
+    // a direct store confirm, standing in for a manual/out-of-band cutover).
+    // Without the precondition wired, the recall would match, CONSUME the
+    // ticket, and only then fail at the handler — burning a human-approved
+    // one-time capability on a no-op. With it wired, the recall must deny
+    // WITHOUT consuming, leaving the ticket recallable.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:mcp-confirm-precondition";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    // Mint the rotation pair directly at the store (not under test here).
+    REQUIRE(store.rotate_engine_credential(principal, 7 * 24 * 3600, now, "admin").has_value());
+    std::string successor_token_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            successor_token_id = t.token_id;
+    REQUIRE_FALSE(successor_token_id.empty());
+
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-confirm-precond-appr-"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw);
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised"); // Security:Write requires approval at this tier
+
+    // 1. Mint — no approval_id yet.
+    auto mint = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 1},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments", {{"principal_id", principal}, {"token_id", successor_token_id}}}}}}
+                            .dump());
+    REQUIRE(mint->status == 200);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    CHECK(mint_body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE_FALSE(approval_id.empty());
+
+    // 2. Approve.
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // 3. DRIFT: the rotation resolves out from under the ticket, through a
+    // path that never touches the approval store — the same
+    // `requesting_user` ("admin") that minted it confirms directly.
+    REQUIRE(store.confirm_rotation(principal, successor_token_id, "admin").has_value());
+    REQUIRE(store.list_active_for_principal(principal).size() == 1);
+
+    // 4. Recall. Must be denied — and must NOT be the pre-#2443 "approval
+    // already used" wording, which would misdescribe a ticket that is still
+    // sitting there unconsumed.
+    auto recall = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 2},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments",
+           {{"approval_id", approval_id},
+            {"principal_id", principal},
+            {"token_id", successor_token_id}}}}}}
+                              .dump());
+    REQUIRE(recall->status == 200);
+    auto recall_body = nlohmann::json::parse(recall->body);
+    REQUIRE(recall_body.contains("error"));
+    CHECK(recall_body["error"]["message"].get<std::string>().find("already used") ==
+          std::string::npos);
+    CHECK(recall_body["error"]["message"].get<std::string>().find("already confirmed") !=
+          std::string::npos);
+    const std::string remediation =
+        recall_body["error"]["data"]["remediation"].get<std::string>();
+    CHECK(remediation.find("NOT consumed") != std::string::npos);
+
+    // 5. The ticket is UNTOUCHED — still consumed_at == 0, still recallable —
+    // not silently burned on the failed recall.
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0);
+    CHECK(row->status == "approved");
+
+    // 6. The generic audit + metric path already covers every ConsumeFailure
+    // kind (it runs ahead of the kind-specific client message) — confirm it
+    // actually fired for this one, naming the kind.
+    bool precondition_denied_audited = false;
+    for (const auto& d : ts.audit_details)
+        if (d.find("approval_id=" + approval_id) != std::string::npos &&
+            d.find("refused: precondition") != std::string::npos)
+            precondition_denied_audited = true;
+    CHECK(precondition_denied_audited);
+
+    // 7. Handler never ran for the drifted recall — no SECOND success audit
+    // for the credential.confirm domain event beyond what step 3's direct
+    // store call would have produced (none, since that bypassed MCP).
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     std::string("engine_principal.credential.confirm|success")) == 0);
+
+    sqlite3_close(raw);
+}
+
 // ── 2. ping ─────────────────────────────────────────────────────────────────
 
 TEST_CASE("MCP Integration: ping returns empty result", "[mcp][integration]") {

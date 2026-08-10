@@ -11,6 +11,7 @@
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "mcp_transport.hpp"     // Streamable HTTP transport pre-checks (2f)
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (streamed POST, 3b)
+#include "rotation_confirm_state.hpp" // classify_confirm_state (#2443 confirm_engine_rotation precondition)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
@@ -3381,10 +3382,73 @@ McpServer::HandlerFn McpServer::build_handler(
                     // rejects a replay of an already-consumed ticket and wins the
                     // race against a concurrent recall, so a mutating tool runs at
                     // most once per ticket).
+                    //
+                    // Pre-consume recheck (#2443), wired for the one tool known to
+                    // drift within the 7-day approval TTL: an engine-key rotation the
+                    // ticket confirms can resolve (sweep cutover, manual revoke, a
+                    // restart evicting the initiator binding) between mint and
+                    // recall. Without this, the recall matches, CONSUMES, and only
+                    // then does confirm_engine_rotation's own handler 409/503 —
+                    // burning a human-approved one-time capability on a no-op.
+                    //
+                    // This reads engine_credential_store_'s active set via the
+                    // PUBLIC, unlocked list_active_for_principal() — the same query
+                    // ApiTokenStore::confirm_rotation() runs INSIDE its per-principal
+                    // advisory-locked transaction, just without the lock. That is a
+                    // WEAKER read (rotation_confirm_state.hpp's load-bearing
+                    // invariant: only the in-transaction primary read is
+                    // authoritative), which is why this narrows the drift window
+                    // rather than closing it — the CAS below and confirm_rotation's
+                    // own in-txn recheck remain the authoritative guards. A denial
+                    // here never asserts AUTHORITY, only that the state the ticket's
+                    // effect depends on has moved on.
+                    ConsumePrecondition precondition;
+                    if (tool_name == "confirm_engine_rotation") {
+                        const auto rot_principal_id = param_str(args, "principal_id");
+                        const auto rot_token_id = param_str(args, "token_id");
+                        precondition = [this, rot_principal_id,
+                                        rot_token_id](const Approval&) -> std::expected<void, std::string> {
+                            if (!engine_credential_store_ || !engine_credential_store_->is_open())
+                                return {}; // pass through; the handler's own store-open guard reports this
+                            const auto active =
+                                engine_credential_store_->list_active_for_principal(rot_principal_id);
+                            using yuzu::server::detail::classify_confirm_state;
+                            using yuzu::server::detail::RotationConfirmState;
+                            switch (classify_confirm_state(active, rot_token_id)) {
+                            case RotationConfirmState::kNoneActive:
+                                // Empty read is ambiguous with a swallowed store fault
+                                // (positive-read contract, rotation_confirm_state.hpp)
+                                // — never deny on it; let the CAS + handler decide.
+                            case RotationConfirmState::kPair:
+                                // Still two active credentials — a live rotation may
+                                // genuinely be pending confirmation; pin-match against
+                                // the specific pair is confirm_rotation's own call.
+                                return {};
+                            case RotationConfirmState::kOverfull:
+                                return std::unexpected(
+                                    "more than two active credentials for this principal; "
+                                    "resolve manually, then re-mint if confirmation is still needed");
+                            case RotationConfirmState::kUnresolvedSole:
+                                return std::unexpected(
+                                    "one active credential with unresolved rotation metadata; "
+                                    "inspect before confirming");
+                            case RotationConfirmState::kSoleConfirmed:
+                                return std::unexpected(
+                                    "rotation already confirmed; nothing to confirm");
+                            case RotationConfirmState::kSoleResolved:
+                            case RotationConfirmState::kSoleOtherToken:
+                                return std::unexpected(
+                                    "no rotation in flight for this token_id; the rotation was "
+                                    "already resolved — re-mint the approval if a new rotation "
+                                    "needs confirming");
+                            }
+                            return {}; // unreachable; classify_confirm_state is total
+                        };
+                    }
                     // H3/N2 (SOC-2 CC7.2): stamp WHO consumed the ticket — the
                     // authenticated principal recalling the tool.
                     if (auto consumed = approval_manager->consume_ticket(
-                            supplied_id, session->username, {});
+                            supplied_id, session->username, precondition);
                         !consumed) {
                         const ConsumeFailure kind = consumed.error().kind;
                         // AUDIT names the kind. This row is server-side and is
@@ -3465,6 +3529,27 @@ McpServer::HandlerFn McpServer::build_handler(
                                                 *approval_manager, a4_error,
                                                 consumed.error().extended_errcode),
                                             "application/json");
+                            return;
+                        }
+                        // kPrecondition is NOT one of the two that must read
+                        // alike (#2442's anti-oracle pairing above is about
+                        // kForeignOrigin vs kNotConsumable — a different
+                        // question). This ticket is UNTOUCHED: consumed_at is
+                        // still 0 and it remains recallable. Reusing "approval
+                        // already used" here would tell the caller to discard a
+                        // still-good, still-recallable ticket — exactly the burn
+                        // class #2443 exists to close. The precondition's own
+                        // message is server-authored (never echoes a caller-
+                        // supplied Approval field — see ConsumePrecondition's
+                        // doc comment) so it is safe to surface directly.
+                        if (kind == ConsumeFailure::kPrecondition) {
+                            res.set_content(
+                                a4_error(kPermissionDenied, consumed.error().message,
+                                         "the approval_id is still valid and was NOT consumed; "
+                                         "retry this exact call once the underlying condition "
+                                         "clears, or submit a new request if a fresh approval is "
+                                         "needed"),
+                                "application/json");
                             return;
                         }
                         res.set_content(
