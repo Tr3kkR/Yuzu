@@ -42,6 +42,37 @@ constexpr std::chrono::milliseconds kReadTimeout{2000};
 constexpr std::chrono::milliseconds kWriteTimeout{4000};
 constexpr std::chrono::milliseconds kBackfillTxnTimeout{60000};
 
+// chaos-injector (Gate 5, #2703, HIGH — CHAOS-1, verified against live PG):
+// serializes every writer of the seed/revoke pair — seed_defaults()'s
+// grant(), remove_permission(), and migrate_from_sqlite()'s F1 revoke block —
+// against each other. Without this, grant()'s `INSERT ... SELECT ... WHERE
+// NOT EXISTS (marker) ... ON CONFLICT DO NOTHING` can resurrect an
+// already-revoked permission: if grant()'s statement snapshot is taken
+// BEFORE a concurrent revoke's marker-insert+DELETE commits, but grant()
+// then blocks on the ON-CONFLICT arbiter waiting for that same uncommitted
+// DELETE, Postgres only re-checks the CONFLICT TARGET after the wait — it
+// does NOT re-evaluate the WHERE NOT EXISTS subquery, which is fixed at the
+// original (pre-revoke) snapshot. Once the revoke's DELETE commits, the
+// conflict is gone and grant()'s already-computed INSERT lands anyway,
+// leaving the marker AND the resurrected row both present, permanently
+// (nothing ever re-syncs role_permissions against revoked_seed_defaults).
+// The LOCK must be acquired in its OWN statement, in an explicit
+// transaction, strictly BEFORE the statement that checks-and-mutates —
+// embedding the lock in the same statement via a CTE does NOT work: a
+// single statement's READ COMMITTED snapshot is fixed at that statement's
+// start, before any of its own function calls (including a blocking
+// pg_advisory_xact_lock) run, so blocking mid-statement never refreshes it.
+// Verified empirically both ways. Coarse-grained (one fixed key, not
+// per-triple): RBAC writes are boot-time seeding + rare admin actions, never
+// a hot path, so cluster-wide serialization across all triples is cheap and
+// avoids needing per-triple lock keys for the backfill's bulk (multi-row,
+// array-parameterized) F1 statement. Two-int32 form + the "yuzu" namespace
+// constant matches house convention (pg_migration_runner.cpp, auth_db.cpp,
+// secret_codec.cpp, kek_op_lock.hpp) — 2037545589 is "yuzu" as big-endian
+// ASCII, hashtext() of a descriptive string differentiates the feature.
+constexpr const char* kRevokeCoordLockSql =
+    "SELECT pg_advisory_xact_lock(2037545589, hashtext('rbac_store:revoke_coordination'))";
+
 // Cross-replica permission-cache coherence (ADR-0041): re-validate the durable
 // generation token at most this often on the read hot path.
 constexpr std::int64_t kRbacGenerationRefreshMs = 1000;
@@ -463,13 +494,27 @@ void RbacStore::seed_defaults() {
     // recreates the role_permissions row directly and does not touch this
     // table; the (now-redundant, harmless) marker just means a future
     // seed_defaults() no-ops against an already-restored row either way.
+    // chaos-injector (Gate 5, #2703, HIGH — CHAOS-1): the lock MUST be its own
+    // statement, in its own explicit transaction, strictly before the
+    // check-and-insert — see kRevokeCoordLockSql's comment for why a CTE in
+    // the same statement does not work. Each grant() call gets its own
+    // mini-transaction rather than wrapping the whole seed_defaults() pass:
+    // every other statement here stays a fire-and-forget auto-commit
+    // (existing, deliberate — a single failed seed statement must not abort
+    // the rest of the reseed), and this preserves that for grant() too.
     const auto grant = [&](std::string_view role, std::string_view type, std::string_view op) {
+        if (!exec("BEGIN"))
+            return;
+        pg::PgTxn txn(c);
+        if (!exec(kRevokeCoordLockSql))
+            return; // txn destructor rolls back
         exec("INSERT INTO rbac_store.role_permissions (role_name, securable_type, operation, "
              "effect) SELECT $1, $2, $3, 'allow' WHERE NOT EXISTS ("
              "  SELECT 1 FROM rbac_store.revoked_seed_defaults "
              "  WHERE role_name = $1 AND securable_type = $2 AND operation = $3"
              ") ON CONFLICT DO NOTHING",
              {std::string(role), std::string(type), std::string(op)});
+        txn.commit();
     };
 
     // Administrator: CRUD on everything + targeted Push + Attest.
@@ -1109,6 +1154,15 @@ std::expected<void, std::string> RbacStore::remove_permission(const std::string&
     std::optional<std::uint64_t> new_gen;
     std::string err;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        // chaos-injector (Gate 5, #2703, HIGH — CHAOS-1): must be the FIRST
+        // statement in this transaction — see kRevokeCoordLockSql's comment.
+        // Serializes against seed_defaults()'s grant() and the backfill's F1
+        // revoke block for the same coordination window.
+        pg::PgResult lk = pg::exec_params(c, kRevokeCoordLockSql, std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
         pg::PgResult marker = pg::exec_params(
             c,
             "INSERT INTO rbac_store.revoked_seed_defaults (role_name, securable_type, "
@@ -2520,6 +2574,18 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                     out.push_back(s);
                 return out;
             };
+            // chaos-injector (Gate 5, #2703, HIGH — CHAOS-1): must be its own
+            // statement, strictly BEFORE the CTE below — see
+            // kRevokeCoordLockSql's comment. Serializes this bulk revoke
+            // against a concurrent seed_defaults() grant() or
+            // remove_permission() call on another connection/replica for any
+            // of the triples this CTE is about to touch.
+            pg::PgResult lk = pg::exec_params(c, kRevokeCoordLockSql, std::vector<std::string>{});
+            if (lk.status() != PGRES_TUPLES_OK) {
+                spdlog::error("RbacStore: migrate_from_sqlite: revoke-coordination lock failed: {}",
+                             PQerrorMessage(c));
+                return false;
+            }
             pg::PgResult revoked = pg::exec_params(
                 c,
                 "WITH revoked AS ("

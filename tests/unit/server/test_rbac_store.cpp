@@ -22,11 +22,14 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -354,6 +357,79 @@ TEST_CASE("RbacStore: remove permission deletes the row and survives a reseed",
     // revoked_seed_defaults and skips re-inserting the revoked row.
     RbacStore reopened{rbac_pool_fx_};
     CHECK_FALSE(reopened.check_role_has_permission("Operator", "AuditLog", "Read"));
+}
+
+// chaos-injector (Gate 5, #2703, HIGH — CHAOS-1, verified against live PG):
+// grant()'s `INSERT ... SELECT ... WHERE NOT EXISTS (marker) ... ON CONFLICT
+// DO NOTHING` takes its READ COMMITTED snapshot once, at statement start. If
+// that snapshot is taken BEFORE a concurrent revoke's marker-insert commits,
+// but grant() then blocks on the ON CONFLICT arbiter waiting for that same
+// revoke's uncommitted DELETE, Postgres — once the revoke commits — only
+// re-checks the CONFLICT TARGET (now gone), never re-evaluates the WHERE NOT
+// EXISTS subquery. So grant()'s already-computed INSERT lands anyway: the
+// marker AND the resurrected row both end up present, permanently (nothing
+// ever re-syncs role_permissions against revoked_seed_defaults). Fixed by a
+// pg_advisory_xact_lock, acquired in its OWN statement strictly before the
+// check-and-mutate statement, in every writer (grant(), remove_permission(),
+// the backfill's F1 block) — see kRevokeCoordLockSql in rbac_store.cpp.
+TEST_CASE("RbacStore: seed_defaults()'s grant() cannot resurrect a permission mid-revoke "
+          "(CHAOS-1)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    REQUIRE(store.check_role_has_permission("Operator", "AuditLog", "Read"));
+
+    // Connection A: open a revoke transaction (lock + marker insert + DELETE)
+    // and hold it UNCOMMITTED — simulating remove_permission()'s in-flight
+    // write racing a concurrent seed_defaults() boot on another connection.
+    auto lease_a = rbac_pool_fx_.acquire();
+    REQUIRE(lease_a);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "SELECT pg_advisory_xact_lock(2037545589, "
+                            "hashtext('rbac_store:revoke_coordination'))",
+                            std::vector<std::string>{})
+                .ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "INSERT INTO rbac_store.revoked_seed_defaults (role_name, "
+                            "securable_type, operation) VALUES ('Operator','AuditLog','Read') "
+                            "ON CONFLICT DO NOTHING",
+                            std::vector<std::string>{})
+                .ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "DELETE FROM rbac_store.role_permissions WHERE role_name='Operator' "
+                            "AND securable_type='AuditLog' AND operation='Read'",
+                            std::vector<std::string>{})
+                .ok());
+
+    // Connection B, on a separate thread: a SECOND RbacStore construction
+    // against the SAME pool — a genuine replica boot, exercising the REAL
+    // (production) seed_defaults()/grant() code, not a hand-copy of its SQL.
+    // Its grant() call for Operator/AuditLog/Read must BLOCK on connection
+    // A's held lock, and once unblocked, must see the marker and insert
+    // NOTHING.
+    std::atomic<bool> b_started{false};
+    std::atomic<bool> b_done{false};
+    std::thread grant_thread([&] {
+        b_started = true;
+        RbacStore reopened{rbac_pool_fx_};
+        REQUIRE(reopened.is_open());
+        b_done = true;
+    });
+
+    // Give the grant thread time to start and genuinely block on connection
+    // A's held lock — proves this is a real blocked-then-unblocked
+    // interleaving, not a lucky race.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    CHECK(b_started.load());
+    CHECK_FALSE(b_done.load());
+
+    REQUIRE(pg::exec_params(lease_a.get(), "COMMIT", std::vector<std::string>{}).ok());
+    lease_a.reset();
+    grant_thread.join();
+    CHECK(b_done.load());
+
+    // THE FIX: the permission must stay revoked.
+    CHECK_FALSE(store.check_role_has_permission("Operator", "AuditLog", "Read"));
 }
 
 // fable (Gate 4, #2703, HIGH): a principal holding BOTH a role whose default

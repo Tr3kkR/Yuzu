@@ -283,6 +283,28 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   miss when the store also has a "global" check), not just the one you're staring at. When in
   doubt, a separate table costs one migration and guarantees it structurally.
 
+  Round 3 shipped a FOURTH bug on top, chaos-tested and closed the same week: `INSERT ... SELECT
+  ... WHERE NOT EXISTS (marker) ... ON CONFLICT DO NOTHING` — a reseed step checking the
+  bookkeeping table above before granting — is **not safe against a concurrent writer of that
+  bookkeeping table** without an explicit lock. A statement's READ COMMITTED snapshot is fixed
+  ONCE, at that statement's start, before any of its own function calls run. If the reseed's
+  snapshot is taken before a concurrent revoke's marker-insert commits, but the reseed's `INSERT`
+  then blocks on the `ON CONFLICT` arbiter waiting for that SAME revoke's uncommitted `DELETE` of
+  the conflicting row, Postgres — once the revoke commits — only re-checks the CONFLICT TARGET
+  (now gone); it does NOT re-evaluate the `WHERE NOT EXISTS` subquery, which is still reading the
+  pre-revoke snapshot. The reseed's already-computed row lands anyway: the marker AND the
+  resurrected row both end up present, permanently — nothing ever re-syncs the data table against
+  the bookkeeping table. Verified empirically (two real connections, one held open uncommitted,
+  the other genuinely blocked and measured). **The lock must be its own statement, in an explicit
+  transaction, strictly BEFORE the statement that checks-and-mutates** — a `pg_advisory_xact_lock`
+  embedded via a CTE in the SAME statement as the check does NOT work, for the identical
+  fixed-snapshot reason: blocking mid-statement never refreshes that statement's snapshot. Fix
+  shape: `BEGIN; SELECT pg_advisory_xact_lock(...); <check-and-mutate>; COMMIT;` in every writer of
+  both the data table and the bookkeeping table, all keyed to the same lock (a fixed/coarse key is
+  fine — this class of write is never a hot path). `RbacStore`'s three writers
+  (`seed_defaults()`'s grant, `remove_permission`, the backfill's revoke block) are the reference
+  case (`kRevokeCoordLockSql`).
+
 ## Non-transactional migrations (the deferred kind)
 
 `PgMigrationRunner` runs every migration in a transaction (`SET LOCAL search_path` requires it),
