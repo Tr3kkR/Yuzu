@@ -1631,22 +1631,8 @@ TEST_CASE("MCP confirm_engine_rotation: replay after success is kInvalidParams +
 // ApiTokenStore instance backs both).
 
 TEST_CASE("MCP rotate_api_token/confirm_api_token_rotation: self-service round trip at the "
-          "operator tier, audit + confirm metric",
+          "operator tier, successor resolved via the shared helper, audit + confirm metric",
           "[mcp][pg][token][rotation]") {
-    // NOTE (coordinator mid-task correction, tracked for integration): the
-    // tool's response deliberately reports token_id/expires_at/
-    // overlap_expires_at UNRESOLVED (""/0/0, successor_unresolved:true)
-    // rather than re-deriving the successor locally — the obvious "scan
-    // list_active_for_principal for the first non-empty supersedes_token_id"
-    // (what the engine tool does, and what the REST twin currently does) is
-    // UNSOUND on this human arm, whose invariant is ≤2-active-PER-ROTATION-
-    // GROUP, not per-principal (api_token_store.hpp "Human arm" comment) — a
-    // principal with concurrent unrelated tokens can have multiple rotations
-    // in flight, so that scan can return the WRONG successor. A shared
-    // seam-level helper (store-returned successor identity, or a function
-    // both REST and MCP call) is the fix; until it lands this test resolves
-    // the real successor id directly from the store, the way integration's
-    // fix will, rather than trusting the tool's own (placeholder) response.
     YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -1679,21 +1665,28 @@ TEST_CASE("MCP rotate_api_token/confirm_api_token_rotation: self-service round t
     auto rot_payload =
         nlohmann::json::parse(rot_body["result"]["content"][0]["text"].get<std::string>());
     REQUIRE_FALSE(rot_payload["raw_token"].get<std::string>().empty());
-    // Deliberately unwired pending the shared successor-resolution helper —
-    // see the NOTE above.
-    CHECK(rot_payload["token_id"].get<std::string>().empty());
-    CHECK(rot_payload["expires_at"].get<int64_t>() == 0);
-    CHECK(rot_payload["overlap_expires_at"].get<int64_t>() == 0);
-    CHECK(rot_payload["successor_unresolved"].get<bool>() == true);
-
-    // Resolve the REAL successor directly from the store (test-only — an
-    // unambiguous exact match on supersedes_token_id == the predecessor's
-    // own token_id, never a "first non-empty" scan).
-    std::string successor_token_id;
-    for (const auto& t : store.list_active_for_principal("test-user"))
-        if (t.supersedes_token_id == token_id)
-            successor_token_id = t.token_id;
+    // Pin the TOOL'S OWN response — resolved via the shared
+    // derive_rotation_successor helper (token_rotation_lookup.hpp), not a
+    // private test-side lookup.
+    const auto successor_token_id = rot_payload["token_id"].get<std::string>();
     REQUIRE_FALSE(successor_token_id.empty());
+    // Lifetime-neutral: successor inherits the predecessor's expires_at
+    // verbatim — never accepted as a caller argument, never recomputed.
+    CHECK(rot_payload["expires_at"].get<int64_t>() == predecessor_expiry);
+    // overlap_expires_at is the PREDECESSOR's own stamp — non-zero, and must
+    // match what the store actually recorded on the predecessor row (never
+    // read off the successor, which never carries one).
+    auto predecessor_row = store.get_token(token_id).value();
+    REQUIRE(predecessor_row.has_value());
+    REQUIRE(predecessor_row->overlap_expires_at > 0);
+    CHECK(rot_payload["overlap_expires_at"].get<int64_t>() ==
+          predecessor_row->overlap_expires_at);
+
+    // Ground truth: the response's token_id really is the structural
+    // successor (its supersedes_token_id links back to the predecessor).
+    auto successor_row = store.get_token(successor_token_id).value();
+    REQUIRE(successor_row.has_value());
+    CHECK(successor_row->supersedes_token_id == token_id);
 
     // api_token.reveal is the success audit for rotate (mirrors REST/engine).
     bool reveal_audited = false;
@@ -1724,6 +1717,76 @@ TEST_CASE("MCP rotate_api_token/confirm_api_token_rotation: self-service round t
     // Sibling counter to REST's yuzu_api_token_confirm_total{surface="rest"}.
     CHECK(reg.counter("yuzu_api_token_confirm_total", {{"surface", "mcp"}, {"result", "success"}})
               .value() == 1.0);
+}
+
+TEST_CASE("MCP rotate_api_token: successor lookup is scoped to the predecessor being rotated, "
+          "not any linked row of the principal (round-3 BLOCKING regression, MCP twin of the "
+          "REST reproduction)",
+          "[mcp][pg][token][rotation][blocking]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_token("token-a", "test-user").has_value());
+    REQUIRE(store.create_token("token-b", "test-user").has_value());
+    auto listing = store.list_tokens("test-user").value();
+    REQUIRE(listing.size() == 2);
+    // list_tokens orders newest-first; token-b was created after token-a.
+    const std::string token_b = listing.front().token_id;
+    const std::string token_a = listing.back().token_id;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start("operator");
+
+    const auto rotate = [&](const std::string& id, int rpc_id) {
+        return ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                       std::to_string(rpc_id) +
+                       R"(,"params":{"name":"rotate_api_token","arguments":{"token_id":")" + id +
+                       R"("}}})");
+    };
+
+    // Rotate A first — test-user now has an in-flight rotation group for A.
+    auto rot_a = rotate(token_a, 952);
+    REQUIRE(rot_a->status == 200);
+    auto successor_a = nlohmann::json::parse(
+        nlohmann::json::parse(rot_a->body)["result"]["content"][0]["text"].get<std::string>())
+                            ["token_id"]
+                                .get<std::string>();
+
+    // Rotate B while A's rotation is still inside its overlap window — legal
+    // (the <=2-active ceiling is per ROTATION GROUP, never per principal).
+    auto rot_b = rotate(token_b, 953);
+    REQUIRE(rot_b->status == 200);
+    auto successor_b = nlohmann::json::parse(
+        nlohmann::json::parse(rot_b->body)["result"]["content"][0]["text"].get<std::string>())
+                            ["token_id"]
+                                .get<std::string>();
+
+    // The BLOCKING bug an unscoped scan would reproduce: matching "any"
+    // linked row deterministically returns A's successor (minted first) even
+    // though B is the token actually rotated.
+    CHECK(successor_b != successor_a);
+    auto b_row = store.get_token(successor_b).value();
+    REQUIRE(b_row.has_value());
+    CHECK(b_row->supersedes_token_id == token_b);
+
+    // Confirming B's successor must revoke ONLY B's predecessor.
+    auto conf_b = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":954,)"
+        R"("params":{"name":"confirm_api_token_rotation","arguments":{"token_id":")" +
+        successor_b + R"("}}})");
+    REQUIRE(conf_b->status == 200);
+    REQUIRE(nlohmann::json::parse(conf_b->body).contains("result"));
+
+    auto token_b_after = store.get_token(token_b).value();
+    REQUIRE(token_b_after.has_value());
+    CHECK(token_b_after->revoked);
+
+    auto token_a_after = store.get_token(token_a).value();
+    REQUIRE(token_a_after.has_value());
+    CHECK_FALSE(token_a_after->revoked); // A's predecessor must still be LIVE
 }
 
 TEST_CASE("MCP rotate_api_token: non-owner denied — self-service only, no admin bypass, no "

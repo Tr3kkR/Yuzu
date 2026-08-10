@@ -11,6 +11,7 @@
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "mcp_transport.hpp"     // Streamable HTTP transport pre-checks (2f)
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (streamed POST, 3b)
+#include "token_rotation_lookup.hpp" // shared REST/MCP human-token rotation successor lookup (P2 #11)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
@@ -817,17 +818,16 @@ static const ToolDef kTools[] = {
      "not-owned token_id are indistinguishable — not an enumeration oracle). The successor "
      "ALWAYS inherits the predecessor's expires_at verbatim — rotation is lifetime-neutral, "
      "never accepted as a caller argument. Requires ApiToken:Write (self-service, not an admin "
-     "operation — unlike the engine credential arm's Security:Write). KNOWN GAP (tracked for "
-     "integration): the response's token_id/expires_at/overlap_expires_at currently report "
-     "unresolved (empty/0, successor_unresolved:true) rather than the successor's real values — "
-     "the raw_token secret itself IS correct and IS the predecessor's real successor, only the "
-     "accompanying identity/expiry fields are pending a shared successor-resolution fix. Mirrors "
-     "POST /api/v1/tokens/{id}/rotate. Destructive — requires ApiToken:Write.",
+     "operation — unlike the engine credential arm's Security:Write). The returned token_id is "
+     "the SUCCESSOR's (scoped exactly to the predecessor rotated, never any other in-flight "
+     "rotation of the caller's — a caller may have several at once); overlap_expires_at is the "
+     "PREDECESSOR's own stamp (the successor row never carries one). Mirrors POST "
+     "/api/v1/tokens/{id}/rotate. Destructive — requires ApiToken:Write.",
      R"j({"type":"object","properties":{)j"
      R"j("token_id":{"type":"string","maxLength":64,"description":"The token_id of the predecessor token being rotated — must be owned by the calling principal"},)j"
      R"j("overlap_days":{"type":"integer","default":7,"minimum":1,"maximum":3650,"description":"Overlap window before the predecessor auto-revokes; rejected outright (never truncated) if it would fall below the 24h floor"})j"
      R"j(},"required":["token_id"]})j",
-     R"j({"type":"object","properties":{"token_id":{"type":"string","description":"KNOWN GAP: currently always empty pending a successor-resolution fix — see tool description"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"expires_at":{"type":"integer","description":"KNOWN GAP: currently always 0 — see tool description"},"overlap_expires_at":{"type":"integer","description":"KNOWN GAP: currently always 0 — see tool description"},"successor_unresolved":{"type":"boolean","description":"true while the above fields are unresolved"}},"required":["token_id","raw_token","expires_at","overlap_expires_at"]})j"},
+     R"j({"type":"object","properties":{"token_id":{"type":"string","description":"The successor's token_id, scoped exactly to the predecessor rotated"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"expires_at":{"type":"integer","description":"The successor's expiry — inherited from the predecessor verbatim"},"overlap_expires_at":{"type":"integer","description":"The PREDECESSOR's own overlap-expiry stamp"}},"required":["token_id","raw_token","expires_at","overlap_expires_at"]})j"},
 
     {"confirm_api_token_rotation",
      "Explicit maker-checker confirmation that a rotated API token's successor secret has been "
@@ -9083,53 +9083,70 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_audit("failure", result.error());
                     return;
                 }
+                // Locate the successor via the SHARED lookup
+                // (token_rotation_lookup.hpp) — scoped exactly to THIS
+                // predecessor, never "any linked row of this principal"
+                // (round-3 BLOCKING finding, closed via the shared helper: a
+                // human principal routinely holds N unrelated active tokens,
+                // so an unscoped match can return a DIFFERENT in-flight
+                // rotation's successor — its raw secret paired with the
+                // wrong token_id, so confirming that id revokes the WRONG
+                // predecessor). One shared helper, not an inline loop — this
+                // tool calls the SAME derivation the REST twin uses, never a
+                // re-derived copy of it.
+                auto successor = yuzu::server::detail::derive_rotation_successor(
+                    *engine_credential_store_, tok->principal_id, token_id);
+                if (!successor.found) {
+                    // rotate_token above already succeeded — a real successor
+                    // row exists and `result` holds its live raw secret — but
+                    // the underlying list_active_for_principal read is
+                    // best-effort and swallows a lease/query failure into an
+                    // empty vector rather than propagating
+                    // (api_token_store.hpp), so a successor genuinely minted
+                    // moments ago failing to show up here is never a
+                    // legitimate "no rotation" case, only an ambiguous read
+                    // failure. Fail CLOSED rather than hand the caller a
+                    // one-time secret with no token_id to ever confirm it
+                    // against: audit as a failure, retryable (kInternalError),
+                    // and never place the secret in the response body.
+                    // Mirrors the REST twin's 503 + Retry-After:2 posture;
+                    // audit_persisted:false folded into the error body the
+                    // same way the sibling !result branch above does, if the
+                    // failure audit itself doesn't persist.
+                    const bool denied_audit_ok =
+                        audit_fn(req, "api_token.rotate", "failure", "ApiToken", token_id,
+                                 "successor lookup failed after mint");
+                    res.set_content(
+                        error_response(id, kInternalError,
+                                       "rotation succeeded but the successor could not be read "
+                                       "back — retry, or check list_tokens",
+                                       denied_audit_ok
+                                           ? std::string_view{}
+                                           : std::string_view{R"({"audit_persisted":false})"}),
+                        "application/json");
+                    mcp_audit("failure", "successor lookup failed after mint");
+                    return;
+                }
                 // The reveal IS the success audit for this route (mirrors the
                 // engine rotate tool and the REST twin) — one row per reveal,
                 // mint or re-serve, never folded into a generic "rotation
-                // succeeded" event.
+                // succeeded" event. Fired only once the successor is
+                // confirmed findable, so the failure branch above is never
+                // ALSO recorded as a success.
                 const bool reveal_audit_ok =
                     audit_fn(req, "api_token.reveal", "success", "ApiToken", token_id, "rotate");
 
-                // DELIBERATELY UNWIRED (coordinator directive, mid-task
-                // correction): the obvious "scan list_active_for_principal
-                // and take the first row with a non-empty supersedes_token_id"
-                // — what the engine tool above does, and what the REST twin
-                // (rest_api_v1.cpp) currently does too — is UNSOUND on this
-                // human arm. It is only sound for the engine arm's own
-                // ≤2-active-per-PRINCIPAL invariant; the human arm's
-                // documented invariant is ≤2 active per ROTATION GROUP
-                // (api_token_store.hpp "Human arm" comment), so a principal
-                // holding N concurrent unrelated tokens can have MULTIPLE
-                // rotations in flight at once, and list_active_for_principal
-                // (ORDER BY created_at ASC, every active token for the
-                // principal) makes that scan return an ARBITRARY successor —
-                // possibly from a different rotation than the one this call
-                // just performed — pairing this call's raw secret with the
-                // WRONG token_id. `overlap_expires_at` has the same class of
-                // bug even after fixing the row match: it is stamped on the
-                // PREDECESSOR row, not the successor, so reading it off
-                // whatever row this loop landed on is a structural 0.
-                //
-                // A specialist ruling requires this be fixed ONCE at the seam
-                // (ApiTokenStore returns the successor identity directly, or
-                // a shared helper both REST and MCP call) so this exact
-                // mistake cannot be independently re-derived a third time.
-                // That helper is not yet in this tree — TODO(integration):
-                // wire token_id/expires_at/overlap_expires_at below through
-                // the shared successor-resolution helper once it lands
-                // (tracked alongside the REST twin's identical fix). Until
-                // then this response deliberately reports the fields
-                // unresolved rather than risk-pairing a real secret with the
-                // wrong token_id.
+                // overlap_expires_at is the PREDECESSOR's own stamp (see
+                // token_rotation_lookup.hpp) — the successor row never
+                // carries one.
                 JObj payload;
-                payload.add("token_id", "")
+                payload.add("token_id", successor.successor_token_id)
                     .add("raw_token", *result)
-                    .add("expires_at", 0)
-                    .add("overlap_expires_at", 0)
-                    .add("successor_unresolved", true);
+                    .add("expires_at", successor.successor_expires_at)
+                    .add("overlap_expires_at", successor.predecessor_overlap_expires_at);
                 if (!reveal_audit_ok)
                     payload.add("audit_persisted", false);
-                mcp_audit("success", token_id);
+                mcp_audit("success", successor.successor_token_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
                 return;
