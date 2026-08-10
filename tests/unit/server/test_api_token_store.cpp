@@ -2466,16 +2466,22 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on an unknown token_id is a ter
 }
 
 TEST_CASE("ApiTokenStore: confirm_token_rotation on a token that was never part of a "
-          "rotation is Transient — deliberately distinct wording+class from the engine "
-          "arm's byte-identical-looking kSoleOtherToken string",
+          "rotation is a terminal Conflict — own wording, arm-parity with the engine "
+          "arm's kSoleOtherToken (round 5 adjudication)",
           "[pg][token][rotation]") {
-    // Round-4 regression: this branch originally reused confirm_rotation's
-    // (engine arm) kSoleOtherToken wording verbatim, byte-for-byte, which
-    // silently inherited that string's Conflict classification via the
-    // "the rotation was resolved" substring in engine_store_error_class.hpp
-    // — even though the two states are different facts (a pin mismatch
-    // against a DIFFERENT surviving credential, vs. nothing pending at all).
-    // The fix gave this state its OWN wording + an explicit classifier entry.
+    // Round-4 review found this branch originally reused confirm_rotation's
+    // (engine arm) kSoleOtherToken wording verbatim, byte-for-byte, and so
+    // silently inherited that string's classification via the "the rotation
+    // was resolved" substring — a genuine bug, since the two states are
+    // different FACTS (a pin mismatch against a DIFFERENT surviving
+    // credential, vs. nothing pending at all) even though both happen to be
+    // Conflict. Round 4's fix gave this state its own wording but ALSO
+    // reclassified it to Transient, reasoning from the "call rotate again"
+    // prose — round 5 adjudication refuted that: #2404 precedent, arm parity
+    // with `kSoleOtherToken` (identical "rotate again" guidance, Conflict),
+    // and `rotation_confirm_state.hpp`'s own "every terminal state ->
+    // Conflict or ClientValidation" contract all say Conflict. This state
+    // keeps its own (round-4) wording — own classifier entry, correct class.
     YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ApiTokenStore store{pool};
@@ -2493,11 +2499,12 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a token that was never part 
     REQUIRE_FALSE(confirmed.has_value());
     CHECK(confirmed.error().find("no rotation currently pending") != std::string::npos);
     CHECK(confirmed.error().find("the rotation was resolved") == std::string::npos);
-    CHECK(classify_engine_store_error(confirmed.error()) == E::Transient);
+    CHECK(classify_engine_store_error(confirmed.error()) == E::Conflict);
 }
 
-TEST_CASE("ApiTokenStore: confirm_token_rotation replay after success is Transient, "
-          "distinctly from the engine arm's own confirm-replay strings",
+TEST_CASE("ApiTokenStore: confirm_token_rotation replay after success is a terminal "
+          "Conflict, own wording distinct from the engine arm's own confirm-replay "
+          "strings",
           "[pg][token][rotation]") {
     YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -2522,12 +2529,13 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation replay after success is Transie
     REQUIRE(store.confirm_token_rotation(successor_id, "alice").has_value());
 
     // Replay: the successor is now the SOLE active credential for alice, and
-    // it is not in the pinned rotation_group any more (kGroupEmpty).
+    // it is not in the pinned rotation_group any more (kGroupEmpty) — a
+    // POSITIVE fact (rotation_confirm_state.hpp), terminal Conflict.
     auto replay = store.confirm_token_rotation(successor_id, "alice");
     REQUIRE_FALSE(replay.has_value());
     CHECK(replay.error().find("no rotation currently pending") != std::string::npos);
     CHECK(replay.error().find("the rotation was resolved") == std::string::npos);
-    CHECK(classify_engine_store_error(replay.error()) == E::Transient);
+    CHECK(classify_engine_store_error(replay.error()) == E::Conflict);
 }
 
 TEST_CASE("ApiTokenStore: sweep_expired_rotations auto-revokes an elapsed human "

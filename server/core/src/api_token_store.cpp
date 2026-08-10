@@ -1615,16 +1615,17 @@ ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
         if (pinned.rotation_group.empty()) {
             // Deliberately NOT the engine arm's verbatim kSoleOtherToken
             // wording ("...the rotation was resolved (confirmed, revoked, or
-            // cut over)..." — see confirm_rotation above): that string is
-            // Conflict-classified for a DIFFERENT fact pattern (a pin
-            // mismatch against a DIFFERENT surviving credential). Reusing it
-            // here byte-for-byte would make this state's classification
-            // parasitic on that unrelated engine-arm entry rather than an
-            // explicit decision for this one — see
-            // engine_store_error_class.hpp's dedicated check for the
-            // rationale (Transient: nothing here changes with a retry of the
-            // SAME confirm, but the guidance is to try `rotate` again, not to
-            // treat this as a terminal do-not-retry conflict).
+            // cut over)..." — see confirm_rotation above): that IS the
+            // correct fact pattern to describe here too (this row was
+            // resolved — confirmed, revoked, or cut over — or never rotated
+            // at all), but reusing that string byte-for-byte would make this
+            // site's classification a silent, parasitic side effect of the
+            // engine arm's entry rather than an explicit decision of its own
+            // (round-4 review). Own wording, own classifier entry — same
+            // Conflict class as the engine arm reaches for the analogous
+            // state (see engine_store_error_class.hpp's dedicated rationale;
+            // round 5 corrected an earlier, refuted Transient
+            // classification of this exact string).
             error_msg = "no rotation currently pending for the supplied token_id — nothing "
                         "to confirm; call rotate again if a new rotation is needed";
             return false;
@@ -1656,8 +1657,10 @@ ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
             // `pinned.rotation_group.empty()` short-circuit above — this is
             // the fresh-under-lock re-confirmation of that same fact (the
             // group had nothing active left) reached via the classifier
-            // instead. Deliberately NOT the engine arm's kSoleOtherToken
-            // wording — see that short-circuit's comment.
+            // instead. A POSITIVE fact (see classify_confirm_state_in_group's
+            // own doc comment), so Conflict, never Transient — same
+            // classifier entry as the short-circuit above; see that
+            // comment's fuller rationale.
             error_msg = "no rotation currently pending for the supplied token_id — nothing "
                         "to confirm; call rotate again if a new rotation is needed";
             return false;

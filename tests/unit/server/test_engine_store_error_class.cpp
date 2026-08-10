@@ -127,16 +127,25 @@ TEST_CASE("classify_engine_store_error: human token-keyed arm (P2 #11) new strin
     CHECK(classify_engine_store_error("no active credential to rotate — mint one first") ==
           E::Transient);
 
-    // Round 4 regression: this state MUST be Transient via its OWN explicit
-    // entry, and must NOT collide with the engine arm's Conflict-classified
-    // "the rotation was resolved" substring — see engine_store_error_class.hpp's
-    // dedicated check for the full story (two byte-identical strings could
-    // never carry two different classes through this matcher; the human arm's
-    // occurrences needed their own wording once that was discovered).
+    // Round 4 review found this state had silently inherited the engine arm's
+    // Conflict classification via a byte-identical reuse of its
+    // kSoleOtherToken wording ("the rotation was resolved..."). The fix gave
+    // it its own wording — correct — but round 4 ALSO reclassified it to
+    // Transient, reasoning from the "call rotate again" prose. Round 5
+    // adjudication refuted that: #2404 precedent (the engine confirm was once
+    // 503-retryable this same way and made an idempotent-hint-honouring agent
+    // retry a permanently-failing call forever), arm parity with
+    // `kSoleOtherToken` itself (identical "rotate again" guidance, Conflict),
+    // and rotation_confirm_state.hpp's own "every terminal state -> Conflict
+    // or ClientValidation" contract (`GroupRotationConfirmState::kGroupEmpty`
+    // is a POSITIVE fact, not ambiguous) all say Conflict. This state keeps
+    // ITS OWN wording (still not byte-identical to kSoleOtherToken — own
+    // classifier entry, in the step-3 Conflict group) but now the correct
+    // class.
     const std::string no_pending_msg =
         "no rotation currently pending for the supplied token_id — nothing "
         "to confirm; call rotate again if a new rotation is needed";
-    CHECK(classify_engine_store_error(no_pending_msg) == E::Transient);
+    CHECK(classify_engine_store_error(no_pending_msg) == E::Conflict);
     CHECK(no_pending_msg.find("the rotation was resolved") == std::string::npos);
 }
 
@@ -201,9 +210,11 @@ TEST_CASE("classify_engine_store_error: round-trip over every error string "
         // ── confirm_token_rotation ──────────────────────────────────────
         {"no such token to confirm", E::ClientValidation},
         {"no in-flight rotation to confirm", E::Transient},
+        // Round 5: Conflict, not Transient — see the dedicated TEST_CASE
+        // above and engine_store_error_class.hpp's step-3 rationale.
         {"no rotation currently pending for the supplied token_id — nothing to confirm; "
          "call rotate again if a new rotation is needed",
-         E::Transient},
+         E::Conflict},
         {"more than two active credentials for this principal - resolve manually before "
          "confirming",
          E::ClientValidation},

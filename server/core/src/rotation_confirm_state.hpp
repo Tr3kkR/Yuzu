@@ -87,17 +87,25 @@ classify_confirm_state(const std::vector<ApiToken>& active, const std::string& p
 /// ceiling PER ROTATION GROUP rather than per principal (a human routinely
 /// holds several unrelated concurrent tokens, unlike an engine principal's
 /// single credential), so the states it needs to discriminate are counted
-/// within one `rotation_group`, never across the whole principal.
+/// within one `rotation_group`, never across the whole principal. Mapped 1:1
+/// to a store error string by the caller exactly like `RotationConfirmState`
+/// above; the strings then classify via `engine_store_error_class.hpp`
+/// (`kAmbiguousEmpty` -> Transient; every terminal state below -> Conflict —
+/// this arm has no ClientValidation state, since arriving here already
+/// implies a well-formed, owned, existing token: round 5 adjudication,
+/// arm-parity with `kSoleOtherToken` above is decisive for `kGroupEmpty`).
 enum class GroupRotationConfirmState {
     kAmbiguousEmpty,        //!< The PRINCIPAL-WIDE active read was empty — ambiguous with a
                              //!< swallowed SELECT failure (same UP-6 premise as kNoneActive
                              //!< above) -> stays retryable/Transient.
     kOverfullGroup,          //!< >2 active rows share this rotation_group -> defensive,
-                             //!< manual resolution (mirrors kOverfull).
+                             //!< manual resolution (mirrors kOverfull) -> Conflict.
     kGroupEmpty,             //!< The principal-wide read was NON-empty, but zero of those rows
                              //!< carry this rotation_group. Unlike kAmbiguousEmpty this IS a
                              //!< positive fact, not ambiguous — see the group-filtering note
-                             //!< below — so it is terminal: the rotation already resolved.
+                             //!< below — so it is terminal -> Conflict, the SAME class
+                             //!< `kSoleOtherToken` above reaches for its own "the rotation was
+                             //!< resolved" positive fact (#2404 exemption; round 5).
     kUnresolvedSoleInGroup,  //!< Exactly 1 active row carries this rotation_group. A resolved
                              //!< standalone credential's rotation_group is cleared to '' and so
                              //!< can never match a non-empty filter — so ANY row surviving the

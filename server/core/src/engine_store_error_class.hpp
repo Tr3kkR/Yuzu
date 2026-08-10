@@ -20,6 +20,13 @@
 /// conflict strings are emitted only after a non-empty active-credential read,
 /// so — unlike the deliberately-transient "no in-flight rotation to confirm"
 /// (0-active, ambiguous with a swallowed read failure) — they are terminal.
+/// The human token-keyed arm's "no rotation currently pending" (P2 #11) is
+/// the SAME exemption applied to `GroupRotationConfirmState::kGroupEmpty`
+/// (`rotation_confirm_state.hpp`): a POSITIVE, non-empty principal-wide read
+/// that simply has nothing left tagged with the pinned rotation_group —
+/// terminal Conflict, not Transient, by the identical #2404 reasoning
+/// (round-5 adjudication corrected an earlier Transient misclassification of
+/// this exact state; see the step-3 entry below).
 
 #include <string>
 #include <string_view>
@@ -39,37 +46,18 @@ enum class EngineStoreErrorClass {
     if (has("CSPRNG"))
         return EngineStoreErrorClass::Transient;
 
-    // 1b. ApiTokenStore::confirm_token_rotation (human token-keyed arm,
-    //     P2 #11, round 4) — "no rotation currently pending ... nothing to
-    //     confirm". EXPLICIT, deliberate entry, not relying on fall-through
-    //     (step 7's default happens to be Transient too, but an explicit
-    //     check is the fix for the class of bug this file exists to prevent
-    //     — see the next paragraph). Genuinely retryable-in-spirit: nothing
-    //     about this token_id's state changes on a bare retry of the SAME
-    //     confirm call, but the message's own guidance is "call rotate
-    //     again", not "this is a dead end" — so unlike step 3's #2404
-    //     confirm-replay strings (below), a client is told to take a
-    //     DIFFERENT follow-up action, which the Transient wire contract
-    //     (retry-shaped, REST 503 / MCP kInternalError) fits better than a
-    //     hard 409 telling it never to retry.
-    //
-    //     LOAD-BEARING WHY THIS MUST BE ITS OWN CHECK, NOT REUSED WORDING:
-    //     the human arm's two emission sites (`pinned.rotation_group.empty()`
-    //     and `GroupRotationConfirmState::kGroupEmpty`, api_token_store.cpp)
-    //     originally reused the ENGINE arm's kSoleOtherToken string
-    //     byte-for-byte (a DIFFERENT fact pattern — a pin mismatch against a
-    //     DIFFERENT surviving credential, not "nothing pending") and so
-    //     silently inherited THAT string's Conflict classification via the
-    //     "the rotation was resolved" substring below (step 3) — a client
-    //     polling confirm on a never-rotated or already-resolved token got a
-    //     409 "don't retry" answer whose own text said to retry. Two
-    //     byte-identical strings can never carry two different
-    //     classifications through this substring matcher, so closing the gap
-    //     required BOTH a new, deliberately-distinct string at the emission
-    //     sites AND this explicit check — reusing the engine wording here
-    //     would have reintroduced the exact collision this entry exists to
-    //     avoid.
-    if (has("no rotation currently pending for the supplied token_id"))
+    // 1b. "no in-flight rotation to confirm" — the deliberately-ambiguous
+    //     0-active / malformed-pair read (`RotationConfirmState::kNoneActive`,
+    //     `GroupRotationConfirmState::kAmbiguousEmpty`): a swallowed read
+    //     failure and a genuinely empty active-credential set are
+    //     indistinguishable here (UP-6, rotation_confirm_state.hpp), so this
+    //     MUST stay retryable. Step 7's default happens to be Transient too,
+    //     but this is an EXPLICIT entry rather than reliance on fall-through
+    //     — the round-4/5 review found that an unkeyed string is exactly what
+    //     lets a later addition silently change its classification by
+    //     accident (the "no rotation currently pending" collision below was
+    //     that same failure mode in the opposite direction).
+    if (has("no in-flight rotation to confirm"))
         return EngineStoreErrorClass::Transient;
 
     // 2. Conflict strings that ALSO contain a broad transient substring —
@@ -89,11 +77,31 @@ enum class EngineStoreErrorClass {
     //      "sole active credential"       -> already confirmed / already resolved (pin match);
     //      "the rotation was resolved"    -> a different credential survives (pin mismatch, 1 active);
     //      "unresolved rotation metadata" -> a best-effort pair-resolve left stale linkage (#2404 F1).
-    //    None contains a broad transient substring ("not open"/"unavailable"/
+    //    "no rotation currently pending for the supplied token_id" (P2 #11
+    //    human token-keyed arm, `GroupRotationConfirmState::kGroupEmpty` /
+    //    the `pinned.rotation_group.empty()` short-circuit,
+    //    api_token_store.cpp) is the SAME #2404 exemption again: emitted only
+    //    after a POSITIVE, non-empty principal-wide read that simply has
+    //    nothing tagged with the pinned rotation_group — terminal, not
+    //    ambiguous, exactly like `kSoleOtherToken`'s "the rotation was
+    //    resolved" above, which carries the identical "rotate again if
+    //    needed" guidance and is Conflict for the identical reason: telling a
+    //    client to take a DIFFERENT follow-up action (call rotate, don't
+    //    retry confirm) is the definition of 409, not a retry hint — an
+    //    agentic caller acts on the machine class, not the prose. (Round 4
+    //    shipped this as an explicit Transient entry instead — refuted by
+    //    #2404 precedent, by `kSoleOtherToken` itself, and by this file's own
+    //    "every terminal state -> Conflict or ClientValidation" contract;
+    //    round 5 corrects it. ClientValidation was also considered and
+    //    rejected: the request is well-formed and names a real, owned token,
+    //    so the failure is purely resource-state, and arm parity with
+    //    `kSoleOtherToken` is decisive.) None of these six substrings
+    //    contains a broad transient substring ("not open"/"unavailable"/
     //    "rotation lock"), so their placement here (before step 5) is safe.
     if (has("grace window elapsed") || has("different operator") ||
         has("does not match the pending rotation") || has("sole active credential") ||
-        has("the rotation was resolved") || has("unresolved rotation metadata"))
+        has("the rotation was resolved") || has("unresolved rotation metadata") ||
+        has("no rotation currently pending for the supplied token_id"))
         return EngineStoreErrorClass::Conflict;
 
     // 4. Advisory-lock contention — transient/retryable.
