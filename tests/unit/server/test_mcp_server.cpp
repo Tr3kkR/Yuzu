@@ -790,11 +790,14 @@ struct McpTestServer {
     /// present Origin). Default nullptr/{} = streaming OFF ⇒ pre-2f behaviour.
     yuzu::server::mcp::McpSessionRegistry* session_registry_for_test{nullptr};
     bool streaming_disabled_{false};
-    /// Streamed POST ships OFF in production - turning it on is a separate rung,
-    /// not a defect gate (see Config::mcp_streamed_post_enable). The harness turns it ON so the streamed
-    /// tests exercise the streamed path - without this every one of them would
-    /// silently take the plain path and pass while proving nothing. A test that
-    /// wants the shipped default sets this false explicitly.
+    /// Streamed POST now ships ON in production (see Config::mcp_streamed_post_enable).
+    /// The harness ALSO defaults this true, but for an independent reason: so the
+    /// streamed tests exercise the streamed path - without this every one of them
+    /// would silently take the plain path and pass while proving nothing. The two
+    /// defaults matching is not load-bearing; do not assume they will stay in sync
+    /// without checking (see the harness/Config binding test above the dormancy
+    /// TEST_CASE below). A test that wants the opt-out (--no-mcp-streamed-post)
+    /// posture sets this false explicitly.
     bool streamed_post_enabled_{true};
     std::vector<std::string> allowed_origins_for_test{};
 
@@ -10263,17 +10266,31 @@ TEST_CASE("Config's shipped default for streamed POST is ON", "[mcp][2f][3b][con
     REQUIRE(yuzu::server::Config{}.mcp_streamed_post_enable);
 }
 
-TEST_CASE("streamed POST ships DORMANT: the default is off and a stream is not opened",
+// Closes the RESIDUAL noted on McpTestServer::streamed_post_enabled_'s declaration: the
+// harness field's own default and Config's own default currently agree (both true), but
+// that agreement is coincidental, not load-bearing - the harness defaults it true so
+// every OTHER streamed test exercises the streamed path regardless of what production
+// ships. A future change to either default with no change to the other would leave every
+// harness-default-relying test silently exercising the wrong path. This test is the
+// tripwire for that divergence; it does not replace the still-open residual (nothing
+// here exercises server.cpp's own `&cfg_.mcp_streamed_post_enable` wiring).
+TEST_CASE("Harness default for streamed_post_enabled_ tracks Config's own default",
+          "[mcp][2f][3b][config]") {
+    McpTestServer ts;
+    REQUIRE(ts.streamed_post_enabled_ == yuzu::server::Config{}.mcp_streamed_post_enable);
+}
+
+TEST_CASE("streamed POST opt-out: --no-mcp-streamed-post falls back to a plain response",
           "[mcp][integration][execute][bridge][2f][3b]") {
-    // The shipped default. 3b's machinery is complete and the four defects that gated
-    // the on-by-default flip (#2739, #2740, #2785, #2789) are fixed, so the operator
-    // surfaces that document its bounds are now true of the implementation. It stays
-    // off because turning the default on is a SEPARATE rung - the same shape as Spark
-    // landing behind prefer_spark_ = false, cut over once the invariants hold.
+    // The shipped default is now ON (see "Config's shipped default for streamed POST is
+    // ON" above). This test covers the operator opt-out instead: with the flag off, the
+    // operator surfaces that document the plain-path bounds still hold - a client asking
+    // to stream simply does not get one, and nothing about the response shape changes.
     //
-    // This test exists because an unpinned default is how dormancy silently ends: the
-    // harness sets streamed_post_enabled_ = true for every OTHER streamed test, so
-    // nothing else in this file would notice the production default changing.
+    // This test exists because an unpinned default is how opt-out coverage silently
+    // rots into no coverage at all: the harness sets streamed_post_enabled_ = true for
+    // every OTHER streamed test, so nothing else in this file would notice the plain-path
+    // fallback breaking.
     namespace smcp = yuzu::server::mcp;
 
     sqlite3* db = nullptr;
@@ -10301,7 +10318,8 @@ TEST_CASE("streamed POST ships DORMANT: the default is off and a stream is not o
     ts.session_registry_for_test = &sessions;
     ts.metrics_for_test = &metrics;
     ts.stream_budget_for_test = &budget;
-    // THE POINT: take the shipped default rather than the harness's opt-in.
+    // THE POINT: take the opt-out (--no-mcp-streamed-post) posture rather than the
+    // harness's default-on setting.
     ts.streamed_post_enabled_ = false;
 
     auto minted = sessions.mint("test-user");
@@ -10327,8 +10345,8 @@ TEST_CASE("streamed POST ships DORMANT: the default is off and a stream is not o
                            {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
     REQUIRE(res);
 
-    // The command still runs and still answers - dormant is a PLAIN response, not a
-    // refusal. A client asking to stream simply does not get a stream.
+    // The command still runs and still answers - the opt-out path is a PLAIN response,
+    // not a refusal. A client asking to stream simply does not get a stream.
     CHECK(res->status == 200);
     CHECK(dispatched);
     CHECK(res->get_header_value("Content-Type").find("text/event-stream") == std::string::npos);

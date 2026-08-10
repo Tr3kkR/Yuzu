@@ -554,10 +554,11 @@ public:
                           "gauge");
         metrics_.describe("yuzu_mcp_streamed_post_enabled",
                           "1 if SSE-on-POST is enabled (--mcp-enable-streamed-post), else 0. "
-                          "Ships 0; the four defects that gated the on-by-default flip "
-                          "(#2739, #2740, #2785, #2789) are fixed, but the flip itself is a "
-                          "separate rung. If this reads 1, size shutdown grace per the Sizing "
-                          "bullet in docs/user-manual/server-admin.md",
+                          "Ships 1: the four defects that gated the on-by-default flip "
+                          "(#2739, #2740, #2785, #2789) are fixed. Size shutdown grace per the "
+                          "Sizing bullet in docs/user-manual/server-admin.md — that guidance is "
+                          "now the default posture. If this reads 0, the operator opted out "
+                          "with --no-mcp-streamed-post.",
                           "gauge");
         metrics_.describe("yuzu_mcp_stream_closes_total", "MCP SSE streams closed, by reason",
                           "counter");
@@ -7526,12 +7527,12 @@ private:
         metrics_.gauge("yuzu_mcp_streamed_post_enabled")
             .set(cfg_.mcp_streamed_post_enable ? 1.0 : 0.0);
         spdlog::info("MCP streamed POST (SSE-on-POST): {}{}",
-                     cfg_.mcp_streamed_post_enable ? "ENABLED" : "disabled (default)",
+                     cfg_.mcp_streamed_post_enable ? "ENABLED (default)" : "disabled (opted out)",
                      cfg_.mcp_streamed_post_enable
                          ? " - size shutdown grace above the 120s response cap plus a "
                            "drain margin (see the Sizing bullet in "
                            "docs/user-manual/server-admin.md)"
-                         : " - enable with --mcp-enable-streamed-post");
+                         : " - re-enable by dropping --no-mcp-streamed-post");
         spdlog::info("HTTP worker pool: {} threads, sized for {} concurrent held-open responses "
                      "(plain-REST reserve {}). EVERY streaming surface leases from one budget: "
                      "GET /mcp/v1/, MCP streamed POST, GET /api/v1/events, the dashboard "
