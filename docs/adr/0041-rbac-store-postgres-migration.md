@@ -103,15 +103,23 @@ every principal→role grant, groups, and membership. Losing them silently rever
 seeded defaults — an authorization change nobody authorized. So a one-time streamed, idempotent,
 resumable, reconciled, **fail-CLOSED** backfill from the legacy `rbac.db` (the ADR-0040 shape),
 seeding defaults first then backfilling operator rows via `ON CONFLICT DO NOTHING`. A built-in
-default the operator explicitly revoked before upgrading is **denied** post-seed (an explicit
-`effect='deny'` tombstone, never deleted), scoped to (role, securable_type) pairs the legacy
-catalogue actually knew about — a securable a later seed adds (e.g. `EnginePrincipal`, #2376) is
-untouched. This mirrors `remove_permission()`'s own permanent mechanism for the identical hazard
-beyond the one-time cutover — the idempotent reseed runs on every boot, and a deleted row has
-nothing to block it from being silently reinserted on the very next restart (fjarvis #2703 F1;
-an initial version of this backfill fix used DELETE and reintroduced exactly that hazard for the
-one-time case, caught by Gate 4 happy-path review before merge and closed with the same
-deny-tombstone mechanism).
+default the operator explicitly revoked before upgrading is **deleted** post-seed — matching legacy
+exactly, a plain absent row — scoped to (role, securable_type) pairs the legacy catalogue actually
+knew about; a securable a later seed adds (e.g. `EnginePrincipal`, #2376) is untouched. The
+revocation is recorded SEPARATELY, as pure reseed-suppression bookkeeping in a dedicated
+`revoked_seed_defaults` table consulted ONLY by the seed step's own grant helper — never by any
+authorization-decision code path — so the idempotent every-boot reseed cannot silently resurrect it
+without the deleted row ever becoming a real authorization fact again. This mirrors
+`remove_permission()`'s own permanent mechanism for the identical hazard beyond the one-time cutover
+(fjarvis #2703 F1). Two earlier versions of this fix each reintroduced a hazard, both caught by Gate
+4 review before merge: a plain DELETE with no marker resurrects on the very next restart (the
+idempotent reseed has nothing left to suppress it); an `effect='deny'` tombstone avoids that but is
+a REAL authorization fact — `check_permission()`/`check_scoped_permission()`/`authorize_list_read()`
+all apply "deny overrides everything, across ALL of a principal's held roles" (pre-existing,
+identical in the legacy store), so the tombstone silently changed the OUTCOME for any principal
+holding a second role that independently grants the same permission, on both the global and the
+management-group-scoped read paths. The `revoked_seed_defaults` table closes both: absence on the
+read path restores exact legacy semantics, and the marker survives every future reseed.
 
 **The `rbac_enabled` flag is the single most dangerous row to lose.** If an operator ENABLED RBAC
 and the flag is not carried across, the fleet silently boots RBAC-**off** — every confined

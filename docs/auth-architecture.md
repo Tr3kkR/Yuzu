@@ -2339,20 +2339,29 @@ resumable, reconciled, **fail-CLOSED** backfill from the legacy `rbac.db`
 (seed defaults first, then backfill operator rows via `ON CONFLICT DO NOTHING`;
 operator edits to seeded permissions are preserved via `DO UPDATE`). A
 built-in default permission the operator explicitly revoked (`remove_permission`)
-before upgrading is **denied**, not deleted — an explicit `effect='deny'`
-tombstone, scoped to (role, securable_type) pairs legacy's own catalogue
-actually knew about, so a securable a later `seed_defaults()` adds (e.g.
-`EnginePrincipal`, #2376) is untouched (fjarvis #2703 F1). This mirrors
+before upgrading is **deleted** — matching legacy exactly, a plain absent row
+— scoped to (role, securable_type) pairs legacy's own catalogue actually
+knew about, so a securable a later `seed_defaults()` adds (e.g.
+`EnginePrincipal`, #2376) is untouched (fjarvis #2703 F1). The revocation is
+recorded SEPARATELY, as pure reseed-suppression bookkeeping in a dedicated
+`revoked_seed_defaults` table — consulted ONLY by `seed_defaults()`'s grant
+helper, never by any authorization-decision code path — so `seed_defaults()`'s
+unconditional every-boot reseed cannot silently resurrect the revoked default
+without ever making it a real authorization fact again. This mirrors
 `remove_permission()`'s own permanent mechanism for the identical hazard
-beyond the one-time cutover: `seed_defaults()` runs unconditionally on every
-server construction, so a genuinely absent row would have nothing to collide
-with and a seeded default would silently return on the next restart; an
-explicit deny row is what `ON CONFLICT DO NOTHING` correctly leaves alone. An
-initial version of the one-time backfill fix used `DELETE` and reintroduced
-exactly this hazard for the pre-cutover case — caught by Gate 4 happy-path
-review (verified empirically: a second `RbacStore` construction against the
-same database resurrected the revoked permission) and closed with the same
-deny-tombstone mechanism `remove_permission()` already used. Reconciliation counts roles + grants + groups +
+beyond the one-time cutover. Two earlier versions of this fix each
+reintroduced a hazard, both caught by Gate 4 review before merge: a plain
+`DELETE` with no marker resurrects on the very next restart (verified
+empirically — a second `RbacStore` construction against the same database
+brought the revoked permission back); an `effect='deny'` tombstone avoids
+that but is a REAL authorization fact — `check_permission()` /
+`check_scoped_permission()` / `authorize_list_read()` all apply "deny
+overrides everything, across ALL of a principal's held roles" (pre-existing,
+identical in the legacy store), so the tombstone silently changed the
+authorization OUTCOME for any principal holding a second role that
+independently grants the same permission — on both the global and the
+management-group-scoped read paths (verified empirically both ways).
+Reconciliation counts roles + grants + groups +
 members and refuses the completion marker on any shortfall (fail-closed →
 refuse boot, retry next start). **The `rbac_enabled` flag is migrated first
 and read-back-verified** before the store is considered open (losing it is

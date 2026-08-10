@@ -270,6 +270,40 @@ const std::vector<pg::PgMigration>& migrations() {
             ALTER TABLE rbac_meta ADD CONSTRAINT rbac_meta_enabled_canonical
                 CHECK (key <> 'rbac_enabled' OR value IN ('true', 'false'));
         )"},
+        // fable (Gate 4, #2703): a revoked BUILT-IN DEFAULT permission needs to
+        // suppress seed_defaults()'s next reseed WITHOUT ever appearing as a
+        // real `role_permissions` row — an earlier round of this fix used an
+        // explicit `effect='deny'` tombstone instead, which is a real
+        // authorization fact and inherits check_permission()/
+        // check_scoped_permission()/authorize_list_read()'s pre-existing
+        // "deny overrides everything, across ALL of a principal's held
+        // roles" semantics. That silently changed the authorization OUTCOME
+        // for any principal holding a second role that independently grants
+        // the same (securable_type, operation) — legacy's plain DELETE never
+        // created a deny row, so legacy computed ALLOW there; the tombstone
+        // computes DENY. This table separates "reseed bookkeeping" from
+        // "operator-authored authorization fact": it is consulted ONLY by
+        // seed_defaults()'s grant() and by remove_permission()/the backfill's
+        // equivalent cleanup, and is NEVER read by any authorization-decision
+        // code path (check_permission, check_scoped_permission,
+        // get_effective_permissions, role_effects_for, authorize_list_read,
+        // holds_permission_via_any_group) — role_permissions absence goes
+        // back to meaning exactly what it meant in the legacy store: this
+        // role grants nothing for this (type, op), full stop, and other
+        // roles' independent grants are untouched.
+        // Same FK shape as role_permissions (deliberately — an unrecognized
+        // role/type/op must still fail remove_permission() outright, and a
+        // deleted CUSTOM role's stray markers should not linger forever;
+        // system roles, the only ones seed_defaults() ever consults this
+        // table for, can never be deleted).
+        {3, R"(
+            CREATE TABLE revoked_seed_defaults (
+                role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
+                securable_type  TEXT NOT NULL REFERENCES securable_types(name),
+                operation       TEXT NOT NULL REFERENCES operations(id),
+                PRIMARY KEY (role_name, securable_type, operation)
+            );
+        )"},
     };
     return kMigrations;
 }
@@ -422,9 +456,19 @@ void RbacStore::seed_defaults() {
              "VALUES ($1, $2, TRUE, $3::bigint) ON CONFLICT (name) DO NOTHING",
              {std::string(r.name), std::string(r.desc), std::to_string(now)});
 
+    // fable (Gate 4, #2703): skip a triple an operator explicitly revoked via
+    // remove_permission() — revoked_seed_defaults is bookkeeping-only (never
+    // read by any authorization decision), so this is the ONLY place its
+    // absence-suppression takes effect. A re-grant via set_permission()
+    // recreates the role_permissions row directly and does not touch this
+    // table; the (now-redundant, harmless) marker just means a future
+    // seed_defaults() no-ops against an already-restored row either way.
     const auto grant = [&](std::string_view role, std::string_view type, std::string_view op) {
         exec("INSERT INTO rbac_store.role_permissions (role_name, securable_type, operation, "
-             "effect) VALUES ($1, $2, $3, 'allow') ON CONFLICT DO NOTHING",
+             "effect) SELECT $1, $2, $3, 'allow' WHERE NOT EXISTS ("
+             "  SELECT 1 FROM rbac_store.revoked_seed_defaults "
+             "  WHERE role_name = $1 AND securable_type = $2 AND operation = $3"
+             ") ON CONFLICT DO NOTHING",
              {std::string(role), std::string(type), std::string(op)});
     };
 
@@ -1044,14 +1088,54 @@ std::expected<void, std::string> RbacStore::remove_permission(const std::string&
     // deleted row leaves nothing to conflict with, so the very next restart
     // silently re-inserts the seeded 'allow' — the operator's revocation is
     // undone forever, on ordinary restart/redeploy, no attacker required.
-    // Fix: upsert an explicit 'deny' row instead of deleting. seed_defaults()'s
-    // ON CONFLICT DO NOTHING then correctly no-ops against the EXISTING deny
-    // row on every future boot — the same mechanism R2 (rbac_store.cpp
-    // migrate_from_sqlite's perms upsert) already relies on to make a legacy
-    // deny win over a seeded allow. The authorization OUTCOME is identical
-    // either way (no matching allow row -> deny); only the row's presence
-    // changes, from absent to an explicit, durable record of the revocation.
-    return set_permission({role_name, securable_type, operation, "deny"});
+    //
+    // fable (Gate 4, #2703, HIGH — this round's fix REVISED again): an
+    // earlier fix upserted an explicit 'deny' row instead of deleting, on
+    // the theory that "the authorization OUTCOME is identical either way
+    // (no matching allow row -> deny)". That theory is false. 'deny' is a
+    // REAL, operator-authored authorization fact, and check_permission() /
+    // check_scoped_permission() / authorize_list_read() all apply "deny
+    // overrides everything, across ALL of a principal's held roles" — a
+    // pre-existing, deliberate invariant, identical in the legacy SQLite
+    // store. A deny row from THIS role therefore vetoes an allow this same
+    // principal holds via a DIFFERENT role — legacy never hit this, because
+    // its DELETE left nothing to veto with; the tombstone does. Fix:
+    // restore the plain DELETE, and record the revocation SEPARATELY, as
+    // pure reseed-suppression bookkeeping in revoked_seed_defaults — a
+    // table seed_defaults()'s grant() consults and no authorization-decision
+    // code path ever reads. Both statements share one transaction (and the
+    // same generation bump) so a crash between them can never leave the
+    // row deleted with no marker to stop it resurrecting on the next boot.
+    std::optional<std::uint64_t> new_gen;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult marker = pg::exec_params(
+            c,
+            "INSERT INTO rbac_store.revoked_seed_defaults (role_name, securable_type, "
+            "operation) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            std::vector<std::string>{sanitize_pg_text(role_name), sanitize_pg_text(securable_type),
+                                     sanitize_pg_text(operation)});
+        if (marker.status() != PGRES_COMMAND_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        pg::PgResult del = pg::exec_params(
+            c,
+            "DELETE FROM rbac_store.role_permissions WHERE role_name = $1 AND "
+            "securable_type = $2 AND operation = $3",
+            std::vector<std::string>{sanitize_pg_text(role_name), sanitize_pg_text(securable_type),
+                                     sanitize_pg_text(operation)});
+        if (del.status() != PGRES_COMMAND_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        new_gen = bump_generation_in_txn(c);
+        return new_gen.has_value();
+    });
+    if (!ok)
+        return std::unexpected(err.empty() ? "remove_permission failed" : err);
+    apply_local_generation(*new_gen);
+    return {};
 }
 
 // ── Principal-role assignments ───────────────────────────────────────────────
@@ -2363,42 +2447,51 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
         // has no positive row to upsert against — the seeded row silently
         // survives, and the row-count reconciliation below can't see it (PG
         // always holds >= legacy counts by design; a missing-in-legacy row
-        // is invisible to a count check). happy-path (Gate 4, #2703,
-        // verified empirically — a second RbacStore construction against the
-        // same pool immediately after a completed backfill resurrected the
-        // revoked permission): an UPDATE to an explicit 'deny' tombstone,
-        // not a DELETE — the exact same reason remove_permission() itself
-        // no longer deletes (7420de72). A deleted row leaves nothing for
-        // seed_defaults()'s ON CONFLICT DO NOTHING to conflict with, so the
-        // very next restart after this one-time backfill silently
-        // reinserts the seeded 'allow' and undoes the operator's
-        // revocation forever. Matching PG role_permissions rows always
-        // exist with effect='allow' at this point (seed_defaults() runs in
-        // the constructor before migrate_from_sqlite is ever called, and
-        // grant() only ever inserts 'allow'), so a plain UPDATE against the
-        // same predicate is sufficient — nothing to upsert against a
-        // not-yet-existing row. Update any PG role_permissions row whose
-        // role AND securable_type were BOTH known to legacy (so legacy
-        // could have had an opinion about it) but whose exact
-        // (role,type,op) triple is absent from legacy's own
-        // role_permissions — i.e. explicitly revoked, not merely
-        // never-seeded. Scoping to legacy's own catalogue is what protects a
-        // securable a LATER seed_defaults() adds (e.g. EnginePrincipal,
-        // #2376): its type is never in legacy's securable_types, so the
-        // role/type filter excludes it and the newly-seeded grant survives
-        // untouched. An empty legacy_role_names/legacy_type_names (a
-        // pre-securable_types-table legacy schema) makes both `= ANY`
-        // filters match nothing — degrades to "touch nothing" rather than
-        // guessing. Comparison values are sanitize_pg_text()'d identically
-        // to the INSERT above so a legacy string with invalid UTF-8/embedded
-        // NUL matches its own already-stored (equally sanitized) row instead
-        // of spuriously mismatching and denying a row legacy still has.
+        // is invisible to a count check).
+        //
+        // fable (Gate 4, #2703, HIGH — this block's fix REVISED again): an
+        // earlier fix here UPDATEd the row to an explicit 'deny' tombstone
+        // instead of deleting it, matching remove_permission()'s own fix at
+        // the time. That silently changes the authorization OUTCOME for any
+        // principal who holds a SECOND role that independently grants the
+        // same (type,op): check_permission() / check_scoped_permission() /
+        // authorize_list_read() all apply "deny overrides everything,
+        // across ALL of a principal's held roles" — a pre-existing,
+        // deliberate invariant, identical in the legacy SQLite store. A
+        // deny row from the revoked role therefore vetoes an allow the same
+        // principal holds via a different role; legacy never hit this
+        // (its DELETE left nothing to veto with). Fix (matching
+        // remove_permission()'s own revised fix): DELETE the row, and
+        // record the revocation SEPARATELY as pure reseed-suppression
+        // bookkeeping in revoked_seed_defaults — never read by any
+        // authorization-decision code path, only by seed_defaults()'s
+        // grant(). Both statements run as one CTE (DELETE ... RETURNING
+        // feeding the INSERT) so they commit or roll back together within
+        // this backfill's existing transaction — no window where the row
+        // is gone but the marker isn't there yet to suppress the reseed.
+        //
+        // Delete any PG role_permissions row whose role AND securable_type
+        // were BOTH known to legacy (so legacy could have had an opinion
+        // about it) but whose exact (role,type,op) triple is absent from
+        // legacy's own role_permissions — i.e. explicitly revoked, not
+        // merely never-seeded. Scoping to legacy's own catalogue is what
+        // protects a securable a LATER seed_defaults() adds (e.g.
+        // EnginePrincipal, #2376): its type is never in legacy's
+        // securable_types, so the role/type filter excludes it and the
+        // newly-seeded grant survives untouched. An empty
+        // legacy_role_names/legacy_type_names (a pre-securable_types-table
+        // legacy schema) makes both `= ANY` filters match nothing —
+        // degrades to "touch nothing" rather than guessing. Comparison
+        // values are sanitize_pg_text()'d identically to the INSERT above
+        // so a legacy string with invalid UTF-8/embedded NUL matches its
+        // own already-stored (equally sanitized) row instead of spuriously
+        // mismatching and revoking a row legacy still has.
         // INVARIANT (security-guardian, #2703): this scoping is safe only
         // because every default grant added to an EXISTING (role,
         // securable_type) pair since the legacy schema was frozen has, so
         // far, ridden a brand-new securable_type (EnginePrincipal, #2376).
         // A future default grant added to an EXISTING role+type pair before
-        // a cutover would be denied by this same logic, since legacy would
+        // a cutover would be revoked by this same logic, since legacy would
         // know about both the role and the type but not (yet) have the new
         // grant. That failure direction is a lockout (access denial), not
         // an escalation, so it stays safe — but revisit this scoping if
@@ -2427,37 +2520,42 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                     out.push_back(s);
                 return out;
             };
-            pg::PgResult upd = pg::exec_params(
+            pg::PgResult revoked = pg::exec_params(
                 c,
-                "UPDATE rbac_store.role_permissions rp SET effect = 'deny' "
-                "WHERE rp.role_name = ANY($1::text[]) "
-                "AND rp.securable_type = ANY($2::text[]) "
-                "AND rp.effect <> 'deny' "
-                "AND NOT EXISTS ("
-                "  SELECT 1 FROM unnest($3::text[], $4::text[], $5::text[]) "
-                "    AS legacy(role_name, securable_type, operation) "
-                "  WHERE legacy.role_name = rp.role_name "
-                "    AND legacy.securable_type = rp.securable_type "
-                "    AND legacy.operation = rp.operation"
-                ")",
+                "WITH revoked AS ("
+                "  DELETE FROM rbac_store.role_permissions rp "
+                "  WHERE rp.role_name = ANY($1::text[]) "
+                "  AND rp.securable_type = ANY($2::text[]) "
+                "  AND NOT EXISTS ("
+                "    SELECT 1 FROM unnest($3::text[], $4::text[], $5::text[]) "
+                "      AS legacy(role_name, securable_type, operation) "
+                "    WHERE legacy.role_name = rp.role_name "
+                "      AND legacy.securable_type = rp.securable_type "
+                "      AND legacy.operation = rp.operation"
+                "  ) "
+                "  RETURNING role_name, securable_type, operation"
+                ") "
+                "INSERT INTO rbac_store.revoked_seed_defaults (role_name, securable_type, "
+                "operation) SELECT role_name, securable_type, operation FROM revoked "
+                "ON CONFLICT DO NOTHING",
                 std::vector<std::string>{pg::to_text_array(to_views(legacy_role_names)),
                                          pg::to_text_array(to_views(legacy_type_names)),
                                          pg::to_text_array(to_views(perm_roles)),
                                          pg::to_text_array(to_views(perm_types)),
                                          pg::to_text_array(to_views(perm_ops))});
-            if (upd.status() != PGRES_COMMAND_OK) {
+            if (revoked.status() != PGRES_COMMAND_OK) {
                 spdlog::error(
-                    "RbacStore: migrate_from_sqlite: revoked-permission tombstone failed: {}",
+                    "RbacStore: migrate_from_sqlite: revoked-permission cleanup failed: {}",
                     PQerrorMessage(c));
                 return false;
             }
-            const char* denied = PQcmdTuples(upd.get());
-            if (denied != nullptr && denied[0] != '\0' && std::strcmp(denied, "0") != 0)
+            const char* removed = PQcmdTuples(revoked.get());
+            if (removed != nullptr && removed[0] != '\0' && std::strcmp(removed, "0") != 0)
                 spdlog::info(
-                    "RbacStore: migrate_from_sqlite: denied {} seeded permission(s) absent "
-                    "from legacy (operator-revoked defaults; tombstoned, not deleted, so a "
-                    "future reseed cannot resurrect them)",
-                    denied);
+                    "RbacStore: migrate_from_sqlite: removed {} seeded permission(s) absent "
+                    "from legacy (operator-revoked defaults; recorded in revoked_seed_defaults "
+                    "so a future reseed cannot resurrect them)",
+                    removed);
         }
         for (const auto& p : principals)
             if (!run("INSERT INTO rbac_store.principal_roles (principal_type, principal_id, "

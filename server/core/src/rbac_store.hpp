@@ -180,13 +180,18 @@ public:
     list_all_role_permissions_checked() const;
 
     std::expected<void, std::string> set_permission(const Permission& perm);
-    /// Revokes by upserting an explicit 'deny' row (never a DELETE) — see the
-    /// implementation comment for why: seed_defaults() runs unconditionally
-    /// on every construction, so a genuinely absent row would have nothing to
-    /// stop a built-in default from silently returning on the next restart.
+    /// Revokes by DELETEing the role_permissions row (restoring the exact
+    /// legacy contract — absence, not a 'deny' row) AND recording the
+    /// revocation in `revoked_seed_defaults`, a bookkeeping-only table
+    /// consulted solely by `seed_defaults()`'s reseed so the built-in
+    /// default cannot silently return on the next restart. Never an
+    /// `effect='deny'` upsert: `check_permission()`/`check_scoped_permission()`/
+    /// `authorize_list_read()` apply "deny overrides everything, across ALL
+    /// of a principal's held roles" — a real deny row here would veto an
+    /// allow the same principal holds via a DIFFERENT role, which the
+    /// legacy store never did (see the implementation comment, #2703).
     /// `role_name`/`securable_type`/`operation` must already be valid FK
-    /// targets (an unrecognised triple now fails with `unexpected`, where an
-    /// earlier DELETE-based version silently no-op'd and returned success).
+    /// targets (an unrecognised triple fails with `unexpected`).
     std::expected<void, std::string> remove_permission(const std::string& role_name,
                                                        const std::string& securable_type,
                                                        const std::string& operation);

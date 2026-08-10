@@ -265,12 +265,23 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   row leaves nothing for the reseed's conflict target to match, so the very next restart
   resurrects the seeded default — the operator's revocation is undone on ordinary
   restart/redeploy, no attacker required. `RbacStore::remove_permission` (#2703, fjarvis) is the
-  reference case: it now upserts an explicit `deny` row instead of deleting, so the reseed's `ON
-  CONFLICT DO NOTHING` correctly no-ops against the existing row. The authorization OUTCOME is
-  identical either way (no matching allow → deny); only the row's presence changes, from absent to
-  an explicit, durable tombstone of the revocation. Any store with the same shape — a seed pass
-  that reruns unconditionally, plus an operator-facing "remove this" operation — needs the same
-  tombstone-via-deny (or equivalent explicit-marker) treatment, not a bare `DELETE`.
+  reference case, and it took THREE rounds to land correctly — the wrong two are as instructive as
+  the right one. Round 1 (bare `DELETE`) had exactly this bug. Round 2 upserted an explicit `deny`
+  row instead, on the theory that "the authorization outcome is identical either way (no matching
+  allow → deny)" — **false when the row's table feeds anything beyond a single positive/negative
+  check.** `RbacStore`'s reader applies "deny overrides everything, across ALL of a principal's
+  held roles" (a pre-existing invariant, not new), so a real deny row from the revoked role vetoed
+  an allow the SAME principal held via a DIFFERENT role — an authorization change nobody
+  authorized, on both the global check and a management-group-scoped visibility read. Round 3
+  (shipped): DELETE the row (so the read path sees exactly what the operator authored — absence,
+  same as if the grant never existed) and record the revocation SEPARATELY, in a dedicated
+  bookkeeping table (`revoked_seed_defaults`) consulted ONLY by the reseed step's own grant
+  helper — never by anything that makes an authorization decision. **The general rule: don't
+  represent "suppress the next reseed" as a fact your read path can see.** A tombstone using the
+  same effect/value the read path already interprets is only safe if that value is neutral
+  everywhere it can be read — verify this for every reader (a scoped/confinement path is easy to
+  miss when the store also has a "global" check), not just the one you're staring at. When in
+  doubt, a separate table costs one migration and guarantees it structurally.
 
 ## Non-transactional migrations (the deferred kind)
 

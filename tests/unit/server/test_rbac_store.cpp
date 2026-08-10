@@ -324,57 +324,70 @@ TEST_CASE("RbacStore: set and get permission", "[rbac_store][pg]") {
     CHECK(perms[0].effect == "allow");
 }
 
-// security-guardian (#2703, HIGH): remove_permission() upserts an explicit
-// 'deny' row rather than deleting, so the revocation survives a reseed on
-// the NEXT restart (seed_defaults() runs unconditionally on every
-// construction; a genuinely absent row has nothing to collide with and a
-// seeded default silently returns). The row therefore still EXISTS after
-// removal — this is deliberate, not a leftover.
-TEST_CASE("RbacStore: remove permission upserts an explicit deny (survives a reseed)",
+// fable (Gate 4, #2703, HIGH — REVISED from an earlier deny-tombstone fix):
+// remove_permission() DELETEs the role_permissions row (restoring the exact
+// legacy contract — absence, not a 'deny' row) and separately records the
+// revocation in revoked_seed_defaults, bookkeeping consulted ONLY by
+// seed_defaults()'s grant(). An earlier fix upserted an explicit 'deny' row
+// instead, on the theory the authorization OUTCOME was identical either
+// way — false: check_permission()/check_scoped_permission() apply "deny
+// overrides everything, across ALL of a principal's held roles", so a deny
+// row from THIS role would veto an allow the SAME principal holds via a
+// DIFFERENT role (see the dual-role divergence test below). The marker
+// table fixes the resurrection bug without creating that authorization
+// fact.
+TEST_CASE("RbacStore: remove permission deletes the row and survives a reseed",
           "[rbac_store][pg]") {
     RBAC_STORE(store);
-    store.create_role({"TestRole", "", false, 0});
-    store.set_permission({"TestRole", "Tag", "Read", "allow"});
-    store.set_permission({"TestRole", "Tag", "Write", "allow"});
+    // Operator's AuditLog:Read is a real seed_defaults() default.
+    REQUIRE(store.check_role_has_permission("Operator", "AuditLog", "Read"));
 
-    REQUIRE(store.remove_permission("TestRole", "Tag", "Write").has_value());
-    auto perms = store.get_role_permissions("TestRole");
-    REQUIRE(perms.size() == 2); // the row is DENY, not absent
-    std::string write_effect, read_effect;
-    for (const auto& p : perms) {
-        if (p.operation == "Write")
-            write_effect = p.effect;
-        if (p.operation == "Read")
-            read_effect = p.effect;
-    }
-    CHECK(write_effect == "deny");
-    CHECK(read_effect == "allow");
-    // The authorization OUTCOME: denied, same as if the row were absent.
-    CHECK_FALSE(store.check_role_has_permission("TestRole", "Tag", "Write"));
+    REQUIRE(store.remove_permission("Operator", "AuditLog", "Read").has_value());
+    // THE FIX: the row is genuinely gone — absent, not tombstoned.
+    for (const auto& p : store.get_role_permissions("Operator"))
+        CHECK_FALSE((p.securable_type == "AuditLog" && p.operation == "Read"));
+    CHECK_FALSE(store.check_role_has_permission("Operator", "AuditLog", "Read"));
 
-    // THE REGRESSION THIS CLOSES: simulate what seed_defaults() does on
-    // every construction — an idempotent re-grant attempt for the same
-    // (role,type,op) — and confirm it does NOT resurrect the allow. This is
-    // exactly ON CONFLICT DO NOTHING's behavior against an existing row.
-    {
-        auto lease = rbac_pool_fx_.acquire();
-        REQUIRE(lease);
-        REQUIRE(pg::exec_params(lease.get(),
-                                "INSERT INTO rbac_store.role_permissions (role_name, "
-                                "securable_type, operation, effect) VALUES ('TestRole', 'Tag', "
-                                "'Write', 'allow') ON CONFLICT (role_name, securable_type, "
-                                "operation) DO NOTHING",
-                                std::vector<std::string>{})
-                    .ok());
-    }
-    CHECK_FALSE(store.check_role_has_permission("TestRole", "Tag", "Write"));
+    // THE REGRESSION THIS CLOSES: a second construction against the SAME
+    // pool runs the REAL seed_defaults() (unconditional on every boot,
+    // ON CONFLICT DO NOTHING) — its grant() now consults
+    // revoked_seed_defaults and skips re-inserting the revoked row.
+    RbacStore reopened{rbac_pool_fx_};
+    CHECK_FALSE(reopened.check_role_has_permission("Operator", "AuditLog", "Read"));
 }
 
-// quality-engineer (#2703): remove_permission() now upserts via set_permission,
-// so it inherits set_permission's FK checks on all three columns
-// (role_permissions.role_name/securable_type/operation each REFERENCE a
-// catalogue table) — an unrecognized triple must fail, not silently
-// "succeed" by upserting a deny row nothing can ever match.
+// fable (Gate 4, #2703, HIGH): a principal holding BOTH a role whose default
+// was revoked AND a different role that independently grants the same
+// (securable_type, operation) must still be granted — matching legacy,
+// where the revoked role's row was simply absent and never vetoed the other
+// role's independent allow. This is the scenario the deny-tombstone fix
+// silently broke (verified empirically before the marker-table fix landed:
+// the same setup denied dualuser under the tombstone).
+TEST_CASE("RbacStore: revoking one role's default does not veto a different role's "
+          "independent grant (dual-role)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    // PlatformEngineer and Operator both seed AuditLog:Read by default.
+    REQUIRE(store.check_role_has_permission("PlatformEngineer", "AuditLog", "Read"));
+    REQUIRE(store.check_role_has_permission("Operator", "AuditLog", "Read"));
+    store.assign_role({"user", "dualuser", "PlatformEngineer"});
+    store.assign_role({"user", "dualuser", "Operator"});
+    REQUIRE(store.check_permission("dualuser", "AuditLog", "Read"));
+
+    REQUIRE(store.remove_permission("PlatformEngineer", "AuditLog", "Read").has_value());
+    CHECK_FALSE(store.check_role_has_permission("PlatformEngineer", "AuditLog", "Read"));
+    // Operator's independent grant is untouched...
+    CHECK(store.check_role_has_permission("Operator", "AuditLog", "Read"));
+    // ...and dualuser, holding both roles, is STILL granted — Operator's
+    // allow controls, matching legacy (an absent row from PlatformEngineer
+    // is neutral, not a veto).
+    CHECK(store.check_permission("dualuser", "AuditLog", "Read"));
+}
+
+// quality-engineer (#2703): remove_permission() still validates all three
+// columns (role_permissions AND revoked_seed_defaults both REFERENCE the
+// same catalogue tables) — an unrecognized triple must fail, not silently
+// "succeed".
 TEST_CASE("RbacStore: remove permission on an unrecognized triple fails", "[rbac_store][pg]") {
     RBAC_STORE(store);
     CHECK_FALSE(store.remove_permission("NoSuchRole", "Tag", "Read").has_value());
@@ -1015,6 +1028,56 @@ TEST_CASE("RbacStore: check_scoped_permission denied without scope", "[rbac_stor
     CHECK_FALSE(rbac.check_scoped_permission("alice", "Tag", "Write", "agent-other", &mgmt));
 }
 
+// fable (Gate 4, #2703, HIGH): the scoped/confinement path has the SAME
+// dual-role hazard as the global one above — role_effects_for() maps a
+// role's effect for (type,op) into resolve_perm_groups()'s deny_groups,
+// which check_scoped_permission()/authorize_list_read() then treat as a
+// hard veto (and expand_visible_set() subtracts whole agent subtrees for).
+// A revoked-default role must stay NEUTRAL in that resolution — never a
+// deny_group — so a principal's independent grant via a DIFFERENT role
+// scoped to the SAME management group still controls.
+TEST_CASE("RbacStore: revoking one role's default does not create a scoped deny_group "
+          "vetoing a different role's independent grant",
+          "[rbac_store][pg]") {
+    RBAC_STORE(rbac);
+    YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore mgmt{pool};
+
+    // Both ITServiceOwner and Operator seed Tag:Write by default.
+    REQUIRE(rbac.check_role_has_permission("ITServiceOwner", "Tag", "Write"));
+    REQUIRE(rbac.check_role_has_permission("Operator", "Tag", "Write"));
+    REQUIRE(rbac.remove_permission("ITServiceOwner", "Tag", "Write").has_value());
+    CHECK_FALSE(rbac.check_role_has_permission("ITServiceOwner", "Tag", "Write"));
+
+    ManagementGroup g;
+    g.name = "Service: CRM";
+    g.membership_type = "static";
+    auto group_id = mgmt.create_group(g);
+    REQUIRE(group_id.has_value());
+    mgmt.add_member(*group_id, "agent-crm-1");
+
+    // alice holds BOTH roles scoped to the SAME group: ITServiceOwner
+    // (revoked default) and Operator (independent, unrevoked grant).
+    GroupRoleAssignment a_ito;
+    a_ito.group_id = *group_id;
+    a_ito.principal_type = "user";
+    a_ito.principal_id = "alice";
+    a_ito.role_name = "ITServiceOwner";
+    mgmt.assign_role(a_ito);
+    GroupRoleAssignment a_op;
+    a_op.group_id = *group_id;
+    a_op.principal_type = "user";
+    a_op.principal_id = "alice";
+    a_op.role_name = "Operator";
+    mgmt.assign_role(a_op);
+
+    // If the revoked role's absence were (wrongly) treated as a deny_group,
+    // this would come back false. It must not — the revoked role is
+    // neutral, exactly as if alice never held it for this (type,op).
+    CHECK(rbac.check_scoped_permission("alice", "Tag", "Write", "agent-crm-1", &mgmt));
+}
+
 // ── Backfill (ADR-0009/0041 MANDATORY class) ─────────────────────────────────
 
 namespace {
@@ -1227,14 +1290,16 @@ TEST_CASE("RbacStore: backfill preserves an operator's deny-override on a seeded
 // runs in the constructor, before this backfill) already re-added it, and
 // nothing touched it. The row-count reconciliation can't catch this either
 // (PG always holds >= legacy counts by design — a missing-in-legacy row is
-// invisible to a count check). The fix scopes an UPDATE-to-deny to
-// (role,type) pairs legacy's OWN catalogue actually knew about, so it never
-// touches a securable a LATER seed_defaults() adds — e.g. EnginePrincipal,
-// #2376 — asserted explicitly below alongside the surgical role/type
-// scoping. (An initial version used DELETE, which reintroduces the exact
-// hazard remove_permission() itself was fixed to avoid — the row's own
-// reseed-survival is asserted directly below, mirroring the R2/F1 pairing.)
-TEST_CASE("RbacStore: backfill denies a seeded default permission the operator explicitly "
+// invisible to a count check). The fix scopes a DELETE + revoked_seed_defaults
+// marker to (role,type) pairs legacy's OWN catalogue actually knew about, so
+// it never touches a securable a LATER seed_defaults() adds — e.g.
+// EnginePrincipal, #2376 — asserted explicitly below alongside the surgical
+// role/type scoping. (Two earlier versions of this fix each reintroduced a
+// hazard: a plain DELETE resurrects on the next restart — the same disease
+// remove_permission() was fixed to avoid, asserted below; an UPDATE-to-deny
+// tombstone avoids that but silently changes the authorization OUTCOME for a
+// dual-role principal — see the dedicated dual-role test above.)
+TEST_CASE("RbacStore: backfill removes a seeded default permission the operator explicitly "
           "removed in legacy, and it survives a reseed",
           "[rbac_store][pg]") {
     RBAC_STORE(store);
@@ -1277,14 +1342,16 @@ TEST_CASE("RbacStore: backfill denies a seeded default permission the operator e
     CHECK(store.check_role_has_permission("Viewer", "EnginePrincipal", "Read"));
 
     // happy-path (Gate 4, #2703, HIGH) — THE REGRESSION THIS CLOSES: a hard
-    // DELETE here has nothing for seed_defaults()'s ON CONFLICT DO NOTHING to
-    // conflict with, so the very next ordinary restart after this one-time
-    // backfill silently reinserts the seeded 'allow' and undoes the
-    // operator's pre-cutover revocation — reproduced empirically by
-    // constructing a second RbacStore against the same pool (simulating a
-    // restart) and observing the revoked permission come back. Fixed by
-    // denying (not deleting) the row, mirroring remove_permission()'s own
-    // fix for the identical hazard post-cutover.
+    // DELETE with no accompanying marker has nothing for seed_defaults()'s
+    // ON CONFLICT DO NOTHING to conflict with, so the very next ordinary
+    // restart after this one-time backfill silently reinserts the seeded
+    // 'allow' and undoes the operator's pre-cutover revocation — reproduced
+    // empirically by constructing a second RbacStore against the same pool
+    // (simulating a restart) and observing the revoked permission come
+    // back. Fixed by recording the revocation in revoked_seed_defaults
+    // alongside the DELETE, mirroring remove_permission()'s own fix for the
+    // identical hazard post-cutover — grant()'s WHERE NOT EXISTS against
+    // that table is what makes this assertion hold.
     RbacStore reopened{rbac_pool_fx_};
     CHECK_FALSE(reopened.check_role_has_permission("Viewer", "AuditLog", "Read"));
 }
