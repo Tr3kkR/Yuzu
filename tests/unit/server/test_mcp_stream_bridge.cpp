@@ -4368,9 +4368,13 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
             fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value();
         // The RING's own LRU-eviction counter (mcp_stream.cpp) — a distinct metric
         // from the bridge-level admission-reclaim one above, despite the similar
-        // name. This residual selects a pin for the ADMISSION side only; it must
-        // never touch the ring's own eviction bookkeeping (#2795's acceptance
-        // criteria named this explicitly).
+        // name. This residual's admission-time reclaim never touches it: selecting
+        // and releasing a pin for the ADMISSION side is a separate code path from
+        // publish()'s pin-full LRU branch, which is what actually increments this
+        // counter (#2795's acceptance criteria named this assertion explicitly).
+        // Not a claim that the ring branch can never fire from a LATER event on
+        // this same session (docs/mcp-server.md's admission table says it can) —
+        // only that THIS reclaim, here, does not reach it.
         out.ring_displaced = fx.reg.counter("yuzu_mcp_stream_pin_displaced_total").value();
         out.audits = fx.audit_count("mcp.bridge.pin_displaced_for_admission");
         // POSITIVELY confirm the over-admission rather than inferring it from the absence
