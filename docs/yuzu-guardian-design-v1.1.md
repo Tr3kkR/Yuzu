@@ -2553,6 +2553,22 @@ token bucket (0.1 batch/agent/s refill, burst 5, `kJournalPageRefillPerSec`/
 `kJournalPageBurst`) that delays paging, never skips it — retention is the only
 deletion path regardless of bucket state.
 
+**The "alert" severities below are the designed posture, not the live one — no
+alert on any of these channels pages an operator today.** The `yuzu-guardian-journal`
+Prometheus rule group (`docs/prometheus/yuzu-alerts.yml`) is entirely commented out,
+for two independent reasons, only the first of which clears at the `prefer_spark`
+cutover: (1) the journal is inert pre-cutover, so every counter is provably 0 and an
+enabled rule could only fire on a forged heartbeat; (2) no churn-robust
+new-increment alert form exists yet for these unlabelled fleet-summed *cumulative*
+counters over a *churning* agent population (`increase()`/`rate()`/`delta()`/bare
+`> 0` each fail differently — full analysis in the YAML file's own preamble) — this
+reason does **not** clear at cutover and has **no filed tracking issue** today. Until
+both clear, every channel below is graph-and-post-incident-review only. The only
+signals that currently page or roll up live are two pipeline-health counters,
+`yuzu_fleet_guardian_journal_reporting` and `..._tag_rejected` — server-owned counts
+published every sweep including at 0, unlike the 30 agent-self-reported counters
+below, and the reason they can be sound where the loss-channel counters cannot.
+
 **Loss / removal channels — every one counted, all `yuzu.guardian_journal_*`
 heartbeat tags unless noted (sparse-emit: a zero counter ships no tag; writer
 `guardian_journal_heartbeat.hpp`, server-side rollup + HELP text
