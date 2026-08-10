@@ -621,6 +621,39 @@ Whichever PR flips `prefer_spark` MUST also:
    forced-blocking sanity step, or a 0 reading is ambiguous (no-block vs gauge-broken). Four
    mechanisms for the loss itself were built and reverted in this PR; the lesson recorded there
    is that the channel needs measuring before it is engineered.
+
+   **Quantitative thresholds (2026-08-10, written before CH-5 per the above decision;
+   proposed - confirm before the external #2340 chaos run).** Derived from the shipped
+   caps (`kMaxJournalEntriesPerBatch`=256, window=4096 entries -> a batch is blocked only
+   above ~94% occupancy per #2364's own math) and the retention bounds (7 d /
+   1000 batches / 32 MiB, `docs/yuzu-guardian-design-v1.1.md` §25):
+   - **Below 94% window occupancy: zero tolerable loss.** No batch should ever be
+     headroom-blocked in this regime; any `evicted_no_send_evidence` increment here is a
+     defect, not an accepted risk.
+   - **Sustained starvation (>=94% occupancy held for the full 7-day retention
+     window):** loss is accepted ONLY when every lost batch is attributable -
+     `evicted_no_send_evidence` may increment for a batch iff that batch's
+     `guardian_journal_headroom_blocked_seconds` episode reached the full retention
+     window at time of eviction. An increment against a batch with no corroborating
+     headroom-blocked episode (zero or absent) is NOT covered by this risk-acceptance
+     and must be investigated as a distinct defect, not counted against the accepted
+     loss.
+   - **Capacity-reject classes (`stage_dropped`, `write_capacity_rejected`) are
+     transient-only:** must clear within one maintenance-tick cycle (30 s page /
+     120 s prune, `kGuardianJournalPageInterval`/`kGuardianJournalPruneInterval`) once
+     the underlying write failure or occupancy condition resolves. Sustained nonzero
+     across a full retention cycle rolls into the starvation regime above.
+   - **Corruption/invariant classes (`quarantined`, `quarantine_failures`,
+     `key_collisions`, `gauge_underflow`) carry zero tolerance** - any nonzero reading
+     on a production endpoint is an incident (hardware fault or a bug), never an
+     accepted-loss statistic; #2364's risk-acceptance does not cover them.
+   - **For CH-11 specifically:** "no more than the true loss" becomes a testable
+     equality under the above - the count of `_evicted_no_send_evidence` increments
+     during the scenario must equal the count of batches whose
+     `headroom_blocked_seconds` episode reached the full retention window at time of
+     eviction; any excess is a defect the scenario should fail on, not a magnitude to
+     eyeball.
+   Posted for confirmation: issue #2364 and the #2340 chaos-campaign issue (CH-11).
 10. ~~**Make the replay pass lazy-parse** (Gate 3 performance, measured). `page_into_window` and
     `prune` both parse the ENTIRE journal before applying the 128-candidate cap: ~680 ms and
     ~668 ms per pass at the byte ceiling, 97% of it in `parse_journal_batch`, with `rows` (raw)
