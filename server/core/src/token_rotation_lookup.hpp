@@ -41,10 +41,10 @@
 /// for a principal, find the row scoped to a predecessor. Owning the store
 /// read inside the helper made that pure logic untestable without a live
 /// Postgres connection, which is exactly why it shipped with zero direct
-/// tests. The caller does its own `list_active_for_principal` read (both
-/// call sites already had a store handle) and hands the result in; the
-/// `found == false` inference below — the exact contract an MCP twin must
-/// honour — is now checkable with a plain in-memory vector.
+/// tests. The caller does its own `list_active_for_principal` read (the one
+/// production call site today already had a store handle) and hands the
+/// result in; the `found == false` inference below — the exact contract an
+/// MCP twin must honour — is now checkable with a plain in-memory vector.
 
 namespace yuzu::server::detail {
 
@@ -107,6 +107,24 @@ struct RotationSuccessorInfo {
 ///     rotation is resolved. A caller deriving a post-confirm response MUST
 ///     NOT apply the rotate-side "fail closed on not-found" rule here; there
 ///     is nothing ambiguous about it finding nothing.
+///   - With NO preceding successful mutation this call observed itself — a
+///     read-only "show my in-flight rotation" caller (e.g. a future
+///     `list_tokens`-style MCP tool reading the same rows; no such twin
+///     exists yet, but the ADR-1005 MCP parity gap already records one as
+///     the obvious next tool) — neither of the two rules above applies.
+///     `found == false` is genuinely AMBIGUOUS here: it could mean "no
+///     rotation is in flight for this token" or a swallowed read failure,
+///     and this header cannot tell the two apart for you — it is a pure
+///     function over whatever `active` vector you supplied, with no
+///     knowledge of whether a mutation preceded this call. The OBLIGATION IS
+///     THE CALLER'S: decide whether to surface `found == false` as "no
+///     rotation in flight" or as a read failure based on whatever OTHER
+///     signal is available to it (e.g. `list_active_for_principal` itself
+///     logs at warn on a swallowed failure; a typed read path would not have
+///     this ambiguity at all). Do not default to treating this case as
+///     benign just because it resembles the confirm-side answer above — the
+///     confirm-side answer is licensed by a mutation this helper's caller
+///     just observed succeed, which a read-only caller has none of.
 [[nodiscard]] inline RotationSuccessorInfo
 derive_rotation_successor(const std::vector<ApiToken>& active,
                           const std::string& predecessor_token_id) {
