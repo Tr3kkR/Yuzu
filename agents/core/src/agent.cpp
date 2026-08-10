@@ -297,6 +297,19 @@ private:
     }
 };
 
+// COPY/MOVE (governance Gate 8, considered and left alone): this is an
+// AGGREGATE, so it has the implicit copy/move constructors, and a copy
+// would run `fn()` TWICE. Deliberately NOT `= delete`d — a user-declared
+// (even deleted) special member function disqualifies a class from being
+// an aggregate, and every construction here goes through the deduction
+// guide's aggregate-init form (`ScopeExit cleanup{lambda}`), which would
+// then fail to compile (no converting constructor exists to take its
+// place — confirmed: attempting this locally breaks every call site in
+// both this file and its sibling below). Every use in this file is a
+// single local RAII variable, never copied or moved out of its declaring
+// scope. Same reasoning applies to the byte-identical sibling in
+// `server/core/src/api_token_store.cpp`; keep both aggregate, not just
+// this one.
 template <typename F> struct ScopeExit {
     F fn;
     ~ScopeExit() { fn(); }

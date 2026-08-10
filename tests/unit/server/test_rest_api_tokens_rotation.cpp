@@ -432,6 +432,46 @@ TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: an operator-tier session CAN ro
     CHECK(res->status == 200);
 }
 
+// De-escalating direction (governance Gate 8 follow-up — see
+// docs/user-manual/authentication.md "Rotating a Token" and
+// docs/auth-architecture.md "Human API-token rotation" for the documented
+// consequence): the harness's session tier/scope default to `""`/`""` —
+// the cookie/JIT-elevated interactive shape — so this pins the guard's
+// OTHER direction from the two tests above: an untiered session can never
+// rotate a TIERED predecessor either, even though it is the token's own
+// owner and holds no lesser authority than the token itself grants nobody
+// else. This is the documented capability loss, not a defect — the owner
+// of an MCP-tiered or service-scoped token can only rotate it by
+// presenting that token's own credential (or an equally-tiered one), never
+// from the dashboard/cookie session. Nothing in this suite exercised this
+// direction before this test — the REST harness's tier/scope default IS
+// untiered, so a route that silently passed empty strings for
+// caller_mcp_tier/caller_scope_service (rather than the real session
+// authority) would have stayed green on every OTHER test in this file.
+TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: an UNTIERED (cookie-shaped) session is "
+          "refused rotating its own TIERED token — the de-escalating direction is blocked too",
+          "[pg][rest][token][rotation][security]") {
+    RestTokenRotationHarness h;
+    auto token_id = h.create_token_for("alice", "alices-tiered-key", now_epoch() + 86400 * 30,
+                                       /*scope_service=*/"", /*mcp_tier=*/"operator");
+    h.session_user = "alice";
+    // h.session_mcp_tier left at its default "" — an untiered/cookie
+    // session, distinct from the token's own "operator" tier.
+
+    auto res = h.rotate(token_id);
+    REQUIRE(res);
+    // Same store-reached "no such token to rotate" wording/status as the
+    // operator-vs-untiered direction above — the guard is symmetric
+    // equality, not an ordering, so "caller has LESS authority than the
+    // token" refuses exactly like "caller has MORE".
+    CHECK(res->status == 400);
+    CHECK(res->body.find("no such token to rotate") != std::string::npos);
+
+    auto looked_up = h.token_store->get_token(token_id).value();
+    REQUIRE(looked_up.has_value());
+    CHECK(looked_up->rotation_group.empty()); // no successor minted
+}
+
 TEST_CASE("REST POST /api/v1/tokens/{id}/confirm: non-owner gets 404 (no oracle), "
           "denied path audited",
           "[pg][rest][token][rotation][owner][idor]") {

@@ -2035,7 +2035,7 @@ TEST_CASE("ApiTokenStore: rotate_token rejects an overlap window below the 24h f
     // No token with this id exists at all — the floor check still fires
     // first (pure math, no DB dependency), distinct message from "no such
     // token".
-    auto rotated = store.rotate_token("deadbeefdeadbeefdeadbeef", kDay - 1, now, "admin");
+    auto rotated = store.rotate_token("deadbeefdeadbeefdeadbeef", kDay - 1, now, "admin", "", "");
     REQUIRE_FALSE(rotated.has_value());
     CHECK(rotated.error().find("floor") != std::string::npos);
 }
@@ -2052,7 +2052,7 @@ TEST_CASE("ApiTokenStore: rotate_token rejects an unknown token_id",
 
     auto now = test_now_epoch();
     auto rotated =
-        store.rotate_token("deadbeefdeadbeefdeadbeef", kDefaultOverlapSecs, now, "admin");
+        store.rotate_token("deadbeefdeadbeefdeadbeef", kDefaultOverlapSecs, now, "admin", "", "");
     REQUIRE_FALSE(rotated.has_value());
     CHECK(rotated.error().find("no such token") != std::string::npos);
     CHECK(classify_engine_store_error(rotated.error()) == E::ClientValidation);
@@ -2085,7 +2085,7 @@ TEST_CASE("ApiTokenStore: rotate_token rejects an engine-kind token — human ar
     // clears and this test reaches — and isolates — the kind check it
     // targets.
     auto rotated = store.rotate_token(active[0].token_id, kDefaultOverlapSecs, now,
-                                      "engine:human-arm-guard", std::nullopt, "readonly", "");
+                                      "engine:human-arm-guard", "readonly", "", std::nullopt);
     REQUIRE_FALSE(rotated.has_value());
     CHECK(rotated.error().find("human-owned") != std::string::npos);
 }
@@ -2109,7 +2109,7 @@ TEST_CASE("ApiTokenStore: rotate_token rejects a non-owner even with a valid tok
     // "admin" is a DIFFERENT user, not merely a different requesting_user
     // label — there is no admin-override arm on this path (deliberate
     // asymmetry with the engine arm's third-party-admin design).
-    auto stolen = store.rotate_token(token_id, kDefaultOverlapSecs, now, "admin");
+    auto stolen = store.rotate_token(token_id, kDefaultOverlapSecs, now, "admin", "", "");
     REQUIRE_FALSE(stolen.has_value());
     CHECK(stolen.error() == "no such token to rotate"); // byte-identical to the genuine 404 case
     CHECK(classify_engine_store_error(stolen.error()) == E::ClientValidation);
@@ -2120,7 +2120,7 @@ TEST_CASE("ApiTokenStore: rotate_token rejects a non-owner even with a valid tok
     CHECK(active[0].rotation_group.empty());
 
     // The genuine owner can still rotate normally afterward.
-    auto real = store.rotate_token(token_id, kDefaultOverlapSecs, now, "alice");
+    auto real = store.rotate_token(token_id, kDefaultOverlapSecs, now, "alice", "", "");
     CHECK(real.has_value());
 }
 
@@ -2155,8 +2155,8 @@ TEST_CASE("ApiTokenStore: rotate_token refuses when the caller's own mcp_tier do
     // carry — without the guard this would mint a fresh untiered/perpetual
     // successor for an operator-tier caller: exactly the escalation this
     // fix closes.
-    auto rotated = store.rotate_token(token_id, kDefaultOverlapSecs, now, "alice", std::nullopt,
-                                      "operator", "");
+    auto rotated = store.rotate_token(token_id, kDefaultOverlapSecs, now, "alice", "operator", "",
+                                      std::nullopt);
     REQUIRE_FALSE(rotated.has_value());
     CHECK(rotated.error() == "no such token to rotate"); // same wording as absent/not-owned —
                                                           // not an authority-probing oracle
@@ -2184,8 +2184,8 @@ TEST_CASE("ApiTokenStore: rotate_token succeeds when the caller's tier/scope mat
     REQUIRE(raw.has_value());
     const std::string token_id = store.list_active_for_principal("alice")[0].token_id;
 
-    auto rotated = store.rotate_token(token_id, kDefaultOverlapSecs, now, "alice", std::nullopt,
-                                      "operator", "svc-a");
+    auto rotated = store.rotate_token(token_id, kDefaultOverlapSecs, now, "alice", "operator",
+                                      "svc-a", std::nullopt);
     REQUIRE(rotated.has_value());
 
     // Pins inheritance itself — nothing else in this suite asserts the
@@ -2220,8 +2220,8 @@ TEST_CASE("ApiTokenStore: rotate_token refuses on a scope_service mismatch even 
     // Same tier as the predecessor, DIFFERENT scope_service — the caller's
     // own token is scoped to a different service than the one being
     // rotated.
-    auto rotated = store.rotate_token(token_id, kDefaultOverlapSecs, now, "alice", std::nullopt,
-                                      "operator", "svc-b");
+    auto rotated = store.rotate_token(token_id, kDefaultOverlapSecs, now, "alice", "operator",
+                                      "svc-b", std::nullopt);
     REQUIRE_FALSE(rotated.has_value());
     CHECK(rotated.error() == "no such token to rotate");
 
@@ -2246,7 +2246,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a non-owner even with t
     REQUIRE(raw.has_value());
     const std::string predecessor_id = store.list_active_for_principal("alice")[0].token_id;
 
-    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice");
+    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice", "", "");
     REQUIRE(rotated.has_value());
     std::string successor_id;
     for (const auto& t : store.list_active_for_principal("alice"))
@@ -2257,14 +2257,14 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a non-owner even with t
     // "admin" knows the correct successor token_id (e.g. observed in an
     // audit log) but is not alice — must still be rejected, byte-identical
     // to the not-found wording, never a distinguishable "not yours".
-    auto stolen_confirm = store.confirm_token_rotation(successor_id, "admin");
+    auto stolen_confirm = store.confirm_token_rotation(successor_id, "admin", "", "");
     REQUIRE_FALSE(stolen_confirm.has_value());
     CHECK(stolen_confirm.error() == "no such token to confirm");
     CHECK(classify_engine_store_error(stolen_confirm.error()) == E::ClientValidation);
 
     // Nothing mutated — the pair is still intact and alice can still confirm.
     CHECK(store.list_active_for_principal("alice").size() == 2);
-    auto real_confirm = store.confirm_token_rotation(successor_id, "alice");
+    auto real_confirm = store.confirm_token_rotation(successor_id, "alice", "", "");
     CHECK(real_confirm.has_value());
 }
 
@@ -2285,7 +2285,7 @@ TEST_CASE("ApiTokenStore: rotate_token rejects a window exceeding the predecesso
     REQUIRE(active.size() == 1);
     const std::string token_id = active[0].token_id;
 
-    auto rotated = store.rotate_token(token_id, kDay, now, "alice");
+    auto rotated = store.rotate_token(token_id, kDay, now, "alice", "", "");
     REQUIRE_FALSE(rotated.has_value());
     CHECK(rotated.error().find("expiry") != std::string::npos);
 
@@ -2309,7 +2309,7 @@ TEST_CASE("ApiTokenStore: rotate_token mints a successor, stamps the rotation pa
     const std::string predecessor_id = before[0].token_id;
     const int64_t predecessor_expires_at = before[0].expires_at;
 
-    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice");
+    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice", "", "");
     REQUIRE(rotated.has_value());
     CHECK(rotated->starts_with("yuzu_"));
     CHECK(*rotated != *predecessor_raw);
@@ -2358,7 +2358,7 @@ TEST_CASE("ApiTokenStore: rotate_token honours an explicit successor_expires_at 
     const std::string predecessor_id = before[0].token_id;
 
     const int64_t override_expiry = now + kDefaultOverlapSecs + kDay;
-    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice",
+    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice", "", "",
                                       override_expiry);
     REQUIRE(rotated.has_value());
 
@@ -2386,7 +2386,7 @@ TEST_CASE("ApiTokenStore: rotate_token — a perpetual predecessor yields a perp
     REQUIRE(before[0].expires_at == 0);
     const std::string predecessor_id = before[0].token_id;
 
-    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice");
+    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice", "", "");
     REQUIRE(rotated.has_value());
 
     auto after = store.list_active_for_principal("alice");
@@ -2425,7 +2425,7 @@ TEST_CASE("ApiTokenStore: rotate_token — a human's OTHER unrelated active toke
             ci_id = t.token_id;
     REQUIRE_FALSE(ci_id.empty());
 
-    auto rotated = store.rotate_token(ci_id, kDefaultOverlapSecs, now, "alice");
+    auto rotated = store.rotate_token(ci_id, kDefaultOverlapSecs, now, "alice", "", "");
     REQUIRE(rotated.has_value());
 
     // Now 4 active total (laptop, cli untouched + the ci-runner pair), but
@@ -2446,10 +2446,10 @@ TEST_CASE("ApiTokenStore: rotate_token re-serves the same raw within the grace w
     REQUIRE(predecessor_raw.has_value());
     const std::string predecessor_id = store.list_active_for_principal("alice")[0].token_id;
 
-    auto first = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice");
+    auto first = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice", "", "");
     REQUIRE(first.has_value());
 
-    auto retry = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice");
+    auto retry = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice", "", "");
     REQUIRE(retry.has_value());
     CHECK(*retry == *first);
 
@@ -2483,7 +2483,7 @@ TEST_CASE("ApiTokenStore: rotate_token — a query failure in the conflict arm's
 
     // First rotate mints the pair and lands us in the re-serve/conflict arm for
     // any subsequent call on the same predecessor.
-    auto first = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice");
+    auto first = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice", "", "");
     REQUIRE(first.has_value());
     REQUIRE(store.list_active_for_principal("alice").size() == 2);
 
@@ -2497,7 +2497,7 @@ TEST_CASE("ApiTokenStore: rotate_token — a query failure in the conflict arm's
         ScopedPgConnHook hook_guard(store.test_hook_before_rotate_group_read_, [](pg_conn* conn) {
             (void)pg::exec_params(conn, "SELECT 1/0", std::vector<std::string>{});
         });
-        retry = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice");
+        retry = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice", "", "");
     }
 
     REQUIRE_FALSE(retry.has_value());
@@ -2512,7 +2512,8 @@ TEST_CASE("ApiTokenStore: rotate_token — a query failure in the conflict arm's
     REQUIRE(after.size() == 2);
 
     // A normal call afterward (hook cleared) still works.
-    auto clean_retry = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice");
+    auto clean_retry =
+        store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice", "", "");
     REQUIRE(clean_retry.has_value());
     CHECK(*clean_retry == *first);
 }
@@ -2591,7 +2592,7 @@ TEST_CASE("ApiTokenStore: rotate_token — a COMMIT failure after the mint arm r
             }
             REQUIRE(severed);
         });
-        rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice");
+        rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice", "", "");
     }
 
     // The transaction never committed, so rotate_token must report failure...
@@ -2630,7 +2631,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation cuts over immediately — revok
     REQUIRE(predecessor_raw.has_value());
     const std::string predecessor_id = store.list_active_for_principal("alice")[0].token_id;
 
-    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice");
+    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice", "", "");
     REQUIRE(rotated.has_value());
     auto active = store.list_active_for_principal("alice");
     REQUIRE(active.size() == 2);
@@ -2640,7 +2641,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation cuts over immediately — revok
             successor_id = t.token_id;
     REQUIRE_FALSE(successor_id.empty());
 
-    auto confirmed = store.confirm_token_rotation(successor_id, "alice");
+    auto confirmed = store.confirm_token_rotation(successor_id, "alice", "", "");
     REQUIRE(confirmed.has_value());
 
     // Predecessor is revoked immediately (no need to wait for the overlap
@@ -2674,12 +2675,12 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a token_id that is not 
     REQUIRE(predecessor_raw.has_value());
     const std::string predecessor_id = store.list_active_for_principal("alice")[0].token_id;
 
-    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice");
+    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice", "", "");
     REQUIRE(rotated.has_value());
 
     // Passing the PREDECESSOR's own id (not the successor's) must be
     // rejected by the pin check, never silently accepted.
-    auto mismatch = store.confirm_token_rotation(predecessor_id, "alice");
+    auto mismatch = store.confirm_token_rotation(predecessor_id, "alice", "", "");
     REQUIRE_FALSE(mismatch.has_value());
     CHECK(store.list_active_for_principal("alice").size() == 2); // unchanged
 }
@@ -2695,7 +2696,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on an unknown token_id is a ter
     using yuzu::server::detail::classify_engine_store_error;
     using E = yuzu::server::detail::EngineStoreErrorClass;
 
-    auto confirmed = store.confirm_token_rotation("deadbeefdeadbeefdeadbeef", "admin");
+    auto confirmed = store.confirm_token_rotation("deadbeefdeadbeefdeadbeef", "admin", "", "");
     REQUIRE_FALSE(confirmed.has_value());
     CHECK(confirmed.error().find("no such token") != std::string::npos);
     CHECK(classify_engine_store_error(confirmed.error()) == E::ClientValidation);
@@ -2731,7 +2732,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a token that was never part 
     REQUIRE(raw.has_value());
     const std::string token_id = store.list_active_for_principal("alice")[0].token_id;
 
-    auto confirmed = store.confirm_token_rotation(token_id, "alice");
+    auto confirmed = store.confirm_token_rotation(token_id, "alice", "", "");
     REQUIRE_FALSE(confirmed.has_value());
     CHECK(confirmed.error().find("no rotation currently pending") != std::string::npos);
     CHECK(confirmed.error().find("the rotation was resolved") == std::string::npos);
@@ -2755,19 +2756,19 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation replay after success is a termi
     REQUIRE(predecessor_raw.has_value());
     const std::string predecessor_id = store.list_active_for_principal("alice")[0].token_id;
 
-    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice");
+    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice", "", "");
     REQUIRE(rotated.has_value());
     std::string successor_id;
     for (const auto& t : store.list_active_for_principal("alice"))
         if (t.token_id != predecessor_id)
             successor_id = t.token_id;
 
-    REQUIRE(store.confirm_token_rotation(successor_id, "alice").has_value());
+    REQUIRE(store.confirm_token_rotation(successor_id, "alice", "", "").has_value());
 
     // Replay: the successor is now the SOLE active credential for alice, and
     // it is not in the pinned rotation_group any more (kGroupEmpty) — a
     // POSITIVE fact (rotation_confirm_state.hpp), terminal Conflict.
-    auto replay = store.confirm_token_rotation(successor_id, "alice");
+    auto replay = store.confirm_token_rotation(successor_id, "alice", "", "");
     REQUIRE_FALSE(replay.has_value());
     CHECK(replay.error().find("no rotation currently pending") != std::string::npos);
     CHECK(replay.error().find("the rotation was resolved") == std::string::npos);
@@ -2788,7 +2789,7 @@ TEST_CASE("ApiTokenStore: sweep_expired_rotations auto-revokes an elapsed human 
     const std::string predecessor_id = store.list_active_for_principal("alice")[0].token_id;
 
     // Short overlap so the sweep at `now + kDay` finds it elapsed.
-    auto rotated = store.rotate_token(predecessor_id, kDay, now, "alice");
+    auto rotated = store.rotate_token(predecessor_id, kDay, now, "alice", "", "");
     REQUIRE(rotated.has_value());
     REQUIRE(store.list_active_for_principal("alice").size() == 2);
 
@@ -2882,7 +2883,7 @@ TEST_CASE("ApiTokenStore: rotate_token on a human token is GROUP-scoped, not "
     REQUIRE(v2.has_value());
     const std::string t2_id = v2->token_id;
 
-    auto rotated = store.rotate_token(t2_id, kDefaultOverlapSecs, now, "alice");
+    auto rotated = store.rotate_token(t2_id, kDefaultOverlapSecs, now, "alice", "", "");
     REQUIRE(rotated.has_value());
     CHECK(rotated->starts_with("yuzu_"));
 
@@ -2926,12 +2927,12 @@ TEST_CASE("ApiTokenStore: rotate_token's ≤2 ceiling is scoped to the "
     const std::string a_id = va->token_id;
 
     // First rotate of A mints a successor -> A's group now has 2 rows.
-    auto first = store.rotate_token(a_id, kDefaultOverlapSecs, now, "bob");
+    auto first = store.rotate_token(a_id, kDefaultOverlapSecs, now, "bob", "", "");
     REQUIRE(first.has_value());
 
     // A same-operator retry within grace re-serves the SAME raw — the
     // in-flight-pair re-serve arm, exercised at A's group scope alone.
-    auto retry = store.rotate_token(a_id, kDefaultOverlapSecs, now, "bob");
+    auto retry = store.rotate_token(a_id, kDefaultOverlapSecs, now, "bob", "", "");
     REQUIRE(retry.has_value());
     CHECK(*retry == *first);
 
@@ -2943,7 +2944,7 @@ TEST_CASE("ApiTokenStore: rotate_token's ≤2 ceiling is scoped to the "
     // checklist). No distinguishable wording is asserted here on purpose —
     // asserting one would itself be an enumeration-oracle regression (item
     // 7b). B, held by the SAME principal, plays no part in this rejection.
-    auto stolen = store.rotate_token(a_id, kDefaultOverlapSecs, now, "mallory");
+    auto stolen = store.rotate_token(a_id, kDefaultOverlapSecs, now, "mallory", "", "");
     REQUIRE_FALSE(stolen.has_value());
 
     // B is completely unaffected throughout.
@@ -2985,7 +2986,7 @@ TEST_CASE("ApiTokenStore: rotate_token never leaves an orphaned rotation "
     REQUIRE(vt.has_value());
     const std::string predecessor_id = vt->token_id;
 
-    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "priya");
+    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "priya", "", "");
     REQUIRE(rotated.has_value());
 
     auto active = store.list_active_for_principal("priya");
@@ -3035,7 +3036,7 @@ TEST_CASE("ApiTokenStore: sweep_expired_rotations auto-revokes a human "
     const std::string predecessor_id = vt->token_id;
 
     // A short overlap window so the sweep fires shortly after `now`.
-    auto rotated = store.rotate_token(predecessor_id, kDay, now, "sanjay");
+    auto rotated = store.rotate_token(predecessor_id, kDay, now, "sanjay", "", "");
     REQUIRE(rotated.has_value());
     std::string successor_id;
     for (const auto& tok : store.list_active_for_principal("sanjay"))
@@ -3091,7 +3092,7 @@ TEST_CASE("ApiTokenStore: list_rotations_nearing_expiry_unused surfaces a "
     // Overlap window ends in exactly 1 day — ask for pairs whose window
     // ends within 2 days, so this pair is within the warn threshold but its
     // window has NOT yet elapsed.
-    auto rotated = store.rotate_token(predecessor_id, kDay, now, "tanya");
+    auto rotated = store.rotate_token(predecessor_id, kDay, now, "tanya", "", "");
     REQUIRE(rotated.has_value());
     std::string successor_id;
     for (const auto& tok : store.list_active_for_principal("tanya"))
@@ -3117,7 +3118,7 @@ TEST_CASE("ApiTokenStore: list_rotations_nearing_expiry_unused surfaces a "
     auto vt2 = store.validate_token(*t2);
     REQUIRE(vt2.has_value());
     auto rotated2 =
-        store.rotate_token(vt2->token_id, kDefaultOverlapSecs, now, "tanya"); // 7d overlap
+        store.rotate_token(vt2->token_id, kDefaultOverlapSecs, now, "tanya", "", ""); // 7d overlap
     REQUIRE(rotated2.has_value());
     auto nearing2 = store.list_rotations_nearing_expiry_unused(now, /*warn_within_secs=*/2 * kDay);
     for (const auto& pair : nearing2)
@@ -3178,7 +3179,7 @@ TEST_CASE("ApiTokenStore: rotate_token defensively rejects when three "
     REQUIRE(vt.has_value());
     const std::string predecessor_id = vt->token_id;
 
-    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "wendy");
+    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "wendy", "", "");
     REQUIRE(rotated.has_value());
     std::string rotation_group;
     for (const auto& tok : store.list_active_for_principal("wendy"))
@@ -3211,7 +3212,7 @@ TEST_CASE("ApiTokenStore: rotate_token defensively rejects when three "
             ++in_group;
     REQUIRE(in_group == 3);
 
-    auto over = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "wendy");
+    auto over = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "wendy", "", "");
     REQUIRE_FALSE(over.has_value());
     CHECK(over.error().find("more than two active credentials") != std::string::npos);
     CHECK(classify_engine_store_error(over.error()) == ClsE::ClientValidation);
@@ -3247,7 +3248,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a group with three "
     REQUIRE(vt.has_value());
     const std::string predecessor_id = vt->token_id;
 
-    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "xena");
+    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "xena", "", "");
     REQUIRE(rotated.has_value());
     std::string successor_id, rotation_group;
     for (const auto& tok : store.list_active_for_principal("xena")) {
@@ -3279,7 +3280,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a group with three "
             ++in_group;
     REQUIRE(in_group == 3);
 
-    auto over = store.confirm_token_rotation(successor_id, "xena");
+    auto over = store.confirm_token_rotation(successor_id, "xena", "", "");
     REQUIRE_FALSE(over.has_value());
     CHECK(over.error().find("more than two active credentials") != std::string::npos);
     CHECK(classify_engine_store_error(over.error()) == ClsE::ClientValidation);
@@ -3340,7 +3341,7 @@ TEST_CASE("ApiTokenStore: concurrent rotate_token calls for the SAME "
     for (int i = 0; i < kThreads; ++i) {
         threads.emplace_back([&]() {
             start_latch.arrive_and_wait();
-            auto r = store.rotate_token(t_id, kDefaultOverlapSecs, now, "carol");
+            auto r = store.rotate_token(t_id, kDefaultOverlapSecs, now, "carol", "", "");
             std::lock_guard lock(results_mtx);
             results.push_back(std::move(r));
         });
@@ -3401,11 +3402,11 @@ TEST_CASE("ApiTokenStore: concurrent rotate_token calls on TWO DIFFERENT "
     std::expected<std::string, std::string> result_a, result_b;
     std::thread ta([&]() {
         start_latch.arrive_and_wait();
-        result_a = store.rotate_token(a_id, kDefaultOverlapSecs, now, "dave");
+        result_a = store.rotate_token(a_id, kDefaultOverlapSecs, now, "dave", "", "");
     });
     std::thread tb([&]() {
         start_latch.arrive_and_wait();
-        result_b = store.rotate_token(b_id, kDefaultOverlapSecs, now, "dave");
+        result_b = store.rotate_token(b_id, kDefaultOverlapSecs, now, "dave", "", "");
     });
     ta.join();
     tb.join();
@@ -3438,7 +3439,7 @@ TEST_CASE("ApiTokenStore: rotate_token's successor inherits the "
     REQUIRE(vt.has_value());
     const std::string t_id = vt->token_id;
 
-    auto rotated = store.rotate_token(t_id, kDefaultOverlapSecs, now, "erin");
+    auto rotated = store.rotate_token(t_id, kDefaultOverlapSecs, now, "erin", "", "");
     REQUIRE(rotated.has_value());
 
     auto active = store.list_active_for_principal("erin");
@@ -3469,7 +3470,7 @@ TEST_CASE("ApiTokenStore: rotate_token on a PERPETUAL predecessor "
     REQUIRE(pre->has_value());
     REQUIRE((*pre)->expires_at == 0);
 
-    auto rotated = store.rotate_token(t_id, kDefaultOverlapSecs, now, "frank");
+    auto rotated = store.rotate_token(t_id, kDefaultOverlapSecs, now, "frank", "", "");
     REQUIRE(rotated.has_value());
 
     auto active = store.list_active_for_principal("frank");
@@ -3499,7 +3500,7 @@ TEST_CASE("ApiTokenStore: rotate_token's optional successor_expires_at "
     // A valid override in the future, past the overlap window's own end.
     const int64_t override_expiry = now + 30 * kDay;
     auto rotated =
-        store.rotate_token(t_id, kDefaultOverlapSecs, now, "grace", override_expiry);
+        store.rotate_token(t_id, kDefaultOverlapSecs, now, "grace", "", "", override_expiry);
     REQUIRE(rotated.has_value());
 
     auto active = store.list_active_for_principal("grace");
@@ -3532,7 +3533,7 @@ TEST_CASE("ApiTokenStore: rotate_token rejects a successor_expires_at "
     const std::string t_id = vt->token_id;
 
     auto rotated =
-        store.rotate_token(t_id, kDefaultOverlapSecs, now, "heidi", now - 1);
+        store.rotate_token(t_id, kDefaultOverlapSecs, now, "heidi", "", "", now - 1);
     REQUIRE_FALSE(rotated.has_value());
 
     // No successor minted; predecessor untouched.
@@ -3564,7 +3565,7 @@ TEST_CASE("ApiTokenStore: rotate_token rejects a successor_expires_at "
     // Overlap window ends at now+kDefaultOverlapSecs (7d); override the
     // successor to expire at now+1d — BEFORE the window it would need to
     // survive.
-    auto rotated = store.rotate_token(t_id, kDefaultOverlapSecs, now, "ivy", now + kDay);
+    auto rotated = store.rotate_token(t_id, kDefaultOverlapSecs, now, "ivy", "", "", now + kDay);
     REQUIRE_FALSE(rotated.has_value());
     CHECK(classify_engine_store_error(rotated.error()) == ClsE::ClientValidation);
 
@@ -3589,7 +3590,7 @@ TEST_CASE("ApiTokenStore: rotate_token rejects an overlap window that would "
     REQUIRE(vt.has_value());
     const std::string t_id = vt->token_id;
 
-    auto rotated = store.rotate_token(t_id, kDefaultOverlapSecs, now, "ivan");
+    auto rotated = store.rotate_token(t_id, kDefaultOverlapSecs, now, "ivan", "", "");
     REQUIRE_FALSE(rotated.has_value());
     CHECK(rotated.error().find("expiry") != std::string::npos);
     CHECK(classify_engine_store_error(rotated.error()) == ClsE::ClientValidation);
@@ -3623,7 +3624,7 @@ TEST_CASE("ApiTokenStore: rotate_token error classification round-trip — "
     // (like the engine floor test at :705) against a bogus token_id, on the
     // assumption it fires before any DB lookup of the predecessor.
     {
-        auto r = store.rotate_token("deadbeefdeadbeefdeadbeef", kDay - 1, now, "admin");
+        auto r = store.rotate_token("deadbeefdeadbeefdeadbeef", kDay - 1, now, "admin", "", "");
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().find("floor") != std::string::npos);
         CHECK(classify_engine_store_error(r.error()) == ClsE::ClientValidation);
@@ -3632,7 +3633,8 @@ TEST_CASE("ApiTokenStore: rotate_token error classification round-trip — "
     // Ceiling: absurdly large overlap window (well past any sane maximum).
     {
         constexpr int64_t kAbsurdOverlap = 11LL * 365 * kDay;
-        auto r = store.rotate_token("deadbeefdeadbeefdeadbeef", kAbsurdOverlap, now, "admin");
+        auto r = store.rotate_token("deadbeefdeadbeefdeadbeef", kAbsurdOverlap, now, "admin", "",
+                                    "");
         REQUIRE_FALSE(r.has_value());
         CHECK(classify_engine_store_error(r.error()) == ClsE::ClientValidation);
     }
@@ -3644,7 +3646,7 @@ TEST_CASE("ApiTokenStore: rotate_token error classification round-trip — "
         REQUIRE(t.has_value());
         auto vt = store.validate_token(*t);
         REQUIRE(vt.has_value());
-        auto r = store.rotate_token(vt->token_id, kDefaultOverlapSecs, now, "");
+        auto r = store.rotate_token(vt->token_id, kDefaultOverlapSecs, now, "", "", "");
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().find("required") != std::string::npos);
         CHECK(classify_engine_store_error(r.error()) == ClsE::ClientValidation);
@@ -3660,10 +3662,11 @@ TEST_CASE("ApiTokenStore: rotate_token error classification round-trip — "
         REQUIRE(t.has_value());
         auto vt = store.validate_token(*t);
         REQUIRE(vt.has_value());
-        auto first = store.rotate_token(vt->token_id, kDefaultOverlapSecs, now, "judy-grace");
+        auto first =
+            store.rotate_token(vt->token_id, kDefaultOverlapSecs, now, "judy-grace", "", "");
         REQUIRE(first.has_value());
         auto lapsed = store.rotate_token(vt->token_id, kDefaultOverlapSecs, now + 300,
-                                         "judy-grace");
+                                         "judy-grace", "", "");
         REQUIRE_FALSE(lapsed.has_value());
         CHECK(lapsed.error().find("grace") != std::string::npos);
         CHECK(classify_engine_store_error(lapsed.error()) == ClsE::Conflict);
@@ -3685,7 +3688,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation error classification "
 
     // Empty successor_token_id.
     {
-        auto r = store.confirm_token_rotation("", "admin");
+        auto r = store.confirm_token_rotation("", "admin", "", "");
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().find("required") != std::string::npos);
         CHECK(classify_engine_store_error(r.error()) == ClsE::ClientValidation);
@@ -3698,7 +3701,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation error classification "
         REQUIRE(t.has_value());
         auto vt = store.validate_token(*t);
         REQUIRE(vt.has_value());
-        auto r = store.confirm_token_rotation(vt->token_id, "");
+        auto r = store.confirm_token_rotation(vt->token_id, "", "", "");
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().find("required") != std::string::npos);
         CHECK(classify_engine_store_error(r.error()) == ClsE::ClientValidation);
@@ -3729,7 +3732,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a never-rotated solo "
     // only, never verbatim (calibration rule stated in this section's header
     // comment) — this scenario is more likely to be reworded for a "rotation
     // group" model than the generic floor/ceiling/operator-binding strings.
-    auto resolved = store.confirm_token_rotation(vt->token_id, "leo");
+    auto resolved = store.confirm_token_rotation(vt->token_id, "leo", "", "");
     REQUIRE_FALSE(resolved.has_value());
     CHECK(classify_engine_store_error(resolved.error()) == ClsE::Conflict);
 }
@@ -3750,7 +3753,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation replay after success is a "
     REQUIRE(vt.has_value());
     const std::string t_id = vt->token_id;
 
-    auto rotated = store.rotate_token(t_id, kDefaultOverlapSecs, now, "mia");
+    auto rotated = store.rotate_token(t_id, kDefaultOverlapSecs, now, "mia", "", "");
     REQUIRE(rotated.has_value());
     auto active = store.list_active_for_principal("mia");
     std::string successor_id;
@@ -3760,10 +3763,10 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation replay after success is a "
     REQUIRE_FALSE(successor_id.empty());
 
     // First confirm succeeds (the real cutover).
-    REQUIRE(store.confirm_token_rotation(successor_id, "mia").has_value());
+    REQUIRE(store.confirm_token_rotation(successor_id, "mia", "", "").has_value());
 
     // The network-dropped-200 replay: SAME args. Terminal, not 503.
-    auto replay = store.confirm_token_rotation(successor_id, "mia");
+    auto replay = store.confirm_token_rotation(successor_id, "mia", "", "");
     REQUIRE_FALSE(replay.has_value());
     CHECK(classify_engine_store_error(replay.error()) == ClsE::Conflict);
     CHECK(store.list_active_for_principal("mia").size() == 1); // no side effect
@@ -3788,7 +3791,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a stale/mismatched "
     REQUIRE(vt.has_value());
     const std::string predecessor_id = vt->token_id;
 
-    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "nina");
+    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "nina", "", "");
     REQUIRE(rotated.has_value());
 
     std::string successor_id, rotation_group;
@@ -3804,7 +3807,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a stale/mismatched "
     // REAL row nina owns, currently in-rotation but holding the WRONG role
     // in the pair (predecessor, not successor) — this genuinely reaches the
     // pin-mismatch branch.
-    auto mismatch = store.confirm_token_rotation(predecessor_id, "nina");
+    auto mismatch = store.confirm_token_rotation(predecessor_id, "nina", "", "");
     REQUIRE_FALSE(mismatch.has_value());
     CHECK(mismatch.error().find("does not match the pending rotation") != std::string::npos);
     CHECK(classify_engine_store_error(mismatch.error()) == ClsE::Conflict);
@@ -3830,8 +3833,8 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a stale/mismatched "
     auto vt_other = store.validate_token(*other_owner);
     REQUIRE(vt_other.has_value());
 
-    auto fabricated = store.confirm_token_rotation("feedfacefeedfacefeedface", "nina");
-    auto not_owned = store.confirm_token_rotation(vt_other->token_id, "nina");
+    auto fabricated = store.confirm_token_rotation("feedfacefeedfacefeedface", "nina", "", "");
+    auto not_owned = store.confirm_token_rotation(vt_other->token_id, "nina", "", "");
     REQUIRE_FALSE(fabricated.has_value());
     REQUIRE_FALSE(not_owned.has_value());
     CHECK(fabricated.error() == not_owned.error());
@@ -3848,7 +3851,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a stale/mismatched "
     }
 
     // The correct id still confirms — the rejections above consumed nothing.
-    CHECK(store.confirm_token_rotation(successor_id, "nina").has_value());
+    CHECK(store.confirm_token_rotation(successor_id, "nina", "", "").has_value());
 }
 
 TEST_CASE("ApiTokenStore: a blind retry carrying an EARLIER rotation's "
@@ -3879,17 +3882,17 @@ TEST_CASE("ApiTokenStore: a blind retry carrying an EARLIER rotation's "
     const std::string t_id = vt->token_id;
 
     // R1: rotate + confirm with R1's successor id (the happy flow).
-    auto r1 = store.rotate_token(t_id, kDefaultOverlapSecs, now, "paul");
+    auto r1 = store.rotate_token(t_id, kDefaultOverlapSecs, now, "paul", "", "");
     REQUIRE(r1.has_value());
     std::string r1_successor_id;
     for (const auto& tok : store.list_active_for_principal("paul"))
         if (tok.supersedes_token_id == t_id)
             r1_successor_id = tok.token_id;
     REQUIRE_FALSE(r1_successor_id.empty());
-    REQUIRE(store.confirm_token_rotation(r1_successor_id, "paul").has_value());
+    REQUIRE(store.confirm_token_rotation(r1_successor_id, "paul", "", "").has_value());
 
     // R2 begins: R1's successor is now R2's predecessor.
-    auto r2 = store.rotate_token(r1_successor_id, kDefaultOverlapSecs, now, "paul");
+    auto r2 = store.rotate_token(r1_successor_id, kDefaultOverlapSecs, now, "paul", "", "");
     REQUIRE(r2.has_value());
     std::string r2_successor_id;
     for (const auto& tok : store.list_active_for_principal("paul"))
@@ -3900,7 +3903,7 @@ TEST_CASE("ApiTokenStore: a blind retry carrying an EARLIER rotation's "
 
     // THE #2384 SCENARIO, token-keyed: a blind retry of the R1 confirm (same
     // args, same operator) lands after R2 started.
-    auto stale_retry = store.confirm_token_rotation(r1_successor_id, "paul");
+    auto stale_retry = store.confirm_token_rotation(r1_successor_id, "paul", "", "");
     REQUIRE_FALSE(stale_retry.has_value());
     CHECK(stale_retry.error().find("does not match the pending rotation") != std::string::npos);
     CHECK(classify_engine_store_error(stale_retry.error()) == ClsE::Conflict);
@@ -3923,7 +3926,7 @@ TEST_CASE("ApiTokenStore: a blind retry carrying an EARLIER rotation's "
     CHECK(r1_successor_still_active);
 
     // R2's own successor id confirms R2 normally.
-    CHECK(store.confirm_token_rotation(r2_successor_id, "paul").has_value());
+    CHECK(store.confirm_token_rotation(r2_successor_id, "paul", "", "").has_value());
 }
 
 TEST_CASE("ApiTokenStore: a successor id from ONE token's already-resolved "
@@ -3955,14 +3958,14 @@ TEST_CASE("ApiTokenStore: a successor id from ONE token's already-resolved "
     auto va = store.validate_token(*a);
     REQUIRE(va.has_value());
     const std::string a1_id = va->token_id;
-    auto ra = store.rotate_token(a1_id, kDefaultOverlapSecs, now, "quinn");
+    auto ra = store.rotate_token(a1_id, kDefaultOverlapSecs, now, "quinn", "", "");
     REQUIRE(ra.has_value());
     std::string a2_id;
     for (const auto& tok : store.list_active_for_principal("quinn"))
         if (tok.supersedes_token_id == a1_id)
             a2_id = tok.token_id;
     REQUIRE_FALSE(a2_id.empty());
-    REQUIRE(store.confirm_token_rotation(a2_id, "quinn").has_value());
+    REQUIRE(store.confirm_token_rotation(a2_id, "quinn", "", "").has_value());
 
     // Lineage B: a SEPARATE token for the SAME user, rotated but NOT yet
     // confirmed — a genuinely pending, unrelated pair, and (crucially) the
@@ -3972,7 +3975,7 @@ TEST_CASE("ApiTokenStore: a successor id from ONE token's already-resolved "
     auto vb = store.validate_token(*b);
     REQUIRE(vb.has_value());
     const std::string b1_id = vb->token_id;
-    auto rb = store.rotate_token(b1_id, kDefaultOverlapSecs, now, "quinn");
+    auto rb = store.rotate_token(b1_id, kDefaultOverlapSecs, now, "quinn", "", "");
     REQUIRE(rb.has_value());
     std::string b2_id;
     for (const auto& tok : store.list_active_for_principal("quinn"))
@@ -3982,7 +3985,7 @@ TEST_CASE("ApiTokenStore: a successor id from ONE token's already-resolved "
 
     // A2 (lineage A's resolved-away successor id) must NOT confirm lineage
     // B's pending pair.
-    auto cross = store.confirm_token_rotation(a2_id, "quinn");
+    auto cross = store.confirm_token_rotation(a2_id, "quinn", "", "");
     REQUIRE_FALSE(cross.has_value());
     CHECK(classify_engine_store_error(cross.error()) == ClsE::Conflict);
 
@@ -3999,7 +4002,7 @@ TEST_CASE("ApiTokenStore: a successor id from ONE token's already-resolved "
     CHECK(b_group_active == 2);
 
     // B's own successor id still confirms B normally.
-    CHECK(store.confirm_token_rotation(b2_id, "quinn").has_value());
+    CHECK(store.confirm_token_rotation(b2_id, "quinn", "", "").has_value());
 }
 
 TEST_CASE("ApiTokenStore: confirm_token_rotation on a group already resolved "
@@ -4030,7 +4033,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a group already resolved "
     auto b = store.create_token("Unrelated B", "karen", now + k90Days);
     REQUIRE(b.has_value());
 
-    auto rotated = store.rotate_token(t_id, kDefaultOverlapSecs, now, "karen");
+    auto rotated = store.rotate_token(t_id, kDefaultOverlapSecs, now, "karen", "", "");
     REQUIRE(rotated.has_value());
     std::string successor_id;
     for (const auto& tok : store.list_active_for_principal("karen"))
@@ -4051,7 +4054,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a group already resolved "
     // A confirm naming the now-revoked successor id must be told the
     // rotation resolved — terminal — never the retryable "no in-flight
     // rotation" (reserved below for a genuinely empty read).
-    auto resolved = store.confirm_token_rotation(successor_id, "karen");
+    auto resolved = store.confirm_token_rotation(successor_id, "karen", "", "");
     REQUIRE_FALSE(resolved.has_value());
     CHECK(classify_engine_store_error(resolved.error()) == ClsE::Conflict);
 }
@@ -4106,7 +4109,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a revoked, "
     REQUIRE(store.revoke_token(t_id).value());
     REQUIRE(store.list_active_for_principal("oscar").empty());
 
-    auto none = store.confirm_token_rotation(t_id, "oscar");
+    auto none = store.confirm_token_rotation(t_id, "oscar", "", "");
     REQUIRE_FALSE(none.has_value());
     CHECK(classify_engine_store_error(none.error()) == ClsE::Conflict);
 }
@@ -4143,7 +4146,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a sole credential with "
     REQUIRE(vt.has_value());
     const std::string predecessor_id = vt->token_id;
 
-    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "uma");
+    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "uma", "", "");
     REQUIRE(rotated.has_value());
     std::string successor_id;
     for (const auto& tok : store.list_active_for_principal("uma"))
@@ -4168,7 +4171,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a sole credential with "
     CHECK(active[0].token_id == successor_id);
     CHECK_FALSE(active[0].rotation_group.empty()); // stale linkage survived
 
-    auto stale = store.confirm_token_rotation(successor_id, "uma");
+    auto stale = store.confirm_token_rotation(successor_id, "uma", "", "");
     REQUIRE_FALSE(stale.has_value());
     CHECK(classify_engine_store_error(stale.error()) == ClsE::Conflict);
 
@@ -4208,14 +4211,14 @@ TEST_CASE("ApiTokenStore: a credential's historical confirmed_at survives a "
     REQUIRE(vt.has_value());
 
     // R1: rotate + confirm. S1 becomes the sole active credential, confirmed.
-    auto r1 = store.rotate_token(vt->token_id, kDefaultOverlapSecs, now, "vince");
+    auto r1 = store.rotate_token(vt->token_id, kDefaultOverlapSecs, now, "vince", "", "");
     REQUIRE(r1.has_value());
     std::string s1_id;
     for (const auto& tok : store.list_active_for_principal("vince"))
         if (!tok.supersedes_token_id.empty())
             s1_id = tok.token_id;
     REQUIRE_FALSE(s1_id.empty());
-    REQUIRE(store.confirm_token_rotation(s1_id, "vince").has_value());
+    REQUIRE(store.confirm_token_rotation(s1_id, "vince", "", "").has_value());
     auto s1_after_r1 = store.get_token(s1_id);
     REQUIRE(s1_after_r1.has_value());
     REQUIRE(s1_after_r1->has_value());
@@ -4225,7 +4228,7 @@ TEST_CASE("ApiTokenStore: a credential's historical confirmed_at survives a "
     // R2: rotate again — S1 is now R2's predecessor and must KEEP its
     // confirmed_at. Then resolve R2 by REVOKING its successor (not
     // confirming), so the pair resolves back to S1 alone.
-    auto r2 = store.rotate_token(s1_id, kDefaultOverlapSecs, now, "vince");
+    auto r2 = store.rotate_token(s1_id, kDefaultOverlapSecs, now, "vince", "", "");
     REQUIRE(r2.has_value());
     std::string s2_id;
     for (const auto& tok : store.list_active_for_principal("vince"))
@@ -4280,7 +4283,7 @@ TEST_CASE("ApiTokenStore: rotate_token is strictly self-service — a second "
     const std::string t_id = vt->token_id;
 
     // A DIFFERENT user, before any rotation is in flight, is rejected.
-    auto stolen = store.rotate_token(t_id, kDefaultOverlapSecs, now, "mallory");
+    auto stolen = store.rotate_token(t_id, kDefaultOverlapSecs, now, "mallory", "", "");
     REQUIRE_FALSE(stolen.has_value());
     auto after_stolen = store.list_active_for_principal("alice-owner");
     REQUIRE(after_stolen.size() == 1);
@@ -4288,12 +4291,12 @@ TEST_CASE("ApiTokenStore: rotate_token is strictly self-service — a second "
 
     // The genuine owner — a "second session", i.e. a fresh call carrying the
     // SAME identity — succeeds normally.
-    auto real = store.rotate_token(t_id, kDefaultOverlapSecs, now, "alice-owner");
+    auto real = store.rotate_token(t_id, kDefaultOverlapSecs, now, "alice-owner", "", "");
     REQUIRE(real.has_value());
 
     // And a further same-owner call re-serves idempotently (second session,
     // still within grace) rather than erroring or minting a third row.
-    auto second_session = store.rotate_token(t_id, kDefaultOverlapSecs, now, "alice-owner");
+    auto second_session = store.rotate_token(t_id, kDefaultOverlapSecs, now, "alice-owner", "", "");
     REQUIRE(second_session.has_value());
     CHECK(*second_session == *real);
 }
@@ -4313,7 +4316,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation is strictly self-service — "
     auto vt = store.validate_token(*t);
     REQUIRE(vt.has_value());
     const std::string t_id = vt->token_id;
-    auto rotated = store.rotate_token(t_id, kDefaultOverlapSecs, now, "bob-owner");
+    auto rotated = store.rotate_token(t_id, kDefaultOverlapSecs, now, "bob-owner", "", "");
     REQUIRE(rotated.has_value());
 
     std::string successor_id;
@@ -4322,13 +4325,13 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation is strictly self-service — "
             successor_id = tok.token_id;
     REQUIRE_FALSE(successor_id.empty());
 
-    auto stolen_confirm = store.confirm_token_rotation(successor_id, "mallory");
+    auto stolen_confirm = store.confirm_token_rotation(successor_id, "mallory", "", "");
     REQUIRE_FALSE(stolen_confirm.has_value());
     for (const auto& tok : store.list_active_for_principal("bob-owner"))
         CHECK(tok.confirmed_at == 0); // both credentials unchanged
 
     // The owner's own confirm (a fresh call — "second session") still works.
-    CHECK(store.confirm_token_rotation(successor_id, "bob-owner").has_value());
+    CHECK(store.confirm_token_rotation(successor_id, "bob-owner", "", "").has_value());
 }
 
 // ── Item 7b: absence of a token_id enumeration oracle ──────────────────
@@ -4369,10 +4372,10 @@ TEST_CASE("ApiTokenStore: rotate_token rejects a nonexistent token_id "
     REQUIRE(vt.has_value());
     const std::string real_other_users_id = vt->token_id;
 
-    auto against_nonexistent =
-        store.rotate_token("0000000000000000deadbeef", kDefaultOverlapSecs, now, "attacker");
+    auto against_nonexistent = store.rotate_token("0000000000000000deadbeef", kDefaultOverlapSecs,
+                                                  now, "attacker", "", "");
     auto against_real_other =
-        store.rotate_token(real_other_users_id, kDefaultOverlapSecs, now, "attacker");
+        store.rotate_token(real_other_users_id, kDefaultOverlapSecs, now, "attacker", "", "");
 
     REQUIRE_FALSE(against_nonexistent.has_value());
     REQUIRE_FALSE(against_real_other.has_value());
@@ -4411,10 +4414,10 @@ TEST_CASE("ApiTokenStore: rotate_token rejects a nonexistent token_id "
     const std::string revoked_id = vt->token_id;
     REQUIRE(store.revoke_token(revoked_id).value());
 
-    auto against_nonexistent =
-        store.rotate_token("1111111111111111deadbeef", kDefaultOverlapSecs, now, "attacker");
+    auto against_nonexistent = store.rotate_token("1111111111111111deadbeef", kDefaultOverlapSecs,
+                                                  now, "attacker", "", "");
     auto against_revoked =
-        store.rotate_token(revoked_id, kDefaultOverlapSecs, now, "attacker");
+        store.rotate_token(revoked_id, kDefaultOverlapSecs, now, "attacker", "", "");
 
     REQUIRE_FALSE(against_nonexistent.has_value());
     REQUIRE_FALSE(against_revoked.has_value());
@@ -4445,7 +4448,8 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a nonexistent "
     auto vt = store.validate_token(*owned);
     REQUIRE(vt.has_value());
     const std::string sam_predecessor_id = vt->token_id;
-    auto rotated = store.rotate_token(sam_predecessor_id, kDefaultOverlapSecs, now, "sam-pending");
+    auto rotated = store.rotate_token(sam_predecessor_id, kDefaultOverlapSecs, now, "sam-pending",
+                                      "", "");
     REQUIRE(rotated.has_value());
     std::string sam_successor_id;
     for (const auto& tok : store.list_active_for_principal("sam-pending"))
@@ -4453,8 +4457,9 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a nonexistent "
             sam_successor_id = tok.token_id;
     REQUIRE_FALSE(sam_successor_id.empty());
 
-    auto against_nonexistent = store.confirm_token_rotation("2222222222222222deadbeef", "attacker");
-    auto against_real_pending = store.confirm_token_rotation(sam_successor_id, "attacker");
+    auto against_nonexistent =
+        store.confirm_token_rotation("2222222222222222deadbeef", "attacker", "", "");
+    auto against_real_pending = store.confirm_token_rotation(sam_successor_id, "attacker", "", "");
 
     REQUIRE_FALSE(against_nonexistent.has_value());
     REQUIRE_FALSE(against_real_pending.has_value());
@@ -4490,7 +4495,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a nonexistent "
     REQUIRE(vt.has_value());
     const std::string tara_predecessor_id = vt->token_id;
     auto rotated =
-        store.rotate_token(tara_predecessor_id, kDefaultOverlapSecs, now, "tara-resolved");
+        store.rotate_token(tara_predecessor_id, kDefaultOverlapSecs, now, "tara-resolved", "", "");
     REQUIRE(rotated.has_value());
     std::string tara_successor_id;
     for (const auto& tok : store.list_active_for_principal("tara-resolved"))
@@ -4498,11 +4503,12 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a nonexistent "
             tara_successor_id = tok.token_id;
     REQUIRE_FALSE(tara_successor_id.empty());
     // The confirm revokes the predecessor.
-    REQUIRE(store.confirm_token_rotation(tara_successor_id, "tara-resolved").has_value());
+    REQUIRE(store.confirm_token_rotation(tara_successor_id, "tara-resolved", "", "").has_value());
 
-    auto against_nonexistent = store.confirm_token_rotation("3333333333333333deadbeef", "attacker");
+    auto against_nonexistent =
+        store.confirm_token_rotation("3333333333333333deadbeef", "attacker", "", "");
     auto against_revoked_predecessor =
-        store.confirm_token_rotation(tara_predecessor_id, "attacker");
+        store.confirm_token_rotation(tara_predecessor_id, "attacker", "", "");
 
     REQUIRE_FALSE(against_nonexistent.has_value());
     REQUIRE_FALSE(against_revoked_predecessor.has_value());
@@ -4542,7 +4548,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation cuts the revoked "
     REQUIRE(pre_cache.has_value());
     const std::string t_id = pre_cache->token_id;
 
-    auto rotated = store.rotate_token(t_id, kDefaultOverlapSecs, now, "judy-cache");
+    auto rotated = store.rotate_token(t_id, kDefaultOverlapSecs, now, "judy-cache", "", "");
     REQUIRE(rotated.has_value());
     std::string successor_id;
     for (const auto& tok : store.list_active_for_principal("judy-cache"))
@@ -4550,7 +4556,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation cuts the revoked "
             successor_id = tok.token_id;
     REQUIRE_FALSE(successor_id.empty());
 
-    REQUIRE(store.confirm_token_rotation(successor_id, "judy-cache").has_value());
+    REQUIRE(store.confirm_token_rotation(successor_id, "judy-cache", "", "").has_value());
 
     // The predecessor's raw token must be rejected NOW, not up to 60s from
     // now — proving the cache entry populated above was actually evicted,

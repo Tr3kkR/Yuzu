@@ -9098,8 +9098,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // hold (governance Gate 7 CRITICAL fix; REST twin is
                 // rest_api_v1.cpp's POST /api/v1/tokens/{id}/rotate).
                 auto result = engine_credential_store_->rotate_token(
-                    token_id, overlap_secs, now_epoch(), session->username, std::nullopt,
-                    session->mcp_tier, session->token_scope_service);
+                    token_id, overlap_secs, now_epoch(), session->username, session->mcp_tier,
+                    session->token_scope_service);
                 if (!result) {
                     const bool denied_audit_ok = audit_fn(req, "api_token.rotate", "failure",
                                                           "ApiToken", token_id, result.error());

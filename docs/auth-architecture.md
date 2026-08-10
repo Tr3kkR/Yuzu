@@ -2019,6 +2019,42 @@ this section does not restate them.
   this section** — see `docs/mcp-server.md` "Human API-token rotation
   tools" and `docs/user-manual/mcp.md` rows 70–71 for the MCP-side
   reference; REST and MCP now have full parity on this surface.
+- **The authority-inheritance guard closes the escalation direction, but is
+  not equivalent to gating `Rotate` the way `Delete` is gated (governance
+  Gate 8 follow-up).** Equality between the caller's own current
+  `mcp_tier`/`scope_service` and the predecessor's guarantees no privilege
+  GAIN — a rotation can never mint more authority than the caller already
+  holds. It does not, on its own, make `rotate`/`confirm` net-neutral with
+  `revoke`/`delete`: `mcp_policy.hpp`'s `requires_approval()` has no
+  `ApiToken` rule at all, so at `supervised` tier a `Delete` call goes
+  through the approval workflow and a `Rotate`/`confirm` pair does not. A
+  caller can therefore rotate-then-confirm a same-principal sibling token of
+  equal tier and scope — destroying its predecessor and revealing a fresh
+  successor secret to themselves — with neither `ApiToken:Delete` nor a
+  supervised-tier approval. No privilege gain, but a real residual:
+  availability (the sibling's predecessor is destroyed) plus cross-consumer
+  credential capture, within one principal's own tokens.
+- **The guard also blocks the DE-escalating direction — an undocumented-
+  until-now capability loss, not a defect.** The guard is equality, not "no
+  broader than": a cookie or JIT-elevated interactive session carries an
+  empty `mcp_tier`/`scope_service`, which matches an untiered predecessor
+  but does **not** match a token that itself carries a tier or scope. So
+  the owner of an MCP-tiered or service-scoped token cannot rotate or
+  confirm it from the dashboard or a plain interactive REST session at
+  all — only the holder of that token's own secret (or an equally-tiered
+  session) can. This is backwards precisely when the token's secret is the
+  thing under suspicion, which is the main reason anyone rotates. Whether
+  to widen the guard to admit a strictly-higher-authority session rotating
+  a narrower token is an open product decision, not made by this fix — see
+  `docs/user-manual/authentication.md` "Rotating a Token" for the
+  operator-facing statement of both points, and
+  `docs/user-manual/rest-api.md`'s rotate/confirm error matrices for the
+  wire-level `400` row this adds. The `"no such token to rotate"`/`"...to
+  confirm"` wording is identical for this case and for absent/not-owned
+  by design (not an authority-probing oracle) — it is therefore misleading
+  for a token that exists and is genuinely the caller's own; this is
+  recorded, not changed, since disambiguating the wording would reopen the
+  oracle it exists to close.
 - **Known residual gaps, tracked, not fixed by this capability:** three
   pre-existing issues were surfaced while building this feature and filed
   rather than folded in silently — `#2943` (a confirm-path fallthrough

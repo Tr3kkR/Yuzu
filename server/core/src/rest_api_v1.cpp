@@ -2798,17 +2798,18 @@ void RestApiV1::register_routes(
             // requesting_user is the AUTHENTICATED session's own username —
             // never a body/query field (security crux, task spec: the
             // store-level self-service ownership gate is only as strong as
-            // this). successor_expires_at is deliberately left std::nullopt
-            // per the SENIOR RULING above. caller_mcp_tier/
-            // caller_scope_service are the session's OWN server-synthesized
-            // authority (synthesize_token_session, auth_routes.cpp — never
+            // this). successor_expires_at is deliberately left at its
+            // std::nullopt default per the SENIOR RULING above — this route
+            // never overrides it. caller_mcp_tier/caller_scope_service are
+            // the session's OWN server-synthesized authority
+            // (synthesize_token_session, auth_routes.cpp — never
             // client-controllable) — threaded through so the store's
             // authority-inheritance guard can refuse a rotation that would
             // mint authority the caller does not already hold (governance
-            // Gate 7 CRITICAL fix).
+            // Gate 7 CRITICAL fix; REQUIRED params since Gate 8 — see
+            // `rotate_token`'s own doc comment).
             auto result = token_store->rotate_token(token_id, overlap_secs, now,
-                                                     session->username, std::nullopt,
-                                                     session->mcp_tier,
+                                                     session->username, session->mcp_tier,
                                                      session->token_scope_service);
             if (!result) {
                 res.status = engine_store_error_status(result.error());

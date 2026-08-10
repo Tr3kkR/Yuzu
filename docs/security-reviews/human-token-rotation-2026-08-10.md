@@ -392,6 +392,34 @@ Owner: **unassigned** for all three — filed, not yet triaged to an owner.
   explicit inheritance assertion; scope mismatch) tagged `[pg][token]
   [rotation]` in `test_api_token_store.cpp`, plus route-level tests
   asserting the threading for both REST and MCP.
+- **UPDATE (governance Gate 8 fix round, same day):** two corrections to
+  how the equality guard above is characterized. (1) Equality closes the
+  privilege-**escalation** direction only — it does not make `rotate`/
+  `confirm` approval-equivalent to `revoke`/`delete`. `mcp_policy.hpp`'s
+  `requires_approval()` carries no `ApiToken` rule, so at `supervised` tier
+  `Delete` requires approval and `Rotate` does not; a caller can rotate and
+  confirm a same-principal sibling token of equal tier/scope — destroying
+  its predecessor and revealing a fresh successor secret to themselves —
+  with neither `ApiToken:Delete` nor an approval. No privilege gain, but a
+  real residual (availability + cross-consumer credential capture within
+  one principal). (2) The guard also blocks the **de-escalating**
+  direction, undocumented until this pass: a cookie/JIT-elevated session's
+  empty tier/scope does not match a predecessor that itself carries a tier
+  or scope, so the owner of an MCP-tiered or service-scoped token cannot
+  rotate/confirm it from the dashboard at all — only that token's own
+  secret (or an equally-tiered session) can, which is backwards precisely
+  when the secret is under suspicion. Both points, plus the fact that the
+  `"no such token to rotate"`/`"...to confirm"` wording is misleading (not
+  wrong) for this case, are now recorded in
+  `docs/auth-architecture.md` "Human API-token rotation",
+  `docs/user-manual/authentication.md` "Rotating a Token", and the error
+  matrices in `docs/user-manual/rest-api.md`. Pinned by a new REST-level
+  test: an untiered (cookie-shaped) caller refused rotating its own tiered
+  token (`test_rest_api_tokens_rotation.cpp`, `[pg][rest][token][rotation]
+  [security]`) — the REST harness's session tier/scope default to
+  untiered, so nothing exercised this direction before this pass.
+  Widening the guard to admit a strictly-higher-authority caller is an
+  explicitly OPEN product decision, not made here.
 
 ## Validation
 

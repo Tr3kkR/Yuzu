@@ -202,6 +202,19 @@ TokenLookup read_token_by_id_on_conn(PGconn* conn, const std::string& token_id) 
 // cannot cover. This template shape is allocation-free (the closure is
 // stored by value, inline, no type erasure) — mirrors
 // `agents/core/src/agent.cpp`'s own `ScopeExit`.
+// COPY/MOVE (governance Gate 8, considered and left alone): this is an
+// AGGREGATE, so it has the implicit copy/move constructors, and a copy
+// would run `fn()` TWICE. Deliberately NOT `= delete`d — a user-declared
+// (even deleted) special member function disqualifies a class from being
+// an aggregate, and every construction here goes through the deduction
+// guide's aggregate-init form (`ScopeExit scrub_secrets{lambda}`), which
+// would then fail to compile (no converting constructor exists to take
+// its place). Every use in this file is a single local RAII variable,
+// never copied or moved out of its declaring scope, and a double-fire
+// here is idempotent (`yuzu::secure_zero` on an already-scrubbed/empty
+// string is a no-op) — so the theoretical hazard has no live path. Same
+// reasoning applies to the byte-identical sibling in
+// `agents/core/src/agent.cpp`; keep both aggregate, not just this one.
 template <typename F> struct ScopeExit {
     F fn;
     ~ScopeExit() { fn(); }
@@ -1259,9 +1272,9 @@ ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::stri
 std::expected<std::string, std::string>
 ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t overlap_secs,
                             int64_t now, const std::string& requesting_user,
-                            std::optional<int64_t> successor_expires_at,
                             const std::string& caller_mcp_tier,
-                            const std::string& caller_scope_service) {
+                            const std::string& caller_scope_service,
+                            std::optional<int64_t> successor_expires_at) {
     if (!open_)
         return std::unexpected("database not open");
     if (predecessor_token_id.empty())
@@ -1319,29 +1332,16 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
         predecessor_expires_at = lookup.token->expires_at;
     }
 
-    // Successor TTL: inherit the predecessor's absolute expires_at VERBATIM
-    // (perpetual, 0, stays perpetual) unless the caller overrides it — never
-    // recomputed as now+90d, which would silently extend authorization
-    // lifetime. The (possibly-overridden) value is validated through the
-    // same policy gate a fresh human mint uses.
-    const int64_t candidate_expires_at = successor_expires_at.value_or(predecessor_expires_at);
-    auto candidate_validation = validate_human_mint(predecessor_name, predecessor_scope_service,
-                                                     predecessor_mcp_tier, candidate_expires_at,
-                                                     now);
+    // Every local plaintext-secret slot the scrub guard below reaches is
+    // declared HERE, empty, and the guard is ARMED before any of them is
+    // populated — including `candidate_raw`/`candidate_hash`/
+    // `candidate_token_id` below, which used to be generated first and only
+    // THEN handed to the guard. `sha256_hex()`/`.substr(0,24)` allocate; a
+    // `bad_alloc` in that pre-guard window would free `candidate_raw`
+    // (already holding the 37-byte plaintext) unscrubbed — precisely the
+    // class of hole this guard's own reasoning below argues against for
+    // every OTHER exit path. Declare-then-arm-then-generate closes it.
     std::string candidate_raw, candidate_hash, candidate_token_id, candidate_error;
-    if (candidate_validation.has_value()) {
-        auto raw_result = generate_raw_token();
-        if (raw_result.has_value()) {
-            candidate_raw = std::move(*raw_result);
-            candidate_hash = sha256_hex(candidate_raw);
-            candidate_token_id = candidate_hash.substr(0, 24);
-        } else {
-            candidate_error = raw_result.error();
-        }
-    } else {
-        candidate_error = candidate_validation.error();
-    }
-
     std::string error_msg;
     std::string raw_out;
     std::string grace_group_out, grace_raw_out;
@@ -1393,6 +1393,28 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
         yuzu::secure_zero(cached_raw);
         yuzu::secure_zero(raw_out);
     }};
+
+    // Successor TTL: inherit the predecessor's absolute expires_at VERBATIM
+    // (perpetual, 0, stays perpetual) unless the caller overrides it — never
+    // recomputed as now+90d, which would silently extend authorization
+    // lifetime. The (possibly-overridden) value is validated through the
+    // same policy gate a fresh human mint uses.
+    const int64_t candidate_expires_at = successor_expires_at.value_or(predecessor_expires_at);
+    auto candidate_validation = validate_human_mint(predecessor_name, predecessor_scope_service,
+                                                     predecessor_mcp_tier, candidate_expires_at,
+                                                     now);
+    if (candidate_validation.has_value()) {
+        auto raw_result = generate_raw_token();
+        if (raw_result.has_value()) {
+            candidate_raw = std::move(*raw_result);
+            candidate_hash = sha256_hex(candidate_raw);
+            candidate_token_id = candidate_hash.substr(0, 24);
+        } else {
+            candidate_error = raw_result.error();
+        }
+    } else {
+        candidate_error = candidate_validation.error();
+    }
 
     // The entire check -> mint -> stamp sequence runs inside ONE transaction
     // opened with the SAME principal-scoped advisory lock

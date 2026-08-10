@@ -414,12 +414,23 @@ public:
     /// oracle. Enforced authoritatively under the advisory-locked
     /// transaction against a FRESH re-read of the predecessor row; the
     /// pre-txn check below is an early-rejection mirror only.
+    ///
+    /// `caller_mcp_tier`/`caller_scope_service` are REQUIRED, not defaulted
+    /// (governance Gate 8 fix) — an untiered `""`/`""` is the predecessor
+    /// that matches the HIGHEST-authority token an account can hold, not
+    /// the strictest one, so a default would make an omitted argument at
+    /// any future call site silently mean "untiered caller", reproducing
+    /// the exact CRITICAL this guard exists to close. Also load-bearing:
+    /// `successor_expires_at` sits between the legacy four-argument form
+    /// and this pair in call-site history, so a copied four-arg call would
+    /// otherwise still compile and still mean "untiered". A caller with a
+    /// genuinely untiered/cookie session passes `""`/`""` explicitly — that
+    /// is self-documenting, never a synonym for "didn't set it".
     [[nodiscard]] std::expected<std::string, std::string>
     rotate_token(const std::string& predecessor_token_id, int64_t overlap_secs, int64_t now,
-                const std::string& requesting_user,
-                std::optional<int64_t> successor_expires_at = std::nullopt,
-                const std::string& caller_mcp_tier = "",
-                const std::string& caller_scope_service = "");
+                const std::string& requesting_user, const std::string& caller_mcp_tier,
+                const std::string& caller_scope_service,
+                std::optional<int64_t> successor_expires_at = std::nullopt);
 
     /// Operator-confirmed cutover for a human token-keyed rotation — same
     /// contract as `confirm_rotation` (immediate predecessor revoke +
@@ -443,12 +454,14 @@ public:
     /// cannot legitimately diverge from what the caller who initiated the
     /// rotation already held, so `rotate_token`'s own guard is the
     /// load-bearing one; this catches only a hypothetical future bypass of
-    /// it, never a live path today.
+    /// it, never a live path today. REQUIRED, not defaulted, for the same
+    /// reason as `rotate_token`'s own pair (governance Gate 8 fix) — see
+    /// that doc comment.
     [[nodiscard]] std::expected<void, std::string>
     confirm_token_rotation(const std::string& successor_token_id,
                            const std::string& requesting_user,
-                           const std::string& caller_mcp_tier = "",
-                           const std::string& caller_scope_service = "");
+                           const std::string& caller_mcp_tier,
+                           const std::string& caller_scope_service);
 
     /// One rotation pair currently in flight, as read by the T12 maintenance
     /// sweep (design doc §7). `predecessor.supersedes_token_id` is always

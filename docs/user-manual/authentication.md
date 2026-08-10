@@ -714,6 +714,49 @@ request field to extend it; rotating a credential is a lateral swap, never
 a way to renew a grant. If you need a longer-lived replacement, create a
 new token instead.
 
+**Rotate is not approval-gated the way Delete is.** The caller's own
+`mcp_tier`/`scope_service` must equal the predecessor's own values (the
+authority-inheritance guard above), so rotation can never mint a token with
+*more* authority than the caller already holds. That equality closes the
+privilege-escalation direction, but it does not make `rotate`/`confirm`
+approval-equivalent to `revoke`/`delete` — MCP's approval policy has no
+`ApiToken` rule for `Rotate`, so at the `supervised` tier a `Delete` call
+requires the approval workflow and a `Rotate`/`confirm` pair does not. A
+same-principal, equal-tier sibling token — for example two MCP agents both
+minted at `operator` for one human — can therefore be rotated and confirmed
+(destroying the sibling's predecessor and revealing a fresh successor
+secret to the caller) with neither an `ApiToken:Delete` grant nor a
+supervised-tier approval. There is no privilege gain here — the caller
+never exceeds their own authority — but the residual is availability (the
+sibling's predecessor is destroyed) plus cross-consumer credential capture
+(the caller sees the sibling's new raw secret) within one principal's own
+tokens.
+
+**The de-escalating direction is blocked too — this is a real capability
+gap, not a bug.** The guard is EQUALITY, not "no broader than": a cookie
+(dashboard) or JIT-elevated interactive session carries an empty
+`mcp_tier`/`scope_service`, same as an untiered token — but it therefore
+does **not** match a token that itself carries an `mcp_tier` or
+`scope_service`. The practical effect: **you cannot rotate or confirm your
+own MCP-tiered or service-scoped token from the dashboard or a cookie
+session at all** — only a caller presenting that token's own credential (or
+an equally-tiered one) can. This is backwards precisely when you suspect
+the token's secret, which is the main reason anyone rotates a credential;
+there is currently no dashboard-driven remediation for a suspected
+MCP-tiered token short of [revoking](#revoking-a-token) it outright.
+Whether to widen the guard to admit a higher-authority session rotating a
+narrower token is an open product decision, not yet made.
+
+**The `400` rejection text is misleading for this case.** Both the
+ownership mismatch and the authority-inheritance mismatch above return the
+identical `"no such token to rotate"` / `"no such token to confirm"`
+wording (by design — see "Self-service only" above for why this is not an
+enumeration oracle), so if you own the token and it genuinely exists, that
+message does not mean what it says; it means your current session's
+authority doesn't match the token's own. This wording is deliberate and is
+not being changed to disambiguate the two cases, since doing so would
+reopen the oracle it exists to close.
+
 See the [REST API reference](rest-api.md) `POST /api/v1/tokens/{token_id}/rotate`
 and `.../confirm` for the full error matrix.
 
