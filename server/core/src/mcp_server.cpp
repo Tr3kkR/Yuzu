@@ -6212,7 +6212,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                           "in flight; wait for one to finish";
                                 streamed_reject(
                                     429, mcp::kMcpStreamCap, "Streamed request capacity reached",
-                                    why == "pin_slots" ? "post_pin_slots" : "post_global_cap",
+                                    // #2918: reserve()'s own server-wide record cap
+                                    // (cfg_.global_record_cap) is a distinct cause from
+                                    // the pre-admission StreamBudget global cap above
+                                    // (post_global_cap) - same metric family, its own
+                                    // label, so the two are discriminable in the
+                                    // Prometheus counter and audit detail.
+                                    why == "pin_slots" ? "post_pin_slots" : "post_record_cap",
                                     why == "pin_slots"
                                         ? pin_remediation
                                         : "retry shortly, or retry without an SSE Accept for a "
