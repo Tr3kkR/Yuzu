@@ -7035,19 +7035,24 @@ The first three gate `GuaranteedState:Read` and are not audited (cohort posture)
 | `--mcp-read-only` | Allow only read-only tools regardless of token tier |
 
 **Streamed responses (progress tracking).** A `tools/call` for `execute_instruction`
-carrying `_meta.progressToken` (a string ≤512 bytes, or an integer) opts into progress
-tracking — **this requires an active session** (a non-empty `Mcp-Session-Id` header
-from a prior `initialize`; without one, progress tracking is skipped entirely and the
-call answers as if no token had been sent). Where progress is then *delivered* depends
-on the request's `Accept` header and whether the server has `--mcp-enable-streamed-post`
-enabled (off by default):
+carrying `_meta.progressToken` (see `docs/user-manual/mcp.md`'s `progressToken`
+definition for the type/length contract; an out-of-spec value is silently treated as
+absent — no error, no progress) opts into progress tracking — **this requires an
+active session**: a non-empty `Mcp-Session-Id` header from a prior `initialize`. A
+`Mcp-Session-Id` that is present but invalid (unknown, expired, or another
+principal's) fails the **entire call** with `404`/`-32007` before progress tracking is
+even considered — that is a property of every non-`initialize` method on this
+endpoint, not specific to progress tracking, and is covered above under `GET /mcp/v1/`.
+The table below assumes a valid session or none at all; where progress *is* tracked,
+delivery depends on the request's `Accept` header and whether the server has
+`--mcp-enable-streamed-post` enabled (off by default):
 
-| `_meta.progressToken` | Session | `Accept: text/event-stream` | Server answers |
+| `_meta.progressToken` | `Mcp-Session-Id` | `Accept: text/event-stream` | Server answers |
 |---|---|---|---|
-| present | active | present, streamed POST enabled | this POST response held open as an SSE stream — `notifications/progress` frames, then the JSON-RPC result last, then EOF |
-| present | active | absent, or streamed POST disabled | plain JSON now; progress frames go to the session's `GET /mcp/v1/` stream instead |
-| present | none | (either) | plain JSON, byte-identical to a call with no progress tracking |
-| absent | (either) | (either) | plain JSON, byte-identical to a call with no progress tracking |
+| present | sent, valid | present, streamed POST enabled | this POST response held open as an SSE stream — `notifications/progress` frames, then the JSON-RPC result last, then EOF |
+| present | sent, valid | absent, or streamed POST disabled | plain JSON now; progress frames go to the session's `GET /mcp/v1/` stream instead |
+| present | not sent | any | plain JSON, byte-identical to a call with no progress tracking |
+| absent | any | any | plain JSON, byte-identical to a call with no progress tracking |
 
 A streamed POST's response headers are `Content-Type: text/event-stream`,
 `Cache-Control: no-cache`, `X-Accel-Buffering: no` (nginx only — Envoy/HAProxy/ALB/
@@ -7062,7 +7067,7 @@ capacity ceiling, or this session's own slots). A duplicate request id or an unk
 session get their own codes (`409`/`-32600`, `404`/`-32007`) instead — see
 `docs/user-manual/mcp.md` "`-32012`: Stream limit reached" for the full cause-by-cause
 remediation, and `docs/mcp-server.md` "Streamed POST — SSE on the response" for the
-complete admission/refusal table, close reasons, and resume/recovery rules. A denial
+admission/refusal table, close reasons, and resume/recovery rules. A denial
 caused by the server disabling/shutting down streaming, or an allocation failure,
 degrades silently to the plain (non-streamed) response instead of erroring — see the
 same admission table for which causes degrade vs. answer. Progress is best-effort either way —
