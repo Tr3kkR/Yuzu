@@ -248,6 +248,30 @@ TEST_CASE("MCP Policy: operator tier allows Read + Tag Write + Execute", "[mcp][
     CHECK(!tier_allows("operator", "ManagementGroup", "Write"));
 }
 
+// P2 #11 security regression guard: operator-tier ApiToken:Write must stay
+// blocked. Full narrative (two abandoned fix attempts + why the shipped
+// ApiToken:Rotate split is correct) lives ONCE, at mcp_policy.hpp's
+// tier_allows() operator-tier comment — this pins only the answer.
+TEST_CASE("MCP Policy: operator tier does NOT allow ApiToken:Write "
+          "(round-3/4 security regression guard)",
+          "[mcp][policy][security]") {
+    CHECK_FALSE(tier_allows("operator", "ApiToken", "Write"));
+    // Confirm this isn't accidentally exempted by the same route/op the two
+    // rotation tools' RBAC check separately consults — Read stays allowed by
+    // the ordinary operator "Read on everything" rule, but Write must not be.
+    CHECK(tier_allows("operator", "ApiToken", "Read"));
+}
+
+// Positive half of the same finding — operator tier DOES allow the shipped
+// ApiToken:Rotate operation (see mcp_policy.hpp for why). REST-transport
+// twin: test_auth_routes.cpp's "operator MCP tier IS allowed ApiToken:Rotate"
+// on AuthRoutes::require_permission.
+TEST_CASE("MCP Policy: operator tier DOES allow the distinct ApiToken:Rotate "
+          "operation",
+          "[mcp][policy][security]") {
+    CHECK(tier_allows("operator", "ApiToken", "Rotate"));
+}
+
 TEST_CASE("MCP Policy: supervised tier allows everything", "[mcp][policy]") {
     CHECK(tier_allows("supervised", "Infrastructure", "Read"));
     CHECK(tier_allows("supervised", "Execution", "Execute"));
@@ -1448,7 +1472,10 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
 // mirrors"); here we only pin the mirror sizes so an accidental edit to one
 // array is caught even when the rbac_store suite is filtered out.
 TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mcp][2g]") {
-    CHECK(rbac_ops_for_test().size() == 7);
+    // 8th op: "Rotate" (P2 #11, SOC 2 CC6.3) — ApiToken-specific, deliberately
+    // distinct from "Write" (see mcp_policy.hpp's tier_allows() operator-tier
+    // comment for why a shared op would have been a privilege escalation).
+    CHECK(rbac_ops_for_test().size() == 8);
     CHECK(rbac_securables_for_test().size() == 23);
 }
 
@@ -1616,6 +1643,273 @@ TEST_CASE("MCP confirm_engine_rotation: replay after success is kInvalidParams +
     CHECK(replay->body.find("rotation already confirmed") != std::string::npos);
     CHECK(confirm_metric("conflict") == 1.0);
     CHECK(confirm_metric("success") == 1.0); // unchanged by the replay
+}
+
+// ── Human API-token rotation (P2 #11, SOC 2 CC6.3) ──────────────────────────
+//
+// rotate_api_token / confirm_api_token_rotation — MCP twins of POST
+// /api/v1/tokens/{id}/rotate and /confirm. Reuses the SAME
+// engine_credential_store_for_test wiring as the engine arm above (one
+// ApiTokenStore instance backs both).
+
+TEST_CASE("MCP rotate_api_token/confirm_api_token_rotation: self-service round trip at the "
+          "operator tier, successor resolved via the shared helper, audit + confirm metric",
+          "[mcp][pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    const int64_t predecessor_expiry = now + 90 * 24 * 3600;
+    REQUIRE(store.create_token("my-key", "test-user", predecessor_expiry).has_value());
+    auto listing = store.list_tokens("test-user").value();
+    REQUIRE(!listing.empty());
+    const std::string token_id = listing.front().token_id;
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.metrics_for_test = &reg;
+    // ApiToken:Write is reachable at operator (NOT supervised-only like the
+    // engine credential arm) — the whole point of the tier decision under
+    // test.
+    ts.start("operator");
+
+    auto rot = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":950,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"("}}})");
+    REQUIRE(rot->status == 200);
+    auto rot_body = nlohmann::json::parse(rot->body);
+    REQUIRE(rot_body.contains("result"));
+    auto rot_payload =
+        nlohmann::json::parse(rot_body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE_FALSE(rot_payload["raw_token"].get<std::string>().empty());
+    // Pin the TOOL'S OWN response — resolved via the shared
+    // derive_rotation_successor helper (token_rotation_lookup.hpp), not a
+    // private test-side lookup.
+    const auto successor_token_id = rot_payload["token_id"].get<std::string>();
+    REQUIRE_FALSE(successor_token_id.empty());
+    // Lifetime-neutral: successor inherits the predecessor's expires_at
+    // verbatim — never accepted as a caller argument, never recomputed.
+    CHECK(rot_payload["expires_at"].get<int64_t>() == predecessor_expiry);
+    // overlap_expires_at is the PREDECESSOR's own stamp — non-zero, and must
+    // match what the store actually recorded on the predecessor row (never
+    // read off the successor, which never carries one).
+    auto predecessor_row = store.get_token(token_id).value();
+    REQUIRE(predecessor_row.has_value());
+    REQUIRE(predecessor_row->overlap_expires_at > 0);
+    CHECK(rot_payload["overlap_expires_at"].get<int64_t>() ==
+          predecessor_row->overlap_expires_at);
+
+    // Ground truth: the response's token_id really is the structural
+    // successor (its supersedes_token_id links back to the predecessor).
+    auto successor_row = store.get_token(successor_token_id).value();
+    REQUIRE(successor_row.has_value());
+    CHECK(successor_row->supersedes_token_id == token_id);
+
+    // api_token.reveal is the success audit for rotate (mirrors REST/engine).
+    bool reveal_audited = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "api_token.reveal|success")
+            reveal_audited = true;
+    CHECK(reveal_audited);
+
+    auto conf = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":951,)"
+        R"("params":{"name":"confirm_api_token_rotation","arguments":{"token_id":")" +
+        successor_token_id + R"("}}})");
+    REQUIRE(conf->status == 200);
+    auto conf_body = nlohmann::json::parse(conf->body);
+    REQUIRE(conf_body.contains("result"));
+    auto conf_payload =
+        nlohmann::json::parse(conf_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(conf_payload["confirmed"].get<bool>() == true);
+    CHECK(conf_payload["token_id"].get<std::string>() == successor_token_id);
+    CHECK(store.list_active_for_principal("test-user").size() == 1); // predecessor revoked
+
+    bool confirm_audited = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "api_token.confirm|success")
+            confirm_audited = true;
+    CHECK(confirm_audited);
+
+    // Sibling counter to REST's yuzu_api_token_confirm_total{surface="rest"}.
+    CHECK(reg.counter("yuzu_api_token_confirm_total", {{"surface", "mcp"}, {"result", "success"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("MCP rotate_api_token: successor lookup is scoped to the predecessor being rotated, "
+          "not any linked row of the principal (round-3 BLOCKING regression, MCP twin of the "
+          "REST reproduction)",
+          "[mcp][pg][token][rotation][blocking]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_token("token-a", "test-user").has_value());
+    REQUIRE(store.create_token("token-b", "test-user").has_value());
+    auto listing = store.list_tokens("test-user").value();
+    REQUIRE(listing.size() == 2);
+    // list_tokens orders newest-first; token-b was created after token-a.
+    const std::string token_b = listing.front().token_id;
+    const std::string token_a = listing.back().token_id;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start("operator");
+
+    const auto rotate = [&](const std::string& id, int rpc_id) {
+        return ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                       std::to_string(rpc_id) +
+                       R"(,"params":{"name":"rotate_api_token","arguments":{"token_id":")" + id +
+                       R"("}}})");
+    };
+
+    // Rotate A first — test-user now has an in-flight rotation group for A.
+    auto rot_a = rotate(token_a, 952);
+    REQUIRE(rot_a->status == 200);
+    auto successor_a = nlohmann::json::parse(
+        nlohmann::json::parse(rot_a->body)["result"]["content"][0]["text"].get<std::string>())
+                            ["token_id"]
+                                .get<std::string>();
+
+    // Rotate B while A's rotation is still inside its overlap window — legal
+    // (the <=2-active ceiling is per ROTATION GROUP, never per principal).
+    auto rot_b = rotate(token_b, 953);
+    REQUIRE(rot_b->status == 200);
+    auto successor_b = nlohmann::json::parse(
+        nlohmann::json::parse(rot_b->body)["result"]["content"][0]["text"].get<std::string>())
+                            ["token_id"]
+                                .get<std::string>();
+
+    // The BLOCKING bug an unscoped scan would reproduce: matching "any"
+    // linked row deterministically returns A's successor (minted first) even
+    // though B is the token actually rotated.
+    CHECK(successor_b != successor_a);
+    auto b_row = store.get_token(successor_b).value();
+    REQUIRE(b_row.has_value());
+    CHECK(b_row->supersedes_token_id == token_b);
+
+    // Confirming B's successor must revoke ONLY B's predecessor.
+    auto conf_b = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":954,)"
+        R"("params":{"name":"confirm_api_token_rotation","arguments":{"token_id":")" +
+        successor_b + R"("}}})");
+    REQUIRE(conf_b->status == 200);
+    REQUIRE(nlohmann::json::parse(conf_b->body).contains("result"));
+
+    auto token_b_after = store.get_token(token_b).value();
+    REQUIRE(token_b_after.has_value());
+    CHECK(token_b_after->revoked);
+
+    auto token_a_after = store.get_token(token_a).value();
+    REQUIRE(token_a_after.has_value());
+    CHECK_FALSE(token_a_after->revoked); // A's predecessor must still be LIVE
+}
+
+TEST_CASE("MCP rotate_api_token: non-owner denied — self-service only, no admin bypass, no "
+          "enumeration oracle",
+          "[mcp][pg][token][rotation][owner][idor]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.create_token("alice-key", "alice").has_value());
+    auto listing = store.list_tokens("alice").value();
+    REQUIRE(!listing.empty());
+    const std::string token_id = listing.front().token_id;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.mock_username = "bob"; // NOT the owner
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":960,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"("}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>() == "token not found");
+
+    // Two rows: the domain-specific api_token.rotate|denied (mirrors REST,
+    // detail carries the owner) plus the generic mcp.rotate_api_token|denied
+    // gate-level row every MCP tool call emits — MCP-only, REST has no
+    // equivalent second row.
+    REQUIRE(ts.audit_log.size() == 2);
+    CHECK(ts.audit_log[0] == "api_token.rotate|denied");
+    CHECK(ts.audit_details[0] == "owner=alice");
+    CHECK(ts.audit_log[1] == "mcp.rotate_api_token|denied");
+
+    // Store state unchanged — no rotation started.
+    auto looked_up = store.get_token(token_id).value();
+    REQUIRE(looked_up.has_value());
+    CHECK(looked_up->rotation_group.empty());
+
+    // Response body identical for a genuinely unknown token_id (enumeration
+    // oracle closed) — same "token not found" text, same kInvalidParams code.
+    auto unknown = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":961,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":"deadbeef1234567890"}}})");
+    REQUIRE(unknown->status == 200);
+    auto unknown_body = nlohmann::json::parse(unknown->body);
+    REQUIRE(unknown_body.contains("error"));
+    CHECK(unknown_body["error"]["code"] == body["error"]["code"]);
+    CHECK(unknown_body["error"]["message"] == body["error"]["message"]);
+}
+
+TEST_CASE("MCP rotate_api_token: readonly tier is denied before RBAC (tier-before-RBAC "
+          "ordering), overlap_days out of range rejected before the multiply",
+          "[mcp][pg][token][rotation][policy]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_token("my-key", "test-user").has_value());
+    auto listing = store.list_tokens("test-user").value();
+    REQUIRE(!listing.empty());
+    const std::string token_id = listing.front().token_id;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start("readonly"); // readonly allows only Read — ApiToken:Write must be denied
+
+    auto denied = nlohmann::json::parse(
+        ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":970,)"
+                R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+                token_id + R"("}}})")
+            ->body);
+    REQUIRE(denied.contains("error"));
+    CHECK(denied["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    // Store untouched by the tier denial.
+    CHECK(store.get_token(token_id).value()->rotation_group.empty());
+
+    // Operator tier passes the tier gate; an out-of-range overlap_days is
+    // rejected by the handler's own bounds check BEFORE the *86400 multiply
+    // (overflow guard, mirrors rotate_engine_credential).
+    McpTestServer ts2;
+    ts2.engine_credential_store_for_test = &store;
+    ts2.start("operator");
+    auto oob = ts2.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":971,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"(","overlap_days":3651}}})");
+    REQUIRE(oob->status == 200);
+    auto oob_body = nlohmann::json::parse(oob->body);
+    REQUIRE(oob_body.contains("error"));
+    CHECK(oob_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(oob_body["error"]["message"].get<std::string>().find("overlap_days out of range") !=
+          std::string::npos);
+    CHECK(store.get_token(token_id).value()->rotation_group.empty());
 }
 
 // ── 2. ping ─────────────────────────────────────────────────────────────────

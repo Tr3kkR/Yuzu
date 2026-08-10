@@ -591,8 +591,10 @@ TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: overlap_secs of the wrong JSON 
     CHECK(pred->rotation_group.empty());
 }
 
-TEST_CASE("REST tokens rotate/confirm: pin ApiToken:Write, never Security:Write "
-          "(round-3 review — the test mock previously ignored perm_fn's own arguments)",
+TEST_CASE("REST tokens rotate/confirm: pin ApiToken:Rotate, never Security:Write or "
+          "ApiToken:Write (round-4 security finding — a shared op with create/list/revoke "
+          "would admit an operator-tier MCP token to POST /api/v1/tokens too; see "
+          "mcp_policy.hpp's tier_allows() operator-tier comment)",
           "[pg][rest][token][rotation][gate]") {
     RestTokenRotationHarness h;
     auto token_id = h.create_token_for("alice", "alice-key");
@@ -605,7 +607,7 @@ TEST_CASE("REST tokens rotate/confirm: pin ApiToken:Write, never Security:Write 
         REQUIRE(res->status == 200);
         REQUIRE(h.perm_checks.size() == 1);
         CHECK(h.perm_checks[0].first == "ApiToken");
-        CHECK(h.perm_checks[0].second == "Write");
+        CHECK(h.perm_checks[0].second == "Rotate");
     }
     SECTION("confirm") {
         auto rotate_res = h.rotate(token_id);
@@ -618,7 +620,7 @@ TEST_CASE("REST tokens rotate/confirm: pin ApiToken:Write, never Security:Write 
         REQUIRE(res->status == 200);
         REQUIRE(h.perm_checks.size() == 1);
         CHECK(h.perm_checks[0].first == "ApiToken");
-        CHECK(h.perm_checks[0].second == "Write");
+        CHECK(h.perm_checks[0].second == "Rotate");
     }
 }
 
