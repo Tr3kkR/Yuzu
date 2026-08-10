@@ -624,6 +624,17 @@ public:
                           "carries NO reason label, and /metrics is not a stronger reader "
                           "than the caller. Read the audit trail for the kind",
                           "counter");
+        metrics_.describe("yuzu_mcp_approval_masked_denials_total",
+                          "MCP approval-ticket recalls refused by a store fault at a point "
+                          "where the #2442 cross-surface origin check could not run — the "
+                          "lookup step, or the consume step's own origin-check read (#2786 "
+                          "arm 1). A foreign-origin ticket is exactly as likely to be behind "
+                          "one of these refusals as an innocent one while the fault holds, so "
+                          "this is the signal that the forgery-detection event is not simply "
+                          "absent. No reason label, same anti-oracle posture as "
+                          "yuzu_mcp_approval_refused_total: what this counter withholds is "
+                          "already withheld there",
+                          "counter");
         // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
         // degrade reason is a static literal inside the bridge, never derived
         // from caller input.
@@ -898,6 +909,8 @@ public:
             // place — so pre-seed it here too, or an absent() alert on a fleet
             // that has never had a refusal cannot fire.
             metrics_.counter("yuzu_mcp_approval_refused_total", {{"tool", tool}});
+            // Same closed set again for the #2786 masked-denial counter.
+            metrics_.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", tool}});
         }
         // #2437 handler-side bound denials. The label set is closed on BOTH
         // axes: `tool` is execute_instruction alone (the only tool that EMITS
