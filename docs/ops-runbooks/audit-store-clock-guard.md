@@ -247,7 +247,12 @@ server, check whether it is actually restarting:
 > holds two resets for too little time to satisfy `for: 15m`. Nothing is
 > misconfigured; there is nothing to fix in scrape config. Narrower than what it
 > replaced - which was silent at every cadence sampled against it - but not
-> closed. Full sweep and method: `docs/prometheus/blind-band-measurement.md`.
+> closed. **The #2854 rung B measurement instrument additionally now finds a
+> wider intermittent-firing gap, starting around 90 minutes** - fires at some
+> eval points but not others within a cycle, which reads to Alertmanager as
+> resolved mid-fault. That gap is measured, not yet closed by a rule change.
+> Full sweep and method: `docs/prometheus/blind-band-measurement.md`, current
+> result: `tests/prometheus/blind_band_manifest.json`.
 >
 > Either way, **do not read this rule's silence as a healthy reaper.** Confirm
 > restarts with `journalctl --list-boots` or the orchestrator's restart count
