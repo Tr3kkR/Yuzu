@@ -10,7 +10,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <string>
 #include <string_view>
+#include <vector>
 
 using yuzu::server::detail::classify_engine_store_error;
 using yuzu::server::detail::confirm_result_label;
@@ -124,6 +126,116 @@ TEST_CASE("classify_engine_store_error: human token-keyed arm (P2 #11) new strin
     // the human path (same 0-active/read-failure ambiguity).
     CHECK(classify_engine_store_error("no active credential to rotate — mint one first") ==
           E::Transient);
+
+    // Round 4 review found this state had silently inherited the engine arm's
+    // Conflict classification via a byte-identical reuse of its
+    // kSoleOtherToken wording ("the rotation was resolved..."). The fix gave
+    // it its own wording — correct — but round 4 ALSO reclassified it to
+    // Transient, reasoning from the "call rotate again" prose. Round 5
+    // adjudication refuted that: #2404 precedent (the engine confirm was once
+    // 503-retryable this same way and made an idempotent-hint-honouring agent
+    // retry a permanently-failing call forever), arm parity with
+    // `kSoleOtherToken` itself (identical "rotate again" guidance, Conflict),
+    // and rotation_confirm_state.hpp's own "every terminal state -> Conflict
+    // or ClientValidation" contract (`GroupRotationConfirmState::kGroupEmpty`
+    // is a POSITIVE fact, not ambiguous) all say Conflict. This state keeps
+    // ITS OWN wording (still not byte-identical to kSoleOtherToken — own
+    // classifier entry, in the step-3 Conflict group) but now the correct
+    // class.
+    const std::string no_pending_msg =
+        "no rotation currently pending for the supplied token_id — nothing "
+        "to confirm; call rotate again if a new rotation is needed";
+    CHECK(classify_engine_store_error(no_pending_msg) == E::Conflict);
+    CHECK(no_pending_msg.find("the rotation was resolved") == std::string::npos);
+}
+
+TEST_CASE("classify_engine_store_error: round-trip over every error string "
+          "rotate_token/confirm_token_rotation can emit (round 4 coverage)",
+          "[engine_store_error]") {
+    // Every literal error_msg/std::unexpected string reachable from
+    // ApiTokenStore::rotate_token and ApiTokenStore::confirm_token_rotation
+    // (api_token_store.cpp), transcribed verbatim, paired with its expected
+    // class. This is the gap three separate reviewers — including two who
+    // walked the error strings specifically looking for collisions — missed:
+    // a new string that ACQUIRES an existing keyed substring by accident
+    // (the round-4 "no rotation currently pending" defect) is invisible to a
+    // test that only checks the individual new strings in isolation, because
+    // the isolated check doesn't re-verify every OTHER string the same
+    // classifier call must still get right. A future string addition that
+    // silently changes ANY of these results — in either direction — fails
+    // here first.
+    using E = EngineStoreErrorClass;
+    struct Case {
+        std::string message;
+        E expected;
+    };
+    const std::vector<Case> cases = {
+        // ── rotate_token ────────────────────────────────────────────────
+        {"database not open", E::Transient},
+        {"token_id required", E::ClientValidation},
+        {"requesting_user required", E::ClientValidation},
+        {"overlap window below 24h floor", E::ClientValidation},
+        {"overlap window exceeds the maximum (10 years)", E::ClientValidation},
+        {"database unavailable — try again", E::Transient},
+        {"no such token to rotate", E::ClientValidation},
+        {"token is not a human-owned credential", E::ClientValidation},
+        {"credential is not currently active — nothing to rotate", E::ClientValidation},
+        {"failed to acquire rotation lock", E::Transient},
+        {"no active credential to rotate — mint one first", E::Transient},
+        {"overlap window would exceed the predecessor credential's expiry", E::ClientValidation},
+        {"overlap window would exceed the successor credential's expiry", E::ClientValidation},
+        {"failed to mint successor credential", E::Transient},
+        {"failed to stamp predecessor overlap window", E::Transient},
+        {"principal has a non-human active credential", E::ClientValidation},
+        {"more than two active credentials for this principal — resolve manually before "
+         "rotating",
+         E::ClientValidation},
+        {"two active credentials not in a recognized rotation pair — resolve via revoke, "
+         "not rotate",
+         E::ClientValidation},
+        {"rotation grace window elapsed; confirm or revoke", E::Conflict},
+        {"rotation in progress by a different operator", E::Conflict},
+        {"rotation failed", E::Transient}, // generic with_txn_for-failed fallback
+        // validate_human_mint's own strings, surfaced verbatim as
+        // rotate_token's candidate_error on the mint arm:
+        {"token name cannot be empty", E::ClientValidation},
+        {"service-scoped tokens must have an expiration time", E::ClientValidation},
+        {"invalid MCP tier — must be 'readonly', 'operator', or 'supervised'",
+         E::ClientValidation},
+        {"MCP tokens must have an expiration time (max 90 days)", E::ClientValidation},
+        {"MCP token TTL cannot exceed 90 days", E::ClientValidation},
+        // generate_raw_token's CSPRNG failure, also surfaced as candidate_error:
+        {"CSPRNG unavailable (entropy exhausted)", E::Transient},
+
+        // ── confirm_token_rotation ──────────────────────────────────────
+        {"no such token to confirm", E::ClientValidation},
+        {"no in-flight rotation to confirm", E::Transient},
+        // Round 5: Conflict, not Transient — see the dedicated TEST_CASE
+        // above and engine_store_error_class.hpp's step-3 rationale.
+        {"no rotation currently pending for the supplied token_id — nothing to confirm; "
+         "call rotate again if a new rotation is needed",
+         E::Conflict},
+        {"more than two active credentials for this principal - resolve manually before "
+         "confirming",
+         E::ClientValidation},
+        {"one active credential with unresolved rotation metadata - inspect the credential "
+         "state and do not rotate; revoke only if it is confirmed stale",
+         E::Conflict},
+        {"token_id does not match the pending rotation successor; pass the token_id "
+         "returned by rotate",
+         E::Conflict},
+        {"rotation confirmation unavailable — retry via rotate or fall back to revoke",
+         E::Conflict},
+        {"failed to confirm rotation", E::Transient},
+        {"failed to revoke predecessor on confirm", E::Transient},
+        {"failed to clear successor rotation state on confirm", E::Transient},
+        {"confirm failed", E::Transient}, // generic with_txn_for-failed fallback
+    };
+
+    for (const auto& c : cases) {
+        CAPTURE(c.message);
+        CHECK(classify_engine_store_error(c.message) == c.expected);
+    }
 }
 
 TEST_CASE("confirm_result_label maps every class to a pre-seeded metric label",

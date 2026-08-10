@@ -185,6 +185,27 @@ TokenLookup read_token_by_id_on_conn(PGconn* conn, const std::string& token_id) 
     return result;
 }
 
+// Runs `fn` unconditionally in its destructor — covers EVERY exit from the
+// enclosing scope, including a thrown exception, which a manual
+// call-before-every-`return` pair cannot (a prior round of this file's own
+// diff used exactly that shape and missed the throw path). Local to this
+// file: every use here guards `yuzu::secure_zero` calls, which are noexcept,
+// so — unlike agents/core's `GuardianRollback` — no swallow-on-throwing-
+// cleanup complexity is needed.
+class ScopeExit {
+public:
+    explicit ScopeExit(std::function<void()> fn) : fn_(std::move(fn)) {}
+    ~ScopeExit() {
+        if (fn_)
+            fn_();
+    }
+    ScopeExit(const ScopeExit&) = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+
+private:
+    std::function<void()> fn_;
+};
+
 } // namespace
 
 // ── Construction ─────────────────────────────────────────────────────────────
@@ -525,6 +546,11 @@ void ApiTokenStore::invalidate_cache(const std::string& token_hash) {
 std::size_t ApiTokenStore::cache_size() const {
     std::lock_guard cache_lock(cache_mtx_);
     return token_cache_.size();
+}
+
+std::size_t ApiTokenStore::rotation_grace_cache_size() const {
+    std::lock_guard cache_lock(rotation_cache_mtx_);
+    return rotation_grace_cache_.size();
 }
 
 void ApiTokenStore::set_engine_referent_check(
@@ -1284,6 +1310,39 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
     std::string error_msg;
     std::string raw_out;
     std::string grace_group_out, grace_raw_out;
+    // Re-serve arm's local secret + owner, hoisted to FUNCTION scope (rather
+    // than declared inside the lambda below) so the scope-exit scrub guard
+    // immediately below can reach `cached_raw` regardless of how the
+    // transaction exits — a lambda-local variable is destroyed the moment
+    // the lambda returns, before any function-scope guard could run.
+    std::string cached_raw, cached_user;
+
+    // Scrub every local plaintext secret copy that is NOT the value being
+    // returned, unconditionally, on EVERY exit from this function from this
+    // point on — including a thrown exception, which a manual
+    // call-before-every-`return` pair (a prior round of this diff used
+    // exactly that shape) cannot cover.
+    //   `candidate_raw`  — always speculatively generated before the txn
+    //                      opens (Hermes F2); dead/unreturned on the
+    //                      re-serve arm or any rejection, and redundant
+    //                      (raw_out/grace_raw_out already hold their OWN
+    //                      copies) even on the mint-success path.
+    //   `grace_raw_out`  — a redundant duplicate of raw_out once
+    //                      store_rotation_raw (below, success-only) has
+    //                      copied it into the grace cache.
+    //   `cached_raw`     — the re-serve arm's local copy of the SAME secret
+    //                      already assigned into raw_out — redundant from
+    //                      that point on.
+    // `raw_out` itself is deliberately NOT scrubbed here — on success it is
+    // the one-time-reveal value the caller must still receive.
+    // NOTE: rotate_engine_credential's own candidate_raw (this file, engine
+    // arm) has the same pre-existing gap — out of scope for this diff; a
+    // future sweep should close both together.
+    ScopeExit scrub_secrets{[&] {
+        yuzu::secure_zero(candidate_raw);
+        yuzu::secure_zero(grace_raw_out);
+        yuzu::secure_zero(cached_raw);
+    }};
 
     // The entire check -> mint -> stamp sequence runs inside ONE transaction
     // opened with the SAME principal-scoped advisory lock
@@ -1375,6 +1434,11 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
             raw_out = candidate_raw;
             grace_group_out = candidate_token_id;
             grace_raw_out = candidate_raw;
+            // Test-only seam (round 4 regression): let a test force the
+            // COMMIT that follows this `return true` to fail, and assert
+            // store_rotation_raw below never ran for this attempt.
+            if (test_hook_before_mint_commit_)
+                test_hook_before_mint_commit_(conn);
             return true;
         }
 
@@ -1441,7 +1505,10 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
             return false;
         }
 
-        std::string cached_raw, cached_user;
+        // `cached_raw`/`cached_user` are the FUNCTION-scope variables
+        // declared above (captured by reference) — never lambda-local, so
+        // the scope-exit scrub guard above can reach `cached_raw` on every
+        // exit from `rotate_token`, not just this lambda's return.
         if (!try_reserve(succ_row->rotation_group, cached_raw, cached_user)) {
             error_msg = "rotation grace window elapsed; confirm or revoke";
             return false;
@@ -1455,30 +1522,27 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
         return true;
     });
 
-    if (!grace_group_out.empty())
-        store_rotation_raw(grace_group_out, grace_raw_out, requesting_user);
-
-    // Scrub the local plaintext copies that are NOT the value being
-    // returned. `candidate_raw` is speculatively generated before the
-    // transaction opens (Hermes F2) and is used only if the mint arm's
-    // fresh re-read actually lands there — on the re-serve arm or any
-    // rejection it is a dead, unreturned secret; even on the mint-success
-    // path `raw_out`/`grace_raw_out` already hold their OWN copies (plain
-    // string assignment, not a move), so `candidate_raw` is redundant the
-    // moment those assignments happened. `grace_raw_out` is likewise a
-    // redundant duplicate of `raw_out` once `store_rotation_raw` above has
-    // copied it into the grace cache. Neither should sit unscrubbed in this
-    // frame for the rest of the call. `raw_out` itself is deliberately NOT
-    // scrubbed here — on success it is the one-time-reveal value the caller
-    // must still receive.
-    // NOTE: `rotate_engine_credential`'s own `candidate_raw` (this file,
-    // engine arm) has the same pre-existing gap — out of scope for this
-    // diff; a future sweep should close both together.
-    yuzu::secure_zero(candidate_raw);
-    yuzu::secure_zero(grace_raw_out);
-
     if (!ok)
         return std::unexpected(error_msg.empty() ? "rotation failed" : error_msg);
+
+    // Cache the raw secret + initiating operator for the grace window AFTER
+    // the mint committed — mirrors rotate_engine_credential's ordering
+    // exactly (this file, engine arm) and for the SAME reason: `with_txn_for`
+    // (`pool_.with_txn_for` -> `PgPool::run_in_txn`, pg/pg_pool.cpp) can still
+    // return false AFTER this callback returned true — a COMMIT failure
+    // (`PgTxn::commit()`, pg/pg_raii.hpp, false when COMMIT != PGRES_COMMAND_OK)
+    // or the aborted-transaction refusal ahead of it. Caching BEFORE checking
+    // `ok` would insert a grace-cache entry keyed to a `candidate_token_id`
+    // with NO committed row — permanently unevictable, since
+    // `evict_rotation_raw` fires only on confirm-success or the sweep
+    // resolving a pair, both of which require a committed row to exist at
+    // all; `scrub_elapsed_grace_secrets` zeroes the entry's `raw` past the
+    // grace window but deliberately never erases the entry itself. The
+    // one-time-reveal contract's "once" means once per grace-bounded
+    // rotation ATTEMPT that actually committed (§7), so a bounded retry BY
+    // THE SAME OPERATOR can re-serve this exact value.
+    if (!grace_group_out.empty())
+        store_rotation_raw(grace_group_out, grace_raw_out, requesting_user);
 
     return raw_out;
 }
@@ -1549,9 +1613,21 @@ ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
             return false;
         }
         if (pinned.rotation_group.empty()) {
-            error_msg = "no rotation in flight for the supplied token_id - the rotation "
-                        "was resolved (confirmed, revoked, or cut over); rotate again if "
-                        "a new rotation is needed";
+            // Deliberately NOT the engine arm's verbatim kSoleOtherToken
+            // wording ("...the rotation was resolved (confirmed, revoked, or
+            // cut over)..." — see confirm_rotation above): that IS the
+            // correct fact pattern to describe here too (this row was
+            // resolved — confirmed, revoked, or cut over — or never rotated
+            // at all), but reusing that string byte-for-byte would make this
+            // site's classification a silent, parasitic side effect of the
+            // engine arm's entry rather than an explicit decision of its own
+            // (round-4 review). Own wording, own classifier entry — same
+            // Conflict class as the engine arm reaches for the analogous
+            // state (see engine_store_error_class.hpp's dedicated rationale;
+            // round 5 corrected an earlier, refuted Transient
+            // classification of this exact string).
+            error_msg = "no rotation currently pending for the supplied token_id — nothing "
+                        "to confirm; call rotate again if a new rotation is needed";
             return false;
         }
         const std::string rotation_group = pinned.rotation_group;
@@ -1577,9 +1653,16 @@ ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
                         "resolve manually before confirming";
             return false;
         case detail::GroupRotationConfirmState::kGroupEmpty:
-            error_msg = "no rotation in flight for the supplied token_id - the rotation "
-                        "was resolved (confirmed, revoked, or cut over); rotate again if "
-                        "a new rotation is needed";
+            // Same state, same wording, and same rationale as the
+            // `pinned.rotation_group.empty()` short-circuit above — this is
+            // the fresh-under-lock re-confirmation of that same fact (the
+            // group had nothing active left) reached via the classifier
+            // instead. A POSITIVE fact (see classify_confirm_state_in_group's
+            // own doc comment), so Conflict, never Transient — same
+            // classifier entry as the short-circuit above; see that
+            // comment's fuller rationale.
+            error_msg = "no rotation currently pending for the supplied token_id — nothing "
+                        "to confirm; call rotate again if a new rotation is needed";
             return false;
         case detail::GroupRotationConfirmState::kUnresolvedSoleInGroup:
             error_msg = "one active credential with unresolved rotation metadata - "

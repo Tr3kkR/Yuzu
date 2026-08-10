@@ -705,18 +705,24 @@ std::string raw_hash_column(PgPool& pool, const std::string& token_id) {
 // REQUIRE/CHECK inside the guarded scope fails (Catch2 throws on assertion
 // failure) — exactly the non-RAII cleanup shape this repo blocks in
 // production code; this guard exists so no future test copies that pattern.
+// SAVES AND RESTORES the prior value (rather than resetting to `nullptr`) —
+// today the prior value is always null (the store is otherwise unhooked), but
+// a save/clear-to-null guard would silently corrupt a nested or sequenced use
+// (this exact class re-armed inside another guarded scope, or two of these in
+// the same TEST_CASE), which its own doc comment above invites.
 class ScopedRotateGroupReadHook {
 public:
     ScopedRotateGroupReadHook(ApiTokenStore& store, std::function<void(pg_conn*)> hook)
-        : store_(store) {
+        : store_(store), prior_(std::move(store_.test_hook_before_rotate_group_read_)) {
         store_.test_hook_before_rotate_group_read_ = std::move(hook);
     }
-    ~ScopedRotateGroupReadHook() { store_.test_hook_before_rotate_group_read_ = nullptr; }
+    ~ScopedRotateGroupReadHook() { store_.test_hook_before_rotate_group_read_ = std::move(prior_); }
     ScopedRotateGroupReadHook(const ScopedRotateGroupReadHook&) = delete;
     ScopedRotateGroupReadHook& operator=(const ScopedRotateGroupReadHook&) = delete;
 
 private:
     ApiTokenStore& store_;
+    std::function<void(pg_conn*)> prior_;
 };
 
 } // namespace
@@ -2288,6 +2294,86 @@ TEST_CASE("ApiTokenStore: rotate_token — a query failure in the conflict arm's
     CHECK(*clean_retry == *first);
 }
 
+TEST_CASE("ApiTokenStore: rotate_token — a COMMIT failure after the mint arm returns true "
+          "never leaks a grace-cache entry (round 4 regression)",
+          "[pg][token][rotation]") {
+    // Regression for a gap found in review: store_rotation_raw was hoisted
+    // above the `if (!ok)` check, so a COMMIT failure — which PgPool::run_in_txn
+    // (pg/pg_pool.cpp) can still report AFTER the callback itself returned
+    // true (the aborted/idle-transaction refusal, or PgTxn::commit() itself
+    // failing, pg/pg_raii.hpp) — inserted a grace-cache entry keyed to a
+    // candidate_token_id with NO committed row. Nothing can ever evict it:
+    // evict_rotation_raw fires only on confirm-success or the sweep
+    // resolving a pair, both of which require a committed row to exist at
+    // all, and scrub_elapsed_grace_secrets zeroes the entry's `raw` past the
+    // grace window but deliberately never erases the entry itself.
+    //
+    // This forces exactly that outcome by killing the transaction's own
+    // backend connection right after the mint arm's INSERT+UPDATE have
+    // already succeeded, but before with_txn_for attempts COMMIT — a genuine
+    // commit failure, not a simulated one — and asserts the grace cache is
+    // EMPTY afterward. LeakSanitizer cannot catch this class of leak (the
+    // entry stays reachable from a live member map, `rotation_grace_cache_`),
+    // so this targeted assertion is the only detector.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto now = test_now_epoch();
+    auto predecessor_raw = store.create_token("my-pat", "alice", now + k90Days);
+    REQUIRE(predecessor_raw.has_value());
+    const std::string predecessor_id = store.list_active_for_principal("alice")[0].token_id;
+
+    REQUIRE(store.rotation_grace_cache_size() == 0);
+
+    store.test_hook_before_mint_commit_ = [&pool](pg_conn* conn) {
+        const int victim_pid = PQbackendPID(conn);
+        REQUIRE(victim_pid > 0);
+        {
+            // A second, independent connection sends the kill — pool size 4
+            // easily covers holding the txn's own lease plus this one.
+            auto axe = pool.acquire();
+            REQUIRE(static_cast<bool>(axe));
+            const std::string kill =
+                "SELECT pg_terminate_backend(" + std::to_string(victim_pid) + ")";
+            PgResult res{PQexec(axe.get(), kill.c_str())};
+            REQUIRE(res.status() == PGRES_TUPLES_OK);
+        }
+        // pg_terminate_backend returns when the signal is SENT, not when the
+        // backend has actually exited (same pattern as test_pg_pool.cpp's
+        // "PgPool discards a connection lost mid-use") — poll on the VICTIM
+        // connection until the client side observes the loss, so the
+        // COMMIT that follows this hook's return genuinely fails rather
+        // than racing a connection that hasn't died yet.
+        bool severed = false;
+        for (int i = 0; i < 100 && !severed; ++i) {
+            PgResult ping{PQexec(conn, "SELECT 1")};
+            severed = ping.status() != PGRES_TUPLES_OK && PQstatus(conn) != CONNECTION_OK;
+            if (!severed)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        REQUIRE(severed);
+    };
+
+    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "alice");
+    store.test_hook_before_mint_commit_ = nullptr;
+
+    // The transaction never committed, so rotate_token must report failure...
+    REQUIRE_FALSE(rotated.has_value());
+    // ...and — the actual defect under test — no grace-cache entry may have
+    // leaked for this failed-commit attempt.
+    CHECK(store.rotation_grace_cache_size() == 0);
+
+    // The DB-side rollback (connection loss aborts the in-flight transaction
+    // server-side too) means the predecessor is untouched — still the
+    // principal's sole active token, never mid-rotation.
+    auto active = store.list_active_for_principal("alice");
+    REQUIRE(active.size() == 1);
+    CHECK(active[0].token_id == predecessor_id);
+    CHECK(active[0].rotation_group.empty());
+}
+
 // NOTE: there is no "grace-window re-serve to a different operator" test for
 // the human arm — unlike the engine arm (where requesting_user is a
 // third-party admin), self-service means ANY requesting_user other than the
@@ -2381,8 +2467,22 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on an unknown token_id is a ter
 }
 
 TEST_CASE("ApiTokenStore: confirm_token_rotation on a token that was never part of a "
-          "rotation is a terminal conflict — 'the rotation was resolved'",
+          "rotation is a terminal Conflict — own wording, arm-parity with the engine "
+          "arm's kSoleOtherToken (round 5 adjudication)",
           "[pg][token][rotation]") {
+    // Round-4 review found this branch originally reused confirm_rotation's
+    // (engine arm) kSoleOtherToken wording verbatim, byte-for-byte, and so
+    // silently inherited that string's classification via the "the rotation
+    // was resolved" substring — a genuine bug, since the two states are
+    // different FACTS (a pin mismatch against a DIFFERENT surviving
+    // credential, vs. nothing pending at all) even though both happen to be
+    // Conflict. Round 4's fix gave this state its own wording but ALSO
+    // reclassified it to Transient, reasoning from the "call rotate again"
+    // prose — round 5 adjudication refuted that: #2404 precedent, arm parity
+    // with `kSoleOtherToken` (identical "rotate again" guidance, Conflict),
+    // and `rotation_confirm_state.hpp`'s own "every terminal state ->
+    // Conflict or ClientValidation" contract all say Conflict. This state
+    // keeps its own (round-4) wording — own classifier entry, correct class.
     YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ApiTokenStore store{pool};
@@ -2398,12 +2498,14 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a token that was never part 
 
     auto confirmed = store.confirm_token_rotation(token_id, "alice");
     REQUIRE_FALSE(confirmed.has_value());
-    CHECK(confirmed.error().find("the rotation was resolved") != std::string::npos);
+    CHECK(confirmed.error().find("no rotation currently pending") != std::string::npos);
+    CHECK(confirmed.error().find("the rotation was resolved") == std::string::npos);
     CHECK(classify_engine_store_error(confirmed.error()) == E::Conflict);
 }
 
 TEST_CASE("ApiTokenStore: confirm_token_rotation replay after success is a terminal "
-          "already-resolved conflict",
+          "Conflict, own wording distinct from the engine arm's own confirm-replay "
+          "strings",
           "[pg][token][rotation]") {
     YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -2428,10 +2530,12 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation replay after success is a termi
     REQUIRE(store.confirm_token_rotation(successor_id, "alice").has_value());
 
     // Replay: the successor is now the SOLE active credential for alice, and
-    // it is not in the pinned rotation_group any more (kGroupEmpty).
+    // it is not in the pinned rotation_group any more (kGroupEmpty) — a
+    // POSITIVE fact (rotation_confirm_state.hpp), terminal Conflict.
     auto replay = store.confirm_token_rotation(successor_id, "alice");
     REQUIRE_FALSE(replay.has_value());
-    CHECK(replay.error().find("the rotation was resolved") != std::string::npos);
+    CHECK(replay.error().find("no rotation currently pending") != std::string::npos);
+    CHECK(replay.error().find("the rotation was resolved") == std::string::npos);
     CHECK(classify_engine_store_error(replay.error()) == E::Conflict);
 }
 
