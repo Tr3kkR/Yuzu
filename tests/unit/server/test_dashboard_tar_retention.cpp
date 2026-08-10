@@ -27,6 +27,7 @@
 
 #include "dashboard_routes.hpp"
 #include "management_group_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include "test_mgmt_group_pg_helper.hpp"
 
@@ -35,9 +36,23 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <initializer_list>
+#include <stdexcept>
 #include <string>
 
 namespace yuzu::server {
+
+using yuzu::server::pg::PgPool;
+
+namespace {
+// ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
+// "responsestore" template key with test_response_store.cpp (identical setup).
+yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("responsestore template: store failed to migrate");
+}};
+} // namespace
 
 // Test-only accessor for the private renderer + its store/scan inputs (#562).
 struct DashboardTarRetentionTestAccess {
@@ -98,9 +113,9 @@ bool contains(const std::string& hay, std::string_view needle) {
 
 TEST_CASE("render_tar_retention_paused: hostile _enabled value is escaped + flagged (#560)",
           "[pg][server][tar][retention-render]") {
-    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-rs-"}};
-    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-mg-"}};
-    ResponseStore rs{rs_db.path};
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
     yuzu::test::ManagementGroupStorePg mg_bundle;
     ManagementGroupStore& mg = *mg_bundle;
     grant_visibility(mg, {"agent-evil", "agent-ok"});
@@ -141,9 +156,9 @@ TEST_CASE("render_tar_retention_paused: a value in the _enabled attribute cannot
     // inject an event handler if the `\"`-escape regressed — html_escape must
     // turn `\"` into `&quot;`. Asserting only absence-of-`<script>` would miss
     // this, so pin the attribute-quote escape directly.
-    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-attr-rs-"}};
-    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-attr-mg-"}};
-    ResponseStore rs{rs_db.path};
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
     yuzu::test::ManagementGroupStorePg mg_bundle;
     ManagementGroupStore& mg = *mg_bundle;
     grant_visibility(mg, {"agent-x"});
@@ -163,9 +178,9 @@ TEST_CASE("render_tar_retention_paused: a value in the _enabled attribute cannot
 
 TEST_CASE("render_tar_retention_paused: dedup keys on received_at_ms, latest wins (#561)",
           "[pg][server][tar][retention-render]") {
-    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-dedup-rs-"}};
-    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-dedup-mg-"}};
-    ResponseStore rs{rs_db.path};
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
     yuzu::test::ManagementGroupStorePg mg_bundle;
     ManagementGroupStore& mg = *mg_bundle;
     grant_visibility(mg, {"agent-A"});
@@ -196,9 +211,9 @@ TEST_CASE("render_tar_retention_paused: dedup keys on received_at_ms, latest win
 
 TEST_CASE("render_tar_retention_paused: each visible agent appears; out-of-scope dropped",
           "[pg][server][tar][retention-render]") {
-    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-multi-rs-"}};
-    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-multi-mg-"}};
-    ResponseStore rs{rs_db.path};
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
     yuzu::test::ManagementGroupStorePg mg_bundle;
     ManagementGroupStore& mg = *mg_bundle;
     grant_visibility(mg, {"agent-A", "agent-B"}); // agent-C deliberately out of scope
@@ -229,9 +244,9 @@ TEST_CASE("render_tar_retention_paused: each visible agent appears; out-of-scope
 
 TEST_CASE("render_tar_retention_paused: paused_at==0 sorts oldest with schema badge (#558)",
           "[pg][server][tar][retention-render]") {
-    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-558-rs-"}};
-    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-558-mg-"}};
-    ResponseStore rs{rs_db.path};
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
     yuzu::test::ManagementGroupStorePg mg_bundle;
     ManagementGroupStore& mg = *mg_bundle;
     grant_visibility(mg, {"agent-legacy", "agent-modern"});
@@ -259,9 +274,9 @@ TEST_CASE("render_tar_retention_paused: paused_at==0 sorts oldest with schema ba
 
 TEST_CASE("render_tar_retention_paused: all-collecting fleet renders the clean empty state",
           "[pg][server][tar][retention-render]") {
-    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-empty-rs-"}};
-    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-empty-mg-"}};
-    ResponseStore rs{rs_db.path};
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
     yuzu::test::ManagementGroupStorePg mg_bundle;
     ManagementGroupStore& mg = *mg_bundle;
     grant_visibility(mg, {"agent-A"});
@@ -279,9 +294,9 @@ TEST_CASE("render_tar_retention_paused: all-collecting fleet renders the clean e
 
 TEST_CASE("render_tar_retention_paused: renders the typed-confirm Purge button (15.A)",
           "[pg][server][tar][retention-render]") {
-    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-purge-rs-"}};
-    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-purge-mg-"}};
-    ResponseStore rs{rs_db.path};
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
     yuzu::test::ManagementGroupStorePg mg_bundle;
     ManagementGroupStore& mg = *mg_bundle;
     grant_visibility(mg, {"agent-A"});
@@ -308,9 +323,9 @@ TEST_CASE("render_tar_retention_paused: renders the typed-confirm Purge button (
 
 TEST_CASE("render_tar_retention_paused: row actions gate on effective permission (15.A LOW)",
           "[pg][server][tar][retention-render]") {
-    yuzu::test::TempDbFile rs_db{std::string_view{"tar-render-perm-rs-"}};
-    yuzu::test::TempDbFile mg_db{std::string_view{"tar-render-perm-mg-"}};
-    ResponseStore rs{rs_db.path};
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
     yuzu::test::ManagementGroupStorePg mg_bundle;
     ManagementGroupStore& mg = *mg_bundle;
     grant_visibility(mg, {"agent-A"});
@@ -348,6 +363,31 @@ TEST_CASE("render_tar_retention_paused: no scan yet renders the placeholder",
     // No stores wired, no scan recorded for this user.
     const std::string html = acc.render("nobody");
     CHECK(contains(html, "No scan data yet"));
+}
+
+// #2691 (Doomgoose finding #7): a degraded response-store read must not
+// render as "every collector is running normally" or "scan still in
+// progress" — both are false claims about fleet state when the read simply
+// failed.
+TEST_CASE("render_tar_retention_paused: a degraded store read renders the "
+          "degrade banner not the clean-fleet claim",
+          "[pg][server][tar][retention-render]") {
+    PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    ResponseStore bad_rs{bad_pool};
+    REQUIRE_FALSE(bad_rs.is_open());
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    grant_visibility(mg, {"agent-A"});
+
+    DashboardTarRetentionTestAccess acc;
+    acc.set_stores(&bad_rs, &mg);
+    acc.set_scan(kUser, kScan, 1, 1); // scan recorded so the read is reached
+    const std::string html = acc.render(kUser);
+
+    CHECK(contains(html, "result-degrade-banner"));
+    CHECK(contains(html, "Retention state unavailable"));
+    CHECK_FALSE(contains(html, "No paused sources detected"));
+    CHECK_FALSE(contains(html, "still in progress"));
 }
 
 } // namespace yuzu::server

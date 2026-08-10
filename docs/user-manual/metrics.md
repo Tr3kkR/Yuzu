@@ -166,6 +166,24 @@ both leave rows undeleted, so an audit table that never shrinks looks identical
 either way. Only the pair distinguishes "the guard is protecting the table" from
 "cleanup is broken".
 
+## Response-store metrics
+
+The response store (PostgreSQL schema `response_store`, ADR-0039) persists agentic
+command/instruction results for the executions drawer and the `/tar` dashboard. Its
+ingest is **fail-soft** (a dropped result is re-derivable operational telemetry — the
+executions ladder still tracks the command), its reads are **degrade-distinguishable**
+(nullopt on a store/pool failure, never a false-empty), and its TTL retention runs the
+same clock-guarded sweep the audit store uses.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_server_response_ingest_dropped_total{reason}` | counter | Response result rows that did not persist, by `reason` (`store_not_open` / `pool_acquire_timeout` / `query_error` / `malformed_identity_field`). Fail-soft by design — the command is still tracked on the executions ladder — but a sustained non-zero rate means drawer/TAR result history is silently lossy. `malformed_identity_field` is a distinct case: `instruction_id`/`execution_id`/`plugin`/`agent_id` are bound unsanitized (see ADR-0039 "Ingest bounds") — a value containing an embedded NUL byte is rejected outright rather than silently truncated at the NUL, so a non-zero rate here means an agent sent a malformed identity field, not a store health problem. See `YuzuResponseMalformedIdentityDrops` (informational, not store-health) vs. `YuzuResponseIngestDrops` (excludes this reason). |
+| `yuzu_server_response_read_degrade_total{reason,source}` | counter | Response reads that returned a **degrade** (nullopt, not empty), by `reason` (`store_not_open` / `pool_acquire_timeout` / `query_error` — the same three as the row above, excluding `malformed_identity_field`, which is write-path only) and `source` (`response_store`). The store seam distinguishes empty from degraded so a consumer renders a degrade banner rather than misreading a blip as "no responses". |
+| `yuzu_server_response_reap_passes_total{result}` | counter | TTL reap passes, by `result`: `swept` (deleted the full expired set), `capped` (hit the per-pass row cap of 10,000 OR the delete-time budget — a backlog likely remains either way; a sustained non-zero rate means expiry is outrunning the drain on this high-write store. Since the reap chunk-cascade fix (#2691 Gate 5), the delete-time budget can be hit before any row in a chunk is actually deleted, so `capped` no longer guarantees rows were removed this pass — it guarantees a backlog probe found one), `noop` (nothing expired), `declined` (the retention classifier vetoed a would-wipe or implausible-clock pass), `declined_no_anchor` (first pass ever against a store with expired rows present — declines once, the next pass drains), `skipped_lock` (another replica held the advisory lock), `failed` (the pass errored). As with the audit reaper, alert on the total NOT increasing — a reaper that never runs leaves every result flat at 0, identical to a quiet healthy store while the table grows — **and** alert on a sustained `capped` rate. |
+
+All reason/result dimensions are seeded to zero at boot, so absent-series alerting stays
+distinguishable from a scrape failure.
+
 ## MCP progress-bridge metrics
 
 The MCP Streamable-HTTP progress bridge projects live `notifications/progress` onto a
