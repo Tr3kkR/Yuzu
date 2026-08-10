@@ -3385,23 +3385,32 @@ McpServer::HandlerFn McpServer::build_handler(
                     //
                     // Pre-consume recheck (#2443), wired for the one tool known to
                     // drift within the 7-day approval TTL: an engine-key rotation the
-                    // ticket confirms can resolve (sweep cutover, manual revoke, a
-                    // restart evicting the initiator binding) between mint and
-                    // recall. Without this, the recall matches, CONSUMES, and only
-                    // then does confirm_engine_rotation's own handler 409/503 —
+                    // ticket confirms can resolve (sweep cutover, manual revoke) between
+                    // mint and recall. Without this, the recall matches, CONSUMES, and
+                    // only then does confirm_engine_rotation's own handler 409/503,
                     // burning a human-approved one-time capability on a no-op.
                     //
                     // This reads engine_credential_store_'s active set via the
-                    // PUBLIC, unlocked list_active_for_principal() — the same query
+                    // PUBLIC, unlocked list_active_for_principal(), the same query
                     // ApiTokenStore::confirm_rotation() runs INSIDE its per-principal
                     // advisory-locked transaction, just without the lock. That is a
                     // WEAKER read (rotation_confirm_state.hpp's load-bearing
                     // invariant: only the in-transaction primary read is
                     // authoritative), which is why this narrows the drift window
-                    // rather than closing it — the CAS below and confirm_rotation's
+                    // rather than closing it: the CAS below and confirm_rotation's
                     // own in-txn recheck remain the authoritative guards. A denial
                     // here never asserts AUTHORITY, only that the state the ticket's
                     // effect depends on has moved on.
+                    //
+                    // NOT closed by this precondition: a restart evicting the
+                    // Hermes F4/F5 initiator (grace-cache) binding. `active` alone
+                    // cannot see that state - it lives in an in-process cache that is
+                    // private to ApiTokenStore (see rotation_confirm_state.hpp's
+                    // pair_matches_pin doc comment). confirm_rotation's own
+                    // in-transaction check remains the only thing that catches it,
+                    // so that specific drift still burns the ticket (tracked
+                    // separately as a follow-up: a read-only accessor for the
+                    // initiator binding would close it here too).
                     ConsumePrecondition precondition;
                     if (tool_name == "confirm_engine_rotation") {
                         const auto rot_principal_id = param_str(args, "principal_id");
@@ -3413,21 +3422,32 @@ McpServer::HandlerFn McpServer::build_handler(
                             const auto active =
                                 engine_credential_store_->list_active_for_principal(rot_principal_id);
                             using yuzu::server::detail::classify_confirm_state;
+                            using yuzu::server::detail::pair_matches_pin;
                             using yuzu::server::detail::RotationConfirmState;
                             switch (classify_confirm_state(active, rot_token_id)) {
                             case RotationConfirmState::kNoneActive:
                                 // Empty read is ambiguous with a swallowed store fault
-                                // (positive-read contract, rotation_confirm_state.hpp)
-                                // — never deny on it; let the CAS + handler decide.
+                                // (positive-read contract, rotation_confirm_state.hpp),
+                                // never deny on it; let the CAS + handler decide.
+                                return {};
                             case RotationConfirmState::kPair:
-                                // Still two active credentials — a live rotation may
-                                // genuinely be pending confirmation; pin-match against
-                                // the specific pair is confirm_rotation's own call.
+                                // Two active credentials is necessary but not
+                                // sufficient: without also checking linkage and the
+                                // pin, a NEWER rotation (a different successor
+                                // token_id than this ticket was minted for) would
+                                // also read as kPair here, pass, get the ticket
+                                // consumed, and then fail confirm_rotation's own
+                                // pin check - the exact burn this precondition
+                                // exists to prevent, just one layer down.
+                                if (!pair_matches_pin(active, rot_token_id))
+                                    return std::unexpected(
+                                        "no rotation in flight for this token_id; the pinned "
+                                        "rotation has moved on");
                                 return {};
                             case RotationConfirmState::kOverfull:
                                 return std::unexpected(
                                     "more than two active credentials for this principal; "
-                                    "resolve manually, then re-mint if confirmation is still needed");
+                                    "resolve manually before confirming");
                             case RotationConfirmState::kUnresolvedSole:
                                 return std::unexpected(
                                     "one active credential with unresolved rotation metadata; "
@@ -3439,8 +3459,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             case RotationConfirmState::kSoleOtherToken:
                                 return std::unexpected(
                                     "no rotation in flight for this token_id; the rotation was "
-                                    "already resolved — re-mint the approval if a new rotation "
-                                    "needs confirming");
+                                    "already resolved");
                             }
                             return {}; // unreachable; classify_confirm_state is total
                         };
@@ -3492,9 +3511,20 @@ McpServer::HandlerFn McpServer::build_handler(
                         // own warn log is the caller-independent half.
                         if (consumed.error().origin_check_unevaluated)
                             count_denial("yuzu_mcp_approval_masked_denials_total", nullptr);
+                        // kPrecondition carries its own specific fact (which
+                        // RotationConfirmState triggered it) in .message. That
+                        // detail is deliberately NOT sent to the client (see the
+                        // kPrecondition branch below - it runs before this tool's
+                        // own RBAC check, so a specific answer here would be a
+                        // credential-state oracle for a tier-eligible, RBAC-less
+                        // caller). The audit row is server-side only, so it is
+                        // the one place the specific fact belongs.
                         mcp_audit("denied",
                                   "approval_id=" + supplied_id +
                                       " refused: " + consume_denial_reason(kind) +
+                                      (kind == ConsumeFailure::kPrecondition
+                                           ? (": " + consumed.error().message)
+                                           : "") +
                                       (consumed.error().origin_check_unevaluated
                                            ? " (origin unverified)"
                                            : ""));
@@ -3533,22 +3563,43 @@ McpServer::HandlerFn McpServer::build_handler(
                         }
                         // kPrecondition is NOT one of the two that must read
                         // alike (#2442's anti-oracle pairing above is about
-                        // kForeignOrigin vs kNotConsumable — a different
+                        // kForeignOrigin vs kNotConsumable - a different
                         // question). This ticket is UNTOUCHED: consumed_at is
                         // still 0 and it remains recallable. Reusing "approval
                         // already used" here would tell the caller to discard a
-                        // still-good, still-recallable ticket — exactly the burn
-                        // class #2443 exists to close. The precondition's own
-                        // message is server-authored (never echoes a caller-
-                        // supplied Approval field — see ConsumePrecondition's
-                        // doc comment) so it is safe to surface directly.
+                        // still-good, still-recallable ticket - exactly the burn
+                        // class #2443 exists to close.
+                        //
+                        // The message stays GENERIC and kind-independent,
+                        // deliberately not `consumed.error().message` (which IS
+                        // server-authored, so it is not a raw-injection risk -
+                        // the reason it is withheld is different). The
+                        // precondition runs ahead of this tool's own per-handler
+                        // RBAC check (perm_fn), so a caller who is tier-eligible
+                        // and holds a matching approved ticket, but would fail
+                        // RBAC, would otherwise learn specific rotation-state
+                        // facts ("already confirmed" / "unresolved metadata" /
+                        // "more than two active credentials") before RBAC has
+                        // run at all - a credential-state oracle. The specific
+                        // fact is still recorded server-side, in the audit row
+                        // above. Remediation is deliberately noncommittal about
+                        // whether a retry will succeed: several of the states
+                        // this can fire for (an already-confirmed or already-
+                        // resolved rotation) are terminal for THIS ticket's
+                        // pinned token_id - promising "retry" would be the
+                        // fix's own remediation steering the caller into a
+                        // burn a newer rotation's mismatched pin would still
+                        // catch, but only after consuming the ticket.
                         if (kind == ConsumeFailure::kPrecondition) {
                             res.set_content(
-                                a4_error(kPermissionDenied, consumed.error().message,
+                                a4_error(kPermissionDenied,
+                                         "approval cannot be redeemed right now: a precondition "
+                                         "on the underlying operation was not met",
                                          "the approval_id is still valid and was NOT consumed; "
-                                         "retry this exact call once the underlying condition "
-                                         "clears, or submit a new request if a fresh approval is "
-                                         "needed"),
+                                         "check the current state of the operation this approval "
+                                         "authorizes before deciding whether to recall it again "
+                                         "with the same approval_id, or submit a new request if a "
+                                         "fresh approval is needed"),
                                 "application/json");
                             return;
                         }

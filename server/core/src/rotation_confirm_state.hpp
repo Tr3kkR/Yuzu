@@ -81,4 +81,42 @@ classify_confirm_state(const std::vector<ApiToken>& active, const std::string& p
                                   : RotationConfirmState::kSoleResolved;
 }
 
+/// A `kPair` classification from `classify_confirm_state` above says only
+/// "exactly two active rows" - it does not check whether those two rows are
+/// actually LINKED to each other (same rotation_group, successor's
+/// supersedes_token_id pointing at the predecessor) or whether the caller's
+/// pinned `pin_token_id` matches the successor. `ApiTokenStore::confirm_rotation`
+/// checks both, under its advisory lock, before it will confirm (see the
+/// pair-processing block right after its own `kPair` arm). A precondition that
+/// treated `kPair` alone as "safe to proceed" would pass a case that later
+/// fails at confirm_rotation's own linkage or pin check, consuming the
+/// one-time approval ticket for nothing (#2443).
+///
+/// This is the SAME public data `classify_confirm_state` already has (the
+/// `active` vector from `list_active_for_principal`/`read_active_for_principal_on_conn`),
+/// so a caller with just the `kPair` result can run this too, no store access
+/// needed. It does NOT check the initiator binding (Hermes F4/F5's grace-cache
+/// `requesting_user` match) - that state lives in an in-process cache private
+/// to `ApiTokenStore` and is not visible from active-row data alone. A `true`
+/// here still leaves the initiator-binding check as the authoritative
+/// in-transaction gate; it only closes the LINKAGE/PIN half of the gap.
+[[nodiscard]] inline bool pair_matches_pin(const std::vector<ApiToken>& active,
+                                           const std::string& pin_token_id) {
+    if (active.size() != 2)
+        return false;
+    const ApiToken* predecessor = nullptr;
+    const ApiToken* successor = nullptr;
+    for (const auto& t : active) {
+        if (!t.supersedes_token_id.empty())
+            successor = &t;
+        else
+            predecessor = &t;
+    }
+    if (predecessor == nullptr || successor == nullptr || successor->rotation_group.empty() ||
+        successor->rotation_group != predecessor->rotation_group ||
+        successor->supersedes_token_id != predecessor->token_id)
+        return false;
+    return successor->token_id == pin_token_id;
+}
+
 } // namespace yuzu::server::detail
