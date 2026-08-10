@@ -2562,12 +2562,14 @@ enabled rule could only fire on a forged heartbeat; (2) no churn-robust
 new-increment alert form exists yet for these unlabelled fleet-summed *cumulative*
 counters over a *churning* agent population (`increase()`/`rate()`/`delta()`/bare
 `> 0` each fail differently — full analysis in the YAML file's own preamble) — this
-reason does **not** clear at cutover and has **no filed tracking issue** today. Until
-both clear, every channel below is graph-and-post-incident-review only. The only
-signals that currently page or roll up live are two pipeline-health counters,
-`yuzu_fleet_guardian_journal_reporting` and `..._tag_rejected` — server-owned counts
-published every sweep including at 0, unlike the 30 agent-self-reported counters
-below, and the reason they can be sound where the loss-channel counters cannot.
+reason does **not** clear at cutover — tracked at #2336 (filed 2026-07-21), currently
+unowned (no assignee, no milestone). Until both clear, every channel below is
+graph-and-post-incident-review only. The only signals that currently roll up live —
+not page; their alert rules sit in the same commented-out group as everything else
+here — are two pipeline-health counters, `yuzu_fleet_guardian_journal_reporting` and
+`..._tag_rejected` — server-owned counts published every sweep including at 0, unlike
+the 30 agent-self-reported counters below, and the reason they can be sound where the
+loss-channel counters cannot.
 
 **Loss / removal channels — every one counted, all `yuzu.guardian_journal_*`
 heartbeat tags unless noted (sparse-emit: a zero counter ships no tag; writer
