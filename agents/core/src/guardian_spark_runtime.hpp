@@ -453,14 +453,19 @@ public:
     /// Install the source of THIS agent's id, folded into every event_id so the
     /// server's global `event_id` PRIMARY KEY (drops on UNIQUE conflict, #1307)
     /// does not treat two agents drifting on the same rule - or the same agent
-    /// after a restart - as duplicate events. A provider (not a fixed string)
-    /// because the agent_id is empty pre-Register and populated later; default is
-    /// empty (rung 7 wires the real provider after Register).
+    /// after a restart - as duplicate events. A provider (not a fixed string) so the
+    /// call site controls how current the value is; default is empty until wired.
+    /// Wired by `GuardianEngine::wire_spark_engine()` (#2237) to a copy of the
+    /// engine's own `agent_id_` - the same source and lifetime the legacy path
+    /// already uses for its event_ids, set once at construction, not gated on a
+    /// later Register completing.
     ///
     /// The provider MUST be self-contained (process-lifetime-safe captures), like
     /// the clock: the runtime snapshots it at pass start so it is not called on the
     /// detached-post-read path, but a provider that borrows agent state and is
-    /// invoked before a shutdown completes is still a hazard.
+    /// invoked before a shutdown completes is still a hazard. A by-value capture of
+    /// an already-immutable string (the wired production provider) is safe; a
+    /// provider that captures a pointer/reference back into its owner is not.
     void set_agent_id_provider(std::function<std::string()> provider);
 
 private:
@@ -545,7 +550,7 @@ private:
     /// registry_mu_: evaluate_key's commit section, attach_rule, detach_rule[_locked]).
     /// Called outside BOTH locks after any outbox_/lifecycle_log_ mutation.
     std::function<void()> outbox_enqueue_waker_;
-    std::function<std::string()> agent_id_fn_;    ///< registry_mu_-guarded; empty until rung 7 wires it
+    std::function<std::string()> agent_id_fn_;    ///< registry_mu_-guarded; wired by GuardianEngine::wire_spark_engine (#2237)
     std::unique_ptr<SparkKeyRuleIndex> index_;                          // key <-> rule fan-out + refcount
     std::unordered_map<std::string, std::shared_ptr<RuleGeneration>> rules_; // rule_id -> generation
     std::unordered_map<std::string, std::shared_ptr<PerKey>> keys_;          // spark_key -> per-key
