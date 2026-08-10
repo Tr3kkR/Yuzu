@@ -2059,8 +2059,11 @@ public:
         // (bounded cardinality only). NOT wired to an increment site by this
         // change — the human confirm-rotation REST/MCP handlers are a sibling
         // piece (P1); this registers + pre-seeds the family they will
-        // increment.
-        metrics_.describe("yuzu_api_token_confirm_total",
+        // increment. The name is the `kApiTokenConfirmTotalMetric` symbol
+        // (rotation_sweep_naming.hpp), not a repeated string literal, so the
+        // sibling's increment call site and this registration can never
+        // silently diverge into a shadow series.
+        metrics_.describe(kApiTokenConfirmTotalMetric,
                           "Human API-token rotation confirm outcomes by surface (rest|mcp) and "
                           "result (success|conflict|client_error|transient); store-reaching calls "
                           "only, pre-store denials excluded - the human-owned twin of "
@@ -2068,7 +2071,7 @@ public:
                           "counter");
         for (auto surface : {"rest", "mcp"}) {
             for (auto result : {"success", "conflict", "client_error", "transient"}) {
-                metrics_.counter("yuzu_api_token_confirm_total",
+                metrics_.counter(kApiTokenConfirmTotalMetric,
                                  {{"surface", surface}, {"result", result}});
             }
         }

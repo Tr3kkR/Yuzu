@@ -24,6 +24,7 @@
 #include <string>
 #include <string_view>
 
+using yuzu::server::kApiTokenConfirmTotalMetric;
 using yuzu::server::kEngineRotationSweepNames;
 using yuzu::server::kHumanRotationSweepNames;
 using yuzu::server::rotation_sweep_names_for_kind;
@@ -83,4 +84,11 @@ TEST_CASE("rotation_sweep_names_for_kind: anything other than the literal 'engin
     CHECK(&rotation_sweep_names_for_kind("") == &kHumanRotationSweepNames);
     CHECK(&rotation_sweep_names_for_kind("bogus") == &kHumanRotationSweepNames);
     CHECK(&rotation_sweep_names_for_kind("Engine") == &kHumanRotationSweepNames); // case-sensitive
+}
+
+TEST_CASE("kApiTokenConfirmTotalMetric: exported symbol matches the registered/pre-seeded "
+          "name — the compile-time seam a REST-side increment call site now shares "
+          "instead of a hand-copied string literal",
+          "[server][rotation][telemetry][principal_kind]") {
+    CHECK(std::string(kApiTokenConfirmTotalMetric) == "yuzu_api_token_confirm_total");
 }

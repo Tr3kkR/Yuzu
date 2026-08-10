@@ -68,4 +68,15 @@ constexpr const RotationSweepNames& rotation_sweep_names_for_kind(std::string_vi
     return principal_kind == "engine" ? kEngineRotationSweepNames : kHumanRotationSweepNames;
 }
 
+/// Human-owned twin of `yuzu_engine_principal_confirm_total` (#2404) —
+/// registered + pre-seeded alongside the four names above, but NOT one of
+/// them: it is not per-swept-row telemetry (the T12 sweep never confirms
+/// anything), it is incremented by the human confirm-rotation REST/MCP
+/// handlers (a sibling piece, not wired here). Exported as a symbol rather
+/// than left as a string literal at each call site so a typo on either side
+/// (registration here vs. the increment call the sibling piece adds) is a
+/// compile error instead of a silently-diverging shadow series sitting next
+/// to a pre-seeded family that looks perfectly healthy at 0.
+inline constexpr const char* kApiTokenConfirmTotalMetric = "yuzu_api_token_confirm_total";
+
 } // namespace yuzu::server
