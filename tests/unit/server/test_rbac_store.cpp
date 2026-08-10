@@ -1263,6 +1263,65 @@ TEST_CASE("RbacStore: migrate_from_sqlite backfills operator config, idempotentl
     CHECK(pr.size() == 1);
 }
 
+// adversarial-review (PR #2703, BLOCKER, both Kimi and Codex independently):
+// docs/postgres-store-playbook.md "Local source absence never creates
+// terminal migration state on its own" (#2697). A replica with no local
+// legacy file stamping the SHARED backfill_complete marker must not let a
+// SIBLING replica that genuinely holds the legacy file silently skip its
+// own migration — the fix is holder-side fingerprint verification, and this
+// is the regression test for the exact scenario both reviewers described.
+TEST_CASE("RbacStore: migrate_from_sqlite refuses a marker stamped by a sourceless sibling when "
+          "this replica genuinely holds the legacy file (adversarial-review #2703)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    // "Replica A" — no local legacy file, stamps the shared marker with the
+    // sourceless sentinel fingerprint.
+    CHECK(store.migrate_from_sqlite("/nonexistent/path/rbac.db"));
+
+    // "Replica B" — same shared Postgres (rbac_pool_fx_), but this one
+    // genuinely holds a legacy file with real, non-empty operator content.
+    RbacStore replica_b{rbac_pool_fx_};
+    REQUIRE(replica_b.is_open());
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_sourceless_race-"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_rbac_db(legacy.path, /*enabled=*/true);
+
+    // Must refuse — the marker's fingerprint ("sourceless") cannot match
+    // this replica's real content.
+    CHECK_FALSE(replica_b.migrate_from_sqlite(legacy.path));
+    // The legacy file must survive the refusal untouched (never silently
+    // discarded/moved aside on a refused backfill).
+    CHECK(std::filesystem::exists(legacy.path));
+    // And replica B's own rbac_enabled=true legacy intent was never applied
+    // fleet-wide — the whole point of refusing before that write.
+    CHECK_FALSE(replica_b.is_rbac_enabled());
+}
+
+// The positive counterpart: a replica whose OWN legacy file is still present
+// after ITS OWN completed migration (e.g. the move-aside rename failed) must
+// verify as a MATCH and skip re-migrating, not refuse.
+TEST_CASE("RbacStore: migrate_from_sqlite verifies a matching fingerprint when this replica's "
+          "own already-migrated legacy file is still present (adversarial-review #2703)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_fp_match-"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_rbac_db(legacy.path, /*enabled=*/false);
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+    CHECK_FALSE(std::filesystem::exists(legacy.path)); // moved aside as usual
+
+    // Recreate a file with IDENTICAL logical content at the same path —
+    // simulating a failed move-aside on a real restart, where the original
+    // file is still sitting there holding the SAME content already migrated.
+    make_legacy_rbac_db(legacy.path, /*enabled=*/false);
+    RbacStore reopened{rbac_pool_fx_};
+    REQUIRE(reopened.is_open());
+    CHECK(reopened.migrate_from_sqlite(legacy.path));
+    // Verified, not re-migrated: no duplicate assignment rows.
+    auto pr = reopened.get_principal_roles("user", "alice");
+    CHECK(pr.size() == 1);
+}
+
 // THE CRITICAL CLAUSE (ADR-0041): losing the rbac_enabled flag silently reverts
 // the fleet to RBAC-off = catastrophic fail-open. An ENABLED legacy DB must come
 // up ENABLED even though the fresh PG store seeds the default 'false' first.

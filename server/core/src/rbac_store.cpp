@@ -13,6 +13,7 @@
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
+#include <openssl/evp.h>
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
@@ -363,6 +364,128 @@ std::string sqlite_text(sqlite3_stmt* s, int col) {
 
 // Bind the SQL boolean literal for a legacy INTEGER is_system value.
 const char* bool_lit(std::int64_t v) { return v != 0 ? "true" : "false"; }
+
+std::string sha256_hex(std::string_view in) {
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int len = 0;
+    if (EVP_Digest(in.data(), in.size(), md, &len, EVP_sha256(), nullptr) != 1)
+        return {};
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(static_cast<std::size_t>(len) * 2);
+    for (unsigned int i = 0; i < len; ++i) {
+        out.push_back(kHex[md[i] >> 4]);
+        out.push_back(kHex[md[i] & 0x0f]);
+    }
+    return out;
+}
+
+// adversarial-review (PR #2703, BLOCKER — verified against the code and the
+// documented anti-pattern before fixing): `docs/postgres-store-playbook.md`
+// "Local source absence never creates terminal migration state on its own"
+// (ADR-0040 round 3, Sol's diagnosis, #2697). A process finding no local
+// legacy file cannot tell "genuine fresh install" from "a sibling replica
+// holds the real one" — stamping the SHARED `backfill_complete` marker from
+// that observation alone let a fileless replica permanently foreclose
+// migration for a sibling that boots later with the real `rbac.db` still on
+// disk. `AuditStore::migrate_from_sqlite` is the fixed reference (fingerprint
+// stamped alongside the marker; a later holder verifies its own file against
+// it before trusting the marker) — this is the same pattern, right-sized for
+// RbacStore's small, single-shot (non-resumable) legacy dataset.
+constexpr const char* kSourcelessFingerprint = "sourceless";
+
+// Deterministic content fingerprint for a legacy rbac.db, independent of
+// on-disk row order (WAL/vacuum state can reorder identical rows without
+// changing their meaning) — every row is read into a canonical, sorted,
+// delimited form before hashing. Returns `kSourcelessFingerprint` for a
+// legacy file with no `roles` table (no operator content — the same "nothing
+// to protect" class as no local file at all, per the anti-pattern above).
+// Returns `nullopt` only on a corrupt/unreadable file — the caller MUST fail
+// closed on that, never treat it as sourceless-equivalent.
+std::optional<std::string> legacy_rbac_fingerprint(const std::filesystem::path& legacy_db_path) {
+    SqliteDb legacy;
+    if (sqlite3_open_v2(legacy_db_path.string().c_str(), legacy.addr(), SQLITE_OPEN_READONLY,
+                        nullptr) != SQLITE_OK)
+        return std::nullopt;
+    sqlite3_exec(legacy.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
+    {
+        SqliteStmt probe;
+        if (sqlite3_prepare_v2(legacy.get(), "SELECT count(*) FROM sqlite_master", -1, probe.addr(),
+                               nullptr) != SQLITE_OK ||
+            sqlite3_step(probe.get()) != SQLITE_ROW)
+            return std::nullopt;
+    }
+    if (!legacy_has_table(legacy.get(), "roles"))
+        return std::string(kSourcelessFingerprint);
+
+    std::string legacy_enabled = "false";
+    if (legacy_has_table(legacy.get(), "rbac_config")) {
+        SqliteStmt s;
+        if (sqlite3_prepare_v2(legacy.get(), "SELECT value FROM rbac_config WHERE key='enabled'", -1,
+                               s.addr(), nullptr) == SQLITE_OK &&
+            sqlite3_step(s.get()) == SQLITE_ROW) {
+            // Raw text, not the strict canonical-bool parse the real migration
+            // path uses: this fingerprint only needs to detect a CONTENT
+            // difference, not validate canonicality — that check stays the
+            // main path's job (fjarvis F2) and must not be duplicated here.
+            legacy_enabled = sqlite_text(s.get(), 0);
+        }
+    }
+
+    const auto read_all = [&](const char* sql,
+                              const std::function<void(sqlite3_stmt*)>& row) -> bool {
+        SqliteStmt s;
+        if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK)
+            return false;
+        int rc;
+        while ((rc = sqlite3_step(s.get())) == SQLITE_ROW)
+            row(s.get());
+        return rc == SQLITE_DONE;
+    };
+
+    std::vector<std::string> rows;
+    bool read_ok = true;
+    read_ok &= read_all("SELECT name, description, is_system, created_at FROM roles",
+                       [&](sqlite3_stmt* s) {
+                           rows.push_back("role|" + sqlite_text(s, 0) + "|" + sqlite_text(s, 1) +
+                                          "|" + std::to_string(sqlite3_column_int64(s, 2)) + "|" +
+                                          std::to_string(sqlite3_column_int64(s, 3)));
+                       });
+    read_ok &= read_all("SELECT role_name, securable_type, operation, effect FROM role_permissions",
+                       [&](sqlite3_stmt* s) {
+                           rows.push_back("perm|" + sqlite_text(s, 0) + "|" + sqlite_text(s, 1) +
+                                          "|" + sqlite_text(s, 2) + "|" + sqlite_text(s, 3));
+                       });
+    read_ok &= read_all("SELECT principal_type, principal_id, role_name FROM principal_roles",
+                       [&](sqlite3_stmt* s) {
+                           rows.push_back("principal|" + sqlite_text(s, 0) + "|" +
+                                          sqlite_text(s, 1) + "|" + sqlite_text(s, 2));
+                       });
+    if (legacy_has_table(legacy.get(), "groups"))
+        read_ok &= read_all(
+            "SELECT name, description, source, external_id, created_at FROM groups",
+            [&](sqlite3_stmt* s) {
+                const std::string ext =
+                    sqlite3_column_type(s, 3) != SQLITE_NULL ? sqlite_text(s, 3) : "";
+                rows.push_back("group|" + sqlite_text(s, 0) + "|" + sqlite_text(s, 1) + "|" +
+                               sqlite_text(s, 2) + "|" + ext + "|" +
+                               std::to_string(sqlite3_column_int64(s, 4)));
+            });
+    if (legacy_has_table(legacy.get(), "group_members"))
+        read_ok &= read_all("SELECT group_name, username FROM group_members",
+                           [&](sqlite3_stmt* s) {
+                               rows.push_back("member|" + sqlite_text(s, 0) + "|" +
+                                              sqlite_text(s, 1));
+                           });
+    if (!read_ok)
+        return std::nullopt;
+
+    std::sort(rows.begin(), rows.end());
+    std::string canon = "enabled=" + legacy_enabled + "\n";
+    for (const auto& r : rows)
+        canon += r + "\n";
+    return sha256_hex(canon);
+}
 
 } // namespace
 
@@ -2178,23 +2301,65 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
             metrics_->counter("yuzu_server_rbac_backfill_total", {{"result", result}}).increment();
     };
 
-    const auto stamp_complete = [&]() -> bool {
-        return pool_.with_txn_for(kBackfillTxnTimeout, [](PGconn* c) -> bool {
-            pg::PgResult mk = pg::exec_params(
-                c,
-                "INSERT INTO rbac_store.rbac_meta (key, value) VALUES ('backfill_complete', $1) "
-                "ON CONFLICT (key) DO NOTHING",
-                std::vector<std::string>{std::to_string(now_secs())});
-            if (mk.status() != PGRES_COMMAND_OK) {
-                spdlog::error("RbacStore: migrate_from_sqlite: marker stamp failed: {}",
-                              PQerrorMessage(c));
-                return false;
-            }
-            return true;
-        });
+    // adversarial-review (PR #2703, BLOCKER — sourceless-marker anti-pattern,
+    // docs/postgres-store-playbook.md "Local source absence never creates
+    // terminal migration state on its own", #2697): the marker and its
+    // source fingerprint are ALWAYS stamped together, in the SAME
+    // transaction, matching AuditStore's fixed reference. The PQcmdTuples
+    // check on the fingerprint insert is the same anti-pattern rule this
+    // playbook lists separately ("trusting PGRES_COMMAND_OK on ON CONFLICT
+    // DO NOTHING to mean YOUR value won") — a lost race here means some
+    // OTHER writer's fingerprint is now the trust anchor, not this call's.
+    const auto stamp_complete = [&](std::string_view source_fingerprint) -> bool {
+        return pool_.with_txn_for(
+            kBackfillTxnTimeout, [source_fingerprint](PGconn* c) -> bool {
+                pg::PgResult mk = pg::exec_params(
+                    c,
+                    "INSERT INTO rbac_store.rbac_meta (key, value) VALUES "
+                    "('backfill_complete', $1) ON CONFLICT (key) DO NOTHING",
+                    std::vector<std::string>{std::to_string(now_secs())});
+                if (mk.status() != PGRES_COMMAND_OK) {
+                    spdlog::error("RbacStore: migrate_from_sqlite: marker stamp failed: {}",
+                                  PQerrorMessage(c));
+                    return false;
+                }
+                pg::PgResult fp = pg::exec_params(
+                    c,
+                    "INSERT INTO rbac_store.rbac_meta (key, value) VALUES "
+                    "('backfill_source_fingerprint', $1) ON CONFLICT (key) DO NOTHING",
+                    std::vector<std::string>{std::string(source_fingerprint)});
+                if (fp.status() != PGRES_COMMAND_OK) {
+                    spdlog::error(
+                        "RbacStore: migrate_from_sqlite: source-fingerprint stamp failed: {}",
+                        PQerrorMessage(c));
+                    return false;
+                }
+                if (std::string(PQcmdTuples(fp.get())) == "0") {
+                    spdlog::error(
+                        "RbacStore: migrate_from_sqlite: lost the race to record this backfill's "
+                        "own source fingerprint — another writer already stamped "
+                        "backfill_source_fingerprint between this pass's marker-absent check and "
+                        "this commit. Refusing to report success; a retry will find the marker "
+                        "present and go through holder-side fingerprint verification instead.");
+                    return false;
+                }
+                return true;
+            });
     };
 
-    // 1. Idempotency marker (short-lived lease released before any legacy I/O).
+    // 1. Local legacy-file presence (cheap stat) — checked BEFORE the marker
+    // lookup so step 2 knows whether THIS replica has something to verify a
+    // pre-existing marker against.
+    std::error_code ec;
+    const bool legacy_exists = std::filesystem::exists(legacy_db_path, ec);
+    if (ec) {
+        spdlog::error("RbacStore: migrate_from_sqlite: cannot stat legacy path {}: {}",
+                      legacy_db_path.string(), ec.message());
+        backfill_metric("failed");
+        return false;
+    }
+
+    // 2. Idempotency marker (short-lived lease released before any legacy I/O).
     {
         auto lease = pool_.acquire();
         if (!lease) {
@@ -2204,7 +2369,9 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
             return false;
         }
         pg::PgResult mk = pg::exec_params(
-            lease.get(), "SELECT 1 FROM rbac_store.rbac_meta WHERE key='backfill_complete'",
+            lease.get(),
+            "SELECT key, value FROM rbac_store.rbac_meta WHERE key IN "
+            "('backfill_complete', 'backfill_source_fingerprint')",
             std::vector<std::string>{});
         if (mk.status() != PGRES_TUPLES_OK) {
             spdlog::error("RbacStore: migrate_from_sqlite: marker lookup failed: {}",
@@ -2212,24 +2379,62 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
             backfill_metric("failed");
             return false;
         }
-        if (PQntuples(mk.get()) > 0) {
-            spdlog::debug("RbacStore: migrate_from_sqlite already completed, skipping");
+        bool marker_present = false;
+        std::optional<std::string> stored_fingerprint;
+        for (int i = 0; i < PQntuples(mk.get()); ++i) {
+            const std::string key = text_col(mk.get(), i, 0);
+            if (key == "backfill_complete")
+                marker_present = true;
+            else if (key == "backfill_source_fingerprint")
+                stored_fingerprint = text_col(mk.get(), i, 1);
+        }
+        if (marker_present) {
+            if (!legacy_exists) {
+                spdlog::debug("RbacStore: migrate_from_sqlite already completed, skipping");
+                return true;
+            }
+            // This replica still holds a local legacy file even though the
+            // fleet marker is already set — verify it was actually the file
+            // that got migrated before trusting the marker. A sourceless
+            // writer's placeholder can never match a real file's fingerprint,
+            // which is exactly what catches the anti-pattern this fix closes.
+            const auto verify_fp = legacy_rbac_fingerprint(legacy_db_path);
+            if (!verify_fp) {
+                spdlog::error(
+                    "RbacStore: migrate_from_sqlite: backfill_complete is already set, and this "
+                    "replica's own legacy db {} exists but is unreadable/corrupt while being "
+                    "fingerprint-verified against it — refusing (fail-closed; never silently "
+                    "trust a marker over an unverifiable local file)",
+                    legacy_db_path.string());
+                backfill_metric("failed");
+                return false;
+            }
+            if (stored_fingerprint != *verify_fp) {
+                spdlog::error(
+                    "RbacStore: migrate_from_sqlite: HOLDER-SIDE VERIFICATION FAILED — "
+                    "backfill_complete is already set (source fingerprint '{}') but this "
+                    "replica's own legacy db {} fingerprints as '{}' — this marker was NOT "
+                    "stamped for this replica's data (docs/postgres-store-playbook.md anti-"
+                    "pattern 'Local source absence never creates terminal migration state on "
+                    "its own', #2697). Refusing to silently accept a completion this replica's "
+                    "roles/grants/groups were never part of. Manual reconciliation required — "
+                    "do not delete this file.",
+                    stored_fingerprint.value_or("<absent>"), legacy_db_path.string(), *verify_fp);
+                backfill_metric("failed");
+                return false;
+            }
+            spdlog::debug("RbacStore: migrate_from_sqlite already completed (fingerprint "
+                         "verified), skipping");
             return true;
         }
     }
 
-    // 2. Legacy present?
-    std::error_code ec;
-    const bool legacy_exists = std::filesystem::exists(legacy_db_path, ec);
-    if (ec) {
-        spdlog::error("RbacStore: migrate_from_sqlite: cannot stat legacy path {}: {}",
-                      legacy_db_path.string(), ec.message());
-        backfill_metric("failed");
-        return false;
-    }
     if (!legacy_exists) {
         // Fresh install — the seeded default rbac_enabled='false' is correct.
-        if (!stamp_complete()) {
+        // Fingerprint is the sourceless sentinel, not skipped: a later
+        // process that DOES hold a legacy file must be able to tell this
+        // marker was never derived from any real content.
+        if (!stamp_complete(kSourcelessFingerprint)) {
             backfill_metric("failed");
             return false;
         }
@@ -2270,7 +2475,9 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
         }
     }
     if (!legacy_has_table(legacy.get(), "roles")) {
-        if (!stamp_complete()) {
+        // No operator content here either — same "nothing to protect" class
+        // as no local file at all (kSourcelessFingerprint, not skipped).
+        if (!stamp_complete(kSourcelessFingerprint)) {
             backfill_metric("failed");
             return false;
         }
@@ -2729,8 +2936,20 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                      legacy_counts.groups, legacy_counts.members, pr, pp, ppr, pg_, pm);
     }
 
-    // 7. Stamp the one-time marker.
-    if (!stamp_complete()) {
+    // 7. Stamp the one-time marker with THIS file's real fingerprint — a
+    // second read pass (the file is still open at legacy_db_path, not yet
+    // moved aside), reusing the exact same canonicalization the holder-side
+    // verification path above uses, so a later boot of this same replica
+    // (if the move-aside below fails) fingerprints identically and matches.
+    const auto source_fp = legacy_rbac_fingerprint(legacy_db_path);
+    if (!source_fp) {
+        spdlog::error("RbacStore: migrate_from_sqlite: could not re-derive this file's own "
+                      "fingerprint immediately after successfully backfilling it; refusing to "
+                      "stamp complete without a trust anchor");
+        backfill_metric("failed");
+        return false;
+    }
+    if (!stamp_complete(*source_fp)) {
         backfill_metric("failed");
         return false;
     }
