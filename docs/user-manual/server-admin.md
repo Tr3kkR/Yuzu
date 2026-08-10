@@ -654,10 +654,15 @@ Three operator-visible consequences:
 - **Per-principal ceiling.** `--mcp-max-streams-per-principal` governs the GET
   channel. The streamed-POST allowance is a fixed 4 concurrent calls per
   principal — numerically the same as, but counted and enforced separately
-  from, any single session's own replay-ring pin-slot count — so the real
-  per-principal held-open ceiling across both channels is
-  `--mcp-max-streams-per-principal + 4`. Lowering the flag to contain a noisy
-  principal does not reduce its streamed-POST concurrency.
+  from, any single session's own replay-ring pin-slot count — so the
+  steady-state per-principal held-open sum across both channels is
+  `--mcp-max-streams-per-principal + 4`. That sum is not a hard ceiling: a
+  GET-channel reconnect keeps the superseded connection's count until it
+  finishes draining, and `McpStreamState` bounds this to one pending handover
+  per *session*, not per principal — a principal with every one of its GET
+  sessions mid-handover at once can transiently double the GET component.
+  Lowering the flag to contain a noisy principal does not reduce its
+  streamed-POST concurrency.
 - **Reverse proxies.** The response sets `X-Accel-Buffering: no`, which only nginx
   honours. Envoy, HAProxy, ALB and Cloudflare need their own no-buffering opt-out,
   or the stream is buffered and dead clients are not detected.
@@ -682,9 +687,10 @@ per-principal bullets above because they are no longer conditional on opting in
   the GET channel alone. This was previously only a concern for operators who
   had explicitly enabled the flag; it is now the default posture for every
   deployment that takes no action.
-- **A principal's real held-open ceiling is `--mcp-max-streams-per-principal +
-  4`**, universally — the streamed-POST allowance is no longer contingent on
-  opting in.
+- **A principal's steady-state held-open sum is `--mcp-max-streams-per-principal
+  + 4`**, universally — the streamed-POST allowance is no longer contingent on
+  opting in. That sum is not a hard ceiling (see the Per-principal ceiling
+  bullet above for the GET-reconnect transient).
 
 **To opt out**, pass `--no-mcp-streamed-post` (or set
 `YUZU_MCP_ENABLE_STREAMED_POST=false`) to keep the pre-flip plain-POST-only

@@ -1095,8 +1095,12 @@ in a tight loop — the cap is protecting the worker pool that also serves your 
 >   on the same session), that sum can be transiently exceeded: a stream
 >   mid-handover counts twice against the GET-channel allowance — the
 >   superseded connection until it finishes draining, and the replacement
->   once admitted — and `McpStreamState` allows at most one pending handover
->   per session, so the overshoot is at most one extra count. Remediation: wait for one of your streamed calls to finish, or resend
+>   once admitted. `McpStreamState` bounds this to at most one pending
+>   handover **per session**, not per principal — a principal holding its
+>   full `--mcp-max-streams-per-principal` GET sessions could in the worst
+>   case have every one of them mid-handover at once, so the GET-channel
+>   component of the aggregate can transiently reach twice
+>   `--mcp-max-streams-per-principal`, not just one extra. Remediation: wait for one of your streamed calls to finish, or resend
 >   the same request without an SSE-capable `Accept` for a plain
 >   (non-streamed) response.
 >

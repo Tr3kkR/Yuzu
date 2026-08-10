@@ -795,7 +795,7 @@ struct McpTestServer {
     /// streamed tests exercise the streamed path - without this every one of them
     /// would silently take the plain path and pass while proving nothing. The two
     /// defaults matching is not load-bearing; do not assume they will stay in sync
-    /// without checking (see the harness/Config binding test above the dormancy
+    /// without checking (see the harness/Config binding test above the opt-out
     /// TEST_CASE below). A test that wants the opt-out (--no-mcp-streamed-post)
     /// posture sets this false explicitly.
     bool streamed_post_enabled_{true};
