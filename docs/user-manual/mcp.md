@@ -470,25 +470,53 @@ for the tool to execute.
 | 67 | `get_access_review` (SOC 2 CC6.2) | Full evidentiary state of one review campaign: metadata plus every frozen attestation row (`pending`/`attested`/`flagged_revoke`) plus `pending_count`. Mirrors `GET /api/v1/access-reviews/{id}`. Self-audited as `access_review.get`. | `AccessReview:Read` |
 | 68 | `list_access_reviews` (SOC 2 CC6.2) | List every review campaign's metadata (**not** its attestations — use `get_access_review` for those), newest-first, capped at the most recent 500. The surface an auditor needs to prove reviews ran on cadence without already knowing a `campaign_id` out-of-band. Mirrors `GET /api/v1/access-reviews`. Self-audited as `access_review.list`. | `AccessReview:Read` |
 | 69 | `close_access_review` (SOC 2 CC6.2) | Close an open review campaign. Does **not** require every attestation to be decided first — a campaign closed with `pending` rows still outstanding is itself evidence (an incomplete review), not something this tool silently forces to completion. Closing is a **one-way lifecycle transition** (there is no reopen path) that permanently freezes every still-`pending` attestation — `destructiveHint:true`. It deletes no evidence (attestation rows are untouched), but the campaign's own `open`→`closed` state is irreversibly transitioned, which is what the hint reflects (corrected from a shipped `destructiveHint:false` — 2g PR 2). Mirrors `POST /api/v1/access-reviews/{id}/close`. Self-audited as `access_review.closed`. | `AccessReview:Attest` |
-| 70 | `rotate_api_token` (P2 #11, SOC 2 CC6.3) | Self-service overlap-pair rotation of a **human-owned** API token: mints a successor token alongside the still-valid predecessor for the overlap window (default+minimum 7 days, floor 24h — arg `overlap_days`, 1–3650, rejected outright — never truncated — below the floor). BOUNDED-IDEMPOTENT, not generally idempotent: a re-call within a short grace window after the original mint re-serves the SAME successor secret (each reveal — original or replay — is independently audited as `api_token.reveal`); past the grace window a re-call errors and the caller falls back to an explicit new token. Self-service ONLY: the caller must own the `token_id` being rotated — no admin override; an unknown `token_id` and a not-owned one are indistinguishable (`kInvalidParams`, "token not found" — not an enumeration oracle). The successor **always** inherits the predecessor's `expires_at` verbatim — not a caller argument. **Wire-shape divergence from the REST twin (deliberate):** REST takes `overlap_secs`, this tool takes `overlap_days` (matching `rotate_engine_credential`'s MCP shape) — bounds are checked BEFORE the `*86400` multiply as an overflow guard. The returned `token_id` is the successor's, resolved via the shared `derive_rotation_successor` helper (`token_rotation_lookup.hpp`) scoped exactly to the predecessor rotated — never "any linked row of this principal", which is unsound once a principal has more than one rotation in flight (this human arm's ceiling is ≤2 active **per rotation group**, unlike the engine arm's ≤2-active-**per-principal**); a lookup miss right after a successful rotate fails CLOSED (retryable error, never a success with an empty `token_id`) rather than risk pairing the real secret with the wrong id. `overlap_expires_at` is the **predecessor's** own stamp (the successor row never carries one). Mirrors `POST /api/v1/tokens/{id}/rotate`. Destructive — requires the `operator` tier (self-service, no approval gate — see the tier note below). | `ApiToken:Write` |
-| 71 | `confirm_api_token_rotation` (P2 #11, SOC 2 CC6.3) | Explicit maker-checker confirmation that a rotated API token's successor secret has been received/installed. Distinct from `rotate_api_token` itself — rotate is the "here is the secret" reveal step; confirm is a separate attestation that closes the loop. `token_id` is the **successor** `token_id` the rotate call returned — the confirm is pinned to that exact rotation, and a stale or mismatched id is rejected with no state change, so a blind retry can never confirm a later rotation. A confirm replayed **after its own rotation resolved** returns a *terminal* already-confirmed/already-resolved conflict (`kInvalidParams`), never a retryable error. Self-service ONLY, same owner-vs-nonexistent posture as `rotate_api_token`. Mirrors `POST /api/v1/tokens/{id}/confirm`. Destructive — requires the `operator` tier. | `ApiToken:Write` |
+| 70 | `rotate_api_token` (P2 #11, SOC 2 CC6.3) | Self-service overlap-pair rotation of a **human-owned** API token: mints a successor token alongside the still-valid predecessor for the overlap window (default+minimum 7 days, floor 24h — arg `overlap_days`, 1–3650, rejected outright — never truncated — below the floor). BOUNDED-IDEMPOTENT, not generally idempotent: a re-call within a short grace window after the original mint re-serves the SAME successor secret (each reveal — original or replay — is independently audited as `api_token.reveal`); past the grace window a re-call errors and the caller falls back to an explicit new token. Self-service ONLY: the caller must own the `token_id` being rotated — no admin override; an unknown `token_id` and a not-owned one are indistinguishable (`kInvalidParams`, "token not found" — not an enumeration oracle). The successor **always** inherits the predecessor's `expires_at` verbatim — not a caller argument. **Wire-shape divergence from the REST twin (deliberate):** REST takes `overlap_secs`, this tool takes `overlap_days` (matching `rotate_engine_credential`'s MCP shape) — bounds are checked BEFORE the `*86400` multiply as an overflow guard. The returned `token_id` is the successor's, resolved via the shared `derive_rotation_successor` helper (`token_rotation_lookup.hpp`) scoped exactly to the predecessor rotated — never "any linked row of this principal", which is unsound once a principal has more than one rotation in flight (this human arm's ceiling is ≤2 active **per rotation group**, unlike the engine arm's ≤2-active-**per-principal**); a lookup miss right after a successful rotate fails CLOSED (retryable error, never a success with an empty `token_id`) rather than risk pairing the real secret with the wrong id. `overlap_expires_at` is the **predecessor's** own stamp (the successor row never carries one). Mirrors `POST /api/v1/tokens/{id}/rotate`. Destructive — requires the `operator` tier (self-service, no approval gate — see the tier note below). | `ApiToken:Rotate` |
+| 71 | `confirm_api_token_rotation` (P2 #11, SOC 2 CC6.3) | Explicit maker-checker confirmation that a rotated API token's successor secret has been received/installed. Distinct from `rotate_api_token` itself — rotate is the "here is the secret" reveal step; confirm is a separate attestation that closes the loop. `token_id` is the **successor** `token_id` the rotate call returned — the confirm is pinned to that exact rotation, and a stale or mismatched id is rejected with no state change, so a blind retry can never confirm a later rotation. A confirm replayed **after its own rotation resolved** returns a *terminal* already-confirmed/already-resolved conflict (`kInvalidParams`), never a retryable error. Self-service ONLY, same owner-vs-nonexistent posture as `rotate_api_token`. Mirrors `POST /api/v1/tokens/{id}/confirm`. Destructive — requires the `operator` tier. | `ApiToken:Rotate` |
 
 > **`rotate_api_token`/`confirm_api_token_rotation` tier behavior (P2 #11, SOC 2
-> CC6.3) — deliberately NOT the engine-credential arm's answer:** both map to
-> `ApiToken:Write`, reachable at the **`operator`** tier (`mcp_policy.hpp`'s
-> `tier_allows` carries an explicit `ApiToken:Write` allowance for `operator`,
-> alongside the existing Tag Write/Delete and Execution/Execute cases) —
-> **not** `supervised`-only like the engine credential arm's `Security:Write`.
-> This is a deliberate tier choice, not an oversight: rotation here is
-> self-service — `ApiTokenStore::rotate_token`/`confirm_token_rotation` reject
-> at the STORE layer unless `requesting_user` equals the resolved token row's
-> own `principal_id`, so the caller can only ever touch their own credential,
-> the same "can only touch your own resource" shape as the `operator` tier's
-> existing Tag allowance. Neither tool is **approval-gated**:
-> `requires_approval()` has no `ApiToken` rule, so no `kApprovalRequired`
-> ticket-then-recall step applies at any tier — matching the REST twin, which
-> needs no admin approval either (only step-up MFA, enforced on REST alone;
-> the MCP surface has no step-up concept). `requesting_user` is **always**
+> CC6.3) — deliberately NOT the engine-credential arm's answer, and NOT plain
+> `ApiToken:Write` either (round-4 security finding):** both tools map to
+> **`ApiToken:Rotate`**, a DISTINCT RBAC operation from the ordinary
+> `ApiToken:Write` that gates `POST /api/v1/tokens` (create) and its settings
+> twin. `mcp_policy.hpp`'s `tier_allows` carries an explicit `ApiToken:Rotate`
+> allowance for the **`operator`** tier, alongside the existing Tag
+> Write/Delete and Execution/Execute cases — **not** `supervised`-only like
+> the engine credential arm's `Security:Write`. This is a deliberate tier
+> choice, not an oversight: rotation here is self-service —
+> `ApiTokenStore::rotate_token`/`confirm_token_rotation` reject at the STORE
+> layer unless `requesting_user` equals the resolved token row's own
+> `principal_id`, so the caller can only ever touch their own credential, the
+> same "can only touch your own resource" shape as the `operator` tier's
+> existing Tag allowance.
+>
+> **Why a distinct operation, not a securable-wide `ApiToken:Write` allowance
+> (the shape a first fix attempt shipped and a security review caught):**
+> mcp_server.cpp's tools/call dispatch runs a GENERIC tier+approval gate for
+> every tool, keyed on the tool's registered `(securable_type, operation)`
+> pair — it is NOT possible to admit "only these two tools" at the operator
+> tier by widening `ApiToken:Write` itself, because `AuthRoutes::
+> require_permission`/`require_scoped_permission` (`auth_routes.cpp`) consult
+> the SAME `tier_allows()` for every REST route authenticated with an
+> MCP-tiered token. A securable-wide `ApiToken:Write` allowance for
+> `operator` would (and, for one round, did) also admit an operator-tier
+> token to REST `POST /api/v1/tokens` — which lets the caller choose the new
+> token's own `mcp_tier` (including omitting it, minting an untiered,
+> perpetual token) — a privilege escalation, not the self-service allowance
+> intended. `ApiToken:Rotate` is a NEW, separate operation seeded ONLY to
+> `Administrator` and `ApiTokenManager` (same population that already holds
+> `ApiToken:Write` — this taxonomy addition changes no role's RBAC-on access)
+> and mapped ONLY by these two tools' `kToolSecurityRows` entries and the
+> REST rotate/confirm routes' `perm_fn` calls — `ApiToken:Write` itself is
+> completely untouched, so `POST /api/v1/tokens` and its settings twin stay
+> supervised-tier-only. This also gives TRUE REST/MCP parity: an
+> operator-tier token can now reach REST
+> `POST /api/v1/tokens/{id}/rotate`/`/confirm` too.
+>
+> Neither tool is **approval-gated**: `requires_approval()` has no `ApiToken`
+> rule at all (for either operation), so no `kApprovalRequired` ticket-then-
+> recall step applies at any tier — matching the REST twin, which needs no
+> admin approval either (only step-up MFA, enforced on REST alone; the MCP
+> surface has no step-up concept). `requesting_user` is **always**
 > `session->username`, the authenticated MCP principal — never a tool
 > argument.
 

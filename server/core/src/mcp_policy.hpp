@@ -26,27 +26,59 @@ inline bool tier_allows(std::string_view mcp_tier,
     }
 
     // ── operator: Read + limited Write/Delete on tags ───────────────────
+    //
+    // ROUND-3 FINDING (security-critical, corrected twice):
+    //
+    // Attempt 1 added `if (securable_type == "ApiToken" && operation ==
+    // "Write") return true;` here to admit rotate_api_token/
+    // confirm_api_token_rotation at the operator tier. That was WRONG:
+    // tier_allows() is keyed on (securable_type, operation), not on the
+    // tool/route — `AuthRoutes::require_permission`/`require_scoped_permission`
+    // (auth_routes.cpp) consult this SAME function for EVERY transport, so
+    // the rule admitted every ApiToken:Write surface, not just the two
+    // rotation tools: REST `POST /api/v1/tokens` (create_token, ApiToken:Write
+    // and nothing else) and its settings twin `POST /api/settings/api-tokens`
+    // both widened to operator-tier tokens. The escalation completes because
+    // mcp_tier is CALLER-CHOSEN at token creation and an OMITTED mcp_tier
+    // mints an untiered, perpetual token — after which every future call
+    // skips this function entirely (`tier_allows` returns true immediately
+    // when `mcp_tier` is empty). Neither compensating control saves it: MFA
+    // step-up short-circuits true for api_token/mcp_token principals, and
+    // with RBAC off (the default) the legacy fallback passes because a
+    // tiered token carries its CREATOR's role — normally an admin's.
+    //
+    // Attempt 2 tried a TOOL-SCOPED exception instead — special-casing
+    // `tier == "operator"` at the two tools' own call sites in
+    // mcp_server.cpp, leaving `tier_allows()` itself supervised-only for
+    // ApiToken:Write. That is structurally unreachable: mcp_server.cpp's
+    // generic C8 gate resolves tier admission from `kToolSecurity`'s
+    // (securable_type, operation) pair for EVERY known-registered tool
+    // BEFORE any per-tool handler code runs, so a call-site-local exception
+    // never executes — the generic gate denies first, using the SAME
+    // ApiToken:Write pair every other ApiToken:Write route/tool uses.
+    //
+    // The fix is a DISTINCT OPERATION, `ApiToken:Rotate` — mapped ONLY by
+    // rotate_api_token/confirm_api_token_rotation's `kToolSecurityRows`
+    // entries (mcp_server.cpp) and the REST rotate/confirm routes' `perm_fn`
+    // calls (rest_api_v1.cpp), never by `POST /api/v1/tokens` create or its
+    // settings twin, which stay on plain `ApiToken:Write`. An operator-tier
+    // allowance on `ApiToken:Rotate` here cannot touch `ApiToken:Write` at
+    // all, on any transport, by construction — the two operations are
+    // different strings, so no shared lookup can conflate them. This also
+    // gives TRUE REST/MCP parity (an operator-tier token can now reach REST
+    // rotate/confirm too), closing the asymmetry the tool-scoped attempt
+    // would have left on record. See `docs/mcp-server.md`'s "Human
+    // API-token rotation tools" note and `rbac_store.cpp`'s seed_defaults()
+    // for the RBAC-on grant population (Administrator + ApiTokenManager,
+    // matching the pre-existing ApiToken:Write holder set).
     if (mcp_tier == "operator") {
         if (operation == "Read") return true;
         if (securable_type == "Tag" && (operation == "Write" || operation == "Delete"))
             return true;
         if (securable_type == "Execution" && operation == "Execute")
             return true;  // Operator tier executes without approval (auto-approved)
-        // Self-service human API-token rotation (P2 #11, SOC 2 CC6.3):
-        // deliberately NOT the engine-credential arm's Security:Write (which
-        // stays supervised-tier + approval-gated — a maker-checker rotation
-        // of a shared machine identity). ApiTokenStore::rotate_token/
-        // confirm_token_rotation are self-service-only at the STORE layer
-        // (reject unless requesting_user == the resolved token row's own
-        // principal_id) — the same posture as the Tag Write/Delete case
-        // above, where the caller can only ever touch their own resource.
-        // Operator tier is the right floor: it is the tier every ordinary
-        // human MCP token is expected to hold (readonly can't write
-        // anything; supervised is reserved for destructive fleet-wide ops),
-        // and requires_approval() has no ApiToken rule, so this never
-        // ticket-gates — matching REST, which needs no admin approval either.
-        if (securable_type == "ApiToken" && operation == "Write")
-            return true;
+        if (securable_type == "ApiToken" && operation == "Rotate")
+            return true;  // rotate_api_token/confirm_api_token_rotation ONLY — see above
         return false;
     }
 

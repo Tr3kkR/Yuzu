@@ -386,7 +386,22 @@ void RbacStore::seed_defaults() {
     // Administrator/ITServiceOwner/Viewer cross-type loops below never widen
     // it onto an unrelated securable — it is granted explicitly, only on
     // AccessReview, only to Administrator and the new Reviewer role.
-    const char* ops[] = {"Read", "Write", "Execute", "Delete", "Approve", "Push", "Attest"};
+    //
+    // "Rotate" (P2 #11, SOC 2 CC6.3) is ApiToken-specific — self-service
+    // overlap-pair rotation of a human-owned API token
+    // (`ApiTokenStore::rotate_token`/`confirm_token_rotation`). Same
+    // treatment as Push/Attest: a first-class operation, deliberately
+    // EXCLUDED from `crud_ops` so no cross-type loop below can ever widen it
+    // onto an unrelated securable, and DELIBERATELY DISTINCT from ApiToken's
+    // own "Write" (create/list/revoke) — a security-critical round found
+    // that reusing Write to admit the MCP rotation tools at the operator
+    // tier silently widened every OTHER ApiToken:Write route/tool too (see
+    // mcp_policy.hpp's tier_allows() operator-tier comment). Granted
+    // explicitly below to Administrator and ApiTokenManager only — the SAME
+    // population that already holds ApiToken:Write, so this taxonomy
+    // addition changes no role's effective RBAC-on access, only adds the
+    // operator-MCP-tier route to it.
+    const char* ops[] = {"Read", "Write", "Execute", "Delete", "Approve", "Push", "Attest", "Rotate"};
     const char* crud_ops[] = {"Read", "Write", "Execute", "Delete", "Approve"};
     for (auto* o : ops) {
         sqlite3_stmt* s = nullptr;
@@ -462,6 +477,14 @@ void RbacStore::seed_defaults() {
     sqlite3_exec(
         db_,
         "INSERT OR IGNORE INTO role_permissions VALUES ('Administrator', 'AccessReview', 'Attest', "
+        "'allow');",
+        nullptr, nullptr, nullptr);
+    // Administrator: Rotate on ApiToken (P2 #11, SOC 2 CC6.3) — same
+    // targeted-grant treatment as Push/Attest above; see the "Rotate"
+    // catalogue comment.
+    sqlite3_exec(
+        db_,
+        "INSERT OR IGNORE INTO role_permissions VALUES ('Administrator', 'ApiToken', 'Rotate', "
         "'allow');",
         nullptr, nullptr, nullptr);
 
@@ -640,8 +663,10 @@ void RbacStore::seed_defaults() {
         }
     }
 
-    // ApiTokenManager: read + write + delete on ApiToken
-    const char* atm_ops[] = {"Read", "Write", "Delete"};
+    // ApiTokenManager: read + write + delete + rotate on ApiToken (Rotate
+    // added P2 #11, SOC 2 CC6.3 — self-service human token rotation; same
+    // population that already holds Write).
+    const char* atm_ops[] = {"Read", "Write", "Delete", "Rotate"};
     for (auto* o : atm_ops) {
         sqlite3_stmt* s = nullptr;
         sqlite3_prepare_v2(

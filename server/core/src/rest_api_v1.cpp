@@ -721,10 +721,10 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Revoke an API token", "tags": ["API Tokens"], "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Token revoked"}, "503": {"description": "Token store unavailable (service unavailable)"}}}
     },
     "/tokens/{token_id}/rotate": {
-      "post": {"summary": "Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3)", "tags": ["API Tokens"], "description": "Mints a successor token alongside the still-valid predecessor for the overlap window; requires ApiToken:Write and step-up on EVERY call (including an idempotent re-serve within the grace window). Self-service only — the caller must own the token; no admin override. The successor always inherits the predecessor's expires_at verbatim (rotation is lifetime-neutral).", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The token_id of the token being rotated (the predecessor)"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token/token_id/expires_at describe the successor (found structurally, scoped to THIS predecessor's token_id); overlap_expires_at describes the PREDECESSOR (echoed for convenience — the epoch it is auto-revoked). token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs present but not an integer, overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires ApiToken:Write"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, no active credential to rotate (ambiguous with a transient store read failure — retry, or mint a new token if genuinely absent), or the rotation succeeded but the successor could not be read back for the response (fails closed rather than return an uncorrelatable secret)"}}}
+      "post": {"summary": "Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3)", "tags": ["API Tokens"], "description": "Mints a successor token alongside the still-valid predecessor for the overlap window; requires ApiToken:Rotate and step-up on EVERY call (including an idempotent re-serve within the grace window). Self-service only — the caller must own the token; no admin override. The successor always inherits the predecessor's expires_at verbatim (rotation is lifetime-neutral).", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The token_id of the token being rotated (the predecessor)"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token/token_id/expires_at describe the successor (found structurally, scoped to THIS predecessor's token_id); overlap_expires_at describes the PREDECESSOR (echoed for convenience — the epoch it is auto-revoked). token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs present but not an integer, overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires ApiToken:Rotate"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, no active credential to rotate (ambiguous with a transient store read failure — retry, or mint a new token if genuinely absent), or the rotation succeeded but the successor could not be read back for the response (fails closed rather than return an uncorrelatable secret)"}}}
     },
     "/tokens/{token_id}/confirm": {
-      "post": {"summary": "Confirm receipt of a rotated API token's successor secret (P2 #11 maker-checker)", "tags": ["API Tokens"], "description": "token_id in the path is the SUCCESSOR token_id the rotate response returned — no request body. Requires ApiToken:Write and step-up. Self-service only.", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The successor token_id returned by the rotate call"}], "responses": {"200": {"description": "Confirmed; predecessor token revoked"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires ApiToken:Write"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry)"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, or no in-flight rotation to confirm"}}}
+      "post": {"summary": "Confirm receipt of a rotated API token's successor secret (P2 #11 maker-checker)", "tags": ["API Tokens"], "description": "token_id in the path is the SUCCESSOR token_id the rotate response returned — no request body. Requires ApiToken:Rotate and step-up. Self-service only.", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The successor token_id returned by the rotate call"}], "responses": {"200": {"description": "Confirmed; predecessor token revoked"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires ApiToken:Rotate"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry)"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, or no in-flight rotation to confirm"}}}
     },
     "/ca/root": {
       "get": {"summary": "Internal CA root certificate (PEM, public)", "tags": ["Security"], "responses": {"200": {"description": "PEM CA certificate", "content": {"application/x-pem-file": {}}}, "404": {"description": "No CA root"}}}
@@ -2705,9 +2705,16 @@ void RestApiV1::register_routes(
     // rotation for a token the caller owns (P2 #11, SOC 2 CC6.3). Mirrors the
     // engine arm's `/engine-principals/{id}/credentials/rotate` route (design
     // §7 gate belt + reveal-audit discipline) but on the HUMAN permission
-    // axis (`ApiToken:Write`, not `Security:Write` — this is self-service,
-    // not an admin operation), with an owner-vs-nonexistent 404 belt (mirrors
-    // the DELETE route above) instead of the engine route's admin gate.
+    // axis. Gated on `ApiToken:Rotate`, a DISTINCT operation from
+    // `ApiToken:Write` (round-3 security finding): giving the MCP twin's
+    // operator-tier allowance the SAME op as `ApiToken:Write` would also
+    // admit an operator-tier MCP token to `POST /api/v1/tokens` (mint, with
+    // a caller-chosen `mcp_tier`) and the settings twin — a privilege
+    // escalation, not a REST/MCP parity fix (see `mcp_policy.hpp`'s
+    // `tier_allows()` operator-tier comment for the full analysis). Not
+    // `Security:Write` either — this is self-service, not an admin
+    // operation — with an owner-vs-nonexistent 404 belt (mirrors the DELETE
+    // route above) instead of the engine route's admin gate.
     // `successor_expires_at` is deliberately NOT accepted from the request
     // body — SENIOR RULING: rotation must read as lifetime-neutral in CC6.3
     // evidence, so the successor always inherits the predecessor's expiry
@@ -2716,7 +2723,7 @@ void RestApiV1::register_routes(
         R"(/api/v1/tokens/([^/]+)/rotate)",
         [perm_fn, auth_fn, audit_fn, step_up_fn, token_store](const httplib::Request& req,
                                                                httplib::Response& res) {
-            if (!perm_fn(req, res, "ApiToken", "Write"))
+            if (!perm_fn(req, res, "ApiToken", "Rotate"))
                 return;
             if (!token_store || !token_store->is_open()) {
                 res.status = 503;
@@ -2895,7 +2902,9 @@ void RestApiV1::register_routes(
                                   {{"surface", "rest"}, {"result", result}})
                         .increment();
             };
-            if (!perm_fn(req, res, "ApiToken", "Write"))
+            // ApiToken:Rotate, not ApiToken:Write — same reasoning as the
+            // rotate route above (round-3 security finding).
+            if (!perm_fn(req, res, "ApiToken", "Rotate"))
                 return;
             if (!token_store || !token_store->is_open()) {
                 confirm_metric("transient"); // store unavailable at the open guard

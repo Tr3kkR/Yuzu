@@ -241,16 +241,33 @@ TEST_CASE("MCP Policy: operator tier allows Read + Tag Write + Execute", "[mcp][
     // Execution
     CHECK(tier_allows("operator", "Execution", "Execute"));
 
-    // Human API-token self-service rotation (P2 #11, SOC 2 CC6.3) — reachable
-    // at operator, unlike the engine-credential arm's Security:Write, because
-    // the store itself confines the caller to their own token.
-    CHECK(tier_allows("operator", "ApiToken", "Write"));
-
     // But NOT policy write, user management, etc.
     CHECK(!tier_allows("operator", "Policy", "Write"));
     CHECK(!tier_allows("operator", "UserManagement", "Write"));
     CHECK(!tier_allows("operator", "Security", "Write"));
     CHECK(!tier_allows("operator", "ManagementGroup", "Write"));
+}
+
+// Round-3 security finding regression guard (P2 #11): tier_allows() itself
+// must NEVER admit operator-tier ApiToken:Write — that rule, once added
+// here, silently widened EVERY ApiToken:Write route/tool on every transport
+// (REST POST /api/v1/tokens create, its settings twin), not just the two
+// rotation tools. AuthRoutes::require_permission/require_scoped_permission
+// (auth_routes.cpp) consult this SAME function for REST, so a securable-
+// keyed rule here is a transport-wide widening, never a tool-scoped one. The
+// two rotation tools' operator-tier admission is intentionally NOT expressed
+// through this function — see api_token_rotation_tier_allows() in
+// mcp_server.cpp and the "MCP rotate_api_token/confirm_api_token_rotation
+// tool-scoped tier check" tests below, which exercise the actual dispatch
+// path instead.
+TEST_CASE("MCP Policy: operator tier does NOT allow ApiToken:Write (round-3 "
+          "security regression guard — must stay tool-scoped, never securable-scoped)",
+          "[mcp][policy][security]") {
+    CHECK_FALSE(tier_allows("operator", "ApiToken", "Write"));
+    // Confirm this isn't accidentally exempted by the same route/op the two
+    // rotation tools' RBAC check separately consults — Read stays allowed by
+    // the ordinary operator "Read on everything" rule, but Write must not be.
+    CHECK(tier_allows("operator", "ApiToken", "Read"));
 }
 
 TEST_CASE("MCP Policy: supervised tier allows everything", "[mcp][policy]") {
@@ -1453,7 +1470,10 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
 // mirrors"); here we only pin the mirror sizes so an accidental edit to one
 // array is caught even when the rbac_store suite is filtered out.
 TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mcp][2g]") {
-    CHECK(rbac_ops_for_test().size() == 7);
+    // 8th op: "Rotate" (P2 #11, SOC 2 CC6.3) — ApiToken-specific, deliberately
+    // distinct from "Write" (see mcp_policy.hpp's tier_allows() operator-tier
+    // comment for why a shared op would have been a privilege escalation).
+    CHECK(rbac_ops_for_test().size() == 8);
     CHECK(rbac_securables_for_test().size() == 23);
 }
 

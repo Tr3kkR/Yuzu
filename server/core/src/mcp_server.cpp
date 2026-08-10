@@ -1332,12 +1332,19 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"get_engine_principal", {"EnginePrincipal", "Read"}},
     {"audit_engine_no_admin", {"AuditLog", "Read"}},
     // Human API-token rotation (P2 #11, SOC 2 CC6.3) — self-service, NOT the
-    // admin Security:Write axis the engine credential arm above uses. See
-    // the tier_allows() extension in mcp_policy.hpp for why ApiToken:Write is
-    // reachable at the operator tier (matching REST's ApiToken:Write, not
-    // Security:Write).
-    {"rotate_api_token", {"ApiToken", "Write"}},
-    {"confirm_api_token_rotation", {"ApiToken", "Write"}},
+    // admin Security:Write axis the engine credential arm above uses, and
+    // DELIBERATELY a DISTINCT operation from the ordinary ApiToken:Write
+    // create/list/revoke surface (round-3 security finding): the generic C8
+    // gate above resolves tier admission from THIS (securable, operation)
+    // pair for every tool, so mapping these two to plain ApiToken:Write would
+    // make an operator-tier allowance here indistinguishable from — and
+    // therefore also admit — REST POST /api/v1/tokens (mint, caller-chosen
+    // mcp_tier) and its settings twin. ApiToken:Rotate lets mcp_policy.hpp
+    // admit these two at the operator tier without touching ApiToken:Write's
+    // supervised-only posture at all. Mirrored in the REST rotate/confirm
+    // routes' perm_fn calls (rest_api_v1.cpp) for true REST/MCP parity.
+    {"rotate_api_token", {"ApiToken", "Rotate"}},
+    {"confirm_api_token_rotation", {"ApiToken", "Rotate"}},
     // PR 4.2 (design §4.1) — engine-principal role-assignment MCP twins of
     // /api/v1/engine-principals/{id}/roles. Mutations map to Security:Write
     // (this mapping drives ONLY the C8 tier/approval gate; each handler
@@ -1466,8 +1473,14 @@ struct ToolSecurityTuple {
 // harmlessly conservative: supervised tier_allows() permits every operation
 // while requires_approval() matches exact strings, so a typo'd op skips its
 // intended approval rule — fail OPEN. Reject at boot instead.
-constexpr std::string_view kRbacOps[] = {"Read",    "Write", "Execute", "Delete",
-                                         "Approve", "Push",  "Attest"};
+// "Rotate" (P2 #11, SOC 2 CC6.3) is deliberately its own operation, distinct
+// from "Write" — see mcp_policy.hpp's tier_allows() operator-tier comment for
+// why: rotate_api_token/confirm_api_token_rotation need an operator-tier
+// allowance that must NEVER be reachable from ApiToken:Write's create/list/
+// revoke surface, and a shared op string is exactly how a prior round's fix
+// attempt widened the wrong thing.
+constexpr std::string_view kRbacOps[] = {"Read",   "Write",  "Execute", "Delete",
+                                         "Approve", "Push",  "Attest",  "Rotate"};
 
 // Closed RBAC securable-type catalogue — mirrors rbac_store.cpp's seeded
 // `types[]` (MOVE TOGETHER; same binding test). A typo'd TYPE is the same
@@ -8380,6 +8393,37 @@ McpServer::HandlerFn McpServer::build_handler(
                 return true;
             };
 
+            // Round-3 security finding, corrected mechanism: a first attempt
+            // special-cased `tier == "operator"` at THIS call site while
+            // leaving `tier_allows(tier, "ApiToken", "Write")` itself
+            // supervised-only, reasoning that the per-tool check below was a
+            // second, independent gate. It is not: the GENERIC C8 gate above
+            // (search "C8: Generic tier + approval checks") already resolves
+            // (securable_type, operation) from `kToolSecurity` for EVERY
+            // known-registered tool and calls `tier_allows()` BEFORE any
+            // per-tool `if (tool_name == ...)` branch ever runs — the
+            // per-tool checks in this file are defense-in-depth duplicates of
+            // that SAME decision, using the SAME (securable, operation) pair,
+            // never an alternate enforcement path a call-site-local exception
+            // could widen independently. With `rotate_api_token`/
+            // `confirm_api_token_rotation` mapped to `{"ApiToken","Write"}`
+            // in `kToolSecurity`, the generic gate denies an operator-tier
+            // caller before dispatch ever reaches this file's per-tool code —
+            // a tool-scoped exception here is structurally unreachable.
+            //
+            // The two tools are therefore mapped to a DISTINCT operation,
+            // `ApiToken:Rotate` (`kToolSecurityRows` below, mirrored in the
+            // REST rotate/confirm routes' `perm_fn` calls), so the generic
+            // gate's `tier_allows()` lookup for THESE two tools is keyed
+            // differently from every other `ApiToken:Write` route/tool
+            // (REST `POST /api/v1/tokens` create, its settings twin) — an
+            // operator-tier allowance on `ApiToken:Rotate` in
+            // `mcp_policy.hpp` cannot touch `ApiToken:Write` at all, on any
+            // transport, by construction. This also gives TRUE parity: an
+            // operator-tier token can now reach REST `POST /api/v1/tokens/
+            // {id}/rotate`/`/confirm` too, closing the asymmetry the
+            // call-site-local attempt would have left on record.
+
             if (tool_name == "create_engine_principal") {
                 if (!tier_allows(tier, "Security", "Write")) {
                     res.set_content(
@@ -8999,13 +9043,13 @@ McpServer::HandlerFn McpServer::build_handler(
             // server.cpp wires everywhere else, not a parallel store.
 
             if (tool_name == "rotate_api_token") {
-                if (!tier_allows(tier, "ApiToken", "Write")) {
+                if (!tier_allows(tier, "ApiToken", "Rotate")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "ApiToken", "Write"))
+                if (!perm_fn(req, res, "ApiToken", "Rotate"))
                     return;
                 if (deny_if_engine_session())
                     return;
@@ -9083,7 +9127,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_audit("failure", result.error());
                     return;
                 }
-                // Locate the successor via the SHARED lookup
+                // Locate the successor via the SHARED, DB-free lookup
                 // (token_rotation_lookup.hpp) — scoped exactly to THIS
                 // predecessor, never "any linked row of this principal"
                 // (round-3 BLOCKING finding, closed via the shared helper: a
@@ -9093,9 +9137,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 // wrong token_id, so confirming that id revokes the WRONG
                 // predecessor). One shared helper, not an inline loop — this
                 // tool calls the SAME derivation the REST twin uses, never a
-                // re-derived copy of it.
-                auto successor = yuzu::server::detail::derive_rotation_successor(
-                    *engine_credential_store_, tok->principal_id, token_id);
+                // re-derived copy of it. This handler owns the store read
+                // (round-4: the helper takes a plain vector so its derivation
+                // logic is unit-testable without Postgres — see
+                // test_token_rotation_lookup.cpp).
+                auto active_after =
+                    engine_credential_store_->list_active_for_principal(tok->principal_id);
+                auto successor =
+                    yuzu::server::detail::derive_rotation_successor(active_after, token_id);
+                // rotate → found==false is a swallowed-read-failure signal,
+                // MUST fail closed (see the header's call-site-dependent
+                // contract). confirm_api_token_rotation below does NOT call
+                // this helper at all — confirm_token_rotation's response
+                // needs no successor lookup, it just echoes the caller-
+                // supplied successor token_id it was already given — so the
+                // confirm-side "found==false is benign" half of the contract
+                // has no call site in this file to misapply it to.
                 if (!successor.found) {
                     // rotate_token above already succeeded — a real successor
                     // row exists and `result` holds its live raw secret — but
@@ -9109,20 +9166,31 @@ McpServer::HandlerFn McpServer::build_handler(
                     // one-time secret with no token_id to ever confirm it
                     // against: audit as a failure, retryable (kInternalError),
                     // and never place the secret in the response body.
-                    // Mirrors the REST twin's 503 + Retry-After:2 posture;
-                    // audit_persisted:false folded into the error body the
-                    // same way the sibling !result branch above does, if the
-                    // failure audit itself doesn't persist.
+                    // Mirrors the REST twin's 503 + Retry-After:2 posture —
+                    // A5: retry_after_ms is machine metadata here, not
+                    // prose-only, matching REST's Retry-After:2 header
+                    // (2000ms). audit_persisted:false is folded into the SAME
+                    // A4 data object (not the sibling !result branch's plain
+                    // error_response — this branch is genuinely retryable and
+                    // needs the retry hint too) if the failure audit itself
+                    // doesn't persist. There is no MCP `list_tokens` tool
+                    // (ADR-1005 parity gap, recorded in docs/mcp-server.md) —
+                    // point at the REST route that actually exists, matching
+                    // the REST twin's own remediation text exactly.
                     const bool denied_audit_ok =
                         audit_fn(req, "api_token.rotate", "failure", "ApiToken", token_id,
                                  "successor lookup failed after mint");
+                    JObj err_data;
+                    err_data.add("correlation_id", yuzu::server::detail::make_correlation_id())
+                        .add("retry_after_ms", 2000)
+                        .add("remediation", "retry, or check GET /api/v1/tokens");
+                    if (!denied_audit_ok)
+                        err_data.add("audit_persisted", false);
                     res.set_content(
                         error_response(id, kInternalError,
                                        "rotation succeeded but the successor could not be read "
-                                       "back — retry, or check list_tokens",
-                                       denied_audit_ok
-                                           ? std::string_view{}
-                                           : std::string_view{R"({"audit_persisted":false})"}),
+                                       "back — retry, or check GET /api/v1/tokens",
+                                       err_data.str()),
                         "application/json");
                     mcp_audit("failure", "successor lookup failed after mint");
                     return;
@@ -9147,6 +9215,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!reveal_audit_ok)
                     payload.add("audit_persisted", false);
                 mcp_audit("success", successor.successor_token_id);
+                // G5 (secret hygiene) — same no-store contract the REST twin
+                // names: the response body carries a raw one-time credential.
+                // MUST NEVER BE STREAMED: plain JSON-RPC POST responses never
+                // enter mcp_stream.hpp's bounded per-session Last-Event-ID
+                // replay ring today (only SSE/streamed-POST frames do), so
+                // nothing is ringed yet — but if this tool is ever moved onto
+                // the streamed-POST/SSE path (track 2f), a raw credential
+                // response MUST be excluded from that ring, or a replayable
+                // buffer would retain a one-time secret past its single
+                // legitimate delivery.
+                res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
+                res.set_header("Pragma", "no-cache");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
                 return;
@@ -9174,13 +9254,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                       {{"surface", "mcp"}, {"result", result}})
                             .increment();
                 };
-                if (!tier_allows(tier, "ApiToken", "Write")) {
+                if (!tier_allows(tier, "ApiToken", "Rotate")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "ApiToken", "Write"))
+                if (!perm_fn(req, res, "ApiToken", "Rotate"))
                     return;
                 if (deny_if_engine_session())
                     return;

@@ -815,7 +815,7 @@ The same ownership constraint applies to the HTMX dashboard path `DELETE /api/se
 
 Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3): mints a successor token while the existing (predecessor) token stays valid for an overlap window — at most **two** active tokens in the rotation group during the overlap. `{token_id}` in the path is the **predecessor's** id. The raw successor secret is returned exactly once per reveal (see the grace-window re-serve note below), the same discipline the engine-principal `credentials/rotate` route above uses. MFA step-up runs on **every** call to this route, including an idempotent re-serve.
 
-**Permission:** `ApiToken:Write`
+**Permission:** `ApiToken:Rotate` — a DISTINCT operation from `ApiToken:Write` (round-4 security finding): `ApiToken:Write` also gates `POST /api/v1/tokens` (mint) and its settings twin, so a shared op would let an operator-tier MCP token mint a brand-new, caller-chosen-tier token — a privilege escalation, not a parity fix. See `mcp_policy.hpp`'s `tier_allows()` operator-tier comment for the full analysis.
 
 **Ownership constraint — self-service only, no admin bypass:** unlike `DELETE /api/v1/tokens/{token_id}` above, there is **no** admin override here. A human token's raw successor secret authenticates *as that user*, so an admin rotating or confirming someone else's token would hand out (or complete the cutover of) a credential that impersonates them — identity takeover, not a permission gap an admin role could legitimately cross. An admin who needs to act on another user's token still has `DELETE` (revoke). Attempting to rotate a token you do not own returns `404 token not found` — identical to the response for a token that does not exist, closing the same enumeration-oracle gap the DELETE route closes. Denied attempts are recorded in the audit log with `action=api_token.rotate`, `result=denied`, and `detail=owner=<real owner>`.
 
@@ -867,7 +867,7 @@ Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6
 | The rotation itself succeeded (a successor token now exists) but the follow-up read that locates it for the response came back empty | `503` — fails CLOSED rather than return a raw one-time secret with no `token_id` to ever confirm it against; retry, or check `GET /api/v1/tokens` |
 | Advisory-lock acquire failure, CSPRNG failure, or a mint/stamp write that did not persist | `503` — retryable store failure |
 | MFA step-up not satisfied | `401` |
-| Missing `ApiToken:Write`, or the caller's own session is engine-classed (structural deny belt) | `403` |
+| Missing `ApiToken:Rotate`, or the caller's own session is engine-classed (structural deny belt) | `403` |
 
 ---
 
@@ -875,7 +875,7 @@ Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6
 
 Explicit maker-checker confirmation that a rotation's successor secret has been received and installed. `{token_id}` in the path is the **successor's** id — the value the `rotate` response above returned — so, unlike the engine-principal confirm route, **no request body is needed at all**: the id in the URL pins the exact rotation being confirmed. On success, the predecessor token is revoked and the successor becomes the sole active token in the rotation group.
 
-**Permission:** `ApiToken:Write`
+**Permission:** `ApiToken:Rotate` (same distinct-operation rationale as `rotate` above)
 
 **Ownership constraint:** the same self-service-only posture as `rotate` above — no admin bypass, `404 token not found` for both a nonexistent successor id and one owned by someone else, and the same `action=api_token.confirm`/`result=denied`/`detail=owner=<real owner>` audit row on a denied attempt.
 
