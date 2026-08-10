@@ -488,17 +488,30 @@ TEST_CASE("REST POST /api/v1/tokens/{id}/rotate: successor lookup is scoped to t
     REQUIRE(rotate_b->status == 200);
     auto data_b = nlohmann::json::parse(rotate_b->body)["data"];
     auto successor_b = data_b["token_id"].get<std::string>();
+    auto raw_b = data_b["token"].get<std::string>();
 
     // The BLOCKING bug: an unscoped scan over list_active_for_principal
-    // matches "any" linked row — deterministically A's successor here, since
-    // it was minted first — even though B is the token actually rotated.
+    // matches "any" linked row — RELIABLY (not deterministically —
+    // created_at is bigint SECONDS, so a same-second tie is possible in
+    // principle; measured stable 8/8 against live Postgres) A's successor
+    // here, since it was minted first — even though B is the token actually
+    // rotated.
     CHECK(successor_b != successor_a);
 
-    // Ground truth: ask the store directly which token B's response should
-    // have described.
+    // Ground truth #1: ask the store directly which token B's response
+    // should have described.
     auto b_row = h.token_store->get_token(successor_b).value();
     REQUIRE(b_row.has_value());
     CHECK(b_row->supersedes_token_id == token_b);
+
+    // Ground truth #2 — the half the id-only check above doesn't cover: the
+    // RAW SECRET the response actually returned must authenticate as the
+    // SAME token_id the response also returned. The bug produced exactly
+    // this mismatch (B's raw secret paired with A's successor token_id) —
+    // pinning only the id leaves that pairing unverified.
+    auto resolved = h.token_store->validate_token(raw_b);
+    REQUIRE(resolved.has_value());
+    CHECK(resolved->token_id == successor_b);
 
     // A's rotation is untouched by rotating B.
     auto a_pred = h.token_store->get_token(token_a).value();

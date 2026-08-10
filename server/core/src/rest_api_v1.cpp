@@ -2802,22 +2802,24 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            // Locate the successor via the SHARED lookup (token_rotation_
-            // lookup.hpp) — scoped exactly to THIS predecessor, never "any
-            // linked row of this principal" (round-3 BLOCKING finding: a
-            // human principal routinely holds N unrelated active tokens, so
-            // an unscoped match can return a DIFFERENT in-flight rotation's
-            // successor — its raw secret paired with the wrong token_id, so
-            // confirming that id revokes the WRONG predecessor). One shared
-            // helper, not an inline loop, so the MCP twin of this route
-            // calls the SAME derivation rather than re-deriving its own copy
-            // — a second copy of this exact loop is how the bug happened the
-            // first time (copied from the engine rotate route, whose OWN
-            // per-principal <=2-active ceiling licensed the loop shape that
-            // is unsound here).
+            // Locate the successor via the SHARED, DB-free lookup
+            // (token_rotation_lookup.hpp) — scoped exactly to THIS
+            // predecessor, never "any linked row of this principal"
+            // (round-3 BLOCKING finding: a human principal routinely holds N
+            // unrelated active tokens, so an unscoped match can return a
+            // DIFFERENT in-flight rotation's successor — its raw secret
+            // paired with the wrong token_id, so confirming that id revokes
+            // the WRONG predecessor). One shared helper, not an inline loop,
+            // so the MCP twin of this route calls the SAME derivation rather
+            // than re-deriving its own copy — a second copy of this exact
+            // loop is how the bug happened the first time (copied from the
+            // engine rotate route, whose OWN per-principal <=2-active
+            // ceiling licensed the loop shape that is unsound here). The
+            // route owns the store read (round-4: the helper takes a plain
+            // vector so its derivation logic is unit-testable without Postgres).
+            auto active_after = token_store->list_active_for_principal(tok->principal_id);
             auto successor =
-                yuzu::server::detail::derive_rotation_successor(*token_store, tok->principal_id,
-                                                                 token_id);
+                yuzu::server::detail::derive_rotation_successor(active_after, token_id);
             if (!successor.found) {
                 // rotate_token above already succeeded — a real successor
                 // row exists in the database and `result` holds its live raw
@@ -2828,8 +2830,11 @@ void RestApiV1::register_routes(
                 // show up here is never a legitimate "no rotation" case,
                 // only an ambiguous read failure. Fail CLOSED rather than
                 // hand the caller a one-time secret with no token_id to ever
-                // confirm it against (round-3 finding): audit as a failure,
-                // 503, and never place the secret in the response body.
+                // confirm it against — this is the ROTATE-side meaning of
+                // `found == false` documented in token_rotation_lookup.hpp;
+                // it does NOT apply after a successful confirm (round-4
+                // clarification): audit as a failure, 503, and never place
+                // the secret in the response body.
                 res.status = 503;
                 res.set_header("Retry-After", "2");
                 res.set_content(
