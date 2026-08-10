@@ -2881,16 +2881,46 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation rejects a stale/mismatched "
     }
     REQUIRE_FALSE(successor_id.empty());
 
-    // The PREDECESSOR's own id (the likely operator mistake) and a bogus id
-    // both mismatch the pending successor.
-    for (const std::string& wrong : {predecessor_id, std::string{"feedfacefeedfacefeedface"}}) {
-        auto mismatch = store.confirm_token_rotation(wrong, "nina");
-        REQUIRE_FALSE(mismatch.has_value());
-        CHECK(mismatch.error().find("does not match the pending rotation") != std::string::npos);
-        CHECK(classify_engine_store_error(mismatch.error()) == ClsE::Conflict);
-    }
+    // The PREDECESSOR's own id (the likely operator mistake) resolves to a
+    // REAL row nina owns, currently in-rotation but holding the WRONG role
+    // in the pair (predecessor, not successor) — this genuinely reaches the
+    // pin-mismatch branch.
+    auto mismatch = store.confirm_token_rotation(predecessor_id, "nina");
+    REQUIRE_FALSE(mismatch.has_value());
+    CHECK(mismatch.error().find("does not match the pending rotation") != std::string::npos);
+    CHECK(classify_engine_store_error(mismatch.error()) == ClsE::Conflict);
 
-    // No mutation: both credentials active, linkage intact, unconfirmed.
+    // A FABRICATED id never resolves to any row at all, so it CANNOT reach
+    // the pin-mismatch branch (which requires a resolved, owned row to
+    // compare a role against) — it is deliberately NOT asserted to produce
+    // the pin-mismatch message here. Engine-precedent mismatch, recorded so
+    // the next reader does not "fix" this back: the engine arm resolves
+    // confirm by PRINCIPAL, so it can compare any supplied id against a
+    // known successor without a row lookup first; the human arm is
+    // TOKEN-keyed and must resolve the id to a row before it can compare
+    // roles — an id that never resolves can never reach that comparison.
+    // Instead, the store folds "never existed" into the SAME response as
+    // "exists, but belongs to someone else" — the enumeration-resistance
+    // property item 7b already establishes — so this is asserted by
+    // comparing the fabricated id's result DIRECTLY against a genuinely
+    // not-owned real token_id's result, not against a hardcoded
+    // string/class, so it keeps holding regardless of the implementer's
+    // chosen not-found wording.
+    auto other_owner = store.create_token("Not nina's PAT", "mallory-2384", now + k90Days);
+    REQUIRE(other_owner.has_value());
+    auto vt_other = store.validate_token(*other_owner);
+    REQUIRE(vt_other.has_value());
+
+    auto fabricated = store.confirm_token_rotation("feedfacefeedfacefeedface", "nina");
+    auto not_owned = store.confirm_token_rotation(vt_other->token_id, "nina");
+    REQUIRE_FALSE(fabricated.has_value());
+    REQUIRE_FALSE(not_owned.has_value());
+    CHECK(fabricated.error() == not_owned.error());
+    CHECK(classify_engine_store_error(fabricated.error()) ==
+          classify_engine_store_error(not_owned.error()));
+
+    // No mutation: both of nina's credentials active, linkage intact,
+    // unconfirmed.
     auto active = store.list_active_for_principal("nina");
     REQUIRE(active.size() == 2);
     for (const auto& tok : active) {
@@ -3107,14 +3137,41 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a group already resolved "
     CHECK(classify_engine_store_error(resolved.error()) == ClsE::Conflict);
 }
 
-TEST_CASE("ApiTokenStore: confirm_token_rotation on a genuinely EMPTY read "
-          "stays retryable, never a false-terminal conflict (#2404, human "
-          "arm)",
+TEST_CASE("ApiTokenStore: confirm_token_rotation on a revoked, "
+          "never-rotated token_id is a terminal nothing-to-confirm, not "
+          "retryable (#2404, human arm)",
           "[pg][token][rotation][human][confirm]") {
-    // The other half of the pair above: once the LAST credential for the
-    // owner's lineage is revoked, the read has nothing to distinguish from a
-    // swallowed SELECT failure — it MUST stay Transient/retryable, exactly
-    // as the engine test at :1258-1267 establishes.
+    // RENAMED + RECLASSIFIED post-merge review. Originally named "...on a
+    // genuinely EMPTY read stays retryable..." and asserted Transient — but
+    // this scenario does not reach the read-ambiguity state that name
+    // describes. confirm_token_rotation resolves the PINNED row by
+    // token_id FIRST; that row is FOUND here (it exists, merely revoked),
+    // and its own rotation_group field is empty — a definite POSITIVE fact
+    // ("this token_id was never part of any rotation"). It never touches a
+    // principal-wide or group-scoped active read, so the "indistinguishable
+    // from a swallowed SELECT failure" reasoning this test used to cite
+    // does not apply here.
+    //
+    // Formally adjudicated to Conflict after this suite was first written,
+    // on three grounds: #2404 already litigated the identical shape on the
+    // engine arm, where a 503 made an idempotent-hint-honouring client
+    // retry a permanently-failing call forever; the engine's
+    // kSoleOtherToken (same "rotate again" guidance) is Conflict; and
+    // rotation_confirm_state.hpp documents every terminal state as
+    // Conflict or ClientValidation, never Transient. Do NOT flip this back
+    // to Transient.
+    //
+    // The genuinely-ambiguous kAmbiguousEmpty path — where the pinned row
+    // DOES have a non-empty rotation_group (so a partner read is actually
+    // attempted) and that group-scoped read itself comes back empty,
+    // indistinguishable from a swallowed SELECT failure — is a DIFFERENT,
+    // narrower state this test does not exercise. It was not added here:
+    // constructing it needs knowledge of which specific query the
+    // group-scoped partner read runs (to sabotage that query alone while
+    // leaving the single-row pin lookup intact), and that implementation
+    // detail is not visible from this worktree (the merged implementation
+    // lives outside it). Reachability and worth are open questions for
+    // whoever holds the merged source, not answered here.
     YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ApiTokenStore store{pool};
@@ -3132,7 +3189,7 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation on a genuinely EMPTY read "
 
     auto none = store.confirm_token_rotation(t_id, "oscar");
     REQUIRE_FALSE(none.has_value());
-    CHECK(classify_engine_store_error(none.error()) == ClsE::Transient);
+    CHECK(classify_engine_store_error(none.error()) == ClsE::Conflict);
 }
 
 TEST_CASE("ApiTokenStore: confirm_token_rotation on a sole credential with "
