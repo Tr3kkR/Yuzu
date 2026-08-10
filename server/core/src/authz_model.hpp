@@ -19,7 +19,7 @@
 /// write `rbac.db`, and it enforces nothing on the wire — it is a header-only
 /// vocabulary + a handful of pure classification rules, seeded with the SAME
 /// securable/operation catalogue `RbacStore::seed_defaults()` hardcodes today
-/// (`rbac_store.cpp:291-327`+ops, 22 seeded types, read-only reference) so PR1.9 has real data
+/// (`rbac_store.cpp:291-327`+ops, 23 seeded types, read-only reference) so PR1.9 has real data
 /// to migrate rather than a speculative schema. `mcp_policy.hpp` is the other
 /// read-only reference for the existing (securable, operation) vocabulary in
 /// live use.
@@ -38,14 +38,10 @@ namespace yuzu::server::authz {
 /// `rbac_store.cpp` seed comment) — deliberately excluded from the CRUD
 /// loops there, and included here for the same reason: a Module capability
 /// can genuinely declare it (the seed catalogue below has an example).
-/// `Rotate` is an EIGHTH, narrower operation added for human API-token
-/// self-service rotation (P2 #11, SOC 2 CC6.3, `rbac_store.cpp` seed
-/// comment) — same treatment as `Push`/`Attest`: deliberately excluded from
-/// the CRUD loops there (so it is never cross-seeded onto an unrelated
-/// securable) and deliberately DISTINCT from `Write` on its own securable
-/// (`ApiToken`), because a round-3/4 security finding showed a shared op
-/// there would let an MCP tier allowance for rotation also admit token
-/// creation — see `mcp_policy.hpp`'s `tier_allows()` operator-tier comment.
+/// `Rotate` is an EIGHTH (P2 #11, SOC 2 CC6.3, `rbac_store.cpp` seed
+/// comment), same treatment, and DELIBERATELY DISTINCT from `Write` on its
+/// own securable (`ApiToken`) — why is mcp_policy.hpp's `tier_allows()`
+/// operator-tier comment, the single narrative home for that finding.
 enum class Operation : uint8_t {
     Read,
     Write,
@@ -305,7 +301,7 @@ struct CapabilitySeed {
 }
 
 /// A small, representative seed catalogue — NOT a full mirror of
-/// `RbacStore`'s full securables × 8 operations catalogue. It exists so PR1.9 has real
+/// `RbacStore`'s 23 securables × 8 operations catalogue. It exists so PR1.9 has real
 /// rows to migrate and so this header's own tests exercise `is_valid`, not
 /// to be the registry itself (that is explicitly out of scope here). Covers
 /// an ordinary CRUD securable (`Response:Read`), a Tag write (mirrors

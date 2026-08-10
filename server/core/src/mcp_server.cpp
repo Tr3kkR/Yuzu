@@ -1333,16 +1333,10 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"audit_engine_no_admin", {"AuditLog", "Read"}},
     // Human API-token rotation (P2 #11, SOC 2 CC6.3) — self-service, NOT the
     // admin Security:Write axis the engine credential arm above uses, and
-    // DELIBERATELY a DISTINCT operation from the ordinary ApiToken:Write
-    // create/list/revoke surface (round-3 security finding): the generic C8
-    // gate above resolves tier admission from THIS (securable, operation)
-    // pair for every tool, so mapping these two to plain ApiToken:Write would
-    // make an operator-tier allowance here indistinguishable from — and
-    // therefore also admit — REST POST /api/v1/tokens (mint, caller-chosen
-    // mcp_tier) and its settings twin. ApiToken:Rotate lets mcp_policy.hpp
-    // admit these two at the operator tier without touching ApiToken:Write's
-    // supervised-only posture at all. Mirrored in the REST rotate/confirm
-    // routes' perm_fn calls (rest_api_v1.cpp) for true REST/MCP parity.
+    // DELIBERATELY `Rotate`, not `Write` (mirrored in the REST rotate/confirm
+    // routes' perm_fn calls for true REST/MCP parity). Full narrative for why
+    // this pair must differ from plain ApiToken:Write lives ONCE, at
+    // mcp_policy.hpp's tier_allows() operator-tier comment.
     {"rotate_api_token", {"ApiToken", "Rotate"}},
     {"confirm_api_token_rotation", {"ApiToken", "Rotate"}},
     // PR 4.2 (design §4.1) — engine-principal role-assignment MCP twins of
@@ -8393,36 +8387,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 return true;
             };
 
-            // Round-3 security finding, corrected mechanism: a first attempt
-            // special-cased `tier == "operator"` at THIS call site while
-            // leaving `tier_allows(tier, "ApiToken", "Write")` itself
-            // supervised-only, reasoning that the per-tool check below was a
-            // second, independent gate. It is not: the GENERIC C8 gate above
-            // (search "C8: Generic tier + approval checks") already resolves
-            // (securable_type, operation) from `kToolSecurity` for EVERY
-            // known-registered tool and calls `tier_allows()` BEFORE any
-            // per-tool `if (tool_name == ...)` branch ever runs — the
-            // per-tool checks in this file are defense-in-depth duplicates of
-            // that SAME decision, using the SAME (securable, operation) pair,
-            // never an alternate enforcement path a call-site-local exception
-            // could widen independently. With `rotate_api_token`/
-            // `confirm_api_token_rotation` mapped to `{"ApiToken","Write"}`
-            // in `kToolSecurity`, the generic gate denies an operator-tier
-            // caller before dispatch ever reaches this file's per-tool code —
-            // a tool-scoped exception here is structurally unreachable.
-            //
-            // The two tools are therefore mapped to a DISTINCT operation,
-            // `ApiToken:Rotate` (`kToolSecurityRows` below, mirrored in the
-            // REST rotate/confirm routes' `perm_fn` calls), so the generic
-            // gate's `tier_allows()` lookup for THESE two tools is keyed
-            // differently from every other `ApiToken:Write` route/tool
-            // (REST `POST /api/v1/tokens` create, its settings twin) — an
-            // operator-tier allowance on `ApiToken:Rotate` in
-            // `mcp_policy.hpp` cannot touch `ApiToken:Write` at all, on any
-            // transport, by construction. This also gives TRUE parity: an
-            // operator-tier token can now reach REST `POST /api/v1/tokens/
-            // {id}/rotate`/`/confirm` too, closing the asymmetry the
-            // call-site-local attempt would have left on record.
+            // P2 #11: rotate_api_token/confirm_api_token_rotation are mapped
+            // below to `{"ApiToken","Rotate"}` in `kToolSecurity`, a DISTINCT
+            // operation from `ApiToken:Write` — the generic C8 gate above
+            // resolves tier admission from THIS mapping for every tool before
+            // any per-tool branch runs, so a call-site-local tier exception
+            // here would be structurally unreachable (dead code, pre-empted
+            // by the generic gate). Full narrative (two abandoned fix
+            // attempts + why the ApiToken:Rotate split is correct) lives
+            // ONCE, at mcp_policy.hpp's tier_allows() operator-tier comment.
 
             if (tool_name == "create_engine_principal") {
                 if (!tier_allows(tier, "Security", "Write")) {
