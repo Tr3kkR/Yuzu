@@ -1448,9 +1448,9 @@ TEST_CASE("ApprovalManager: a genuinely transient fault at the origin check is f
     // the flag/errcode ride along, and that redemption still correctly
     // reports kForeignOrigin once the fault clears.
     yuzu::test::TempDbFile dbfile("yuzu_test_2786_ch5_");
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(dbfile.path.string().c_str(), &db) == SQLITE_OK);
-    ApprovalManager mgr(db);
+    SqliteDb db;
+    REQUIRE(sqlite3_open(dbfile.path.string().c_str(), db.addr()) == SQLITE_OK);
+    ApprovalManager mgr(db.get());
     mgr.create_tables();
 
     auto forged = mgr.submit("mcp.quarantine_device", "attacker", "{}", "",
@@ -1462,9 +1462,9 @@ TEST_CASE("ApprovalManager: a genuinely transient fault at the origin check is f
     // the first connection's read inside consume_ticket's origin check gets a
     // real SQLITE_BUSY (rollback-journal default, no busy_timeout set on
     // either connection — deterministic, no sleep/retry loop needed).
-    sqlite3* locker = nullptr;
-    REQUIRE(sqlite3_open(dbfile.path.string().c_str(), &locker) == SQLITE_OK);
-    REQUIRE(sqlite3_exec(locker, "BEGIN EXCLUSIVE;", nullptr, nullptr, nullptr) == SQLITE_OK);
+    SqliteDb locker;
+    REQUIRE(sqlite3_open(dbfile.path.string().c_str(), locker.addr()) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(locker.get(), "BEGIN EXCLUSIVE;", nullptr, nullptr, nullptr) == SQLITE_OK);
 
     auto faulted = mgr.consume_ticket(*forged, "attacker", {});
     REQUIRE(!faulted.has_value());
@@ -1476,8 +1476,8 @@ TEST_CASE("ApprovalManager: a genuinely transient fault at the origin check is f
     // so a read would fault identically to the write above. Checked below,
     // once the lock releases.
 
-    REQUIRE(sqlite3_exec(locker, "ROLLBACK;", nullptr, nullptr, nullptr) == SQLITE_OK);
-    sqlite3_close(locker);
+    REQUIRE(sqlite3_exec(locker.get(), "ROLLBACK;", nullptr, nullptr, nullptr) == SQLITE_OK);
+    locker.close();
 
     // Untouched: the fault must not have burned the ticket.
     CHECK(mgr.get(*forged)->consumed_at == 0);
@@ -1489,8 +1489,6 @@ TEST_CASE("ApprovalManager: a genuinely transient fault at the origin check is f
     CHECK(cleared.error().kind == ConsumeFailure::kForeignOrigin);
     CHECK(!cleared.error().origin_check_unevaluated);
     CHECK(mgr.get(*forged)->consumed_at == 0);
-
-    sqlite3_close(db);
 }
 
 TEST_CASE("ApprovalManager: a CAS-step fault after a passing origin check does NOT flag "

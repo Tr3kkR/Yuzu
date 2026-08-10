@@ -26,6 +26,7 @@
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "approval_manager.hpp"
 #include "auth_routes.hpp"           // real-AuthRoutes integration test (C1)
+#include "sqlite_raii.hpp"
 #include <yuzu/server/server.hpp>     // Config (real-AuthRoutes integration test)
 #include "audit_store.hpp"
 #include "pg/pg_pool.hpp"
@@ -7472,12 +7473,11 @@ TEST_CASE("MCP approval recall: a store fault AT the origin check masks a foreig
     // scenario — directly on the row, mirroring what a REST-gate mint under
     // the reserved `mcp.` prefix would have recorded.
     {
-        sqlite3_stmt* stmt = nullptr;
+        SqliteStmt stmt;
         REQUIRE(sqlite3_prepare_v2(conn.h, "UPDATE approvals SET origin = 'instruction' WHERE id = ?",
-                                   -1, &stmt, nullptr) == SQLITE_OK);
-        sqlite3_bind_text(stmt, 1, approval_id.c_str(), -1, SQLITE_TRANSIENT);
-        REQUIRE(sqlite3_step(stmt) == SQLITE_DONE);
-        sqlite3_finalize(stmt);
+                                   -1, stmt.addr(), nullptr) == SQLITE_OK);
+        sqlite3_bind_text(stmt.get(), 1, approval_id.c_str(), -1, SQLITE_TRANSIENT);
+        REQUIRE(sqlite3_step(stmt.get()) == SQLITE_DONE);
     }
 
     std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":257,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":")" +

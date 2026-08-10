@@ -647,15 +647,18 @@ std::expected<void, ConsumeError>
 ApprovalManager::consume_ticket(const std::string& id, const std::string& consumed_by,
                                 const ConsumePrecondition& precondition) {
     // These three guards are NOT store faults — `extended_errcode` stays at
-    // its default 0, which routes `approval_store_error_body` to the
-    // TRANSIENT arm ("retry this call unchanged") for `!db_` too, correctly,
-    // since `!mgr.is_open()` independently forces the permanent arm there.
-    // For the other two (empty id/consumed_by), "retry unchanged" is
-    // misleading — these are caller/argument errors, not conditions that
-    // clear on their own. Harmless today: the MCP recall (the sole
-    // production caller) pre-validates a non-empty `supplied_id` before
-    // calling, and `consumed_by` is the session's own username, never empty
-    // for an authenticated caller. A future caller that reaches this
+    // its default 0. For `!db_`, that default is harmless: `!mgr.is_open()`
+    // independently forces `approval_store_error_body`'s PERMANENT arm
+    // regardless of `extended_errcode`, so this guard never reaches the
+    // TRANSIENT wording. For the other two (empty id/consumed_by), `db_` IS
+    // open, so `extended_errcode=0` alone (not one of the four permanent
+    // codes) DOES take the transient arm ("retry this call unchanged") if
+    // this `kStoreError` ever reaches `approval_store_error_body` — and
+    // that's misleading, since these are caller/argument errors, not
+    // conditions that clear on their own. Harmless today: the MCP recall
+    // (the sole production caller) pre-validates a non-empty `supplied_id`
+    // before calling, and `consumed_by` is the session's own username, never
+    // empty for an authenticated caller. A future caller that reaches this
     // function without that pre-validation should not trust the transient
     // wording for these two cases.
     if (!db_)

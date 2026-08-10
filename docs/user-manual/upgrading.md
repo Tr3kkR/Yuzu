@@ -92,7 +92,7 @@ configure OIDC.
 
 An MCP approval-ticket recall that hits a store fault has always returned `-32603` with a `retry_after_ms` hint. Previously that hint was `5000` (retry after 5 seconds) for every store fault except a never-opened store, including one that was open but failing in a way no amount of retrying clears — SQLite corruption, not-a-database, a read-only filesystem, or a full disk. Those four cases now correctly get `retry_after_ms: null` (the same "escalate to an operator" response a never-opened store gets) instead of the transient retry hint.
 
-**What to do:** if you have automation that blindly retries on `-32603` without checking `retry_after_ms`, it now stops retrying sooner in this specific case — which is the correct behavior (the old retries were futile). If your automation already honors `retry_after_ms` per [invariant A5](agentic-first-principle.md), no change is needed. See [`mcp.md`](mcp.md) "`-32603`: Approval store unavailable" for the full response-body reference.
+**What to do:** if you have automation that blindly retries on `-32603` without checking `retry_after_ms`, it now stops retrying sooner in this specific case — which is the correct behavior (the old retries were futile). If your automation already honors `retry_after_ms` per [invariant A5](../agentic-first-principle.md), no change is needed. See [`mcp.md`](mcp.md) "`-32603`: Approval store unavailable" for the full response-body reference.
 
 ## Behaviour change: `mcp.bridge.*` audit rows can now carry `result=failure` (#2487 / #2506)
 

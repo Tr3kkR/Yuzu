@@ -201,11 +201,16 @@ struct ConsumeError {
     /// `sqlite3_extended_errcode()` for a `kStoreError` produced by a SQLite
     /// read/write failure; 0 otherwise (store not open, missing argument, a
     /// throwing precondition). See `is_permanent_sqlite_error` (#2786). The 0
-    /// default is safe for those non-SQLite producers specifically because
+    /// default is safe for the store-not-open producer specifically because
     /// `approval_store_error_body`'s permanent-arm check is `!is_open() ||
     /// is_permanent_sqlite_error(extended_errcode)` — the `is_open()` disjunct
-    /// alone correctly classifies the store-not-open case, and the others
-    /// never reach that body at all (they deny before any store call).
+    /// alone correctly forces the permanent arm there regardless of
+    /// `extended_errcode`. The missing-argument/throwing-precondition
+    /// producers are NOT similarly protected: the store IS open in those
+    /// cases, so a 0 `extended_errcode` DOES take the transient arm if that
+    /// `kStoreError` ever reaches `approval_store_error_body` (see
+    /// `consume_ticket`'s guard-clause comment for why this is harmless
+    /// today — the sole production caller never triggers them).
     int extended_errcode = 0;
     /// True ONLY when the #2442 cross-surface origin check's own read
     /// (`get_checked` inside `consume_ticket`) is the thing that faulted —
