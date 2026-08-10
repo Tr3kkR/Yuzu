@@ -180,6 +180,13 @@ public:
     list_all_role_permissions_checked() const;
 
     std::expected<void, std::string> set_permission(const Permission& perm);
+    /// Revokes by upserting an explicit 'deny' row (never a DELETE) — see the
+    /// implementation comment for why: seed_defaults() runs unconditionally
+    /// on every construction, so a genuinely absent row would have nothing to
+    /// stop a built-in default from silently returning on the next restart.
+    /// `role_name`/`securable_type`/`operation` must already be valid FK
+    /// targets (an unrecognised triple now fails with `unexpected`, where an
+    /// earlier DELETE-based version silently no-op'd and returned success).
     std::expected<void, std::string> remove_permission(const std::string& role_name,
                                                        const std::string& securable_type,
                                                        const std::string& operation);
