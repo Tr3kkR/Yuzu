@@ -1398,9 +1398,18 @@ TEST_CASE("RbacStore: migrate_from_sqlite backfills operator config, idempotentl
 // SIBLING replica that genuinely holds the legacy file silently skip its
 // own migration — the fix is holder-side fingerprint verification, and this
 // is the regression test for the exact scenario both reviewers described.
-TEST_CASE("RbacStore: migrate_from_sqlite refuses a marker stamped by a sourceless sibling when "
-          "this replica genuinely holds the legacy file (adversarial-review #2703)",
+TEST_CASE("RbacStore: migrate_from_sqlite promotes a sourceless sibling's marker when this "
+          "replica genuinely holds the legacy file (adversarial-review #2703, revised by "
+          "governance re-review's promotion fix)",
           "[rbac_store][pg]") {
+    // governance re-review (PR #2703): this test previously asserted a
+    // REFUSAL here (the sourceless-marker anti-pattern's original fix, before
+    // the promotion upsert existed). With the monotonic-promotion fix, a
+    // stored "sourceless" value carries no evidence worth protecting — no
+    // real migration has EVER happened for this fleet yet, the same safety
+    // class as a fresh install — so this replica now proceeds with its own
+    // real migration instead of refusing, and step 7's stamp_complete
+    // correctly promotes the marker to this replica's real fingerprint.
     RBAC_STORE(store);
     // "Replica A" — no local legacy file, stamps the shared marker with the
     // sourceless sentinel fingerprint.
@@ -1414,15 +1423,25 @@ TEST_CASE("RbacStore: migrate_from_sqlite refuses a marker stamped by a sourcele
     std::filesystem::remove(legacy.path);
     make_legacy_rbac_db(legacy.path, /*enabled=*/true);
 
-    // Must refuse — the marker's fingerprint ("sourceless") cannot match
-    // this replica's real content.
-    CHECK_FALSE(replica_b.migrate_from_sqlite(legacy.path));
-    // The legacy file must survive the refusal untouched (never silently
-    // discarded/moved aside on a refused backfill).
-    CHECK(std::filesystem::exists(legacy.path));
-    // And replica B's own rbac_enabled=true legacy intent was never applied
-    // fleet-wide — the whole point of refusing before that write.
-    CHECK_FALSE(replica_b.is_rbac_enabled());
+    // Must succeed — the shared marker had nothing real to protect, so this
+    // replica's own genuine migration proceeds and claims it.
+    CHECK(replica_b.migrate_from_sqlite(legacy.path));
+    // A real migration moves its legacy file aside, same as any other.
+    CHECK_FALSE(std::filesystem::exists(legacy.path));
+    // replica B's own rbac_enabled=true legacy intent WAS applied — this is
+    // a genuine migration, not a skipped no-op.
+    CHECK(replica_b.is_rbac_enabled());
+    // The migrated data (alice's CustomRole grant, seeded by
+    // make_legacy_rbac_db) is actually present, not silently dropped.
+    auto pr = replica_b.get_principal_roles("user", "alice");
+    CHECK(pr.size() == 1);
+
+    // A THIRD replica, sharing the pool, with NO local file, must now see the
+    // marker as trustworthy (backfill_source_fingerprint promoted to B's real
+    // value) and skip cleanly — proving the promotion actually stuck.
+    RbacStore replica_c{rbac_pool_fx_};
+    REQUIRE(replica_c.is_open());
+    CHECK(replica_c.migrate_from_sqlite("/nonexistent/other/rbac.db"));
 }
 
 // The positive counterpart: a replica whose OWN legacy file is still present
@@ -1448,6 +1467,42 @@ TEST_CASE("RbacStore: migrate_from_sqlite verifies a matching fingerprint when t
     // Verified, not re-migrated: no duplicate assignment rows.
     auto pr = reopened.get_principal_roles("user", "alice");
     CHECK(pr.size() == 1);
+}
+
+// governance re-review (PR #2703, HIGH — unhappy-path, EMPIRICALLY reproduced
+// against a live Postgres before this fix): a marker stamped by the
+// pre-fingerprint-mechanism code (backfill_complete present, NO
+// backfill_source_fingerprint row at all) must NOT be silently trusted or
+// silently re-migrated — unlike the sourceless case, a real migration DID
+// happen under the old scheme, so this replica may hold live post-cutover
+// operator changes a fresh re-migration would clobber. Making this permanent
+// per the original scratch repro (built, run red, reverted).
+TEST_CASE("RbacStore: migrate_from_sqlite refuses (not silently trusts, not silently "
+          "re-migrates) a pre-fingerprint-mechanism marker when this replica holds real legacy "
+          "content (governance re-review, PR #2703)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    // Simulate a marker stamped by the pre-31273f288 code: `backfill_complete`
+    // present, no `backfill_source_fingerprint` row.
+    {
+        auto lease = rbac_pool_fx_.acquire();
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "INSERT INTO rbac_store.rbac_meta (key, value) VALUES ('backfill_complete', '1') "
+            "ON CONFLICT (key) DO NOTHING",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_prefingerprint_upgrade-"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_rbac_db(legacy.path, /*enabled=*/true);
+
+    CHECK_FALSE(store.migrate_from_sqlite(legacy.path));
+    // Refused, not silently accepted OR silently re-migrated — the file must
+    // survive untouched either way.
+    CHECK(std::filesystem::exists(legacy.path));
+    CHECK_FALSE(store.is_rbac_enabled());
 }
 
 // THE CRITICAL CLAUSE (ADR-0041): losing the rbac_enabled flag silently reverts
