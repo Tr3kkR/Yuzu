@@ -6,4 +6,6 @@
   `mcp.session.reject` audit detail could not tell the two causes apart. It now emits its
   own `reason=post_record_cap`, pre-seeded on the counter alongside the other streamed-POST
   admission labels. `docs/mcp-server.md`'s admission table gains a row for this cause,
-  distinct from the shared-budget row above it (#2918).
+  distinct from the shared-budget row above it. Any alert or SIEM rule already keyed on
+  `reason="post_global_cap"` as "any streamed-POST capacity rejection" should widen to
+  include `post_record_cap`, or it will silently under-count rather than go dark (#2918).
