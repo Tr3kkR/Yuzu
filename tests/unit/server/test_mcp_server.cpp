@@ -10583,6 +10583,43 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
         CHECK(budget.active() == 0);
     }
 
+    SECTION("reserve()'s own record cap -> 429 naming post_record_cap, distinct "
+            "from the pre-admission budget's post_global_cap (#2918)") {
+        // A bridge-local cap of 1, separate from the shared `bridge` fixture
+        // (default 256): the FIRST reserve fills it, so the SECOND is refused by
+        // reserve()'s own `cfg_.global_record_cap` check - never reaching the
+        // budget (which has room) or the pin-slots arm (which only ever triggers
+        // past 4 STREAMED records on one session). This is the arm nothing at
+        // the mcp_server.cpp integration level exercised before #2918: the
+        // metric label was shared with the budget's post_global_cap, so the two
+        // causes were indistinguishable in the counter and the audit detail.
+        smcp::McpStreamBridge capped_bridge{&bus, &sessions, &metrics, {},
+                                            smcp::McpStreamBridge::Config{.global_record_cap = 1}};
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&capped_bridge);
+
+        auto first = call_sse(exec_body(755, /*with_token=*/true));
+        REQUIRE(first->status == 200);
+        const auto rows_before = tracker.query_executions({}).size();
+
+        auto second = call_sse(exec_body(756, /*with_token=*/true));
+        REQUIRE(second->status == 429);
+        auto body = nlohmann::json::parse(second->body);
+        CHECK(body["id"] == 756);
+        CHECK(body["error"]["code"] == smcp::kMcpStreamCap);
+        CHECK(reject_count("post_record_cap") == 1.0);
+        CHECK(reject_count("post_global_cap") == 0.0);
+        CHECK(reject_count("post_pin_slots") == 0.0);
+        // Refused at admission: reserve was never called for it, nothing dispatched.
+        CHECK(tracker.query_executions({}).size() == rows_before);
+        CHECK(audit_has("mcp.session.reject|failure"));
+        // `capped_bridge` is SECTION-local and about to go out of scope, but
+        // `ts` (TEST_CASE-scoped) outlives it - null the borrowed pointer
+        // rather than leave it dangling, matching this file's other
+        // borrowed-pointer fixtures (Gate 3 cpp-expert, #2918).
+        ts.mcp.set_stream_bridge(nullptr);
+    }
+
     SECTION("per-principal cap hit by CONCURRENT streams -> 429 naming "
             "post_per_principal_cap (#2789)") {
         ts.start_with_dispatch(dispatch, "operator");
