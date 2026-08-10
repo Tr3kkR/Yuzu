@@ -42,7 +42,7 @@ skill claims anything is "done."
 | Capability | Status | Source of truth |
 |---|---|---|
 | Local password auth (PBKDF2-SHA256) | Shipped (v0.10) | `auth.cpp:69` `pbkdf2_sha256()` (OpenSSL `PKCS5_PBKDF2_HMAC` + BCrypt path) |
-| Persistent auth store (`auth.db`, SQLite) | Shipped (v0.12) | `auth_db.cpp:222-236` chmod 0600 + L402 `MigrationRunner::run`; agent-doc `.claude/agents/authdb.md` |
+| Persistent auth store (Postgres schema `auth`) | Shipped (v0.12) | `docs/auth-architecture.md` "AuthDB — persistent authentication store" |
 | Session-cookie auth (HTMX dashboard) | Shipped | `auth_routes.cpp:43,386` (`extract_session_cookie`, `Set-Cookie: yuzu_session=…`) |
 | API tokens — Bearer + `X-Yuzu-Token` | Shipped | `api_token_store.cpp` (store); both header forms parsed at `auth_routes.cpp:108-119` |
 | Owner-scoped token revocation (#222) | Shipped | `rest_api_v1.cpp:1058-1082` (owner-vs-admin check at L1060) |
@@ -98,9 +98,9 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 
 ### Hard invariants that must NOT regress when adding any of the above
 
-These are pulled from `docs/auth-architecture.md` and
-`.claude/agents/authdb.md`. Every PR adding a feature in Section 2 above
-must check them:
+These are pulled from `docs/auth-architecture.md`, including its
+"AuthDB — persistent authentication store" section. Every PR adding a
+feature in Section 2 above must check them:
 
 - HTTPS by default; refuse to start without `--https-cert` + `--https-key`
   unless `--no-https` is passed.
@@ -546,7 +546,8 @@ For every feature in Section 3:
      invariants.
    - `docs/enterprise-readiness-soc2-first-customer.md` §3.2 for the
      enterprise/SOC 2 framing.
-   - `.claude/agents/authdb.md` if the feature touches `auth.db`.
+   - `docs/auth-architecture.md` "AuthDB — persistent authentication store"
+     if the feature touches AuthDB.
    - `docs/mcp-server.md` if the feature touches the MCP surface.
 
 2. **Plan.** Produce a short plan covering:
@@ -569,7 +570,8 @@ For every feature in Section 3:
 
 5. **Governance.** Run `/governance dev..HEAD` before pushing — Gate 2
    (security-guardian + docs-writer mandatory deep-dive) plus the AuthDB
-   review agent (`.claude/agents/authdb.md`) for any `auth_db.*` touch.
+   reviewer contract (`.codex/skills/governance/references/reviewers.md`) for
+   any `auth_db.*` touch.
    CRITICAL/HIGH findings block merge.
 
 6. **Docs.** docs-writer always picks up the user-manual + REST API
@@ -590,7 +592,8 @@ For every feature in Section 3:
   role assignments, RFC 8693 delegation, credential rotation/lifetime
   ceilings; the most detailed reference for the token-rotation and
   service-account-governance gaps in the matrix above.
-- **AuthDB review agent:** `.claude/agents/authdb.md`
+- **AuthDB invariants:** `docs/auth-architecture.md` "AuthDB — persistent
+  authentication store"
 - **Security review agent:** `.claude/agents/security-guardian.md`
 - **MCP token + tier policy:** `docs/mcp-server.md`
 - **Enterprise readiness plan:** `docs/enterprise-readiness-soc2-first-customer.md`

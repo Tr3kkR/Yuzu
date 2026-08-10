@@ -119,5 +119,5 @@ enrollments are lost, and SCIM self-heals on the IdP's next sync. `mfa_totp_secr
 `SecretCodec`'s (ADR-0010) **first production consumer**. The SQLite-era `sessions` table (a
 permanent v1 dead-write — sessions were always in-memory-authoritative) and the unused `auth_kv`
 scaffolding were dropped, not migrated. Full record: `docs/auth-architecture.md` "AuthDB —
-persistent authentication store" and `.claude/agents/authdb.md`; ladder entry:
+persistent authentication store"; ladder entry:
 `docs/postgres-migration-ladder.md` "Done".
