@@ -610,9 +610,9 @@ server `PgPool`).
   hand-edit or a bug on an old release — the migration's own `ALTER TABLE ...
   ADD CONSTRAINT` fails validation and the server refuses to boot with a raw
   Postgres `23514 check_violation` rather than the app's own message. Recovery:
-  connect directly and correct the row (`UPDATE rbac_meta SET value = 'false'
-  WHERE key = 'rbac_enabled'`, or `'true'` if RBAC was genuinely enabled) before
-  restarting.
+  connect directly and correct the row (`UPDATE rbac_store.rbac_meta SET value
+  = 'false' WHERE key = 'rbac_enabled'`, or `'true'` if RBAC was genuinely
+  enabled) before restarting.
 - The legacy `rbac.db` file is **moved aside** only after the backfill is
   verified. It is never read again; keep the moved-aside copy until you have
   confirmed RBAC behaves as expected, then remove it.
