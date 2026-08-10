@@ -365,11 +365,11 @@ std::string sqlite_text(sqlite3_stmt* s, int col) {
 // Bind the SQL boolean literal for a legacy INTEGER is_system value.
 const char* bool_lit(std::int64_t v) { return v != 0 ? "true" : "false"; }
 
-std::string sha256_hex(std::string_view in) {
+std::optional<std::string> sha256_hex(std::string_view in) {
     unsigned char md[EVP_MAX_MD_SIZE];
     unsigned int len = 0;
     if (EVP_Digest(in.data(), in.size(), md, &len, EVP_sha256(), nullptr) != 1)
-        return {};
+        return std::nullopt;
     static const char* kHex = "0123456789abcdef";
     std::string out;
     out.reserve(static_cast<std::size_t>(len) * 2);
@@ -394,13 +394,256 @@ std::string sha256_hex(std::string_view in) {
 // RbacStore's small, single-shot (non-resumable) legacy dataset.
 constexpr const char* kSourcelessFingerprint = "sourceless";
 
-// Deterministic content fingerprint for a legacy rbac.db, independent of
-// on-disk row order (WAL/vacuum state can reorder identical rows without
-// changing their meaning) — every row is read into a canonical, sorted,
-// delimited form before hashing. Returns `kSourcelessFingerprint` for a
-// legacy file with no `roles` table (no operator content — the same "nothing
-// to protect" class as no local file at all, per the anti-pattern above).
-// Returns `nullopt` only on a corrupt/unreadable file — the caller MUST fail
+// governance re-review (PR #2703, BLOCKING — canonicalization collision,
+// confirmed independently by 3 reviewers, one with an empirical repro): the
+// original encoding joined fields with an unescaped '|' and rows with '\n'.
+// SQLite TEXT columns carry arbitrary bytes (sqlite3_column_bytes, not a
+// C string) and NOTHING in RbacStore restricts role/group/principal free
+// text to a printable-safe charset (create_role only rejects an empty
+// name) — so two genuinely different legacy datasets could canonicalize to
+// the identical preimage and hash identically, silently defeating the
+// verification this whole mechanism exists to provide. A different
+// delimiter byte (e.g. the device/software-inventory stores' \x1f/\x1e
+// convention) does not fix this: it is still just some other byte a TEXT
+// column can legally contain. Every field below is therefore
+// LENGTH-PREFIXED ("<byte-length>:<bytes>") rather than delimited — two
+// different field sequences can never encode to the same preimage
+// regardless of what bytes they contain, because the length prefix is
+// unambiguous about where each field ends.
+void append_field(std::string& out, std::string_view f) {
+    out += std::to_string(f.size());
+    out += ':';
+    out.append(f.data(), f.size());
+}
+void append_field(std::string& out, std::int64_t v) { append_field(out, std::to_string(v)); }
+
+struct LType {
+    std::string name, description;
+    std::int64_t is_system{0};
+};
+struct LRole {
+    std::string name, description;
+    std::int64_t is_system{0}, created_at{0};
+};
+struct LPerm {
+    std::string role_name, securable_type, operation, effect;
+};
+struct LPrincipal {
+    std::string principal_type, principal_id, role_name;
+};
+struct LGroup {
+    std::string name, description, source;
+    std::optional<std::string> external_id;
+    std::int64_t created_at{0};
+};
+struct LMember {
+    std::string group_name, username;
+};
+
+// Every row category this backfill reads from a legacy rbac.db, read ONCE
+// and shared by the real migration (INSERT loop) and both fingerprint call
+// sites (holder-side verification, and the post-migration trust-anchor
+// stamp) — there is deliberately no second file read anywhere in this
+// mechanism (governance re-review, MEDIUM->closed: a second independent
+// read pass was previously the trust anchor's own TOCTOU window: a legacy
+// file mutated between the migrated read and the re-derived fingerprint
+// read, e.g. by an old server binary still live during a rolling upgrade,
+// would stamp a fingerprint that never matched what was actually migrated,
+// and every future verification would then wrongly validate against it).
+struct LegacySnapshot {
+    std::string enabled = "false";
+    std::vector<LType> types;
+    std::vector<std::pair<std::string, std::string>> ops;
+    std::vector<LRole> roles;
+    std::vector<LPerm> perms;
+    std::vector<LPrincipal> principals;
+    std::vector<LGroup> groups;
+    std::vector<LMember> members;
+};
+
+// Reads every row this backfill cares about from an ALREADY-OPEN legacy
+// connection already known to have a `roles` table (the sourceless case is
+// the caller's responsibility, same as before). Fails closed (nullopt) on
+// any partial/corrupt read — matches the pre-refactor read_all contract.
+std::optional<LegacySnapshot> read_legacy_snapshot(sqlite3* legacy) {
+    LegacySnapshot snap;
+    if (legacy_has_table(legacy, "rbac_config")) {
+        SqliteStmt s;
+        if (sqlite3_prepare_v2(legacy, "SELECT value FROM rbac_config WHERE key='enabled'", -1,
+                               s.addr(), nullptr) == SQLITE_OK &&
+            sqlite3_step(s.get()) == SQLITE_ROW) {
+            // Raw text, not the strict canonical-bool parse the caller applies
+            // to this same value for the actual rbac_enabled write: this
+            // snapshot only needs to detect a CONTENT difference for
+            // fingerprinting purposes, not validate canonicality (fjarvis F2
+            // stays the sole owner of that check, applied by the caller).
+            snap.enabled = sqlite_text(s.get(), 0);
+        }
+    }
+
+    const auto read_all = [&](const char* sql,
+                              const std::function<void(sqlite3_stmt*)>& row) -> bool {
+        SqliteStmt s;
+        if (sqlite3_prepare_v2(legacy, sql, -1, s.addr(), nullptr) != SQLITE_OK)
+            return false;
+        int rc;
+        while ((rc = sqlite3_step(s.get())) == SQLITE_ROW)
+            row(s.get());
+        return rc == SQLITE_DONE;
+    };
+
+    bool ok = true;
+    if (legacy_has_table(legacy, "securable_types"))
+        ok &= read_all("SELECT name, description, is_system FROM securable_types",
+                       [&](sqlite3_stmt* s) {
+                           snap.types.push_back(
+                               {sqlite_text(s, 0), sqlite_text(s, 1), sqlite3_column_int64(s, 2)});
+                       });
+    if (legacy_has_table(legacy, "operations"))
+        ok &= read_all("SELECT id, description FROM operations", [&](sqlite3_stmt* s) {
+            snap.ops.emplace_back(sqlite_text(s, 0), sqlite_text(s, 1));
+        });
+    ok &= read_all("SELECT name, description, is_system, created_at FROM roles",
+                   [&](sqlite3_stmt* s) {
+                       snap.roles.push_back({sqlite_text(s, 0), sqlite_text(s, 1),
+                                             sqlite3_column_int64(s, 2),
+                                             sqlite3_column_int64(s, 3)});
+                   });
+    ok &= read_all("SELECT role_name, securable_type, operation, effect FROM role_permissions",
+                   [&](sqlite3_stmt* s) {
+                       snap.perms.push_back({sqlite_text(s, 0), sqlite_text(s, 1),
+                                             sqlite_text(s, 2), sqlite_text(s, 3)});
+                   });
+    ok &= read_all("SELECT principal_type, principal_id, role_name FROM principal_roles",
+                   [&](sqlite3_stmt* s) {
+                       snap.principals.push_back(
+                           {sqlite_text(s, 0), sqlite_text(s, 1), sqlite_text(s, 2)});
+                   });
+    if (legacy_has_table(legacy, "groups"))
+        ok &= read_all(
+            "SELECT name, description, source, external_id, created_at FROM groups",
+            [&](sqlite3_stmt* s) {
+                LGroup g{sqlite_text(s, 0), sqlite_text(s, 1), sqlite_text(s, 2), std::nullopt,
+                        sqlite3_column_int64(s, 4)};
+                if (sqlite3_column_type(s, 3) != SQLITE_NULL)
+                    g.external_id = sqlite_text(s, 3);
+                snap.groups.push_back(std::move(g));
+            });
+    if (legacy_has_table(legacy, "group_members"))
+        ok &= read_all("SELECT group_name, username FROM group_members", [&](sqlite3_stmt* s) {
+            snap.members.push_back({sqlite_text(s, 0), sqlite_text(s, 1)});
+        });
+    if (!ok)
+        return std::nullopt;
+    return snap;
+}
+
+// Injective preimage: every field length-prefixed (see append_field above),
+// every row tagged by category, the row set sorted so on-disk order
+// (WAL/vacuum state can reorder identical rows without changing their
+// meaning) never changes the result. `groups.external_id`'s NULL-vs-empty-
+// string distinction is preserved via an explicit presence tag ahead of the
+// value field — collapsing the two (as the pre-fix encoding did) would
+// fingerprint a NULL and an empty string identically even though the real
+// migration (step 5's INSERT) does not treat them the same. A leading
+// version/domain tag is hashed as part of the preimage (standard hash
+// domain-separation hygiene) independent of the "v2:" prefix the caller
+// puts on the STORED value — that prefix is for an operator/log reading the
+// stored value directly, this one is for the hash itself.
+std::string canonicalize_legacy_snapshot(const LegacySnapshot& snap) {
+    std::vector<std::string> rows;
+    rows.reserve(snap.types.size() + snap.ops.size() + snap.roles.size() + snap.perms.size() +
+                 snap.principals.size() + snap.groups.size() + snap.members.size());
+    for (const auto& t : snap.types) {
+        std::string r;
+        append_field(r, "type");
+        append_field(r, t.name);
+        append_field(r, t.description);
+        append_field(r, t.is_system);
+        rows.push_back(std::move(r));
+    }
+    for (const auto& o : snap.ops) {
+        std::string r;
+        append_field(r, "op");
+        append_field(r, o.first);
+        append_field(r, o.second);
+        rows.push_back(std::move(r));
+    }
+    for (const auto& role : snap.roles) {
+        std::string r;
+        append_field(r, "role");
+        append_field(r, role.name);
+        append_field(r, role.description);
+        append_field(r, role.is_system);
+        append_field(r, role.created_at);
+        rows.push_back(std::move(r));
+    }
+    for (const auto& p : snap.perms) {
+        std::string r;
+        append_field(r, "perm");
+        append_field(r, p.role_name);
+        append_field(r, p.securable_type);
+        append_field(r, p.operation);
+        append_field(r, p.effect);
+        rows.push_back(std::move(r));
+    }
+    for (const auto& p : snap.principals) {
+        std::string r;
+        append_field(r, "principal");
+        append_field(r, p.principal_type);
+        append_field(r, p.principal_id);
+        append_field(r, p.role_name);
+        rows.push_back(std::move(r));
+    }
+    for (const auto& g : snap.groups) {
+        std::string r;
+        append_field(r, "group");
+        append_field(r, g.name);
+        append_field(r, g.description);
+        append_field(r, g.source);
+        append_field(r, g.external_id ? "1" : "0"); // presence tag, disambiguates NULL vs ""
+        append_field(r, g.external_id.value_or(""));
+        append_field(r, g.created_at);
+        rows.push_back(std::move(r));
+    }
+    for (const auto& m : snap.members) {
+        std::string r;
+        append_field(r, "member");
+        append_field(r, m.group_name);
+        append_field(r, m.username);
+        rows.push_back(std::move(r));
+    }
+    std::sort(rows.begin(), rows.end());
+
+    std::string canon = "rbac-legacy-fingerprint-v2\n";
+    append_field(canon, snap.enabled);
+    for (const auto& r : rows)
+        canon += r;
+    return canon;
+}
+
+// "v2:"-prefixed so a stored value's scheme is legible directly (to an
+// operator reading rbac_meta, or in a log line) without decoding the hash —
+// a future encoding change becomes a diagnosable "scheme changed" instead of
+// reproducing the collision/TOCTOU class of defect this encoding closes as
+// an unexplainable holder-side verification failure. Returns nullopt only on
+// an EVP_Digest failure (essentially unreachable for SHA-256, but the
+// contract stays fail-closed: a caller MUST NOT trust an empty-string
+// fingerprint as valid, unlike the pre-fix version of this function).
+std::optional<std::string> fingerprint_legacy_snapshot(const LegacySnapshot& snap) {
+    const auto hash = sha256_hex(canonicalize_legacy_snapshot(snap));
+    if (!hash)
+        return std::nullopt;
+    return "v2:" + *hash;
+}
+
+// Path-based convenience for the holder-side verification call site (which
+// has no already-open connection to reuse): opens read-only, probes for
+// corruption, and either returns the sourceless sentinel (no `roles` table —
+// same "nothing to protect" class as no local file at all) or reads a full
+// snapshot and fingerprints it via the exact same function the real
+// migration path uses from its in-memory snapshot. Returns nullopt only on a
+// corrupt/unreadable file or a snapshot read failure — the caller MUST fail
 // closed on that, never treat it as sourceless-equivalent.
 std::optional<std::string> legacy_rbac_fingerprint(const std::filesystem::path& legacy_db_path) {
     SqliteDb legacy;
@@ -418,73 +661,10 @@ std::optional<std::string> legacy_rbac_fingerprint(const std::filesystem::path& 
     if (!legacy_has_table(legacy.get(), "roles"))
         return std::string(kSourcelessFingerprint);
 
-    std::string legacy_enabled = "false";
-    if (legacy_has_table(legacy.get(), "rbac_config")) {
-        SqliteStmt s;
-        if (sqlite3_prepare_v2(legacy.get(), "SELECT value FROM rbac_config WHERE key='enabled'", -1,
-                               s.addr(), nullptr) == SQLITE_OK &&
-            sqlite3_step(s.get()) == SQLITE_ROW) {
-            // Raw text, not the strict canonical-bool parse the real migration
-            // path uses: this fingerprint only needs to detect a CONTENT
-            // difference, not validate canonicality — that check stays the
-            // main path's job (fjarvis F2) and must not be duplicated here.
-            legacy_enabled = sqlite_text(s.get(), 0);
-        }
-    }
-
-    const auto read_all = [&](const char* sql,
-                              const std::function<void(sqlite3_stmt*)>& row) -> bool {
-        SqliteStmt s;
-        if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK)
-            return false;
-        int rc;
-        while ((rc = sqlite3_step(s.get())) == SQLITE_ROW)
-            row(s.get());
-        return rc == SQLITE_DONE;
-    };
-
-    std::vector<std::string> rows;
-    bool read_ok = true;
-    read_ok &= read_all("SELECT name, description, is_system, created_at FROM roles",
-                       [&](sqlite3_stmt* s) {
-                           rows.push_back("role|" + sqlite_text(s, 0) + "|" + sqlite_text(s, 1) +
-                                          "|" + std::to_string(sqlite3_column_int64(s, 2)) + "|" +
-                                          std::to_string(sqlite3_column_int64(s, 3)));
-                       });
-    read_ok &= read_all("SELECT role_name, securable_type, operation, effect FROM role_permissions",
-                       [&](sqlite3_stmt* s) {
-                           rows.push_back("perm|" + sqlite_text(s, 0) + "|" + sqlite_text(s, 1) +
-                                          "|" + sqlite_text(s, 2) + "|" + sqlite_text(s, 3));
-                       });
-    read_ok &= read_all("SELECT principal_type, principal_id, role_name FROM principal_roles",
-                       [&](sqlite3_stmt* s) {
-                           rows.push_back("principal|" + sqlite_text(s, 0) + "|" +
-                                          sqlite_text(s, 1) + "|" + sqlite_text(s, 2));
-                       });
-    if (legacy_has_table(legacy.get(), "groups"))
-        read_ok &= read_all(
-            "SELECT name, description, source, external_id, created_at FROM groups",
-            [&](sqlite3_stmt* s) {
-                const std::string ext =
-                    sqlite3_column_type(s, 3) != SQLITE_NULL ? sqlite_text(s, 3) : "";
-                rows.push_back("group|" + sqlite_text(s, 0) + "|" + sqlite_text(s, 1) + "|" +
-                               sqlite_text(s, 2) + "|" + ext + "|" +
-                               std::to_string(sqlite3_column_int64(s, 4)));
-            });
-    if (legacy_has_table(legacy.get(), "group_members"))
-        read_ok &= read_all("SELECT group_name, username FROM group_members",
-                           [&](sqlite3_stmt* s) {
-                               rows.push_back("member|" + sqlite_text(s, 0) + "|" +
-                                              sqlite_text(s, 1));
-                           });
-    if (!read_ok)
+    const auto snap = read_legacy_snapshot(legacy.get());
+    if (!snap)
         return std::nullopt;
-
-    std::sort(rows.begin(), rows.end());
-    std::string canon = "enabled=" + legacy_enabled + "\n";
-    for (const auto& r : rows)
-        canon += r + "\n";
-    return sha256_hex(canon);
+    return fingerprint_legacy_snapshot(*snap);
 }
 
 } // namespace
@@ -2354,6 +2534,29 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
             });
     };
 
+    // Shared by step 8 (fresh successful migration) AND the verified-match
+    // branch of step 2 (this replica's OWN already-migrated file is still
+    // present, e.g. an earlier move-aside attempt failed) — non-fatal on
+    // failure either way, logged for an operator to clean up manually.
+    // governance re-review (Fable): RbacStore's verified-match path used to
+    // just skip without retrying the rename, unlike AuditStore's equivalent
+    // (audit_store.cpp) — a once-failed move-aside then re-fingerprinted the
+    // same file on every future boot forever, never converging on the
+    // playbook's one-release retention policy.
+    const auto move_legacy_aside = [](const std::filesystem::path& path) {
+        std::error_code mv_ec;
+        auto aside = path;
+        aside += ".migrated-" + std::to_string(now_secs());
+        std::filesystem::rename(path, aside, mv_ec);
+        if (mv_ec)
+            spdlog::warn("RbacStore: migrate_from_sqlite: could not move legacy {} aside ({}); "
+                         "it is safe to archive/remove manually",
+                         path.string(), mv_ec.message());
+        else
+            spdlog::info("RbacStore: migrate_from_sqlite: moved legacy rbac db to {}",
+                         aside.string());
+    };
+
     // 1. Local legacy-file presence (cheap stat) — checked BEFORE the marker
     // lookup so step 2 knows whether THIS replica has something to verify a
     // pre-existing marker against.
@@ -2443,6 +2646,15 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
             }
             spdlog::debug("RbacStore: migrate_from_sqlite already completed (fingerprint "
                          "verified), skipping");
+            // governance re-review (Fable): retry the move-aside here too, not
+            // only on the fresh-migration path — a verified match means this
+            // IS the file a prior boot on this replica already migrated, and a
+            // once-failed move-aside (the only way it could still be here)
+            // deserves the same retry, or it re-verifies against this same
+            // file forever and never converges on the playbook's one-release
+            // retention policy. legacy_rbac_fingerprint() above opened and
+            // closed its own connection, so nothing holds this path open.
+            move_legacy_aside(legacy_db_path);
             return true;
         }
     }
@@ -2506,33 +2718,50 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
         return true;
     }
 
+    // 3b. Read every legacy row ONCE (config tables are small) into the shared
+    // snapshot — the single source both the real migration (below) and this
+    // stamp's own trust-anchor fingerprint (step 7) derive from. No second
+    // file read anywhere in this function (governance re-review, MEDIUM ->
+    // closed: a second independent read at step 7 was previously a TOCTOU
+    // window between what actually got migrated and what got fingerprinted).
+    const auto snap_opt = read_legacy_snapshot(legacy.get());
+    if (!snap_opt) {
+        spdlog::error("RbacStore: migrate_from_sqlite: legacy read failed: {}",
+                      sqlite3_errmsg(legacy.get()));
+        backfill_metric("failed");
+        return false;
+    }
+    const LegacySnapshot& snap = *snap_opt;
+    const auto& types = snap.types;
+    const auto& ops = snap.ops;
+    const auto& roles = snap.roles;
+    const auto& perms = snap.perms;
+    const auto& principals = snap.principals;
+    const auto& groups = snap.groups;
+    const auto& members = snap.members;
+
     // 4. CRITICAL — the rbac_enabled flag FIRST, read-back-verified. Losing it
     // silently reverts the fleet to RBAC-off (catastrophic fail-open). The
     // seeded default 'false' is a placeholder legacy intent must OVERRIDE, so
     // this is DO UPDATE (not DO NOTHING).
     std::string legacy_enabled = "false";
-    if (legacy_has_table(legacy.get(), "rbac_config")) {
-        SqliteStmt s;
-        if (sqlite3_prepare_v2(legacy.get(),
-                               "SELECT value FROM rbac_config WHERE key='enabled'", -1, s.addr(),
-                               nullptr) == SQLITE_OK &&
-            sqlite3_step(s.get()) == SQLITE_ROW) {
-            // fjarvis F2 (#2703): parse strictly rather than coercing any
-            // non-canonical value to "false" — the same fail-open class as
-            // the PG-side read this row is about to feed, one hop earlier.
-            const std::string raw = sqlite_text(s.get(), 0);
-            const auto parsed = parse_canonical_bool(raw);
-            if (!parsed) {
-                spdlog::error(
-                    "RbacStore: migrate_from_sqlite: legacy rbac_config.enabled holds a "
-                    "non-canonical value (expected exactly \"true\" or \"false\") — refusing "
-                    "backfill (fail-closed; coercing it to false would silently disable RBAC "
-                    "on a fleet that enabled it)");
-                backfill_metric("failed");
-                return false;
-            }
-            legacy_enabled = *parsed ? "true" : "false";
+    {
+        // fjarvis F2 (#2703): parse strictly rather than coercing any
+        // non-canonical value to "false" — the same fail-open class as the
+        // PG-side read this row is about to feed, one hop earlier. snap.enabled
+        // defaults to "false" itself when legacy has no rbac_config row, which
+        // parses canonically, so this still runs unconditionally.
+        const auto parsed = parse_canonical_bool(snap.enabled);
+        if (!parsed) {
+            spdlog::error(
+                "RbacStore: migrate_from_sqlite: legacy rbac_config.enabled holds a "
+                "non-canonical value (expected exactly \"true\" or \"false\") — refusing "
+                "backfill (fail-closed; coercing it to false would silently disable RBAC "
+                "on a fleet that enabled it)");
+            backfill_metric("failed");
+            return false;
         }
+        legacy_enabled = *parsed ? "true" : "false";
     }
     {
         const bool ok = pool_.with_txn_for(kBackfillTxnTimeout, [&](PGconn* c) -> bool {
@@ -2568,127 +2797,23 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                      legacy_enabled);
     }
 
-    // 5. Backfill config tables. Small, authoritative sets — one transaction,
-    // whole-table reads, ON CONFLICT DO NOTHING (idempotent + crash-resumable
-    // by re-run). securable_types/operations are backfilled too (defensive:
+    // 5. Backfill config tables from the snapshot already read at step 3b —
+    // one transaction, ON CONFLICT DO NOTHING (idempotent + crash-resumable by
+    // re-run). securable_types/operations are backfilled too (defensive:
     // keeps role_permissions FKs satisfiable even for a hypothetical custom
     // type). Legacy is already migration-cleaned, so v3/v4 cleanups are not
-    // replayed. Reconciliation counts are gathered here for the assert below.
+    // replayed. Reconciliation counts below are the snapshot's own row counts
+    // — a genuinely partial read already failed closed at step 3b (read_all's
+    // rc == SQLITE_DONE contract), so re-counting via a second query would be
+    // redundant, not an independent check.
     struct TableCounts {
         std::int64_t roles{0}, perms{0}, principals{0}, groups{0}, members{0};
     };
-    TableCounts legacy_counts;
-    const auto count_legacy = [&](const char* table) -> std::int64_t {
-        if (!legacy_has_table(legacy.get(), table))
-            return 0;
-        SqliteStmt s;
-        const std::string q = std::string("SELECT COUNT(*) FROM ") + table;
-        if (sqlite3_prepare_v2(legacy.get(), q.c_str(), -1, s.addr(), nullptr) != SQLITE_OK ||
-            sqlite3_step(s.get()) != SQLITE_ROW)
-            return -1;
-        return sqlite3_column_int64(s.get(), 0);
-    };
-    legacy_counts.roles = count_legacy("roles");
-    legacy_counts.perms = count_legacy("role_permissions");
-    legacy_counts.principals = count_legacy("principal_roles");
-    legacy_counts.groups = count_legacy("groups");
-    legacy_counts.members = count_legacy("group_members");
-    if (legacy_counts.roles < 0 || legacy_counts.perms < 0 || legacy_counts.principals < 0 ||
-        legacy_counts.groups < 0 || legacy_counts.members < 0) {
-        spdlog::error("RbacStore: migrate_from_sqlite: legacy count failed: {}",
-                      sqlite3_errmsg(legacy.get()));
-        backfill_metric("failed");
-        return false;
-    }
-
-    // Read every legacy row into memory (config tables are small) BEFORE the PG
-    // txn, so no two leases are held at once.
-    struct LRole {
-        std::string name, description;
-        std::int64_t is_system{0}, created_at{0};
-    };
-    struct LType {
-        std::string name, description;
-        std::int64_t is_system{0};
-    };
-    struct LPerm {
-        std::string role_name, securable_type, operation, effect;
-    };
-    struct LPrincipal {
-        std::string principal_type, principal_id, role_name;
-    };
-    struct LGroup {
-        std::string name, description, source;
-        std::optional<std::string> external_id;
-        std::int64_t created_at{0};
-    };
-    struct LMember {
-        std::string group_name, username;
-    };
-    std::vector<LType> types;
-    std::vector<std::pair<std::string, std::string>> ops; // (id, description) is_system implied
-    std::vector<LRole> roles;
-    std::vector<LPerm> perms;
-    std::vector<LPrincipal> principals;
-    std::vector<LGroup> groups;
-    std::vector<LMember> members;
-
-    const auto read_all = [&](const char* sql, const std::function<void(sqlite3_stmt*)>& row)
-        -> bool {
-        SqliteStmt s;
-        if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK)
-            return false;
-        int rc;
-        while ((rc = sqlite3_step(s.get())) == SQLITE_ROW)
-            row(s.get());
-        return rc == SQLITE_DONE;
-    };
-
-    bool read_ok = true;
-    if (legacy_has_table(legacy.get(), "securable_types"))
-        read_ok &= read_all("SELECT name, description, is_system FROM securable_types",
-                            [&](sqlite3_stmt* s) {
-                                types.push_back({sqlite_text(s, 0), sqlite_text(s, 1),
-                                                 sqlite3_column_int64(s, 2)});
-                            });
-    if (legacy_has_table(legacy.get(), "operations"))
-        read_ok &= read_all("SELECT id, description FROM operations", [&](sqlite3_stmt* s) {
-            ops.emplace_back(sqlite_text(s, 0), sqlite_text(s, 1));
-        });
-    read_ok &= read_all("SELECT name, description, is_system, created_at FROM roles",
-                       [&](sqlite3_stmt* s) {
-                           roles.push_back({sqlite_text(s, 0), sqlite_text(s, 1),
-                                            sqlite3_column_int64(s, 2), sqlite3_column_int64(s, 3)});
-                       });
-    read_ok &= read_all("SELECT role_name, securable_type, operation, effect FROM role_permissions",
-                       [&](sqlite3_stmt* s) {
-                           perms.push_back({sqlite_text(s, 0), sqlite_text(s, 1), sqlite_text(s, 2),
-                                            sqlite_text(s, 3)});
-                       });
-    read_ok &= read_all("SELECT principal_type, principal_id, role_name FROM principal_roles",
-                       [&](sqlite3_stmt* s) {
-                           principals.push_back(
-                               {sqlite_text(s, 0), sqlite_text(s, 1), sqlite_text(s, 2)});
-                       });
-    if (legacy_has_table(legacy.get(), "groups"))
-        read_ok &= read_all("SELECT name, description, source, external_id, created_at FROM groups",
-                           [&](sqlite3_stmt* s) {
-                               LGroup g{sqlite_text(s, 0), sqlite_text(s, 1), sqlite_text(s, 2),
-                                        std::nullopt, sqlite3_column_int64(s, 4)};
-                               if (sqlite3_column_type(s, 3) != SQLITE_NULL)
-                                   g.external_id = sqlite_text(s, 3);
-                               groups.push_back(std::move(g));
-                           });
-    if (legacy_has_table(legacy.get(), "group_members"))
-        read_ok &= read_all("SELECT group_name, username FROM group_members", [&](sqlite3_stmt* s) {
-            members.push_back({sqlite_text(s, 0), sqlite_text(s, 1)});
-        });
-    if (!read_ok) {
-        spdlog::error("RbacStore: migrate_from_sqlite: legacy read failed: {}",
-                      sqlite3_errmsg(legacy.get()));
-        backfill_metric("failed");
-        return false;
-    }
+    const TableCounts legacy_counts{static_cast<std::int64_t>(roles.size()),
+                                    static_cast<std::int64_t>(perms.size()),
+                                    static_cast<std::int64_t>(principals.size()),
+                                    static_cast<std::int64_t>(groups.size()),
+                                    static_cast<std::int64_t>(members.size())};
 
     const bool insert_ok = pool_.with_txn_for(kBackfillTxnTimeout, [&](PGconn* c) -> bool {
         const auto run = [&](const char* sql, const std::vector<std::string>& p) -> bool {
@@ -2954,14 +3079,14 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                      legacy_counts.groups, legacy_counts.members, pr, pp, ppr, pg_, pm);
     }
 
-    // 7. Stamp the one-time marker with THIS file's real fingerprint — a
-    // second read pass (the file is still open at legacy_db_path, not yet
-    // moved aside), reusing the exact same canonicalization the holder-side
-    // verification path above uses, so a later boot of this same replica
-    // (if the move-aside below fails) fingerprints identically and matches.
-    const auto source_fp = legacy_rbac_fingerprint(legacy_db_path);
+    // 7. Stamp the one-time marker with THIS file's real fingerprint — derived
+    // from the SAME snapshot already read at step 3b, not a second file read
+    // (governance re-review: a second independent read here was previously
+    // the trust anchor's own TOCTOU window — see the comment on
+    // read_legacy_snapshot's declaration).
+    const auto source_fp = fingerprint_legacy_snapshot(snap);
     if (!source_fp) {
-        spdlog::error("RbacStore: migrate_from_sqlite: could not re-derive this file's own "
+        spdlog::error("RbacStore: migrate_from_sqlite: could not derive this file's own "
                       "fingerprint immediately after successfully backfilling it; refusing to "
                       "stamp complete without a trust anchor");
         backfill_metric("failed");
@@ -2979,16 +3104,7 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
     // rename-with-open-handle, so it passed on Linux/macOS). All legacy reads
     // are already materialised in memory above.
     legacy.close();
-    std::error_code mv_ec;
-    auto aside = legacy_db_path;
-    aside += ".migrated-" + std::to_string(now_secs());
-    std::filesystem::rename(legacy_db_path, aside, mv_ec);
-    if (mv_ec)
-        spdlog::warn("RbacStore: migrate_from_sqlite: backfill complete but could not move legacy "
-                     "{} aside ({}); it is safe to archive/remove manually",
-                     legacy_db_path.string(), mv_ec.message());
-    else
-        spdlog::info("RbacStore: migrate_from_sqlite: moved legacy rbac db to {}", aside.string());
+    move_legacy_aside(legacy_db_path);
 
     backfill_metric("completed");
     return true;

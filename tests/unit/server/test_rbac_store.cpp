@@ -1217,7 +1217,61 @@ void make_legacy_rbac_db(const std::filesystem::path& path, bool enabled) {
                       (enabled ? "true" : "false") + "');";
     REQUIRE(sqlite3_exec(db.get(), cfg.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
 }
+
+// governance re-review (PR #2703, BLOCKING — canonicalization collision):
+// minimal legacy DB with exactly ONE role, whose name/description are the
+// caller's choice — lets a test craft two field splits that would collide
+// under an unescaped delimiter join (e.g. name="a|b",desc="c" vs
+// name="a",desc="b|c") but must NOT collide under the length-prefixed
+// encoding this fix ships.
+void make_legacy_rbac_db_one_role(const std::filesystem::path& path, const std::string& role_name,
+                                  const std::string& role_desc) {
+    SqliteDb db;
+    REQUIRE(sqlite3_open_v2(path.string().c_str(), db.addr(),
+                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+    const char* ddl =
+        "CREATE TABLE roles (name TEXT PRIMARY KEY, description TEXT, is_system INTEGER, created_at "
+        "INTEGER);"
+        "CREATE TABLE role_permissions (role_name TEXT, securable_type TEXT, operation TEXT, effect "
+        "TEXT);"
+        "CREATE TABLE principal_roles (principal_type TEXT, principal_id TEXT, role_name TEXT);";
+    SqliteErrMsg err;
+    REQUIRE(sqlite3_exec(db.get(), ddl, nullptr, nullptr, err.addr()) == SQLITE_OK);
+    SqliteStmt s;
+    REQUIRE(sqlite3_prepare_v2(db.get(),
+                               "INSERT INTO roles (name, description, is_system, created_at) "
+                               "VALUES (?, ?, 0, 5)",
+                               -1, s.addr(), nullptr) == SQLITE_OK);
+    sqlite3_bind_text(s.get(), 1, role_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s.get(), 2, role_desc.c_str(), -1, SQLITE_TRANSIENT);
+    REQUIRE(sqlite3_step(s.get()) == SQLITE_DONE);
+}
 } // namespace
+
+TEST_CASE("RbacStore: migrate_from_sqlite's fingerprint does not collide on a delimiter-crafted "
+          "field split (governance re-review, PR #2703)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::test::TempDbFile legacy_a{"yuzu_test_rbac_collide_a-"};
+    std::filesystem::remove(legacy_a.path);
+    make_legacy_rbac_db_one_role(legacy_a.path, "a|b", "c");
+    REQUIRE(store.migrate_from_sqlite(legacy_a.path));
+
+    // Same shared marker (stamped for A's content above); replica B holds a
+    // DIFFERENT legacy file whose fields split the same raw bytes across the
+    // name/description boundary differently ("a" / "b|c" vs "a|b" / "c"). An
+    // unescaped '|' join would canonicalize both to the identical preimage —
+    // this must now be correctly detected as a MISMATCH, not silently waved
+    // through as "already migrated, matches".
+    RbacStore replica_b{rbac_pool_fx_};
+    REQUIRE(replica_b.is_open());
+    yuzu::test::TempDbFile legacy_b{"yuzu_test_rbac_collide_b-"};
+    std::filesystem::remove(legacy_b.path);
+    make_legacy_rbac_db_one_role(legacy_b.path, "a", "b|c");
+
+    CHECK_FALSE(replica_b.migrate_from_sqlite(legacy_b.path));
+    CHECK(std::filesystem::exists(legacy_b.path)); // refused, never moved aside
+}
 
 TEST_CASE("RbacStore: migrate_from_sqlite returns false on an unopened store", "[rbac_store][pg]") {
     PgPool bad{{.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1",
