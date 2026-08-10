@@ -160,6 +160,31 @@ std::vector<ApiToken> read_active_for_principal_on_conn(PGconn* conn, const std:
     return result;
 }
 
+// Fresh single-row lookup by token_id, on any caller-supplied PGconn* — a
+// pool lease outside a transaction, or the connection inside one. Shared by
+// rotate_token/confirm_token_rotation's pre-txn principal_id resolution and
+// their in-txn fresh re-read (invariant: state re-derived under the advisory
+// lock, never the pre-lock snapshot). `ok` distinguishes a genuine zero-row
+// match (positive: this token_id definitively does not exist) from a query
+// failure (retryable) — unlike read_active_for_principal_on_conn's
+// empty-vector contract, a single WHERE token_id=$1 lookup can tell the two
+// apart cheaply, so callers here get MORE precision than the count-based
+// principal-wide read the engine arm relies on.
+struct TokenLookup {
+    bool ok = false;                 // the SELECT itself succeeded
+    std::optional<ApiToken> token;   // engaged iff ok && a row matched
+};
+TokenLookup read_token_by_id_on_conn(PGconn* conn, const std::string& token_id) {
+    TokenLookup result;
+    const std::string sql = std::string("SELECT token_id, '' AS token_hash, ") + kTokenColsTail +
+                            " FROM api_token_store.api_tokens WHERE token_id = $1";
+    pg::PgResult res = pg::exec_params(conn, sql.c_str(), std::vector<std::string>{token_id});
+    result.ok = (res.status() == PGRES_TUPLES_OK);
+    if (result.ok && PQntuples(res.get()) > 0)
+        result.token = read_token(res.get(), 0);
+    return result;
+}
+
 } // namespace
 
 // ── Construction ─────────────────────────────────────────────────────────────
@@ -244,21 +269,15 @@ ApiTokenStore::create_token(const std::string& name, const std::string& principa
                             const std::string& mcp_tier, std::string principal_kind) {
     if (!open_)
         return std::unexpected("database not open");
-    if (name.empty())
-        return std::unexpected("token name cannot be empty");
-    if (!scope_service.empty() && expires_at <= 0)
-        return std::unexpected("service-scoped tokens must have an expiration time");
-    if (!mcp_tier.empty() && !mcp::is_valid_tier(mcp_tier))
-        return std::unexpected(
-            "invalid MCP tier — must be 'readonly', 'operator', or 'supervised'");
-    if (!mcp_tier.empty() && expires_at <= 0)
-        return std::unexpected("MCP tokens must have an expiration time (max 90 days)");
-    if (!mcp_tier.empty() && expires_at > 0) {
-        auto now = now_epoch();
-        constexpr int64_t k90Days = 90 * 24 * 3600;
-        if (expires_at - now > k90Days)
-            return std::unexpected("MCP token TTL cannot exceed 90 days");
-    }
+
+    // Common human-mint checks (name/scope/tier/TTL), unconditional for both
+    // principal_kind values — factored out so rotate_token's candidate-
+    // successor prep shares the exact same policy gate (anti-drift, mirrors
+    // validate_engine_mint's role for the engine arm).
+    auto human_validation = validate_human_mint(name, scope_service, mcp_tier, expires_at,
+                                                now_epoch());
+    if (!human_validation.has_value())
+        return std::unexpected(human_validation.error());
 
     // ── Engine principal block (design doc §6/§7/§8) ───────────────────────
     // C++-side allowlist ahead of the DB CHECK (principal_kind IN
@@ -645,6 +664,31 @@ ApiTokenStore::validate_engine_mint(const std::string& principal_id,
         return std::unexpected("engine principal store unavailable — try again");
     }
     return std::unexpected("engine referent check returned an unrecognized status");
+}
+
+std::expected<void, std::string>
+ApiTokenStore::validate_human_mint(const std::string& name, const std::string& scope_service,
+                                   const std::string& mcp_tier, int64_t expires_at,
+                                   int64_t now) const {
+    // Verbatim `create_token`'s pre-refactor common checks — kept byte-for-
+    // byte so factoring this out changes nothing about the wire-visible
+    // error strings (engine_store_error_class.hpp keys on these exact
+    // substrings).
+    if (name.empty())
+        return std::unexpected("token name cannot be empty");
+    if (!scope_service.empty() && expires_at <= 0)
+        return std::unexpected("service-scoped tokens must have an expiration time");
+    if (!mcp_tier.empty() && !mcp::is_valid_tier(mcp_tier))
+        return std::unexpected(
+            "invalid MCP tier — must be 'readonly', 'operator', or 'supervised'");
+    if (!mcp_tier.empty() && expires_at <= 0)
+        return std::unexpected("MCP tokens must have an expiration time (max 90 days)");
+    if (!mcp_tier.empty() && expires_at > 0) {
+        constexpr int64_t k90Days = 90 * 24 * 3600;
+        if (expires_at - now > k90Days)
+            return std::unexpected("MCP token TTL cannot exceed 90 days");
+    }
+    return {};
 }
 
 bool ApiTokenStore::try_reserve(const std::string& rotation_group, std::string& out_raw,
@@ -1145,6 +1189,489 @@ ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::stri
     // stale row AFTER invalidate_cache ran, letting the revoked predecessor
     // validate from cache for up to kTokenCacheTtl (60s) past confirm — exactly
     // the immediate-cutover guarantee this call exists to provide.
+    revoke_generation_.fetch_add(1, std::memory_order_release);
+    invalidate_cache(revoked_hash);
+    evict_rotation_raw(confirmed_group);
+    return {};
+}
+
+// ── Human arm: token-keyed overlap-pair rotation (P2 #11, SOC 2 CC6.3) ─────
+//
+// See the .hpp doc comments for the full state-machine description. The
+// short version: `rotate_engine_credential`/`confirm_rotation` above key on
+// principal_id and arbitrate on a per-PRINCIPAL <=2-active ceiling, which is
+// wrong for a human (one username, many unrelated tokens). These two
+// key on the TOKEN being rotated instead, and enforce <=2 PER ROTATION
+// GROUP. The advisory lock is still `hashtext(principal_id)` — the SAME key
+// the engine arm and the sweep use — so all rotation activity for a shared
+// principal still serializes, even across the human/engine seam.
+
+std::expected<std::string, std::string>
+ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t overlap_secs,
+                            int64_t now, const std::string& requesting_user,
+                            std::optional<int64_t> successor_expires_at) {
+    if (!open_)
+        return std::unexpected("database not open");
+    if (predecessor_token_id.empty())
+        return std::unexpected("token_id required");
+    if (requesting_user.empty())
+        return std::unexpected("requesting_user required");
+    if (overlap_secs < kOverlapFloorSecs)
+        return std::unexpected("overlap window below 24h floor");
+    if (overlap_secs > kOverlapCeilSecs)
+        return std::unexpected("overlap window exceeds the maximum (10 years)");
+
+    // Pre-txn prep (mirrors Hermes F2 for the human arm): resolve the
+    // predecessor row here, BEFORE the locked transaction opens — both to
+    // derive the advisory-lock key (principal_id, taken from the row, never
+    // a caller-supplied value) and to seed the speculative candidate
+    // successor below. Never nested inside with_txn_for's own connection.
+    std::string principal_id, predecessor_name, predecessor_scope_service, predecessor_mcp_tier;
+    int64_t predecessor_expires_at = 0;
+    {
+        auto lease = pool_.try_acquire_for(kReadTimeout);
+        if (!lease)
+            return std::unexpected("database unavailable — try again");
+        auto lookup = read_token_by_id_on_conn(lease.get(), predecessor_token_id);
+        if (!lookup.ok)
+            return std::unexpected("database unavailable — try again");
+        // Self-service ONLY (deliberate asymmetry with the engine arm, where
+        // requesting_user is a third-party admin by design): a human token's
+        // raw successor secret authenticates AS that user, so a mismatch is
+        // identity takeover, not a permission gap an admin override could
+        // legitimately cross — admins already have revoke_token for that.
+        // Folded into the SAME "no such token" wording the genuine-absent
+        // case uses (never a distinguishable "not yours" message) so this
+        // is not an ownership-enumeration oracle — same posture the human
+        // DELETE route takes for a non-owner (rest_api_v1.cpp).
+        if (!lookup.token || lookup.token->principal_id != requesting_user)
+            return std::unexpected("no such token to rotate");
+        if (lookup.token->principal_kind != "human")
+            return std::unexpected("token is not a human-owned credential");
+        if (lookup.token->revoked ||
+            (lookup.token->expires_at != 0 && now > lookup.token->expires_at))
+            return std::unexpected("credential is not currently active — nothing to rotate");
+        principal_id = lookup.token->principal_id;
+        predecessor_name = lookup.token->name;
+        predecessor_scope_service = lookup.token->scope_service;
+        predecessor_mcp_tier = lookup.token->mcp_tier;
+        predecessor_expires_at = lookup.token->expires_at;
+    }
+
+    // Successor TTL: inherit the predecessor's absolute expires_at VERBATIM
+    // (perpetual, 0, stays perpetual) unless the caller overrides it — never
+    // recomputed as now+90d, which would silently extend authorization
+    // lifetime. The (possibly-overridden) value is validated through the
+    // same policy gate a fresh human mint uses.
+    const int64_t candidate_expires_at = successor_expires_at.value_or(predecessor_expires_at);
+    auto candidate_validation = validate_human_mint(predecessor_name, predecessor_scope_service,
+                                                     predecessor_mcp_tier, candidate_expires_at,
+                                                     now);
+    std::string candidate_raw, candidate_hash, candidate_token_id, candidate_error;
+    if (candidate_validation.has_value()) {
+        auto raw_result = generate_raw_token();
+        if (raw_result.has_value()) {
+            candidate_raw = std::move(*raw_result);
+            candidate_hash = sha256_hex(candidate_raw);
+            candidate_token_id = candidate_hash.substr(0, 24);
+        } else {
+            candidate_error = raw_result.error();
+        }
+    } else {
+        candidate_error = candidate_validation.error();
+    }
+
+    std::string error_msg;
+    std::string raw_out;
+    std::string grace_group_out, grace_raw_out;
+
+    // The entire check -> mint -> stamp sequence runs inside ONE transaction
+    // opened with the SAME principal-scoped advisory lock
+    // rotate_engine_credential/confirm_rotation/sweep take — never a
+    // token-scoped lock, or a concurrent rotate for a DIFFERENT token owned
+    // by the same principal could race this one.
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult lock_res =
+            pg::exec_params(conn, "SELECT pg_advisory_xact_lock(hashtext($1))",
+                            std::vector<std::string>{principal_id});
+        if (lock_res.status() != PGRES_TUPLES_OK) {
+            error_msg = "failed to acquire rotation lock";
+            return false;
+        }
+
+        // Fresh re-read of the pinned predecessor row, under the lock —
+        // never the pre-txn snapshot above.
+        auto lookup = read_token_by_id_on_conn(conn, predecessor_token_id);
+        if (!lookup.ok) {
+            // Ambiguous with a swallowed read failure — mirrors the engine
+            // arm's 0-active rejection wording, which classifies Transient
+            // for exactly this reason.
+            error_msg = "no active credential to rotate — mint one first";
+            return false;
+        }
+        // Self-service ONLY — same rationale + same indistinguishable-from-
+        // absent wording as the pre-txn check above; re-asserted here
+        // because this is the AUTHORITATIVE read (never trust the pre-lock
+        // snapshot for the write decision).
+        if (!lookup.token || lookup.token->principal_id != requesting_user) {
+            error_msg = "no such token to rotate";
+            return false;
+        }
+        const ApiToken& predecessor = *lookup.token;
+        if (predecessor.principal_kind != "human") {
+            error_msg = "token is not a human-owned credential";
+            return false;
+        }
+        if (predecessor.revoked || (predecessor.expires_at != 0 && now > predecessor.expires_at)) {
+            error_msg = "credential is not currently active — nothing to rotate";
+            return false;
+        }
+
+        if (predecessor.rotation_group.empty()) {
+            // ── Mint arm: no rotation in flight for THIS token yet ────────
+            const int64_t window_end = now + overlap_secs;
+            if (predecessor.expires_at != 0 && window_end > predecessor.expires_at) {
+                error_msg = "overlap window would exceed the predecessor credential's expiry";
+                return false;
+            }
+            if (candidate_expires_at != 0 && window_end > candidate_expires_at) {
+                error_msg = "overlap window would exceed the successor credential's expiry";
+                return false;
+            }
+            if (!candidate_error.empty()) {
+                error_msg = candidate_error;
+                return false;
+            }
+
+            pg::PgResult ins = pg::exec_params(
+                conn,
+                "INSERT INTO api_token_store.api_tokens "
+                "(token_id, token_hash, name, principal_id, scope_service, mcp_tier, "
+                " principal_kind, created_at, expires_at, rotation_group, supersedes_token_id) "
+                "VALUES ($1,$2,$3,$4,$5,$6,'human',$7::bigint,$8::bigint,$9,$10) "
+                "RETURNING token_id",
+                std::vector<std::string>{candidate_token_id, candidate_hash, predecessor.name,
+                                         principal_id, predecessor.scope_service,
+                                         predecessor.mcp_tier, std::to_string(now),
+                                         std::to_string(candidate_expires_at), candidate_token_id,
+                                         predecessor.token_id});
+            if (ins.status() != PGRES_TUPLES_OK || PQntuples(ins.get()) == 0) {
+                error_msg = "failed to mint successor credential";
+                return false;
+            }
+
+            pg::PgResult r2 = pg::exec_params(
+                conn,
+                "UPDATE api_token_store.api_tokens "
+                "SET rotation_group = $1, overlap_expires_at = $2::bigint "
+                "WHERE token_id = $3 AND revoked = FALSE RETURNING token_id",
+                std::vector<std::string>{candidate_token_id, std::to_string(now + overlap_secs),
+                                         predecessor.token_id});
+            if (r2.status() != PGRES_TUPLES_OK || PQntuples(r2.get()) == 0) {
+                error_msg = "failed to stamp predecessor overlap window";
+                return false;
+            }
+
+            raw_out = candidate_raw;
+            grace_group_out = candidate_token_id;
+            grace_raw_out = candidate_raw;
+            return true;
+        }
+
+        // ── Re-serve / conflict arm: predecessor already stamped ─────────
+        // <=2 enforced PER ROTATION GROUP, never per principal (invariant
+        // #3 — a human's other, unrelated active tokens must never count
+        // against this ceiling). Reuses the PRINCIPAL-WIDE read + in-memory
+        // filter — the SAME pattern confirm_token_rotation uses via
+        // classify_confirm_state_in_group, and the SAME reason: a
+        // group-scoped SQL query's own zero-row result is indistinguishable
+        // from a swallowed SELECT failure, which is exactly the trap the
+        // "GROUP-FILTERING NOTE" in rotation_confirm_state.hpp warns against
+        // reintroducing. Filtering an already-fetched, non-empty
+        // principal-wide read is positive evidence the query itself
+        // succeeded; a group-scoped-only read has no such evidence to lean
+        // on.
+        if (test_hook_before_rotate_group_read_)
+            test_hook_before_rotate_group_read_(conn);
+        auto principal_active = read_active_for_principal_on_conn(conn, principal_id, now);
+        if (principal_active.empty()) {
+            // Ambiguous with a swallowed read failure — predecessor is
+            // known-active (checked above, under this same advisory lock,
+            // moments ago), so a genuinely empty read here can only mean
+            // the SELECT failed. Reuses the SAME wording — and Transient
+            // classification — the pre-mint lookup-failure branch above
+            // uses for the identical ambiguity; never the terminal
+            // "not a recognized rotation pair" conflict below.
+            error_msg = "no active credential to rotate — mint one first";
+            return false;
+        }
+        for (const auto& t : principal_active) {
+            if (t.principal_kind != "human") {
+                error_msg = "principal has a non-human active credential";
+                return false;
+            }
+        }
+        std::vector<ApiToken> in_group;
+        for (const auto& t : principal_active)
+            if (t.rotation_group == predecessor.rotation_group)
+                in_group.push_back(t);
+        if (in_group.size() > 2) {
+            error_msg = "more than two active credentials for this principal — "
+                       "resolve manually before rotating";
+            return false;
+        }
+        const ApiToken* pred_row = nullptr;
+        const ApiToken* succ_row = nullptr;
+        for (const auto& t : in_group) {
+            if (!t.supersedes_token_id.empty())
+                succ_row = &t;
+            else
+                pred_row = &t;
+        }
+        if (in_group.size() != 2 || pred_row == nullptr || succ_row == nullptr ||
+            succ_row->rotation_group != pred_row->rotation_group ||
+            succ_row->supersedes_token_id != pred_row->token_id) {
+            error_msg = "two active credentials not in a recognized rotation pair — "
+                       "resolve via revoke, not rotate";
+            return false;
+        }
+
+        if (now - succ_row->created_at > kRotationGraceSecs.count()) {
+            error_msg = "rotation grace window elapsed; confirm or revoke";
+            return false;
+        }
+
+        std::string cached_raw, cached_user;
+        if (!try_reserve(succ_row->rotation_group, cached_raw, cached_user)) {
+            error_msg = "rotation grace window elapsed; confirm or revoke";
+            return false;
+        }
+        if (cached_user != requesting_user) {
+            error_msg = "rotation in progress by a different operator";
+            return false;
+        }
+
+        raw_out = cached_raw;
+        return true;
+    });
+
+    if (!grace_group_out.empty())
+        store_rotation_raw(grace_group_out, grace_raw_out, requesting_user);
+
+    // Scrub the local plaintext copies that are NOT the value being
+    // returned. `candidate_raw` is speculatively generated before the
+    // transaction opens (Hermes F2) and is used only if the mint arm's
+    // fresh re-read actually lands there — on the re-serve arm or any
+    // rejection it is a dead, unreturned secret; even on the mint-success
+    // path `raw_out`/`grace_raw_out` already hold their OWN copies (plain
+    // string assignment, not a move), so `candidate_raw` is redundant the
+    // moment those assignments happened. `grace_raw_out` is likewise a
+    // redundant duplicate of `raw_out` once `store_rotation_raw` above has
+    // copied it into the grace cache. Neither should sit unscrubbed in this
+    // frame for the rest of the call. `raw_out` itself is deliberately NOT
+    // scrubbed here — on success it is the one-time-reveal value the caller
+    // must still receive.
+    // NOTE: `rotate_engine_credential`'s own `candidate_raw` (this file,
+    // engine arm) has the same pre-existing gap — out of scope for this
+    // diff; a future sweep should close both together.
+    yuzu::secure_zero(candidate_raw);
+    yuzu::secure_zero(grace_raw_out);
+
+    if (!ok)
+        return std::unexpected(error_msg.empty() ? "rotation failed" : error_msg);
+
+    return raw_out;
+}
+
+std::expected<void, std::string>
+ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
+                                      const std::string& requesting_user) {
+    if (!open_)
+        return std::unexpected("database not open");
+    if (successor_token_id.empty())
+        return std::unexpected("token_id required");
+    if (requesting_user.empty())
+        return std::unexpected("requesting_user required");
+
+    // Pre-txn prep: resolve principal_id from the pinned row — the advisory
+    // lock key — before opening the locked transaction. Never nested inside
+    // with_txn_for's own connection.
+    std::string principal_id;
+    {
+        auto lease = pool_.try_acquire_for(kReadTimeout);
+        if (!lease)
+            return std::unexpected("database unavailable — try again");
+        auto lookup = read_token_by_id_on_conn(lease.get(), successor_token_id);
+        if (!lookup.ok)
+            return std::unexpected("database unavailable — try again");
+        // Self-service ONLY — same rationale as rotate_token: confirming
+        // someone else's rotation would let a non-owner complete a cutover
+        // of a credential that authenticates AS that user. Folded into the
+        // SAME "no such token" wording the genuine-absent case uses.
+        if (!lookup.token || lookup.token->principal_id != requesting_user)
+            return std::unexpected("no such token to confirm");
+        if (lookup.token->principal_kind != "human")
+            return std::unexpected("token is not a human-owned credential");
+        principal_id = lookup.token->principal_id;
+    }
+
+    const int64_t now = now_epoch();
+    std::string error_msg;
+    std::string revoked_hash;
+    std::string confirmed_group;
+
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult lock_res =
+            pg::exec_params(conn, "SELECT pg_advisory_xact_lock(hashtext($1))",
+                            std::vector<std::string>{principal_id});
+        if (lock_res.status() != PGRES_TUPLES_OK) {
+            error_msg = "failed to acquire rotation lock";
+            return false;
+        }
+
+        // Fresh re-read of the pinned row, under the lock — never the
+        // pre-txn snapshot above.
+        auto lookup = read_token_by_id_on_conn(conn, successor_token_id);
+        if (!lookup.ok) {
+            error_msg = "no in-flight rotation to confirm";
+            return false;
+        }
+        // Self-service ONLY, re-asserted here as the AUTHORITATIVE read —
+        // same rationale + same indistinguishable-from-absent wording as
+        // the pre-txn check above.
+        if (!lookup.token || lookup.token->principal_id != requesting_user) {
+            error_msg = "no such token to confirm";
+            return false;
+        }
+        const ApiToken& pinned = *lookup.token;
+        if (pinned.principal_kind != "human") {
+            error_msg = "token is not a human-owned credential";
+            return false;
+        }
+        if (pinned.rotation_group.empty()) {
+            error_msg = "no rotation in flight for the supplied token_id - the rotation "
+                        "was resolved (confirmed, revoked, or cut over); rotate again if "
+                        "a new rotation is needed";
+            return false;
+        }
+        const std::string rotation_group = pinned.rotation_group;
+
+        // UP-6, group-aware sibling (rotation_confirm_state.hpp): reuses the
+        // SAME principal-wide read (never a group-scoped SQL query, which
+        // would reintroduce the read-vs-failure ambiguity in a new place),
+        // filtering it in memory.
+        auto principal_active = read_active_for_principal_on_conn(conn, principal_id, now);
+        for (const auto& t : principal_active) {
+            if (t.principal_kind != "human") {
+                error_msg = "principal has a non-human active credential";
+                return false;
+            }
+        }
+
+        switch (detail::classify_confirm_state_in_group(principal_active, rotation_group)) {
+        case detail::GroupRotationConfirmState::kAmbiguousEmpty:
+            error_msg = "no in-flight rotation to confirm";
+            return false;
+        case detail::GroupRotationConfirmState::kOverfullGroup:
+            error_msg = "more than two active credentials for this principal - "
+                        "resolve manually before confirming";
+            return false;
+        case detail::GroupRotationConfirmState::kGroupEmpty:
+            error_msg = "no rotation in flight for the supplied token_id - the rotation "
+                        "was resolved (confirmed, revoked, or cut over); rotate again if "
+                        "a new rotation is needed";
+            return false;
+        case detail::GroupRotationConfirmState::kUnresolvedSoleInGroup:
+            error_msg = "one active credential with unresolved rotation metadata - "
+                        "inspect the credential state and do not rotate; revoke only "
+                        "if it is confirmed stale";
+            return false;
+        case detail::GroupRotationConfirmState::kPairInGroup:
+            break; // exactly two in-group -> fall through to pair processing below
+        }
+
+        const ApiToken* predecessor = nullptr;
+        const ApiToken* successor = nullptr;
+        for (const auto& t : principal_active) {
+            if (t.rotation_group != rotation_group)
+                continue;
+            if (!t.supersedes_token_id.empty())
+                successor = &t;
+            else
+                predecessor = &t;
+        }
+        if (predecessor == nullptr || successor == nullptr ||
+            successor->supersedes_token_id != predecessor->token_id) {
+            error_msg = "no in-flight rotation to confirm";
+            return false;
+        }
+
+        // #2384-equivalent pin: the caller must supply the exact successor
+        // token_id rotate returned.
+        if (successor->token_id != successor_token_id) {
+            error_msg = "token_id does not match the pending rotation successor; "
+                        "pass the token_id returned by rotate";
+            return false;
+        }
+
+        // Same operator-initiator binding as confirm_rotation (Hermes F4/F5).
+        std::string initiator;
+        if (!grace_entry_owner(rotation_group, initiator)) {
+            error_msg = "rotation confirmation unavailable — retry via rotate or fall back to "
+                       "revoke";
+            return false;
+        }
+        if (initiator != requesting_user) {
+            error_msg = "rotation in progress by a different operator";
+            return false;
+        }
+
+        confirmed_group = rotation_group;
+
+        pg::PgResult confirm_res = pg::exec_params(
+            conn,
+            "UPDATE api_token_store.api_tokens SET confirmed_at = $1::bigint "
+            "WHERE token_id = $2 AND revoked = FALSE RETURNING token_id",
+            std::vector<std::string>{std::to_string(now), successor->token_id});
+        if (confirm_res.status() != PGRES_TUPLES_OK || PQntuples(confirm_res.get()) == 0) {
+            error_msg = "failed to confirm rotation";
+            return false;
+        }
+
+        // Bump the revoke generation BEFORE the predecessor's revoke UPDATE
+        // — same TOCTOU contract confirm_rotation/revoke_token use.
+        revoke_generation_.fetch_add(1, std::memory_order_release);
+
+        pg::PgResult revoke_res = pg::exec_params(
+            conn,
+            "UPDATE api_token_store.api_tokens SET revoked = TRUE "
+            "WHERE token_id = $1 AND revoked = FALSE RETURNING token_hash",
+            std::vector<std::string>{predecessor->token_id});
+        if (revoke_res.status() != PGRES_TUPLES_OK || PQntuples(revoke_res.get()) == 0) {
+            error_msg = "failed to revoke predecessor on confirm";
+            return false;
+        }
+        revoked_hash = PQgetvalue(revoke_res.get(), 0, 0);
+
+        pg::PgResult clear_res = pg::exec_params(
+            conn,
+            "UPDATE api_token_store.api_tokens "
+            "SET rotation_group = '', supersedes_token_id = '', overlap_expires_at = 0 "
+            "WHERE token_id = $1 AND revoked = FALSE RETURNING token_id",
+            std::vector<std::string>{successor->token_id});
+        if (clear_res.status() != PGRES_TUPLES_OK || PQntuples(clear_res.get()) == 0) {
+            error_msg = "failed to clear successor rotation state on confirm";
+            return false;
+        }
+
+        return true;
+    });
+
+    if (!ok)
+        return std::unexpected(error_msg.empty() ? "confirm failed" : error_msg);
+
+    // Second generation bump AFTER the txn commits, before invalidating the
+    // cache — same double-bump TOCTOU contract confirm_rotation uses.
     revoke_generation_.fetch_add(1, std::memory_order_release);
     invalidate_cache(revoked_hash);
     evict_rotation_raw(confirmed_group);

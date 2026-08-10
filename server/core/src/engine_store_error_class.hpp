@@ -116,6 +116,19 @@ enum class EngineStoreErrorClass {
         "overlap window would exceed the successor credential's expiry",
         "not in a recognized rotation pair",
         "more than two active credentials",
+        // ApiTokenStore::rotate_token / confirm_token_rotation (human
+        // token-keyed arm, P2 #11) — new, permanent client-validation
+        // conditions the group-scoped state machine can name precisely
+        // (unlike the principal-wide engine arm's ambiguous 0-active case,
+        // these are reached only after a POSITIVE, definitive row lookup —
+        // see api_token_store.cpp's TokenLookup / rotation_confirm_state.hpp's
+        // classify_confirm_state_in_group for why each is safe to classify
+        // terminally rather than falling to the retryable default).
+        "no such token to rotate",
+        "no such token to confirm",
+        "token is not a human-owned credential",
+        "credential is not currently active — nothing to rotate",
+        "principal has a non-human active credential",
     };
     for (const std::string_view needle : kClientValidationSubstrings)
         if (has(needle))

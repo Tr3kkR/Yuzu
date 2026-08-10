@@ -102,6 +102,30 @@ TEST_CASE("classify_engine_store_error: #2404 confirm-replay terminal strings",
     CHECK(classify_engine_store_error("no in-flight rotation to confirm") == E::Transient);
 }
 
+TEST_CASE("classify_engine_store_error: human token-keyed arm (P2 #11) new strings",
+          "[engine_store_error]") {
+    using E = EngineStoreErrorClass;
+
+    // rotate_token/confirm_token_rotation reach these only after a POSITIVE,
+    // definitive row lookup (TokenLookup::ok, api_token_store.cpp) — unlike
+    // the engine arm's ambiguous 0-active case, so they classify terminally
+    // (permanent client error), never the retryable default.
+    CHECK(classify_engine_store_error("no such token to rotate") == E::ClientValidation);
+    CHECK(classify_engine_store_error("no such token to confirm") == E::ClientValidation);
+    CHECK(classify_engine_store_error("token is not a human-owned credential") ==
+          E::ClientValidation);
+    CHECK(classify_engine_store_error("credential is not currently active — nothing to "
+                                      "rotate") == E::ClientValidation);
+    CHECK(classify_engine_store_error("principal has a non-human active credential") ==
+          E::ClientValidation);
+
+    // The deliberately-ambiguous query-failure wording the mint arm reuses
+    // verbatim from the engine arm must stay Transient even when reached via
+    // the human path (same 0-active/read-failure ambiguity).
+    CHECK(classify_engine_store_error("no active credential to rotate — mint one first") ==
+          E::Transient);
+}
+
 TEST_CASE("confirm_result_label maps every class to a pre-seeded metric label",
           "[engine_store_error]") {
     using E = EngineStoreErrorClass;
