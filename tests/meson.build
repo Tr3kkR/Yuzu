@@ -60,6 +60,7 @@ contract_test_exe = executable(
     'unit/contracts/test_b2_use_case.cpp',
     'unit/contracts/test_b3_platform.cpp',
     'unit/contracts/test_b4_fact.cpp',
+    'unit/contracts/test_b4_finalisation.cpp',
     'unit/contracts/test_rest_a4_error.cpp',
     'unit/contracts/test_transport_auth_slot.cpp',
     'unit/contracts/test_use_case_types.cpp',

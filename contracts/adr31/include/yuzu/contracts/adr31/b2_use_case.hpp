@@ -74,4 +74,13 @@ canonical_b2_result_bytes(const B2UseCaseResult& result);
 canonical_b2_result_bytes(std::string_view result_schema_version,
                           const B2UseCaseResultPayload& result);
 
+/// SHA-256 binding of canonical_b2_result_bytes(), encoded as `sha256:` plus
+/// lowercase hexadecimal. The finalisation receipt is outside this domain.
+[[nodiscard]] std::expected<std::string, ContractError>
+canonical_b2_result_hash(const B2UseCaseResult& result);
+
+[[nodiscard]] std::expected<std::string, ContractError>
+canonical_b2_result_hash(std::string_view result_schema_version,
+                         const B2UseCaseResultPayload& result);
+
 } // namespace yuzu::contracts::adr31

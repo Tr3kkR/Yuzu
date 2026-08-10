@@ -13,6 +13,7 @@ yuzu_adr31_contracts_lib = static_library(
     'src/b2_use_case.cpp',
     'src/b3_platform.cpp',
     'src/b4_fact.cpp',
+    'src/b4_finalisation.cpp',
     'src/json_support.cpp',
     'src/rest_a4_support.cpp',
     'src/transport_auth_slot.cpp',

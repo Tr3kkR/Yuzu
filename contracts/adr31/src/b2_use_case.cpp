@@ -36,6 +36,28 @@ constexpr std::array<std::string_view, 5> kResultFields{
     return ContractError{code, std::move(path), std::move(message)};
 }
 
+[[nodiscard]] std::expected<std::string, ContractError>
+sha256_hash(std::string_view canonical, std::string_view error_path,
+            std::string_view error_message) {
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+    unsigned int digest_size = 0;
+    if (EVP_Digest(canonical.data(), canonical.size(), digest.data(), &digest_size, EVP_sha256(),
+                   nullptr) != 1 ||
+        digest_size != 32) {
+        return std::unexpected(error(ContractErrorCode::InvalidValue, std::string{error_path},
+                                     std::string{error_message}));
+    }
+
+    constexpr std::string_view hex = "0123456789abcdef";
+    std::string encoded{"sha256:"};
+    encoded.reserve(7 + digest_size * 2);
+    for (unsigned int index = 0; index < digest_size; ++index) {
+        encoded.push_back(hex[digest[index] >> 4]);
+        encoded.push_back(hex[digest[index] & 0x0f]);
+    }
+    return encoded;
+}
+
 template <std::size_t Size>
 [[nodiscard]] bool is_known_field(std::string_view name,
                                   const std::array<std::string_view, Size>& known_fields) {
@@ -670,24 +692,8 @@ std::expected<std::string, ContractError> canonical_b2_input_hash(const B2UseCas
     auto canonical = canonical_b2_input_bytes(request);
     if (!canonical)
         return std::unexpected(canonical.error());
-
-    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
-    unsigned int digest_size = 0;
-    if (EVP_Digest(canonical->data(), canonical->size(), digest.data(), &digest_size, EVP_sha256(),
-                   nullptr) != 1 ||
-        digest_size != 32) {
-        return std::unexpected(error(ContractErrorCode::InvalidValue, "/normalised_inputs",
-                                     "canonical input hash could not be computed"));
-    }
-
-    constexpr std::string_view hex = "0123456789abcdef";
-    std::string encoded{"sha256:"};
-    encoded.reserve(7 + digest_size * 2);
-    for (unsigned int index = 0; index < digest_size; ++index) {
-        encoded.push_back(hex[digest[index] >> 4]);
-        encoded.push_back(hex[digest[index] & 0x0f]);
-    }
-    return encoded;
+    return sha256_hash(*canonical, "/normalised_inputs",
+                       "canonical input hash could not be computed");
 }
 
 std::expected<std::string, ContractError> encode_b2_use_case_result(const B2UseCaseResult& result) {
@@ -782,6 +788,22 @@ canonical_b2_result_bytes(std::string_view result_schema_version,
         {"result", result_payload_json(result)},
     };
     return detail::encode_contract_json(hash_domain);
+}
+
+std::expected<std::string, ContractError> canonical_b2_result_hash(const B2UseCaseResult& result) {
+    auto canonical = canonical_b2_result_bytes(result);
+    if (!canonical)
+        return std::unexpected(canonical.error());
+    return sha256_hash(*canonical, "/result", "canonical result hash could not be computed");
+}
+
+std::expected<std::string, ContractError>
+canonical_b2_result_hash(std::string_view result_schema_version,
+                         const B2UseCaseResultPayload& result) {
+    auto canonical = canonical_b2_result_bytes(result_schema_version, result);
+    if (!canonical)
+        return std::unexpected(canonical.error());
+    return sha256_hash(*canonical, "/result", "canonical result hash could not be computed");
 }
 
 } // namespace yuzu::contracts::adr31
