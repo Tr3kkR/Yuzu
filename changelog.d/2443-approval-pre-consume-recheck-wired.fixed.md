@@ -8,13 +8,13 @@
   additionally verifies the active-credential pair is actually linked to and pinned by the
   ticket's own `token_id` (not just "two active credentials exist" - a newer, unrelated rotation
   would otherwise pass the same count check and still burn the ticket at `confirm_rotation`'s own
-  pin check). If the rotation already resolved (confirmed, revoked, cut over to zero active
-  credentials, an anomalous credential count, or a pin mismatch against a newer rotation), the
-  recall denies WITHOUT consuming: the ticket stays approved and recallable, instead of the
-  pre-#2443 "approval already used" wording that would have misdescribed a still-good ticket. An
-  empty active-credential read (ambiguous with a masked store fault) also denies rather than
-  passing through - denying never consumes, so treating that ambiguity conservatively costs
-  nothing under either cause. The client-facing denial is deliberately generic (no rotation-state
+  pin check). If the rotation already resolved (confirmed, revoked, an anomalous credential count,
+  or a pin mismatch against a newer rotation), the recall denies WITHOUT consuming: the ticket
+  stays approved and recallable, instead of the pre-#2443 "approval already used" wording that
+  would have misdescribed a still-good ticket. An empty active-credential read - ambiguous between
+  a genuine revoke-to-zero and a masked store fault - also denies rather than passing through:
+  denying never consumes, so treating that ambiguity conservatively costs nothing under either
+  cause. The client-facing denial is deliberately generic (no rotation-state
   specifics, and points the caller at `get_engine_principal` to check current state) because this
   precondition runs before the tool's own RBAC check; the specific reason is still recorded in the
   audit row. A new `yuzu_mcp_approval_precondition_denied_total` counter breaks this denial class

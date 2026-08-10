@@ -2059,6 +2059,13 @@ TEST_CASE("MCP confirm_engine_rotation: a revoke-to-zero (kNoneActive) denies WI
     auto recall_body = nlohmann::json::parse(recall->body);
     REQUIRE(recall_body.contains("error")); // denied, not passed through to the handler
 
+    // The specific fact stays server-side (audit-only, checked below) - this
+    // precondition runs before RBAC, so a specific answer here would be a
+    // credential-state oracle for a tier-eligible, RBAC-less caller
+    // (security-guardian, Gate 8: regression-pin the anti-oracle property,
+    // not just confirm it by inspection).
+    CHECK(recall->body.find("no active credential") == std::string::npos);
+
     // The ticket is UNTOUCHED - the whole point of denying instead of
     // guessing on an ambiguous empty read.
     auto row = appr.get(approval_id);
