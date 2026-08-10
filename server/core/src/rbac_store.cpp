@@ -346,13 +346,25 @@ const std::vector<pg::PgMigration>& migrations() {
 }
 
 // ── Legacy (SQLite) introspection for the backfill ───────────────────────────
-bool legacy_has_table(sqlite3* db, const char* table) {
+// nullopt means "could not determine" (a genuine prepare/step error), distinct
+// from `false` ("determined the table is absent") — every caller MUST treat
+// nullopt as a read failure, never coerce it to "absent" (governance
+// re-review, PR #2703 round 2, cpp-expert HIGH: the pre-fix bool return
+// conflated the two, and one caller — rbac_config.enabled below — had no
+// accounting at all for the error case, silently keeping the "false" default
+// on a transient SQLite error).
+std::optional<bool> legacy_has_table(sqlite3* db, const char* table) {
     SqliteStmt s;
     if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", -1,
                            s.addr(), nullptr) != SQLITE_OK)
-        return false;
+        return std::nullopt;
     sqlite3_bind_text(s.get(), 1, table, -1, SQLITE_STATIC);
-    return sqlite3_step(s.get()) == SQLITE_ROW;
+    const int rc = sqlite3_step(s.get());
+    if (rc == SQLITE_ROW)
+        return true;
+    if (rc == SQLITE_DONE)
+        return false;
+    return std::nullopt;
 }
 
 std::string sqlite_text(sqlite3_stmt* s, int col) {
@@ -467,17 +479,43 @@ struct LegacySnapshot {
 // any partial/corrupt read — matches the pre-refactor read_all contract.
 std::optional<LegacySnapshot> read_legacy_snapshot(sqlite3* legacy) {
     LegacySnapshot snap;
-    if (legacy_has_table(legacy, "rbac_config")) {
+    bool ok = true;
+    const auto has_table = [&](const char* table) -> bool {
+        const auto present = legacy_has_table(legacy, table);
+        if (!present) {
+            ok = false;
+            return false;
+        }
+        return *present;
+    };
+
+    if (has_table("rbac_config")) {
         SqliteStmt s;
         if (sqlite3_prepare_v2(legacy, "SELECT value FROM rbac_config WHERE key='enabled'", -1,
-                               s.addr(), nullptr) == SQLITE_OK &&
-            sqlite3_step(s.get()) == SQLITE_ROW) {
-            // Raw text, not the strict canonical-bool parse the caller applies
-            // to this same value for the actual rbac_enabled write: this
-            // snapshot only needs to detect a CONTENT difference for
-            // fingerprinting purposes, not validate canonicality (fjarvis F2
-            // stays the sole owner of that check, applied by the caller).
-            snap.enabled = sqlite_text(s.get(), 0);
+                               s.addr(), nullptr) != SQLITE_OK) {
+            ok = false;
+        } else {
+            const int rc = sqlite3_step(s.get());
+            if (rc == SQLITE_ROW) {
+                // Raw text, not the strict canonical-bool parse the caller
+                // applies to this same value for the actual rbac_enabled
+                // write: this snapshot only needs to detect a CONTENT
+                // difference for fingerprinting purposes, not validate
+                // canonicality (fjarvis F2 stays the sole owner of that
+                // check, applied by the caller).
+                snap.enabled = sqlite_text(s.get(), 0);
+            } else if (rc != SQLITE_DONE) {
+                // A genuine read error, not "table exists but has no
+                // 'enabled' row" (SQLITE_DONE — the "false" default is
+                // correct there). Governance re-review round 2, cpp-expert
+                // HIGH: this block previously had no failure accounting at
+                // all, so a transient error here silently kept the "false"
+                // default and could migrate an RBAC-enabled fleet to
+                // RBAC-disabled with nothing downstream able to catch it —
+                // the read-back verify and the fingerprint both derive from
+                // this same already-poisoned snapshot.
+                ok = false;
+            }
         }
     }
 
@@ -492,14 +530,13 @@ std::optional<LegacySnapshot> read_legacy_snapshot(sqlite3* legacy) {
         return rc == SQLITE_DONE;
     };
 
-    bool ok = true;
-    if (legacy_has_table(legacy, "securable_types"))
+    if (has_table("securable_types"))
         ok &= read_all("SELECT name, description, is_system FROM securable_types",
                        [&](sqlite3_stmt* s) {
                            snap.types.push_back(
                                {sqlite_text(s, 0), sqlite_text(s, 1), sqlite3_column_int64(s, 2)});
                        });
-    if (legacy_has_table(legacy, "operations"))
+    if (has_table("operations"))
         ok &= read_all("SELECT id, description FROM operations", [&](sqlite3_stmt* s) {
             snap.ops.emplace_back(sqlite_text(s, 0), sqlite_text(s, 1));
         });
@@ -519,7 +556,7 @@ std::optional<LegacySnapshot> read_legacy_snapshot(sqlite3* legacy) {
                        snap.principals.push_back(
                            {sqlite_text(s, 0), sqlite_text(s, 1), sqlite_text(s, 2)});
                    });
-    if (legacy_has_table(legacy, "groups"))
+    if (has_table("groups"))
         ok &= read_all(
             "SELECT name, description, source, external_id, created_at FROM groups",
             [&](sqlite3_stmt* s) {
@@ -529,7 +566,7 @@ std::optional<LegacySnapshot> read_legacy_snapshot(sqlite3* legacy) {
                     g.external_id = sqlite_text(s, 3);
                 snap.groups.push_back(std::move(g));
             });
-    if (legacy_has_table(legacy, "group_members"))
+    if (has_table("group_members"))
         ok &= read_all("SELECT group_name, username FROM group_members", [&](sqlite3_stmt* s) {
             snap.members.push_back({sqlite_text(s, 0), sqlite_text(s, 1)});
         });
@@ -550,6 +587,15 @@ std::optional<LegacySnapshot> read_legacy_snapshot(sqlite3* legacy) {
 // domain-separation hygiene) independent of the "v2:" prefix the caller
 // puts on the STORED value — that prefix is for an operator/log reading the
 // stored value directly, this one is for the hash itself.
+//
+// security-guardian (governance re-review round 2, LOW-MEDIUM, fail-closed
+// direction only): this hashes the RAW sqlite_text() bytes, while the real
+// migration (step 5) applies sanitize_pg_text()/bool_lit() normalization
+// first. A legacy value that differs only in a way sanitize_pg_text()
+// strips (e.g. a stray NUL) can therefore fingerprint-mismatch even though
+// the migrated PG rows would be byte-identical — a spurious holder-side
+// refusal, never a false accept, so left as-is rather than fixed in this
+// round.
 std::string canonicalize_legacy_snapshot(const LegacySnapshot& snap) {
     std::vector<std::string> rows;
     rows.reserve(snap.types.size() + snap.ops.size() + snap.roles.size() + snap.perms.size() +
@@ -658,7 +704,10 @@ std::optional<std::string> legacy_rbac_fingerprint(const std::filesystem::path& 
             sqlite3_step(probe.get()) != SQLITE_ROW)
             return std::nullopt;
     }
-    if (!legacy_has_table(legacy.get(), "roles"))
+    const auto has_roles = legacy_has_table(legacy.get(), "roles");
+    if (!has_roles)
+        return std::nullopt; // genuine read error, NOT "no roles table"
+    if (!*has_roles)
         return std::string(kSourcelessFingerprint);
 
     const auto snap = read_legacy_snapshot(legacy.get());
@@ -2531,12 +2580,25 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                     return false;
                 }
                 if (PQntuples(fp.get()) == 0 && source_fingerprint != kSourcelessFingerprint) {
+                    // unhappy-path (round 2, C2): this replica's own steps
+                    // 4-6 already committed real writes to Postgres before
+                    // losing this race — they are not rolled back, and a
+                    // retry does NOT recover cleanly. The next boot will
+                    // find the marker present with a DIFFERENT real
+                    // fingerprint and permanently refuse (HOLDER-SIDE
+                    // VERIFICATION FAILED) until an operator reconciles
+                    // which replica's config is authoritative — see the
+                    // runbook. Say that plainly rather than implying a
+                    // clean automatic recovery exists.
                     spdlog::error(
                         "RbacStore: migrate_from_sqlite: lost the race to record this backfill's "
                         "own source fingerprint — a DIFFERENT real fingerprint already stamped "
                         "backfill_source_fingerprint between this pass's marker-absent check and "
-                        "this commit. Refusing to report success; a retry will find the marker "
-                        "present and go through holder-side fingerprint verification instead.");
+                        "this commit. This replica's own migration steps already committed to "
+                        "Postgres; a retry will find the marker present, fail holder-side "
+                        "fingerprint verification against the winning replica's value, and "
+                        "require manual reconciliation — see "
+                        "docs/ops-runbooks/rbac-store-backfill-recovery.md.");
                     return false;
                 }
                 // A sourceless stamp losing this same race is NOT an error (matches
@@ -2702,23 +2764,39 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
             return false;
         }
         if (*stored_fingerprint == kSourcelessFingerprint) {
-            // governance re-review (PR #2703, HIGH — chaos-injector's
-            // Finding A / unhappy-path's Finding 2): no real migration has
-            // EVER happened for this fleet yet — a fileless sibling merely
-            // stamped first. That is the SAME safety class as a fresh
-            // install (nothing real to clobber), so unlike the two cases
-            // above, this one does NOT refuse: fall through to a normal
-            // migration attempt below. Step 7's stamp_complete will
-            // correctly PROMOTE this stored sourceless value to this
-            // replica's own real fingerprint (the monotonic-promotion
-            // upsert), closing the race without operator intervention.
-            spdlog::info(
-                "RbacStore: migrate_from_sqlite: backfill_complete is set with a sourceless "
-                "source fingerprint (no real legacy data has been migrated for this fleet "
-                "yet) and this replica's own legacy db {} holds real content — proceeding "
-                "with a normal migration; success will promote the shared marker to this "
-                "replica's real fingerprint",
-                legacy_db_path.string());
+            // governance re-review (PR #2703 round 2 — REVERTED from a
+            // fall-through this same round's own re-review round found
+            // unsafe; see Fable's original Q2 answer this branch had gone
+            // beyond). Promotion is safe AT STAMP TIME (commit 2's
+            // monotonic-promotion upsert in stamp_complete, above): by step
+            // 7 the writer has already durably committed its OWN migration,
+            // so correcting the trust anchor cannot clobber anything. This
+            // is a DIFFERENT moment — a LATER boot that finds the marker
+            // ALREADY sourceless, where this replica has done no migration
+            // work of its own yet — and here the mechanism cannot bound
+            // what post-cutover mutations a fresh auto-migration would
+            // clobber. Concretely (unhappy-path, round 2): a fileless
+            // sibling's sourceless stamp makes rbac_store operational with
+            // only seeded defaults, and a live IdP login in the interim can
+            // run reconcile_idp_memberships (auth_routes.cpp), which
+            // DELETEs a stale group_members row a legacy rbac.db snapshot
+            // still records — this file's own group_members INSERT (ON
+            // CONFLICT DO NOTHING) would silently resurrect exactly that
+            // row, restoring a role grant to a user correctly de-
+            // provisioned from an IdP group. Refuse; let the operator
+            // confirm no live post-cutover state exists before moving the
+            // file aside by hand.
+            spdlog::error(
+                "RbacStore: migrate_from_sqlite: backfill_complete is already set with a "
+                "sourceless source fingerprint (no legacy rbac.db has been migrated for this "
+                "fleet yet), and this replica's own legacy db {} still holds real content "
+                "(fingerprint '{}'). Refusing to auto-migrate on this later boot: rbac_store "
+                "may already have accepted live post-cutover state (e.g. IdP group "
+                "reconciliation) this file's stale content would silently clobber — see "
+                "docs/ops-runbooks/rbac-store-backfill-recovery.md.",
+                legacy_db_path.string(), *verify_fp);
+            backfill_metric("failed");
+            return false;
         } else if (*stored_fingerprint != *verify_fp) {
             spdlog::error(
                 "RbacStore: migrate_from_sqlite: HOLDER-SIDE VERIFICATION FAILED — "
@@ -2794,7 +2872,19 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
             return false;
         }
     }
-    if (!legacy_has_table(legacy.get(), "roles")) {
+    const auto has_roles = legacy_has_table(legacy.get(), "roles");
+    if (!has_roles) {
+        // A genuine read error, NOT "no roles table" — must NOT be treated
+        // as sourceless (governance re-review round 2, cpp-expert): stamping
+        // the marker on a read failure would permanently foreclose this
+        // replica's real migration on every future boot.
+        spdlog::error("RbacStore: migrate_from_sqlite: legacy db {} could not be probed for a "
+                      "roles table ({}); refusing backfill (fail-closed)",
+                      legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
+        backfill_metric("failed");
+        return false;
+    }
+    if (!*has_roles) {
         // No operator content here either — same "nothing to protect" class
         // as no local file at all (kSourcelessFingerprint, not skipped).
         if (!stamp_complete(kSourcelessFingerprint)) {

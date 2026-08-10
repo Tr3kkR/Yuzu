@@ -8,14 +8,25 @@ Background: [Upgrading § RBAC store moves to PostgreSQL](../user-manual/upgradi
 ADR-0041, `docs/postgres-store-playbook.md` "Local source absence never
 creates terminal migration state on its own" (#2697).
 
-## Two different holder-side verification refusals
+## Holder-side verification refusals
 
 The `backfill_complete` marker is already set when this replica boots, and
 this replica still holds a legacy `rbac.db` at its configured path. Rather
 than trust a marker it cannot vouch for, this replica verifies that ITS
 file's content is what got migrated, and refuses to serve if it cannot. The
-log line tells you which of two genuinely different situations you're in —
-read it before doing anything:
+log line tells you which of four situations you're in — read it before
+doing anything. Stored/logged fingerprint values look like `v2:<64 hex
+characters>` (the `v2:` names the encoding scheme, so a future scheme change
+is diagnosable rather than an unexplained mismatch); the literal unprefixed
+string `sourceless` is a distinct sentinel, not a scheme-versioned hash.
+
+### "legacy db ... exists but is unreadable/corrupt while being fingerprint-verified"
+
+This replica's own legacy file could not be opened or read as a valid
+`rbac.db` (corrupt, truncated, or not a SQLite file at all). Fails closed —
+an unreadable file is never silently treated as "nothing to protect." Fix
+the file's readability (restore from backup if the corruption is genuine) or
+confirm it's safe to discard, then retry.
 
 ### "backfill_complete is already set with NO recorded source fingerprint"
 
@@ -43,6 +54,36 @@ history alone, treat it as the second case and engage engineering before
 moving anything — unlike AuditStore's equivalent evidence trail, this file
 holds live authorization config a fleet may currently depend on.
 
+### "backfill_complete is already set with a sourceless source fingerprint"
+
+No real legacy data has been migrated for this fleet yet — a fileless
+sibling merely stamped `backfill_complete` first, from a boot that found no
+local `rbac.db` at all. This replica's own file holds real content, but
+this refuses rather than proceeding with a normal migration, because a
+fileless sibling's stamp makes `rbac_store` operational (seeded defaults
+only) and this replica cannot bound what live post-cutover state has
+accumulated since — in particular, a live IdP login can run
+`reconcile_idp_memberships`, which deletes a stale `group_members` row that
+this replica's own (older) legacy file still records; migrating that file
+would silently reinsert the row `reconcile_idp_memberships` correctly
+removed, restoring a role grant to a user already de-provisioned from an
+IdP group.
+
+**To make this rare rather than routine, boot the replica holding the real,
+authoritative `rbac.db` FIRST** on any fresh multi-replica rollout — the
+same guidance as the different-fingerprint case below, and for the same
+reason: whichever replica's stamp lands first wins.
+
+**To recover:** confirm no live RBAC-affecting activity has happened on this
+fleet since the sourceless stamp — check the server/audit log for role,
+grant, or group changes, and specifically for `reconcile_idp_memberships`
+activity, from that time forward. If genuinely nothing has: engage
+engineering to clear the `backfill_complete` and `backfill_source_fingerprint`
+rows from `rbac_meta` and restart this replica, which will then find the
+marker absent and complete a normal migration. If you cannot confirm the
+fleet is clean, treat it like the different-fingerprint case below and
+engage engineering before touching anything.
+
 ### "HOLDER-SIDE VERIFICATION FAILED ... a DIFFERENT recorded source fingerprint"
 
 Unambiguous: a different replica's legacy `rbac.db` was migrated, and this
@@ -63,28 +104,27 @@ engage engineering: recovering the correct config back into `rbac_store`
 after a wrong replica has already migrated is a case-specific DBA task, not
 scripted here.
 
-## Note: no "sourceless" refusal, and no abandon procedure
+## Note: no "abandon by hand" procedure
 
-Two things AuditStore's equivalent runbook covers that RbacStore's mechanism
+One thing AuditStore's equivalent runbook covers that RbacStore's mechanism
 does not need:
 
-- **A stored `"sourceless"` value never causes a refusal here.** No real
-  migration has happened yet in that case (the same safety class as a fresh
-  install), so a replica holding real content proceeds with a normal
-  migration instead of refusing — it will succeed and correctly claim the
-  marker. If you see an `info`-level "proceeding with a normal migration"
-  log line rather than an error, that is this case; no operator action
-  needed.
 - **There is no "rows present, marker absent, abandon by hand" procedure.**
-  RbacStore's backfill is a single, small, one-shot transaction (not
-  AuditStore's resumable streaming design) — the marker is stamped only
-  after that one transaction, its reconciliation, and re-deriving the
-  fingerprint all succeed. If the process is interrupted between the data
-  commit and the marker stamp, the next boot simply finds the marker absent
-  and retries the whole migration from scratch; every insert is `ON
-  CONFLICT DO NOTHING`/`DO UPDATE` against the same legacy content, so the
-  retry is a clean no-op over already-migrated rows, not a duplicate or a
-  stuck state. Nothing to abandon by hand.
+  RbacStore's backfill is a single boot-time pass made of a few small
+  transactions (not AuditStore's resumable streaming design) — the marker is
+  stamped only after the data commits, its reconciliation, and re-deriving
+  the fingerprint all succeed. If the process is interrupted at any point
+  before the marker stamp, the next boot simply finds the marker absent and
+  retries the whole migration from scratch; every insert is `ON CONFLICT DO
+  NOTHING`/`DO UPDATE` against the same legacy content, so the retry is a
+  clean no-op over already-migrated rows, not a duplicate or a stuck state.
+  Nothing to abandon by hand.
+- **A previously-failed move-aside retries automatically.** If an earlier
+  boot's migration succeeded but renaming the legacy file aside failed
+  (e.g. a permissions issue), a later boot that verifies the file still
+  matches (the "fingerprint verified, skipping" case) retries the move —
+  you do not need to move it aside by hand once the underlying problem is
+  fixed, though it's still safe to do so.
 
 **Not affected:** the RBAC data model, REST/MCP surface, and
 `check_permission`/`authorize_list_read` behavior are unchanged by any of

@@ -2387,28 +2387,35 @@ the single most dangerous outcome); a flag-backfill failure fails the whole
 backfill closed. The legacy `rbac.db` is moved aside only after a verified
 backfill.
 
-**Cross-replica coherence (governance re-review, #2703).** The shared
-Postgres `backfill_complete` marker alone cannot distinguish "genuinely no
-legacy data anywhere" from "a fileless replica happened to check first" —
-stamping it from local absence alone let a fileless replica permanently
-foreclose migration for a sibling genuinely holding the real `rbac.db`
-(matches the anti-pattern `docs/postgres-store-playbook.md` documents for
-`AuditStore`, #2697). The fix: a SHA-256 content fingerprint of the legacy
-file (length-prefixed, injective encoding over every migrated row — not a
-delimiter join, which cannot safely disambiguate unconstrained operator
-free-text) is stamped alongside the marker, in the same transaction, derived
-from the exact rows actually migrated (no second file read — the trust
-anchor and the migrated data come from one shared in-memory snapshot). Any
-later replica that still holds a local legacy file re-derives its own
-fingerprint and verifies it against the stored value before trusting an
-existing marker. Three outcomes: a genuine match (skip, safe); a stored
-`"sourceless"` value with real local content (no real migration has
-happened yet — proceed with a normal migration, which promotes the marker
-via a monotonic upsert rather than refusing); or a genuinely different
-real fingerprint, or an absent one from a marker that predates this
-mechanism (both fail closed — the latter case cannot be told apart from a
-genuine prior migration under live operator changes since, so it is never
-auto-retried). Operator-facing failure modes and recovery:
+**Cross-replica marker fingerprinting (governance re-review, #2703).** The
+shared Postgres `backfill_complete` marker alone cannot distinguish
+"genuinely no legacy data anywhere" from "a fileless replica happened to
+check first" — stamping it from local absence alone let a fileless replica
+permanently foreclose migration for a sibling genuinely holding the real
+`rbac.db` (matches the anti-pattern `docs/postgres-store-playbook.md`
+documents for `AuditStore`, #2697). The fix: a SHA-256 content fingerprint
+of the legacy file (length-prefixed, injective encoding over every migrated
+row — not a delimiter join, which cannot safely disambiguate unconstrained
+operator free-text) is stamped alongside the marker, in the same
+transaction, derived from the exact rows actually migrated (no second file
+read — the trust anchor and the migrated data come from one shared
+in-memory snapshot). Any later replica that still holds a local legacy file
+re-derives its own fingerprint and verifies it against the stored value
+before trusting an existing marker: a genuine match skips (safe); anything
+else fails closed, with a distinct diagnostic for each of a stored
+`"sourceless"` value (no real migration has happened yet, but this later
+boot cannot bound what live post-cutover mutations — e.g. IdP group
+reconciliation — a fresh auto-migration might clobber), a genuinely
+different real fingerprint, and an absent fingerprint from a marker that
+predates this mechanism. None of the fail-closed cases auto-retry; a
+genuine prior migration under live operator changes since cannot be told
+apart from a different replica's completion this file was never part of.
+Promotion of a stored `"sourceless"` value to a real fingerprint happens
+only at STAMP TIME, inside a replica's own migration (a monotonic upsert in
+`stamp_complete`) — by then that replica's writes are already durably
+committed, so correcting the trust anchor cannot clobber anything; a later
+boot's mismatch is a materially different, unbounded situation and always
+refuses. Operator-facing failure modes and recovery:
 `docs/ops-runbooks/rbac-store-backfill-recovery.md`.
 
 **Metrics.** `yuzu_server_rbac_read_degrade_total{reason}` — three

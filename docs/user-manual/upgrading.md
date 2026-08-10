@@ -622,10 +622,13 @@ server `PgPool`).
   file was never proven part of. This closes a multi-replica anti-pattern
   (a fileless replica could otherwise foreclose migration for a sibling
   genuinely holding the real file) but means an operator on a mixed-fleet
-  first boot or a retained legacy file may see one of two distinct refusals
-  — `docs/ops-runbooks/rbac-store-backfill-recovery.md` covers both and how
-  to tell them apart. Keep the moved-aside copy until you have confirmed
-  RBAC behaves as expected, then remove it.
+  first boot or a retained legacy file may see one of a few distinct
+  refusals — `docs/ops-runbooks/rbac-store-backfill-recovery.md` covers each
+  and how to tell them apart. A verified-match boot also retries the
+  move-aside automatically, so a once-failed rename does not need manual
+  cleanup once the underlying problem (e.g. a permissions issue) is fixed.
+  Keep the moved-aside copy until you have confirmed RBAC behaves as
+  expected, then remove it.
 
 **What to expect / do:**
 
