@@ -700,7 +700,114 @@ std::string raw_hash_column(PgPool& pool, const std::string& token_id) {
     return PQgetvalue(res.get(), 0, 0);
 }
 
+// P2 #11: manually wires two already-created tokens into the overlap-pair
+// rotation shape `rotate_engine_credential` (and, for a human principal, the
+// P1 sibling `rotate_token` — not yet in this tree) would leave behind:
+// predecessor gets `rotation_group` + `overlap_expires_at`; successor gets
+// the SAME `rotation_group` + `supersedes_token_id == predecessor's
+// token_id`. There is no public store API to mint a HUMAN rotation pair
+// today (create_token's principal_kind defaults to "human", but nothing
+// wires the rotation columns for it outside the not-yet-landed rotate_token),
+// so store-level coverage of the human sweep path goes through this direct-
+// SQL seam, matching the file's existing direct-SQL precedent (raw_hash_column
+// above, the F3 trigger seam below).
+void wire_manual_rotation_pair(PgPool& pool, const std::string& rotation_group,
+                               const std::string& predecessor_id, const std::string& successor_id,
+                               int64_t overlap_expires_at) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    pg::PgResult r1 = pg::exec_params(
+        lease.get(),
+        "UPDATE api_token_store.api_tokens SET rotation_group = $1, overlap_expires_at = $2 "
+        "WHERE token_id = $3",
+        std::vector<std::string>{rotation_group, std::to_string(overlap_expires_at), predecessor_id});
+    REQUIRE(r1.ok());
+    pg::PgResult r2 = pg::exec_params(
+        lease.get(),
+        "UPDATE api_token_store.api_tokens SET rotation_group = $1, supersedes_token_id = $2 "
+        "WHERE token_id = $3",
+        std::vector<std::string>{rotation_group, predecessor_id, successor_id});
+    REQUIRE(r2.ok());
+}
+
 } // namespace
+
+TEST_CASE("ApiTokenStore::sweep_expired_rotations: a HUMAN rotation pair's swept predecessor "
+          "reports principal_kind=='human' — the signal server.cpp's sweep driver "
+          "(rotation_sweep_names_for_kind) keys its metric/audit routing on (P2 #11)",
+          "[pg][token][rotation][sweep][principal_kind]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string principal = "alice-p2-11-sweep";
+    auto now = test_now_epoch();
+    // principal_kind defaults to "human" — create_token's public signature
+    // has no way to mint anything else without ALSO passing "engine" (which
+    // triggers the engine-only referent-check block), so the default arm
+    // exercised here IS the human path under test.
+    REQUIRE(store.create_token("pred", principal, now + k90Days).has_value());
+    REQUIRE(store.create_token("succ", principal, now + k90Days).has_value());
+
+    auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 2);
+    const ApiToken* predecessor = active[0].name == "pred" ? &active[0] : &active[1];
+    const ApiToken* successor = active[0].name == "succ" ? &active[0] : &active[1];
+    REQUIRE(predecessor->principal_kind == "human");
+    REQUIRE(successor->principal_kind == "human");
+
+    // Overlap window already elapsed — this tick's sweep must pick it up.
+    wire_manual_rotation_pair(pool, predecessor->token_id, predecessor->token_id,
+                              successor->token_id, now - 1);
+
+    bool tick_failed = false;
+    auto swept = store.sweep_expired_rotations(now, &tick_failed);
+    REQUIRE_FALSE(tick_failed);
+    REQUIRE(swept.size() == 1);
+    CHECK(swept[0].token_id == predecessor->token_id);
+    // THE ASSERTION THIS TEST EXISTS FOR: the store hands the driver a real
+    // "human" tag on the swept row — not a value that quietly defaults to
+    // "engine" or gets lost between the scan and the returned ApiToken. A
+    // wrong value here would misroute EVERY human rotation to the engine
+    // metric/audit family regardless of how correct the driver's own
+    // branching logic is.
+    CHECK(swept[0].principal_kind == "human");
+}
+
+TEST_CASE("ApiTokenStore::list_rotations_nearing_expiry_unused: a HUMAN pair nearing expiry "
+          "reports principal_kind=='human' on BOTH halves of the returned pair (P2 #11)",
+          "[pg][token][rotation][sweep][principal_kind]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string principal = "alice-p2-11-nearing";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("pred", principal, now + k90Days).has_value());
+    REQUIRE(store.create_token("succ", principal, now + k90Days).has_value());
+
+    auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 2);
+    const ApiToken* predecessor = active[0].name == "pred" ? &active[0] : &active[1];
+    const ApiToken* successor = active[0].name == "succ" ? &active[0] : &active[1];
+
+    // Window ends 1h from now (inside a 24h warn lead); successor's
+    // last_used_at stays 0 (create_token never touches it) — the "never
+    // presented" precondition this half's query requires.
+    wire_manual_rotation_pair(pool, predecessor->token_id, predecessor->token_id,
+                              successor->token_id, now + 3600);
+
+    auto nearing = store.list_rotations_nearing_expiry_unused(now, 24 * 3600);
+    REQUIRE(nearing.size() == 1);
+    CHECK(nearing[0].predecessor.token_id == predecessor->token_id);
+    CHECK(nearing[0].successor.token_id == successor->token_id);
+    // Both halves must carry "human" — server.cpp's successor-unused path
+    // keys its family/action off pair.predecessor.principal_kind.
+    CHECK(nearing[0].predecessor.principal_kind == "human");
+    CHECK(nearing[0].successor.principal_kind == "human");
+}
 
 TEST_CASE("ApiTokenStore: rotate_engine_credential rejects an overlap window below the 24h "
           "floor",

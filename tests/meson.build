@@ -534,6 +534,7 @@ if build_server
       'unit/server/test_route_sink_harness.cpp',
       'unit/server/test_rest_tar_purge.cpp',
       'unit/server/test_api_token_store.cpp',
+      'unit/server/test_rotation_sweep_naming.cpp', # P2 #11: sweep-driver metric/audit family discrimination by principal_kind
       'unit/server/test_engine_principal_store.cpp',
       'unit/server/test_engine_principal_integration.cpp',
       # #2367: test-only definition of EngineLivenessTestAccess::revalidate,

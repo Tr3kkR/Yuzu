@@ -21,6 +21,7 @@
 #include "store_errors.hpp"
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include "rotation_sweep_naming.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "body_cap_policy.hpp" // #2407: pre-auth request-body cap policy table
@@ -1987,9 +1988,19 @@ public:
         // never close (two live credentials persist). The per-tick try/catch
         // keeps the thread alive; this counter makes that degradation
         // alertable instead of log-only (Gate 8 UP8-6).
+        // P2 #11: this is the SHARED per-tick health counter for the ONE
+        // sweep loop below, which serves BOTH engine-credential AND
+        // human API-token rotation pairs — unlike the auto-revoked/events
+        // counters above (and their yuzu_api_token_rotation_* twins below),
+        // it stays a single un-split series: a failed tick is a tick-level
+        // fault (pool contention / query error), not attributable to one
+        // kind's rows. Name/label/semantics unchanged; only this describe
+        // text was amended so it no longer implies engine-only scope.
         metrics_.describe("yuzu_engine_principal_rotation_sweep_failures_total",
-                          "Cumulative engine-credential rotation-sweep ticks that failed with an "
-                          "exception (predecessor auto-revocation skipped for that tick)",
+                          "Cumulative rotation-sweep ticks that failed with an exception "
+                          "(predecessor auto-revocation skipped for that tick) — the sweep is "
+                          "shared across BOTH engine-credential and human API-token rotation "
+                          "pairs; this counter is not split by principal_kind",
                           "counter");
         // #2404: confirm-rotation endpoint outcomes, so a 409-conflict or
         // 503-transient retry storm on confirm is alertable instead of
@@ -2012,6 +2023,52 @@ public:
         for (auto surface : {"rest", "mcp"}) {
             for (auto result : {"success", "conflict", "client_error", "transient"}) {
                 metrics_.counter("yuzu_engine_principal_confirm_total",
+                                 {{"surface", surface}, {"result", result}});
+            }
+        }
+        // P2 #11 (SOC 2 CC6.3): human-owned twin of the three engine-credential
+        // rotation families above. The T12 sweep (`sweep_expired_rotations`/
+        // `list_rotations_nearing_expiry_unused`) scans both `principal_kind`s
+        // with no filter — the driver below picks the family via
+        // `rotation_sweep_names_for_kind` (rotation_sweep_naming.hpp), the ONE
+        // chokepoint for this decision. Deliberately a SEPARATE family, never a
+        // `kind` label on the engine names above (dishonest naming under an
+        // `engine_principal`-named series, and it would silently widen that
+        // series' pre-seeded bounded cross-product) — see the header for the
+        // full rationale. Every name/label pulled from
+        // `kHumanRotationSweepNames` so the describe/pre-seed sites here can
+        // never drift from what the driver actually increments.
+        metrics_.describe(kHumanRotationSweepNames.metric_events,
+                          "Cumulative human API-token rotation sweep events, by reason (bounded "
+                          "label set) — the human-owned twin of "
+                          "yuzu_engine_principal_rotation_events_total",
+                          "counter");
+        metrics_.describe(kHumanRotationSweepNames.metric_auto_revoked,
+                          "Cumulative human API-token predecessors auto-revoked at overlap "
+                          "window end — the human-owned twin of "
+                          "yuzu_engine_principal_rotation_auto_revoked_total",
+                          "counter");
+        metrics_.counter(kHumanRotationSweepNames.metric_auto_revoked);
+        for (auto reason : {"successor_unused"}) {
+            metrics_.counter(kHumanRotationSweepNames.metric_events, {{"reason", reason}});
+        }
+        // Human-owned twin of yuzu_engine_principal_confirm_total (#2404):
+        // same scope contract — counts only calls that reached the credential
+        // store or found it unavailable at the store-open guard, `result`
+        // mirrors the same taxonomy plus success, no principal_id label
+        // (bounded cardinality only). NOT wired to an increment site by this
+        // change — the human confirm-rotation REST/MCP handlers are a sibling
+        // piece (P1); this registers + pre-seeds the family they will
+        // increment.
+        metrics_.describe("yuzu_api_token_confirm_total",
+                          "Human API-token rotation confirm outcomes by surface (rest|mcp) and "
+                          "result (success|conflict|client_error|transient); store-reaching calls "
+                          "only, pre-store denials excluded — the human-owned twin of "
+                          "yuzu_engine_principal_confirm_total",
+                          "counter");
+        for (auto surface : {"rest", "mcp"}) {
+            for (auto result : {"success", "conflict", "client_error", "transient"}) {
+                metrics_.counter("yuzu_api_token_confirm_total",
                                  {{"surface", surface}, {"result", result}});
             }
         }
@@ -5277,14 +5334,19 @@ public:
                 });
         }
 
-        // T12 (design doc §7): engine-credential overlap-pair rotation
-        // sweep — auto-revoke + successor-unused warning. Only started when
-        // api_token_store_ is actually open (nothing to sweep otherwise).
-        // 60s cadence: overlap windows floor at 24h (kOverlapFloorSecs in
-        // api_token_store.cpp), so a minute of sweep latency is immaterial
-        // to either half's correctness — the sweep is idempotent and a
-        // missed tick simply defers to the next one (see
-        // sweep_expired_rotations's doc comment).
+        // T12 (design doc §7): overlap-pair rotation sweep — auto-revoke +
+        // successor-unused warning, covering BOTH engine-credential and
+        // (P2 #11) human API-token rotation pairs; the scan itself has no
+        // principal_kind filter. Only started when api_token_store_ is
+        // actually open (nothing to sweep otherwise). 60s cadence: overlap
+        // windows floor at 24h (kOverlapFloorSecs in api_token_store.cpp),
+        // so a minute of sweep latency is immaterial to either half's
+        // correctness — the sweep is idempotent and a missed tick simply
+        // defers to the next one (see sweep_expired_rotations's doc
+        // comment). Each swept row/pair is routed to the engine or human
+        // metric family + audit action by `rotation_sweep_names_for_kind`
+        // (rotation_sweep_naming.hpp) — the ONE chokepoint for that
+        // decision, keyed on the predecessor's `principal_kind`.
         if (api_token_store_ && api_token_store_->is_open()) {
             engine_rotation_sweep_thread_ = std::thread([this]() {
                 spdlog::info("Engine-credential rotation sweep thread started (interval=60s)");
@@ -5344,14 +5406,18 @@ public:
                             .increment();
                     }
                     for (const auto& predecessor : revoked) {
-                        metrics_.counter("yuzu_engine_principal_rotation_auto_revoked_total")
-                            .increment();
+                        // P2 #11: route to the engine or human family/audit
+                        // action by THIS row's own principal_kind — never
+                        // assume every swept row is engine-owned.
+                        const auto& names =
+                            rotation_sweep_names_for_kind(predecessor.principal_kind);
+                        metrics_.counter(names.metric_auto_revoked).increment();
                         if (audit_store_ && audit_store_->is_open()) {
                             (void)audit_store_->log(
                                 {.timestamp = now,
                                  .principal = "system",
                                  .principal_role = "system",
-                                 .action = "engine_principal.rotation.auto_revoke",
+                                 .action = names.audit_auto_revoke,
                                  .target_type = "ApiToken",
                                  .target_id = predecessor.token_id,
                                  .detail = "principal_id=" + predecessor.principal_id +
@@ -5380,16 +5446,21 @@ public:
                             continue; // already warned this rotation attempt — don't re-spam
                         warned_rotation_groups.insert(pair.successor.rotation_group);
 
+                        // P2 #11: same per-row discrimination as Half 1,
+                        // keyed on the predecessor (the pair shares one
+                        // principal_id, so predecessor/successor always
+                        // agree on principal_kind).
+                        const auto& names =
+                            rotation_sweep_names_for_kind(pair.predecessor.principal_kind);
                         metrics_
-                            .counter("yuzu_engine_principal_rotation_events_total",
-                                     {{"reason", "successor_unused"}})
+                            .counter(names.metric_events, {{"reason", "successor_unused"}})
                             .increment();
                         if (audit_store_ && audit_store_->is_open()) {
                             (void)audit_store_->log(
                                 {.timestamp = now,
                                  .principal = "system",
                                  .principal_role = "system",
-                                 .action = "engine_principal.rotation.successor_unused",
+                                 .action = names.audit_successor_unused,
                                  .target_type = "ApiToken",
                                  .target_id = pair.successor.token_id,
                                  .detail = "principal_id=" + pair.predecessor.principal_id +
