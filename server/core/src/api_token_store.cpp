@@ -686,9 +686,21 @@ ApiTokenStore::list_active_for_principal(const std::string& principal_id) const 
     if (!open_ || principal_id.empty())
         return result;
 
+    // Both early returns below share rotation_confirm_state.hpp's positive-read
+    // contract: an empty vector here is indistinguishable from a genuine
+    // zero-active-credentials read by ANY caller of this public accessor. That
+    // is fine for a destructive in-transaction consumer (stays retryable), but
+    // #2443's precondition caller has no other signal to notice a persistent
+    // fault here — the warn line is that signal for on-call, since the caller
+    // itself denies-without-consuming either way and cannot distinguish the
+    // causes from the return value alone.
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        spdlog::warn("ApiTokenStore::list_active_for_principal: pool lease timed out for "
+                     "principal_id={}",
+                     principal_id);
         return result;
+    }
 
     const auto now = now_epoch();
     const std::string sql = std::string("SELECT token_id, '' AS token_hash, ") + kTokenColsTail +
@@ -698,8 +710,12 @@ ApiTokenStore::list_active_for_principal(const std::string& principal_id) const 
                             "ORDER BY created_at ASC";
     pg::PgResult res = pg::exec_params(
         lease.get(), sql.c_str(), std::vector<std::string>{principal_id, std::to_string(now)});
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ApiTokenStore::list_active_for_principal: query failed for "
+                     "principal_id={}: {}",
+                     principal_id, PQerrorMessage(lease.get()));
         return result;
+    }
 
     const int rows = PQntuples(res.get());
     result.reserve(static_cast<std::size_t>(rows));
@@ -1204,6 +1220,18 @@ ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::stri
             break; // exactly two active -> fall through to pair processing below
         }
 
+        // This linkage check is intentionally NOT expressed via
+        // rotation_confirm_state.hpp::pair_matches_pin, even though the two
+        // are checking the same shape (#2443 added that helper for the same
+        // linkage question, unlocked). pair_matches_pin collapses "not
+        // linked" and "linked but wrong pin" into one bool; here those are
+        // two DIFFERENT client-visible error classes (this block: retryable
+        // "no in-flight rotation to confirm"; the pin check below: terminal
+        // "token_id does not match" - see engine_store_error_class.hpp).
+        // Swapping in the bool would silently merge them. A shared helper
+        // needs a reason enum, not a bool - tracked as #2953, not done here
+        // to avoid changing this authoritative path's error taxonomy late in
+        // an unrelated governance round.
         const ApiToken* predecessor = nullptr;
         const ApiToken* successor = nullptr;
         for (const auto& t : active) {

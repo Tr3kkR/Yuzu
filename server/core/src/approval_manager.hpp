@@ -108,19 +108,34 @@ struct ApprovalQuery {
 /// kNotConsumable means the one-time capability is spent. Distinguishing them by
 /// parsing the message string would be a fragile seam, so the kind is typed.
 ///
-/// OBLIGATION ON THE FIRST CALLER of the three-argument overload: today the MCP
-/// recall maps every consume failure onto one message — "approval already used
-/// (one-time ticket)", remediating "submit a new request without approval_id".
-/// That is correct only while the two-argument overload is the sole caller.
-/// Wired as-is to a precondition, it would tell the operator to discard a ticket
-/// this code deliberately left recallable — re-entering the very burn class
-/// #2443 exists to close. Map the kinds, and audit a kPrecondition denial: a
-/// refusal to honour a human-approved capability currently leaves nothing but a
-/// log line.
+/// DISCHARGED (#2443, confirm_engine_rotation): the MCP recall's shared consume
+/// failure handling in mcp_server.cpp gives kPrecondition its own client
+/// message instead of falling through to "approval already used" - the
+/// fallthrough would have told the operator to discard a ticket this code
+/// deliberately left recallable, re-entering the very burn class #2443 exists
+/// to close. That message is deliberately GENERIC and kind-independent, not
+/// this error's own `.message` string: the precondition runs before the
+/// tool's own per-handler RBAC check, so echoing the specific fact (which
+/// RotationConfirmState fired) would be a credential-state oracle for a
+/// tier-eligible, RBAC-less caller. The specific fact still reaches the
+/// audit row - server-side, ahead of RBAC concerns - via mcp_server.cpp's
+/// `mcp_audit("denied", ...)`, which already fires generically for every
+/// ConsumeFailure kind, so kPrecondition needed no new audit/metric plumbing
+/// there, only the message split. This store method's own `spdlog::info` on
+/// a precondition decline (see the impl) stays a log line by design; the
+/// caller's audit row is the durable record.
+///
+/// A FUTURE second caller of the three-argument overload inherits this same
+/// obligation for its own kind of drift: (1) do not let its kPrecondition
+/// message fall through to the shared "already used" wording, and (2) if its
+/// `.message` carries anything the caller shouldn't learn before their own
+/// RBAC gate runs, keep it out of the client-facing text the way this one
+/// does - do not assume this comment's DISCHARGED note still covers it.
 enum class ConsumeFailure {
     kPrecondition,  ///< precondition denied — ticket UNTOUCHED, still recallable
     kNotConsumable, ///< absent / not approved / already consumed (the CAS lost)
-    kStoreError,    ///< store unavailable, missing argument, or a SQLite failure
+    kStoreError,    ///< store unavailable, missing argument, or a SQLite failure —
+                    ///< see ConsumeError::extended_errcode/origin_check_unevaluated
     kForeignOrigin, ///< minted on a surface other than the MCP recall (#2442)
 };
 
@@ -185,9 +200,44 @@ enum class ConsumeFailure {
 inline constexpr const char* kNotConsumableMessage =
     "approval not consumable (already used, not approved, or absent)";
 
+/// A store read's failure, kept apart from the row simply not being there.
+/// `extended_errcode` is `sqlite3_extended_errcode()` at the failing
+/// prepare/step, or 0 when the failure has no SQLite origin (store not open,
+/// missing argument) — see `is_permanent_sqlite_error` (#2786 "PR 1c").
+struct StoreReadError {
+    std::string message;
+    int extended_errcode = 0;
+};
+
 struct ConsumeError {
     ConsumeFailure kind{ConsumeFailure::kStoreError};
     std::string message;
+    /// `sqlite3_extended_errcode()` for a `kStoreError` produced by a SQLite
+    /// read/write failure; 0 otherwise (store not open, missing argument, a
+    /// throwing precondition). See `is_permanent_sqlite_error` (#2786). The 0
+    /// default is safe for the store-not-open producer specifically because
+    /// `approval_store_error_body`'s permanent-arm check is `!is_open() ||
+    /// is_permanent_sqlite_error(extended_errcode)` — the `is_open()` disjunct
+    /// alone correctly forces the permanent arm there regardless of
+    /// `extended_errcode`. The missing-argument/throwing-precondition
+    /// producers are NOT similarly protected: the store IS open in those
+    /// cases, so a 0 `extended_errcode` DOES take the transient arm if that
+    /// `kStoreError` ever reaches `approval_store_error_body` (see
+    /// `consume_ticket`'s guard-clause comment for why this is harmless
+    /// today — the sole production caller never triggers them).
+    int extended_errcode = 0;
+    /// True ONLY when the #2442 cross-surface origin check's own read
+    /// (`get_checked` inside `consume_ticket`) is the thing that faulted —
+    /// so the origin comparison never ran and a foreign-origin ticket could
+    /// be hiding behind this refusal exactly as easily as an innocent one.
+    /// #2786 arm 1: without this, a store fault at that specific read
+    /// reports as a plain `kStoreError` and the forgery-detection signal is
+    /// lost for the duration of the fault. False for every other
+    /// `kStoreError` producer (the store-not-open guard, the missing-id/
+    /// missing-principal guards, the CAS itself, the precondition recheck
+    /// read, a throwing precondition) — those never reached the origin
+    /// check, so there is nothing masked to flag.
+    bool origin_check_unevaluated = false;
 };
 
 /// A cheap, read-only recheck of the state a ticket's effect depends on,
@@ -254,7 +304,7 @@ public:
     /// caller that 404s either way, and NOT fine for one deciding whether a
     /// one-time capability is spent — see consume_ticket's pre-consume recheck,
     /// which uses this.
-    std::expected<std::optional<Approval>, std::string> get_checked(const std::string& id) const;
+    std::expected<std::optional<Approval>, StoreReadError> get_checked(const std::string& id) const;
 
     /// Newest PENDING approval matching (definition_id, submitted_by,
     /// scope_expression), or nullopt. The MCP approval-ticket mint dedup key

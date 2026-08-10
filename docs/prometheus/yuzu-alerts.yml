@@ -1200,12 +1200,25 @@ groups:
       # upper edge, and the old rule was blind above 195 too. This is strictly
       # and substantially better, and still has a hole.
       #
-      # Closing it needs a SERVER change, not a PromQL one. The natural signal,
-      # `..._retention_last_pass_unixtime`, is seeded 0 and never reloaded from
-      # the persisted `audit_retention_meta` anchor, so it zeroes on every restart
-      # and a freshness rule built on it REGRESSES the 30-minute crash loop this
-      # rule already catches. Tracked separately; do not rewrite this expression
-      # in place without a cadence x evaluation-interval sweep.
+      # Closing it needs a SERVER change, not a PromQL one -- and as of #2854 the
+      # server half exists: `..._retention_last_pass_unixtime` is now seeded from
+      # the persisted `audit_retention_meta` anchor at startup, surviving a
+      # restart (including the first PostgreSQL boot). A value of INT64_MIN
+      # (-9223372036854775808) is a distinct anomaly sentinel -- the durable
+      # anchor could not be read or trusted as a plausible integer -- not a
+      # genuine timestamp, and self-corrects at the next pass whose own clock
+      # reading is plausible -- even if that pass then declines or fails for an
+      # unrelated reason -- but NOT at a pass that itself refuses on an
+      # implausible clock, which skips the stamp entirely to avoid poisoning
+      # this gauge with a value already known to be garbage; any future
+      # rule reading this gauge must exclude it explicitly, the same way it
+      # must exclude a negative dead-CMOS reading. What's still open is the
+      # RULE that uses it -- a freshness expression built naively on this gauge
+      # still needs the min/max-over-time treatment #2854's design worked out (a
+      # bare instant-vector freshness check regresses the 30-minute crash loop
+      # this rule already catches), and that redesign is tracked separately.
+      # Do not rewrite this expression in place without a cadence x
+      # evaluation-interval sweep.
       #
       # KNOWN LIMIT, and it bites hardest where crash loops live. `resets()` needs
       # ONE CONTINUOUS SERIES per server. If a restart changes the `instance`
@@ -2013,7 +2026,8 @@ groups:
   #
   # REASON 2 - NO CHURN-ROBUST NEW-INCREMENT ALERT EXISTS OVER THIS SHAPE. This one does
   # not clear at the cutover. It clears only when a per-agent axis exists for the
-  # JOURNAL: #2083 is spark-scoped, and the journal equivalent is not filed (see below).
+  # JOURNAL: #2083 is spark-scoped, and the journal equivalent is tracked at #2336
+  # (filed 2026-07-21; see below).
   # These are UNLABELLED fleet SUMS of per-agent CUMULATIVE counters over a CHURNING
   # population, and all three candidate forms fail (governance Gate-4 unhappy-path +
   # Gate-6 sre):
@@ -2057,7 +2071,7 @@ groups:
   # rules stay disabled even once the cutover clears REASON 1, and it is separate again
   # from prerequisites (a)-(d) below. Closing it needs the per-agent delta plus a
   # server-owned monotonic counter - #2083 is the spark-scoped tracker, and the journal
-  # side belongs on #2298's cutover-gate list and is not yet filed there.
+  # side is tracked at #2336 (filed 2026-07-21; referenced from #2298's gate list).
   #
   # UNTIL BOTH REASONS CLEAR THESE ARE MONITOR-ONLY: graph them, review them in
   # post-incident analysis, do not page on them.

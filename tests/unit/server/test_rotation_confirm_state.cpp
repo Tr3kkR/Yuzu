@@ -20,6 +20,7 @@ using yuzu::server::detail::classify_confirm_state;
 using yuzu::server::detail::classify_confirm_state_in_group;
 using yuzu::server::detail::GroupRotationConfirmState;
 using yuzu::server::detail::RotationConfirmState;
+using yuzu::server::detail::pair_matches_pin;
 
 namespace {
 
@@ -142,4 +143,76 @@ TEST_CASE("classify_confirm_state_in_group: more than two rows sharing a group i
                                  grouped_token("c", group)};
     CHECK(classify_confirm_state_in_group(active, group) ==
           GroupRotationConfirmState::kOverfullGroup);
+}
+
+// ── From dev (#2443/#2953): pair_matches_pin linkage+pin precondition ──────
+// Appended alongside the P2 #11 group-aware cases above; the two suites are
+// independent — engine-arm pin/linkage vs human-arm rotation_group counting.
+
+namespace {
+
+// A linked (predecessor, successor) pair - same rotation_group, successor's
+// supersedes_token_id pointing at the predecessor.
+std::pair<ApiToken, ApiToken> linked_pair(const std::string& predecessor_id,
+                                          const std::string& successor_id,
+                                          const std::string& group = "grp-1") {
+    ApiToken predecessor = clear_token(predecessor_id);
+    predecessor.rotation_group = group;
+    ApiToken successor = clear_token(successor_id);
+    successor.rotation_group = group;
+    successor.supersedes_token_id = predecessor_id;
+    return {predecessor, successor};
+}
+
+} // namespace
+
+// #2443: `classify_confirm_state` alone only counts rows - `pair_matches_pin`
+// is the additional check that closes the burn where a NEWER rotation (a
+// different successor token_id than the ticket was minted for) also reads as
+// `kPair`.
+TEST_CASE("pair_matches_pin", "[rotation_confirm][2443]") {
+    SECTION("not exactly 2 active -> false regardless of content") {
+        CHECK_FALSE(pair_matches_pin({}, "x"));
+        CHECK_FALSE(pair_matches_pin({clear_token("a")}, "a"));
+        auto [p, s] = linked_pair("p", "s");
+        CHECK_FALSE(pair_matches_pin({p, s, clear_token("c")}, "s"));
+    }
+    SECTION("linked pair, pin matches the successor -> true") {
+        auto [p, s] = linked_pair("p", "s");
+        CHECK(pair_matches_pin({p, s}, "s"));
+        CHECK(pair_matches_pin({s, p}, "s")); // order-independent
+    }
+    SECTION("linked pair, pin does NOT match the successor (a NEWER rotation) -> false") {
+        // The exact #2443 burn shape: the ticket was pinned to an OLDER
+        // successor ("old-s") that has since resolved; a NEW rotation
+        // produced a different successor ("new-s"). Both are still
+        // structurally a valid pair - just not the pair this ticket names.
+        auto [p, s] = linked_pair("p", "new-s");
+        CHECK_FALSE(pair_matches_pin({p, s}, "old-s"));
+    }
+    SECTION("two active rows but NOT linked to each other -> false even if the pin matches "
+            "one of them") {
+        // Two independently-minted standalone credentials (no rotation in
+        // progress between them) must never read as a confirmable pair.
+        ApiToken a = clear_token("a");
+        ApiToken b = clear_token("b");
+        CHECK_FALSE(pair_matches_pin({a, b}, "b"));
+    }
+    SECTION("mismatched rotation_group -> false") {
+        auto [p, s] = linked_pair("p", "s", "grp-1");
+        s.rotation_group = "grp-2"; // linkage broken
+        CHECK_FALSE(pair_matches_pin({p, s}, "s"));
+    }
+    SECTION("supersedes_token_id points at the wrong predecessor -> false") {
+        auto [p, s] = linked_pair("p", "s");
+        s.supersedes_token_id = "not-p";
+        CHECK_FALSE(pair_matches_pin({p, s}, "s"));
+    }
+    SECTION("both rows look like successors (malformed) -> no predecessor found -> false") {
+        ApiToken a = clear_token("a");
+        a.supersedes_token_id = "x";
+        ApiToken b = clear_token("b");
+        b.supersedes_token_id = "y";
+        CHECK_FALSE(pair_matches_pin({a, b}, "a"));
+    }
 }

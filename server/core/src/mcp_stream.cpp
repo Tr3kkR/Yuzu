@@ -1606,9 +1606,9 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
         // Only a prefix of the session id reaches the audit row — enough to join a
         // reject to its stream, never enough to replay it. Sanitized because the id is
         // an attacker-controlled HEADER until it validates: raw bytes here could inject
-        // `;`/`=` field separators or CR/LF into a "k=v;k=v" audit detail that SIEM
-        // tooling parses (yuzu::server::detail::sanitize_detail_value, the convention
-        // for every externally-controlled audit string).
+        // `;`/`=` field separators into a "k=v;k=v" audit detail that SIEM tooling
+        // parses (yuzu::server::detail::sanitize_detail_value, the convention for
+        // every externally-controlled audit string).
         (void)audit("mcp.session.reject", "failure",
                     yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8)),
                     std::string("reason=") + reason + " cid=" + cid);

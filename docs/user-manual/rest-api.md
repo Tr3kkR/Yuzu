@@ -234,6 +234,21 @@ Every request is checked against a per-route body-size cap **before authenticati
 
 All three responses use the standard [A4 error envelope](#json-envelope) with a `remediation` hint (no `permission` field — the request is rejected before any principal is resolved) — **except the `scim` class**, which publishes SCIM's own RFC 7644 §3.12 error shape (`schemas`/`status`/`detail`) on `application/scim+json` instead of the generic envelope (`scim::error()`, `scim_json.hpp:192`; wired into all three status codes above in `server.cpp`'s pre-routing handler). This gate is separate from, and runs *before*, any route-local body check a handler may also carry (e.g. the SCIM/response-template 64 KiB checks below) — those still exist for defense-in-depth if a future edit widens this table's entry, but on the current table this pre-routing gate rejects first. **This is not purely a timing change for every affected class.** For most (response templates, CA import), an earlier rejection at the same byte count is the entire effect. SCIM is **no longer** an exception to that either (fixed as part of this change, D7): the pre-routing rejection's SCIM shape matches the wording of the handler's own (now-superseded, and unreachable — the pre-routing cap and the handler check the identical 64 KiB threshold, so the pre-routing gate always wins first) `413` check exactly, and extends the same shape to the `411`/`415` cases the handler-level check never covered.
 
+### Post-Read Backstop (#2407)
+
+The pre-routing gate above is what stops an oversized body from being buffered at all — but it can only act on a **declared** size. Its structural limit, recorded in `body_cap_policy.hpp`'s KNOWN LIMITATION paragraph: on the 24 of 25 classes below that don't set `requires_measurable`, a genuine chunked (or otherwise undeclared) body is not size-checked by the pre-routing gate at all — it is admitted, up to httplib's own 100 MiB backstop, without that table's cap being consulted.
+
+A second stage, wired at httplib's `Server::set_pre_request_handler` in `server.cpp`, closes that gap from the other side. It runs inside httplib's `dispatch_request` — **after** `read_content` has consumed the body off the socket into `req.body`, and after the route has matched, but **before the route's own handler runs**. At that point the body's actual size is known, so this stage resolves the SAME `kBodyCapTable`/`resolve_body_cap` the pre-routing gate uses (no forked table) and, if the now-fully-read body is over the class's cap, refuses with the same `413` A4/SCIM envelope shape and the same 1-in-100 per-reason log throttle as the pre-routing gate (tagged `[#2407 post-read]` in the journal rather than `[#2407]`). The rejection reason is a new value, `over_cap_post_read`, on `yuzu_body_cap_rejected_total{path_class,reason}` — pre-seeded at 0 for every class, unconditionally, unlike `unmeasurable`; see `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for the full description.
+
+**What an operator observes.** A chunked (or otherwise undeclared) body that exceeds its route class's cap is now refused — where it previously reached the route handler uncapped, bounded only by httplib's 100 MiB backstop. That is the change: the 24-of-25-class gap the pre-routing gate leaves open is now closed for a body that turns out, once read, to be over cap.
+
+**The two stages are mutually exclusive per request, not stacked.** httplib's `routing()` returns as soon as the pre-routing handler answers Handled, so it never calls `dispatch_request` for a request that gate already refused — a **measurable** over-cap body (a declared `Content-Length` above the cap) is still rejected by the pre-routing gate, before anything is buffered, exactly as before this stage existed. Do not describe this as "the cap now runs twice" — in practice `over_cap_post_read` fires almost exclusively for the chunked/unmeasurable case the pre-routing gate deliberately admits.
+
+**Limitations — read before relying on this as complete coverage:**
+
+- **Multipart is not covered.** httplib only appends to `req.body` on the non-multipart branch of `read_content` (`httplib.h:11002` swaps the receiver for the multipart parser once it detects a multipart body) — so `req.body.size()` reads 0 for ANY multipart request, regardless of the real bytes read off the wire. **No multipart class is covered** — stated as a rule rather than a list, because an earlier draft of this text enumerated a single class and was wrong: `/api/settings/updates/upload` (`ota_upload`) and `/api/settings/cert-upload` (no table entry, so the 4 MiB default) are multipart too. Their chunked-body gap is **not** closed by this stage. This is not a regression introduced here — it is exactly as exposed as it was before this stage existed — but do not read the post-read stage as having closed coverage for every class.
+- **The stage only runs when a route matched.** `set_pre_request_handler` is invoked from httplib's `dispatch_request`, which only runs once routing has matched a route — a request to a path that 404s never reaches this handler at all. It is a backstop behind the pre-routing gate for matched routes, not a second universal pre-auth gate.
+
 **Why not one global cap?** httplib's own `Server::set_payload_max_length` is a single server-wide knob shared by every route on the same listener, including the ~70 MiB live-query bundle route and the OTA agent-binary upload — a single small value would break those outright, and a single large value (httplib's 100 MiB default) leaves every small JSON/form route able to buffer up to 100 MiB from an unauthenticated caller. The table below exists so each route class gets a cap sized to what it actually needs.
 
 ### Per-class caps
@@ -6935,8 +6950,10 @@ The MCP endpoint enables AI models and automation tools to interact with Yuzu vi
 #### `GET /mcp/v1/`
 
 The MCP Streamable HTTP **SSE channel** — the server→client half of a session minted by
-`initialize`. Carries heartbeats and, on reconnect, replayed frames; producers
-(`notifications/progress`) arrive with the next 2f rung.
+`initialize`. Carries heartbeats, replayed frames on reconnect, and
+`notifications/progress` frames for any `POST /mcp/v1/` call on this session that
+requested progress tracking and isn't being delivered as a streamed POST instead (see
+below).
 
 **Permission:** the same credential as `POST /mcp/v1/`, plus the session's
 `Mcp-Session-Id` header. The credential is re-checked once per tick (~3 s), whether or
@@ -7100,6 +7117,54 @@ The first three gate `GuaranteedState:Read` and are not audited (cohort posture)
 |---|---|
 | `--mcp-disable` | Reject all `/mcp/v1/` requests |
 | `--mcp-read-only` | Allow only read-only tools regardless of token tier |
+
+**Streamed responses (progress tracking).** A `tools/call` for `execute_instruction`
+carrying `_meta.progressToken` (see `docs/user-manual/mcp.md`'s `progressToken`
+definition for the type/length contract; an out-of-spec value is silently treated as
+absent — no error, no progress) opts into progress tracking — **this requires an
+active session**: a non-empty `Mcp-Session-Id` header from a prior `initialize`. A
+`Mcp-Session-Id` that is present but invalid (unknown, expired, or another
+principal's) fails the **entire call** with `404`/`-32007` before progress tracking is
+even considered — that is a property of every non-`initialize` method on this
+endpoint, not specific to progress tracking, and is covered above under `GET /mcp/v1/`.
+The table below assumes a valid session or none at all; where progress *is* tracked,
+delivery depends on the request's `Accept` header and whether the server has
+`--mcp-enable-streamed-post` enabled (off by default):
+
+| `_meta.progressToken` | `Mcp-Session-Id` | `Accept: text/event-stream` | Server answers |
+|---|---|---|---|
+| present | sent, valid | present, streamed POST enabled | this POST response held open as an SSE stream — `notifications/progress` frames, then the JSON-RPC result last, then EOF |
+| present | sent, valid | absent, or streamed POST disabled | plain JSON now; progress frames go to the session's `GET /mcp/v1/` stream instead |
+| present | not sent | any | plain JSON, byte-identical to a call with no progress tracking |
+| absent | any | any | plain JSON, byte-identical to a call with no progress tracking |
+
+A streamed POST's response headers are `Content-Type: text/event-stream`,
+`Cache-Control: no-cache`, `X-Accel-Buffering: no` (nginx only — Envoy/HAProxy/ALB/
+Cloudflare need their own response-buffering opt-out, or the proxy will buffer the
+whole stream and the server cannot detect that the client has gone), `X-Correlation-Id`,
+and `X-Content-Type-Options: nosniff`. **Capacity** denials reuse `-32012` / HTTP `429`
+— the same code and `retry_after_ms`/`Retry-After` A4 shape as the `GET` channel above,
+but a longer fixed value (30s vs. the `GET` channel's 5s: none of these causes is
+likely to clear within a second or two) and a distinct set of causes (a shared
+cross-surface budget, this principal's own streamed-call allowance, a server-wide
+capacity ceiling, or this session's own slots). A duplicate request id or an unknown
+session get their own codes (`409`/`-32600`, `404`/`-32007`) instead — see
+`docs/user-manual/mcp.md` "`-32012`: Stream limit reached" for the full cause-by-cause
+remediation, and `docs/mcp-server.md` "Streamed POST — SSE on the response" for the
+admission/refusal table, close reasons, and resume/recovery rules. A denial
+caused by the server disabling/shutting down streaming, or an allocation failure,
+degrades silently to the plain (non-streamed) response instead of erroring — see the
+same admission table for which causes degrade vs. answer. Every session open, close,
+and denial is recorded in the audit log under `mcp.session.open` / `mcp.session.close`
+/ `mcp.session.reject` (`target_type = McpSession`) — see `docs/user-manual/mcp.md`
+"Audit". Progress is best-effort regardless of delivery mode: admission (the same
+`reserve()` call this table describes) runs whether or not the request is a streamed
+POST, but only the streamed-POST arm answers a capacity rejection with an explicit
+`429` — the identical causes silently degrade to a plain response, with no progress
+delivered anywhere and no error surfaced, when progress is being delivered on the
+`GET` channel instead (streamed POST not requested, or not enabled). A caller must
+therefore still be prepared to poll (`query_responses` / `get_execution_status`)
+regardless of which delivery mode it used.
 
 ---
 

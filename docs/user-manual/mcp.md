@@ -461,7 +461,7 @@ for the tool to execute.
 | 58 | `revoke_engine_principal` | Terminally revoke an engine principal: revokes every active credential first, then flips `lifecycle_state` to revoked. TERMINAL and irreversible — a false-positive response mints a successor principal instead. Mirrors `DELETE /api/v1/engine-principals/{id}`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
 | 59 | `mint_engine_credential` | Mint the FIRST credential for an engine principal (minted credential is hard-locked to MCP tier `readonly`, 90-day ceiling — design doc §7/§8). Returns the raw credential value exactly once; use `rotate_engine_credential` once a credential already exists (a second mint call errors). Mirrors `POST /api/v1/engine-principals/{id}/credentials`. Destructive — live credential issuance; requires the `supervised` tier (approval-gated). | `Security:Write` |
 | 60 | `rotate_engine_credential` | Rotate an engine principal's credential via the overlap-pair workflow (design doc §7): mints a successor (both credentials valid during a default/minimum 7-day overlap, 24h floor — rejected outright, never truncated, below it), auto-revokes the predecessor at window end. BOUNDED-IDEMPOTENT: a re-call within a short grace window after the original mint re-serves the SAME successor secret (each reveal, original or replay, is independently audited as `engine_principal.credential.reveal`); once the grace window lapses a re-call errors. Mirrors `POST /api/v1/engine-principals/{id}/credentials/rotate`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
-| 61 | `confirm_engine_rotation` | Explicit maker-checker confirmation that a rotation's successor secret has been received/installed by its consumer. Distinct from `rotate_engine_credential` itself — rotate is the "here is the secret" reveal step; confirm is a separate attestation that closes the loop. **Requires the successor `token_id` the rotate call returned** — the confirm is pinned to that exact rotation, and a stale or mismatched id is rejected with no state change (#2384), so a blind retry can never confirm a later rotation. A confirm replayed **after its own rotation resolved** returns a *terminal* already-confirmed/already-resolved conflict (`kInvalidParams`), never a retryable error, so a client honouring `idempotentHint` stops instead of looping (#2404); an exact supervised replay carrying the same consumed `approval_id` is denied even earlier at the approval gate. Mirrors `POST /api/v1/engine-principals/{id}/credentials/confirm`. Requires the `supervised` tier (approval-gated). | `Security:Write` |
+| 61 | `confirm_engine_rotation` | Explicit maker-checker confirmation that a rotation's successor secret has been received/installed by its consumer. Distinct from `rotate_engine_credential` itself — rotate is the "here is the secret" reveal step; confirm is a separate attestation that closes the loop. **Requires the successor `token_id` the rotate call returned** — the confirm is pinned to that exact rotation, and a stale or mismatched id is rejected with no state change (#2384), so a blind retry can never confirm a later rotation. A confirm replayed **after its own rotation resolved** returns a *terminal* already-confirmed/already-resolved conflict (`kInvalidParams`), never a retryable error, so a client honouring `idempotentHint` stops instead of looping (#2404). The approval gate applies two independent checks before this logic runs (#2443): an exact replay of an already-consumed `approval_id` is denied ("approval already used"); and separately, a never-consumed, still-valid `approval_id` can also be denied if the rotation's state moved on since the ticket was minted — that denial leaves the ticket **unconsumed and recallable**, with a distinct message pointing the caller at `get_engine_principal` for the rotation's current state. Mirrors `POST /api/v1/engine-principals/{id}/credentials/confirm`. Requires the `supervised` tier (approval-gated). | `Security:Write` |
 | 62 | `transfer_engine_principal_owner` | Reassign an engine principal's named responsible owner. Admin-forced — independent of the outgoing owner's cooperation. `new_owner` is FK-validated against the user store. Mirrors `POST /api/v1/engine-principals/{id}/transfer-owner`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
 | 63 | `audit_engine_no_admin` | Auditor-runnable proof that "no admin, ever" and "no all-permissions toggle" hold for every engine principal — joins `principal_type=engine` against each principal's resolved role assignments AND effective permissions, and reports any violating row (literal admin/system role, or a full securable × operation wildcard grant). A `503`/internal-error result means the RBAC reference data needed to compute the wildcard bound could not be resolved — treat as "unable to verify," never as "clean." Mirrors `GET /api/v1/engine-principals/audit/no-admin` exactly (same checks — the two auditors must never diverge). | `AuditLog:Read` |
 | 64 | `export_access_review` (SOC 2 CC6.2) | Stateless cross-principal grant export — every user/group/engine-principal's **direct** role grants right now, with `effective_permission_count`, last activity, `classification`, `lifecycle_state`, and `source` (provenance). Mirrors `GET /api/v1/access-reviews/export` exactly, JSON only (the REST twin's `?format=csv` has no MCP equivalent — use the REST endpoint directly for a CSV download). Deliberately gated on a **global** `AccessReview:Read`, not a management-group-confined read — a scoped slice would be useless as fleet-wide CC6.2 evidence (#2225). Self-audited as `access_review.exported`. | `AccessReview:Read` |
@@ -1282,6 +1282,15 @@ replay — which is exactly what this response refuses to make, and `/metrics`
 is not a stronger reader than the caller — so alert on the refusal rate and
 read the audit trail for the kind.
 
+If a store fault happens to coincide with this exact check — the recall's
+lookup step, or the consume step's own cross-surface origin comparison — a
+foreign-origin ticket cannot be told apart from an innocent one for the
+duration of the fault, and the refusal comes back as `-32603` (below), not
+this `-32003`. `yuzu_mcp_approval_masked_denials_total` counts those refusals
+specifically, and the audit row carries a `(lookup)` or `(origin unverified)`
+suffix, so the event is not silently indistinguishable from ordinary store
+contention.
+
 **Fix**: For an RBAC denial — grant the permission to the token creator's
 principal, or use an account with the required permissions. For a ticket recall —
 submit the call **without** `approval_id` to obtain a fresh approval ticket, then
@@ -1307,16 +1316,16 @@ ticket's remaining window ends with it expired like any other.
 **Fix**: Check `retry_after_ms` in the response body — two distinct bodies
 share this code:
 
-- **`retry_after_ms` is a number (currently 5000)**: the store is open but the
-  read or write failed, most likely transiently. Retry after the hint.
-  Retrying indefinitely is not safe, and this body alone cannot tell you when
-  to stop: a store that is open but failing permanently (corruption,
-  read-only, disk full) still takes this arm and will honour a client that
-  retries forever. Bound your own retries — a handful of attempts, then
-  escalate to an operator. Distinguishing that case from a genuinely
-  transient one is a follow-up change.
-- **`retry_after_ms` is `null`**: the store never opened. This will not clear
-  on retry; escalate to an operator immediately.
+- **`retry_after_ms` is a number (currently 5000)**: the store is open and the
+  read or write failure is classified transient — retry after the hint.
+  Retrying indefinitely is still not unconditionally safe (an operator-side
+  escalation is always a reasonable backstop), but this body no longer
+  conflates "failing right now" with "failing permanently": a store that is
+  open but failing in a way an unchanged retry cannot clear (corruption,
+  not-a-database, read-only, disk full) takes the other arm below instead.
+- **`retry_after_ms` is `null`**: either the store never opened, or it is open
+  but failing permanently (corruption, not-a-database, read-only, disk full).
+  Neither will clear on retry; escalate to an operator immediately.
 
 Do **not** re-submit without `approval_id` while the approval
 window is still open: the ticket was not consumed, and minting a fresh one asks

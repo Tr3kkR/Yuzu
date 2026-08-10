@@ -30,6 +30,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <set>
 #include <string>
 #include <string_view>
@@ -372,6 +373,21 @@ struct UnifiedBodyCapTestServer {
     std::thread server_thread;
     int port{0};
     std::atomic<int> handler_calls{0};
+    // body-cap-post-read-stage (#2898-aware): counts every invocation of the
+    // fixture's `set_pre_request_handler` below, admitted or refused. Used
+    // to prove ORDERING against the pre-routing stage — a request the
+    // pre-routing handler already refused never reaches `dispatch_request`
+    // at all (httplib's routing() returns as soon as pre-routing answers
+    // Handled), so this stays 0 for a pre-routing rejection and >=1 for
+    // anything that reaches the second stage.
+    std::atomic<int> post_read_calls{0};
+    // Mirrors server.cpp's ONE metrics-counter increment per post-read
+    // rejection (this fixture has no real `metrics_` object to assert
+    // against — see this file's header comment on what the fixture
+    // deliberately does not reproduce). Used only to prove "increments once
+    // per rejection, never twice for the one request" within the fixture's
+    // own model, not as a stand-in for exercising the production Counter.
+    std::atomic<int> post_read_rejections{0};
 
     void start() {
         auto ok_handler = [this](const httplib::Request&, httplib::Response& res) {
@@ -383,6 +399,10 @@ struct UnifiedBodyCapTestServer {
         svr.Get("/health", ok_handler);
         svr.Post("/health", ok_handler);
         svr.Post("/mcp/v1/", ok_handler);
+        // A small-cap (256 KiB), requires_measurable=false class — used by
+        // the post-read-stage tests below so a genuine chunked over-cap body
+        // stays cheap to send in a test.
+        svr.Post("/api/v1/ca/import-chain", ok_handler);
 
         svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res)
                                         -> httplib::Server::HandlerResponse {
@@ -427,6 +447,29 @@ struct UnifiedBodyCapTestServer {
             // AFTER the cap check above ran unconditionally (D3).
             return httplib::Server::HandlerResponse::Unhandled;
         });
+
+        // body-cap-post-read-stage — GENUINELY WIRED into this fixture the
+        // same way server.cpp wires it (issue #2898: earlier versions of
+        // this fixture only reproduced the pre-routing decision with pure
+        // functions, which meant a test against the fixture could never
+        // observe a defect in server.cpp's real `set_pre_request_handler`).
+        // Real httplib::Server here means `req.body` is genuinely populated
+        // by httplib's own `read_content` before this fires — including for
+        // a real chunked-Transfer-Encoding request the pre-routing handler
+        // above admitted unmeasured, which is the whole point of this
+        // stage.
+        svr.set_pre_request_handler([this](const httplib::Request& req, httplib::Response& res)
+                                        -> httplib::Server::HandlerResponse {
+            post_read_calls.fetch_add(1);
+            const auto cap_match = resolve_body_cap(req.method, req.path);
+            if (req.body.size() <= cap_match.max_body_bytes) {
+                return httplib::Server::HandlerResponse::Unhandled;
+            }
+            post_read_rejections.fetch_add(1);
+            res.status = 413;
+            return httplib::Server::HandlerResponse::Handled;
+        });
+
         port = svr.bind_to_any_port("127.0.0.1");
         REQUIRE(port > 0);
         server_thread = std::thread([this]() { svr.listen_after_bind(); });
@@ -482,6 +525,58 @@ std::string raw_request_status_line(int port, const std::string& request_head) {
     INFO("recv returned " << n << " bytes: " << std::string(buf, n > 0 ? n : 0));
     REQUIRE(n > 0);
     return std::string(buf, static_cast<size_t>(n));
+}
+
+/// Send a raw request and ACTUALLY WRITE the whole thing — unlike
+/// `raw_request_status_line` above, which deliberately never sends the body
+/// it declares. Needed for the post-read-stage tests: those need httplib to
+/// genuinely finish `read_content` and populate `req.body` before this
+/// stage's decision can be exercised at all, so the (chunked-framed) body
+/// must actually be sent, not just declared. Loops on `::send` — a single
+/// blocking call is not guaranteed to enqueue a several-hundred-KiB payload
+/// in one syscall.
+std::string raw_request_status_line_send_all(int port, const std::string& request) {
+    struct Fd {
+        int v;
+        explicit Fd(int f) : v(f) {}
+        ~Fd() {
+            if (v >= 0)
+                ::close(v);
+        }
+        Fd(const Fd&) = delete;
+        Fd& operator=(const Fd&) = delete;
+    } sock{::socket(AF_INET, SOCK_STREAM, 0)};
+    REQUIRE(sock.v >= 0);
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE(::connect(sock.v, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+
+    timeval tv{};
+    tv.tv_sec = 10;
+    REQUIRE(::setsockopt(sock.v, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0);
+
+    std::size_t sent = 0;
+    while (sent < request.size()) {
+        const ssize_t n = ::send(sock.v, request.data() + sent, request.size() - sent, 0);
+        REQUIRE(n > 0);
+        sent += static_cast<std::size_t>(n);
+    }
+
+    char buf[256] = {};
+    const ssize_t n = ::recv(sock.v, buf, sizeof(buf) - 1, 0);
+    INFO("recv returned " << n << " bytes: " << std::string(buf, n > 0 ? n : 0));
+    REQUIRE(n > 0);
+    return std::string(buf, static_cast<size_t>(n));
+}
+
+/// A genuine (real bytes, no Content-Length) chunked-encoded body of exactly
+/// `total` bytes, as one HTTP chunk plus the terminating zero-length chunk.
+std::string chunked_encode(std::size_t total) {
+    const std::string data(total, 'x');
+    return std::format("{:x}\r\n", total) + data + "\r\n0\r\n\r\n";
 }
 #endif // !_WIN32
 
@@ -814,6 +909,96 @@ TEST_CASE("Pre-routing body cap: duplicate Content-Length headers cannot desync 
     INFO("response: " << resp);
     CHECK((refused || admitted));
     CHECK(ts.handler_calls.load() == (admitted ? 1 : 0));
+}
+#endif // !_WIN32
+
+// ── 9. Post-read body cap, second stage (body-cap-post-read-stage) ────────
+//
+// GENUINELY WIRED into `UnifiedBodyCapTestServer` (see that fixture's
+// `set_pre_request_handler` above) — issue #2898 is the reason this needed
+// calling out explicitly: earlier body-cap fixtures in this file only
+// reproduced production's DECISION with the same pure functions
+// (`resolve_body_cap` etc.), never httplib's actual middleware wiring for
+// this stage, so a test written only against a fixture like that could not
+// have told a real server.cpp defect from a fixture defect. These cases
+// exercise the real httplib `pre_request_handler_` call site end-to-end —
+// same reasoning as section 8 above for the pre-routing stage.
+#ifndef _WIN32
+TEST_CASE("Post-read body cap: a genuine chunked body over a class's cap is rejected "
+          "after being read, not admitted uncapped",
+          "[body_cap][post_read][bounds][integration]") {
+    // /api/v1/ca/import-chain: 256 KiB cap, requires_measurable=false — the
+    // pre-routing stage admits ANY chunked body on this class unmeasured
+    // (body_cap_policy.hpp's KNOWN LIMITATION paragraph). This sends a REAL
+    // chunked body of 256 KiB + 1 byte — no Content-Length, so the
+    // pre-routing gate cannot and does not reject it — and expects the
+    // post-read stage to catch it once httplib has actually read it into
+    // `req.body`.
+    UnifiedBodyCapTestServer ts;
+    ts.start();
+
+    constexpr std::size_t kCap = 256u * 1024;
+    const std::string req = "POST /api/v1/ca/import-chain HTTP/1.1\r\n"
+                            "Host: 127.0.0.1\r\n"
+                            "Content-Type: application/octet-stream\r\n"
+                            "Transfer-Encoding: chunked\r\n\r\n" +
+                            chunked_encode(kCap + 1);
+    const auto resp = raw_request_status_line_send_all(ts.port, req);
+    CHECK(resp.starts_with("HTTP/1.1 413"));
+    // The route handler never ran — the request was refused between read
+    // and dispatch.
+    CHECK(ts.handler_calls.load() == 0);
+    // The post-read stage genuinely fired (not skipped/short-circuited) ...
+    CHECK(ts.post_read_calls.load() == 1);
+    // ... and its rejection-side effect (the counter-increment analogue)
+    // fired EXACTLY once for this one request — not zero, not twice.
+    CHECK(ts.post_read_rejections.load() == 1);
+}
+
+TEST_CASE("Post-read body cap: a genuine chunked body under a class's cap is still "
+          "admitted",
+          "[body_cap][post_read][bounds][integration]") {
+    // Same class, same framing, comfortably under the 256 KiB cap — proves
+    // this stage is a CAP, not a blanket refusal of every chunked body.
+    UnifiedBodyCapTestServer ts;
+    ts.start();
+
+    const std::string req = "POST /api/v1/ca/import-chain HTTP/1.1\r\n"
+                            "Host: 127.0.0.1\r\n"
+                            "Content-Type: application/octet-stream\r\n"
+                            "Transfer-Encoding: chunked\r\n\r\n" +
+                            chunked_encode(1024);
+    const auto resp = raw_request_status_line_send_all(ts.port, req);
+    CHECK(resp.starts_with("HTTP/1.1 200"));
+    CHECK(ts.handler_calls.load() == 1);
+    CHECK(ts.post_read_calls.load() == 1);
+    CHECK(ts.post_read_rejections.load() == 0);
+}
+
+TEST_CASE("Post-read body cap: a MEASURABLE over-cap body is still caught by the "
+          "earlier pre-routing stage, never reaching the post-read stage",
+          "[body_cap][post_read][bounds][integration]") {
+    // Same class (256 KiB cap) as the two cases above, but this time the
+    // body is declared via Content-Length (never actually sent — the
+    // pre-routing gate must refuse before any of it is read, same
+    // declare-without-send technique as section 8's D2/D3 cases). Proves
+    // the ORDERING claim from the brief: for a body the pre-routing stage
+    // CAN size, it is the one that rejects — this second stage never even
+    // runs (httplib's routing() returns as soon as pre-routing answers
+    // Handled, without ever calling dispatch_request).
+    UnifiedBodyCapTestServer ts;
+    ts.start();
+
+    const std::string req = "POST /api/v1/ca/import-chain HTTP/1.1\r\n"
+                            "Host: 127.0.0.1\r\n"
+                            "Content-Length: 8388608\r\n\r\n"; // 8 MiB, never sent
+    const auto resp = raw_request_status_line(ts.port, req);
+    CHECK(resp.starts_with("HTTP/1.1 413"));
+    CHECK(ts.handler_calls.load() == 0);
+    // The load-bearing assertion for this test: the post-read stage was
+    // never even invoked for this request.
+    CHECK(ts.post_read_calls.load() == 0);
+    CHECK(ts.post_read_rejections.load() == 0);
 }
 #endif // !_WIN32
 

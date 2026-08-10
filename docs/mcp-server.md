@@ -82,7 +82,13 @@ JSON-RPC error responses from the denial paths (read-only mode, tier policy, app
 > lets the call through to the handler. A recall against a still-**pending**
 > ticket returns the same `kApprovalRequired` envelope (keep polling
 > `status_url`); a rejected/expired/mismatched/consumed ticket returns
-> `kPermissionDenied` (-32003). This generic gate governs every approval-gated
+> `kPermissionDenied` (-32003). `confirm_engine_rotation`'s recall additionally
+> runs a pre-consume precondition (#2443) that rechecks live rotation state
+> before consuming the ticket; a precondition failure also returns
+> `kPermissionDenied` (-32003) but with a distinct, deliberately generic
+> message ("approval cannot be redeemed right now...") and — unlike the four
+> causes above — leaves the ticket UNCONSUMED and still recallable. This
+> generic gate governs every approval-gated
 > tool — the supervised tier's `execute_instruction` / `revoke_certificate` /
 > `execute_bundle`, plus `delete_tag` (operator + supervised) and
 > `quarantine_device` (supervised). **Degraded path:** if the server has no
@@ -243,8 +249,9 @@ A streamed POST holds an HTTP worker open for its lifetime, so it leases from th
 
 | Condition | Status | JSON-RPC error | Retry? |
 |---|---|---|---|
-| per-principal or global stream cap | 429 | `-32012` | yes — `Retry-After` + `retry_after_ms` (30s: a streamed slot is held until the work finishes, so the GET figure would just cause a retry storm) |
-| this session's streamed-call cap | 429 | `-32012` | yes — retry. Admission first reclaims a slot from an undelivered final (#2740), so a retry can succeed before any call finishes. A refusal that survives that means either every slot is a call genuinely in flight ("wait for one to finish" is then true) or the reclaim found nothing takeable — see "A pin released to admit a new call" above |
+| per-principal or global stream cap (pre-admission `StreamBudget`, `reason=post_per_principal_cap`/`post_global_cap`) | 429 | `-32012` | yes — `Retry-After` + `retry_after_ms` (30s: a streamed slot is held until the work finishes, so the GET figure would just cause a retry storm) |
+| server-wide bridge record cap (`reserve()`'s own `global_record_cap`, Decision 15(d) — bounded in-memory state; distinct check from the pre-admission budget above, `reason=post_record_cap`; **fixed at 256, not currently operator-configurable by any flag or env var** — unlike the row above, there is no dial to raise; a sustained condition shows as `yuzu_mcp_bridge_records_active` approaching 256) | 429 | `-32012` | yes — `Retry-After` + `retry_after_ms` (30s, same as the row above); or retry without an SSE `Accept` for a plain response |
+| this session's streamed-call cap (`reason=post_pin_slots`) | 429 | `-32012` | yes — retry. Admission first reclaims a slot from an undelivered final (#2740), so a retry can succeed before any call finishes. A refusal that survives that means either every slot is a call genuinely in flight ("wait for one to finish" is then true) or the reclaim found nothing takeable — see "A pin released to admit a new call" above |
 | request id already in flight | 409 | `-32600` | no — use a fresh id |
 | session unknown or expired | 404 | `-32007` | re-`initialize` |
 | streaming disabled / shutting down | 200 | — | none needed; you get the plain response |
