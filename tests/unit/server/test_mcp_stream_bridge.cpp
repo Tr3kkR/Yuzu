@@ -4333,6 +4333,7 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
             double raced{};
             double failed{};
             double displaced{};
+            double ring_displaced{};
             std::size_t audits{};
             std::size_t still_pinned{};
         };
@@ -4365,6 +4366,12 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
         out.failed = fx.reg.counter("yuzu_mcp_bridge_pin_release_failed_total").value();
         out.displaced =
             fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value();
+        // The RING's own LRU-eviction counter (mcp_stream.cpp) — a distinct metric
+        // from the bridge-level admission-reclaim one above, despite the similar
+        // name. This residual selects a pin for the ADMISSION side only; it must
+        // never touch the ring's own eviction bookkeeping (#2795's acceptance
+        // criteria named this explicitly).
+        out.ring_displaced = fx.reg.counter("yuzu_mcp_stream_pin_displaced_total").value();
         out.audits = fx.audit_count("mcp.bridge.pin_displaced_for_admission");
         // POSITIVELY confirm the over-admission rather than inferring it from the absence
         // of the displaced counter: the pin the reclaim selected is still HELD, so the
@@ -4383,6 +4390,7 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
         // Not credited as a displacement, and not audited: no exemption was released by
         // us, so attributing that loss to the admitting principal would be a false record.
         CHECK(out.displaced == 0.0);
+        CHECK(out.ring_displaced == 0.0);  // the ring's own LRU eviction never fires either
         CHECK(out.audits == 0);
         CHECK(out.still_pinned == 4);  // the pin was NOT released - the session is over cap
     }
@@ -4393,6 +4401,7 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
         CHECK(out.failed == 1.0);
         CHECK(out.raced == 0.0);  // the two arms are distinct, not aliases
         CHECK(out.displaced == 0.0);
+        CHECK(out.ring_displaced == 0.0);
         CHECK(out.audits == 0);
         CHECK(out.still_pinned == 4);  // the pin was NOT released - the session is over cap
     }
