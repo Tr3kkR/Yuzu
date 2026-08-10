@@ -3,6 +3,7 @@
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
+#include "mcp_approval_error.hpp" // shared approval-store failure body (#2786)
 #include "mcp_input_schema.hpp" // input-schema subset compiler (#2405 C8 pre-approval gate)
 #include "mcp_jsonrpc.hpp"
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
@@ -3315,7 +3316,33 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
 
                     // Recall path → validate the supplied ticket.
-                    auto appr = approval_manager->get(supplied_id);
+                    // get_checked, NOT get: a store read that FAILED is not a
+                    // read that found nothing. `get` collapsed the two, so a
+                    // transient SQLite failure here read as "no such ticket"
+                    // and the branch below told the caller to submit a fresh
+                    // request, discarding a live human-approved capability on
+                    // a failure a retry may clear. Same burn class the
+                    // consume-side guard below closes, on the same request
+                    // path, reached FIRST.
+                    auto appr_read = approval_manager->get_checked(supplied_id);
+                    if (!appr_read) {
+                        count_denial("yuzu_mcp_approval_refused_total", nullptr);
+                        // A lookup-rung fault means the origin check two rungs
+                        // down never gets a chance to run either — the forgery
+                        // signal is masked here just as surely as at the
+                        // consume rung's own read (#2786 arm 1).
+                        count_denial("yuzu_mcp_approval_masked_denials_total", nullptr);
+                        mcp_audit("denied",
+                                  "approval_id=" + supplied_id + " refused: " +
+                                      consume_denial_reason(ConsumeFailure::kStoreError) +
+                                      " (lookup)");
+                        res.set_content(approval_store_error_body(
+                                            *approval_manager, a4_error,
+                                            appr_read.error().extended_errcode),
+                                        "application/json");
+                        return;
+                    }
+                    auto appr = std::move(*appr_read);
                     if (!appr || appr->definition_id != definition_id ||
                         appr->scope_expression != canon) {
                         // Absent, or for a different tool / different arguments.
@@ -3373,9 +3400,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         // and its write unchecked, so nothing can alert on it.
                         // The counter gives an operator a refusal RATE.
                         //
-                        // It deliberately carries NO reason label. The denial
-                        // token is exactly the distinction the client response
-                        // below refuses to make, and `/metrics` is not a
+                        // It deliberately carries NO reason label. A store
+                        // failure is already exposed via the response code
+                        // (-32603 vs -32003); what the audit token carries
+                        // and this counter withholds is the split WITHIN a
+                        // -32003 denial - foreign_origin vs an ordinary
+                        // replay - which is the distinction the client
+                        // response below refuses to make. `/metrics` is not a
                         // stronger reader than the caller: it is exempt for
                         // localhost and otherwise needs only a resolved
                         // session — the same credential the MCP caller already
@@ -3386,8 +3417,23 @@ McpServer::HandlerFn McpServer::build_handler(
                         // The kind stays in the audit trail, which is genuinely
                         // server-side.
                         count_denial("yuzu_mcp_approval_refused_total", nullptr);
-                        mcp_audit("denied", "approval_id=" + supplied_id +
-                                                " refused: " + consume_denial_reason(kind));
+                        // #2786 arm 1: when the ORIGIN check's own read is what
+                        // faulted, the comparison never ran, so a foreign-origin
+                        // ticket is exactly as likely to be behind this refusal
+                        // as an innocent one — the forgery signal would
+                        // otherwise be lost to a plain "store_error". The
+                        // masked counter (no reason label, same anti-oracle
+                        // rationale below) and the audit suffix are the
+                        // caller-visible half of that signal; ApprovalManager's
+                        // own warn log is the caller-independent half.
+                        if (consumed.error().origin_check_unevaluated)
+                            count_denial("yuzu_mcp_approval_masked_denials_total", nullptr);
+                        mcp_audit("denied",
+                                  "approval_id=" + supplied_id +
+                                      " refused: " + consume_denial_reason(kind) +
+                                      (consumed.error().origin_check_unevaluated
+                                           ? " (origin unverified)"
+                                           : ""));
 
                         // CLIENT message stays uniform for the two that must not
                         // be distinguishable: a foreign-origin refusal reads
@@ -3397,59 +3443,28 @@ McpServer::HandlerFn McpServer::build_handler(
                         // kStoreError is NOT one of those. It leaves the ticket
                         // UNTOUCHED, so telling the caller it was "already used"
                         // and to fetch a fresh one would burn a live human
-                        // approval on a failure a retry may clear.
+                        // approval on a failure a retry may clear. The shared
+                        // body below (also used by rung 1's lookup failure,
+                        // above) carries this remediation and the conditional
+                        // retry directive A5 requires.
                         //
-                        // The remediation says "not consumed", which is always
-                        // true, rather than "still valid", which is not: the
-                        // 7-day TTL keeps running through an outage, so an
-                        // outage outlasting the ticket's remaining window ends
-                        // with it expired. Promising validity and then refusing
-                        // the ticket would leave the caller waiting on a
-                        // capability that had been retired underneath them.
+                        // The `!is_open()` arm inside that shared body is
+                        // defence in depth here, NOT the live discriminator for
+                        // a closed store: rung 1's lookup is `get_checked` now,
+                        // so a closed store is refused there and never reaches
+                        // this line. It is kept because it costs nothing and
+                        // stops THIS site becoming the fail-open one if rung 1's
+                        // lookup ever changes.
                         //
-                        // The retry directive is CONDITIONAL, and the condition
-                        // is the point. A5 wants a retry hint to be machine
-                        // metadata rather than prose, and omitting it emits
-                        // null, which this file's convention reads as NOT
-                        // retryable — so a transient failure must carry one.
-                        //
-                        // `kStoreError` also covers the store never having
-                        // opened, and telling a client to retry every 5s a
-                        // condition that cannot clear is an unbounded loop that
-                        // writes an audit row per attempt.
-                        //
-                        // The `!is_open()` arm below is DEFENCE IN DEPTH, not a
-                        // live discriminator, and saying otherwise was wrong:
-                        // a closed store cannot reach this line today. The
-                        // lookup above uses `get()`, which collapses a failed
-                        // read to "no row", so a closed store returns -32003
-                        // there and consume is never called. The arm is kept
-                        // because it costs one branch and stops this site
-                        // becoming the fail-open one if that lookup changes.
-                        //
-                        // What is NOT covered either way: an OPEN handle whose
-                        // reads fail permanently — CORRUPT, NOTADB, READONLY,
-                        // FULL — takes the retry arm and is told to retry
-                        // forever. That is the real gap, it needs
-                        // sqlite3_extended_errcode carried on ConsumeError,
-                        // and it is not closed here.
+                        // An OPEN handle whose reads fail permanently — CORRUPT,
+                        // NOTADB, READONLY, FULL — is classified by the shared
+                        // body via `extended_errcode` (#2786 "PR 1c") rather
+                        // than taking the transient "retry forever" arm.
                         if (kind == ConsumeFailure::kStoreError) {
-                            const bool open = approval_manager->is_open();
-                            res.set_content(
-                                open ? a4_error(kInternalError,
-                                                "approval store temporarily unavailable",
-                                                "retry this call unchanged — the approval was NOT "
-                                                "consumed, so do not request a fresh one. The "
-                                                "7-day approval window keeps running during an "
-                                                "outage: if it elapses the ticket expires and a "
-                                                "new approval is required",
-                                                5000)
-                                     : a4_error(kInternalError, "approval store unavailable",
-                                                "this will NOT clear on retry — the approval was "
-                                                "NOT consumed and does not need re-requesting "
-                                                "while the 7-day window holds. Escalate to an "
-                                                "operator"),
-                                "application/json");
+                            res.set_content(approval_store_error_body(
+                                                *approval_manager, a4_error,
+                                                consumed.error().extended_errcode),
+                                            "application/json");
                             return;
                         }
                         res.set_content(
@@ -3771,14 +3786,24 @@ McpServer::HandlerFn McpServer::build_handler(
                 // freshly minted by execute_instruction on this server cannot
                 // have pre-PR-2 untagged rows, so a fallback would only risk
                 // folding in another execution's responses.
-                auto responses = !exec_id.empty() ? response_store->query_by_execution(exec_id, rq)
-                                                   : response_store->query(instr_id, rq);
+                auto responses_opt = !exec_id.empty()
+                                         ? response_store->query_by_execution(exec_id, rq)
+                                         : response_store->query(instr_id, rq);
                 // Audit target is the primary correlation key actually used:
                 // execution_id when present (the exact-correlation path), else
                 // instruction_id. When both are supplied execution_id wins, so
                 // a dual-id call is recorded under the execution_id it served —
                 // deliberate (execution_id is the agentic-dispatch unit).
                 const std::string& key = !exec_id.empty() ? exec_id : instr_id;
+                if (!responses_opt) {
+                    mcp_audit("failure", "store degraded; " + key);
+                    res.set_content(
+                        a4_error(kInternalError, "Response store degraded — query failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                auto responses = std::move(*responses_opt);
 
                 // Did the raw query hit the row cap BEFORE scope filtering? If so the
                 // result is incomplete (more rows exist past the LIMIT). Capture this
@@ -4026,6 +4051,20 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto instr_id = param_str(args, "instruction_id");
                 AggregationQuery aq;
                 aq.group_by = param_str(args, "group_by");
+                // Validate against aggregate()'s own allow-list BEFORE calling
+                // in (#2691, Doomgoose finding #2): an allow-list miss inside
+                // aggregate() returns nullopt, which this handler otherwise
+                // maps unconditionally to kInternalError below — a typo'd
+                // group_by would read as store degradation for a healthy
+                // database. Bad client input is kInvalidParams, not
+                // kInternalError.
+                if (std::find(ResponseStore::allowed_group_by().begin(),
+                              ResponseStore::allowed_group_by().end(),
+                              aq.group_by) == ResponseStore::allowed_group_by().end()) {
+                    res.set_content(error_response(id, kInvalidParams, "invalid group_by"),
+                                    "application/json");
+                    return;
+                }
                 auto agg_str = param_str(args, "aggregate", "count");
                 if (agg_str == "sum")
                     aq.op = AggregateOp::Sum;
@@ -4065,8 +4104,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         // #1634 sre review). Audit the degraded access for CC7.2 parity.
                         mcp_audit("failure", "store degraded; " + instr_id);
                         res.set_content(
-                            error_response(id, kInternalError,
-                                           "Response store degraded — aggregate failed"),
+                            a4_error(kInternalError,
+                                     "Response store degraded — aggregate failed", {},
+                                     /*retry_after_ms=*/5000),
                             "application/json");
                         return;
                     }
@@ -4082,7 +4122,17 @@ McpServer::HandlerFn McpServer::build_handler(
                         agg_scope = std::move(in_scope);
                 }
 
-                auto results = response_store->aggregate(instr_id, aq, {}, agg_scope);
+                auto results_opt = response_store->aggregate(instr_id, aq, {}, agg_scope);
+                if (!results_opt) {
+                    mcp_audit("failure", "store degraded; " + instr_id);
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "Response store degraded — aggregate failed", {},
+                                 /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
+                const auto& results = *results_opt;
                 JArr arr;
                 for (const auto& r : results) {
                     arr.add(JObj()
@@ -7359,6 +7409,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 const bool is_admin = session->role == auth::Role::admin;
                 auto agg = bundle_orch->collate(bundle_id, session->username, is_admin);
                 if (!agg) {
+                    // #2691 (Doomgoose finding #3): kDegraded is a real store
+                    // read failure on a bundle that WAS found and owned — a
+                    // retryable kInternalError, never the same terminal
+                    // "not found" (or false "denied" audit row) a genuinely-
+                    // absent/not-owned bundle gets.
+                    if (agg.error() == CollateError::kDegraded) {
+                        mcp_audit("failure", "response store degraded: " + bundle_id);
+                        res.set_content(
+                            a4_error(kInternalError, "Response store degraded", {},
+                                     /*retry_after_ms=*/5000),
+                            "application/json");
+                        return;
+                    }
                     mcp_audit("denied", "not found or not owned: " + bundle_id);
                     res.set_content(error_response(id, kInvalidParams, "bundle not found"),
                                     "application/json");

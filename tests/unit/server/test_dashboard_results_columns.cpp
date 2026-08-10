@@ -29,13 +29,29 @@
 
 #include "dashboard_routes.hpp"
 #include "instruction_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "response_store.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
 
 namespace yuzu::server {
+
+using yuzu::server::pg::PgPool;
+
+namespace {
+// ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
+// "responsestore" template key with test_response_store.cpp (identical setup).
+yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("responsestore template: store failed to migrate");
+}};
+} // namespace
 
 // Test-only accessor for the private schema-aware column resolution +
 // render_results, and their store inputs (PR1.7 remediation, Gate 3).
@@ -51,6 +67,9 @@ struct DashboardResultsColumnsTestAccess {
         return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
                                      /*filters=*/{}, /*text_query=*/"", definition_id);
+    }
+    std::string render_filter_bar(const std::string& command_id, const std::string& plugin) {
+        return routes.render_filter_bar(command_id, plugin);
     }
 };
 
@@ -111,14 +130,16 @@ std::size_t count_occurrences(const std::string& hay, std::string_view needle) {
 
 TEST_CASE("render_results: a schema-only definition (no visualization) resolves "
           "real columns instead of the plugin-only fallback (PR1.7 remediation)",
-          "[server][dashboard][render_results]") {
+          "[pg][server][dashboard][render_results]") {
     InstructionStore is{":memory:"};
     REQUIRE(is.is_open());
     auto created = is.create_definition(make_list_profiles_definition());
     REQUIRE(created.has_value());
     const std::string definition_id = *created;
 
-    ResponseStore rs{":memory:"};
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
     const std::string command_id = "cmd-list-profiles-1";
     rs.store(mk_list_profiles_response(command_id));
 
@@ -156,11 +177,13 @@ TEST_CASE("render_results: a schema-only definition (no visualization) resolves 
 
 TEST_CASE("render_results: no definition_id falls back to columns_for_plugin "
           "unchanged (regression pin for every other plugin/action)",
-          "[server][dashboard][render_results]") {
+          "[pg][server][dashboard][render_results]") {
     InstructionStore is{":memory:"};
     REQUIRE(is.is_open());
 
-    ResponseStore rs{":memory:"};
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
     const std::string command_id = "cmd-no-def-1";
     StoredResponse r;
     r.instruction_id = command_id;
@@ -179,6 +202,51 @@ TEST_CASE("render_results: no definition_id falls back to columns_for_plugin "
 
     CHECK(contains(html, ">Output<"));
     CHECK_FALSE(contains(html, "profile_name"));
+}
+
+// #2691 (Doomgoose finding #7): a degraded response-store read must render
+// distinguishably from a genuine zero-match answer — "No results match your
+// filters" is a false claim when the store just couldn't be read.
+TEST_CASE("render_results: a degraded store read renders the degrade banner "
+          "not \"no results match your filters\"",
+          "[server][dashboard][render_results]") {
+    InstructionStore is{":memory:"};
+    REQUIRE(is.is_open());
+
+    PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    ResponseStore bad_rs{bad_pool};
+    REQUIRE_FALSE(bad_rs.is_open());
+
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(&is, &bad_rs);
+    const std::string html = acc.render("cmd-degraded", "registry");
+
+    CHECK(contains(html, "result-degrade-banner"));
+    CHECK(contains(html, "Results unavailable"));
+    CHECK_FALSE(contains(html, "No results match your filters"));
+}
+
+// #2691 (Gate 4 consistency-auditor): the per-column filter dropdown must not
+// silently render "All" with zero options on a degraded facet_values() read —
+// indistinguishable from "this column genuinely has no other values", right
+// next to a results table that correctly banners the same degrade.
+TEST_CASE("render_filter_bar: a degraded facet read disables the dropdown "
+          "instead of rendering an empty All",
+          "[server][dashboard][render_filter_bar]") {
+    InstructionStore is{":memory:"};
+    REQUIRE(is.is_open());
+
+    PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    ResponseStore bad_rs{bad_pool};
+    REQUIRE_FALSE(bad_rs.is_open());
+
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(&is, &bad_rs);
+    const std::string html = acc.render_filter_bar("cmd-degraded", "registry");
+
+    CHECK(contains(html, "disabled"));
+    CHECK(contains(html, "(unavailable)"));
+    CHECK(contains(html, "response store degraded"));
 }
 
 } // namespace yuzu::server

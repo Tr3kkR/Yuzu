@@ -23,6 +23,7 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "body_cap_policy.hpp" // #2407: pre-auth request-body cap policy table
 #include "ca_routes.hpp"
 #include "ca_store.hpp"
 #include "default_certs.hpp"
@@ -31,6 +32,7 @@
 #include "kek_routes.hpp"
 #include "key_provider.hpp"
 #include "scim_routes.hpp"
+#include <yuzu/server/scim_json.hpp> // D7 (#2407 hardening): scim::error() for the pre-routing body-cap 4xx
 #include "x509_ca.hpp"
 #include "compliance_eval.hpp"
 #include "custom_properties_store.hpp"
@@ -321,6 +323,35 @@ using yuzu::server::audit_token;
 // their own stream lifetime via `adopt_quota_slot_into_stream`. server.cpp
 // keeps only the httplib-specific, worker-thread-affine call sites below.
 
+// -- General pre-auth body-cap chokepoint (#2407) -----------------------------
+//
+// `resolve_body_cap` (body_cap_policy.hpp) generalizes the #2437 /mcp/-only
+// gate to every request, every method, every path (D1/D2/D3 hardening —
+// governance run 2026-08). The "can this server size the body before reading
+// it" test now lives in ONE place, `body_unmeasurable` /
+// `has_non_identity_content_encoding` (web_utils.hpp) — `mcp_body_unmeasurable`
+// is a thin composition of the same two functions, so there is no longer a
+// second, hand-re-expressed copy of the rule in this file to drift against
+// it. See the pre-routing handler below for the chokepoint itself.
+//
+// `kBodyCapTable`'s `/mcp/` row (body_cap_policy.hpp) hardcodes its cap as
+// `4u * 1024 * 1024` rather than referencing `mcp::kMcpMaxRequestBodyBytes`
+// (mcp_jsonrpc.hpp) directly — body_cap_policy.hpp is a pure data table with
+// no dependency on the MCP transport headers, and pulling that dependency in
+// just for this one row would be a worse trade than a literal plus a bound
+// check. The static_assert below is that bound check: it fails the build the
+// moment the two values disagree, so the "two authorities for one property"
+// class of bug #2407 D1 fixed for the /mcp/-vs-general-table split cannot
+// reopen here as an /mcp/-table-vs-/mcp/-input-bounds split instead.
+static_assert(yuzu::server::kBodyCapTable[0].path_prefix == "/mcp/" &&
+                  yuzu::server::kBodyCapTable[0].max_body_bytes ==
+                      mcp::kMcpMaxRequestBodyBytes,
+              "kBodyCapTable's /mcp/ row (body_cap_policy.hpp) must stay bound to "
+              "mcp::kMcpMaxRequestBodyBytes (mcp_jsonrpc.hpp) — the /mcp/ row is "
+              "expected to be table index 0 and its max_body_bytes must equal that "
+              "constant exactly; if the table's row order changed, update this "
+              "assert to locate the /mcp/ row instead of assuming index 0");
+//
 // -- KEK rotation seam helpers (#2395) -----------------------------------------
 //
 // The three KekOps lambdas (register_routes call site below) all need to
@@ -583,12 +614,26 @@ public:
                           "malformed arguments or probing",
                           "counter");
         metrics_.describe("yuzu_mcp_approval_refused_total",
-                          "MCP approval-ticket recalls refused at the consume step "
-                          "(#2442): a replay, a ticket minted on another surface, or a "
-                          "store failure. Deliberately carries NO reason label — the "
-                          "denial kind is exactly the distinction the client response "
-                          "withholds, and /metrics is not a stronger reader than the "
-                          "caller. Read the audit trail for the kind",
+                          "MCP approval-ticket recalls refused at the ticket-lookup step "
+                          "(#2786) or the consume step (#2442): a replay, a ticket minted "
+                          "on another surface, or a store failure at either step. A store "
+                          "failure is already exposed to the caller through the A4 retry "
+                          "envelope (-32603 vs -32003); what stays withheld is the split "
+                          "WITHIN a -32003 consume denial — a foreign-origin ticket reads "
+                          "exactly like an ordinary replay, so this counter deliberately "
+                          "carries NO reason label, and /metrics is not a stronger reader "
+                          "than the caller. Read the audit trail for the kind",
+                          "counter");
+        metrics_.describe("yuzu_mcp_approval_masked_denials_total",
+                          "MCP approval-ticket recalls refused by a store fault at a point "
+                          "where the #2442 cross-surface origin check could not run — the "
+                          "lookup step, or the consume step's own origin-check read (#2786 "
+                          "arm 1). A foreign-origin ticket is exactly as likely to be behind "
+                          "one of these refusals as an innocent one while the fault holds, so "
+                          "this is the signal that the forgery-detection event is not simply "
+                          "absent. No reason label, same anti-oracle posture as "
+                          "yuzu_mcp_approval_refused_total: what this counter withholds is "
+                          "already withheld there",
                           "counter");
         // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
         // degrade reason is a static literal inside the bridge, never derived
@@ -864,6 +909,8 @@ public:
             // place — so pre-seed it here too, or an absent() alert on a fleet
             // that has never had a refusal cannot fire.
             metrics_.counter("yuzu_mcp_approval_refused_total", {{"tool", tool}});
+            // Same closed set again for the #2786 masked-denial counter.
+            metrics_.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", tool}});
         }
         // #2437 handler-side bound denials. The label set is closed on BOTH
         // axes: `tool` is execute_instruction alone (the only tool that EMITS
@@ -947,9 +994,62 @@ public:
         // `reason` distinguishes a measured over-cap body (413) from one this
         // server refuses to measure at all (411: chunked, or POST with no
         // Content-Length — both would otherwise revert to httplib's 100 MB
-        // default and evade the cap entirely).
-        for (auto reason : {"over_cap", "unmeasurable"}) {
+        // default and evade the cap entirely) from a non-identity
+        // Content-Encoding (415, #2407 R4 hardening 2026-08-07 — see the
+        // pre-routing handler's Content-Encoding branch: it now increments
+        // this counter too, on `path_class == "mcp"`, so the compatibility
+        // series genuinely covers every reason this class can be refused
+        // for, not just the two that predate #2407's unification).
+        for (auto reason : {"over_cap", "unmeasurable", "unsupported_encoding"}) {
             metrics_.counter("yuzu_mcp_body_too_large_total", {{"reason", reason}});
+        }
+        // #2407 general pre-auth body-cap rejection, EVERY route class
+        // (including /mcp/, which also keeps emitting the metric above for
+        // compatibility — see the pre-routing handler). `path_class` is one
+        // of `kBodyCapTable`'s fixed labels — NEVER the raw request path,
+        // which is attacker-controlled and would be an unbounded-cardinality
+        // label on a pre-auth metric. Seeded PER CLASS from the table itself
+        // (not a hand-copied list) so a new table entry is pre-seeded
+        // automatically. `reason=unmeasurable` is seeded only for a class
+        // whose `requires_measurable` bit is set — seeding it for every class
+        // would publish series no code path can reach today (same reasoning
+        // as the dispatch-target-shape seeding above), and only /mcp/ opts in
+        // currently. `reason=unsupported_encoding` (D4 hardening) is seeded
+        // for EVERY class, unconditionally: a non-identity Content-Encoding
+        // is refused regardless of `requires_measurable`, so every class can
+        // reach it. `reason=over_cap_post_read` (body-cap-post-read-stage) is ALSO
+        // seeded for EVERY class, unconditionally — unlike `unmeasurable`,
+        // this is not gated on `requires_measurable`: the post-read stage
+        // (this file's `set_pre_request_handler`) is the backstop for every
+        // class that admits an unmeasurable body up to httplib's own 100 MiB
+        // backstop, which today is every class but /mcp/, and in principle
+        // any class could reach it if a future table edit ever widened a
+        // measured cap past what a handler can actually process.
+        metrics_.describe(
+            "yuzu_body_cap_rejected_total",
+            "Pre-auth request-body cap rejections by route class and reason "
+            "(over_cap: measured and over the class's cap, pre-read; "
+            "unmeasurable: a chunked/undeclared body refused outright for a "
+            "class that requires one it can size; unsupported_encoding: a "
+            "non-identity Content-Encoding, refused on every class; "
+            "over_cap_post_read: the body was read in full — because it could not be "
+            "sized in advance — and turned out to be over the class's cap)",
+            "counter");
+        for (const auto& entry : yuzu::server::kBodyCapTable) {
+            metrics_.counter("yuzu_body_cap_rejected_total",
+                             {{"path_class", std::string(entry.path_class)},
+                              {"reason", "over_cap"}});
+            metrics_.counter("yuzu_body_cap_rejected_total",
+                             {{"path_class", std::string(entry.path_class)},
+                              {"reason", "unsupported_encoding"}});
+            metrics_.counter("yuzu_body_cap_rejected_total",
+                             {{"path_class", std::string(entry.path_class)},
+                              {"reason", "over_cap_post_read"}});
+            if (entry.requires_measurable) {
+                metrics_.counter("yuzu_body_cap_rejected_total",
+                                 {{"path_class", std::string(entry.path_class)},
+                                  {"reason", "unmeasurable"}});
+            }
         }
         for (auto reason : {"client_disconnect", "superseded", "session_terminated",
                             "credential_revoked", "auth_unavailable", "internal_error",
@@ -1084,6 +1184,52 @@ public:
                           "was held at its prior value — a non-zero rate means that gauge may be "
                           "frozen, not genuinely low",
                           "counter");
+        // ResponseStore observability (ADR-0039). Described + seeded up front so
+        // the HELP/TYPE lines and closed reason/result dimensions export zeros on
+        // an idle server (absent-series alerting stays distinguishable from a
+        // scrape failure).
+        metrics_.describe("yuzu_server_response_ingest_dropped_total",
+                          "Response result rows that did not persist (fail-soft ingest, ADR-0039), "
+                          "by reason (store_not_open/pool_acquire_timeout/query_error/"
+                          "malformed_identity_field) — the executions ladder still tracks the "
+                          "command; a sustained non-zero rate means drawer/TAR result history is "
+                          "silently lossy. malformed_identity_field is distinct: an "
+                          "instruction_id/execution_id/plugin containing an embedded NUL byte was "
+                          "rejected rather than silently truncated (#2691 UP-5) — a non-zero rate "
+                          "here means an agent sent a malformed identity field, not store "
+                          "unhealth",
+                          "counter");
+        metrics_.describe("yuzu_server_response_read_degrade_total",
+                          "Response reads that returned a degrade (nullopt, not empty) rather than "
+                          "a result, by reason (store_not_open/pool_acquire_timeout/query_error) "
+                          "and source (response_store) — the seam distinguishes empty from "
+                          "degraded so a consumer can render a degrade banner, never misread a "
+                          "blip as 'no responses'",
+                          "counter");
+        metrics_.describe("yuzu_server_response_reap_passes_total",
+                          "TTL reap passes (clock-guarded gc_sweep, ADR-0039), by result "
+                          "(swept = deleted the full expired set; capped = deleted the per-pass "
+                          "cap of 10000 and a backlog likely remains — sustained non-zero means "
+                          "expiry is outrunning the drain; noop = nothing expired; declined = "
+                          "retention classifier vetoed a would-wipe/clock-ahead pass; "
+                          "declined_no_anchor = first pass ever against a store with expired rows "
+                          "present, declines once, the next pass drains; skipped_lock = another "
+                          "replica held the advisory lock; failed = pass errored). Alert on the "
+                          "TOTAL (sum across result) not increasing, never on one label alone — "
+                          "see YuzuResponseReapNotRunning.",
+                          "counter");
+        // malformed_identity_field is a write-path-only reason (never a read
+        // degrade) — seeded separately so read_degrade_total doesn't carry a
+        // spurious always-zero series for a reason it can never emit.
+        for (const auto reason :
+             {"store_not_open", "pool_acquire_timeout", "query_error", "malformed_identity_field"})
+            metrics_.counter("yuzu_server_response_ingest_dropped_total", {{"reason", reason}});
+        for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
+            metrics_.counter("yuzu_server_response_read_degrade_total",
+                             {{"reason", reason}, {"source", "response_store"}});
+        for (const auto result : {"swept", "capped", "noop", "declined", "declined_no_anchor",
+                                  "skipped_lock", "failed"})
+            metrics_.counter("yuzu_server_response_reap_passes_total", {{"result", result}});
         // DEX app-perf-over-time (B1/B2) — ingest, rollup, and read-degrade signals.
         // Described up front so the HELP/TYPE lines exist on an idle server (a
         // low-traffic deployment otherwise ships these series invisible until the
@@ -2598,13 +2744,26 @@ public:
             }
         }
 
-        // Initialize response store
-        {
-            auto resp_db = cfg_.db_dir() / "responses.db";
+        // Response store — born-on-SQLite, migrated to Postgres (ADR-0006/0008/0039,
+        // schema `response_store`). Construction fail-CLOSED per ADR-0012 §1 (same
+        // template as ResultSetStore/ScimStore above). NO backfill (ADR-0009
+        // skippable class — ADR-0039): responses are TTL'd operational telemetry,
+        // not authoritative config or compliance evidence, so the legacy
+        // `responses.db` is never read on upgrade. One-time loud boot log records
+        // the deliberate reset.
+        if (pg_pool_ && !startup_failed_) {
             response_store_ =
-                std::make_unique<ResponseStore>(resp_db, cfg_.response_retention_days);
-            if (response_store_->is_open()) {
-                response_store_->start_cleanup();
+                std::make_unique<ResponseStore>(*pg_pool_, cfg_.response_retention_days);
+            if (!response_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: response store migration/open failed "
+                              "(database reachable but the response_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                response_store_->set_metrics(&metrics_);
+                spdlog::warn("[PG] response history reset on Postgres cutover — the legacy "
+                             "responses.db is not migrated (ADR-0039, skippable backfill class); "
+                             "the executions drawer/TAR views self-refill as new commands run");
             }
         }
 
@@ -2689,7 +2848,9 @@ public:
                        seen.size() < dispatched.size()) {
                     ResponseQuery q;
                     q.limit = static_cast<int>(dispatched.size()) + 16;
-                    auto rows = response_store_->query(command_id, q);
+                    // Degrade → empty this iteration; the poll loop retries
+                    // until the deadline (deny-or-benign, not authz — ADR-0039).
+                    auto rows = response_store_->query(command_id, q).value_or(std::vector<StoredResponse>{});
                     for (const auto& r : rows) {
                         if (seen.insert(r.agent_id).second)
                             matched.push_back(r);
@@ -5435,8 +5596,9 @@ public:
         }
         if (analytics_store_)
             analytics_store_->stop_drain();
-        if (response_store_)
-            response_store_->stop_cleanup();
+        // ADR-0039: response_store_ no longer runs an in-process cleanup
+        // thread — reap_expired() piggybacks the result-set maintenance
+        // thread, already joined above. Nothing to stop here.
         if (audit_store_)
             audit_store_->stop_cleanup();
         // GuaranteedStateStore no longer runs its own cleanup thread (ADR-0038):
@@ -5661,6 +5823,12 @@ public:
         // thread that leased it is already joined above; every HTTP/gRPC handler
         // holding the raw pointer is quiesced by the drains above.
         result_set_store_.reset();
+        // ResponseStore (ADR-0039) borrows pg_pool_ — unwire the consumer that
+        // holds the raw pointer (agent_service_'s Subscribe-stream ingest) before
+        // dropping it, then drop before the pool. The maintenance thread that
+        // leased it for reap_expired() is already joined above.
+        agent_service_.set_response_store(nullptr);
+        response_store_.reset();
         // GuaranteedStateStore (ADR-0038): same discipline — null the borrowed
         // pointers in both ingest services (Subscribe loop / gateway
         // ForwardGuardianMessage), then drop the store, BEFORE the pool. The
@@ -7399,12 +7567,401 @@ private:
             // contract.
             detail::tls_engine_principal() = false;
 
-            // Lightweight probes — always allowed, no auth, no rate limit.
-            // /health and /api/health are included here (governance Gate 7,
-            // unhappy-path UP-1) so monitoring integrations behind a NAT or
-            // sharing a source-IP bucket with authed REST traffic cannot
-            // 429-starve the health probe. The endpoints themselves are
-            // strictly read-only and documented as unauthenticated.
+            // -- Pre-auth request-body cap (#2407, hardened 2026-08-07 R3) -------
+            // ONE ENFORCEMENT LAMBDA, called from TWO call sites (D3, R3 —
+            // never forked into two copies of the check). The four
+            // unauthenticated health-probe paths (/livez, /readyz, /health,
+            // /api/health) also skip the 401 gate further down, so before
+            // this cap existed they were the last unauthenticated 100 MiB
+            // buffer on the server — the cap MUST still reach them even
+            // though they are exempt from on-behalf-of and the rate limiter.
+            // A single unconditional placement cannot satisfy that AND the
+            // separate requirement below, which is why this is a callable,
+            // not an inline block:
+            //
+            //   1. Probes are capped — call site 1, inside the probe branch
+            //      just below: for a probe, this cap is the ONLY gate it
+            //      hits, so it runs immediately, before the Unhandled
+            //      return that skips everything else.
+            //   2. Probes stay exempt from on-behalf-of and rate limiting —
+            //      unchanged: the probe branch returns before either runs.
+            //   3. Every NON-probe request hits the on-behalf-of guard and
+            //      the rate limiter BEFORE this cap — call site 2, after
+            //      both, restores the pre-R3 ordering an earlier version of
+            //      this fix accidentally reversed by moving the whole
+            //      block, comment included, above BOTH gates: a bogus/
+            //      oversized Content-Length or Content-Encoding header
+            //      could flood unlimited, unthrottled 4xx responses (each
+            //      building an A4 envelope) past the rate limiter, and a
+            //      request carrying a reserved on-behalf-of header would be
+            //      swallowed by the cap's 413 before
+            //      `yuzu_onbehalf_rejected_total` ever incremented,
+            //      masking the header-injecting-proxy CRITICAL alert. A
+            //      flood of genuinely oversized/malformed-framing bodies
+            //      from a single source IP is now rate-limited like any
+            //      other traffic; the on-behalf-of guard sees — and
+            //      counts — a reserved header before a coincidentally
+            //      oversized body could hide it.
+            //
+            // Formerly two authorities for one property: an `/mcp/`-only
+            // branch (#2437, `mcp_body_exceeds_cap`/`mcp_body_unmeasurable`)
+            // and a separate `else if (method != GET/HEAD)` branch for
+            // everyone else driven by `resolve_body_cap` (#2407) — editing the
+            // `/mcp/` row in `kBodyCapTable` was a silent no-op because that
+            // branch never consulted it. Folded into one (D1): every path,
+            // including /mcp/, now resolves through `resolve_body_cap`; the
+            // `yuzu_mcp_body_too_large_total{reason}` counter is preserved
+            // (not retired) by also incrementing it whenever
+            // `cap_match.path_class == "mcp"`.
+            //
+            // GET/HEAD are no longer excluded (D2): the exclusion used to be
+            // justified in-code by "they never carry a body" — FALSE, and this
+            // file's own web_utils.hpp already documented the opposite.
+            // Verified empirically against this vcpkg baseline: httplib's
+            // `expect_content()` is true for ANY method with `Content-Length >
+            // 0` or chunked framing (httplib.h:8330), so a GET declaring
+            // `Content-Length: 20971520` buffers 20 MiB regardless of method.
+            // A legitimate GET/HEAD body is 0 bytes, which resolves under the
+            // (4 MiB, by default) cap trivially.
+            //
+            // Content-Encoding (D4): a non-identity value is refused
+            // UNCONDITIONALLY, on every class, regardless of that class's
+            // `requires_measurable` bit — checked first, and separately from
+            // the framing check below. `requires_measurable` defaults OFF for
+            // every class but /mcp/ specifically so a chunked/undeclared body
+            // stays admitted up to httplib's 100 MiB backstop for clients this
+            // repo does not control (body_cap_policy.hpp's file header) — that
+            // reasoning does NOT extend to compression, which has zero
+            // compatibility cost (verified: no Yuzu route file references
+            // `Content-Encoding` at all, so none accepts a compressed request
+            // body) and a ~1000x amplification cost: this build compiles with
+            // `CPPHTTPLIB_BROTLI_SUPPORT` (ZLIB/ZSTD off — vcpkg_installed/
+            // x64-linux/share/httplib/httplibTargets.cmake), and httplib
+            // enforces its global payload limit against the DECOMPRESSED
+            // size, so a sub-cap `Content-Encoding: br` body can expand to
+            // ~100 MiB before anything downstream sees it. `Transfer-Encoding`
+            // (chunked) is UNCHANGED — still gated by `requires_measurable`
+            // per class, per the file-header reasoning above; chunked is
+            // legal HTTP this repo does not control every client's use of.
+            //
+            // CONNECTION-REUSE CONSTRAINT (D5 — investigated, NOT fixable
+            // here). Returning Handled means the body is never read off the
+            // socket, which is the whole point: a rejection never buffers the
+            // oversized payload.
+            //
+            // The consequence is that this handler cannot also close the
+            // connection. httplib stamps an ADVISORY `Connection: close`
+            // response header on a 4xx, but its own close decision is
+            // internal state that `pre_routing_handler_` is given no access
+            // to — its signature carries only `(const Request&, Response&)`,
+            // no stream and no socket — so neither closing nor draining is
+            // reachable from here. The two server-GLOBAL knobs that could
+            // force it are both rejected: one is already rejected elsewhere
+            // in this file for squeezing the multipart cert upload and
+            // content-distribution staging, and the other would break
+            // legitimate keep-alive fleet-wide to fix one pre-auth path.
+            //
+            // DO NOT spend time re-deriving this — it has been investigated
+            // against the vendored httplib and confirmed unfixable at this
+            // layer. The residual risk, its deployment preconditions and the
+            // candidate remediations are tracked through private security
+            // reporting per SECURITY.md, deliberately not restated here.
+            // Re-evaluate if a future httplib exposes the stream or the
+            // close flag to a pre-routing handler.
+            //
+            // Returns true (and has already populated `res`) when the
+            // request was refused; false means "not this gate's business,
+            // keep going" — the caller decides what Unhandled/the next
+            // gate means at ITS call site, this lambda never does.
+            auto enforce_pre_auth_body_cap = [&]() -> bool {
+                bool unmeasurable_cause = false;
+                // CONTAIN THE WHOLE BLOCK, not just the metric (governance
+                // Gate 8, security + cpp-safety). httplib invokes this
+                // handler from TWO sites: routing() (inside process_request's
+                // try/catch) and the WebSocket-upgrade path at
+                // httplib.h:11741, which is NOT — and ThreadPool::worker runs
+                // tasks bare. Every throwing expression below (header reads,
+                // the log, the sanitizers, the counters, the envelope build)
+                // must stay inside this try, or a crafted request reaches an
+                // unguarded call site and takes the whole process down.
+                try {
+                    // TWO deliberately separate header lookups (#2407 R1 fix,
+                    // hardened 2026-08-07 — do not "simplify" back to one).
+                    // Presence (`has_content_length`) is answered by this
+                    // iterator range. The VALUE comes from
+                    // `content_length_for_body_cap` (web_utils.hpp) — see
+                    // that function's doc comment for the CRITICAL bypass a
+                    // hand-rolled `std::from_chars` parse caused here once
+                    // already (an all-digit `Content-Length` above 2^64-1
+                    // parsed to 0 — "no header, don't cap" — under the old
+                    // code, while httplib's own accessor, which this now
+                    // calls directly, correctly reports `SIZE_MAX`). Routing
+                    // both this call site and the test fixtures' through the
+                    // ONE shared function makes that divergence structurally
+                    // impossible instead of something to keep re-verifying
+                    // by hand.
+                    const auto cl_range = req.headers.equal_range("Content-Length");
+                    const bool has_content_length = cl_range.first != cl_range.second;
+
+                    // THE DECISION — the ONE callable both this production
+                    // chokepoint and test_body_cap_policy.cpp's
+                    // UnifiedBodyCapTestServer fixture invoke (#2898). See
+                    // `evaluate_body_cap`'s doc comment (body_cap_policy.hpp)
+                    // for the D1-D5 ordering it encodes and why it stays
+                    // httplib-free; `is_chunked` MUST come from httplib's own
+                    // `is_chunked_transfer_encoding`, never a re-derived
+                    // reading of the header text (third time this change was
+                    // bitten by re-deciding a framing/length header
+                    // ourselves instead of asking httplib — see
+                    // `content_length_is_authoritative`'s doc comment).
+                    const auto decision = yuzu::server::evaluate_body_cap(
+                        req.method, req.path, has_content_length,
+                        content_length_for_body_cap(req),
+                        req.get_header_value("Transfer-Encoding"),
+                        req.get_header_value("Content-Encoding"),
+                        httplib::detail::is_chunked_transfer_encoding(req.headers));
+
+                    if (!decision.refuse)
+                        return false;
+
+                    unmeasurable_cause = decision.status == 411;
+                    const auto& cap_match = decision;
+
+                    if (decision.reason == "unsupported_encoding") {
+                        static std::atomic<std::uint64_t> encoding_hits{0};
+                        constexpr std::uint64_t kBodyLogEvery = 100;
+                        if (encoding_hits.fetch_add(1, std::memory_order_relaxed) %
+                                kBodyLogEvery ==
+                            0) {
+                            spdlog::warn(
+                                "[#2407] rejected {} {} from {}: unsupported "
+                                "Content-Encoding (class={}, 1 log per {} "
+                                "rejections; the counter records all)",
+                                onbehalf::sanitize_for_log(req.method, 16),
+                                onbehalf::sanitize_for_log(req.path),
+                                onbehalf::sanitize_for_log(req.remote_addr, 64),
+                                cap_match.path_class, kBodyLogEvery);
+                        }
+                        try {
+                            metrics_
+                                .counter("yuzu_body_cap_rejected_total",
+                                         {{"path_class", std::string(cap_match.path_class)},
+                                          {"reason", "unsupported_encoding"}})
+                                .increment();
+                            if (cap_match.path_class == "mcp") {
+                                // #2407 R4 fix (2026-08-07): this branch runs
+                                // BEFORE the framing/measurability check
+                                // below (D4 — Content-Encoding is refused
+                                // UNCONDITIONALLY on every class, checked
+                                // first, and that ordering is unchanged by
+                                // this fix, deliberately: 415 is the
+                                // correct status for an unsupported
+                                // encoding, and reordering it behind the
+                                // framing check just for /mcp/ would
+                                // resurrect the wrong 411 status D4 fixed).
+                                // What WAS lost by that reordering is the
+                                // #2437 compatibility counter, which an
+                                // earlier round of this fix only
+                                // incremented from the unmeasurable/
+                                // over_cap branch further down — an /mcp/
+                                // request with a bad Content-Encoding
+                                // returned 415 (correct) but silently
+                                // stopped incrementing
+                                // `yuzu_mcp_body_too_large_total`, dropping
+                                // an arm of the alert at
+                                // docs/prometheus/yuzu-alerts.yml:414.
+                                // Incrementing it here, unconditionally
+                                // alongside the (also unconditional) 415
+                                // status, restores that without touching
+                                // the status code.
+                                metrics_
+                                    .counter("yuzu_mcp_body_too_large_total",
+                                             {{"reason", "unsupported_encoding"}})
+                                    .increment();
+                            }
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                            // Observability must never kill the process from
+                            // the unguarded WebSocket-upgrade path.
+                        }
+                        res.status = 415;
+                        // D7: the SCIM class publishes RFC 7644 §3.12's own
+                        // error envelope (application/scim+json) instead of
+                        // the generic A4 shape — an in-scope oversize/refusal
+                        // used to fall through silently to the generic
+                        // envelope once the pre-routing check started
+                        // winning ahead of the (now-dead) handler-level 64
+                        // KiB check, and IdP connectors validate conformance.
+                        if (cap_match.path_class == "scim") {
+                            res.set_content(
+                                scim::error(415, "Content-Encoding is not supported on this "
+                                                 "request")
+                                    .dump(),
+                                "application/scim+json");
+                        } else {
+                            res.set_content(
+                                detail::a4_denial(
+                                    res, 415,
+                                    "this request's Content-Encoding is not accepted",
+                                    detail::A4ErrorOpts{
+                                        .remediation =
+                                            "send the body identity-encoded (omit "
+                                            "Content-Encoding, or set it to 'identity'); no "
+                                            "Yuzu route accepts a compressed request body"}),
+                                "application/json");
+                        }
+                        return true;
+                    }
+
+                    // `decision.reason` here is always either "unmeasurable"
+                    // or "over_cap" — the "unsupported_encoding" case already
+                    // returned above. Both questions ("is this framing
+                    // refused outright?" vs "does the declared length exceed
+                    // the cap?") were decided together by `evaluate_body_cap`
+                    // (body_cap_policy.hpp) — see that function's doc comment
+                    // for why they must stay two separate predicates
+                    // internally (collapsing them was a live unauthenticated
+                    // bypass, found by the fifth reviewer of this change).
+                    // This call site only needs to know WHICH of the two
+                    // reasons fired, to pick the right throttle counter, log
+                    // wording, and envelope text below.
+                    const bool refuse_unmeasurable = decision.reason == "unmeasurable";
+                    {
+                        // Own throttle per reason: a cheap over_cap flood
+                        // (huge Content-Length, no body sent) must not
+                        // suppress the rarer unmeasurable signal.
+                        static std::atomic<std::uint64_t> over_cap_hits{0};
+                        static std::atomic<std::uint64_t> unmeasurable_hits{0};
+                        constexpr std::uint64_t kBodyLogEvery = 100;
+                        auto& hits = refuse_unmeasurable ? unmeasurable_hits : over_cap_hits;
+                        if (hits.fetch_add(1, std::memory_order_relaxed) % kBodyLogEvery ==
+                            0) {
+                            spdlog::warn(
+                                "[#2407] rejected {} {} from {}: {} (class={}, 1 log per {} "
+                                "rejections; the counter records all)",
+                                onbehalf::sanitize_for_log(req.method, 16),
+                                onbehalf::sanitize_for_log(req.path),
+                                onbehalf::sanitize_for_log(req.remote_addr, 64),
+                                refuse_unmeasurable ? "unmeasurable body" : "body over cap",
+                                cap_match.path_class, kBodyLogEvery);
+                        }
+                        try {
+                            metrics_
+                                .counter("yuzu_body_cap_rejected_total",
+                                         {{"path_class", std::string(cap_match.path_class)},
+                                          {"reason",
+                                           refuse_unmeasurable ? "unmeasurable" : "over_cap"}})
+                                .increment();
+                            if (cap_match.path_class == "mcp") {
+                                // #2437 compatibility series, PRESERVED (D1)
+                                // for these two reasons — the THIRD
+                                // (`unsupported_encoding`) is incremented
+                                // from the separate Content-Encoding branch
+                                // above (#2407 R4), since that check runs
+                                // first and returns before reaching here.
+                                // Both sites together are what make the
+                                // series genuinely complete; dashboards/
+                                // alerts still key off this one.
+                                metrics_
+                                    .counter("yuzu_mcp_body_too_large_total",
+                                             {{"reason", refuse_unmeasurable
+                                                             ? "unmeasurable"
+                                                             : "over_cap"}})
+                                    .increment();
+                            }
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                            // Observability must never kill the process from
+                            // the unguarded WebSocket-upgrade path.
+                        }
+                        res.status = decision.status;
+                        if (cap_match.path_class == "scim") {
+                            // D7: match scim_routes.cpp's own now-superseded
+                            // handler-level check's wording, so an IdP
+                            // connector sees the identical envelope whether
+                            // the 4xx comes from here or there.
+                            res.set_content(
+                                scim::error(res.status,
+                                            refuse_unmeasurable
+                                                ? "this request must carry a body this "
+                                                  "server can size in advance"
+                                                : "request body too large")
+                                    .dump(),
+                                "application/scim+json");
+                        } else if (cap_match.path_class == "mcp") {
+                            res.set_content(
+                                refuse_unmeasurable
+                                    ? detail::a4_denial(
+                                          res, 411,
+                                          "MCP requests must carry a body this server can "
+                                          "size in advance",
+                                          detail::A4ErrorOpts{
+                                              .remediation =
+                                                  "send the JSON-RPC body with a "
+                                                  "Content-Length header, no "
+                                                  "Transfer-Encoding, and no "
+                                                  "Content-Encoding other than identity; a "
+                                                  "body whose size cannot be checked before "
+                                                  "reading it cannot be admitted under the "
+                                                  "4 MiB MCP cap (see docs/mcp-server.md)"})
+                                    : detail::a4_denial(
+                                          res, 413,
+                                          "request body exceeds the MCP transport limit",
+                                          detail::A4ErrorOpts{
+                                              .remediation =
+                                                  "the largest accepted MCP request body is "
+                                                  "4 MiB; reduce the arguments, or for a "
+                                                  "large execute_bundle use the REST twin "
+                                                  "POST /api/v1/bundles (see "
+                                                  "docs/mcp-server.md)"}),
+                                "application/json");
+                        } else {
+                            res.set_content(
+                                refuse_unmeasurable
+                                    ? detail::a4_denial(
+                                          res, 411,
+                                          "this request must carry a body this server can "
+                                          "size in advance",
+                                          detail::A4ErrorOpts{
+                                              .remediation =
+                                                  "send the body with a Content-Length "
+                                                  "header, no Transfer-Encoding, and no "
+                                                  "Content-Encoding other than identity"})
+                                    : detail::a4_denial(
+                                          res, 413,
+                                          "request body exceeds this route's size cap",
+                                          detail::A4ErrorOpts{
+                                              .remediation =
+                                                  "reduce the request body size; see "
+                                                  "docs/user-manual/rest-api.md for the "
+                                                  "per-route limit"}),
+                                "application/json");
+                        }
+                        return true;
+                    }
+                } catch (...) { // NOLINT(bugprone-empty-catch)
+                    // Last-resort containment for the WHOLE block, including
+                    // the header reads that decide it. We cannot build an
+                    // envelope if we got here, but we can still refuse rather
+                    // than let the throw reach httplib's UNGUARDED WebSocket-
+                    // upgrade call site and take the process down.
+                    res.status = unmeasurable_cause ? 411 : 413;
+                    return true;
+                }
+                return false;
+            };
+
+            // Lightweight probes — capped (R3, call site 1 of
+            // `enforce_pre_auth_body_cap` above), but otherwise always
+            // allowed: no auth, no rate limit. /health and /api/health are
+            // included here (governance Gate 7, unhappy-path UP-1) so
+            // monitoring integrations behind a NAT or sharing a source-IP
+            // bucket with authed REST traffic cannot 429-starve the health
+            // probe. The endpoints themselves are strictly read-only and
+            // documented as unauthenticated. This IS the probes' only gate:
+            // the cap check runs here, unconditionally, before the
+            // Unhandled return, precisely because everything past this
+            // point (on-behalf-of, rate limiting) is skipped for these four
+            // paths — before the cap reached them too, they were the last
+            // unauthenticated 100 MiB buffer on the server.
             // Liveness/readiness probes are EXEMPT from the on-behalf-of guard
             // below — a RECORDED ADR-1005 exception (documented in
             // docs/auth-architecture.md; ledger entry lands with the ADR).
@@ -7416,6 +7973,8 @@ private:
             // guard exists to surface. Every other path rejects below.
             if (req.path == "/livez" || req.path == "/readyz" || req.path == "/health" ||
                 req.path == "/api/health") {
+                if (enforce_pre_auth_body_cap())
+                    return httplib::Server::HandlerResponse::Handled;
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
@@ -7500,176 +8059,21 @@ private:
                 return httplib::Server::HandlerResponse::Handled;
             }
 
-            // MCP request-body bound (#2437). Placed HERE, after the rate
-            // limiter and before auth, for two reasons that are easy to get
-            // wrong:
-            //   * httplib calls this pre-routing handler BEFORE it reads the
-            //     request body (httplib.h: pre_routing_handler_ in routing(),
-            //     read_content later in the same function), so returning
-            //     Handled costs a header parse and never buffers the payload.
-            //     Enforcing the same bound inside the MCP handler would be too
-            //     late — the body is already in memory by then.
-            //   * it is per-path, NOT the server-global
-            //     `set_payload_max_length` knob, which would also cap the
-            //     multipart certificate upload and content distribution on
-            //     this same httplib instance. httplib's 100 MB default stays
-            //     as the outer backstop for every other route.
-            // Unlike the on-behalf-of guard above, this sits AFTER the rate
-            // limiter: there is no diagnostic reason to let an oversized-body
-            // flood bypass the limiter, and no misconfiguration it would mask.
-            // A chunked or Content-Length-less POST/PUT/PATCH is REFUSED 411,
-            // not admitted: httplib consults Transfer-Encoding before
-            // Content-Length and reads a header-less POST to EOF, so either
-            // shape would revert to the 100 MB default and evade this cap
-            // entirely. A bound removable by deleting a header is not a bound.
-            // ON THE UNREAD BODY (checked at primary source against the
-            // vendored httplib 0.37.1 — don't re-derive, and re-check on a
-            // vcpkg baseline bump). Returning Handled means the body is never
-            // read off the socket. What ACTUALLY happens next:
-            //   * write_response_core stamps `Connection: close` on any status
-            //     >= 400 (httplib.h:10789, "Don't leave connections open after
-            //     errors"), so a conforming client closes.
-            //   * but NOTHING sets httplib's `connection_closed` flag for an
-            //     error response, so process_server_socket_core loops again
-            //     (httplib.h:5516-5531). A client that already transmitted the
-            //     declared body — which it always has under
-            //     `Expect: 100-continue`, since process_request auto-answers
-            //     100 BEFORE routing — leaves those bytes to be parsed as
-            //     subsequent request lines on this same socket.
-            //   * bounded: <= keep_alive_max_count_ (100) parses and the idle
-            //     timeout, then teardown. Malformed lines 400 before
-            //     pre-routing runs (so they skip the rate limiter); a
-            //     well-formed smuggled request goes through the FULL middleware
-            //     chain including auth, so there is no auth bypass.
-            // Same shape as the two early returns above (on-behalf-of 403,
-            // rate-limit 429), which have always returned Handled on POSTs
-            // carrying bodies — this adds an instance of an existing pattern,
-            // not a new one.
-            // CAVEAT IF A REVERSE PROXY IS EVER PUT IN FRONT: an unread
-            // Content-Length body is a textbook request-smuggling primitive
-            // between proxy and origin. The shipped rigs expose the server
-            // directly, so this is a documented constraint, not a live bug.
-            // The DECISION lives in web_utils.hpp so it has direct unit
-            // coverage (same reason is_login_exempt_path was extracted from
-            // this lambda); only this call site is review-only.
-            // The path test is hoisted to the CALL SITE, not left inside the
-            // predicate: get_header_value_u64 is a function ARGUMENT and is
-            // therefore evaluated unconditionally, so the predicate's internal
-            // && cannot short-circuit it. Measured at 14.22 ns/request
-            // unguarded vs 0.84 ns guarded, on EVERY request server-wide
-            // (governance perf-S1).
-            if (is_mcp_path(req.path)) {
-              // Hoisted ABOVE the try so the catch below can answer with the
-              // right status: collapsing an unmeasurable-body refusal into a
-              // 413 would tell the client to shrink a body whose size was
-              // never the problem.
-              bool unmeasurable_cause = false;
-              // CONTAIN THE WHOLE BRANCH, not just the metric (governance Gate 8,
-              // security + cpp-safety). httplib invokes this handler from TWO
-              // sites: routing() (inside process_request's try/catch) and the
-              // WebSocket-upgrade path at httplib.h:11741, which is NOT — and
-              // ThreadPool::worker runs tasks bare. A GET /mcp/v1/ carrying
-              // `Upgrade: websocket` and an oversized Content-Length reaches
-              // here via that second site, so a bad_alloc from the header read,
-              // the log, the sanitizers, the counter OR the envelope build is
-              // std::terminate. The first attempt guarded only the one operation
-              // it had been told about; the hazard is the path.
-              try {
-                const bool oversize = mcp_body_exceeds_cap(
-                    req.path, req.get_header_value_u64("Content-Length", 0),
-                    mcp::kMcpMaxRequestBodyBytes);
-                // Header VALUES passed through, not a re-implementation of
-                // httplib's parsing — matching its decision by hand is what
-                // let `Transfer-Encoding: Chunked` through last round.
-                const bool unmeasurable = mcp_body_unmeasurable(
-                    req.path, req.method, req.has_header("Content-Length"),
-                    req.get_header_value("Transfer-Encoding"),
-                    req.get_header_value("Content-Encoding"));
-                unmeasurable_cause = unmeasurable;
-                if (oversize || unmeasurable) {
-                    // Throttled log: this is a pre-auth ingress rejection with
-                    // NO principal to audit, and observability-conventions.md
-                    // requires metric + sampled log for exactly that shape.
-                    // Mirrors the on-behalf-of guard above, whose sanitizer
-                    // this reuses (httplib percent-decodes req.path, so raw
-                    // control bytes would otherwise forge log lines).
-                    // OWN throttle, NOT onbehalf::note_rejection (governance
-                    // Gate 8 security HIGH-1). Reusing it fed
-                    // yuzu_onbehalf_rejected_total, which carries a CRITICAL
-                    // alert reading "likely a header-injecting proxy" — so an
-                    // unauthenticated chunked-POST flood would have paged
-                    // someone about an ADR-1005 breach that never happened,
-                    // and would have consumed the shared 1-in-100 log slot
-                    // that the genuine on-behalf-of warnings need. Never
-                    // borrow a security control's counter for a transport
-                    // bound.
-                    // ONE COUNTER PER REASON. A shared counter lets a cheap
-                    // over_cap flood (huge Content-Length, no body sent)
-                    // suppress ~99% of the unmeasurable lines, hiding the
-                    // rarer signal behind the noisier one.
-                    static std::atomic<std::uint64_t> over_cap_hits{0};
-                    static std::atomic<std::uint64_t> unmeasurable_hits{0};
-                    constexpr std::uint64_t kBodyLogEvery = 100;
-                    auto& hits = unmeasurable ? unmeasurable_hits : over_cap_hits;
-                    if (hits.fetch_add(1, std::memory_order_relaxed) % kBodyLogEvery == 0) {
-                        spdlog::warn("[#2437] rejected {} {} from {}: {} (1 log per {} "
-                                     "rejections; the counter records all)",
-                                     onbehalf::sanitize_for_log(req.method, 16),
-                                     onbehalf::sanitize_for_log(req.path),
-                                     onbehalf::sanitize_for_log(req.remote_addr, 64),
-                                     unmeasurable ? "unmeasurable body" : "body over cap",
-                                     kBodyLogEvery);
-                    }
-                    try {
-                        metrics_
-                            .counter("yuzu_mcp_body_too_large_total",
-                                     {{"reason", unmeasurable ? "unmeasurable" : "over_cap"}})
-                            .increment();
-                    } catch (...) { // NOLINT(bugprone-empty-catch)
-                        // Guarded because this call site is NOT inside
-                        // httplib's try/catch on the WebSocket-upgrade path
-                        // (httplib.h:11741 vs routing()'s at :11811), and
-                        // ThreadPool::worker invokes tasks bare — an escaped
-                        // throw here is std::terminate (cpp-safety S1 / UP-9).
-                        // The sibling handler-side increment is guarded the
-                        // same way; observability must never kill the process.
-                    }
-                    res.status = unmeasurable ? 411 : 413;
-                    res.set_content(
-                        unmeasurable
-                            ? detail::a4_denial(
-                                  res, 411,
-                                  "MCP requests must carry a body this server can size "
-                                  "in advance",
-                                  detail::A4ErrorOpts{
-                                      .remediation =
-                                          "send the JSON-RPC body with a Content-Length "
-                                          "header, no Transfer-Encoding, and no "
-                                          "Content-Encoding other than identity; a body "
-                                          "whose size cannot be checked before reading it "
-                                          "cannot be admitted under the 4 MiB MCP cap "
-                                          "(see docs/mcp-server.md)"})
-                            : detail::a4_denial(
-                                  res, 413, "request body exceeds the MCP transport limit",
-                                  detail::A4ErrorOpts{
-                                      .remediation =
-                                          "the largest accepted MCP request body is 4 MiB; "
-                                          "reduce the arguments, or for a large "
-                                          "execute_bundle use the REST twin POST "
-                                          "/api/v1/bundles (see docs/mcp-server.md)"}),
-                        "application/json");
-                  return httplib::Server::HandlerResponse::Handled;
-                }
-              } catch (...) { // NOLINT(bugprone-empty-catch)
-                  // Last-resort containment for the WHOLE branch, including the
-                  // header read that decides it. We cannot build an envelope if
-                  // we got here, but we can still refuse rather than let the
-                  // throw reach httplib's UNGUARDED WebSocket-upgrade call site
-                  // and take the process down.
-                  res.status = unmeasurable_cause ? 411 : 413;
-                  return httplib::Server::HandlerResponse::Handled;
-              }
-            }
+            // Pre-auth request-body cap (R3, call site 2 of
+            // `enforce_pre_auth_body_cap` — see that lambda's header
+            // comment above). Every path reaching here is a NON-probe path
+            // that has already cleared the on-behalf-of guard and the rate
+            // limiter above, restoring the invariant those two gates run
+            // BEFORE this cap for everyone except the four exempt probes
+            // (call site 1): a flood of bogus/oversized Content-Length or
+            // Content-Encoding headers from one source IP is rate-limited
+            // like any other traffic before it can generate unlimited
+            // unthrottled 4xx responses here, and a request also carrying
+            // a reserved on-behalf-of header is rejected — and counted —
+            // by that guard first, rather than being swallowed by a 413
+            // before `yuzu_onbehalf_rejected_total` ever increments.
+            if (enforce_pre_auth_body_cap())
+                return httplib::Server::HandlerResponse::Handled;
 
             // Allow unauthenticated access to login pages, health, OIDC flow, and OpenAPI spec.
             // /health and /api/health are ALSO covered by the early-return
@@ -7781,6 +8185,172 @@ private:
             }
 
             return httplib::Server::HandlerResponse::Unhandled;
+        });
+
+        // -- Post-read pre-auth body cap, second stage (body-cap-post-read) -----
+        // The pre-routing gate above bounds the DECLARED size of a request
+        // whose framing lets it be measured in advance (a Content-Length the
+        // class's cap can be checked against before anything is read off the
+        // socket). It has a structural limit, recorded in body_cap_policy.hpp's
+        // KNOWN LIMITATION paragraph: on any class with `requires_measurable ==
+        // false` (24 of 25 rows) a genuine chunked — or otherwise unmeasurable
+        // — body is NOT size-checked there at all; it falls through to
+        // httplib's own 100 MiB backstop (`CPPHTTPLIB_PAYLOAD_MAX_LENGTH`) and
+        // is handed to the route handler uncapped by this table. This second
+        // stage closes that hole from the other side: httplib's
+        // `pre_request_handler_` (httplib.h `Server::dispatch_request`, called
+        // from `routing()` only once the pre-routing handler above has
+        // returned Unhandled) runs AFTER `read_content` has consumed the body
+        // off the socket into `req.body` and AFTER the route MATCHED
+        // (`req.matched_route` is set), but BEFORE the route's own handler
+        // runs. That ordering means this stage can compare the body's ACTUAL,
+        // now-known size against the same `resolve_body_cap` table the
+        // pre-routing gate uses — the one table, never forked — and refuse a
+        // request the earlier stage could not size before admitting it.
+        //
+        // The two stages are complementary, not redundant: pre-routing bounds
+        // what the server will ever BUFFER (a rejection there costs a header
+        // parse, never the body itself); this stage bounds what reaches a
+        // route HANDLER, and — because the body is already fully read off the
+        // socket by the time this runs — a rejection here leaves the
+        // connection in a clean state, unlike a pre-routing rejection, which
+        // necessarily leaves an unread body still queued on the wire (see the
+        // pre-routing handler's own D5 comment above). For a MEASURABLE
+        // over-cap body the pre-routing gate has already refused the request
+        // before dispatch_request is ever reached, so in practice this stage
+        // fires almost exclusively for the chunked/unmeasurable case the
+        // earlier gate deliberately admits.
+        //
+        // ROUTE-MATCH GATED, NOT UNIVERSAL: httplib's `dispatch_request` only
+        // invokes `pre_request_handler_` once a route has MATCHED (see the
+        // vendored httplib.h) — an unmatched path (a 404) never reaches this
+        // handler at all. Do not read this as a second universal pre-auth
+        // gate; the pre-routing handler above is that gate, and this is a
+        // narrower backstop that runs strictly behind it.
+        //
+        // MULTIPART LIMITATION, recorded rather than implied away: httplib's
+        // `read_content` only appends bytes to `req.body` on the
+        // NON-multipart branch; a `multipart/form-data` request's content
+        // lands in `req.form.files`/`req.form.fields` instead, so
+        // `req.body.size()` reads 0 for ANY multipart request regardless of
+        // the real bytes read off the wire. **NO multipart class is covered
+        // by this stage** — stated as a RULE, not a list. An earlier draft
+        // named a single class and was wrong: `/api/settings/updates/upload`
+        // (`ota_upload`) and `/api/settings/cert-upload` (no table entry, so
+        // the catch-all default) are multipart too. Enumerating instances is
+        // how that error was made; the rule is what holds.
+        //
+        // SECOND CALL SITE: httplib also reaches this handler from
+        // `dispatch_request_for_content_reader`, where the body was streamed
+        // through a `ContentReader` and `req.body` is likewise EMPTY — so a
+        // route registered that way is not covered either. Dormant today
+        // (this codebase registers no `ContentReader` route), but it is the
+        // same blind spot as multipart and will not announce itself.
+        //
+        // Same table, same `path_class` label (never the attacker-controlled
+        // `req.path`), same 413 A4/SCIM envelope shapes, and the same
+        // per-reason log throttle as the pre-routing gate. `reason=over_cap_post_read`
+        // is its own value on `yuzu_body_cap_rejected_total` — pre-seeded for
+        // EVERY class in the boot-time seeding loop above — so an `absent()`
+        // alert can tell "this stage never fired" from "this stage isn't
+        // deployed".
+        //
+        // DOES NOT DOUBLE-COUNT: httplib's routing() returns immediately once
+        // the pre-routing handler above answers Handled, without ever calling
+        // dispatch_request — so a request the pre-routing gate already
+        // refused can never also reach this handler for the same request.
+        //
+        // CONTAIN THE WHOLE BLOCK (governance Gate 8, security + cpp-safety).
+        //
+        // NOT for the reason the pre-routing handler is contained, and the
+        // difference matters because the wrong reason is the one a future
+        // maintainer would trust. `enforce_pre_auth_body_cap` is contained
+        // because httplib calls `pre_routing_handler_` from the UNGUARDED
+        // WebSocket-upgrade path. This handler is NOT reachable from there —
+        // that path calls only `pre_routing_handler_` and the upgrade
+        // entry's own handler, never `pre_request_handler_`. Both real call
+        // sites sit inside `routing()`, which httplib does wrap in try/catch.
+        //
+        // It is contained anyway, deliberately: relying on a caller's
+        // try/catch means this block's safety depends on vendored code we do
+        // not control and would silently lose on a version bump. Containing
+        // it locally costs nothing and fails CLOSED (413) rather than
+        // deferring to httplib's generic 500.
+        //
+        // `[this]` ONLY. The httplib member function that invokes this
+        // handler (`Server::dispatch_request`) is `const`, but that constness
+        // is on httplib::Server's own members — it says nothing about what
+        // this lambda captures. `this` is the ServerImpl pointer, copied by
+        // value; calling `metrics_`/logging through it is unaffected. There
+        // are no pre-routing-handler locals in scope to capture by reference
+        // here, and none should be added — httplib can invoke
+        // `pre_request_handler_` from two distinct call sites
+        // (`dispatch_request` and `dispatch_request_for_content_reader`), so a
+        // captured reference to something scoped to one request's stack frame
+        // would be a dangling-reference hazard on the other.
+        web_server_->set_pre_request_handler([this](const httplib::Request& req,
+                                                     httplib::Response& res)
+                                                  -> httplib::Server::HandlerResponse {
+            try {
+                const auto cap_match = resolve_body_cap(req.method, req.path);
+                if (req.body.size() <= cap_match.max_body_bytes) {
+                    return httplib::Server::HandlerResponse::Unhandled;
+                }
+
+                static std::atomic<std::uint64_t> post_read_hits{0};
+                constexpr std::uint64_t kBodyLogEvery = 100;
+                if (post_read_hits.fetch_add(1, std::memory_order_relaxed) %
+                        kBodyLogEvery ==
+                    0) {
+                    spdlog::warn(
+                        "[#2407 post-read] rejected {} {} from {}: body {} bytes read, "
+                        "over the {}-byte cap (class={}, 1 log per {} rejections; the "
+                        "counter records all)",
+                        onbehalf::sanitize_for_log(req.method, 16),
+                        onbehalf::sanitize_for_log(req.path),
+                        onbehalf::sanitize_for_log(req.remote_addr, 64), req.body.size(),
+                        cap_match.max_body_bytes, cap_match.path_class, kBodyLogEvery);
+                }
+                try {
+                    metrics_
+                        .counter("yuzu_body_cap_rejected_total",
+                                 {{"path_class", std::string(cap_match.path_class)},
+                                  {"reason", "over_cap_post_read"}})
+                        .increment();
+                } catch (...) { // NOLINT(bugprone-empty-catch)
+                    // Observability must never kill the process from this
+                    // handler either — same reasoning as the pre-routing
+                    // gate's own metric try/catch above.
+                }
+
+                res.status = 413;
+                if (cap_match.path_class == "scim") {
+                    // D7 parity: same RFC 7644 §3.12 envelope the pre-routing
+                    // gate's SCIM branch uses.
+                    res.set_content(
+                        scim::error(413, "request body too large").dump(),
+                        "application/scim+json");
+                } else {
+                    res.set_content(
+                        detail::a4_denial(
+                            res, 413, "request body exceeds this route's size cap",
+                            detail::A4ErrorOpts{
+                                .remediation =
+                                    "reduce the request body size; see "
+                                    "docs/user-manual/rest-api.md for the per-route "
+                                    "limit"}),
+                        "application/json");
+                }
+                return httplib::Server::HandlerResponse::Handled;
+            } catch (...) { // NOLINT(bugprone-empty-catch)
+                // Last-resort containment for the whole block — see
+                // `enforce_pre_auth_body_cap`'s identical catch above. No
+                // envelope can be built once we are here, but the request
+                // must still be refused rather than let the throw reach an
+                // unguarded httplib call site.
+                res.status = 413;
+                return httplib::Server::HandlerResponse::Handled;
+            }
         });
 
         // -- Auth routes (login, logout, OIDC) — delegated to AuthRoutes --------
@@ -9815,10 +10385,38 @@ private:
             else if (op_str == "max")
                 op = AggregateOp::Max;
 
+            // Validate CLIENT input against ResponseStore::aggregate()'s own
+            // allow-lists BEFORE calling in (#2691, Doomgoose finding #2): an
+            // allow-list miss inside aggregate() itself returns nullopt,
+            // which this handler otherwise maps unconditionally to 503 "store
+            // degraded" below — a typo'd group_by/op_column would page the
+            // degrade alert for a healthy database. Bad TARGETED client input
+            // is a 400, not a 503.
+            if (std::find(ResponseStore::allowed_group_by().begin(),
+                          ResponseStore::allowed_group_by().end(),
+                          group_by) == ResponseStore::allowed_group_by().end()) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid group_by"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            auto op_column_param = req.get_param_value("op_column");
+            const std::string effective_op_column = op_column_param.empty() ? "id" : op_column_param;
+            if (std::find(ResponseStore::allowed_op_column().begin(),
+                          ResponseStore::allowed_op_column().end(),
+                          effective_op_column) == ResponseStore::allowed_op_column().end()) {
+                res.status = 400;
+                res.set_content(
+                    R"({"error":{"code":400,"message":"invalid op_column"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+
             AggregationQuery aq;
             aq.group_by = group_by;
             aq.op = op;
-            aq.op_column = req.get_param_value("op_column");
+            aq.op_column = op_column_param;
 
             ResponseQuery filter;
             if (req.has_param("agent_id"))
@@ -9887,7 +10485,15 @@ private:
                 (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
                                 "scope_dropped=" + std::to_string(agg_dropped) + " surface=aggregate");
 
-            auto results = response_store_->aggregate(instruction_id, aq, filter, agg_scope);
+            auto results_opt = response_store_->aggregate(instruction_id, aq, filter, agg_scope);
+            if (!results_opt) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            const auto& results = *results_opt;
 
             int64_t total_rows = 0;
             nlohmann::json groups = nlohmann::json::array();
@@ -9943,7 +10549,15 @@ private:
                 return;
             }
 
-            auto results = response_store_->query(instruction_id, q);
+            auto results_opt = response_store_->query(instruction_id, q);
+            if (!results_opt) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            auto results = std::move(*results_opt);
 
             // #1634 management-group scope: drop out-of-scope agents' rows before
             // export (mirrors MCP query_responses / the visualization reader). The
@@ -10057,7 +10671,15 @@ private:
                 return;
             }
 
-            auto results = response_store_->query(instruction_id, q);
+            auto results_opt = response_store_->query(instruction_id, q);
+            if (!results_opt) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            auto results = std::move(*results_opt);
 
             // #1634 management-group scope: drop out-of-scope agents' rows before
             // serving (mirrors the export sibling above + MCP query_responses). The
@@ -12584,18 +13206,20 @@ private:
         // gauges. Borrows result_set_store_, execution_tracker_, response_store_
         // and metrics_, so it MUST be joined before any of them are torn down
         // (join sits next to the policy-eval join in stop()).
-        // Started if EITHER store is open (cpp-safety Gate-3 SHOULD / JC-6): the
-        // Guardian retention reap piggybacks this thread, and gating its
-        // existence on result_set_store health would silently stop enforcing
-        // guardian_observations PII TTL if that unrelated store were ever
-        // closed/optional. Both stores fail-closed together at boot today, so
-        // this is defensive against a future refactor; each unit of work below
-        // is independently gated on its own store's is_open().
+        // Started if ANY of the three stores is open (cpp-safety Gate-3 SHOULD /
+        // JC-6): the response and Guardian reaps piggyback this thread, so
+        // gating its existence on result_set_store health alone would silently
+        // stop response-TTL enforcement or guardian_observations PII TTL if
+        // that unrelated store were ever closed/optional. All three stores
+        // fail-closed together at boot today, so this is defensive against a
+        // future refactor; each unit of work below is independently gated on
+        // its own store's is_open().
         if ((result_set_store_ && result_set_store_->is_open()) ||
+            (response_store_ && response_store_->is_open()) ||
             (guaranteed_state_store_ && guaranteed_state_store_->is_open())) {
             result_set_maint_thread_ = std::thread([this]() {
-                spdlog::info("Result-set/Guardian maintenance thread started (cadence=2s, GC=5m, "
-                             "Guardian reap=60m)");
+                spdlog::info("Result-set/response/Guardian maintenance thread started "
+                             "(cadence=2s, GC=5m, response/Guardian reap=60m)");
                 constexpr int kGcEveryNTicks = 150;            // ~5 minutes at 2s/tick
                 // Guardian retention reap (ADR-0038): matches the old SQLite cleanup
                 // thread's 60-minute default cadence (cleanup_interval_min). Piggybacks
@@ -12603,6 +13227,12 @@ private:
                 // guarded/advisory-locked pass regardless of which thread calls it.
                 constexpr int kGuardianReapEveryNTicks = 1800; // ~60 minutes at 2s/tick
                 constexpr int64_t kPendingTimeoutSeconds = 300; // give up waiting after 5m
+                // ADR-0039: response_store_'s reap_expired() piggybacks this same
+                // thread at a ~60-minute cadence (matches the old in-process
+                // cleanup thread's default `cleanup_interval_min`), independently
+                // is_open-gated (JC-6 decoupling — a response-store outage must
+                // not wedge the result-set GC/materialize work above).
+                constexpr int kResponseReapEveryNTicks = 1800; // ~60 minutes at 2s/tick
                 int tick = 0;
                 while (!stop_requested_.load(std::memory_order_acquire)) {
                     for (int i = 0; i < 2 && !stop_requested_.load(std::memory_order_acquire); ++i)
@@ -12614,12 +13244,20 @@ private:
                                                 std::chrono::system_clock::now().time_since_epoch())
                                                 .count();
 
+                        // Each unit of work below is INDEPENDENTLY is_open-gated
+                        // (JC-6): the thread starts if any of the three stores is
+                        // open, so a closed result-set store must not crash the
+                        // response/Guardian reaps (or vice-versa). `tick`
+                        // increments unconditionally so a closed result-set store
+                        // never starves the response/Guardian reap cadences.
+                        const bool rs_ok = result_set_store_ && result_set_store_->is_open();
+                        ++tick;
+
                         // 1) Materialise terminal pending sets (result-set store
-                        // only; the thread may be running solely for the Guardian
-                        // reap — JC-6 decoupling).
-                        for (const auto& p : (result_set_store_ && result_set_store_->is_open())
-                                                 ? result_set_store_->list_pending()
-                                                 : std::vector<yuzu::server::PendingSet>{}) {
+                        // only; the thread may be running solely for the response
+                        // or Guardian reap — JC-6 decoupling).
+                        if (rs_ok)
+                        for (const auto& p : result_set_store_->list_pending()) {
                             if (p.source_execution_id.empty())
                                 continue;
                             bool terminal = false;
@@ -12641,8 +13279,14 @@ private:
                             std::vector<std::string> members;
                             std::unordered_set<std::string> seen;
                             if (response_store_) {
-                                for (const auto& r :
-                                     response_store_->query_by_execution(p.source_execution_id)) {
+                                auto rows = response_store_->query_by_execution(p.source_execution_id);
+                                if (!rows) {
+                                    // Degraded read: skip materializing THIS pending set
+                                    // this tick rather than risk a false-empty membership
+                                    // (ADR-0039) — it retries on the next 2s tick.
+                                    continue;
+                                }
+                                for (const auto& r : *rows) {
                                     if (!rs_matcher::response_matches(p.matcher, r.status, r.output))
                                         continue;
                                     if (seen.insert(r.agent_id).second)
@@ -12667,10 +13311,8 @@ private:
                             }
                         }
 
-                        // 2) GC sweep on the slow cadence (result-set store only).
-                        ++tick;
-                        if (result_set_store_ && result_set_store_->is_open() &&
-                            tick % kGcEveryNTicks == 0) {
+                        // 2) GC sweep on the slow cadence.
+                        if (rs_ok && tick % kGcEveryNTicks == 0) {
                             int swept = result_set_store_->gc_sweep();
                             if (swept > 0) {
                                 metrics_.counter("yuzu_result_set_gc_total")
@@ -12679,7 +13321,14 @@ private:
                             }
                         }
 
-                        // 2b) Guardian retention reap (ADR-0038) on its own, much
+                        // 2b) Response-store retention reap (~60m cadence, ADR-0039) —
+                        // replaces the old in-process cleanup thread.
+                        if (response_store_ && response_store_->is_open() &&
+                            tick % kResponseReapEveryNTicks == 0) {
+                            response_store_->reap_expired();
+                        }
+
+                        // 2c) Guardian retention reap (ADR-0038) on its own, much
                         // slower cadence — piggybacks on this thread's tick counter,
                         // independently gated on the Guardian store's own health.
                         if (guaranteed_state_store_ && guaranteed_state_store_->is_open() &&
@@ -12687,8 +13336,8 @@ private:
                             guaranteed_state_store_->reap_expired();
                         }
 
-                        // 3) Refresh alive gauges (result-set store only).
-                        if (result_set_store_ && result_set_store_->is_open()) {
+                        // 3) Refresh alive gauges.
+                        if (rs_ok) {
                             auto c = result_set_store_->counts();
                             metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "true"}})
                                 .set(static_cast<double>(c.pinned));
@@ -13057,7 +13706,7 @@ private:
                     return out;
                 ResponseQuery q;
                 q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
-                for (const auto& r : response_store_->query(command_id, q))
+                for (const auto& r : response_store_->query(command_id, q).value_or(std::vector<StoredResponse>{}))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
@@ -13279,7 +13928,7 @@ private:
                     return out;
                 ResponseQuery q;
                 q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
-                for (const auto& r : response_store_->query(command_id, q))
+                for (const auto& r : response_store_->query(command_id, q).value_or(std::vector<StoredResponse>{}))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
@@ -13615,8 +14264,11 @@ private:
                     return {};
                 ResponseQuery q;
                 q.limit = 50000; // > cohort cap (20000) with headroom; keyset paging is a follow-up
+                // Degrade → empty (ADR-0039 deny-or-benign): reads as "no agent
+                // has responded yet", never a fabricated stage transition.
                 return deployment::best_response_per_agent(
-                    response_store_->query_by_execution(execution_id, q));
+                    response_store_->query_by_execution(execution_id, q)
+                        .value_or(std::vector<StoredResponse>{}));
             },
             audit_fn, preflight_run_store_.get(), deployment_run_store_.get());
 
@@ -13645,7 +14297,7 @@ private:
                     return out;
                 ResponseQuery q;
                 q.agent_id = agent_id; // #1634: scope the poll read AT THE STORE SEAM
-                for (const auto& r : response_store_->query(command_id, q))
+                for (const auto& r : response_store_->query(command_id, q).value_or(std::vector<StoredResponse>{}))
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },

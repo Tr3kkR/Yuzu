@@ -88,6 +88,12 @@ a reviewed runbook rather than summarised here. Until that lands, see
 [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to
 configure OIDC.
 
+## Behaviour change: MCP approval-store permanent failures now say don't retry (#2786)
+
+An MCP approval-ticket recall that hits a store fault has always returned `-32603` with a `retry_after_ms` hint. Previously that hint was `5000` (retry after 5 seconds) for every store fault except a never-opened store, including one that was open but failing in a way no amount of retrying clears — SQLite corruption, not-a-database, a read-only filesystem, or a full disk. Those four cases now correctly get `retry_after_ms: null` (the same "escalate to an operator" response a never-opened store gets) instead of the transient retry hint.
+
+**What to do:** if you have automation that blindly retries on `-32603` without checking `retry_after_ms`, it now stops retrying sooner in this specific case — which is the correct behavior (the old retries were futile). If your automation already honors `retry_after_ms` per [invariant A5](../agentic-first-principle.md), no change is needed. See [`mcp.md`](mcp.md) "`-32603`: Approval store unavailable" for the full response-body reference.
+
 ## Behaviour change: `mcp.bridge.*` audit rows can now carry `result=failure` (#2487 / #2506)
 
 Audit rows for the MCP progress bridge (`mcp.bridge.done_reap`, `session_dead`, `arming_reaped`, `pin_acked`, `forced_expire`) were previously stamped `result=success` unconditionally, regardless of what actually happened. They now report the real outcome: `result=failure` when a background teardown could not release one of the resources it owns, or when the terminal-frame publish ladder poisoned the session, threw, or was never reached. The `detail` field names which, and no longer asserts a delivery or a poisoning that did not occur.
@@ -536,6 +542,34 @@ What to expect / do:
 - **Back up `<ca-dir>/default-ca.key` (0600) and the new `ca.db`** in `--data-dir`
   — losing the CA key forces a full fleet re-enrollment.
 - Relocate the cert directory with `--ca-dir` (e.g. a dedicated container volume).
+
+## ⚠️ Behaviour change: response history resets on Postgres cutover (ADR-0039)
+
+`ResponseStore` (agentic command/instruction results — the executions drawer
+and TAR read source) moves from the SQLite `responses.db` file to the server's
+PostgreSQL substrate in this release (ADR-0006 Wave 1, schema `response_store`).
+Like the `ApiTokenStore` and AuthDB cutovers, this is a **fresh-start cutover
+with no data migration** — response results are expendable, TTL'd telemetry
+(ADR-0009 skippable backfill), so the legacy `responses.db` is **never read** on
+upgrade.
+
+**What happens on first PG boot:**
+- The server logs a one-time `response history reset on Postgres cutover`
+  warning.
+- Executions-drawer and TAR views for commands issued **before** the cutover
+  are empty; results for commands issued after are unaffected and refill
+  immediately as agents report.
+- No operator action required. To preserve pre-cutover response history,
+  export it from the old `responses.db` before upgrading (see
+  `docs/user-manual/response-store.md` → periodic exports).
+
+**Also in this release:** non-UTF-8 bytes in a plugin's output/error (which
+the old SQLite `TEXT` column tolerated but PostgreSQL `TEXT` rejects) are now
+replaced with the Unicode replacement character (U+FFFD) at ingest — the
+response row is still stored and still renders, defanged, rather than being
+dropped (governance #1593). Retention moved from an hourly background thread
+to a clock-guarded, capped reap on the maintenance tick (no operator-visible
+behaviour change beyond the same 90-day default).
 
 ## ⚠️ Breaking: local accounts + MFA enrolments reset (AuthDB/ScimStore → Postgres, ADR-0006)
 

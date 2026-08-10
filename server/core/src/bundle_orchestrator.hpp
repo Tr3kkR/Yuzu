@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -42,6 +43,17 @@ class MetricsRegistry; // optional metrics sink (yuzu_bundle_*)
 namespace yuzu::server {
 
 class ResponseStore; // collate reads responses by correlation id
+
+/// `collate()`'s error channel (#2691, Doomgoose finding #3). `kNotFoundOrDenied`
+/// deliberately conflates "unknown/expired correlation id" with "known but not
+/// owned by this principal" — existence must not become an enumeration oracle,
+/// so both map to the same caller-facing 404. `kDegraded` is a DISTINCT signal:
+/// the underlying ResponseStore read failed (store/pool/query error), which the
+/// caller must map to a retryable 503/kInternalError, never the same 404 a
+/// genuinely-absent bundle gets — conflating the two previously meant a poll
+/// hitting a transient store blip saw a terminal "not found" (and, on REST, a
+/// false "denied" audit row) instead of a signal to retry.
+enum class CollateError { kNotFoundOrDenied, kDegraded };
 
 class BundleOrchestrator {
 public:
@@ -107,11 +119,14 @@ public:
                             const std::string& principal, const AuditSink& audit,
                             const yuzu::server::authz::VisibleSet& exec_visible = {});
 
-    /// Collate the bundle's responses. Returns nullopt when the correlation id
-    /// is unknown/expired OR not owned by `principal` (and not `is_admin`) — the
-    /// caller maps nullopt to a 404 so existence isn't an enumeration oracle;
-    /// the real reason is audited by the wrapper.
-    [[nodiscard]] std::optional<BundleAggregate>
+    /// Collate the bundle's responses. Returns `unexpected(kNotFoundOrDenied)`
+    /// when the correlation id is unknown/expired OR not owned by `principal`
+    /// (and not `is_admin`) — the caller maps this to a 404 so existence isn't
+    /// an enumeration oracle; the real reason is audited by the wrapper.
+    /// Returns `unexpected(kDegraded)` when the manifest was found and owned
+    /// but the underlying ResponseStore read failed — the caller maps THIS to
+    /// a retryable 503/kInternalError, distinct from the terminal 404 above.
+    [[nodiscard]] std::expected<BundleAggregate, CollateError>
     collate(const std::string& correlation_id, const std::string& principal, bool is_admin);
 
     /// Correlation-id prefix. `notify_exec_tracker` skips ids with this prefix

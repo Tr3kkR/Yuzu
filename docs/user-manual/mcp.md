@@ -775,9 +775,9 @@ proposes.
    than another one — #2442) and **atomically consumes** the ticket (one-time —
    a replay, a mismatched tool/args, or a ticket from another surface, returns
    `-32003` `PermissionDenied`), then executes. A `-32603` means the store
-   failed while consuming, not that the ticket is spent. Note that a store
-   failure during the earlier lookup is *not* separated out and also returns
-   `-32003`; the error-code reference explains why that matters.
+   failed at either the lookup or the consume step, not that the ticket is
+   spent — see the error-code reference below for the fix, which is the
+   opposite of `-32003`'s.
 
 ### What requires approval
 
@@ -962,6 +962,24 @@ oracle). Sessions are in-memory, so a **server restart** also drops them.
 **Fix**: Re-run `initialize` to mint a fresh `Mcp-Session-Id` and retry. Sessions
 are never required — a client may also simply omit the header and use plain POST.
 
+> **A live session can also end up here — not only via streamed POST.** A
+> `GET` resume presenting `Last-Event-ID` for a frame no longer in the replay
+> ring terminates the session server-side rather than answering with a gap:
+> `-32007` / HTTP 404, `error.message` "Replay window exceeded", audited as
+> `mcp.session.close` with `reason=replay_window_exceeded`. This is ordinary
+> ring eviction, reachable today — with `--mcp-enable-streamed-post` off — by
+> any GET-channel client that falls behind the ring's own capacity.
+> `--mcp-enable-streamed-post` adds a second, faster way to reach the same
+> state: a session whose client disconnects and retries repeatedly can hit a
+> further streamed call's admission reclaim (see "A pin released to admit a
+> new call" in `docs/mcp-server.md`) — each reclaim releases one undelivered
+> final's eviction exemption, after which ordinary ring eviction can reach it
+> like any other unpinned frame. Either way, the session is gone once this
+> fires, same as the causes above —
+> re-initialize. Nothing about the underlying result is lost: it stays fetchable
+> by `execution_id` (`get_execution_status` / `query_responses`), which is what
+> this error's own remediation already points at.
+
 ### -32008: Origin not allowed (HTTP 403)
 
 **Symptom**: A request carrying an `Origin` header returns `-32008` / HTTP `403`.
@@ -1046,6 +1064,62 @@ second).
 **Fix**: Honour `retry_after_ms`. Close a stream you no longer need (drop the GET
 connection, or `DELETE /mcp/v1/` the session), or raise the cap. Do **not** blind-retry
 in a tight loop — the cap is protecting the worker pool that also serves your POSTs.
+
+> **Same code, four more causes (streamed POST, `--mcp-enable-streamed-post`).**
+> A `POST` to `/mcp/v1/` requesting an SSE-capable stream (`_meta.progressToken`
+> plus an SSE-capable `Accept`) can also return `-32012` / HTTP `429`, with
+> `retry_after_ms` fixed at 30s — longer than the GET-channel figure above,
+> since none of these causes is likely to clear within a second or two.
+> `error.data` carries no machine-readable cause label, only `remediation`
+> text — read it in full, since more than one cause can share the same
+> `error.message`. Two checkpoints, in order:
+>
+> **Checked before the call is even accepted** (`error.message`: "Concurrent
+> stream cap reached"; no record is created, so nothing to clean up):
+>
+> - the shared `--max-sse-streams` budget — every streaming surface on this
+>   server draws from one pool (MCP GET, MCP streamed POST, `/api/v1/events`,
+>   dashboard, legacy `/events`) — is exhausted. Remediation: retry shortly, or
+>   resend the same request without an SSE-capable `Accept` for a plain
+>   (non-streamed) response.
+> - this principal's own streamed-POST allowance, summed across every session
+>   that principal holds open, is exhausted. This is a **fixed 4 concurrent
+>   calls per principal** — numerically the same as, but counted and enforced
+>   separately from, any single session's own replay-ring pin-slot count (the
+>   next checkpoint below) — and it is **not** governed by
+>   `--mcp-max-streams-per-principal`. That flag affects only the GET channel;
+>   a principal's total held-open ceiling across both channels is that value +
+>   4. Remediation: wait for one of your streamed calls to finish, or resend
+>   the same request without an SSE-capable `Accept` for a plain
+>   (non-streamed) response.
+>
+> **Checked during admission itself, after that budget was already available**
+> (`error.message`: "Streamed request capacity reached"):
+>
+> - a server-wide ceiling on the total count of progress-tracked calls the
+>   server is still holding open (executing, or finished with results not
+>   yet delivered; streamed or not, across every session and principal) is
+>   full. This is an internal capacity limit, not adjustable by any flag.
+>   Remediation: retry shortly, or resend without an SSE-capable `Accept`.
+> - this session's own streamed-call slots are full — some held by results
+>   that have not reached a client yet, some by calls still executing with
+>   no result yet at all, or both. Admission first tries to reclaim a slot
+>   from an undelivered final before refusing — see "A pin released to
+>   admit a new call" in `docs/mcp-server.md` — so reaching this refusal
+>   means either no undelivered final existed to reclaim, or one did and
+>   couldn't be taken. The `remediation` text distinguishes two states:
+>   - if slots are held by results still being written, retry — a result
+>     still being written frees its slot as it lands. If this persists across
+>     several retries, resume the `GET` channel with `Last-Event-ID` set to
+>     one below the lowest id you still need — replay starts strictly above
+>     the cursor, and the cursor releases every pinned final at or below it on
+>     this session. A gap on that resume, or having no cursor to send, means
+>     re-initializing for a fresh session and fetching results by
+>     `execution_id` (see `-32007` above for what a gap on this session's own
+>     reclaimed results looks like);
+>   - if slots are held by calls genuinely still in flight (not a stuck slot,
+>     just the concurrency limit), the remediation is simply to wait for one
+>     to finish.
 
 ### -32014: Streamed result no longer buffered
 
@@ -1152,50 +1226,57 @@ The last of those is deliberately indistinguishable from a replay in this
 response: reporting it separately would turn the recall into a probe for which
 surface minted a ticket. Server-side it is distinguishable — the audit row
 records `refused: foreign_origin`. The `yuzu_mcp_approval_refused_total` counter
-does **not** break the refusals down by reason — that breakdown is exactly what
-this response withholds, and `/metrics` is not a stronger reader than the caller
-— so alert on the refusal rate and read the audit trail for the kind.
+does **not** break the refusals down by reason: a store failure is already
+exposed via the response code (`-32603` vs `-32003`), and what stays withheld
+is the split *within* a `-32003` denial — foreign-origin vs an ordinary
+replay — which is exactly what this response refuses to make, and `/metrics`
+is not a stronger reader than the caller — so alert on the refusal rate and
+read the audit trail for the kind.
+
+If a store fault happens to coincide with this exact check — the recall's
+lookup step, or the consume step's own cross-surface origin comparison — a
+foreign-origin ticket cannot be told apart from an innocent one for the
+duration of the fault, and the refusal comes back as `-32603` (below), not
+this `-32003`. `yuzu_mcp_approval_masked_denials_total` counts those refusals
+specifically, and the audit row carries a `(lookup)` or `(origin unverified)`
+suffix, so the event is not silently indistinguishable from ordinary store
+contention.
 
 **Fix**: For an RBAC denial — grant the permission to the token creator's
 principal, or use an account with the required permissions. For a ticket recall —
 submit the call **without** `approval_id` to obtain a fresh approval ticket, then
 recall once it is approved.
 
-> **Do not apply that fix to a `-32603`.** A store failure at the CONSUME step
-> returns `-32603`, and its remediation is the opposite of this one's. See below.
->
-> **Known gap, and it points the wrong way.** A store failure at the earlier
-> TICKET-LOOKUP step is not distinguished: it reads as "no such ticket" and
-> surfaces here, as `-32003`, whose fix above tells you to re-submit without
-> `approval_id`. Following it during a transient store failure mints a duplicate
-> while your original approval is still outstanding, spending a second human
-> review. If you see `-32003` for a ticket you believe is valid and recently
-> approved, prefer retrying the identical call a few times before re-minting.
-> Separating a store failure from a missing ticket at the lookup step is a
-> follow-up change; it is not fixed in this release.
+> **Do not apply that fix to a `-32603`.** A store failure at the lookup or the
+> consume step returns `-32603`, and its remediation is the opposite of this
+> one's. See below.
 
 ### -32603: Approval store unavailable
 
 **Symptom**: An approval-ticket recall returns error code `-32603` rather than
-`-32003`. This comes from the CONSUME step — see the gap noted above for the
-lookup step, which does not produce this code.
+`-32003`. This can come from either step of a recall: the ticket lookup or the
+consume.
 
-**Cause**: The approval store could not be read or written while consuming the
-ticket. The ticket was **not** consumed.
+**Cause**: The approval store could not be read (or, at the consume step,
+written) while handling the ticket. The ticket was **not** consumed.
 
 It is not necessarily still usable, and the difference matters: the 7-day
 approval window keeps running during an outage, so an outage that outlasts the
 ticket's remaining window ends with it expired like any other.
 
-**Fix**: Retry the identical call, including the same `approval_id`, after at
-least the `retry_after_ms` the response carries (currently 5000).
+**Fix**: Check `retry_after_ms` in the response body — two distinct bodies
+share this code:
 
-Retrying indefinitely is not safe, and the response cannot currently tell you
-when to stop: a store that is failing permanently rather than transiently
-returns this same body, so a client that honours the hint forever will retry
-forever, and each attempt writes an audit row.
-Bound your own retries — a handful of attempts, then escalate to an operator.
-Distinguishing permanent from transient here is a follow-up change.
+- **`retry_after_ms` is a number (currently 5000)**: the store is open and the
+  read or write failure is classified transient — retry after the hint.
+  Retrying indefinitely is still not unconditionally safe (an operator-side
+  escalation is always a reasonable backstop), but this body no longer
+  conflates "failing right now" with "failing permanently": a store that is
+  open but failing in a way an unchanged retry cannot clear (corruption,
+  not-a-database, read-only, disk full) takes the other arm below instead.
+- **`retry_after_ms` is `null`**: either the store never opened, or it is open
+  but failing permanently (corruption, not-a-database, read-only, disk full).
+  Neither will clear on retry; escalate to an operator immediately.
 
 Do **not** re-submit without `approval_id` while the approval
 window is still open: the ticket was not consumed, and minting a fresh one asks

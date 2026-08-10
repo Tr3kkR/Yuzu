@@ -185,11 +185,15 @@ private:
                                    const std::string& definition_id = {},
                                    const std::string& template_id = {});
 
-    /// Render group creation form.
+    /// Render group creation form. `agent_count` nullopt (#2691, Doomgoose
+    /// finding #7) renders an honest "count unavailable" hint instead of a
+    /// number — the store read that produces it can degrade, and "0 agents
+    /// will be added" is a materially different, wrong claim from "the count
+    /// could not be determined".
     std::string render_create_group_form(const std::string& command_id,
                                           const std::string& plugin,
                                           const std::vector<FacetFilter>& filters,
-                                          int64_t agent_count);
+                                          std::optional<int64_t> agent_count);
 
     /// Render scope list with groups section.
     std::string render_scope_list(const std::string& selected, const std::string& username);
