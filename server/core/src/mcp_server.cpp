@@ -3432,8 +3432,23 @@ McpServer::HandlerFn McpServer::build_handler(
                         const auto rot_token_id = param_str(args, "token_id");
                         precondition = [this, rot_principal_id,
                                         rot_token_id](const Approval&) -> std::expected<void, std::string> {
+                            // Same reasoning as kNoneActive below: passing this
+                            // through was the bug, not the fix. The handler's
+                            // own store-open guard (further down this file,
+                            // right before its confirm_rotation call) runs
+                            // AFTER consume_ticket, not before - so a
+                            // pass-through here consumes the ticket first and
+                            // only then hits that guard, burning a
+                            // human-approved capability on a no-op exactly
+                            // like an unresolved kNoneActive read would.
+                            // Denying costs nothing: the ticket stays valid
+                            // and the retry is free, and the handler would
+                            // have refused anyway (its own guard reports
+                            // "transient", retryable) - deny-here just avoids
+                            // paying for that refusal with the ticket.
                             if (!engine_credential_store_ || !engine_credential_store_->is_open())
-                                return {}; // pass through; the handler's own store-open guard reports this
+                                return std::unexpected(
+                                    "engine credential store unavailable; retry");
                             const auto active =
                                 engine_credential_store_->list_active_for_principal(rot_principal_id);
                             using yuzu::server::detail::classify_confirm_state;

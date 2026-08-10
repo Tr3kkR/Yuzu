@@ -1652,9 +1652,9 @@ TEST_CASE("MCP confirm_engine_rotation: a pre-consume precondition denies a drif
     REQUIRE_FALSE(successor_token_id.empty());
 
     yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_confirm_precond_appr-"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
-    yuzu::server::ApprovalManager appr(raw);
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
     appr.create_tables();
 
     yuzu::MetricsRegistry reg;
@@ -1752,8 +1752,6 @@ TEST_CASE("MCP confirm_engine_rotation: a pre-consume precondition denies a drif
     // store call would have produced (none, since that bypassed MCP).
     CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
                      std::string("engine_principal.credential.confirm|success")) == 0);
-
-    sqlite3_close(raw);
 }
 
 TEST_CASE("MCP confirm_engine_rotation: a NEWER rotation's mismatched pin is caught by "
@@ -1788,9 +1786,9 @@ TEST_CASE("MCP confirm_engine_rotation: a NEWER rotation's mismatched pin is cau
     REQUIRE_FALSE(token_a.empty());
 
     yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_confirm_newer_pair_appr-"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
-    yuzu::server::ApprovalManager appr(raw);
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
     appr.create_tables();
 
     McpTestServer ts;
@@ -1849,8 +1847,6 @@ TEST_CASE("MCP confirm_engine_rotation: a NEWER rotation's mismatched pin is cau
             d.find("refused: precondition") != std::string::npos)
             precondition_denied_audited = true;
     CHECK(precondition_denied_audited);
-
-    sqlite3_close(raw);
 }
 
 TEST_CASE("MCP confirm_engine_rotation: precondition ALLOWS an undrifted recall through to "
@@ -1889,9 +1885,9 @@ TEST_CASE("MCP confirm_engine_rotation: precondition ALLOWS an undrifted recall 
     REQUIRE_FALSE(successor_token_id.empty());
 
     yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_confirm_allow_appr-"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
-    yuzu::server::ApprovalManager appr(raw);
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
     appr.create_tables();
 
     yuzu::MetricsRegistry reg;
@@ -1968,8 +1964,6 @@ TEST_CASE("MCP confirm_engine_rotation: precondition ALLOWS an undrifted recall 
     REQUIRE(active.size() == 1);
     CHECK(active.front().token_id == successor_token_id);
     CHECK(active.front().confirmed_at != 0);
-
-    sqlite3_close(raw);
 }
 
 TEST_CASE("MCP confirm_engine_rotation: a revoke-to-zero (kNoneActive) denies WITHOUT "
@@ -2006,9 +2000,9 @@ TEST_CASE("MCP confirm_engine_rotation: a revoke-to-zero (kNoneActive) denies WI
     REQUIRE_FALSE(predecessor_token_id.empty());
 
     yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_confirm_none_active_appr-"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
-    yuzu::server::ApprovalManager appr(raw);
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
     appr.create_tables();
 
     yuzu::MetricsRegistry reg;
@@ -2081,8 +2075,87 @@ TEST_CASE("MCP confirm_engine_rotation: a revoke-to-zero (kNoneActive) denies WI
             d.find("refused: precondition: no active credential found") != std::string::npos)
             precondition_denied_audited = true;
     CHECK(precondition_denied_audited);
+}
 
-    sqlite3_close(raw);
+TEST_CASE("MCP confirm_engine_rotation: a closed/unwired engine-credential store "
+          "denies WITHOUT consuming, not a pass-through that burns the ticket "
+          "at the handler's own guard (#2443, fjarvis Gate-8-followup review)",
+          "[mcp][engine_principal][confirm][approval]") {
+    // The precondition's own closed-store check used to `return {}`
+    // (pass-through), reasoning that "the handler's own store-open guard
+    // reports this" - but the handler's guard runs AFTER consume_ticket, not
+    // before, so that pass-through consumed the ticket and only then hit the
+    // handler's guard: burning a human-approved capability on a no-op,
+    // exactly the kNoneActive shape two tests above. No live PG token store
+    // needed here - the whole point is the precondition never reaches one.
+    yuzu::test::TempDbFile adb{
+        std::string_view{"yuzu_test_mcp_confirm_closed_store_appr-"}};
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    // Deliberately NOT set: ts.engine_credential_store_for_test - the
+    // precondition's `!engine_credential_store_` arm is what this test
+    // exercises.
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("supervised");
+
+    const auto precondition_denied_metric = [&]() {
+        return reg
+            .counter("yuzu_mcp_approval_precondition_denied_total",
+                     {{"tool", "confirm_engine_rotation"}})
+            .value();
+    };
+
+    auto mint = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 1},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments", {{"principal_id", "engine:mcp-confirm-closed-store"},
+                         {"token_id", "deadbeefdeadbeefdeadbeef"}}}}}}
+                            .dump());
+    REQUIRE(mint->status == 200);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE_FALSE(approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    auto recall = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 2},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments",
+           {{"approval_id", approval_id},
+            {"principal_id", "engine:mcp-confirm-closed-store"},
+            {"token_id", "deadbeefdeadbeefdeadbeef"}}}}}}
+                              .dump());
+    REQUIRE(recall->status == 200);
+    auto recall_body = nlohmann::json::parse(recall->body);
+    REQUIRE(recall_body.contains("error")); // denied, not passed through to the handler
+
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0); // NOT burned on a store that was never open
+    CHECK(row->status == "approved");
+
+    CHECK(precondition_denied_metric() == 1.0);
+
+    bool precondition_denied_audited = false;
+    for (const auto& d : ts.audit_details)
+        if (d.find("approval_id=" + approval_id) != std::string::npos &&
+            d.find("refused: precondition: engine credential store unavailable") !=
+                std::string::npos)
+            precondition_denied_audited = true;
+    CHECK(precondition_denied_audited);
 }
 
 // ── 2. ping ─────────────────────────────────────────────────────────────────
