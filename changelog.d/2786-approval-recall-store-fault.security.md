@@ -8,5 +8,5 @@
   share one response body: an open store reports a temporary failure with a machine-readable
   `retry_after_ms`; a store that never opened reports a permanent failure with none, since only an
   operator restarting the server can clear it. This closes arm 2 of #2786; arm 1 (the security
-  signal a masked foreign-origin refusal loses) and the open-handle-permanent-failure gap remain
-  open, tracked for a follow-up change.
+  signal a masked foreign-origin refusal loses) and the open-handle-permanent-failure gap are
+  closed by a follow-up change in the same release.
