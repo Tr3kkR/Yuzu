@@ -112,7 +112,11 @@ jobs:
   prometheus-rules:
     name: Prometheus alert rules
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # 10 -> 15 for #2854 rung B: a second promtool step (the coverage-manifest
+    # check below) now shares this job's budget. Both steps together were
+    # measured locally at well under a minute against the pinned image; the
+    # extra 5 minutes is margin for a cold image pull, not the steady-state cost.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -142,3 +146,17 @@ jobs:
           # takes precedence over any promtool that happens to be on PATH.
           YUZU_TEST_ENABLE_PROMTOOL_DOCKER: "1"
         run: python3 tests/prometheus/run_promtool_tests.py
+
+      # #2854 rung B: the coverage-manifest gate. Distinct from the step above -
+      # `run_promtool_tests.py` proves the shipped rules parse and behave per
+      # `tests/prometheus/yuzu-alerts.test.yml`'s hand-written cases;
+      # `blind_band_sweep.py --check` proves the audit-retention alert family's
+      # measured COVERAGE across a swept range of restart cadences has not
+      # silently widened relative to the committed
+      # `tests/prometheus/blind_band_manifest.json`. Same opt-in, same pinned
+      # image (imported from the script above, not a second copy), same
+      # ubuntu-24.04 runner already carrying the PyYAML install above it.
+      - name: Audit-retention alert coverage manifest (promtool)
+        env:
+          YUZU_TEST_ENABLE_PROMTOOL_DOCKER: "1"
+        run: python3 tests/prometheus/blind_band_sweep.py --check
