@@ -2310,7 +2310,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (mcp_sessions->validate_and_touch(sid, session->username) !=
                     McpSessionRegistry::ValidateResult::kValid) {
                     const auto cid = yuzu::server::detail::make_correlation_id();
-                    session_audit("mcp.session.reject", "failure", sid.substr(0, 8),
+                    // #2917: the session id is an attacker-controlled HEADER until
+                    // it validates, so the prefix that reaches an audit row is
+                    // sanitised — raw bytes could inject the `;`/`=` field
+                    // separators audit tooling parses. The GET and DELETE
+                    // siblings already do this (DELETE's own comment notes it
+                    // was fixed to match GET); this POST path was passing it
+                    // through raw.
+                    session_audit("mcp.session.reject", "failure",
+                                  yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8)),
                                   "reason=unknown_session cid=" + cid);
                     res.status = 404;
                     // Echo the request id — this is a post-parse error with a known
@@ -9849,7 +9857,7 @@ McpServer::HandlerFn McpServer::build_delete_handler(AuthFn auth_fn, AuditFn aud
         }
         // The session id is an attacker-controlled HEADER until it validates, so the
         // prefix that reaches an audit row is sanitised — raw bytes could inject the
-        // `;`/`=` field separators audit tooling parses, or CR/LF. The GET sibling in
+        // `;`/`=` field separators audit tooling parses. The GET sibling in
         // mcp_stream.cpp already does this; DELETE takes the same untrusted input into
         // the same verbs and was passing it through raw.
         const auto audit_sid = yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8));
