@@ -4366,15 +4366,21 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
         out.failed = fx.reg.counter("yuzu_mcp_bridge_pin_release_failed_total").value();
         out.displaced =
             fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value();
-        // The RING's own LRU-eviction counter (mcp_stream.cpp) — a distinct metric
-        // from the bridge-level admission-reclaim one above, despite the similar
-        // name. This residual's admission-time reclaim never touches it: selecting
-        // and releasing a pin for the ADMISSION side is a separate code path from
-        // publish()'s pin-full LRU branch, which is what actually increments this
-        // counter (#2795's acceptance criteria named this assertion explicitly).
-        // Not a claim that the ring branch can never fire from a LATER event on
-        // this same session (docs/mcp-server.md's "Terminal durability" prose
-        // says it can) — only that THIS reclaim, here, does not reach it.
+        // The pin-slot array's own LRU-displacement counter (mcp_stream.cpp,
+        // kMetricPinDisplaced) - a distinct metric from the bridge-level
+        // admission-reclaim one above, and NOT the replay ring's own frame-
+        // eviction counter (kMetricRingEvictions /
+        // yuzu_mcp_stream_replay_ring_evictions_total) despite the "ring"-
+        // adjacent name: this one only strips a pinned terminal's eviction
+        // EXEMPTION, it never evicts a frame from the ring itself. This
+        // residual's admission-time reclaim never touches it: selecting and
+        // releasing a pin for the ADMISSION side is a separate code path from
+        // publish()'s pin-slot-full LRU branch, which is what actually
+        // increments this counter (#2795's acceptance criteria named this
+        // assertion explicitly). Not a claim that this branch can never fire
+        // from a LATER event on this same session (docs/mcp-server.md's
+        // "Terminal durability" prose says it can) - only that THIS reclaim,
+        // here, does not reach it.
         out.ring_displaced = fx.reg.counter("yuzu_mcp_stream_pin_displaced_total").value();
         out.audits = fx.audit_count("mcp.bridge.pin_displaced_for_admission");
         // POSITIVELY confirm the over-admission rather than inferring it from the absence
@@ -4394,7 +4400,7 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
         // Not credited as a displacement, and not audited: no exemption was released by
         // us, so attributing that loss to the admitting principal would be a false record.
         CHECK(out.displaced == 0.0);
-        CHECK(out.ring_displaced == 0.0);  // the ring's own LRU eviction never fires either
+        CHECK(out.ring_displaced == 0.0);  // the pin-slot LRU displacement never fires either
         CHECK(out.audits == 0);
         CHECK(out.still_pinned == 4);  // the pin was NOT released - the session is over cap
     }
