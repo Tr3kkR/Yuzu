@@ -362,13 +362,27 @@ private:
     mutable std::unordered_map<std::string, bool> perm_cache_; // "user:type:op" -> allow/deny
     mutable uint64_t cached_generation_{0};   // durable generation perm_cache_ is valid for
     mutable bool generation_valid_{false};    // false ⇒ assume-changed, do not trust cache
-    mutable int64_t last_generation_refresh_ms_{0};
+    // fjarvis F3 (#2703): split from a single timestamp. `refresh_started_ms_`
+    // gates whether a NEW refresh attempt may begin (stampede/retry-storm
+    // prevention) and is bumped BEFORE the query runs. `last_successful_refresh_ms_`
+    // is bumped ONLY when a refresh actually lands (or on a local write via
+    // `apply_local_generation`) and is the honest measure of cache freshness —
+    // a single shared timestamp bumped pre-query let a concurrent reader
+    // during an in-flight refresh believe the cache was fresh-as-of-now when
+    // it was really fresh-as-of-the-PREVIOUS successful refresh, silently
+    // falsifying the accepted ~kRbacGenerationRefreshMs staleness bound for
+    // however long the in-flight query took.
+    mutable int64_t refresh_started_ms_{0};
+    mutable int64_t last_successful_refresh_ms_{0};
 
     /// At most once per `kRbacGenerationRefreshMs`, re-read the durable
     /// `write_generation` + `rbac_enabled` in ONE query; on a generation change
     /// clear `perm_cache_`; on ANY error clear the cache and mark it invalid
     /// (assume-changed — never extend trust). Leaves `rbac_enabled_` unchanged
-    /// on a read error (never flips to disabled/fail-open).
+    /// on a read error (never flips to disabled/fail-open). A concurrent
+    /// caller that misses the gate while a refresh is in flight AND finds the
+    /// cache already past the accepted bound counts a `stale_beyond_accepted_bound`
+    /// degrade (fjarvis F3) — the acceptance is measured, not assumed.
     void maybe_refresh_generation() const;
 
     /// Apply a locally-committed durable generation: clear `perm_cache_`, set

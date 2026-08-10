@@ -1,6 +1,7 @@
 #include "rbac_store.hpp"
 
 #include "management_group_store.hpp"
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -50,6 +51,13 @@ constexpr std::int64_t kRbacGenerationRefreshMs = 1000;
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
 constexpr const char* kReasonRefreshFailed = "generation_refresh_failed";
+// fjarvis F2 (#2703): the durable rbac_enabled row read back as neither
+// exactly "true" nor "false" — see parse_canonical_bool.
+constexpr const char* kReasonNonCanonicalFlag = "rbac_enabled_non_canonical";
+// fjarvis F3 (#2703): a reader observed the cache past the accepted
+// kRbacGenerationRefreshMs bound while a refresh was already in flight — see
+// RbacStore::maybe_refresh_generation.
+constexpr const char* kReasonStaleBeyondBound = "stale_beyond_accepted_bound";
 constexpr std::uint64_t kReadDegradeLogSample = 100;
 constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
 
@@ -110,6 +118,23 @@ std::uint64_t to_u64(const char* s) {
     return static_cast<std::uint64_t>(std::strtoull(s, nullptr, 10));
 }
 bool to_bool(const char* s) { return s != nullptr && (s[0] == 't' || s[0] == 'T' || s[0] == '1'); }
+
+/// Strict canonical-boolean parser for `rbac_meta.value` (rbac_enabled):
+/// unlike `to_bool` above (the loose native-PG-boolean-text convention —
+/// 't'/'T'/'1'), this column is application-level TEXT storing the EXACT
+/// literal "true"/"false" this store itself writes. fjarvis F2 (#2703): a
+/// loose `== "true"` comparison silently treats ANY other value ("TRUE",
+/// "1", corruption, a hand-edit) as false with no error — the RBAC-disabled
+/// fail-open direction. `nullopt` means the value is neither canonical
+/// string; every call site must treat that identically to an
+/// unreadable/missing flag (fail closed), never coerce it to false.
+std::optional<bool> parse_canonical_bool(std::string_view s) {
+    if (s == "true")
+        return true;
+    if (s == "false")
+        return false;
+    return std::nullopt;
+}
 
 std::string text_col(PGresult* res, int row, int col) {
     if (PQgetisnull(res, row, col))
@@ -229,6 +254,21 @@ const std::vector<pg::PgMigration>& migrations() {
         // `AccessReview` and `SoftwareLicensing` used. A migration is needed
         // only when a change cannot be expressed as an idempotent additive
         // re-seed (e.g. deleting rows).
+        // fjarvis F2 (#2703): guard rbac_enabled at the schema level too — a
+        // hand-edit or a future bug could otherwise write a non-canonical
+        // value that the C++-side `parse_canonical_bool()` strict parser
+        // would then correctly refuse to trust, but only at READ time
+        // (refusing boot / dropping the cache). A CHECK constraint rejects
+        // the bad value at WRITE time instead, which is strictly better: the
+        // write itself fails loudly rather than silently landing and waiting
+        // to be discovered on the next boot or refresh. Scoped to the one
+        // key this applies to — every other `rbac_meta` value
+        // (`write_generation`, `backfill_complete`) is not a boolean and
+        // must not be constrained.
+        {2, R"(
+            ALTER TABLE rbac_meta ADD CONSTRAINT rbac_meta_enabled_canonical
+                CHECK (key <> 'rbac_enabled' OR value IN ('true', 'false'));
+        )"},
     };
     return kMigrations;
 }
@@ -492,7 +532,22 @@ bool RbacStore::load_enabled_flag() {
                       static_cast<int>(r.status()));
         return false;
     }
-    rbac_enabled_.store(text_col(r.get(), 0, 0) == "true", std::memory_order_relaxed);
+    // fjarvis F2 (#2703): the row EXISTS and the query succeeded, so the
+    // branch above doesn't fire — but a value that isn't exactly "true" or
+    // "false" (a hand-edit, corruption, a future writer using a different
+    // convention) previously coerced silently to false via `== "true"`. That
+    // is boot-succeeds-RBAC-off on a fleet that enabled it — the same
+    // fail-open class the branch above exists to close, one level down.
+    // Treat a non-canonical value identically: refuse to start.
+    const auto enabled_parsed = parse_canonical_bool(text_col(r.get(), 0, 0));
+    if (!enabled_parsed) {
+        spdlog::error("RbacStore: durable rbac_enabled flag holds a non-canonical value "
+                      "(expected exactly \"true\" or \"false\") — refusing to start "
+                      "(fail-closed; coercing an unrecognised value to false would silently "
+                      "disable RBAC on a fleet that enabled it)");
+        return false;
+    }
+    rbac_enabled_.store(*enabled_parsed, std::memory_order_relaxed);
     // Anchor the generation cache from the durable counter so the first read
     // does not immediately re-query. This row is likewise init-guaranteed.
     pg::PgResult g = pg::exec_params(
@@ -506,7 +561,9 @@ bool RbacStore::load_enabled_flag() {
     std::lock_guard lock(cache_mtx_);
     cached_generation_ = to_u64(PQgetvalue(g.get(), 0, 0));
     generation_valid_ = true;
-    last_generation_refresh_ms_ = now_ms();
+    // Boot-time load is itself a genuine completed refresh — both timestamps
+    // are honestly "now" (fjarvis F3, #2703 — see the member comments).
+    refresh_started_ms_ = last_successful_refresh_ms_ = now_ms();
     return true;
 }
 
@@ -517,19 +574,44 @@ void RbacStore::maybe_refresh_generation() const {
         return;
     {
         std::lock_guard lock(cache_mtx_);
-        if ((now_ms() - last_generation_refresh_ms_) < kRbacGenerationRefreshMs)
+        if ((now_ms() - refresh_started_ms_) < kRbacGenerationRefreshMs) {
+            // fjarvis F3 (#2703): a refresh recently started (or is still in
+            // flight) elsewhere, so THIS thread must not also fire a query —
+            // that's the stampede this gate exists to prevent. But "someone
+            // recently started a refresh" is not the same claim as "the cache
+            // is fresh as of now" — the in-flight query may still be running.
+            // Measure against `last_successful_refresh_ms_` (bumped only on
+            // actual completion, never pre-emptively) so a slow in-flight
+            // refresh under load is COUNTED rather than silently trusted: the
+            // accepted ~kRbacGenerationRefreshMs bound stays honest instead of
+            // being falsified by whichever thread happens to check first.
+            if ((now_ms() - last_successful_refresh_ms_) >= kRbacGenerationRefreshMs) {
+                static DegradeSampler sampler;
+                if (note_read_degrade(metrics_, kReasonStaleBeyondBound, sampler))
+                    spdlog::warn(
+                        "RbacStore: cache read while a generation refresh is in flight AND "
+                        "already past the accepted {}ms staleness bound — serving the "
+                        "pre-refresh cache regardless (no cache to fail over to); this "
+                        "replica's rbac view may be stale beyond the accepted bound",
+                        kRbacGenerationRefreshMs);
+            }
             return;
-        // Claim the refresh for THIS thread by advancing the timestamp inside the
-        // gate before releasing the lock (Gate 3 perf). Otherwise every concurrent
-        // authz thread that crosses the interval boundary at once fires the SELECT
-        // + grabs a pool lease — an N-way refresh stampede once per interval under
-        // load, competing with real permission queries. Now exactly one thread
-        // refreshes per interval; the rest see the fresh stamp and return.
-        last_generation_refresh_ms_ = now_ms();
+        }
+        // Claim the refresh for THIS thread by advancing refresh_started_ms_
+        // inside the gate before releasing the lock (Gate 3 perf). Otherwise
+        // every concurrent authz thread that crosses the interval boundary at
+        // once fires the SELECT + grabs a pool lease — an N-way refresh
+        // stampede once per interval under load, competing with real
+        // permission queries. Now exactly one thread refreshes per interval;
+        // the rest see the fresh started-stamp and return (fjarvis F3: NOT
+        // last_successful_refresh_ms_ — that one earns its update on actual
+        // completion, below).
+        refresh_started_ms_ = now_ms();
     }
     // Read the durable generation + enabled flag WITHOUT holding cache_mtx_.
     std::optional<std::uint64_t> durable_gen;
     std::optional<bool> durable_enabled;
+    bool saw_non_canonical_enabled = false;
     if (auto lease = pool_.try_acquire_for(kReadTimeout)) {
         pg::PgResult r = pg::exec_params(
             lease.get(),
@@ -541,13 +623,26 @@ void RbacStore::maybe_refresh_generation() const {
                 const std::string k = text_col(r.get(), i, 0);
                 if (k == "write_generation")
                     durable_gen = to_u64(PQgetvalue(r.get(), i, 1));
-                else if (k == "rbac_enabled")
-                    durable_enabled = (text_col(r.get(), i, 1) == "true");
+                else if (k == "rbac_enabled") {
+                    // fjarvis F2 (#2703): parse strictly. A non-canonical
+                    // value leaves durable_enabled at nullopt, and the
+                    // existing "if (durable_enabled)" below already does the
+                    // right thing (leave rbac_enabled_ untouched) — the loose
+                    // `== "true"` this replaces silently coerced anything
+                    // non-canonical to false instead.
+                    durable_enabled = parse_canonical_bool(text_col(r.get(), i, 1));
+                    saw_non_canonical_enabled = !durable_enabled;
+                }
             }
         }
     }
     std::lock_guard lock(cache_mtx_);
-    last_generation_refresh_ms_ = now_ms();
+    if (saw_non_canonical_enabled) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonNonCanonicalFlag, sampler))
+            spdlog::warn("RbacStore: durable rbac_enabled refresh read a non-canonical value — "
+                         "leaving the cached enabled-state unchanged (never coercing to false)");
+    }
     if (!durable_gen) {
         // Fail toward "assume changed": drop the cache and stop trusting it. Do
         // NOT touch rbac_enabled_ — flipping it to disabled would be fail-open.
@@ -563,6 +658,9 @@ void RbacStore::maybe_refresh_generation() const {
         generation_valid_ = false;
         return;
     }
+    // The refresh genuinely landed — this is the ONLY place (besides boot and
+    // a local write) that earns a last_successful_refresh_ms_ update.
+    last_successful_refresh_ms_ = now_ms();
     if (durable_enabled)
         rbac_enabled_.store(*durable_enabled, std::memory_order_relaxed);
     // Adopt the durable generation only when it moves FORWARD (Gate 3 cpp-safety):
@@ -582,7 +680,9 @@ void RbacStore::apply_local_generation(std::uint64_t new_gen) const {
     perm_cache_.clear();
     cached_generation_ = new_gen;
     generation_valid_ = true;
-    last_generation_refresh_ms_ = now_ms();
+    // A locally-committed write is genuinely fresh data as of now — both
+    // timestamps earn the update (fjarvis F3, #2703).
+    refresh_started_ms_ = last_successful_refresh_ms_ = now_ms();
 }
 
 namespace {
@@ -2003,7 +2103,21 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                                "SELECT value FROM rbac_config WHERE key='enabled'", -1, s.addr(),
                                nullptr) == SQLITE_OK &&
             sqlite3_step(s.get()) == SQLITE_ROW) {
-            legacy_enabled = (sqlite_text(s.get(), 0) == "true") ? "true" : "false";
+            // fjarvis F2 (#2703): parse strictly rather than coercing any
+            // non-canonical value to "false" — the same fail-open class as
+            // the PG-side read this row is about to feed, one hop earlier.
+            const std::string raw = sqlite_text(s.get(), 0);
+            const auto parsed = parse_canonical_bool(raw);
+            if (!parsed) {
+                spdlog::error(
+                    "RbacStore: migrate_from_sqlite: legacy rbac_config.enabled holds a "
+                    "non-canonical value (expected exactly \"true\" or \"false\") — refusing "
+                    "backfill (fail-closed; coercing it to false would silently disable RBAC "
+                    "on a fleet that enabled it)");
+                backfill_metric("failed");
+                return false;
+            }
+            legacy_enabled = *parsed ? "true" : "false";
         }
     }
     {
@@ -2204,6 +2318,77 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                      {sanitize_pg_text(p.role_name), sanitize_pg_text(p.securable_type),
                       sanitize_pg_text(p.operation), sanitize_pg_text(p.effect)}))
                 return false;
+        // fjarvis F1 — seed_defaults() (constructor, runs before this backfill)
+        // unconditionally re-inserts every built-in default permission
+        // (ON CONFLICT DO NOTHING). If an operator called remove_permission()
+        // to revoke a built-in default in the legacy store, that revocation
+        // has no positive row to upsert against — the seeded row silently
+        // survives, and the row-count reconciliation below can't see it (PG
+        // always holds >= legacy counts by design; a missing-in-legacy row
+        // is invisible to a count check). Delete any PG role_permissions row
+        // whose role AND securable_type were BOTH known to legacy (so legacy
+        // could have had an opinion about it) but whose exact
+        // (role,type,op) triple is absent from legacy's own
+        // role_permissions — i.e. explicitly revoked, not merely
+        // never-seeded. Scoping to legacy's own catalogue is what protects a
+        // securable a LATER seed_defaults() adds (e.g. EnginePrincipal,
+        // #2376): its type is never in legacy's securable_types, so the
+        // role/type filter excludes it and the newly-seeded grant survives
+        // untouched. An empty legacy_role_names/legacy_type_names (a
+        // pre-securable_types-table legacy schema) makes both `= ANY`
+        // filters match nothing — degrades to "delete nothing" rather than
+        // guessing. Comparison values are sanitize_pg_text()'d identically
+        // to the INSERT above so a legacy string with invalid UTF-8/embedded
+        // NUL matches its own already-stored (equally sanitized) row instead
+        // of spuriously mismatching and deleting a row legacy still has.
+        {
+            std::vector<std::string> legacy_role_names, legacy_type_names, perm_roles, perm_types,
+                perm_ops;
+            legacy_role_names.reserve(roles.size());
+            for (const auto& r : roles)
+                legacy_role_names.push_back(sanitize_pg_text(r.name));
+            legacy_type_names.reserve(types.size());
+            for (const auto& t : types)
+                legacy_type_names.push_back(sanitize_pg_text(t.name));
+            perm_roles.reserve(perms.size());
+            perm_types.reserve(perms.size());
+            perm_ops.reserve(perms.size());
+            for (const auto& p : perms) {
+                perm_roles.push_back(sanitize_pg_text(p.role_name));
+                perm_types.push_back(sanitize_pg_text(p.securable_type));
+                perm_ops.push_back(sanitize_pg_text(p.operation));
+            }
+            const auto to_views = [](const std::vector<std::string>& v) {
+                std::vector<std::string_view> out;
+                out.reserve(v.size());
+                for (const auto& s : v)
+                    out.push_back(s);
+                return out;
+            };
+            pg::PgResult del = pg::exec_params(
+                c,
+                "DELETE FROM rbac_store.role_permissions rp "
+                "WHERE rp.role_name = ANY($1::text[]) "
+                "AND rp.securable_type = ANY($2::text[]) "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM unnest($3::text[], $4::text[], $5::text[]) "
+                "    AS legacy(role_name, securable_type, operation) "
+                "  WHERE legacy.role_name = rp.role_name "
+                "    AND legacy.securable_type = rp.securable_type "
+                "    AND legacy.operation = rp.operation"
+                ")",
+                std::vector<std::string>{pg::to_text_array(to_views(legacy_role_names)),
+                                         pg::to_text_array(to_views(legacy_type_names)),
+                                         pg::to_text_array(to_views(perm_roles)),
+                                         pg::to_text_array(to_views(perm_types)),
+                                         pg::to_text_array(to_views(perm_ops))});
+            if (del.status() != PGRES_COMMAND_OK) {
+                spdlog::error(
+                    "RbacStore: migrate_from_sqlite: revoked-permission cleanup failed: {}",
+                    PQerrorMessage(c));
+                return false;
+            }
+        }
         for (const auto& p : principals)
             if (!run("INSERT INTO rbac_store.principal_roles (principal_type, principal_id, "
                      "role_name) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",

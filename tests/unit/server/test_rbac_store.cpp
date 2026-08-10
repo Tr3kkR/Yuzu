@@ -1147,3 +1147,108 @@ TEST_CASE("RbacStore: backfill preserves an operator's deny-override on a seeded
             effect = p.effect;
     CHECK(effect == "deny");
 }
+
+// fjarvis F1 (#2703, HIGH) — the mirror image of R2 above. R2 is "legacy has
+// an explicit deny that collides with the seed" (DO UPDATE preserves it). F1
+// is "legacy has NOTHING for a seeded default" (no row to collide with): the
+// backfill's perms loop only iterates rows PRESENT in legacy, so a default
+// permission the operator explicitly removed via remove_permission() before
+// upgrading has no positive row to upsert against. seed_defaults() (which
+// runs in the constructor, before this backfill) already re-added it, and
+// nothing deleted it. The row-count reconciliation can't catch this either
+// (PG always holds >= legacy counts by design — a missing-in-legacy row is
+// invisible to a count check). The fix scopes a DELETE to (role,type) pairs
+// legacy's OWN catalogue actually knew about, so it never touches a
+// securable a LATER seed_defaults() adds — e.g. EnginePrincipal, #2376 —
+// asserted explicitly below alongside the surgical role/type scoping.
+TEST_CASE("RbacStore: backfill deletes a seeded default permission the operator explicitly "
+          "removed in legacy",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_f1-"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_rbac_db(legacy.path, /*enabled=*/false);
+    {
+        sqlite3* db = nullptr;
+        REQUIRE(sqlite3_open(legacy.path.string().c_str(), &db) == SQLITE_OK);
+        // Legacy KNOWS about role "Viewer" and securable_type "AuditLog"
+        // (both existed pre-upgrade) — this is exactly what scopes the
+        // delete. Deliberately NO ('Viewer','AuditLog','Read') row: the
+        // operator called remove_permission() to revoke it before upgrading.
+        REQUIRE(sqlite3_exec(db,
+                             "INSERT INTO roles VALUES ('Viewer', 'seeded', 1, 0);"
+                             "INSERT INTO securable_types VALUES ('AuditLog', '', 1);",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(db);
+    }
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+
+    // THE FIX: the revoked default does not come back.
+    CHECK_FALSE(store.check_role_has_permission("Viewer", "AuditLog", "Read"));
+    // Surgical, not wholesale: an UNRELATED seeded default for the SAME role
+    // survives — its securable_type ("Response") is not in legacy's
+    // securable_types, so the type-filter excludes it from the delete.
+    CHECK(store.check_role_has_permission("Viewer", "Response", "Read"));
+    // A DIFFERENT role's grant on the SAME securable_type ("AuditLog")
+    // survives — "Administrator" is not in legacy's roles table, so the
+    // role-filter excludes it regardless of the type match.
+    CHECK(store.check_role_has_permission("Administrator", "AuditLog", "Read"));
+    // A securable that never existed in legacy at all — EnginePrincipal,
+    // #2376 — is never touched by this delete for either role: its type is
+    // absent from legacy's securable_types, so the type-filter excludes it
+    // outright. This is the assertion that would fail if the fix's scoping
+    // were loosened to "delete anything absent from legacy's perms".
+    CHECK(store.check_role_has_permission("Administrator", "EnginePrincipal", "Read"));
+    CHECK(store.check_role_has_permission("Viewer", "EnginePrincipal", "Read"));
+}
+
+// fjarvis F2 (#2703, HIGH), schema-level layer: `rbac_meta.value` for
+// key='rbac_enabled' is now constrained to exactly "true"/"false" (migration
+// v2). A write attempting anything else — a hand-edit, a future bug writing
+// a different boolean convention — must be rejected outright at write time,
+// not land silently and wait to be discovered on the next boot/refresh.
+TEST_CASE("RbacStore: rbac_meta rejects a non-canonical rbac_enabled value at write time",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    auto lease = rbac_pool_fx_.acquire();
+    REQUIRE(lease);
+    pg::PgResult r = pg::exec_params(
+        lease.get(), "UPDATE rbac_store.rbac_meta SET value = 'TRUE' WHERE key = 'rbac_enabled'",
+        std::vector<std::string>{});
+    CHECK(r.status() == PGRES_FATAL_ERROR);
+    // 23514 = check_violation (SQLSTATE) — confirms it's the new constraint
+    // firing, not some unrelated failure.
+    const char* sqlstate = PQresultErrorField(r.get(), PG_DIAG_SQLSTATE);
+    REQUIRE(sqlstate != nullptr);
+    CHECK(std::string(sqlstate) == "23514");
+}
+
+// fjarvis F2 (#2703, HIGH), application-level layer (defense in depth): even
+// with the schema-level guard bypassed — as an older un-migrated deployment
+// would be, or a maintenance script run with elevated privilege — a
+// non-canonical value already sitting in the row must not silently coerce to
+// "false" (RBAC-off) on the next boot. `load_enabled_flag()` must refuse.
+TEST_CASE("RbacStore: refuses to start on a non-canonical rbac_enabled value already in the row",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    {
+        auto lease = rbac_pool_fx_.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "ALTER TABLE rbac_store.rbac_meta DROP CONSTRAINT "
+                                "rbac_meta_enabled_canonical",
+                                std::vector<std::string>{})
+                    .ok());
+        REQUIRE(pg::exec_params(lease.get(),
+                                "UPDATE rbac_store.rbac_meta SET value = 'TRUE' WHERE key = "
+                                "'rbac_enabled'",
+                                std::vector<std::string>{})
+                    .ok());
+    }
+    // A fresh construction against the SAME (now-corrupted) database must
+    // refuse to open, not silently boot RBAC-off. seed_defaults()'s
+    // rbac_enabled INSERT is ON CONFLICT DO NOTHING, so it does not clobber
+    // the hand-set value before load_enabled_flag() reads it.
+    RbacStore reopened{rbac_pool_fx_};
+    CHECK_FALSE(reopened.is_open());
+}
