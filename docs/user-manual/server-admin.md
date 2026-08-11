@@ -688,8 +688,8 @@ per-principal bullets above because they are no longer conditional on opting in
   must be sized comfortably above the ~156 s worst-case bound derived in the
   Sizing bullet above** (120 s cap + pump ticks + the 30 s write timeout), not
   the ~30 s that sufficed for the GET channel alone. The shipped systemd unit
-  and every shipped `deploy/docker/docker-compose*.yml` use **210 s** — use that
-  as your own starting point if you're not deploying from one of those. This
+  and every shipped compose file that runs `yuzu-server` use **210 s** — use
+  that as your own starting point if you're not deploying from one of those. This
   was previously only a concern for operators who had explicitly enabled the
   flag; it is now the default posture for every deployment that takes no
   action.

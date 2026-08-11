@@ -362,7 +362,6 @@ groups:
             allocation pressure or a stream-teardown bug on the POST path
             specifically, distinct from the pre-existing GET-only degrade reasons
             in the same metric family.
-          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpBridgeProjectionDegraded
         expr: |
           yuzu_mcp_bridge_projection_degraded_total > 0
