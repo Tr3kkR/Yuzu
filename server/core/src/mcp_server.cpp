@@ -766,7 +766,7 @@ static const ToolDef kTools[] = {
     {"execute_bundle",
      "Fan one instruction out into several plugin actions on ONE device, async. The server "
      "dispatches each step as an ordinary command under a shared correlation id and returns "
-     "bundle_id + expected immediately (it does NOT wait). Poll get_bundle_result with the "
+     "bundle_id + agent_id + expected immediately (it does NOT wait). Poll get_bundle_result with the "
      "bundle_id for the collated result - bundles do NOT emit notifications/progress "
      "(no _meta.progressToken support in the 2f scope; polling is the contract here). Use "
      "this instead of N execute_instruction calls when refreshing a device "
