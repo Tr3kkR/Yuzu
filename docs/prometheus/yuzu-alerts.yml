@@ -1001,6 +1001,93 @@ groups:
             docs/ops-runbooks/rotation-sweep-clock-guard.md.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/rotation-sweep-clock-guard.md"
 
+      # #2964 round 3 review (finding 6): yuzu_rotation_sweep_lost_revocations_total
+      # existed with a metric describe() and TWO in-code cross-references
+      # ("the signal for THAT failure mode", see YuzuRotationSweepNotRunning's
+      # own annotation above) telling an operator to alert on it -- with no
+      # rule that actually did. An `Ok`, un-declined tick that loses every one
+      # of its per-pair revoke transactions to pool contention is invisible
+      # to every OTHER rule in this file (the classification transaction
+      # still commits, so the liveness gauge stays fresh and nothing declines
+      # -- see this metric's own describe() text in server.cpp). `> 0` over
+      # 15m, `for: 10m`: a single blip self-heals (each affected predecessor
+      # remains eligible and is retried the very next tick, per the metric's
+      # own doc comment), so this alert is scoped to a LOSS THAT PERSISTS
+      # across multiple ticks, not a one-off.
+      - alert: YuzuRotationSweepLostRevocations
+        expr: |
+          increase(yuzu_rotation_sweep_lost_revocations_total[15m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Rotation sweep is losing per-pair revoke transactions"
+          description: >-
+            yuzu_rotation_sweep_lost_revocations_total has been rising for at
+            least 10 minutes -- an accepted (Ok) sweep tick is selecting
+            eligible predecessors for auto-revoke and then losing some or all
+            of their per-pair revoke transactions (pool/lock/query fault, not
+            the benign already-resolved no-op). The classification
+            transaction still commits on schedule, so
+            yuzu_rotation_sweep_last_pass_timestamp_seconds stays fresh
+            throughout -- YuzuRotationSweepNotRunning cannot see this failure
+            mode. A likely cause is connection-pool exhaustion: this sweep
+            pins one connection for its store-wide session lock for the
+            WHOLE call, so every per-pair with_txn_for call needs a SECOND,
+            concurrently-available connection (the POOL-SIZE FLOOR documented
+            on ApiTokenStore::sweep_expired_rotations) -- check pool
+            saturation (yuzu_pg_pool_in_use / yuzu_pg_pool_size) alongside
+            this alert. Each affected predecessor remains eligible and is
+            retried on the next tick, so a persisting alert means the
+            underlying contention is ALSO persisting, not that credentials
+            are piling up unrevoked forever. Runbook:
+            docs/ops-runbooks/rotation-sweep-clock-guard.md.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/rotation-sweep-clock-guard.md"
+
+      # #2964 round 3 review (finding 6): yuzu_rotation_sweep_declined_total
+      # existed with no alert at all. A single decline is EXPECTED, routine
+      # SLA behaviour (docs/user-manual/authentication.md "Rotating a
+      # Token"; docs/user-manual/engine-principals.md) -- fact-set dedup
+      # suppresses a REPEAT of the identical anomaly and drains on the very
+      # next tick, so one decline is not itself actionable. What IS
+      # actionable, and invisible to every other rule in this family, is a
+      # clock fault that keeps changing SHAPE tick to tick (each distinct
+      # fact set declines fresh, since dedup only suppresses an exact
+      # repeat) -- see docs/user-manual/authentication.md's own correction
+      # of the earlier, false "a sustained clock anomaly is held safe
+      # forever" claim (#2964 round 3 review finding 5): it is NOT held safe
+      # forever when the anomaly repeats identically, but a changing-shape
+      # fault genuinely can decline indefinitely, one tick at a time. `> 1`
+      # over 15m, `for: 10m`: tolerates the single ordinary decline (and its
+      # one-tick "roughly 120 seconds total" SLA companion) while catching a
+      # streak that keeps recurring past what dedup alone would explain.
+      - alert: YuzuRotationSweepDeclinedSustained
+        expr: |
+          increase(yuzu_rotation_sweep_declined_total[15m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Rotation sweep clock guard is declining repeatedly, not draining"
+          description: >-
+            yuzu_rotation_sweep_declined_total has risen more than once in 15
+            minutes and stayed elevated for at least 10 -- more than the
+            single decline the fact-set dedup rule's own "one extra tick,
+            then drains" SLA predicts for an anomaly that settles on one
+            shape. The likely cause is a clock fault whose SHAPE keeps
+            changing tick to tick (a jittering clock rather than one clean
+            step), since dedup only suppresses a repeat of the IDENTICAL
+            fact set -- each distinct fact set declines fresh. Check
+            PostgreSQL's own clock on the server the same way
+            YuzuAuditRetentionClockAnomaly's own first triage step does (this
+            sweep reads the identical SELECT EXTRACT(EPOCH FROM now())), and
+            check api_token_store.rotation_retention_meta directly for the
+            recorded last_anomaly_facts history. Both credentials in every
+            affected pair stay active while this persists -- see the runbook
+            for what that costs. Runbook:
+            docs/ops-runbooks/rotation-sweep-clock-guard.md.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/rotation-sweep-clock-guard.md"
+
   # ── yuzu-postgres — server storage substrate (#1320 PR 3) ──────────────
   # The server fails closed without PostgreSQL, so substrate health is
   # service-affecting. NOTE ON TIMING: /readyz flips to 503 *immediately* on

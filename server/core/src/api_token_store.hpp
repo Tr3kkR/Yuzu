@@ -89,17 +89,29 @@ namespace yuzu::server {
 // Part 7 (clock-guarded-retention routed concern): ABSOLUTE elapsed-step
 // threshold for the T12 rotation sweep's clock guard (#2964), never scaled
 // to a retention window (this store has none to scale against — only a 60s
-// tick cadence, `server.cpp`). Order-of-magnitude match to the OTHER
-// clock-guarded stores in this codebase (`result_set_store.cpp`'s
-// kGcBigStepSecs, `guaranteed_state_store.cpp`'s/`response_store.cpp`'s
-// kReapBigStepSecs, all ~1 day) is independently justified here, not
-// copied: at a 60s cadence, ANY accepted pass whose previous verdict is
-// more than a day old already means either a genuinely remarkable outage
-// (the server was simply not sweeping) or a clock jump — both warrant a
-// decline+report rather than a silent drain. Namespace-scope (not a class
-// member) so a test can reference it without duplicating the magic number —
-// mirrors `audit_store.hpp`'s `kAuditMinBigStepSec`.
-inline constexpr std::int64_t kRotationSweepBigStepSecs = 86'400;
+// tick cadence, `server.cpp`).
+//
+// #2964 round 3 review (finding 1b): the FIRST value here (86'400, a bare
+// copy of `audit_store`'s constant) failed the routed concern's own "copy
+// the SHAPE, never the numbers" rule — `audit_store` re-anchors far less
+// often than every 60s, so a one-day floor on a 60-second cadence silently
+// tolerated a forward jump of just under 24 hours, which is precisely the
+// sub-86400 hole this store's (now-removed) would-wipe probe was being
+// asked to cover instead (see the DELIBERATE NON-ADOPTION comment in the
+// .cpp). This value is derived from THIS store's own re-anchor cadence: 60
+// consecutive missed re-anchors at the 60s tick cadence (`server.cpp`'s
+// sweep-thread loop period) is itself remarkable — either the sweep has
+// gone genuinely unable to reach a verdict for an hour straight (a real
+// outage, still "multi-hour" territory once it is noticed and reported —
+// the guard reports at the first tick past threshold, not at hour one
+// exactly) or the clock moved by more than an hour, and either warrants a
+// decline+report rather than a silent drain. An ordinary transient blip
+// (one failed pool acquire, one skipped-lock tick) is one to a handful of
+// ticks, nowhere near this floor, so this does not fire on routine
+// contention. Namespace-scope (not a class member) so a test can reference
+// it without duplicating the magic number — mirrors `audit_store.hpp`'s
+// `kAuditMinBigStepSec`.
+inline constexpr std::int64_t kRotationSweepBigStepSecs = 60 * 60; // 60 ticks x 60s/tick = 1h
 
 // Forward-declared rather than pulling in engine_principal_store.hpp here —
 // a scoped enum's underlying type defaults to `int`, so an opaque
@@ -560,21 +572,48 @@ public:
         std::string fail_reason;
         /// The classified anomaly behind a `Declined` outcome
         /// (`audit_retention::Anomaly::None` for every other outcome) —
-        /// lets the caller choose a metric label without re-parsing
-        /// `decline_reason`.
+        /// lets the caller choose a human-readable decline REASON without
+        /// re-parsing `decline_reason`.
+        ///
+        /// #2964 round 3 review (finding 2): do NOT route a metric on this
+        /// field alone. `classify`'s precedence is `BadState > Step > Wipe >
+        /// NoAnchor` (`audit_retention_rules.hpp`), so a bootstrap tick that
+        /// ALSO observes another anomaly classifies as that other anomaly,
+        /// not `NoAnchor` — even though `facts.no_anchor` is still true and
+        /// the routed-concern policy floor ("a bootstrap decline counts to
+        /// its own series, never the clock-anomaly one, because it asserts
+        /// only that nothing can yet be ruled out") still applies. Use
+        /// `no_anchor` below for that routing decision instead; this field
+        /// is for the human-readable reason only.
         audit_retention::Anomaly decline_anomaly = audit_retention::Anomaly::None;
+        /// The RAW `Facts::no_anchor` bit behind a `Declined` outcome
+        /// (`false` for every other outcome) — the routing key for the
+        /// bootstrap-vs-clock-anomaly metric split (see `decline_anomaly`'s
+        /// own doc comment for why the collapsed enum is the wrong thing to
+        /// switch on for this). Correct even when another anomaly outranks
+        /// `NoAnchor` in `decline_anomaly`, because this is the fact itself,
+        /// never the classified precedence winner.
+        bool no_anchor = false;
         /// Count of predecessors whose per-pair revoke transaction genuinely
-        /// FAILED (pool acquire / lock / query / execution fault) rather than
-        /// resolving as the expected idempotent no-op (already revoked, or
-        /// resolved out from under the sweep by a concurrent manual
-        /// revoke/confirm under the same principal-scoped lock). Only
-        /// meaningful when `outcome == Ok`. Before this field existed a tick
-        /// that selected N candidates and failed EVERY per-pair transaction
-        /// returned `{Ok, revoked={}, capped=false}` — byte-identical to a
-        /// genuinely idle tick — because the loop's success branch had no
-        /// `else`; this is what lets the caller tell the two apart. This
-        /// conflation was PRE-EXISTING (the two-bool `SweepResult` this type
-        /// replaced had the same gap).
+        /// FAILED (pool acquire / lock / query / execution fault, at ANY
+        /// point in that transaction's lifecycle — INCLUDING a COMMIT that
+        /// fails after the transaction's own work already succeeded, #2964
+        /// round 3 review finding 6) rather than resolving as the expected
+        /// idempotent no-op (already revoked, or resolved out from under the
+        /// sweep by a concurrent manual revoke/confirm under the same
+        /// principal-scoped lock). Only meaningful when `outcome == Ok`.
+        /// Before this field existed a tick that selected N candidates and
+        /// failed EVERY per-pair transaction returned `{Ok, revoked={},
+        /// capped=false}` — byte-identical to a genuinely idle tick —
+        /// because the loop's success branch had no `else`; this is what
+        /// lets the caller tell the two apart, PROVIDED the counting
+        /// condition covers every way a per-pair transaction can fail — the
+        /// round-2 shape counted only an in-lambda failure and silently
+        /// dropped a pair whose COMMIT failed after the lambda itself
+        /// reported success, which is the specific gap round 3 closed (see
+        /// the counting site in `sweep_expired_rotations`'s own comment).
+        /// This conflation was PRE-EXISTING (the two-bool `SweepResult` this
+        /// type replaced had the same gap).
         ///
         /// GOVERNANCE CHAOS-INJECTION FINDING (#2964 fix round): this is not
         /// a rare/exceptional path — it is ORDINARY pool contention.
@@ -672,19 +711,21 @@ public:
     /// see the LOCKING SHAPE paragraph for why the lock must be session- and
     /// whole-call-scoped rather than released before the per-pair revokes.
     ///
-    /// The eligibility PROBES (part 1 of the routed concern: "probe by
-    /// OUTCOME") measure the ELIGIBLE set only — pairs this sweep could
-    /// actually revoke — never every syntactically-elapsed predecessor. A
-    /// pair whose successor has never been presented (`last_used_at == 0`,
-    /// UP-5) is PERMANENTLY ineligible (see below); counting it toward
-    /// "would this pass expire everything?" would distort that probe into a
-    /// false decline forever, since such a pair never becomes eligible no
-    /// matter how much time passes. The would-wipe half of that probe is
-    /// additionally gated on a minimum eligible POPULATION
-    /// (`kMinWipeProbePopulation`, see the .cpp) — "every eligible row is
-    /// expired" is the routine, expected state of a population of one (the
-    /// FIRST rotation on any deployment guarantees it), and testing it there
-    /// distinguishes nothing; see that constant's own doc comment.
+    /// The eligibility PROBE measures the ELIGIBLE set only — pairs this
+    /// sweep could actually revoke — never every syntactically-elapsed
+    /// predecessor. A pair whose successor has never been presented
+    /// (`last_used_at == 0`, UP-5) is PERMANENTLY ineligible (see below) and
+    /// plays no part in this probe's outcome, since such a pair never
+    /// becomes eligible no matter how much time passes. This store does NOT
+    /// adopt the clock-guarded-retention routed concern's part 1 would-wipe
+    /// half (`Facts::would_wipe` is hardcoded `false`) — see the DELIBERATE
+    /// NON-ADOPTION comment in the .cpp, near where `kMinWipeProbePopulation`
+    /// used to live, for the measured reason: a would-wipe predicate whose
+    /// true positive (a genuine clock jump) and single most common false
+    /// positive (an ordinary drain tick) are the same observable outcome
+    /// swallows a later genuine anomaly through fact-set dedup regardless of
+    /// any population floor, and this store's per-pair UP-5 re-assertion
+    /// already bounds the harm of accepting that mis-fit.
     ///
     /// Never revokes a predecessor whose successor has NEVER been presented
     /// (`last_used_at == 0`, read fresh under THIS row's own locked
@@ -756,9 +797,16 @@ public:
     /// of the routed concern, applied to this sweep's own observability: a
     /// store-wide session lock serialises the sweep, so `SkippedLock` on
     /// N-1 replicas is routine and staleness must be judged against the ONE
-    /// shared anchor, never a per-replica one. `nullopt` on a lease/query
-    /// failure or when no pass has ever reached a verdict (fresh install) —
-    /// the caller must not fabricate a reading.
+    /// shared anchor, never a per-replica one. Part 2 of the routed concern
+    /// (compare against PostgreSQL's OWN clock, not N independently-
+    /// drifting replica clocks) plus its unnumbered SINGLE-WRITER clause
+    /// ("on a Postgres store the reading and the dedup state must become
+    /// SHARED rows under an ... advisory lock, because process-local state
+    /// paces at N x cap across replicas") — NOT part 5 (#2964 round 3 review
+    /// finding 6; an earlier revision of this comment mis-cited part 5,
+    /// which is the unconditional per-tick cap, unrelated to this claim).
+    /// `nullopt` on a lease/query failure or when no pass has ever reached a
+    /// verdict (fresh install) — the caller must not fabricate a reading.
     [[nodiscard]] std::optional<int64_t> rotation_sweep_last_pass_now() const;
 
     /// Result of `list_rotations_nearing_expiry_unused` below.

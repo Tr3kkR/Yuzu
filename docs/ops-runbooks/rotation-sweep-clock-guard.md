@@ -50,8 +50,18 @@ worth knowing before you triage:
   This sweep probes only the **eligible** set — pairs with a live, used
   successor — because a pair whose successor was never used is *permanently*
   ineligible (see "Unless the successor was never presented at all" in the
-  two user-manual pages above) and would otherwise skew the would-wipe probe
-  into a false decline forever.
+  two user-manual pages above) and must never influence what this sweep
+  decides to touch.
+- **No would-wipe detection**, unlike `audit_store`. This sweep's eligible
+  population is a drain queue that reaches 100% expiry as a matter of
+  routine course (every deployment's first in-flight rotation does, the
+  moment its overlap window elapses on a perfectly correct clock) —
+  a would-wipe verdict cannot distinguish that routine case from a genuine
+  clock jump at any population size, so `api_token_store.cpp` deliberately
+  does not adopt that half of the routed clock-guarded-retention concern
+  (see the DELIBERATE NON-ADOPTION comment near `kRotationSweepBigStepSecs`'s
+  definition). `yuzu_rotation_sweep_declined_total` can only be a big-step
+  or bad-state decline here, never a would-wipe one.
 
 ## `yuzu_rotation_sweep_lock_skipped_total` — read your replica count first
 
@@ -158,17 +168,33 @@ pool contention still stamps this gauge fresh on schedule; check
 `yuzu_rotation_sweep_lost_revocations_total` for that separate failure mode
 before concluding "gauge is fresh, so revocation is working".
 
-If this fires: check the server log for `sweep_expired_rotations:` failure
-lines (`fail_reason` on the returned `SweepResult` now carries the actual
-libpq error text and failing stage — the `S-SWEEP-EXCEPTION-GUARD` catch in
-`server.cpp` logs and continues rather than crashing the process, so a
-repeatedly-throwing tick reads as this alert, not a restart), and confirm
-"ApiTokenStore: opened" appears in the boot log — a migration whose reported
-success was actually a silent skip (e.g. a migration-numbering collision,
-#3013) now refuses construction closed rather than opening against a schema
-missing `rotation_retention_meta`, so the sweep thread is never started at
-all in that case (server.cpp gates it on `api_token_store_->is_open()`) —
-check for "Rotation sweep thread started" too.
+If this fires, first rule out the case where there is no server log line to
+find at all: a migration whose reported success was actually a silent skip
+(e.g. a migration-numbering collision, #3013) leaves `rotation_retention_meta`
+missing, `ApiTokenStore`'s own post-migration smoke-read catches that at
+construction, and (ADR-0012 §1) **the whole server refuses to start** — not
+merely "the sweep thread never starts while the rest of the server serves".
+This is a BOOT failure, not a runtime one: there is no `sweep_expired_
+rotations:` failure line to grep for, because the process never got far
+enough to run a tick, and no gauge goes stale, because the process metrics
+endpoint itself is down. The actual signature is the scrape target reporting
+`up == 0` (or the process simply not being there to `curl /metrics` at all),
+not this alert on its own — check whether the server process is running and
+the boot log for "Refusing to start: api-token store migration/open failed"
+before treating this as a live-but-stuck sweep.
+
+Only once you have confirmed the server IS up and serving should you look
+for the hypothetical RUNTIME variant of the same defect — e.g. an
+out-of-band `DROP TABLE api_token_store.rotation_retention_meta` after a
+successful boot, which the construction-time smoke-read cannot see. THAT
+case looks the way this section used to describe: check the server log for
+`sweep_expired_rotations:` failure lines (`fail_reason` on the returned
+`SweepResult` carries the actual libpq error text and failing stage — the
+`S-SWEEP-EXCEPTION-GUARD` catch in `server.cpp` logs and continues rather
+than crashing the process, so a repeatedly-throwing tick reads as this
+alert, not a restart), and confirm "ApiTokenStore: opened" and "Rotation
+sweep thread started" both appear in the (now-relevant, because the server
+did boot) server log.
 
 ## Verifying recovery
 

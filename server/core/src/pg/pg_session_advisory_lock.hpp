@@ -6,64 +6,114 @@
 /// governance-hardened) so a second store that needs a session-scoped lock
 /// does not hand-roll its own release protocol.
 ///
-/// The mechanism this guard defends against, precisely: a session advisory
-/// lock is released by an explicit `pg_advisory_unlock` call, which is an
-/// ORDINARY SQL statement — so if the connection is in an ABORTED
-/// transaction when that statement runs, it fails at the QUERY level
-/// (`current transaction is aborted, commands ignored until end of
-/// transaction block`) rather than actually releasing the lock. The lock
-/// then survives whatever ROLLBACK eventually happens, the connection
-/// itself stays `CONNECTION_OK`, and `PgPool::release()` (which only checks
-/// `PQstatus` and rolls back a non-idle transaction) recycles a connection
-/// still holding the lock. Session advisory locks are re-entrant per
-/// backend, so the wedge is asymmetric: whichever request next draws the
-/// poisoned connection succeeds while every other connection is denied
-/// indefinitely.
+/// THE MECHANISM (what every consumer needs to know): a session advisory
+/// lock is released by an explicit `pg_advisory_unlock` call — an ORDINARY
+/// SQL statement, so it fails at the QUERY level on a connection whose
+/// transaction is currently ABORTED, rather than actually releasing the
+/// lock. Left there, the lock survives whatever ROLLBACK eventually
+/// happens, the connection itself stays `CONNECTION_OK`, and
+/// `PgPool::release()` (which only checks `PQstatus`) recycles a connection
+/// still holding it. Session advisory locks are re-entrant per backend, so
+/// the wedge is asymmetric: whichever request next draws the poisoned
+/// connection succeeds while every other connection is denied indefinitely.
 ///
-/// An earlier revision of the T12 rotation sweep's store-wide sweep lock
-/// (`api_token_store.cpp`, #2964 fix round) carried its own ad-hoc
-/// `ScopeExit`-based release with a `pg_advisory_unlock_all()` fallback and a
-/// FALSE in-code claim that the fallback was a working safety net.
-/// GOVERNANCE CHAOS-INJECTION FINDING (#2964 fix round): that specific call
-/// site was NOT actually reachable to the aborted-transaction failure mode
-/// above — the unlock guard is declared BEFORE the `pg::PgTxn` covering the
-/// classification transaction, so C++'s reverse-destruction-order guarantee
-/// means `~PgTxn`'s ROLLBACK always runs before the unlock attempt on every
-/// return path, leaving the connection clean by the time the unlock query
-/// fires. Induced directly against live Postgres: a forced mid-transaction
-/// failure left the database with zero advisory locks held afterward. So
-/// this specific hole is closed by declaration order today, not by this
-/// guard — do not describe adopting this guard as fixing a live/reachable
-/// wedge at that call site.
+/// THE RECOVERY PROTOCOL this guard's destructor runs on an unlock-query
+/// failure: (1) if the connection is already dead, nothing leaked — the
+/// session, and every lock it held, is gone with it. (2) If the connection
+/// is alive and its transaction is ABORTED (the ordinary case above),
+/// ROLLBACK (the one statement Postgres accepts in that state) and retry
+/// the SAME targeted unlock once — this recovers the ordinary case
+/// genuinely, not merely best-effort. (3) Only if that does not apply, or
+/// does not work, does it fall back to terminating this backend
+/// (`pg_terminate_backend(pg_backend_pid())`) as a LAST resort — itself an
+/// ordinary SQL statement with no special exemption from the same failure
+/// mode, so this is best-effort, not a hard guarantee, for whatever is left
+/// after (1) and (2) do not apply.
 ///
-/// What is still wrong, and still worth fixing, regardless: (1)
-/// `pg_advisory_unlock_all()` is an ordinary SQL statement too, and fails
-/// IDENTICALLY to the targeted unlock in exactly the aborted-transaction
-/// case it would be relied on for — it is not a "belt and suspenders"
-/// fallback, it is a second copy of the same failure, and the in-code claim
-/// that it was a working safety net was false regardless of whether the
-/// aborted-transaction case is reachable here; (2) the sweep's safety today
-/// is an UNPINNED dependency on getting a specific pair of declarations in a
-/// specific order — nothing enforces it, and a future edit (reordering the
-/// two declarations, adding an early return between them, or splitting the
-/// classification into two transactions) could silently reintroduce exactly
-/// the KEK-class hazard this guard exists to close, with no compiler
-/// diagnostic and no test failure. Adopting this shared, already-hardened
-/// guard removes that dependency: its destructor handles a failed unlock
-/// correctly (dead-connection vs live-connection discrimination, backend
-/// self-termination on the live case) regardless of WHY the unlock query
-/// failed or what declaration order got it there — correct by construction,
-/// not correct by the current code's luck.
-
-#include "pg_raii.hpp"
-
-#include <libpq-fe.h>
-#include <spdlog/spdlog.h>
+/// HISTORY (condensed; see #2964 PR history for the full account): an
+/// earlier revision hand-rolled its own release with a false claim that
+/// `pg_advisory_unlock_all()` was a working "fallback" (it fails
+/// identically to the targeted unlock in the aborted-transaction case);
+/// a later revision fixed that but then fell straight to
+/// `pg_terminate_backend` on any live-connection failure with an
+/// overclaimed "correct by construction" comment — also false, since that
+/// terminate call fails the same way on an aborted transaction. THIS
+/// revision is the first to actually recover the aborted-transaction case
+/// (step (2) above) rather than merely documenting around it. The T12
+/// rotation-sweep call site (`api_token_store.cpp`) is additionally safe
+/// against this specific failure mode by an UNRELATED, unpinned mechanism —
+/// its unlock guard is declared before the `pg::PgTxn` covering its
+/// classification transaction, so reverse-destruction-order means
+/// `~PgTxn`'s own ROLLBACK always runs first — but that is a property of
+/// THAT call site's declaration order, not of this guard, and a THIRD
+/// consumer must not assume it gets that property for free.
 
 #include <string>
 #include <utility>
 
+#include <libpq-fe.h>
+#include <spdlog/spdlog.h>
+
+// STL -> third-party -> project (docs/cpp-conventions.md) — this project
+// header sits last (#2964 round 3 review finding 6: an earlier revision had
+// this inverted).
+#include "pg_raii.hpp"
+
 namespace yuzu::server::pg {
+
+/// A SESSION advisory lock's KEY, as the Postgres SQL expression(s) that
+/// compute it — generates matching try-lock/unlock SQL from ONE definition
+/// (#2964 round 3 review finding 3), so a call site can never hand-write a
+/// try-lock and an unlock statement that reference different keys. Before
+/// this existed, each of the two consumers (`KekOpLockGuard`,
+/// `api_token_store.cpp`'s rotation-sweep lock) hand-wrote its own matched
+/// pair of SQL string constants; a drift between them unlocks a key this
+/// session never locked, Postgres returns `false` (a legitimate result for
+/// "not held"), and the guard's destructor treats that as released — a
+/// SILENT leak of the key actually held, indistinguishable from the benign
+/// release-if-held case.
+///
+/// Two forms, matching the two this codebase's session locks use today:
+///   * `single(key_sql)` — one bigint key expression, e.g.
+///     `"hashtextextended('api_token_store:rotation_sweep', 0)"`.
+///   * `pair(classid_sql, objid_sql)` — two int32 key expressions, e.g.
+///     `"2037545589"` and `"hashtext('secrets_kek_op')"`.
+///
+/// Each argument is a full SQL EXPRESSION, not a literal value — every
+/// existing call site's key is (at least in part) computed by Postgres
+/// itself (`hashtext`/`hashtextextended`), never reproduced in C++, so this
+/// stores the expression text rather than a resolved integer.
+class PgAdvisoryLockKey {
+public:
+    [[nodiscard]] static PgAdvisoryLockKey single(std::string key_sql) {
+        return PgAdvisoryLockKey(std::move(key_sql), std::string(), /*is_pair=*/false);
+    }
+    [[nodiscard]] static PgAdvisoryLockKey pair(std::string classid_sql, std::string objid_sql) {
+        return PgAdvisoryLockKey(std::move(classid_sql), std::move(objid_sql), /*is_pair=*/true);
+    }
+
+    [[nodiscard]] std::string try_lock_sql() const {
+        return is_pair_ ? "SELECT pg_try_advisory_lock(" + first_ + ", " + second_ + ")"
+                        : "SELECT pg_try_advisory_lock(" + first_ + ")";
+    }
+    [[nodiscard]] std::string unlock_sql() const {
+        return is_pair_ ? "SELECT pg_advisory_unlock(" + first_ + ", " + second_ + ")"
+                        : "SELECT pg_advisory_unlock(" + first_ + ")";
+    }
+
+private:
+    // Private, taking the discriminator explicitly rather than inferring it
+    // from `second.empty()` — a `pair()` caller could (however implausibly)
+    // hand a key expression that happens to be an empty string, and that
+    // must still generate the two-argument form. Only the two named
+    // factories above construct this type.
+    PgAdvisoryLockKey(std::string first, std::string second, bool is_pair)
+        : first_(std::move(first)), second_(std::move(second)), is_pair_(is_pair) {}
+
+    std::string first_;
+    std::string second_;
+    bool is_pair_;
+};
 
 /// Construct only after the caller has confirmed the lock was actually
 /// granted (e.g. a `pg_try_advisory_lock`/`pg_advisory_lock` call that
@@ -81,15 +131,26 @@ namespace yuzu::server::pg {
 /// only way to unlock at all.
 class PgSessionAdvisoryLockGuard {
 public:
-    /// `unlock_sql` — a complete `SELECT pg_advisory_unlock(...)` statement
-    /// (single-bigint-key or two-int32-key form, caller's choice) whose sole
-    /// output column is the boolean unlock result. `label` is a short,
-    /// human-readable name for this lock (e.g. `"KEK op"`,
+    /// `key` — the SAME `PgAdvisoryLockKey` the caller used to build its
+    /// try-lock statement (`key.try_lock_sql()`); this guard derives its own
+    /// unlock statement from it (`key.unlock_sql()`) so the two can never
+    /// reference different keys (#2964 round 3 review finding 3). `label` is
+    /// a short, human-readable name for this lock (e.g. `"KEK op"`,
     /// `"api_token_store rotation sweep"`) used to prefix every log line this
     /// guard emits, so a caller can tell which lock family is misbehaving
     /// without inspecting the SQL string.
-    PgSessionAdvisoryLockGuard(PGconn* conn, std::string unlock_sql, std::string label) noexcept
-        : conn_(conn), unlock_sql_(std::move(unlock_sql)), label_(std::move(label)) {}
+    ///
+    /// Deliberately NOT `noexcept` (#2964 round 3 review, item 6):
+    /// `key.unlock_sql()` builds a fresh, heap-allocated string on every
+    /// call (it concatenates the key expression text — never a static
+    /// literal, since every existing key is at least partly computed by
+    /// Postgres itself), so this mem-initializer can throw `bad_alloc`. A
+    /// `noexcept` here would turn that into `std::terminate` instead of an
+    /// ordinary propagating exception; the two call sites already tolerate a
+    /// throwing constructor (neither constructs this guard in a context that
+    /// requires `noexcept`).
+    PgSessionAdvisoryLockGuard(PGconn* conn, const PgAdvisoryLockKey& key, std::string label)
+        : conn_(conn), unlock_sql_(key.unlock_sql()), label_(std::move(label)) {}
 
     ~PgSessionAdvisoryLockGuard() {
         // Implicitly noexcept: a throwing log sink here would std::terminate
@@ -122,21 +183,49 @@ public:
             //    looks: whichever request next draws THIS connection
             //    succeeds while every other connection is denied
             //    indefinitely.
-            //
-            // For the second case, end the session deliberately. Terminating
-            // our own backend releases every session lock it holds and marks
-            // the connection bad, so `PgPool::release` discards it instead of
-            // recycling a poisoned one. Killing one pooled connection is
-            // strictly better than wedging this lock cluster-wide until the
-            // next process restart.
             if (PQstatus(conn_) != CONNECTION_OK) {
                 spdlog::warn("{}: advisory-lock release failed on an already-dead connection — "
                              "the session (and its locks) are gone; nothing leaked",
                              label_);
                 return;
             }
+
+            // #2964 round 3 review (finding 3): before assuming the lock is
+            // unrecoverably wedged, try to actually RECOVER it. The ordinary
+            // cause of a live-connection unlock failure is an ABORTED
+            // transaction — every statement other than ROLLBACK (or COMMIT,
+            // which behaves the same way here) fails identically in that
+            // state, INCLUDING the `pg_terminate_backend` call this used to
+            // fall to directly. Roll back, then retry the SAME targeted
+            // unlock once — measured against live Postgres to take a leak
+            // from 1 to 0.
+            if (PQtransactionStatus(conn_) != PQTRANS_IDLE) {
+                pg::PgResult rollback{PQexec(conn_, "ROLLBACK")};
+                if (rollback.ok()) {
+                    pg::PgResult retry{PQexec(conn_, unlock_sql_.c_str())};
+                    if (retry.ok()) {
+                        spdlog::warn("{}: advisory-lock release failed on an aborted "
+                                     "transaction — rolled back and the retried unlock "
+                                     "succeeded; nothing leaked",
+                                     label_);
+                        return;
+                    }
+                }
+            }
+
+            // Recovery did not apply (the connection was not in an aborted
+            // transaction to begin with) or did not work. Genuinely
+            // best-effort from here: terminate our own backend, which
+            // releases every session lock it holds and marks the connection
+            // bad so `PgPool::release` discards it instead of recycling a
+            // poisoned one. This is NOT a guarantee — the terminate
+            // statement is itself an ordinary SQL statement and can fail the
+            // same way the unlock did if the connection is broken for some
+            // other reason — but killing one pooled connection on a
+            // best-effort basis is still strictly better than doing nothing.
             spdlog::critical("{}: could not release the advisory lock on a live connection: {} "
-                             "— terminating this backend to guarantee the lock is released",
+                             "— terminating this backend on a best-effort basis to try to "
+                             "guarantee the lock is released",
                              label_, PQerrorMessage(conn_));
             pg::PgResult kill{PQexec(conn_, "SELECT pg_terminate_backend(pg_backend_pid())")};
             (void)kill; // best-effort; the connection is discarded either way

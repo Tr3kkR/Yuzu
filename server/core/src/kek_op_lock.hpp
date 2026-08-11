@@ -36,10 +36,18 @@
 namespace yuzu::server::detail {
 
 constexpr std::chrono::milliseconds kKekOpAcquireTimeout{5000};
-constexpr const char* kKekOpTryLockSql =
-    "SELECT pg_try_advisory_lock(2037545589, hashtext('secrets_kek_op'))";
-constexpr const char* kKekOpUnlockSql =
-    "SELECT pg_advisory_unlock(2037545589, hashtext('secrets_kek_op'))";
+
+// ONE definition of the `secrets_kek_op` lock's key, generating matching
+// try-lock/unlock SQL (`pg::PgAdvisoryLockKey`, #2964 round 3 review finding
+// 3) — replaces the former hand-written `kKekOpTryLockSql`/`kKekOpUnlockSql`
+// pair of string constants, which could drift (a drift unlocks a key never
+// locked; Postgres reports `false`, and the release guard treats `false` as
+// "released" — a silent leak of the key actually held).
+inline const pg::PgAdvisoryLockKey& kek_op_lock_key() {
+    static const pg::PgAdvisoryLockKey key =
+        pg::PgAdvisoryLockKey::pair("2037545589", "hashtext('secrets_kek_op')");
+    return key;
+}
 
 enum class KekOpLockAttempt { kAcquired, kConflict, kError };
 
@@ -49,7 +57,8 @@ enum class KekOpLockAttempt { kAcquired, kConflict, kError };
 /// Conflict immediately (rule from #2395: KEK ops never queue behind each
 /// other).
 [[nodiscard]] inline KekOpLockAttempt try_lock_kek_op(PGconn* conn) {
-    pg::PgResult res{PQexec(conn, kKekOpTryLockSql)};
+    const std::string try_lock_sql = kek_op_lock_key().try_lock_sql();
+    pg::PgResult res{PQexec(conn, try_lock_sql.c_str())};
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("KEK op: advisory-lock attempt failed: {}", PQerrorMessage(conn));
         return KekOpLockAttempt::kError;
@@ -78,15 +87,18 @@ enum class KekOpLockAttempt { kAcquired, kConflict, kError };
 ///
 /// Thin, KEK-specific wrapper around the reusable
 /// `pg::PgSessionAdvisoryLockGuard` (`pg/pg_session_advisory_lock.hpp`) —
-/// this class's whole job is pinning `kKekOpUnlockSql` and a log label so
+/// this class's whole job is pinning `kek_op_lock_key()` and a log label so
 /// every existing call site (`explicit KekOpLockGuard{conn}`) keeps working
 /// unchanged. See the generic guard's own doc comment for the release
-/// protocol (dead-connection vs live-connection discrimination, backend
-/// self-termination on a live-connection failure).
+/// protocol (dead-connection vs live-connection discrimination, rollback +
+/// retry, backend self-termination as the last resort on a live-connection
+/// failure that recovery could not fix).
 class KekOpLockGuard {
 public:
-    explicit KekOpLockGuard(PGconn* conn) noexcept
-        : inner_(conn, kKekOpUnlockSql, "KEK op") {}
+    // Deliberately NOT `noexcept` — see `PgSessionAdvisoryLockGuard`'s own
+    // constructor doc comment (`pg/pg_session_advisory_lock.hpp`) for why:
+    // `inner_`'s mem-initializer heap-allocates a fresh unlock-SQL string.
+    explicit KekOpLockGuard(PGconn* conn) : inner_(conn, kek_op_lock_key(), "KEK op") {}
 
     KekOpLockGuard(const KekOpLockGuard&) = delete;
     KekOpLockGuard& operator=(const KekOpLockGuard&) = delete;

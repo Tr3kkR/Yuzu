@@ -22,7 +22,10 @@
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
 #include "audit_retention_rules.hpp" // audit_retention::Anomaly — the rotation sweep's
-                                     // SweepResult::decline_anomaly, switched on below
+                                     // SweepResult::decline_anomaly type (the human-readable
+                                     // decline REASON only — the metric split below routes on
+                                     // the raw SweepResult::no_anchor fact instead, #2964 round
+                                     // 3 review finding 2; see that field's own doc comment)
 #include "rotation_sweep_naming.hpp"
 #include "rotation_warn_dedup.hpp"
 #include "approval_manager.hpp"
@@ -2120,10 +2123,12 @@ public:
         // one is a SEPARATE series, never folded into this one.
         metrics_.describe("yuzu_rotation_sweep_declined_total",
                           "Cumulative rotation-sweep ticks the clock guard declined on a genuine "
-                          "clock anomaly (would-wipe / big-step / bad-state) - shared across BOTH "
-                          "engine-credential and human API-token rotation pairs, not split by "
-                          "principal_kind. Excludes bootstrap declines (no durable anchor yet) - "
-                          "see yuzu_rotation_sweep_bootstrap_declines_total",
+                          "clock anomaly (big-step / bad-state - this store does not adopt the "
+                          "would-wipe half of the routed-concern probe, see api_token_store.cpp's "
+                          "DELIBERATE NON-ADOPTION comment) - shared across BOTH engine-credential "
+                          "and human API-token rotation pairs, not split by principal_kind. "
+                          "Excludes bootstrap declines (no durable anchor yet) - see "
+                          "yuzu_rotation_sweep_bootstrap_declines_total",
                           "counter");
         metrics_.counter("yuzu_rotation_sweep_declined_total");
         // #2964 fix round finding 4 (routed-concern POLICY FLOOR: a bootstrap
@@ -2134,8 +2139,10 @@ public:
         // alert's "the clock moved" claim on every server carrying a rotation
         // backlog through the first sweep tick after an upgrade — the exact
         // false-positive #2579/audit_store's own bootstrap counter exists to
-        // avoid, mirrored here. `SweepResult::decline_anomaly` (`api_token_
-        // store.hpp`) is what this counter is derived from.
+        // avoid, mirrored here. `SweepResult::no_anchor` (`api_token_
+        // store.hpp`) is what this counter is derived from — the raw fact,
+        // not `decline_anomaly`'s classified precedence winner (#2964 round
+        // 3 review finding 2; see that field's own doc comment).
         metrics_.describe("yuzu_rotation_sweep_bootstrap_declines_total",
                           "Cumulative rotation-sweep ticks declined because no pass on this "
                           "database has yet reached a verdict (NOT a clock anomaly - a weaker "
@@ -5662,6 +5669,20 @@ public:
                 // the counter.
                 constexpr std::size_t kConsecutiveSkippedLockWarnThreshold = 3;
                 std::size_t consecutive_lock_skipped = 0;
+                // #2964 round 3 review (finding 6): the warn below used to
+                // fire on EVERY tick once the streak crossed the threshold
+                // (the guard only reset the streak, never a separate "next
+                // warn at" mark) — ~1440 lines/day per non-winning replica
+                // in a multi-replica deployment, where a losing replica's
+                // own `describe()`-documented topology makes this routine.
+                // `rotation_warn_dedup.hpp`'s own header cites that exact
+                // ~1440/day shape as the thing every cadence in THIS file
+                // exists to avoid. Warn once on the CROSSING tick, then only
+                // again on a WIDENING interval (doubling each time) — an
+                // operator still gets escalating visibility on a streak that
+                // keeps growing, without a log line every 60 seconds
+                // forever. Reset alongside `consecutive_lock_skipped`.
+                std::size_t next_skipped_lock_warn_at = kConsecutiveSkippedLockWarnThreshold;
 
                 while (!stop_requested_.load(std::memory_order_acquire)) {
                     for (int i = 0; i < 60 && !stop_requested_.load(std::memory_order_acquire);
@@ -5700,6 +5721,7 @@ public:
                     auto sweep = api_token_store_->sweep_expired_rotations(now);
                     if (sweep.outcome != ApiTokenStore::SweepOutcome::SkippedLock) {
                         consecutive_lock_skipped = 0;
+                        next_skipped_lock_warn_at = kConsecutiveSkippedLockWarnThreshold;
                     }
                     switch (sweep.outcome) {
                     case ApiTokenStore::SweepOutcome::Failed:
@@ -5729,7 +5751,18 @@ public:
                         // the counter alone is sufficient for a multi-replica
                         // deployment (routine there), but silent-forever is
                         // wrong for the single-replica default.
-                        if (++consecutive_lock_skipped >= kConsecutiveSkippedLockWarnThreshold) {
+                        //
+                        // #2964 round 3 review (finding 6): warn on the
+                        // CROSSING tick only, then again on a WIDENING
+                        // interval (`next_skipped_lock_warn_at` doubles each
+                        // time it fires) — never on every tick past the
+                        // threshold, which was measured to be ~1440
+                        // lines/day per non-winning replica in a
+                        // multi-replica deployment (routine topology there;
+                        // see `describe()` above and this file's own
+                        // consecutive-skip comment).
+                        ++consecutive_lock_skipped;
+                        if (consecutive_lock_skipped >= next_skipped_lock_warn_at) {
                             spdlog::warn(
                                 "Rotation sweep has been unable to acquire its store-wide sweep "
                                 "lock for {} consecutive ticks — routine only on a multi-replica "
@@ -5738,6 +5771,7 @@ public:
                                 "session lock (zombie process / botched blue-green cutover / "
                                 "unauthorised second instance on the same DSN) — investigate",
                                 consecutive_lock_skipped);
+                            next_skipped_lock_warn_at *= 2;
                         }
                         break;
                     case ApiTokenStore::SweepOutcome::Declined:
@@ -5754,7 +5788,20 @@ public:
                         // one — see yuzu_rotation_sweep_bootstrap_declines_
                         // total's own describe() text for why sharing the
                         // counter would be a false "the clock moved" claim.
-                        if (sweep.decline_anomaly == audit_retention::Anomaly::NoAnchor) {
+                        //
+                        // #2964 round 3 review (finding 2): routes on
+                        // `sweep.no_anchor` — the RAW fact — never on
+                        // `sweep.decline_anomaly == NoAnchor`. `classify`'s
+                        // precedence (`BadState > Step > Wipe > NoAnchor`,
+                        // `audit_retention_rules.hpp`) means a bootstrap tick
+                        // that ALSO observes another anomaly classifies as
+                        // that other anomaly even though `no_anchor` is still
+                        // true — switching on the collapsed enum here would
+                        // have miscounted that tick to the clock-anomaly
+                        // series, exactly the false "the clock moved" claim
+                        // this split exists to avoid. See
+                        // `SweepResult::no_anchor`'s own doc comment.
+                        if (sweep.no_anchor) {
                             metrics_.counter("yuzu_rotation_sweep_bootstrap_declines_total")
                                 .increment();
                         } else {

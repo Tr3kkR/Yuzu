@@ -663,20 +663,30 @@ the next tick (roughly 120 seconds total), after which an identical anomaly
 drains normally on the following tick; every decline is counted and
 logged — a fresh deployment's first-ever bootstrap decline (no durable
 clock reading yet) increments `yuzu_rotation_sweep_bootstrap_declines_total`,
-a genuine clock anomaly (implausible reading, big step, or would-wipe)
-increments `yuzu_rotation_sweep_declined_total`; the two are deliberately
-separate series (see
-[metrics.md](metrics.md#rotation-sweep-clock-guard-metrics-2964)).** Two cases are not
-"eventually" but **never**, by design, until an operator acts: **the
+a genuine clock anomaly (implausible reading or a big step) increments
+`yuzu_rotation_sweep_declined_total`; the two are deliberately separate
+series (see
+[metrics.md](metrics.md#rotation-sweep-clock-guard-metrics-2964)).** One case
+is not "eventually" but **never**, by design, until an operator acts: **the
 successor was never presented at all** — the sweep leaves BOTH credentials
 active indefinitely rather than revoke your only working token out from
 under you (a dropped rotate response, or simply never picking up the new
-secret, must not end in zero usable credentials); and a **sustained** clock
-or store-wide-lock fault — an identical anomaly repeating tick after tick,
-or every replica losing the sweep's advisory lock to a wedged holder —
-which `docs/ops-runbooks/rotation-sweep-clock-guard.md` and the
-`YuzuRotationSweepNotRunning` alert exist to surface, since neither is
-distinguishable from "one declined tick" using this page alone.
+secret, must not end in zero usable credentials). A **sustained clock
+anomaly is NOT this case**, even though it sounds like it should be: the
+guard suppresses only a *repeat of the identical* anomaly (the fact-set
+dedup rule) and drains on the very next tick once it does, so a clock fault
+that settles on one anomaly shape — even indefinitely — costs at most the
+one extra declined tick already described above, and revocation then
+proceeds on schedule against the (still bad) clock reading; do not read this
+SLA as "credentials are held safe for the duration of a clock incident". The
+genuinely open-ended **never**-until-an-operator-acts case on this axis is a
+clock fault that keeps changing shape tick to tick (each distinct fact set
+declines fresh, so dedup never gets a repeat to suppress) — indistinguishable
+from a sustained fault using the counters above alone, which is exactly why
+`docs/ops-runbooks/rotation-sweep-clock-guard.md` exists. The other
+genuinely open-ended case is a **store-wide-lock fault** — every replica
+losing the sweep's advisory lock to a wedged holder — which the same runbook
+and the `YuzuRotationSweepNotRunning` alert exist to surface.
 
 **MFA step-up is required on every call, if you have MFA enrolled — and
 that includes a repeat call.** Unlike most session activity, `rotate` and
