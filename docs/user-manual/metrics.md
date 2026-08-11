@@ -518,6 +518,62 @@ never closes, so a confirm surfaces the `unresolved rotation metadata` state) �
 **inspect the credential before revoking**, since in that state the sole active
 credential is the good survivor.
 
+**`yuzu_rotation_sweep_capped_total`** (governance UP-5/UP-6, no labels,
+shared across engine-credential and human API-token rotation pairs — deliberately
+kind-neutral naming, unlike `yuzu_engine_principal_rotation_sweep_failures_total`
+above, because a capped tick is a tick-level property, not attributable to one
+kind's rows; the sibling failures counter keeps its engine-scoped name only
+because renaming an already-shipped series would break existing alerts): a
+rotation sweep tick found MORE eligible predecessors than its per-tick
+auto-revoke cap (`kMaxAutoRevokesPerTick`, `api_token_store.cpp`) and processed
+only the cap's worth, deferring the rest to later ticks — the
+clock-guarded-retention routed concern's mandatory unconditional cap, applied
+here (a single forward NTP step must degrade to a bounded multi-tick drain,
+never a fleet-wide cutover in one tick). A sustained non-zero rate means the
+fleet has more concurrent in-flight rotations than the cap comfortably drains
+— raise the cap, or find out why so many rotations are in flight at once,
+rather than ignore it.
+
+## Human API-token confirm metric (P2 #11)
+
+```
+# HELP yuzu_api_token_confirm_total Human API-token rotation confirm outcomes by surface (rest|mcp) and result (success|conflict|client_error|transient); store-reaching calls only, pre-store denials excluded - the human-owned twin of yuzu_engine_principal_confirm_total
+# TYPE yuzu_api_token_confirm_total counter
+yuzu_api_token_confirm_total{surface="rest",result="success"} 0
+yuzu_api_token_confirm_total{surface="rest",result="conflict"} 0
+yuzu_api_token_confirm_total{surface="rest",result="client_error"} 0
+yuzu_api_token_confirm_total{surface="rest",result="transient"} 0
+yuzu_api_token_confirm_total{surface="mcp",result="success"} 0
+yuzu_api_token_confirm_total{surface="mcp",result="conflict"} 0
+yuzu_api_token_confirm_total{surface="mcp",result="client_error"} 0
+yuzu_api_token_confirm_total{surface="mcp",result="transient"} 0
+```
+
+The human-owned twin of [`yuzu_engine_principal_confirm_total`](#engine-credential-confirm-metric-2404)
+directly above — same closed `surface` x `result` cross-product (8 series),
+pre-seeded to `0` at startup for the same `absent()`-alert reason, and the
+same intended scope contract: counted only when a confirm reaches the
+credential store or trips the store-open guard (`result="transient"`),
+excluding pre-store denials (permission, input validation, an MCP
+approval-gate replay) so the label set stays a fact about store outcomes.
+`result` mirrors the same store-error taxonomy as the engine family.
+
+**Live — both transports increment this family.** It is registered and
+pre-seeded (`rotation_sweep_naming.hpp`'s `kApiTokenConfirmTotalMetric`
+symbol, shared by the registration site and both increment call sites so a
+typo can't silently create a second, uncounted shadow series) at
+`rest_api_v1.cpp`'s `POST /api/v1/tokens/{id}/confirm` handler
+(`surface="rest"`) and `mcp_server.cpp`'s `confirm_api_token_rotation` tool
+handler (`surface="mcp"`). Treat it exactly like the engine family:
+`increase(yuzu_api_token_confirm_total{result="conflict"}[15m]) > <n>`
+for a client stuck replaying a resolved confirm, paired with whatever audit
+action the confirm-rotation piece emits for per-principal forensics — the
+metric is the signal, the audit row is the evidence. See
+[audit-log.md](audit-log.md) for the `api_token.rotation.auto_revoke` /
+`.successor_unused` rows this piece DOES ship (the sweep-driven auto-revoke
+and successor-unused-warning half of human token rotation, distinct from
+confirm).
+
 ## Access review metrics
 
 Periodic access reviews (SOC 2 CC6.2, `docs/auth-architecture.md` "Periodic
