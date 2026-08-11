@@ -226,6 +226,12 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <unordered_set>
 #include <vector>
 
+#ifdef _WIN32
+#include <io.h> // _write — async-signal-safe stderr write, stop()'s escalation log (#2703 Gate 7 item 2)
+#else
+#include <unistd.h> // ::write — same
+#endif
+
 // Defined in dashboard_ui.cpp (separate TU to isolate MSVC raw-string issues).
 extern const char* const kDashboardIndexHtml;
 
@@ -5752,15 +5758,22 @@ public:
             if (finished) {
                 web_thread_.join();
             } else {
-                spdlog::critical(
-                    "ServerImpl::stop: web thread did not finish within the 15s "
-                    "shutdown grace bound (#2703 Gate 7 item 2) — most likely an "
-                    "open MCP GET/streamed-POST connection (not covered by the SSE "
-                    "close-signal above) or a genuinely wedged handler. "
-                    "Force-exiting rather than risking a use-after-free by "
-                    "continuing teardown past a thread that may still be running "
-                    "against these same stores.");
-                spdlog::default_logger()->flush();
+                // `stop()` is called synchronously and directly from the SIGTERM/SIGINT
+                // OS signal handler (`on_signal()`, main.cpp) — NOT deferred to a normal
+                // thread context. spdlog::critical()/flush() allocate and take internal
+                // locks, which is undefined behaviour inside a signal handler (the same
+                // class #73 fixed for the single log line at the top of on_signal(), but
+                // never eliminated from the rest of the synchronously-invoked stop() call
+                // graph — tracked as a systemic follow-up). Use only the async-signal-safe
+                // primitive already established there: a raw write() of a fixed message.
+                const char msg[] =
+                    "ServerImpl::stop: web thread did not finish within the 15s shutdown "
+                    "grace bound (#2703 Gate 7 item 2) - force-exiting.\n";
+#ifdef _WIN32
+                _write(2, msg, sizeof(msg) - 1);
+#else
+                (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
                 std::_Exit(1);
             }
         }
