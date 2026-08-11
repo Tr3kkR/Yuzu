@@ -281,6 +281,34 @@ static int engine_store_error_status(const std::string& err) {
     return 503; // unreachable — all enum cases return above
 }
 
+// #2961 round-2 finding (item 4): the store's own error string for the
+// resolve_rotation_initiator failure — "rotation confirmation unavailable —
+// fall back to revoke" — is the ONLY guidance a machine client (agentic
+// worker over REST/MCP) ever sees for this state, and "revoke" alone reads
+// as the terminal `DELETE /api/v1/engine-principals/{id}` route, which
+// destroys BOTH credentials plus the principal. There is no MCP twin of
+// `DELETE /api/v1/tokens/{token_id}` — the actual safe remedy is
+// per-credential revoke on the SPECIFIC untrusted token. Named here, once,
+// as a structured `remediation` field rather than folded into the message
+// string itself, so a client that reads `remediation` gets the safe route
+// without string-parsing the error message.
+constexpr std::string_view kRotationConfirmUnavailableRemediation =
+    "revoke the specific untrusted credential via DELETE /api/v1/tokens/{token_id} "
+    "(there is no per-credential revoke via the MCP engine-principal tools) — "
+    "never DELETE /api/v1/engine-principals/{id}, which is terminal and destroys "
+    "both credentials plus the principal";
+
+// Remediation text for a store confirm-rotation error, or empty for every
+// other error class (those already carry an actionable message on their
+// own). Shared by both confirm routes (engine + human arm) so the two
+// transports can never diverge on wording, same rationale as
+// classify_engine_store_error's own single-chokepoint contract.
+static std::string_view confirm_rotation_error_remediation(const std::string& err) {
+    if (err.find("rotation confirmation unavailable") != std::string::npos)
+        return kRotationConfirmUnavailableRemediation;
+    return {};
+}
+
 // AccessReviewStore (Periodic Access Reviews, SOC 2 CC6.2) error mapping —
 // per access_review_store.hpp's documented contract, `get_campaign` /
 // `record_attestation` / `close_campaign` signal "no such campaign / no such
@@ -2983,7 +3011,11 @@ void RestApiV1::register_routes(
                 confirm_metric(yuzu::server::detail::confirm_result_label(
                     yuzu::server::detail::classify_engine_store_error(confirmed.error())));
                 res.status = engine_store_error_status(confirmed.error());
-                res.set_content(detail::a4_error(res, confirmed.error()), "application/json");
+                res.set_content(detail::a4_error(
+                                    res, confirmed.error(),
+                                    {.remediation =
+                                         confirm_rotation_error_remediation(confirmed.error())}),
+                                "application/json");
                 (void)audit_fn(req, "api_token.confirm", "failure", "ApiToken", token_id,
                                confirmed.error());
                 return;
@@ -3582,7 +3614,11 @@ void RestApiV1::register_routes(
                 confirm_metric(yuzu::server::detail::confirm_result_label(
                     yuzu::server::detail::classify_engine_store_error(confirmed.error())));
                 res.status = engine_store_error_status(confirmed.error());
-                res.set_content(detail::a4_error(res, confirmed.error()), "application/json");
+                res.set_content(detail::a4_error(
+                                    res, confirmed.error(),
+                                    {.remediation =
+                                         confirm_rotation_error_remediation(confirmed.error())}),
+                                "application/json");
                 (void)audit_fn(req, "engine_principal.credential.confirm", "failure",
                                "EnginePrincipal", principal_id, confirmed.error());
                 return;
