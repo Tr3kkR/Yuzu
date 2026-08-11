@@ -7023,6 +7023,22 @@ private:
                                                                    agent_id, mgmt_group_store_.get());
     }
 
+    /// Same shape as `response_agent_in_scope`, bound to ("Inventory","Read"): the
+    /// per-device Inventory-scope predicate for GET /api/v1/inventory/software (REST)
+    /// and query_installed_software (MCP). Was two byte-identical inline lambdas
+    /// gating on the raw `!is_rbac_enabled()` accessor instead of
+    /// `rbac_enforcement_in_effect` — that accessor can read stale-false while RBAC is
+    /// durably enabled elsewhere (a degraded generation-refresh cache, ADR-0041), which
+    /// would silently disclose the whole fleet's software inventory to a confined
+    /// operator (governance re-review, #2703). Hoisted to one definition so the REST
+    /// and MCP surfaces cannot drift the way #2500's dispatch-targeting defect did.
+    bool inventory_agent_in_scope(const std::string& username, const std::string& agent_id) const {
+        if (!rbac_enforcement_in_effect(rbac_store_.get()))
+            return true; // loaded & explicitly disabled → legacy-open
+        return rbac_store_ && rbac_store_->check_scoped_permission(username, "Inventory", "Read",
+                                                                   agent_id, mgmt_group_store_.get());
+    }
+
     /// Return the agent list as JSON, filtered by RBAC visibility for the given user.
     nlohmann::json get_visible_agents_json(const std::string& username) {
         auto agents = registry_.to_json_obj();
@@ -12834,10 +12850,18 @@ private:
         // nullopt = caller sees the whole fleet (global Infrastructure:Read OR RBAC
         // off); else the caller's management-group members. The global-read branch is
         // load-bearing — a bare get_visible_agents would blank an admin in no group.
+        //
+        // #2703 Gate 7: gate on rbac_enforcement_in_effect (NOT raw is_rbac_enabled())
+        // — the latter can read stale-false while RBAC is durably enabled elsewhere (a
+        // degraded generation-refresh cache), which would silently disclose the whole
+        // fleet to a confined operator. Mirrors get_visible_agents_json's identical
+        // fix immediately above.
         auto visible_set_fn =
             [this](const std::string& username) -> std::optional<std::set<std::string>> {
-            if (rbac_store_ && rbac_store_->is_rbac_enabled() && mgmt_group_store_) {
-                if (!rbac_store_->check_permission(username, "Infrastructure", "Read")) {
+            if (mgmt_group_store_ && rbac_enforcement_in_effect(rbac_store_.get())) {
+                bool global_read = rbac_store_ && rbac_store_->is_open() &&
+                                   rbac_store_->check_permission(username, "Infrastructure", "Read");
+                if (!global_read) {
                     // ADR-0042: get_visible_agents nullopt means the mgmt-store
                     // DEGRADED — return an EMPTY confined set (fail-closed: sees
                     // nothing), NOT nullopt here (which means "sees all fleet").
@@ -15248,10 +15272,7 @@ private:
             // param defaults to {} = no filter (unscoped fleet read).
             software_inventory_store_.get(),
             [this](const std::string& username, const std::string& agent_id) -> bool {
-                if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
-                    return true;
-                return rbac_store_->check_scoped_permission(username, "Inventory", "Read", agent_id,
-                                                            mgmt_group_store_.get());
+                return inventory_agent_in_scope(username, agent_id);
             },
             // #1634: per-agent Response-scope predicate for the fan-out response
             // readers (GET /api/v1/executions/{id}/visualization). Routes through the
@@ -15449,10 +15470,7 @@ private:
                 // isolation). MUST be wired here; the param defaults to {} = no filter.
                 software_inventory_store_.get(),
                 [this](const std::string& username, const std::string& agent_id) -> bool {
-                    if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
-                        return true;
-                    return rbac_store_->check_scoped_permission(username, "Inventory", "Read",
-                                                                agent_id, mgmt_group_store_.get());
+                    return inventory_agent_in_scope(username, agent_id);
                 },
                 // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
                 // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.

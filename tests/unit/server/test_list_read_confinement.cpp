@@ -26,6 +26,9 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -408,4 +411,86 @@ TEST_CASE("authorize_list_read: a degraded mgmt store denies a confined operator
           ListReadDecision::DenyAll);
     // The per-agent scoped check on the same degraded store also fails closed.
     CHECK_FALSE(r.rbac.check_scoped_permission("alice", "Response", "Read", "a_p", &r.mgmt));
+}
+
+// Governance re-review, #2703 Gate 7 (G11-SEC-CALLSITE-01 / QA-1): a lexical
+// regression backstop for the class of defect just found and fixed —
+// server.cpp confinement-relevant closures reading the raw `is_rbac_enabled()`
+// accessor instead of the fail-closed `rbac_enforcement_in_effect()` free
+// function. `rbac_enforcement_in_effect()` itself is already covered at the
+// primitive level (test_rbac_store.cpp's degraded-generation-view test), and
+// `visible_set_fn`/`inventory_agent_in_scope` are now one-line delegations to
+// it — so the residual, previously-uncaught risk is WIRING drift at the
+// call site, which no store-level test can see and which a doc comment has
+// already failed to prevent three times (cpp-expert/architect, Gate 3, same
+// round). No ServerImpl test harness exists to exercise this at runtime
+// (`response_agent_in_scope`, the established-correct sibling, has no direct
+// test either), so this scans the real source text instead: every live
+// `is_rbac_enabled()` call site in server.cpp must be on the explicit
+// allowlist below (today: exactly one, the nav-bar/`/api/me`-style session
+// JSON, which is display-only per rbac_store.hpp's own documented exception)
+// or the test fails, naming the offending line, so a future addition is a
+// deliberate allowlist edit rather than a silent regression.
+TEST_CASE("server.cpp: every live is_rbac_enabled() call site is display-only "
+          "(allowlisted), never a confinement decision (#2703 Gate 7)",
+          "[list_read][rbac][lexical]") {
+    const auto find_server_cpp = []() -> std::filesystem::path {
+        const std::filesystem::path rel{"server/core/src/server.cpp"};
+        for (auto base : {std::filesystem::current_path(),
+                          std::filesystem::absolute(std::filesystem::path(__FILE__))
+                              .parent_path()}) {
+            for (int up = 0; up < 6; ++up) {
+                auto cand = base / rel;
+                if (std::filesystem::exists(cand))
+                    return cand;
+                if (!base.has_parent_path())
+                    break;
+                base = base.parent_path();
+            }
+        }
+        return {};
+    }();
+    REQUIRE_FALSE(find_server_cpp.empty());
+
+    std::ifstream in(find_server_cpp);
+    REQUIRE(in.is_open());
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    const std::string src = buf.str();
+
+    // Known-safe display-only site: the nav-bar/session-info JSON. Matched by
+    // the exact live-code line, not by proximity to a comment, so a future
+    // reformat that keeps the same test-and-branch shape still matches, and
+    // any OTHER new call site (different shape, different purpose) does not.
+    const std::unordered_set<std::string> allowlist = {
+        "if (rbac_store_ && rbac_store_->is_rbac_enabled()) {",
+    };
+
+    std::istringstream lines(src);
+    std::string line;
+    int lineno = 0;
+    std::vector<std::string> offenders;
+    while (std::getline(lines, line)) {
+        ++lineno;
+        if (line.find("is_rbac_enabled()") == std::string::npos)
+            continue;
+        // Skip comment-only lines (// or ///) — this test guards live code,
+        // not the prose warning against this exact mistake.
+        auto first_nonspace = line.find_first_not_of(" \t");
+        if (first_nonspace != std::string::npos && line.compare(first_nonspace, 2, "//") == 0)
+            continue;
+        std::string trimmed = line.substr(first_nonspace == std::string::npos ? 0 : first_nonspace);
+        if (allowlist.count(trimmed))
+            continue;
+        offenders.push_back("server.cpp:" + std::to_string(lineno) + ": " + trimmed);
+    }
+
+    INFO("A new/changed is_rbac_enabled() call site in server.cpp was found outside the "
+         "allowlist. If it decides confinement/authorization scope, use "
+         "rbac_enforcement_in_effect(rbac_store_.get()) instead (see rbac_store.hpp's doc "
+         "comment on is_rbac_enabled()). If it is genuinely display-only (like the nav-bar "
+         "JSON), add its exact trimmed line text to this test's allowlist deliberately.");
+    for (const auto& o : offenders)
+        UNSCOPED_INFO(o);
+    CHECK(offenders.empty());
 }
