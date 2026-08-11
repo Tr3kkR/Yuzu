@@ -108,15 +108,29 @@ struct ApprovalQuery {
 /// kNotConsumable means the one-time capability is spent. Distinguishing them by
 /// parsing the message string would be a fragile seam, so the kind is typed.
 ///
-/// OBLIGATION ON THE FIRST CALLER of the three-argument overload: today the MCP
-/// recall maps every consume failure onto one message — "approval already used
-/// (one-time ticket)", remediating "submit a new request without approval_id".
-/// That is correct only while the two-argument overload is the sole caller.
-/// Wired as-is to a precondition, it would tell the operator to discard a ticket
-/// this code deliberately left recallable — re-entering the very burn class
-/// #2443 exists to close. Map the kinds, and audit a kPrecondition denial: a
-/// refusal to honour a human-approved capability currently leaves nothing but a
-/// log line.
+/// DISCHARGED (#2443, confirm_engine_rotation): the MCP recall's shared consume
+/// failure handling in mcp_server.cpp gives kPrecondition its own client
+/// message instead of falling through to "approval already used" - the
+/// fallthrough would have told the operator to discard a ticket this code
+/// deliberately left recallable, re-entering the very burn class #2443 exists
+/// to close. That message is deliberately GENERIC and kind-independent, not
+/// this error's own `.message` string: the precondition runs before the
+/// tool's own per-handler RBAC check, so echoing the specific fact (which
+/// RotationConfirmState fired) would be a credential-state oracle for a
+/// tier-eligible, RBAC-less caller. The specific fact still reaches the
+/// audit row - server-side, ahead of RBAC concerns - via mcp_server.cpp's
+/// `mcp_audit("denied", ...)`, which already fires generically for every
+/// ConsumeFailure kind, so kPrecondition needed no new audit/metric plumbing
+/// there, only the message split. This store method's own `spdlog::info` on
+/// a precondition decline (see the impl) stays a log line by design; the
+/// caller's audit row is the durable record.
+///
+/// A FUTURE second caller of the three-argument overload inherits this same
+/// obligation for its own kind of drift: (1) do not let its kPrecondition
+/// message fall through to the shared "already used" wording, and (2) if its
+/// `.message` carries anything the caller shouldn't learn before their own
+/// RBAC gate runs, keep it out of the client-facing text the way this one
+/// does - do not assume this comment's DISCHARGED note still covers it.
 enum class ConsumeFailure {
     kPrecondition,  ///< precondition denied — ticket UNTOUCHED, still recallable
     kNotConsumable, ///< absent / not approved / already consumed (the CAS lost)

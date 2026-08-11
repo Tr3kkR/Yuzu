@@ -636,6 +636,17 @@ public:
                           "yuzu_mcp_approval_refused_total: what this counter withholds is "
                           "already withheld there",
                           "counter");
+        metrics_.describe("yuzu_mcp_approval_precondition_denied_total",
+                          "MCP approval-ticket recalls refused by a pre-consume precondition "
+                          "(#2443) — the ticket matched and was approved, but the underlying "
+                          "operation's live state had already moved on since mint. A subset "
+                          "of yuzu_mcp_approval_refused_total, broken out separately: unlike "
+                          "the masked-denial split above, a precondition denial is already "
+                          "distinguishable to the caller from the response body, so this "
+                          "carries no anti-oracle restriction — it is not a `reason` label on "
+                          "the shared counter because the shared counter's other kinds "
+                          "(foreign-origin vs ordinary replay) still must not be",
+                          "counter");
         // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
         // degrade reason is a static literal inside the bridge, never derived
         // from caller input.
@@ -913,6 +924,15 @@ public:
             // Same closed set again for the #2786 masked-denial counter.
             metrics_.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", tool}});
         }
+        // yuzu_mcp_approval_precondition_denied_total's reachable label set is
+        // NARROWER than the two above: kPrecondition can only fire for a tool
+        // that actually has a ConsumePrecondition wired, which today is just
+        // confirm_engine_rotation (#2443) — pre-seeding the full
+        // approval-gated set here would claim reachability for tools whose
+        // precondition is always `{}`. Extend this list alongside #2939's
+        // sweep as each tool gets its own precondition wired.
+        metrics_.counter("yuzu_mcp_approval_precondition_denied_total",
+                         {{"tool", "confirm_engine_rotation"}});
         // #2437 handler-side bound denials. The label set is closed on BOTH
         // axes: `tool` is execute_instruction alone (the only tool that EMITS
         // this counter today; the two kAgenticParamMaxLen read tools bound in
