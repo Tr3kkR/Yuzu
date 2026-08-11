@@ -166,7 +166,7 @@ groups:
         # same non-denying condition — reproducing exactly the false alarm
         # this rule exists to prevent, just via a different reason value.
         # Splitting it keeps generation_refresh_failed denial-only. Folding
-        # any of the four observe-only reasons into this alert's reason=~match
+        # any of the three observe-only reasons into this alert's reason=~match
         # would page "callers being denied fleet-wide" for a condition that
         # denies nobody — a false alarm during exactly the kind of incident
         # this alert exists to page accurately for. If any ever needs its own

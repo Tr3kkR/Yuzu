@@ -198,7 +198,14 @@ bounded-staleness-for-continuity tradeoff, chosen because clearing the cache on 
 transient blip turned a brief pool hiccup into an immediate fleet-wide authorization outage,
 which is a worse availability posture than tolerating a few seconds of staleness. Only once
 the 5s bound is exceeded does the store fall back to the original "assume changed" behavior
-and clear the cache. A new fail-fast circuit breaker (2 consecutive pool-acquire/query
+and clear the cache. **This bound covers two distinct pieces of cached trust, not one:**
+`perm_cache_` (individual cached allow/deny verdicts) as described above, and separately the
+cached `rbac_enabled` view that `rbac_enforcement_in_effect()` consults — a refresh failure
+inside the bound does not degrade EITHER, so a confinement-critical caller keeps trusting the
+last-known-good `rbac_enabled` state (not just cached permission verdicts) through the same
+short blip; only once the bound is exceeded does `rbac_enabled_view_degraded()` report true
+and `rbac_enforcement_in_effect()` fail closed to "enforcement in effect" regardless of what
+the raw flag last read. A new fail-fast circuit breaker (2 consecutive pool-acquire/query
 failures) independently bounds how long an uncached check can block on a doomed pool, without
 itself affecting cache validity. That bound is tight (well under a second) ONLY for pool
 exhaustion — a connection that cannot be acquired within the 250ms budget. A query that DOES

@@ -97,8 +97,16 @@ public:
         /// connection (NAT/firewall reap) as a failed statement instead of an
         /// indefinite hang. 0 leaves libpq defaults.
         int keepalives_idle_s = 30;
-        /// TCP_USER_TIMEOUT (ms, libpq 12+/Linux+Windows — no-op where the
-        /// platform lacks the socket option), injected as `tcp_user_timeout=`
+        /// TCP_USER_TIMEOUT (ms, libpq 12+ — a no-op where the platform lacks
+        /// the socket option, e.g. macOS). Linux support is confirmed against
+        /// this project's vendored libpq (`fe-connect.c` sets `TCP_USER_TIMEOUT`
+        /// under `__linux__`). **Windows is unconfirmed, not confirmed
+        /// unsupported** — Gate 3 review (#2703) produced disagreeing reads
+        /// of libpq's own Windows conditional compilation and neither could be
+        /// fully settled from available evidence; treat it as a documented
+        /// open question rather than an established fact either way until
+        /// someone verifies against a live Windows build. Injected as
+        /// `tcp_user_timeout=`
         /// unless the conninfo sets its own. Distinct from keepalives_idle
         /// above: keepalives only start probing once the connection goes
         /// IDLE (no traffic either direction) and, with `keepalives_interval`/

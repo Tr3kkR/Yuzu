@@ -693,28 +693,72 @@ server `PgPool`).
   answering for up to ~5 s regardless of breaker state; new/uncached
   decisions deny once the breaker trips, at whichever of the two speeds
   above applies; once the 5 s bound elapses, every check denies until the
-  backend recovers. Watch
+  backend recovers. **Not just a sustained outage — flapping (repeated
+  short degrade/recover cycles, the shape a managed-Postgres failover or a
+  brief network partition actually produces) is arguably the worse case for
+  this mechanism, not a milder one:** the breaker's closed-state failure
+  streak resets to 0 on a single success, so each recovery — even one that
+  lasts only as long as the next probe — reopens the breaker back to FULL
+  concurrency rather than easing back in; a Postgres backend that is
+  flapping rather than cleanly down can therefore see repeated full-
+  concurrency retry bursts instead of a single clean trip-and-stay-open
+  (tracked for a half-open concurrency cap, see #3016). **Blast radius while
+  open is bounded by the shared connection pool, not the breaker itself:**
+  every authz check on this replica denies while the breaker is open —
+  including checks against securable types that have nothing to do with
+  whatever degraded — because the breaker gates pool ACCESS, shared across
+  every `RbacStore` caller on the process, not per-query health. **No
+  operator action is needed for recovery** — the breaker self-heals: once a
+  probe succeeds (the next attempt after its ~1 s cooldown), it closes
+  again automatically and normal service resumes. Watch
   `yuzu_server_rbac_breaker_open` (gauge) and
   `yuzu_server_rbac_authz_check_seconds` (histogram) after upgrade.
+- **If you alert on the raw `generation_refresh_failed` reason label,
+  re-baseline after upgrade.** This release splits what was previously a
+  single reason into two: `generation_refresh_failed` (still denying —
+  unchanged meaning) and the new `generation_refresh_failed_within_bound`
+  (a refresh failure that landed inside the bounded ~5 s stale-serve window
+  above and denied nobody). A custom alert or dashboard built against the
+  pre-upgrade single-reason series may see its rate drop after upgrade —
+  that is the intended effect of the split, not a sign the underlying
+  condition stopped occurring. The shipped `YuzuRbacReadDegraded` alert
+  already accounts for this (see `docs/prometheus/yuzu-alerts.yml`); a
+  custom query built directly against `yuzu_server_rbac_read_degrade_total`
+  should be reviewed against the reason list in `metrics.md` before relying
+  on it post-upgrade.
 - **Shutdown grace bounds now stack; raise your orchestrator's termination
-  grace period if you don't see clean shutdowns.** A graceful `SIGTERM` walks
-  several independently-bounded waits in sequence — up to 30 s draining
-  in-flight executions, up to 5 s waiting on the NVD-sync background thread,
-  up to 15 s waiting on the HTTP listener thread (#2703 Gate 7 item 2), and
-  up to 5 s on the gRPC shutdown deadline — which can stack to **~55 s** in
-  the worst case if more than one is genuinely wedged. Kubernetes' default
-  `terminationGracePeriodSeconds` is **30**, so a pod with slow-draining work
-  in more than one of those stages can be `SIGKILL`ed mid-sequence before the
-  server finishes its own bounded teardown. If you run under Kubernetes (or
-  any orchestrator with a similar default), raise the grace period to
-  comfortably exceed ~55 s rather than relying on the platform default. If
-  the 15 s HTTP-listener bound is exceeded, the diagnostic line is written
-  directly to **stderr** (not through the configured logger) before the
-  process force-exits — an async-signal-safety requirement, since `stop()`
-  runs synchronously inside the SIGTERM handler (see #3007). If you rely on
-  the log file or a structured log sink rather than captured stderr, this
-  one line will not appear there; check container/service stderr capture
-  for it instead.
+  grace period, but understand what that does and does not buy you.** A
+  graceful `SIGTERM` walks several independently-bounded waits in sequence —
+  up to 30 s draining in-flight executions, up to 5 s waiting on the
+  NVD-sync background thread, up to 15 s waiting on the HTTP listener thread
+  (#2703 Gate 7 item 2), and up to 5 s on the gRPC shutdown deadline — which
+  can stack to **~55 s** in the worst case if more than one is genuinely
+  wedged. Kubernetes' default `terminationGracePeriodSeconds` is **30**, so
+  a pod with slow-draining work in more than one of those stages can be
+  `SIGKILL`ed mid-sequence before the server finishes its own bounded
+  teardown. If you run under Kubernetes (or any orchestrator with a similar
+  default), raise the grace period to comfortably exceed ~55 s rather than
+  relying on the platform default. **Two things a longer grace period does
+  NOT fix:** (1) the 30 s drain window only waits on executions already
+  `running` in `execution_tracker_` when shutdown begins — it does not stop
+  the HTTP listener from accepting and starting NEW requests during that
+  window, so a request that lands late in the drain is not bounded by the
+  ~55 s figure at all; raising the grace period does not close this gap,
+  because the gap is about admission, not about how long the drain itself
+  waits. (2) if the 15 s HTTP-listener bound IS exceeded, the server
+  force-exits (`std::_Exit(1)`) on its OWN internal schedule, independent of
+  whatever grace period the orchestrator was configured with — a longer
+  external grace period only prevents the orchestrator from `SIGKILL`ing
+  the process BEFORE that internal bound fires; it cannot prevent or delay
+  the force-exit itself, and the force-exit skips
+  `offload_target_store_->flush_all()` and any other still-pending teardown
+  the same way a `SIGKILL` would. If the 15 s HTTP-listener bound is
+  exceeded, the diagnostic line is written directly to **stderr** (not
+  through the configured logger) before the process force-exits — an
+  async-signal-safety requirement, since `stop()` runs synchronously inside
+  the SIGTERM handler (see #3007). If you rely on the log file or a
+  structured log sink rather than captured stderr, this one line will not
+  appear there; check container/service stderr capture for it instead.
 - Confirm on first boot: the backfill completion log line, no `RbacStore`
   open/migrate errors, and that RBAC is still enabled if you had enabled it
   (Settings → RBAC, or check that confined operators still see only their

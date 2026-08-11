@@ -2340,7 +2340,17 @@ under PostgreSQL degradation" note for the full mechanism and its CAIQ
 characterization. **The `rbac_enabled` flag propagates on the same durable
 path.** The ~1 s bounded stale-allow window is an **accepted, gate-recorded
 residual risk** (well inside the fleet's minutes-scale revocation-latency
-envelope); `LISTEN/NOTIFY` (window → 0) is the named follow-up.
+envelope); `LISTEN/NOTIFY` (window → 0) is the named follow-up. **The 5 s
+stale-serve bound above covers this flag's cached view too, not just
+`perm_cache_`:** `rbac_enforcement_in_effect()` — the fail-closed accessor
+every confinement-critical caller MUST use instead of the raw
+`is_rbac_enabled()` — consults `rbac_enabled_view_degraded()`, which is
+gated by the same `kRbacStaleServeBoundMs` window as the permission cache.
+A refresh failure inside the bound therefore keeps trusting the
+last-known-good `rbac_enabled` state exactly as it keeps trusting cached
+permission verdicts; only past the bound does the view count as degraded
+and `rbac_enforcement_in_effect()` fail closed (treats degraded the same as
+enabled) regardless of what the raw flag last read.
 
 **Fail-closed BOOT on the `rbac_enabled` flag.** The `rbac_enabled` flag is
 durable in `rbac_meta`. An unreadable OR non-canonical flag at boot **refuses

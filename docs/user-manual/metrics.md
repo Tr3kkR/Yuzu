@@ -1038,15 +1038,17 @@ sum(rate(yuzu_server_mgmt_group_backfill_total{result="failed"}[15m])) > 0
 
 The `RbacStore` — the PostgreSQL authorization substrate (schema `rbac_store`)
 that backs `require_permission` / `require_scoped_permission` /
-`authorize_list_read` — exports two counters. Authorization reads **fail closed
-(deny-on-degrade)**: when the store cannot answer, it **denies** rather than
-allowing, so a degrade is a **fleet-wide authorization-availability event**, not
-a silent partial outage.
+`authorize_list_read` — exports two counters, a histogram, and a gauge.
+Authorization reads **fail closed (deny-on-degrade)**: when the store cannot
+answer, it **denies** rather than allowing, so a degrade is a **fleet-wide
+authorization-availability event**, not a silent partial outage.
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `yuzu_server_rbac_read_degrade_total` | counter | `reason` | An authorization-cache read against `rbac_store` was affected by a degrade. **Three reasons DENY**: `pool_acquire_timeout` (no PG connection available in time), `query_error` (the authz query failed), `generation_refresh_failed` (the durable cross-replica cache-coherence token could not be re-read PAST the bounded ~5s stale-serve window — treated as "assume changed", cache cleared) — a non-zero rate on these means callers are being denied because the substrate is unhealthy. **Four reasons are OBSERVE-ONLY and deny nothing** (fjarvis #2703 F2/F3 + the 2026-08-11 bounded-stale-serve split): `rbac_enabled_non_canonical` (a periodic refresh read a durable `rbac_enabled` value that wasn't exactly `"true"`/`"false"`; the cached enabled-state is left unchanged rather than coerced), `stale_beyond_accepted_bound` (a reader landed inside an in-flight generation refresh that was already past the accepted ~1s staleness bound; the read still proceeds from the pre-refresh cache), and `generation_refresh_failed_within_bound` (a generation refresh failed but the store is still inside the bounded ~5s stale-serve window from ADR-0041's "Update" — the existing cache keeps answering unchanged; early warning only, nobody is denied). The `YuzuRbacReadDegraded` alert is scoped to the three denying reasons only. |
+| `yuzu_server_rbac_read_degrade_total` | counter | `reason` | An authorization-cache read against `rbac_store` was affected by a degrade. **Three reasons DENY**: `pool_acquire_timeout` (no PG connection available in time — also recorded here when the fail-fast circuit breaker denies without touching the pool, since a breaker-open denial is one of this reason's two contributing failure modes, not a distinct reason), `query_error` (the authz query failed), `generation_refresh_failed` (the durable cross-replica cache-coherence token could not be re-read PAST the bounded ~5s stale-serve window — treated as "assume changed", cache cleared) — a non-zero rate on these means callers are being denied because the substrate is unhealthy. **Three reasons are OBSERVE-ONLY and deny nothing** (fjarvis #2703 F2/F3 + the 2026-08-11 bounded-stale-serve split): `rbac_enabled_non_canonical` (a periodic refresh read a durable `rbac_enabled` value that wasn't exactly `"true"`/`"false"`; the cached enabled-state is left unchanged rather than coerced), `stale_beyond_accepted_bound` (a reader landed inside an in-flight generation refresh that was already past the accepted ~1s staleness bound; the read still proceeds from the pre-refresh cache), and `generation_refresh_failed_within_bound` (a generation refresh failed but the store is still inside the bounded ~5s stale-serve window from ADR-0041's "Update" — the existing cache keeps answering unchanged; early warning only, nobody is denied). The `YuzuRbacReadDegraded` alert is scoped to the three denying reasons only. |
 | `yuzu_server_rbac_backfill_total` | counter | `result` | Outcome of the one-time legacy-`rbac.db` → PostgreSQL backfill at boot. `result` ∈ `fresh` (empty legacy store — nothing to migrate), `completed` (backfill reconciled and committed), `failed` (backfill could not complete — the server **fails the boot closed** and retries on the next start). |
+| `yuzu_server_rbac_authz_check_seconds` | histogram | none | End-to-end latency of `check_permission` — acquire + query + cache lookup, every outcome including cache hits and breaker-denied fast paths. Extended buckets out to 60s (not the default 10s ceiling), because the measured lock-contention tail on this path runs to ~18.5s and, per the dark-network analysis in the SOC2 doc's availability-posture note, as far as ~40s. Distinct from `yuzu_pg_acquire_wait_seconds`, which reads fast even when the acquire itself succeeds but the query afterward blocks on `PgPool`'s injected `lock_timeout` — this histogram is the only place that scenario's true end-to-end cost is visible. |
+| `yuzu_server_rbac_breaker_open` | gauge | none | `1` when the authz-hot-path fail-fast circuit breaker is open (2 consecutive `pool_acquire_timeout`/`query_error` failures), `0` when closed. Per-process/per-replica, not fleet-wide — a fleet-wide view needs `count(yuzu_server_rbac_breaker_open == 1)` across replicas. |
 
 **Example output:**
 
@@ -1063,6 +1065,17 @@ yuzu_server_rbac_read_degrade_total{reason="stale_beyond_accepted_bound"} 0
 # HELP yuzu_server_rbac_backfill_total Outcome of the RbacStore Postgres backfill at boot
 # TYPE yuzu_server_rbac_backfill_total counter
 yuzu_server_rbac_backfill_total{result="completed"} 1
+
+# HELP yuzu_server_rbac_authz_check_seconds End-to-end latency of RbacStore::check_permission
+# TYPE yuzu_server_rbac_authz_check_seconds histogram
+yuzu_server_rbac_authz_check_seconds_bucket{le="0.005"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="+Inf"} 0
+yuzu_server_rbac_authz_check_seconds_sum 0
+yuzu_server_rbac_authz_check_seconds_count 0
+
+# HELP yuzu_server_rbac_breaker_open 1 when the authz fail-fast breaker is open, 0 when closed
+# TYPE yuzu_server_rbac_breaker_open gauge
+yuzu_server_rbac_breaker_open 0
 ```
 
 **Suggested alert (a degrade on one of the three denying reasons denies authz fleet-wide):**

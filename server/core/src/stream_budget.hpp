@@ -344,8 +344,8 @@ public:
     /// (`McpStreamPump`'s teardown is driven by `session_alive_`/session-
     /// registry revalidation, a materially different mechanism) — an open
     /// MCP stream still relies on the bounded web-thread join + escalation
-    /// in `ServerImpl::stop()` as its backstop. Tracked as a named follow-up,
-    /// not silently left uncovered.
+    /// in `ServerImpl::stop()` as its backstop. Tracked as a named follow-up
+    /// (#2371 comment, 2026-08-11), not silently left uncovered.
     void begin_closing() { closing_.store(true, std::memory_order_release); }
     bool closing() const { return closing_.load(std::memory_order_acquire); }
 
