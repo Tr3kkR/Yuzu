@@ -700,7 +700,14 @@ server `PgPool`).
   in more than one of those stages can be `SIGKILL`ed mid-sequence before the
   server finishes its own bounded teardown. If you run under Kubernetes (or
   any orchestrator with a similar default), raise the grace period to
-  comfortably exceed ~55 s rather than relying on the platform default.
+  comfortably exceed ~55 s rather than relying on the platform default. If
+  the 15 s HTTP-listener bound is exceeded, the diagnostic line is written
+  directly to **stderr** (not through the configured logger) before the
+  process force-exits — an async-signal-safety requirement, since `stop()`
+  runs synchronously inside the SIGTERM handler (see #3007). If you rely on
+  the log file or a structured log sink rather than captured stderr, this
+  one line will not appear there; check container/service stderr capture
+  for it instead.
 - Confirm on first boot: the backfill completion log line, no `RbacStore`
   open/migrate errors, and that RBAC is still enabled if you had enabled it
   (Settings → RBAC, or check that confined operators still see only their
