@@ -180,8 +180,9 @@ enum class McpStreamClose {
     kInternalError,      ///< the pump caught an exception — OUR fault, not the client's
     // The next four are produced ONLY by the streamed-POST surface (2f PR 3b); the GET pump
     // never emits them. Declared here so to_string / close_remediation / the metric seed cover
-    // the whole closed reason set from C4. Their producer code shipped in 3b, but only runs
-    // when --mcp-enable-streamed-post is set (not the default): the POST pump emits all four.
+    // the whole closed reason set from C4. Their producer code shipped in 3b and runs whenever
+    // --mcp-enable-streamed-post is set, which is now the default: the POST pump emits all four
+    // unless an operator has opted out with --no-mcp-streamed-post.
     kCancelled,          ///< the client sent notifications/cancelled; the execution continues
     kCapExpired,         ///< the streamed-POST response time cap elapsed; the execution continues
     kRecordGone,         ///< the bridge can no longer serve this key (erased, or shutting down)

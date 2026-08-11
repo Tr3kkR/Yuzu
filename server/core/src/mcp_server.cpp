@@ -463,7 +463,10 @@ static const ToolDef kTools[] = {
     {"validate_scope",
      "Validate a scope expression without executing it. Returns parse errors if invalid.",
      R"({"type":"object","properties":{"expression":{"type":"string","description":"Scope expression to validate"}},"required":["expression"]})",
-     R"j({"type":"object","properties":{"valid":{"type":"boolean"},"expression":{"type":"string","description":"The input expression, echoed back verbatim (not canonicalized) — present only when valid is true"},"error":{"type":"string","description":"Parse error message — present only when valid is false"}},"required":["valid"],"oneOf":[{"required":["expression"]},{"required":["error"]}]})j"},
+     R"j({"oneOf":[)j"
+     R"j({"type":"object","properties":{"valid":{"const":true},"expression":{"type":"string","description":"The input expression, echoed back verbatim (not canonicalized)"}},"required":["valid","expression"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"valid":{"const":false},"error":{"type":"string","description":"Parse error message"}},"required":["valid","error"],"additionalProperties":false})j"
+     R"j(]})j"},
 
     {"preview_scope_targets", "Show which agents match a scope expression.",
      R"({"type":"object","properties":{"expression":{"type":"string","description":"Scope expression"}},"required":["expression"]})",
@@ -729,9 +732,9 @@ static const ToolDef kTools[] = {
      "the tools/call params and notifications/progress frames (agents responded / targeted, with "
      "the execution_id in _meta under \"yuzu.execution_id\") are delivered as the fleet "
      "responds. WHERE they arrive is your choice, per request: send an SSE-capable Accept "
-     "(text/event-stream) with the token and - IF the server has streamed POST enabled "
-     "(--mcp-enable-streamed-post; OFF by default, so assume not unless you have "
-     "confirmed it) - THIS POST response is held open as the stream. Otherwise you get "
+     "(text/event-stream) with the token and - streamed POST is on by default "
+     "(--mcp-enable-streamed-post; assume enabled unless the server has opted out with "
+     "--no-mcp-streamed-post) - THIS POST response is held open as the stream. Otherwise you get "
      "a normal complete JSON answer and progress arrives on the session GET channel - "
      "progress frames first, the JSON-RPC result last, then EOF; send the token WITHOUT an SSE "
      "Accept and this POST answers immediately in JSON while the frames go to the session's GET "
@@ -771,7 +774,18 @@ static const ToolDef kTools[] = {
      R"j("params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"Key-value parameters"},)j"
      R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. Omit BOTH this and agent_ids to target all agents; supplying either one empty is rejected rather than widened to __all__."},)j"
      R"j("agent_ids":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target. EXCLUSIVE with scope - supplying both is rejected, because the old precedence discarded this list in favour of the broader scope. Omit entirely to target all agents; an EMPTY array is rejected, because a target list that resolves to nothing must not silently widen to the whole fleet."})j"
-     R"j(},"required":["plugin","action"]})j"},
+     R"j(},"required":["plugin","action"]})j",
+     // #2712: two fully self-contained, mutually-exclusive branches - each
+     // declares its OWN complete properties/required/additionalProperties:false
+     // rather than sharing top-level properties with per-branch const/required,
+     // which would let the zero-agents document also satisfy the normal branch
+     // (its required set is a strict subset of the zero-agents fields). Same
+     // class of gap an adversarial review of batch 1 found in validate_scope's
+     // looser oneOf - fixed there too in this commit.
+     R"j({"oneOf":[)j"
+     R"j({"type":"object","properties":{"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":1},"plugin":{"type":"string"},"action":{"type":"string"}},"required":["command_id","execution_id","agents_reached","plugin","action"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"no_agents_reached"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message"],"additionalProperties":false})j"
+     R"j(]})j"},
 
     // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
     // One instruction → several plugin actions on ONE device → collated results,
@@ -779,7 +793,7 @@ static const ToolDef kTools[] = {
     {"execute_bundle",
      "Fan one instruction out into several plugin actions on ONE device, async. The server "
      "dispatches each step as an ordinary command under a shared correlation id and returns "
-     "bundle_id + expected immediately (it does NOT wait). Poll get_bundle_result with the "
+     "bundle_id + agent_id + expected immediately (it does NOT wait). Poll get_bundle_result with the "
      "bundle_id for the collated result - bundles do NOT emit notifications/progress "
      "(no _meta.progressToken support in the 2f scope; polling is the contract here). Use "
      "this instead of N execute_instruction calls when refreshing a device "
@@ -791,7 +805,8 @@ static const ToolDef kTools[] = {
      R"j("plugin":{"type":"string"},"action":{"type":"string"},)j"
      R"j("params":{"type":"object","additionalProperties":{"type":"string"}})j"
      R"j(},"required":["plugin","action"]}})j"
-     R"j(},"required":["agent_id","steps"]})j"},
+     R"j(},"required":["agent_id","steps"]})j",
+     R"j({"type":"object","properties":{"bundle_id":{"type":"string"},"expected":{"type":"integer","minimum":1},"agent_id":{"type":"string"}},"required":["bundle_id","expected","agent_id"]})j"},
 
     {"get_bundle_result",
      "Collate a bundle dispatched by execute_bundle: server-grouped "
@@ -802,7 +817,15 @@ static const ToolDef kTools[] = {
      "Requires Response:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("bundle_id":{"type":"string","description":"The bundle id (bundle-…) returned by execute_bundle"})j"
-     R"j(},"required":["bundle_id"]})j"},
+     R"j(},"required":["bundle_id"]})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("complete":{"type":"boolean","description":"True once every step is terminal - NOT a success signal, check succeeded==expected"},)j"
+     R"j("received":{"type":"integer","minimum":0},"succeeded":{"type":"integer","minimum":0},"expected":{"type":"integer","minimum":0},)j"
+     R"j("steps":{"type":"array","items":{"type":"object","properties":{)j"
+     R"j("plugin":{"type":"string"},"action":{"type":"string"},"state":{"type":"string","enum":["pending","responded","dispatch_failed"]},)j"
+     R"j("status":{"type":"integer","description":"CommandResponse::Status enum value, meaningful when state is responded"},"output":{"type":"string"})j"
+     R"j(},"required":["plugin","action","state","status","output"]}})j"
+     R"j(},"required":["complete","received","succeeded","expected","steps"]})j"},
 
     // ── Internal-CA tools (MCP/REST parity for /api/v1/ca/*, PR4 B-2) ──────────
     {"list_issued_certs",
@@ -821,7 +844,10 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("serial_hex":{"type":"string","description":"Cert serial (1-64 hex) from list_issued_certs"},)j"
      R"j("reason":{"type":"string","description":"Optional revocation reason (audited)"})j"
-     R"j(},"required":["serial_hex"]})j"},
+     R"j(},"required":["serial_hex"]})j",
+     R"j({"type":"object","properties":{"revoked":{"const":true},"serial_hex":{"type":"string"},"crl_republished":{"type":"boolean"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
+     R"j(},"required":["revoked","serial_hex","crl_republished"]})j"},
 
     // ── Engine-principal lifecycle tools (ADR-1005 item 2b, plan PR 4.3;
     // MCP twins of the REST /api/v1/engine-principals/* surface, design doc
@@ -1040,17 +1066,24 @@ static const ToolDef kTools[] = {
     // approval and returns approval_id + status_url; after an admin approves
     // it, re-call with that approval_id to execute (one-time; replay-safe).
     {"set_tag",
-     "Set a device tag (structured category or free-form). Mirrors PUT /api/v1/tags. "
+     "Set a device tag (structured category or free-form). Mirrors PUT /api/v1/tags (same "
+     "store write, same tag-push trigger) — response shape is a SUPERSET of the REST twin's "
+     "bare {\"set\":true}: this tool also echoes agent_id/key. "
      "Requires the operator or supervised MCP tier (Tag:Write). Fires the agent tag-push on "
      "a structured-category change, exactly like the REST path.",
      R"j({"type":"object","properties":{)j"
      R"j("agent_id":{"type":"string","description":"Target agent id"},)j"
      R"j("key":{"type":"string","description":"Tag key (category keys role/environment/location/service are case-normalised)"},)j"
      R"j("value":{"type":"string","description":"Tag value; category keys validate against their allowed set"})j"
-     R"j(},"required":["agent_id","key","value"]})j"},
+     R"j(},"required":["agent_id","key","value"]})j",
+     R"j({"type":"object","properties":{"set":{"const":true},"agent_id":{"type":"string"},"key":{"type":"string"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
+     R"j(},"required":["set","agent_id","key"]})j"},
 
     {"delete_tag",
-     "Delete a device tag by agent_id + key. Mirrors DELETE /api/v1/tags/{agent_id}/{key}. "
+     "Delete a device tag by agent_id + key. Mirrors DELETE /api/v1/tags/{agent_id}/{key} (same "
+     "store write) — response shape is a SUPERSET of the REST twin's bare {\"deleted\":true}: "
+     "this tool also echoes agent_id/key. "
      "Destructive (Tag:Delete): approval-gated on the operator AND supervised tiers — the first "
      "call returns an approval ticket (kApprovalRequired), re-call with the returned approval_id "
      "after an admin approves.",
@@ -1058,23 +1091,40 @@ static const ToolDef kTools[] = {
      R"j("agent_id":{"type":"string","description":"Target agent id"},)j"
      R"j("key":{"type":"string","description":"Tag key to delete"},)j"
      R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"})j"
-     R"j(},"required":["agent_id","key"]})j"},
+     R"j(},"required":["agent_id","key"]})j",
+     R"j({"type":"object","properties":{"deleted":{"const":true},"agent_id":{"type":"string"},"key":{"type":"string"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
+     R"j(},"required":["deleted","agent_id","key"]})j"},
 
     {"approve_request",
-     "Approve a pending approval request by id. Mirrors POST /api/approvals/{id}/approve "
-     "(Approval:Approve, supervised MCP tier). The reviewer cannot be the submitter.",
+     "Approve a pending approval request by id (same ApprovalManager::approve() write as "
+     "the legacy dashboard route POST /api/approvals/{id}/approve, but NOT a wire-format "
+     "mirror of it: that HTMX-facing route returns {\"status\":\"approved\"} for a toast, "
+     "while this tool returns {approved, approval_id} below - do not assume the two are "
+     "interchangeable response shapes). Requires Approval:Approve, supervised MCP tier. The "
+     "reviewer cannot be the submitter.",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","description":"Id of the pending approval to approve"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
-     R"j(},"required":["approval_id"]})j"},
+     R"j(},"required":["approval_id"]})j",
+     R"j({"type":"object","properties":{"approved":{"const":true},"approval_id":{"type":"string"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
+     R"j(},"required":["approved","approval_id"]})j"},
 
     {"reject_request",
-     "Reject a pending approval request by id. Mirrors POST /api/approvals/{id}/reject "
-     "(Approval:Approve, supervised MCP tier). The reviewer cannot be the submitter.",
+     "Reject a pending approval request by id (same ApprovalManager::reject() write as "
+     "the legacy dashboard route POST /api/approvals/{id}/reject, but NOT a wire-format "
+     "mirror of it: that HTMX-facing route returns {\"status\":\"rejected\"} for a toast, "
+     "while this tool returns {rejected, approval_id} below - do not assume the two are "
+     "interchangeable response shapes). Requires Approval:Approve, supervised MCP tier. The "
+     "reviewer cannot be the submitter.",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","description":"Id of the pending approval to reject"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
-     R"j(},"required":["approval_id"]})j"},
+     R"j(},"required":["approval_id"]})j",
+     R"j({"type":"object","properties":{"rejected":{"const":true},"approval_id":{"type":"string"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
+     R"j(},"required":["rejected","approval_id"]})j"},
 
     {"quarantine_device",
      "Isolate a device from the network (records the quarantine AND dispatches the live "
@@ -1087,7 +1137,13 @@ static const ToolDef kTools[] = {
      R"j("reason":{"type":"string","description":"Optional quarantine reason (audited)"},)j"
      R"j("whitelist":{"type":"string","description":"Comma-separated extra IPs to allow through the isolation firewall"},)j"
      R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"})j"
-     R"j(},"required":["agent_id"]})j"},
+     R"j(},"required":["agent_id"]})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("command_id":{"type":"string","description":"Empty when the live isolation dispatch was never attempted or threw - the quarantine record is still persisted"},)j"
+     R"j("agents_reached":{"type":"integer","minimum":0,"description":"0 means recorded-only (device offline/unreachable) - NOT a failure, the record still persists"},)j"
+     R"j("quarantine_record":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"quarantined_by":{"type":"string"},"reason":{"type":"string"},"whitelist":{"type":"string"}},"required":["agent_id","status","quarantined_by","reason","whitelist"]},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
+     R"j(},"required":["command_id","agents_reached","quarantine_record"]})j"},
 
     // ── Engine principal role assignments (PR 4.2, design §4.1) — MCP twins of
     // POST/DELETE/GET /api/v1/engine-principals/{id}/roles. Closes the "no
@@ -6594,14 +6650,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // The three wiring deps are part of eligibility, not assertions: a
                 // build_handler caller that omits any of them (every pre-3b test)
                 // gets today's plain path rather than a stream it cannot service.
-                // 3b still ships DORMANT, but no longer because it is unsound: the
-                // four defects that gated the flip are fixed - #2739 (the response
-                // cap now fires on a busy execution: the drain-then-settle state in
+                // 3b now ships ON by default: the four defects that gated the flip
+                // are fixed - #2739 (the response cap now fires on a busy
+                // execution: the drain-then-settle state in
                 // mcp_stream_bridge.cpp's project_record), #2740 (an undelivered
                 // final no longer holds a session slot for good: the reclaim in
                 // McpStreamBridge::reserve), #2785 (POST frames carry the ring event
-                // id) and #2789 (per-principal reject coverage). Turning the default
-                // on is a SEPARATE rung, so this flag stays off here.
+                // id) and #2789 (per-principal reject coverage). An operator can
+                // still opt out with --no-mcp-streamed-post.
                 //
                 // nullptr reads as OFF, so every caller that does not opt in - incl.
                 // every pre-3b test - gets the plain path, matching the wiring-deps
@@ -6946,24 +7002,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     // stays for backwards compatibility with workers
                     // that parse it; the status field is the stable
                     // programmatic surface.
-                    auto zero_obj = JObj()
-                                        .add("status", "no_agents_reached")
-                                        .add("command_id", command_id)
-                                        .add("execution_id", execution_id)
-                                        .add("agents_reached", 0)
-                                        .add("plugin", plugin)
-                                        .add("action", action)
-                                        .add("message", "No agents reachable for command dispatch");
-                    auto result =
+                    const std::string zero_payload =
                         JObj()
-                            .raw("content",
-                                 JArr()
-                                     .add(JObj().add("type", "text").add("text", zero_obj.str()))
-                                     .str())
+                            .add("status", "no_agents_reached")
+                            .add("command_id", command_id)
+                            .add("execution_id", execution_id)
+                            .add("agents_reached", 0)
+                            .add("plugin", plugin)
+                            .add("action", action)
+                            .add("message", "No agents reachable for command dispatch")
                             .str();
                     mcp_audit("failure",
                               std::string("no_agents_reached execution_id=") + execution_id);
-                    res.set_content(success_response(id, result), "application/json");
+                    res.set_content(
+                        success_response(id, tool_result(zero_payload, kObjectOutputSchema)),
+                        "application/json");
                     return;
                 }
 
@@ -7008,19 +7061,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 // Empty execution_id (no tracker) is included anyway as
                 // an empty string so the response shape is stable; tests
                 // assert presence-or-empty, not non-empty.
-                auto result_obj = JObj()
-                                      .add("command_id", command_id)
-                                      .add("execution_id", execution_id)
-                                      .add("agents_reached", agents_reached)
-                                      .add("plugin", plugin)
-                                      .add("action", action);
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr()
-                                 .add(JObj().add("type", "text").add("text", result_obj.str()))
-                                 .str())
-                        .str();
+                const std::string payload = JObj()
+                                                .add("command_id", command_id)
+                                                .add("execution_id", execution_id)
+                                                .add("agents_reached", agents_reached)
+                                                .add("plugin", plugin)
+                                                .add("action", action)
+                                                .str();
+                // #2712: structuredContent is baked into `result` HERE, before it
+                // is handed to bridge->arm() below as result_base - a streamed or
+                // parked final's build_real_final() parse-merges result_base and
+                // only ADDS top-level status/agents_success/agents_failure keys
+                // (mcp_stream_bridge.cpp), so structuredContent survives into every
+                // final shape unchanged. This is a deliberate, pinned decision, not
+                // an accident of construction order - see the bridge byte-pin test
+                // added alongside this change.
+                auto result = tool_result(payload, kObjectOutputSchema);
                 // S5 (2f PR 3a): arm GET-only - the atomic flip-and-drain hands
                 // the latched mailbox to the projector, which publishes progress
                 // LIVE onto this session's GET stream. `result` is passed as the
@@ -7556,7 +7612,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 payload.add("set", true).add("agent_id", agent_id).add("key", key);
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
-                res.set_content(success_response(id, tool_result(payload.str())), "application/json");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -7607,7 +7664,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 payload.add("deleted", true).add("agent_id", agent_id).add("key", key);
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
-                res.set_content(success_response(id, tool_result(payload.str())), "application/json");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -7648,7 +7706,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("approval_id", target_id);
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
-                res.set_content(success_response(id, tool_result(payload.str())), "application/json");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -7802,7 +7861,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     .raw("quarantine_record", record_obj.str());
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
-                res.set_content(success_response(id, tool_result(payload.str())), "application/json");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -7895,20 +7955,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto result_obj = JObj()
-                                      .add("bundle_id", r.correlation_id)
-                                      .add("expected", static_cast<int64_t>(r.expected))
-                                      .add("agent_id", agent_id);
-                auto result =
-                    JObj()
-                        .raw("content", JArr()
-                                            .add(JObj().add("type", "text").add("text",
-                                                                                result_obj.str()))
-                                            .str())
-                        .str();
+                auto payload = JObj()
+                                   .add("bundle_id", r.correlation_id)
+                                   .add("expected", static_cast<int64_t>(r.expected))
+                                   .add("agent_id", agent_id)
+                                   .str();
                 mcp_audit("success", std::string("bundle_id=") + r.correlation_id +
                                          " steps=" + std::to_string(r.expected));
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -7951,16 +8006,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr()
-                                 .add(JObj().add("type", "text").add("text", aggregate_to_json(*agg)))
-                                 .str())
-                        .str();
+                // #2712: aggregate_to_json() deliberately dumps with
+                // error_handler_t::replace (bundle_service.cpp) to survive invalid
+                // UTF-8 in untrusted plugin output (#1593) - wrap that string
+                // UNCHANGED through tool_result(), never reserialize it.
+                const std::string payload = aggregate_to_json(*agg);
                 mcp_audit("success", std::string("bundle_id=") + bundle_id +
                                          " complete=" + (agg->complete ? "1" : "0"));
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -8421,21 +8475,17 @@ McpServer::HandlerFn McpServer::build_handler(
                                            : "CRL build/record failed after revocation; CRL may "
                                              "be stale") &&
                            audit_ok;
-                nlohmann::json payload = {{"revoked", true},
-                                          {"serial_hex", serial},
-                                          {"crl_republished", crl_ok}};
+                nlohmann::json payload_j = {{"revoked", true},
+                                            {"serial_hex", serial},
+                                            {"crl_republished", crl_ok}};
                 if (!audit_ok)
-                    payload["audit_persisted"] = false;
-                auto result = JObj()
-                                  .raw("content", JArr()
-                                                      .add(JObj().add("type", "text").add(
-                                                          "text", payload.dump()))
-                                                      .str())
-                                  .str();
+                    payload_j["audit_persisted"] = false;
+                const std::string payload = payload_j.dump();
                 // L2 (#1240): record the tool-layer invocation too (mcp.<tool>) so
                 // MCP usage correlates with the ca.* domain events in the audit store.
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 

@@ -332,9 +332,10 @@ public:
                             // stale [=]-over-const-bool& alias pattern.
                             McpSessionRegistry* sessions = nullptr,
                             const bool* mcp_streaming_disabled = nullptr,
-                            // 3b: SSE-on-POST gate. nullptr or false = plain path, which
-                            // remains the shipped default - turning it on is a separate rung,
-                            // not a defect gate.
+                            // 3b: SSE-on-POST gate. nullptr or false = plain path - the
+                            // wiring-deps fallback every pre-3b caller gets. The shipped
+                            // Config default is now true; nullptr here just means this
+                            // caller has not wired the flag in, not the production posture.
                             const bool* mcp_streamed_post_enabled = nullptr,
                             std::vector<std::string> allowed_origins = {},
                             // ADR-0024: backs the query_software_licenses discovery read
@@ -437,9 +438,10 @@ public:
                          // temporary that would dangle once build_handler captures its address.
                          McpSessionRegistry* sessions = nullptr,
                          const bool* mcp_streaming_disabled = nullptr,
-                            // 3b: SSE-on-POST gate. nullptr or false = plain path, which
-                            // remains the shipped default - turning it on is a separate rung,
-                            // not a defect gate.
+                            // 3b: SSE-on-POST gate. nullptr or false = plain path - the
+                            // wiring-deps fallback every pre-3b caller gets. The shipped
+                            // Config default is now true; nullptr here just means this
+                            // caller has not wired the flag in, not the production posture.
                             const bool* mcp_streamed_post_enabled = nullptr,
                          std::vector<std::string> allowed_origins = {},
                          SoftwareLicensingStore* software_licensing_store = nullptr,

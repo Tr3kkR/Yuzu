@@ -814,11 +814,14 @@ struct McpTestServer {
     /// present Origin). Default nullptr/{} = streaming OFF ⇒ pre-2f behaviour.
     yuzu::server::mcp::McpSessionRegistry* session_registry_for_test{nullptr};
     bool streaming_disabled_{false};
-    /// Streamed POST ships OFF in production - turning it on is a separate rung,
-    /// not a defect gate (see Config::mcp_streamed_post_enable). The harness turns it ON so the streamed
-    /// tests exercise the streamed path - without this every one of them would
-    /// silently take the plain path and pass while proving nothing. A test that
-    /// wants the shipped default sets this false explicitly.
+    /// Streamed POST now ships ON in production (see Config::mcp_streamed_post_enable).
+    /// The harness ALSO defaults this true, but for an independent reason: so the
+    /// streamed tests exercise the streamed path - without this every one of them
+    /// would silently take the plain path and pass while proving nothing. The two
+    /// defaults matching is not load-bearing; do not assume they will stay in sync
+    /// without checking (see the harness/Config binding test above the opt-out
+    /// TEST_CASE below). A test that wants the opt-out (--no-mcp-streamed-post)
+    /// posture sets this false explicitly.
     bool streamed_post_enabled_{true};
     std::vector<std::string> allowed_origins_for_test{};
 
@@ -2641,15 +2644,15 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
     // outputSchema check in this file was the get_fleet_posture_fast
     // special-case below - #2712's own filing named that as the reason the
     // other ~45 gaps were invisible to CI. This closed, explicit exemption
-    // set is the retrofit backlog #2712 tracks (execute_*/writes family,
-    // not yet done); every tool NOT in it must advertise
-    // outputSchema, or this test fails - so a NEW tool merging without one
-    // fails immediately, and exempting one requires editing this literal
-    // list, a visible reviewable diff line rather than a silent gap. Mirrors
-    // the kToolAnnotation completeness check above
-    // (CHECK(classified == listed)). DEX + network family (#2712 batch 2) is
-    // no longer exempt - it now has real schemas, see the shared handler
-    // blocks in mcp_server.cpp.
+    // set is the retrofit backlog #2712 tracks; every tool NOT in it must
+    // advertise outputSchema, or this test fails - so a NEW tool merging
+    // without one fails immediately, and exempting one requires editing
+    // this literal list, a visible reviewable diff line rather than a
+    // silent gap. Mirrors the kToolAnnotation completeness check above
+    // (CHECK(classified == listed)). #2712's three batches (Phase-1 reads,
+    // DEX+network, execute_*/writes) have all landed - this set is now
+    // empty, but kept as the mechanism (not deleted) since it is the
+    // structural gate a NEW tool without a schema fails against.
     //
     // CAVEAT (adversarial review of PR #2978, 2026-08-11): this gate checks
     // outputSchema PRESENCE, not typed-NESS - it does not reject the generic
@@ -2662,18 +2665,7 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
     // question, get_incident_playbook, summarize_working_set) still ship
     // the placeholder and pass this gate anyway - tracked as #2986, not
     // silently ignored.
-    static const std::set<std::string> kOutputSchemaExempt = {
-        // execute_* + writes family (#2712 batch 3, not started)
-        "execute_instruction",
-        "execute_bundle",
-        "get_bundle_result",
-        "revoke_certificate",
-        "quarantine_device",
-        "delete_tag",
-        "set_tag",
-        "approve_request",
-        "reject_request",
-    };
+    static const std::set<std::string> kOutputSchemaExempt = {};
     for (const auto& tool : tools) {
         const auto name = tool["name"].get<std::string>();
         if (kOutputSchemaExempt.count(name))
@@ -4791,6 +4783,16 @@ TEST_CASE("MCP Integration: execute_instruction happy dispatch", "[mcp][integrat
     // create_execution and dispatch_fn sees "").
     CHECK(text["execution_id"].get<std::string>().empty());
     CHECK(ts.last_dispatch_execution_id.empty());
+
+    // #2712: structuredContent mirrors content[0].text exactly (same string,
+    // no wrap) for the normal-dispatch oneOf branch - and must NOT carry the
+    // zero-agents branch's status/message fields, matching the closed
+    // additionalProperties:false per-branch design.
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto& sc = body["result"]["structuredContent"];
+    CHECK(sc == text);
+    CHECK_FALSE(sc.contains("status"));
+    CHECK_FALSE(sc.contains("message"));
 }
 
 // ── 23a2. CDX-R5-02: execute_instruction confinement handoff ───────────────
@@ -5441,6 +5443,18 @@ TEST_CASE("MCP Integration: execute_instruction zero agents reached",
 
     auto text_str = content[0]["text"].get<std::string>();
     CHECK(text_str.find("No agents reachable") != std::string::npos);
+
+    // #2712: structuredContent mirrors content[0].text for the zero-agents
+    // oneOf branch - status is the stable discriminator, agents_reached is
+    // pinned to 0 (const), and the branch must NOT carry the normal-dispatch
+    // branch's fields beyond what both share.
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto text = nlohmann::json::parse(text_str);
+    auto& sc = body["result"]["structuredContent"];
+    CHECK(sc == text);
+    CHECK(sc["status"] == "no_agents_reached");
+    CHECK(sc["agents_reached"] == 0);
+    CHECK(sc.contains("message"));
 }
 
 // ── 28. Default scope to __all__ ─────────────────────────────────────────
@@ -6458,6 +6472,66 @@ TEST_CASE("MCP CA: revoke_certificate supervised + approval manager mints a tick
     sqlite3_close(raw);
 }
 
+TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches revoked:true "
+          "(#2712)",
+          "[mcp][integration][pki][security][approval]") {
+    yuzu::test::TempDbFile db{std::string_view{"yuzu_test_mcp_ca_"}};
+    yuzu::server::CaStore store(db.path);
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "CAFE";
+    rec.subject = "agent-z";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec));
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
+    // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
+    // manual close is skipped on failure - leaking the connection.
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+
+    auto res1 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"CAFE","reason":"compromised"}}})");
+    REQUIRE(res1);
+    auto body1 = nlohmann::json::parse(res1->body);
+    REQUIRE(body1.contains("error"));
+    std::string approval_id = body1["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+
+    std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"CAFE","reason":"compromised","approval_id":")" +
+                         approval_id + R"("}}})";
+    auto res2 = ts.call(recall);
+    REQUIRE(res2);
+    auto body2 = nlohmann::json::parse(res2->body);
+    REQUIRE(body2.contains("result")); // SUCCESS
+    auto payload =
+        nlohmann::json::parse(body2["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["revoked"] == true);
+    CHECK(payload["serial_hex"] == "CAFE");
+    CHECK(payload["crl_republished"] == true);
+    CHECK(store.is_revoked("CAFE"));
+    CHECK(ts.crl_publish_calls_ == 1);
+    // #2712: structuredContent mirrors content[0].text exactly.
+    REQUIRE(body2["result"].contains("structuredContent"));
+    CHECK(body2["result"]["structuredContent"] == payload);
+}
+
 // ── #2395 track D: KEK rotation MCP tools (parity with kek_routes.cpp) ────────
 // rotate_kek / rewrap_secrets / get_kek_status are the MCP twins of
 // POST/GET /api/v1/secrets/kek/*, sharing the SAME KekOps seam (kek_ops_for_test,
@@ -6975,6 +7049,14 @@ nlohmann::json bundle_payload(const std::unique_ptr<httplib::Response>& res) {
     REQUIRE(body.contains("result"));
     return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
 }
+// #2712: result.structuredContent of the same reply - both execute_bundle and
+// get_bundle_result are already object-shaped, so this must equal bundle_payload().
+nlohmann::json bundle_structured(const std::unique_ptr<httplib::Response>& res) {
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    REQUIRE(body["result"].contains("structuredContent"));
+    return body["result"]["structuredContent"];
+}
 
 bool audit_has(const std::vector<std::string>& log, const std::string& entry) {
     for (const auto& e : log)
@@ -7138,6 +7220,9 @@ TEST_CASE("MCP execute_bundle fans each step out + returns bundle_id", "[pg][mcp
     CHECK(audit_has(ts.audit_log, "bundle.os_info.uptime|dispatched"));
     CHECK(audit_has(ts.audit_log, "bundle.os_info.os_name|dispatched"));
     CHECK(audit_has(ts.audit_log, "mcp.execute_bundle|success"));
+
+    // #2712: structuredContent mirrors content[0].text exactly.
+    CHECK(bundle_structured(res) == p);
 }
 
 TEST_CASE("MCP get_bundle_result collates the responses in request order", "[pg][mcp][bundle]") {
@@ -7177,6 +7262,11 @@ TEST_CASE("MCP get_bundle_result collates the responses in request order", "[pg]
     REQUIRE(p["steps"].size() == 2);
     CHECK(p["steps"][0]["action"] == "uptime"); // request order, not arrival
     CHECK(p["steps"][0]["output"] == "up 3d");
+
+    // #2712: structuredContent mirrors content[0].text - aggregate_to_json()'s
+    // output is wrapped UNCHANGED (error_handler_t::replace preserved), never
+    // reserialized, so this must be an exact match, not just field-equivalent.
+    CHECK(bundle_structured(get) == p);
 }
 
 TEST_CASE("MCP get_bundle_result enforces ownership (IDOR)", "[pg][mcp][bundle]") {
@@ -7310,6 +7400,21 @@ TEST_CASE("MCP get_bundle_result tolerates non-UTF-8 plugin output (no envelope 
     REQUIRE(body.contains("result")); // NOT a thrown / escaped envelope
     auto p = bundle_payload(resp);
     CHECK(p["steps"][0]["state"] == "responded");
+
+    // #2712: structuredContent must ALSO survive the invalid-UTF-8 input
+    // without throwing (it's the same error_handler_t::replace string, wrapped
+    // unchanged by tool_result() - never reserialized) - and must be byte-
+    // identical to content[0].text once both are parsed, not merely
+    // field-equivalent, since a reserialization bug could silently diverge on
+    // exactly this kind of replaced-character content.
+    REQUIRE(body["result"].contains("structuredContent"));
+    CHECK(body["result"]["structuredContent"] == p);
+    // Exact-equality, matching the REST twin's identical scenario
+    // (test_rest_bundle.cpp:455) - confirms the invalid byte was REPLACED
+    // with U+FFFD (not silently dropped/truncated, which a bare
+    // absence-of-0xff check could not distinguish from this).
+    const auto out = p["steps"][0]["output"].get<std::string>();
+    CHECK(out == "\xEF\xBF\xBD" "binary");
 }
 
 // ── query_installed_software (ADR-0016 typed store + management-group scope) ──
@@ -7986,6 +8091,14 @@ nlohmann::json write_tool_payload(const std::unique_ptr<httplib::Response>& res)
     REQUIRE(body.contains("result"));
     return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
 }
+// #2712: result.structuredContent of the same reply - every write tool in this
+// block is already object-shaped, so this must equal write_tool_payload().
+nlohmann::json write_tool_structured(const std::unique_ptr<httplib::Response>& res) {
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    REQUIRE(body["result"].contains("structuredContent"));
+    return body["result"]["structuredContent"];
+}
 } // namespace
 
 TEST_CASE("MCP set_tag operator sets the tag and fires the agent tag-push",
@@ -8014,6 +8127,9 @@ TEST_CASE("MCP set_tag operator sets the tag and fires the agent tag-push",
     CHECK(ts.tag_pushes[0].first == "agent-1");
     CHECK(ts.tag_pushes[0].second == "role");
     CHECK(ts.audit_log.back() == "mcp.set_tag|success");
+
+    // #2712: structuredContent mirrors content[0].text exactly.
+    CHECK(write_tool_structured(res) == payload);
 }
 
 TEST_CASE("MCP set_tag rejects an invalid category value", "[mcp][integration][tag]") {
@@ -8099,6 +8215,8 @@ TEST_CASE("MCP delete_tag full approval-ticket round-trip + replay is rejected",
     auto payload2 = write_tool_payload(res2);
     CHECK(payload2["deleted"] == true);
     CHECK(tags.get_tag("agent-1", "role").empty()); // actually deleted
+    // #2712: structuredContent mirrors content[0].text exactly.
+    CHECK(write_tool_structured(res2) == payload2);
 
     // 4. Replay the SAME approval_id → rejected (one-time ticket already consumed).
     auto res3 = ts.call(recall);
@@ -9942,6 +10060,8 @@ TEST_CASE("MCP approve_request approves a pending request as a second principal"
     REQUIRE(row);
     CHECK(row->status == "approved");
     CHECK(row->reviewed_by == "test-user");
+    // #2712: structuredContent mirrors content[0].text exactly.
+    CHECK(write_tool_structured(res) == payload);
     sqlite3_close(raw);
 }
 
@@ -9966,6 +10086,8 @@ TEST_CASE("MCP reject_request rejects a pending request", "[mcp][integration][ap
     auto row = appr.get(*submitted);
     REQUIRE(row);
     CHECK(row->status == "rejected");
+    // #2712: structuredContent mirrors content[0].text exactly.
+    CHECK(write_tool_structured(res) == payload);
     sqlite3_close(raw);
 }
 
@@ -10054,7 +10176,77 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     REQUIRE(ts.last_dispatch_exec_visible.has_value());
     CHECK(ts.last_dispatch_exec_visible->size() == 1);
     CHECK(ts.last_dispatch_exec_visible->count("agent-q") == 1);
+    // #2712: structuredContent mirrors content[0].text exactly.
+    CHECK(write_tool_structured(res2) == payload2);
     sqlite3_close(raw);
+}
+
+TEST_CASE("MCP quarantine_device records-only (agents_reached=0) is still a SUCCESS, "
+          "never a failure - pins the schema's minimum:0, not minimum:1",
+          "[mcp][integration][quarantine][approval]") {
+    // #2712: an offline/unreachable device still gets recorded (the isolation
+    // dispatch just never lands) - this is NOT a failure path, and the schema
+    // must accept agents_reached==0 as a valid success value. A naive copy of
+    // execute_instruction's normal-branch minimum:1 onto this tool would be
+    // exactly the wrong constraint here (Fable's review of the #2712 batch 3
+    // plan flagged this as the natural mistake to avoid).
+    yuzu::test::TempDbFile qdb{std::string_view{"yuzu_test_mcp_quar_"}};
+    yuzu::server::QuarantineStore quar(qdb.path);
+    REQUIRE(quar.is_open());
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
+    // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
+    // manual close is skipped on failure - leaking the connection.
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.quarantine_store_for_test = &quar;
+    ts.approval_manager_for_test = &appr;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    // dispatch_fn_for_test stays unwired (nullptr) - the handler's
+    // `if (dispatch_fn)` guard skips the isolation dispatch entirely, leaving
+    // agents_reached at its default-initialized 0. This is the same shape a
+    // wired-but-offline-device dispatch would produce.
+    ts.start("supervised");
+
+    auto res1 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":242,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-offline","reason":"malware"}}})");
+    REQUIRE(res1);
+    auto body1 = nlohmann::json::parse(res1->body);
+    REQUIRE(body1.contains("error"));
+    std::string approval_id = body1["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+
+    std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":243,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-offline","reason":"malware","approval_id":")" +
+                         approval_id + R"("}}})";
+    auto res2 = ts.call(recall);
+    REQUIRE(res2);
+    auto body2 = nlohmann::json::parse(res2->body);
+    REQUIRE(body2.contains("result")); // SUCCESS, not an error - recording still worked
+    auto payload2 = write_tool_payload(res2);
+    CHECK(payload2["agents_reached"] == 0);
+    CHECK(payload2["command_id"].get<std::string>().empty());
+    // The record still persisted despite no live dispatch.
+    auto rec = quar.get_status("agent-offline");
+    REQUIRE(rec);
+    CHECK(rec->status == "active");
+    // #2712: structuredContent mirrors content[0].text exactly, including the
+    // agents_reached:0 value the schema must accept (minimum:0).
+    CHECK(write_tool_structured(res2) == payload2);
 }
 
 TEST_CASE("MCP write tools are advertised in tools/list", "[mcp][integration][tag]") {
@@ -11207,6 +11399,14 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         CHECK(normalize(res_bridged->body, exec_bridged) ==
               normalize(res_plain->body, exec_plain));
 
+        // #2712: this is a deliberate, pinned decision (not an accident of
+        // construction order) - structuredContent must be present on the
+        // GET-only-armed response exactly like the plain one, since `result`
+        // (which now carries structuredContent) is the SAME string passed to
+        // bridge->arm() as result_base below.
+        CHECK(nlohmann::json::parse(res_bridged->body)["result"].contains(
+            "structuredContent"));
+
         // STOP-SHIP SURFACE, widened ahead of the streamed-POST rung (C8).
         // Comparing bodies alone is not "byte-untouched": mcp-remote 0.1.37 and
         // Claude Desktop negotiate on the status line and the headers, and the
@@ -11467,8 +11667,8 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
 // so progress-before-final, on_final_written and EOF are covered by the pump's own
 // tests in test_mcp_stream_bridge.cpp, NOT from here. Stated rather than implied,
 // because a test named "streamed happy path" reads like end-to-end proof.
-TEST_CASE("Config's shipped default for streamed POST is OFF", "[mcp][2f][3b][config]") {
-    // The dormancy test below pins the HARNESS field it is given, not Config's own
+TEST_CASE("Config's shipped default for streamed POST is ON", "[mcp][2f][3b][config]") {
+    // The opt-out test below pins the HARNESS field it is given, not Config's own
     // default — flipping the production default alone, without also flipping the
     // harness line, would leave that test green regardless.
     //
@@ -11479,20 +11679,34 @@ TEST_CASE("Config's shipped default for streamed POST is OFF", "[mcp][2f][3b][co
     // RESIDUAL, deliberately not closed here: nothing in this file exercises
     // server.cpp's own `&cfg_.mcp_streamed_post_enable` wiring. Closing that needs
     // a live ServerImpl, which is not a unit test; tracked as a follow-up.
-    REQUIRE_FALSE(yuzu::server::Config{}.mcp_streamed_post_enable);
+    REQUIRE(yuzu::server::Config{}.mcp_streamed_post_enable);
 }
 
-TEST_CASE("streamed POST ships DORMANT: the default is off and a stream is not opened",
+// Closes the RESIDUAL noted on McpTestServer::streamed_post_enabled_'s declaration: the
+// harness field's own default and Config's own default currently agree (both true), but
+// that agreement is coincidental, not load-bearing - the harness defaults it true so
+// every OTHER streamed test exercises the streamed path regardless of what production
+// ships. A future change to either default with no change to the other would leave every
+// harness-default-relying test silently exercising the wrong path. This test is the
+// tripwire for that divergence; it does not replace the still-open residual (nothing
+// here exercises server.cpp's own `&cfg_.mcp_streamed_post_enable` wiring).
+TEST_CASE("Harness default for streamed_post_enabled_ tracks Config's own default",
+          "[mcp][2f][3b][config]") {
+    McpTestServer ts;
+    REQUIRE(ts.streamed_post_enabled_ == yuzu::server::Config{}.mcp_streamed_post_enable);
+}
+
+TEST_CASE("streamed POST opt-out: --no-mcp-streamed-post falls back to a plain response",
           "[mcp][integration][execute][bridge][2f][3b]") {
-    // The shipped default. 3b's machinery is complete and the four defects that gated
-    // the on-by-default flip (#2739, #2740, #2785, #2789) are fixed, so the operator
-    // surfaces that document its bounds are now true of the implementation. It stays
-    // off because turning the default on is a SEPARATE rung - the same shape as Spark
-    // landing behind prefer_spark_ = false, cut over once the invariants hold.
+    // The shipped default is now ON (see "Config's shipped default for streamed POST is
+    // ON" above). This test covers the operator opt-out instead: with the flag off, the
+    // operator surfaces that document the plain-path bounds still hold - a client asking
+    // to stream simply does not get one, and nothing about the response shape changes.
     //
-    // This test exists because an unpinned default is how dormancy silently ends: the
-    // harness sets streamed_post_enabled_ = true for every OTHER streamed test, so
-    // nothing else in this file would notice the production default changing.
+    // This test exists because an unpinned default is how opt-out coverage silently
+    // rots into no coverage at all: the harness sets streamed_post_enabled_ = true for
+    // every OTHER streamed test, so nothing else in this file would notice the plain-path
+    // fallback breaking.
     namespace smcp = yuzu::server::mcp;
 
     sqlite3* db = nullptr;
@@ -11520,7 +11734,8 @@ TEST_CASE("streamed POST ships DORMANT: the default is off and a stream is not o
     ts.session_registry_for_test = &sessions;
     ts.metrics_for_test = &metrics;
     ts.stream_budget_for_test = &budget;
-    // THE POINT: take the shipped default rather than the harness's opt-in.
+    // THE POINT: take the opt-out (--no-mcp-streamed-post) posture rather than the
+    // harness's default-on setting.
     ts.streamed_post_enabled_ = false;
 
     auto minted = sessions.mint("test-user");
@@ -11546,8 +11761,8 @@ TEST_CASE("streamed POST ships DORMANT: the default is off and a stream is not o
                            {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
     REQUIRE(res);
 
-    // The command still runs and still answers - dormant is a PLAIN response, not a
-    // refusal. A client asking to stream simply does not get a stream.
+    // The command still runs and still answers - the opt-out path is a PLAIN response,
+    // not a refusal. A client asking to stream simply does not get a stream.
     CHECK(res->status == 200);
     CHECK(dispatched);
     CHECK(res->get_header_value("Content-Type").find("text/event-stream") == std::string::npos);

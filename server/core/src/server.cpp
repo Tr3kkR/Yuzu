@@ -556,10 +556,11 @@ public:
                           "gauge");
         metrics_.describe("yuzu_mcp_streamed_post_enabled",
                           "1 if SSE-on-POST is enabled (--mcp-enable-streamed-post), else 0. "
-                          "Ships 0; the four defects that gated the on-by-default flip "
-                          "(#2739, #2740, #2785, #2789) are fixed, but the flip itself is a "
-                          "separate rung. If this reads 1, size shutdown grace per the Sizing "
-                          "bullet in docs/user-manual/server-admin.md",
+                          "Ships 1: the four defects that gated the on-by-default flip "
+                          "(#2739, #2740, #2785, #2789) are fixed. Size shutdown grace per the "
+                          "Sizing bullet in docs/user-manual/server-admin.md — that guidance is "
+                          "now the default posture. If this reads 0, the operator opted out "
+                          "with --no-mcp-streamed-post.",
                           "gauge");
         metrics_.describe("yuzu_mcp_stream_closes_total", "MCP SSE streams closed, by reason",
                           "counter");
@@ -7726,19 +7727,19 @@ private:
         // its sibling above, from the same post-clamp number.
         metrics_.gauge("yuzu_mcp_streams_cap").set(static_cast<double>(effective_streams));
         metrics_.gauge("yuzu_http_worker_pool_size").set(static_cast<double>(pool_max));
-        // A dormant, security-relevant toggle nobody can confirm is dormant is an
-        // operability gap. --max-sse-streams already surfaces its resolved value as a
-        // gauge; this does the same, so an operator can answer "is streamed POST live
-        // on this box" from /metrics rather than from ps.
+        // A security-relevant toggle nobody can confirm the state of is an operability
+        // gap. --max-sse-streams already surfaces its resolved value as a gauge; this
+        // does the same, so an operator can answer "is streamed POST live on this box"
+        // from /metrics rather than from ps.
         metrics_.gauge("yuzu_mcp_streamed_post_enabled")
             .set(cfg_.mcp_streamed_post_enable ? 1.0 : 0.0);
         spdlog::info("MCP streamed POST (SSE-on-POST): {}{}",
-                     cfg_.mcp_streamed_post_enable ? "ENABLED" : "disabled (default)",
+                     cfg_.mcp_streamed_post_enable ? "ENABLED" : "disabled",
                      cfg_.mcp_streamed_post_enable
                          ? " - size shutdown grace above the 120s response cap plus a "
                            "drain margin (see the Sizing bullet in "
                            "docs/user-manual/server-admin.md)"
-                         : " - enable with --mcp-enable-streamed-post");
+                         : " - re-enable with --mcp-enable-streamed-post");
         spdlog::info("HTTP worker pool: {} threads, sized for {} concurrent held-open responses "
                      "(plain-REST reserve {}). EVERY streaming surface leases from one budget: "
                      "GET /mcp/v1/, MCP streamed POST, GET /api/v1/events, the dashboard "
