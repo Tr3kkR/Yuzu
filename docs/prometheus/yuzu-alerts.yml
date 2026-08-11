@@ -153,15 +153,24 @@ groups:
         # to avoid false LB evictions), so this is otherwise dashboard-invisible.
         # reason = pool_acquire_timeout | query_error | generation_refresh_failed.
         #
-        # DELIBERATELY excludes two other reason values on this same metric
-        # (#2703 fjarvis F2/F3 fix): rbac_enabled_non_canonical and
-        # stale_beyond_accepted_bound are OBSERVE-ONLY — the read still
-        # PROCEEDS (served from cache / the last-known-good enabled value),
-        # nothing is denied. Folding them into this alert's reason=~match
+        # DELIBERATELY excludes three other reason values on this same metric
+        # (#2703 fjarvis F2/F3 fix + the 2026-08-11 bounded-stale-serve split):
+        # rbac_enabled_non_canonical, stale_beyond_accepted_bound, and
+        # generation_refresh_failed_within_bound are OBSERVE-ONLY — the read
+        # still PROCEEDS (served from cache / the last-known-good enabled
+        # value), nothing is denied. generation_refresh_failed_within_bound in
+        # particular exists BECAUSE of this exclusion rule: once the bounded
+        # ~5s stale-serve window (ADR-0041 Update) let a failed refresh keep
+        # serving cached decisions instead of denying, the original single
+        # generation_refresh_failed reason would have started firing on that
+        # same non-denying condition — reproducing exactly the false alarm
+        # this rule exists to prevent, just via a different reason value.
+        # Splitting it keeps generation_refresh_failed denial-only. Folding
+        # any of the four observe-only reasons into this alert's reason=~match
         # would page "callers being denied fleet-wide" for a condition that
         # denies nobody — a false alarm during exactly the kind of incident
-        # this alert exists to page accurately for. If either ever needs its
-        # own alert, it must NOT claim fleet-wide denial.
+        # this alert exists to page accurately for. If any ever needs its own
+        # alert, it must NOT claim fleet-wide denial.
         expr: |
           sum(rate(yuzu_server_rbac_read_degrade_total{reason=~"pool_acquire_timeout|query_error|generation_refresh_failed"}[5m])) by (reason) > 0
         for: 5m
@@ -178,7 +187,11 @@ groups:
             agentic callers are being denied fleet-wide. pool_acquire_timeout /
             query_error correlate with yuzu_pg_* saturation or outage;
             generation_refresh_failed means the cross-replica cache-coherence
-            token could not be re-read. Check Postgres availability and the
+            token could not be re-read PAST the bounded ~5s stale-serve window
+            — cached decisions were dropped and callers are genuinely denied
+            (a refresh failure still inside that window counts separately, as
+            the non-alerting generation_refresh_failed_within_bound reason,
+            and denies nobody). Check Postgres availability and the
             server RbacStore warnings. See docs/auth-architecture.md
             "RbacStore — the authorization substrate".
           runbook_url: "https://docs.yuzu.io/runbooks/rbac-read-degraded"

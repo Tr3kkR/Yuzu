@@ -1114,17 +1114,19 @@ public:
                           "Authorization reads/refreshes that hit a degraded store, by reason "
                           "(pool_acquire_timeout/query_error = a check denied fail-closed rather "
                           "than returning data; generation_refresh_failed = the cross-replica "
-                          "generation/enabled-flag refresh failed and the perm cache was dropped; "
-                          "rbac_enabled_non_canonical/stale_beyond_accepted_bound are OBSERVE-ONLY — "
-                          "the store still served its existing decision, this counts a data-quality "
-                          "or staleness condition rather than a denied check — see the alert's "
+                          "generation/enabled-flag refresh failed PAST the bounded ~5s stale-serve "
+                          "window and the perm cache was dropped — denying; "
+                          "generation_refresh_failed_within_bound/rbac_enabled_non_canonical/"
+                          "stale_beyond_accepted_bound are OBSERVE-ONLY — the store still served "
+                          "its existing decision from cache, this counts a data-quality or "
+                          "staleness condition rather than a denied check — see the alert's "
                           "reason filter before assuming any nonzero rate here pages). "
                           "A sustained non-zero rate in the denying reasons is a fleet-wide authz "
                           "availability event, not mass access-denial — alert on it.",
                           "counter");
         for (const auto reason : {"pool_acquire_timeout", "query_error",
-                                  "generation_refresh_failed", "rbac_enabled_non_canonical",
-                                  "stale_beyond_accepted_bound"})
+                                  "generation_refresh_failed", "generation_refresh_failed_within_bound",
+                                  "rbac_enabled_non_canonical", "stale_beyond_accepted_bound"})
             metrics_.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}});
         metrics_.describe("yuzu_server_rbac_backfill_total",
                           "One-time legacy rbac.db → rbac_store PostgreSQL backfill outcome on "

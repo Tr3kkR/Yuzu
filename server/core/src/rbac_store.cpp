@@ -129,6 +129,15 @@ constexpr int kBreakerTripThreshold = 2;
 // degrades are counted here.
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
+// DENYING: fires only once a failed refresh is past kRbacStaleServeBoundMs
+// and the cache is actually cleared (see maybe_refresh_generation). Must
+// stay denial-only — YuzuRbacReadDegraded (docs/prometheus/yuzu-alerts.yml)
+// is a severity:critical alert whose own design rationale is "never fold in
+// a reason that can fire without denying anyone"; that rationale is exactly
+// why kReasonRefreshFailedWithinBound below exists as a separate value
+// rather than sharing this one (#2703 Gate 7 merge-slice, found during doc
+// cross-check: the pre-split single reason violated that same rationale the
+// moment the bounded stale-serve window shipped).
 constexpr const char* kReasonRefreshFailed = "generation_refresh_failed";
 // fjarvis F2 (#2703): the durable rbac_enabled row read back as neither
 // exactly "true" nor "false" — see parse_canonical_bool.
@@ -137,6 +146,12 @@ constexpr const char* kReasonNonCanonicalFlag = "rbac_enabled_non_canonical";
 // kRbacGenerationRefreshMs bound while a refresh was already in flight — see
 // RbacStore::maybe_refresh_generation.
 constexpr const char* kReasonStaleBeyondBound = "stale_beyond_accepted_bound";
+// OBSERVE-ONLY: a refresh failed but the bounded stale-serve window
+// (kRbacStaleServeBoundMs) has not yet elapsed, so the existing cache keeps
+// serving unchanged and nothing is denied — early warning only. See
+// kReasonRefreshFailed's comment above for why this cannot share that
+// reason value.
+constexpr const char* kReasonRefreshFailedWithinBound = "generation_refresh_failed_within_bound";
 constexpr std::uint64_t kReadDegradeLogSample = 100;
 constexpr std::int64_t kDegradeEpisodeGapSecs = 60;
 
@@ -1202,6 +1217,7 @@ void RbacStore::maybe_refresh_generation() const {
     // which degrade(s) to fire is decided as plain bools first.
     bool fire_non_canonical_degrade = saw_non_canonical_enabled;
     bool fire_refresh_failed_degrade = false;
+    bool refresh_failed_cache_dropped = false;
     {
         std::lock_guard lock(cache_mtx_);
         if (!durable_gen) {
@@ -1219,6 +1235,7 @@ void RbacStore::maybe_refresh_generation() const {
                                           now_ms(), last_successful_refresh_ms_,
                                           kRbacStaleServeBoundMs);
             fire_refresh_failed_degrade = true;
+            refresh_failed_cache_dropped = !within_stale_serve_bound;
             if (!within_stale_serve_bound) {
                 // Fail toward "assume changed": drop the cache and stop
                 // trusting it — the bound is exceeded, or we never had a
@@ -1258,11 +1275,28 @@ void RbacStore::maybe_refresh_generation() const {
         // generation + enabled-flag refresh is failing (Gate 3 architect /
         // Gate 6 sre): a persistent refresh failure means this replica's
         // rbac_enabled view can go stale, the more-sensitive fail-open
-        // dimension.
-        static DegradeSampler sampler;
-        if (note_read_degrade(metrics_, kReasonRefreshFailed, sampler))
-            spdlog::warn("RbacStore: durable generation/enabled-flag refresh failed — cache "
-                         "dropped (assume-changed); rbac_enabled view may be stale on this replica");
+        // dimension. Two DISTINCT reasons (own sampler each, matching this
+        // file's one-sampler-per-call-site convention — see check_permission's
+        // pool-timeout/query-error sites): kReasonRefreshFailed fires ONLY
+        // when the cache was actually dropped (denying, alert-eligible);
+        // kReasonRefreshFailedWithinBound fires while the bounded stale-serve
+        // window still protects the cache (observe-only, nobody denied). See
+        // the reason constants' comments above for why they must not merge.
+        if (refresh_failed_cache_dropped) {
+            static DegradeSampler sampler;
+            if (note_read_degrade(metrics_, kReasonRefreshFailed, sampler))
+                spdlog::warn(
+                    "RbacStore: durable generation/enabled-flag refresh failed — cache "
+                    "dropped (assume-changed); rbac_enabled view may be stale on this replica");
+        } else {
+            static DegradeSampler sampler;
+            if (note_read_degrade(metrics_, kReasonRefreshFailedWithinBound, sampler))
+                spdlog::warn(
+                    "RbacStore: durable generation/enabled-flag refresh failed — still within "
+                    "the {}ms bounded stale-serve window, serving the existing cache "
+                    "unchanged; rbac_enabled view may be stale on this replica",
+                    kRbacStaleServeBoundMs);
+        }
     }
 }
 

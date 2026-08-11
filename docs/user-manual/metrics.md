@@ -1045,7 +1045,7 @@ a silent partial outage.
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `yuzu_server_rbac_read_degrade_total` | counter | `reason` | An authorization-cache read against `rbac_store` was affected by a degrade. **Three reasons DENY**: `pool_acquire_timeout` (no PG connection available in time), `query_error` (the authz query failed), `generation_refresh_failed` (the durable cross-replica cache-coherence token could not be re-read — treated as "assume changed", cache cleared) — a non-zero rate on these means callers are being denied because the substrate is unhealthy. **Two reasons are OBSERVE-ONLY and deny nothing** (fjarvis #2703 F2/F3): `rbac_enabled_non_canonical` (a periodic refresh read a durable `rbac_enabled` value that wasn't exactly `"true"`/`"false"`; the cached enabled-state is left unchanged rather than coerced) and `stale_beyond_accepted_bound` (a reader landed inside an in-flight generation refresh that was already past the accepted ~1s staleness bound; the read still proceeds from the pre-refresh cache). The `YuzuRbacReadDegraded` alert is scoped to the three denying reasons only. |
+| `yuzu_server_rbac_read_degrade_total` | counter | `reason` | An authorization-cache read against `rbac_store` was affected by a degrade. **Three reasons DENY**: `pool_acquire_timeout` (no PG connection available in time), `query_error` (the authz query failed), `generation_refresh_failed` (the durable cross-replica cache-coherence token could not be re-read PAST the bounded ~5s stale-serve window — treated as "assume changed", cache cleared) — a non-zero rate on these means callers are being denied because the substrate is unhealthy. **Four reasons are OBSERVE-ONLY and deny nothing** (fjarvis #2703 F2/F3 + the 2026-08-11 bounded-stale-serve split): `rbac_enabled_non_canonical` (a periodic refresh read a durable `rbac_enabled` value that wasn't exactly `"true"`/`"false"`; the cached enabled-state is left unchanged rather than coerced), `stale_beyond_accepted_bound` (a reader landed inside an in-flight generation refresh that was already past the accepted ~1s staleness bound; the read still proceeds from the pre-refresh cache), and `generation_refresh_failed_within_bound` (a generation refresh failed but the store is still inside the bounded ~5s stale-serve window from ADR-0041's "Update" — the existing cache keeps answering unchanged; early warning only, nobody is denied). The `YuzuRbacReadDegraded` alert is scoped to the three denying reasons only. |
 | `yuzu_server_rbac_backfill_total` | counter | `result` | Outcome of the one-time legacy-`rbac.db` → PostgreSQL backfill at boot. `result` ∈ `fresh` (empty legacy store — nothing to migrate), `completed` (backfill reconciled and committed), `failed` (backfill could not complete — the server **fails the boot closed** and retries on the next start). |
 
 **Example output:**
@@ -1056,6 +1056,7 @@ a silent partial outage.
 yuzu_server_rbac_read_degrade_total{reason="pool_acquire_timeout"} 0
 yuzu_server_rbac_read_degrade_total{reason="query_error"} 0
 yuzu_server_rbac_read_degrade_total{reason="generation_refresh_failed"} 0
+yuzu_server_rbac_read_degrade_total{reason="generation_refresh_failed_within_bound"} 0
 yuzu_server_rbac_read_degrade_total{reason="rbac_enabled_non_canonical"} 0
 yuzu_server_rbac_read_degrade_total{reason="stale_beyond_accepted_bound"} 0
 
@@ -1067,9 +1068,10 @@ yuzu_server_rbac_backfill_total{result="completed"} 1
 **Suggested alert (a degrade on one of the three denying reasons denies authz fleet-wide):**
 
 ```promql
-# Scoped to the three DENYING reasons only — rbac_enabled_non_canonical and
-# stale_beyond_accepted_bound share this metric but deny nothing, so folding
-# them into this expression would page a false "callers denied fleet-wide".
+# Scoped to the three DENYING reasons only — rbac_enabled_non_canonical,
+# stale_beyond_accepted_bound, and generation_refresh_failed_within_bound
+# share this metric but deny nothing, so folding them into this expression
+# would page a false "callers denied fleet-wide".
 sum(rate(yuzu_server_rbac_read_degrade_total{reason=~"pool_acquire_timeout|query_error|generation_refresh_failed"}[5m])) by (reason) > 0
 ```
 
