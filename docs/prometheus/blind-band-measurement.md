@@ -9,8 +9,9 @@ manifest is the RESULT and the gate. A change to `docs/prometheus/yuzu-alerts.ym
 widens or narrows coverage shows up as `--check` reddening; the fix is
 
 ```bash
-python3 tests/prometheus/blind_band_sweep.py --emit > /tmp/manifest.json \
-  && mv /tmp/manifest.json tests/prometheus/blind_band_manifest.json
+tmp=$(mktemp) \
+  && python3 tests/prometheus/blind_band_sweep.py --emit > "$tmp" \
+  && mv "$tmp" tests/prometheus/blind_band_manifest.json
 ```
 
 (`--emit` only ever prints to stdout — it never writes the file itself. Emit to a

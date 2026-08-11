@@ -411,10 +411,12 @@ tests:
   #
   # The collapsed grace as a rule of its own: no genuine stamp in the whole
   # window - every sample 0 (never ran) or the INT64_MIN unreadable-anchor
-  # sentinel, with at least one 0 - means no retention pass has EVER run
-  # against this database. Cases 32-38 (#2854 rung D) plus 39-43 (the same
-  # PR's governance hardening round: mixed-seed regimes, the R2 window pin,
-  # and the pinned false-story states). The readable acceptance argument these
+  # sentinel, with at least one 0 (a dead-CMOS negative BESIDE both still
+  # fires, with an imprecise story - the sentinel keeps never-ran unprovable)
+  # - means no retention pass has EVER run against this database. Cases 32-38
+  # (#2854 rung D) plus 39-46 (the same PR's governance hardening rounds:
+  # mixed-seed regimes, the R2 window pin, the pinned false-story states, and
+  # the structural-grace completeness cases). The readable acceptance argument these
   # encode is the truth table in the rung D design; the machine-checked
   # version of the coverage claim is tests/prometheus/blind_band_manifest.json,
   # gated by blind_band_sweep.py --check.
@@ -738,6 +740,79 @@ tests:
         eval_time: 3h10m
         exp_samples: []
 
+  # CASE 44 -- a sustained 0/negative anchor flap MUST page the liveness rule
+  # (governance CA-G8-1 + Gate 8 security probe A, both MEASURED silent under
+  # the max-only grace this replaces). An anchored database whose only pass
+  # stamped a dead-CMOS negative epoch, with the anchor row flapping
+  # present/absent (restore loop; or a relabel collision merging a fresh and
+  # a dead-CMOS-anchored server), alternates -100 seeds with 0 seeds. The
+  # negative stamp is EVIDENCE OF A PASS, so it must lift the grace exactly
+  # as a positive one does - the structural grace (excused == the never-ran
+  # rule's own condition) is what guarantees no window shape silences both
+  # rules. RED against the max-only grace.
+  - interval: 1m
+    name: retention not running - a 0/negative anchor flap fires, never silences
+    input_series:
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "0x209"
+      - series: 'yuzu_server_audit_retention_last_pass_unixtime{job="yuzu",instance="s1"}'
+        values: "-100x9 0x9 -100x9 0x9 -100x9 0x9 -100x9 0x9 -100x9 0x9 -100x9 0x9 -100x9 0x9 -100x9 0x9 -100x9 0x9 -100x9 0x9 -100x9"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing"}'
+        eval_time: 3h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      # And not the never-ran rule: min is -100, matching neither of its arms.
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNeverRan"}'
+        eval_time: 3h20m
+        exp_samples: []
+
+  # CASE 45 -- the bounded 0-then-negative handoff, pinned (Gate 8
+  # unhappy-path, measured green): fresh database, single dead-CMOS pass at
+  # 60m whose anchor PERSISTS, reaper dead after. The pre-pass 0 samples and
+  # the pre-pass counter samples age out of their [3h] windows together, so
+  # the liveness rule's excusal and its own left side flip in step - it
+  # fires once the window is negative-only, with no silent gap beyond the
+  # increase() window itself.
+  - interval: 1m
+    name: retention not running - a persisted dead-CMOS anchor pages after the handoff
+    input_series:
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "0x59 1x240"
+      - series: 'yuzu_server_audit_retention_last_pass_unixtime{job="yuzu",instance="s1"}'
+        values: "0x59 -100x240"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing"}'
+        eval_time: 4h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNeverRan"}'
+        eval_time: 4h20m
+        exp_samples: []
+
+  # CASE 46 -- the finite negative EPISODE hands back to never-ran (Gate 8
+  # unhappy-path, measured green): fresh database, one dead-CMOS pass at 60m
+  # whose anchor does NOT survive (restart at 70m reseeds 0), reaper dead
+  # after. Once the -100 samples age out (~250m) the window is all-0 again
+  # and the never-ran rule latches, firing by ~7h11m - the same shape and
+  # timing as case 41's lost-anchor rewind. Not a silent state, a slow
+  # handoff; pinned so a future arm edit cannot turn it into one.
+  - interval: 1m
+    name: retention never ran - a finite dead-CMOS episode hands back to never-ran
+    input_series:
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "0x59 1x9 0x380"
+      - series: 'yuzu_server_audit_retention_last_pass_unixtime{job="yuzu",instance="s1"}'
+        values: "0x59 -100x9 0x380"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNeverRan", alertstate="firing"}'
+        eval_time: 7h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNeverRan", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
   # ── YuzuAuditRetentionMetricMissing ───────────────────────────────────────
   #
   # The companion to the rule above, which cannot detect its own input going
@@ -820,9 +895,10 @@ tests:
   # CASE 13 -- WHAT ACTUALLY HAPPENS WHEN A SERVER DIES, which is neither of the
   # static states cases 10 and 11 pin. The target stops being scraped at t=20m:
   # `absent()` goes true once the series ages out (~5m staleness), while
-  # `increase(passes[3h])` still sees the pre-death samples and returns 0, and
-  # the stale stamp series empties the `unless` operand. So BOTH rules fire,
-  # for roughly three hours.
+  # `increase(passes[3h])` still sees the pre-death samples and returns 0,
+  # while the anchored stamp's lingering non-zero samples keep the range-form
+  # grace lifted (max_over_time reads them for the same 3h the left side
+  # does). So BOTH rules fire, for roughly three hours.
   #
   # That is a real double-page and this case exists to state it honestly rather
   # than let three comments keep implying the two rules partition cleanly. It is

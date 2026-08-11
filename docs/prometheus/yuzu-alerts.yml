@@ -1269,13 +1269,17 @@ groups:
       # a 0 seed and the INT64_MIN unreadable-anchor sentinel, or an
       # anchor-loss flap mixing 0 with a real stamp -- reset the `for:` clock
       # forever and NEITHER liveness rule fired on a genuinely dead reaper.
-      # `max_over_time(...[3h]) == 0` excuses only a window whose HIGHEST
-      # stamp sample is exactly 0 -- some sample reads 0 and none reads a
-      # genuine (positive) stamp: one real stamp sample in 3h lifts the grace
-      # for a full window, so the 0/real-stamp mix fires HERE, and the
-      # all-zero and zero/sentinel regimes are owned by
-      # YuzuAuditRetentionNeverRan below (whose min-arm deliberately accepts
-      # the sentinel -- see its comment). A negative dead-CMOS stamp keeps max_over_time negative,
+      # THE GRACE IS EXACTLY THE NEXT RULE'S FIRING CONDITION -- the same
+      # max/min expression, verbatim -- so the pair partitions the dead-reaper
+      # states STRUCTURALLY: every window shape is either excused here and
+      # owned below, or unexcused here and paged here. Excused means "the
+      # window carries no evidence a pass ever happened": every sample is 0
+      # or the unreadable-anchor sentinel, with at least one 0. ANY evidence
+      # of a pass -- a genuine positive stamp, or a dead-CMOS NEGATIVE stamp
+      # (a pass is a pass, whatever the clock said; governance CA-G8-1
+      # measured a 0/negative anchor-flap silencing the max-only form of this
+      # grace) -- lifts it for a full window and fires HERE, as does a window
+      # of only sentinels (nothing rules a dead reaper out). A negative dead-CMOS stamp keeps max_over_time negative,
       # never 0, so it does not earn the grace either -- a pass happened, and a
       # subsequently dead reaper still pages here. Pinned in the test file.
       # `unless` rather than `and` so an absent stamp series cannot silence the
@@ -1345,6 +1349,10 @@ groups:
           increase(yuzu_server_audit_retention_passes_total[3h]) == 0
           unless (
             max_over_time(yuzu_server_audit_retention_last_pass_unixtime[3h]) == 0
+            and (
+              min_over_time(yuzu_server_audit_retention_last_pass_unixtime[3h]) == 0
+              or min_over_time(yuzu_server_audit_retention_last_pass_unixtime[3h]) == -9223372036854775808
+            )
           )
         for: 15m
         labels:
@@ -1356,11 +1364,11 @@ groups:
             being drained and rows are being retained past the configured window. Note the
             other retention COUNTERS cannot move in this state - they all key on a
             counter rising, and nothing is running to raise one. The only excused state
-            is a stamp whose HIGHEST sample over the last 3 hours is exactly 0 - a
-            database with no recorded pass, which belongs to
-            YuzuAuditRetentionNeverRan. Any window holding a genuine stamp - or only
-            negative values (a dead-CMOS clock's pass, or the INT64_MIN
-            unreadable-anchor sentinel with no 0 beside it) - does not excuse, so a
+            is a 3-hour window carrying no evidence of any pass - every stamp sample 0
+            or the INT64_MIN unreadable-anchor sentinel, with at least one 0 - which is
+            exactly the state YuzuAuditRetentionNeverRan fires on. Any evidence of a
+            pass - a genuine stamp, or a dead-CMOS negative one - or a window of only
+            sentinels does not excuse, so a
             crash-looping server on an anchored database fires here at every restart
             cadence, and this rule STAYS firing while the reaper stays dead: treat
             RESOLVED as recovery only alongside yuzu_server_audit_retention_passes_total
@@ -1414,7 +1422,9 @@ groups:
       # vs 3h), different remediations (dead reaper vs store-never-opened /
       # first-boot failure), and burying a second condition inside one
       # expression is the exact mistake this redesign fixed. Mutual exclusivity
-      # is pinned in the test file.
+      # is STRUCTURAL while the target is scraped (the grace above IS this
+      # rule's condition) and pinned in the test file; after total scrape
+      # loss, see the case-13/case-42 double-page notes there.
       - alert: YuzuAuditRetentionNeverRan
         expr: |
           max_over_time(yuzu_server_audit_retention_last_pass_unixtime[3h]) == 0
@@ -1430,7 +1440,10 @@ groups:
           description: >-
             yuzu_server_audit_retention_last_pass_unixtime has recorded no genuine
             pass for at least the 3 hours of `for:` - every sample read 0 (never ran)
-            or the INT64_MIN unreadable-anchor sentinel, with at least one 0 - this
+            or the INT64_MIN unreadable-anchor sentinel, with at least one 0 (a
+            dead-CMOS negative hiding BESIDE both of those still lands here - an
+            unreadable anchor keeps never-ran unprovable - so expect an imprecise
+            story in that corruption-grade triple mix) - this
             database has never had a retention pass land. Not "not recently": NEVER -
             the gauge is seeded from the durable audit_retention_meta anchor at
             startup (#2854), so 0 is a fact about the DATABASE, not about a young

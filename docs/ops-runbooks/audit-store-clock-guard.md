@@ -304,14 +304,15 @@ threw` in the log. The rule's only grace is a stamp whose HIGHEST sample over
 the trailing 3 hours is exactly `0` — a database with no recorded pass, which
 is `YuzuAuditRetentionNeverRan`'s state below (the cleanup thread sleeps a
 full interval before its first pass, so a fresh install legitimately has no
-pass yet). The grace reads the whole window, not the instant sample, so a
-series that merely MIXES `0` with something else cannot flap it: one genuine
-stamp anywhere in 3 hours lifts the grace for a full window (an anchor-loss
-flap on an anchored database fires HERE), while a window of only zeros and
-unreadable-anchor sentinels belongs to `YuzuAuditRetentionNeverRan`. A
-negative dead-CMOS stamp never reads as `0`, so it does not excuse either — a
-crash-looping server on an anchored database fires here at EVERY restart
-cadence. The retired uptime
+pass yet). The grace reads the whole window, not the instant sample, and it
+is EXACTLY `YuzuAuditRetentionNeverRan`'s firing condition, so every window
+shape is owned by exactly one of the pair: any evidence of a pass — a genuine
+positive stamp OR a dead-CMOS negative one — anywhere in 3 hours lifts the
+grace for a full window (an anchor-loss flap mixing `0` with either kind of
+real stamp fires HERE), a window of only sentinels fires here too (nothing
+rules a dead reaper out), and only windows of zeros-and-sentinels belong to
+`YuzuAuditRetentionNeverRan`. A crash-looping server on an anchored database
+fires here at EVERY restart cadence. The retired uptime
 grace's blind band (164-195 minute cadences, plus an intermittent-firing gap
 from ~90 minutes) is closed; the coverage claim is machine-checked on every PR
 against `tests/prometheus/blind_band_manifest.json` (empty = fully covered;
@@ -377,7 +378,8 @@ This is `YuzuAuditRetentionNotRunning`'s excused state, given its own alert
 and a first-boot-sized grace: while the target is being scraped the two are
 mutually exclusive per server (after TOTAL scrape loss the anchored state
 still double-pages with `YuzuAuditRetentionMetricMissing` — see that section
-— while the fresh state keeps paging here alone), and
+— while the fresh state keeps paging here, joined by that same fleet-wide
+absence alert if the whole fleet's series are gone), and
 the remediation differs — this one is almost never "the reaper died later",
 it is "the first pass never happened":
 
@@ -393,13 +395,28 @@ it is "the first pass never happened":
   the log; see `YuzuAuditRetentionFailing` above.
 
 A NEGATIVE stamp does not fire this rule — a dead-CMOS pass is still a pass,
-and disproves "never ran". The INT64_MIN unreadable-anchor sentinel is
+and disproves "never ran" (one corruption-grade exception: a window mixing a
+negative stamp with BOTH zeros and sentinels still fires here, because the
+sentinel keeps never-ran unprovable — expect an imprecise story there). The INT64_MIN unreadable-anchor sentinel is
 treated as UNKNOWN, not as evidence: a window of only sentinels leaves
 `YuzuAuditRetentionNotRunning` to page a dead reaper, but a window mixing
 sentinels with `0` seeds — a crash-looping fresh install whose anchor read
 intermittently fails — still fires HERE, because a failed read cannot
 disprove never-ran (#2854 governance sec-F1; the earlier form was silent in
-exactly that state).
+exactly that state). To tell a mixed-seed loop from a plain fresh-install
+boot loop, grep the boot log for the anchor-read warnings
+(`"could not read the retention liveness anchor"`, `"...is not an integer"`,
+`"...is implausible"`): those point at PostgreSQL connectivity/pool or a
+corrupt anchor row — a different owning fix than an app crash loop.
+
+**After a known anchor-loss event (restore, template rehydrate, manual
+delete) with a reaper that was already dead, THIS is the alert to expect,
+on its slow path**: the pre-wipe stamp keeps `YuzuAuditRetentionNotRunning`'s
+left side and its grace clearing in step, so that rule never latches, and
+this one fires only once the old stamp ages out of its window plus `for:` —
+up to ~7 hours after the wipe (pinned by the lost-anchor rewind case in the
+test file). Budget response time accordingly; recovery of the anchor row
+itself is `YuzuAuditRetentionAnchorNotSurviving` territory.
 
 **During a staged rollout, expect this alert from old-but-anchored servers.**
 A server build that exports the stamp but predates the seed-from-anchor
@@ -468,6 +485,10 @@ here — including the half-join variant where a relabel rule drops ONLY
 `..._retention_passes_total` for one server while its stamp and other series
 still flow: that server's liveness rule selects nothing, this rule stays
 suppressed by the fleet's surviving series, and its dashboards look healthy.
+(A relabel collision that MERGES two servers' stamp series pages
+`YuzuAuditRetentionNotRunning` instead — any real stamp in the merged window,
+positive or dead-CMOS negative, lifts the grace — so that misconfiguration is
+loud, not silent.)
 
 **An `up`-based target-down alert does not cover that**, and this page said it did
 until #2553 pass 13. The server you are missing is alive and scraped - typically
