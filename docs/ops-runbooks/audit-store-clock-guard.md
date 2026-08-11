@@ -413,7 +413,10 @@ treated as UNKNOWN, not as evidence: a window of only sentinels leaves
 sentinels with `0` seeds — a crash-looping fresh install whose anchor read
 intermittently fails — still fires HERE, because a failed read cannot
 disprove never-ran (#2854 governance sec-F1; the earlier form was silent in
-exactly that state). To tell a mixed-seed loop from a plain fresh-install
+exactly that state; one measured exception is filed as #2997 — an oscillation
+phase-locked at a 180–195 minute period can starve both rules' `for:`
+clocks, so treat prolonged silence under a KNOWN mixed-seed loop as
+unproven, not clear). To tell a mixed-seed loop from a plain fresh-install
 boot loop, grep the boot log for the anchor-read warnings
 (`"could not read the retention liveness anchor"`, `"...is not an integer"`,
 `"...is implausible"`): those point at PostgreSQL connectivity/pool or a

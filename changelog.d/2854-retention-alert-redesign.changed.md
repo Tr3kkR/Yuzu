@@ -7,7 +7,9 @@
   and a new `YuzuAuditRetentionNeverRan` alert owns that excused state (no
   genuine stamp for a further 3 hours; a window mixing `0` seeds with the
   unreadable-anchor sentinel still counts as never-ran, so a crash-looping
-  fresh install pages even when its anchor reads intermittently fail).
+  fresh install pages even when its anchor reads intermittently fail — with
+  one measured, filed exception: an oscillation phase-locked at a 180–195
+  minute period can starve both rules' `for:` clocks, #2997).
   **Two firings will be new to you.** First, the old grace's measured blind
   band is closed: a dead reaper at a 164–195 minute restart cadence (and the
   wider intermittent band from ~90 minutes) now pages instead of staying

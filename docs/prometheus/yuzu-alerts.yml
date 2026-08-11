@@ -1459,7 +1459,9 @@ groups:
             is over long before this fires. Restarts do not reset the clock: the [3h]
             window holds the samples across crash-loop gaps - including a boot whose
             anchor read failed and seeded the sentinel - so a fresh install stuck in
-            a boot loop still pages.
+            a boot loop still pages (one measured, filed exception: a mixed-seed
+            oscillation phase-locked at a 180-195 minute period can starve both
+            rules' for: clocks - #2997).
             Check that the store opened at boot (a failed migration closes it and
             start_cleanup() then early-returns) and the server log for
             "AuditStore: retention pass threw".
