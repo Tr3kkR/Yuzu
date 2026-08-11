@@ -762,6 +762,72 @@ void wire_manual_rotation_pair(PgPool& pool, const std::string& rotation_group,
     REQUIRE(r2.ok());
 }
 
+// #2964: PostgreSQL's OWN clock, queried directly — the T12 rotation
+// sweep's clock-guard DECISION reads it inside its own session-locked
+// transaction, not the `now` argument a caller passes to
+// `sweep_expired_rotations` (mirrors `AuditStore::cleanup_once`'s identical
+// divergence; `test_audit_store.cpp` carries the same helper under the
+// name `pg_now`). Sweep tests below force a predecessor's
+// `overlap_expires_at` relative to THIS reading — never rely on a
+// synthetic future `now` argument to "time-travel" the eligibility
+// decision, which no longer works once the decision reads PG's own clock.
+int64_t pg_now(PgPool& pool) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    pg::PgResult r{PQexec(lease.get(), "SELECT EXTRACT(EPOCH FROM now())::bigint")};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
+    return std::stoll(PQgetvalue(r.get(), 0, 0));
+}
+
+// Force an EXISTING predecessor row's overlap window to a specific instant
+// (typically already-elapsed relative to `pg_now`) via a direct UPDATE —
+// simulates "the window has now elapsed" without an actual wall-clock
+// wait. Narrower than `wire_manual_rotation_pair` above (which also wires
+// the rotation_group/supersedes_token_id linkage for a FRESH pair) — this
+// only rewrites the deadline on a pair `rotate_engine_credential`/
+// `rotate_token` already minted correctly.
+void force_overlap_expires_at(PgPool& pool, const std::string& token_id,
+                              int64_t overlap_expires_at) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "UPDATE api_token_store.api_tokens SET overlap_expires_at = $1 WHERE token_id = $2",
+        std::vector<std::string>{std::to_string(overlap_expires_at), token_id});
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+
+// #2964: settle this store's clock-guard bootstrap marker with a pass over
+// an EMPTY table (nothing eligible yet, so `!has_expired` short-circuits
+// to `Anomaly::None` before `no_anchor` is even tested — routed concern
+// part 6) — mirrors `AuditStore`'s own `anchor_guard`
+// (`test_audit_store.cpp`). Needed because almost every sweep test below is
+// about something else (the auto-revoke shape, UP-5, UP-6) and each would
+// otherwise spend its FIRST-ever pass on a fresh `YUZU_REQUIRE_PG_DB_TPL`
+// clone absorbing a bootstrap decline it never meant to exercise. Call
+// BEFORE minting any rotation pair.
+void anchor_sweep_guard(ApiTokenStore& store, int64_t now) {
+    auto r = store.sweep_expired_rotations(now);
+    REQUIRE(r.outcome == ApiTokenStore::SweepOutcome::Ok);
+    REQUIRE(r.revoked.empty());
+}
+
+// #2964: mint one harmless companion rotation pair whose overlap window
+// stays comfortably in the future, so a test's OWN single- (or few-) pair
+// setup elapsing all at once inside its isolated per-test database is not
+// indistinguishable from a genuine would-wipe clock jump (the guard's own
+// probe: "would this pass expire EVERY eligible row, with none left
+// surviving?" — routed concern part 1). Call once per test that expects an
+// actual DRAIN, under a principal the test itself never otherwise touches.
+void seed_sweep_survivor(ApiTokenStore& store, int64_t now, const std::string& survivor_principal) {
+    REQUIRE(store.create_token("survivor-pred", survivor_principal, now + k90Days).has_value());
+    const std::string pred_id = store.list_active_for_principal(survivor_principal)[0].token_id;
+    auto rotated = store.rotate_token(pred_id, kDay, now, survivor_principal, "", "");
+    REQUIRE(rotated.has_value());
+    REQUIRE(store.validate_token(*rotated).has_value());
+}
+
 } // namespace
 
 TEST_CASE("ApiTokenStore::sweep_expired_rotations: a HUMAN rotation pair's swept predecessor "
@@ -775,6 +841,9 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: a HUMAN rotation pair's swept
 
     const std::string principal = "alice-p2-11-sweep";
     auto now = test_now_epoch();
+    anchor_sweep_guard(store, now);
+    seed_sweep_survivor(store, now, "alice-p2-11-sweep-survivor");
+
     // principal_kind defaults to "human" — create_token's public signature
     // has no way to mint anything else without ALSO passing "engine" (which
     // triggers the engine-only referent-check block), so the default arm
@@ -800,18 +869,17 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: a HUMAN rotation pair's swept
     wire_manual_rotation_pair(pool, predecessor->token_id, predecessor->token_id,
                               successor->token_id, now - 1);
 
-    bool tick_failed = false;
-    auto swept = store.sweep_expired_rotations(now, &tick_failed);
-    REQUIRE_FALSE(tick_failed);
-    REQUIRE(swept.size() == 1);
-    CHECK(swept[0].token_id == predecessor->token_id);
+    auto swept = store.sweep_expired_rotations(now);
+    REQUIRE(swept.outcome == ApiTokenStore::SweepOutcome::Ok);
+    REQUIRE(swept.revoked.size() == 1);
+    CHECK(swept.revoked[0].token_id == predecessor->token_id);
     // THE ASSERTION THIS TEST EXISTS FOR: the store hands the driver a real
     // "human" tag on the swept row — not a value that quietly defaults to
     // "engine" or gets lost between the scan and the returned ApiToken. A
     // wrong value here would misroute EVERY human rotation to the engine
     // metric/audit family regardless of how correct the driver's own
     // branching logic is.
-    CHECK(swept[0].principal_kind == "human");
+    CHECK(swept.revoked[0].principal_kind == "human");
 }
 
 TEST_CASE("ApiTokenStore::list_rotations_nearing_expiry_unused: a HUMAN pair nearing expiry "
@@ -1200,6 +1268,9 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: rolls back the predecessor's 
 
     const std::string principal = "engine:rotation-sweep-rollback";
     auto now = test_now_epoch();
+    anchor_sweep_guard(store, now);
+    seed_sweep_survivor(store, now, "rotation-sweep-rollback-survivor");
+
     REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
                 .has_value());
     auto rotated = store.rotate_engine_credential(principal, kDay, now, "admin");
@@ -1252,11 +1323,15 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: rolls back the predecessor's 
         REQUIRE(trig_res.ok());
     }
 
-    // AFTER the overlap window elapses, sweep attempts to revoke the
+    // AFTER the overlap window elapses (forced directly relative to
+    // PostgreSQL's own clock — #2964, the sweep's eligibility decision no
+    // longer reads the `now` argument), sweep attempts to revoke the
     // predecessor + clear the successor together in one transaction — the
     // clear fails, so NEITHER change may commit.
+    force_overlap_expires_at(pool, predecessor_id, pg_now(pool) - 1);
     auto swept = store.sweep_expired_rotations(now + kDay + 1);
-    CHECK(swept.empty());
+    CHECK(swept.outcome == ApiTokenStore::SweepOutcome::Ok);
+    CHECK(swept.revoked.empty());
 
     auto predecessor_after = store.get_token(predecessor_id).value();
     REQUIRE(predecessor_after.has_value());
@@ -1270,7 +1345,8 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: rolls back the predecessor's 
     // Idempotent: re-running the (still-failing) sweep doesn't corrupt
     // anything further — same clean rollback each time.
     auto swept_again = store.sweep_expired_rotations(now + kDay + 2);
-    CHECK(swept_again.empty());
+    CHECK(swept_again.outcome == ApiTokenStore::SweepOutcome::Ok);
+    CHECK(swept_again.revoked.empty());
     auto predecessor_still = store.get_token(predecessor_id).value();
     REQUIRE(predecessor_still.has_value());
     CHECK_FALSE(predecessor_still->revoked);
@@ -1474,15 +1550,23 @@ TEST_CASE("ApiTokenStore: confirm_rotation after the sweep cuts over is a termin
 
     const std::string principal = "engine:rotation-confirm-swept";
     auto now = test_now_epoch();
+    anchor_sweep_guard(store, now);
+    seed_sweep_survivor(store, now, "rotation-confirm-swept-survivor");
+
     REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
                 .has_value());
     auto rotated = store.rotate_engine_credential(principal, kDay, now, "admin");
     REQUIRE(rotated.has_value());
     std::string successor_id;
-    for (const auto& t : store.list_active_for_principal(principal))
+    std::string predecessor_id;
+    for (const auto& t : store.list_active_for_principal(principal)) {
         if (!t.supersedes_token_id.empty())
             successor_id = t.token_id;
+        else
+            predecessor_id = t.token_id;
+    }
     REQUIRE_FALSE(successor_id.empty());
+    REQUIRE_FALSE(predecessor_id.empty());
 
     // UP-5: present the successor so the sweep below actually auto-revokes
     // (a never-used successor is now left alone) — this test is about the
@@ -1490,8 +1574,12 @@ TEST_CASE("ApiTokenStore: confirm_rotation after the sweep cuts over is a termin
     REQUIRE(store.validate_token(*rotated).has_value());
 
     // The overlap sweep auto-revokes the predecessor and clears the successor
-    // (which was never confirmed: confirmed_at stays 0).
-    store.sweep_expired_rotations(now + kDay + 1);
+    // (which was never confirmed: confirmed_at stays 0). Forced into the
+    // past relative to PostgreSQL's own clock (#2964).
+    force_overlap_expires_at(pool, predecessor_id, pg_now(pool) - 1);
+    auto sweep_result = store.sweep_expired_rotations(now + kDay + 1);
+    REQUIRE(sweep_result.outcome == ApiTokenStore::SweepOutcome::Ok);
+    REQUIRE(sweep_result.revoked.size() == 1);
     auto active = store.list_active_for_principal(principal);
     REQUIRE(active.size() == 1);
     CHECK(active[0].token_id == successor_id);
@@ -1852,10 +1940,9 @@ TEST_CASE("ApiTokenStore: revoking a rotation SUCCESSOR clears the predecessor's
     // Run the sweep AFTER the original overlap window would have elapsed. Without
     // the §7 fix the sweep would auto-revoke the predecessor as
     // "overlap_window_elapsed", leaving the principal with ZERO credentials.
-    bool tick_failed = false;
-    auto swept = store.sweep_expired_rotations(now + kDay + 1, &tick_failed);
-    CHECK_FALSE(tick_failed);
-    CHECK(swept.empty()); // nothing to auto-revoke — the pair was already resolved
+    auto swept = store.sweep_expired_rotations(now + kDay + 1);
+    CHECK(swept.outcome == ApiTokenStore::SweepOutcome::Ok);
+    CHECK(swept.revoked.empty()); // nothing to auto-revoke — the pair was already resolved
 
     auto still = store.get_token(predecessor_id);
     REQUIRE(still.has_value());
@@ -2803,6 +2890,9 @@ TEST_CASE("ApiTokenStore: sweep_expired_rotations auto-revokes an elapsed human 
     REQUIRE(store.is_open());
 
     auto now = test_now_epoch();
+    anchor_sweep_guard(store, now);
+    seed_sweep_survivor(store, now, "alice-parity-survivor");
+
     auto predecessor_raw = store.create_token("my-pat", "alice", now + k90Days);
     REQUIRE(predecessor_raw.has_value());
     const std::string predecessor_id = store.list_active_for_principal("alice")[0].token_id;
@@ -2817,9 +2907,13 @@ TEST_CASE("ApiTokenStore: sweep_expired_rotations auto-revokes an elapsed human 
     // below); this test is about the human/engine sweep parity, not UP-5.
     REQUIRE(store.validate_token(*rotated).has_value());
 
+    // Forced into the past relative to PostgreSQL's own clock — #2964, the
+    // sweep's eligibility decision no longer reads the `now` argument.
+    force_overlap_expires_at(pool, predecessor_id, pg_now(pool) - 1);
     auto swept = store.sweep_expired_rotations(now + kDay + 1);
-    REQUIRE(swept.size() == 1);
-    CHECK(swept[0].token_id == predecessor_id);
+    REQUIRE(swept.outcome == ApiTokenStore::SweepOutcome::Ok);
+    REQUIRE(swept.revoked.size() == 1);
+    CHECK(swept.revoked[0].token_id == predecessor_id);
 
     auto after = store.list_active_for_principal("alice");
     REQUIRE(after.size() == 1);
@@ -3053,6 +3147,9 @@ TEST_CASE("ApiTokenStore: sweep_expired_rotations auto-revokes a human "
     REQUIRE(store.is_open());
 
     auto now = test_now_epoch();
+    anchor_sweep_guard(store, now);
+    seed_sweep_survivor(store, now, "sanjay-clears-successor-survivor");
+
     auto t = store.create_token("Sweep PAT", "sanjay", now + k90Days);
     REQUIRE(t.has_value());
     auto vt = store.validate_token(*t);
@@ -3073,11 +3170,13 @@ TEST_CASE("ApiTokenStore: sweep_expired_rotations auto-revokes a human "
     // never-used carve-out, which has its own dedicated test).
     REQUIRE(store.validate_token(*rotated).has_value());
 
-    bool tick_failed = false;
-    auto swept = store.sweep_expired_rotations(now + kDay + 1, &tick_failed);
-    CHECK_FALSE(tick_failed);
+    // Forced into the past relative to PostgreSQL's own clock — #2964, the
+    // sweep's eligibility decision no longer reads the `now` argument.
+    force_overlap_expires_at(pool, predecessor_id, pg_now(pool) - 1);
+    auto swept = store.sweep_expired_rotations(now + kDay + 1);
+    REQUIRE(swept.outcome == ApiTokenStore::SweepOutcome::Ok);
     bool predecessor_in_swept = false;
-    for (const auto& tok : swept)
+    for (const auto& tok : swept.revoked)
         if (tok.token_id == predecessor_id)
             predecessor_in_swept = true;
     CHECK(predecessor_in_swept);
@@ -3128,12 +3227,15 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: a NEVER-USED successor's pred
     // Deliberately never validate the successor — the "secret was lost /
     // never delivered" case this fix guards against.
 
-    bool tick_failed = false;
-    auto swept = store.sweep_expired_rotations(now + kDay + 1, &tick_failed);
-    CHECK_FALSE(tick_failed);
+    // Forced into the past relative to PostgreSQL's own clock — #2964 —
+    // so this genuinely exercises "elapsed AND never-used-successor", not
+    // merely "not yet elapsed for an unrelated reason".
+    force_overlap_expires_at(pool, predecessor_id, pg_now(pool) - 1);
+    auto swept = store.sweep_expired_rotations(now + kDay + 1);
+    REQUIRE(swept.outcome == ApiTokenStore::SweepOutcome::Ok);
     // THE ASSERTION THIS TEST EXISTS FOR: pre-fix this predecessor would be
     // in `swept` (auto-revoked). Post-fix it must be left alone.
-    CHECK(swept.empty());
+    CHECK(swept.revoked.empty());
 
     auto pred_after = store.get_token(predecessor_id);
     REQUIRE(pred_after.has_value());
@@ -3159,8 +3261,9 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: a NEVER-USED successor's pred
 
     // Idempotent — a much later sweep still declines; this is not a
     // one-tick reprieve, it is an indefinite hold until an operator acts.
-    auto second = store.sweep_expired_rotations(now + kDay + 100, &tick_failed);
-    CHECK(second.empty());
+    auto second = store.sweep_expired_rotations(now + kDay + 100);
+    CHECK(second.outcome == ApiTokenStore::SweepOutcome::Ok);
+    CHECK(second.revoked.empty());
 }
 
 TEST_CASE("ApiTokenStore::sweep_expired_rotations: caps auto-revokes per tick — a clock jump "
@@ -3177,6 +3280,13 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: caps auto-revokes per tick �
     REQUIRE(store.is_open());
 
     auto now = test_now_epoch();
+    anchor_sweep_guard(store, now);
+    // Principal deliberately does NOT match the `cap-test-up6-%` LIKE
+    // pattern the bulk force-elapse UPDATE below uses, or this survivor
+    // would be swept into the past right along with the 201 pairs under
+    // test and stop being a survivor.
+    seed_sweep_survivor(store, now, "cap-survivor-only");
+
     // kMaxAutoRevokesPerTick (api_token_store.cpp, currently 200) + 1 —
     // one more pair than the cap allows in a single tick, each on its own
     // principal so no per-rotation-group ceiling gets in the way.
@@ -3193,22 +3303,244 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: caps auto-revokes per tick �
         REQUIRE(store.validate_token(*rotated).has_value());
     }
 
-    bool tick_failed = false;
-    bool tick_capped = false;
-    auto swept = store.sweep_expired_rotations(now + kDay + 1, &tick_failed, &tick_capped);
-    CHECK_FALSE(tick_failed);
-    // THE ASSERTION THIS TEST EXISTS FOR: pre-fix, `swept.size()` would be
-    // 201 (every eligible row, unconditionally, in one tick). Post-fix it
-    // is capped, and the cap is reported.
-    CHECK(tick_capped);
-    CHECK(swept.size() == 200);
+    // Force every predecessor's overlap window into the past relative to
+    // PostgreSQL's own clock (#2964) in ONE bulk UPDATE — 201 individual
+    // round trips would work too, but this is the same operation the
+    // production sweep itself would observe.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "UPDATE api_token_store.api_tokens SET overlap_expires_at = $1 "
+            "WHERE principal_id LIKE 'cap-test-up6-%' AND supersedes_token_id = ''",
+            std::vector<std::string>{std::to_string(pg_now(pool) - 1)});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+
+    auto swept = store.sweep_expired_rotations(now + kDay + 1);
+    REQUIRE(swept.outcome == ApiTokenStore::SweepOutcome::Ok);
+    // THE ASSERTION THIS TEST EXISTS FOR: pre-fix, `swept.revoked.size()`
+    // would be 201 (every eligible row, unconditionally, in one tick).
+    // Post-fix it is capped, and the cap is reported.
+    CHECK(swept.capped);
+    CHECK(swept.revoked.size() == 200);
 
     // The remainder drains on the NEXT tick — nothing is lost, only
     // deferred, and the second tick reports itself uncapped.
-    auto second = store.sweep_expired_rotations(now + kDay + 2, &tick_failed, &tick_capped);
-    CHECK_FALSE(tick_failed);
-    CHECK_FALSE(tick_capped);
-    CHECK(second.size() == 1);
+    auto second = store.sweep_expired_rotations(now + kDay + 2);
+    REQUIRE(second.outcome == ApiTokenStore::SweepOutcome::Ok);
+    CHECK_FALSE(second.capped);
+    CHECK(second.revoked.size() == 1);
+}
+
+// ── #2964: clock-guarded-retention shape (routed concern, all seven parts) ──
+
+TEST_CASE("ApiTokenStore::sweep_expired_rotations: a persisted prior reading + a "
+          "forward-skewed pass declines rather than drains — the reviewer's falsifier",
+          "[pg][token][rotation][sweep][clock-guard]") {
+    // THE ASSERTION THIS TEST EXISTS FOR: with a genuinely stale durable
+    // anchor (`last_pass_now` far enough behind PostgreSQL's own clock to
+    // trip the absolute step threshold, part 7), the sweep must DECLINE —
+    // never silently auto-revoke a live credential on an unverified clock
+    // history. Reverting the production `big_step` check (or the anchor
+    // read it depends on) makes this test fail: `first.outcome` would come
+    // back `Ok` with the predecessor already in `first.revoked`.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto now = test_now_epoch();
+    anchor_sweep_guard(store, now);
+    seed_sweep_survivor(store, now, "falsifier-survivor");
+
+    auto t = store.create_token("Falsifier PAT", "falsifier-principal", now + k90Days);
+    REQUIRE(t.has_value());
+    const std::string predecessor_id =
+        store.list_active_for_principal("falsifier-principal")[0].token_id;
+    auto rotated = store.rotate_token(predecessor_id, kDay, now, "falsifier-principal", "", "");
+    REQUIRE(rotated.has_value());
+    REQUIRE(store.validate_token(*rotated).has_value());
+    force_overlap_expires_at(pool, predecessor_id, pg_now(pool) - 1);
+
+    // Directly poison the durable anchor to a reading far enough in the
+    // past to trip `kRotationSweepBigStepSecs` — simulates a server that
+    // has not swept in a very long time (or whose clock jumped forward),
+    // WITHOUT waiting for real time to pass. Direct-SQL precedent:
+    // `force_overlap_expires_at` above / `wire_manual_rotation_pair`.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "INSERT INTO api_token_store.rotation_retention_meta (key, value) VALUES "
+            "('last_pass_now', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            std::vector<std::string>{
+                std::to_string(pg_now(pool) - kRotationSweepBigStepSecs - 1000)});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+
+    auto first = store.sweep_expired_rotations(now);
+    REQUIRE(first.outcome == ApiTokenStore::SweepOutcome::Declined);
+    CHECK(first.revoked.empty());
+    CHECK_FALSE(first.decline_reason.empty());
+
+    // Both credentials in the pair stay fully active — nothing was
+    // auto-revoked on the unverified reading.
+    auto pred_after = store.get_token(predecessor_id);
+    REQUIRE(pred_after.has_value());
+    REQUIRE(pred_after->has_value());
+    CHECK_FALSE((*pred_after)->revoked);
+
+    // Not permanent: the decline re-anchors, so the VERY NEXT pass compares
+    // against a fresh reading (no longer a big step) and drains, paced by
+    // the cap as always — the same "declines once, then drains" shape
+    // `AuditStore` documents for its own #2579 fix.
+    auto second = store.sweep_expired_rotations(now + 1);
+    REQUIRE(second.outcome == ApiTokenStore::SweepOutcome::Ok);
+    REQUIRE(second.revoked.size() == 1);
+    CHECK(second.revoked[0].token_id == predecessor_id);
+}
+
+TEST_CASE("ApiTokenStore::sweep_expired_rotations: a decline is distinguishable from "
+          "\"nothing eligible\" through the typed outcome",
+          "[pg][token][rotation][sweep][clock-guard]") {
+    // Pre-#2964 the store returned an empty vector for BOTH "the clock
+    // guard declined" and "nothing was eligible this tick" — this test
+    // pins that the typed outcome tells them apart.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto now = test_now_epoch();
+
+    // "Nothing eligible": an anchored, empty store — Ok, not Declined.
+    auto nothing_eligible = store.sweep_expired_rotations(now);
+    REQUIRE(nothing_eligible.outcome == ApiTokenStore::SweepOutcome::Ok);
+    CHECK(nothing_eligible.revoked.empty());
+
+    // "Declined": poison the (now-settled) anchor to trip the step
+    // threshold, then mint + elapse ONE eligible pair.
+    seed_sweep_survivor(store, now, "distinguish-survivor");
+    auto t = store.create_token("Distinguish PAT", "distinguish-principal", now + k90Days);
+    REQUIRE(t.has_value());
+    const std::string predecessor_id =
+        store.list_active_for_principal("distinguish-principal")[0].token_id;
+    auto rotated = store.rotate_token(predecessor_id, kDay, now, "distinguish-principal", "", "");
+    REQUIRE(rotated.has_value());
+    REQUIRE(store.validate_token(*rotated).has_value());
+    force_overlap_expires_at(pool, predecessor_id, pg_now(pool) - 1);
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "INSERT INTO api_token_store.rotation_retention_meta (key, value) VALUES "
+            "('last_pass_now', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            std::vector<std::string>{
+                std::to_string(pg_now(pool) - kRotationSweepBigStepSecs - 1000)});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+
+    auto declined = store.sweep_expired_rotations(now);
+    // THE ASSERTION THIS TEST EXISTS FOR: both calls left `revoked` empty,
+    // but only ONE of them is a clock-guard decline — the typed outcome is
+    // what tells them apart (a bool/empty-vector-only contract could not).
+    REQUIRE(declined.outcome == ApiTokenStore::SweepOutcome::Declined);
+    CHECK(declined.revoked.empty());
+    CHECK(declined.outcome != nothing_eligible.outcome);
+}
+
+TEST_CASE("ApiTokenStore::sweep_expired_rotations: a tree of only never-used-successor "
+          "pairs never reads as a would-wipe (UP-5 pairs are excluded from the probe set)",
+          "[pg][token][rotation][sweep][clock-guard][up5]") {
+    // THE ASSERTION THIS TEST EXISTS FOR: every predecessor here is
+    // permanently ineligible (its successor was never presented) and every
+    // one has an elapsed overlap window — if the clock guard's probes
+    // counted these toward "would this pass expire EVERY eligible row?"
+    // the way a naive `overlap_expires_at <= now` scan would, this would
+    // misclassify as `Anomaly::Wipe` and DECLINE, even though nothing here
+    // was ever going to be auto-revoked in the first place. Reverting the
+    // probe SQL to drop the `s.last_used_at <> 0` clause (part 5's own
+    // eligibility predicate) makes this test fail: `outcome` would come
+    // back `Declined`, not `Ok`.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto now = test_now_epoch();
+    anchor_sweep_guard(store, now);
+
+    // Deliberately NO survivor pair and NO other activity — the whole
+    // point is that the UP-5 exclusion alone is enough; nothing else props
+    // this up.
+    for (int i = 0; i < 3; ++i) {
+        const std::string principal = "up5-only-tree-" + std::to_string(i);
+        REQUIRE(store.create_token("pred", principal, now + k90Days).has_value());
+        const std::string pred_id = store.list_active_for_principal(principal)[0].token_id;
+        auto rotated = store.rotate_token(pred_id, kDay, now, principal, "", "");
+        REQUIRE(rotated.has_value());
+        // Deliberately never validate the successor (UP-5's carve-out).
+        force_overlap_expires_at(pool, pred_id, pg_now(pool) - 1);
+    }
+
+    auto swept = store.sweep_expired_rotations(now);
+    REQUIRE(swept.outcome == ApiTokenStore::SweepOutcome::Ok);
+    CHECK(swept.revoked.empty());
+}
+
+TEST_CASE("ApiTokenStore::sweep_expired_rotations: the anchor sanitiser treats an "
+          "ahead-of-now, a negative, and an unparseable reading as an anomaly",
+          "[pg][token][rotation][sweep][clock-guard]") {
+    // Three independent malformed-anchor shapes, each of which must decline
+    // (never a quiet reset — routed concern part 3) rather than silently
+    // draining on an untrustworthy comparison point. Each SECTION gets its
+    // own fresh PgTestTemplate clone (the enclosing TEST_CASE body,
+    // including YUZU_REQUIRE_PG_DB_TPL, re-runs per leaf SECTION).
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto now = test_now_epoch();
+    anchor_sweep_guard(store, now);
+    seed_sweep_survivor(store, now, "sanitiser-survivor");
+
+    auto t = store.create_token("Sanitiser PAT", "sanitiser-principal", now + k90Days);
+    REQUIRE(t.has_value());
+    const std::string predecessor_id =
+        store.list_active_for_principal("sanitiser-principal")[0].token_id;
+    auto rotated = store.rotate_token(predecessor_id, kDay, now, "sanitiser-principal", "", "");
+    REQUIRE(rotated.has_value());
+    REQUIRE(store.validate_token(*rotated).has_value());
+    force_overlap_expires_at(pool, predecessor_id, pg_now(pool) - 1);
+
+    std::string poisoned_value;
+    SECTION("ahead-of-now") { poisoned_value = std::to_string(pg_now(pool) + 10'000'000); }
+    SECTION("negative") { poisoned_value = "-1"; }
+    SECTION("unparseable") { poisoned_value = "not-a-number"; }
+
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "INSERT INTO api_token_store.rotation_retention_meta (key, value) VALUES "
+            "('last_pass_now', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            std::vector<std::string>{poisoned_value});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+
+    auto swept = store.sweep_expired_rotations(now);
+    REQUIRE(swept.outcome == ApiTokenStore::SweepOutcome::Declined);
+    CHECK(swept.revoked.empty());
+    auto pred_after = store.get_token(predecessor_id);
+    REQUIRE(pred_after.has_value());
+    REQUIRE(pred_after->has_value());
+    CHECK_FALSE((*pred_after)->revoked); // never auto-revoked on a corrupt reading
 }
 
 TEST_CASE("ApiTokenStore: list_rotations_nearing_expiry_unused surfaces a "

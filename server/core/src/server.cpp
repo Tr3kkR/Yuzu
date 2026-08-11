@@ -2101,6 +2101,37 @@ public:
                           "principal_kind",
                           "counter");
         metrics_.counter("yuzu_rotation_sweep_capped_total");
+        // #2964 (clock-guarded-retention routed concern, part 10): the sweep's
+        // clock guard DECLINED a tick (a clock anomaly, or no durable anchor
+        // yet with predecessors already eligible) — both credentials in every
+        // affected pair stay active rather than being auto-revoked on an
+        // unverified reading. A decline must never be indistinguishable from
+        // "nothing was eligible this tick" (both leave zero rows revoked) —
+        // this counter, plus the caller's own actionable log line, are what
+        // make the two distinguishable. Same shared, un-split-by-
+        // principal_kind scope as its sweep_failures/capped siblings above —
+        // the decline is a tick-level clock-guard verdict, not attributable
+        // to one kind's rows.
+        metrics_.describe("yuzu_rotation_sweep_declined_total",
+                          "Cumulative rotation-sweep ticks the clock guard declined (clock "
+                          "anomaly, or no durable anchor yet with predecessors already eligible) "
+                          "- shared across BOTH engine-credential and human API-token rotation "
+                          "pairs, not split by principal_kind",
+                          "counter");
+        metrics_.counter("yuzu_rotation_sweep_declined_total");
+        // #2964: another replica already held the sweep's store-wide session
+        // advisory lock this tick — routine leader-election contention, NOT
+        // a fault. Counted so a replica that never manages to win the lock is
+        // still observable, but deliberately NEVER logged/audited per-tick
+        // (a healthy fleet skips this on most replicas on most ticks; a
+        // per-tick warning here would be noise, unlike the Declined signal
+        // above, which is genuinely actionable).
+        metrics_.describe("yuzu_rotation_sweep_lock_skipped_total",
+                          "Cumulative rotation-sweep ticks this replica skipped because another "
+                          "replica already held the store-wide sweep lock - routine "
+                          "leader-election contention, not a fault",
+                          "counter");
+        metrics_.counter("yuzu_rotation_sweep_lock_skipped_total");
         // #2404: confirm-rotation endpoint outcomes, so a 409-conflict or
         // 503-transient retry storm on confirm is alertable instead of
         // invisible (yuzu_http_requests_total has no per-route label). SCOPE
@@ -5516,29 +5547,54 @@ public:
                                          .count();
 
                     // Half 1: auto-revoke elapsed predecessors + clear the
-                    // surviving successor's rotation state. A failed tick (pool
-                    // contention / query error) is reported via the out-param —
-                    // the store swallows it (returns empty) rather than throwing,
-                    // so without this the sweep-failures alert would stay at zero
-                    // while rotated-out credentials silently outlive their window.
-                    bool sweep_tick_failed = false;
-                    bool sweep_tick_capped = false;
-                    auto revoked = api_token_store_->sweep_expired_rotations(
-                        now, &sweep_tick_failed, &sweep_tick_capped);
-                    if (sweep_tick_failed) {
+                    // surviving successor's rotation state — now the FULL
+                    // seven-part clock-guarded-retention shape (#2964), not
+                    // only the unconditional cap it shipped with. The typed
+                    // outcome (routed concern part 10) replaces the old
+                    // two-bool contract: `Failed` (pool/query fault — a
+                    // missed tick, deferred to the next one), `SkippedLock`
+                    // (routine leader-election contention — another replica
+                    // is sweeping this tick, never worth a warning),
+                    // `Declined` (the clock guard declined the whole pass —
+                    // MUST be visible as its own thing, never
+                    // indistinguishable from "nothing was eligible"), `Ok`
+                    // (ran to completion, possibly with zero revocations).
+                    auto sweep = api_token_store_->sweep_expired_rotations(now);
+                    switch (sweep.outcome) {
+                    case ApiTokenStore::SweepOutcome::Failed:
                         spdlog::warn("Rotation sweep tick could not run (pool "
                                      "contention / query failure) — predecessor auto-revoke deferred "
                                      "to the next tick");
                         metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
                             .increment();
+                        break;
+                    case ApiTokenStore::SweepOutcome::SkippedLock:
+                        // Routine leader-election contention — counted only
+                        // (see the counter's own describe() text above for
+                        // why this deliberately does NOT log/warn per tick).
+                        metrics_.counter("yuzu_rotation_sweep_lock_skipped_total").increment();
+                        break;
+                    case ApiTokenStore::SweepOutcome::Declined:
+                        // Actionable: the store's own `decline_reason`
+                        // already names WHICH anomaly and what it costs
+                        // (both credentials in every affected pair stay
+                        // active past their overlap window until the next
+                        // tick clears the anomaly).
+                        spdlog::warn("Rotation sweep tick declined by its clock guard: {}",
+                                     sweep.decline_reason);
+                        metrics_.counter("yuzu_rotation_sweep_declined_total").increment();
+                        break;
+                    case ApiTokenStore::SweepOutcome::Ok:
+                        // UP-6: the per-tick cap already logged the eligible/
+                        // processed counts inside the store — the counter
+                        // here is the alertable signal that a drain is in
+                        // progress.
+                        if (sweep.capped) {
+                            metrics_.counter("yuzu_rotation_sweep_capped_total").increment();
+                        }
+                        break;
                     }
-                    // UP-6: the per-tick cap already logged the eligible/
-                    // processed counts inside the store — the counter here is
-                    // the alertable signal that a drain is in progress.
-                    if (sweep_tick_capped) {
-                        metrics_.counter("yuzu_rotation_sweep_capped_total").increment();
-                    }
-                    for (const auto& predecessor : revoked) {
+                    for (const auto& predecessor : sweep.revoked) {
                         // P2 #11: route to the engine or human family/audit
                         // action by THIS row's own principal_kind — never
                         // assume every swept row is engine-owned.
