@@ -300,13 +300,16 @@ seeing the alert go away.
 
 Check that the store opened at boot (a failed migration closes it, and
 `start_cleanup()` then early-returns), and look for `AuditStore: retention pass
-threw` in the log. The rule's only grace is a stamp whose HIGHEST sample over
-the trailing 3 hours is exactly `0` — a database with no recorded pass, which
-is `YuzuAuditRetentionNeverRan`'s state below (the cleanup thread sleeps a
-full interval before its first pass, so a fresh install legitimately has no
-pass yet). The grace reads the whole window, not the instant sample, and it
-is EXACTLY `YuzuAuditRetentionNeverRan`'s firing condition, so every window
-shape is owned by exactly one of the pair: any evidence of a pass — a genuine
+threw` in the log. The rule's only grace is a 3-hour window carrying no
+evidence of any pass — every stamp sample `0` or the unreadable-anchor
+sentinel, with at least one `0` — which is `YuzuAuditRetentionNeverRan`'s
+state below (the cleanup thread sleeps a full interval before its first pass,
+so a fresh install legitimately has no pass yet). The grace reads the whole window, not the instant sample, and it
+is EXACTLY `YuzuAuditRetentionNeverRan`'s firing condition, so at every
+instant every window shape is owned by exactly one of the pair (a
+phase-locked oscillation between the two owners faster than either `for:`
+can still starve both — a measured, filed corner; see the rules-file
+comment): any evidence of a pass — a genuine
 positive stamp OR a dead-CMOS negative one — anywhere in 3 hours lifts the
 grace for a full window (an anchor-loss flap mixing `0` with either kind of
 real stamp fires HERE), a window of only sentinels fires here too (nothing
@@ -321,6 +324,13 @@ this paragraph, as the current truth. If the alert is firing on a young server,
 the database is anchored and the reaper genuinely has not run for 3 hours —
 check whether the process is crash-looping before its first pass can land:
 `resets(yuzu_server_uptime_seconds[3h])`.
+
+**If the stamp series is FLAPPING between `0` and another value** (graph
+it), the cause is the anchor row itself appearing and disappearing — a
+restore loop, a replica template, or a relabel collision merging two servers
+— not the reaper alone: triage the anchor first (`SELECT value FROM
+audit_store.audit_retention_meta WHERE key = 'last_pass_now';` per server)
+alongside the reaper checks above.
 
 **Before assuming a crash loop, check the stamp series exists.** If
 `yuzu_server_audit_retention_last_pass_unixtime` returns nothing for this
@@ -414,8 +424,11 @@ delete) with a reaper that was already dead, THIS is the alert to expect,
 on its slow path**: the pre-wipe stamp keeps `YuzuAuditRetentionNotRunning`'s
 left side and its grace clearing in step, so that rule never latches, and
 this one fires only once the old stamp ages out of its window plus `for:` —
-up to ~7 hours after the wipe (pinned by the lost-anchor rewind case in the
-test file). Budget response time accordingly; recovery of the anchor row
+~6 hours after the wipe itself (~7 from the original boot; pinned by the
+lost-anchor rewind case in the test file), and the handoff includes a genuine
+alerting GAP of up to ~3 hours between `YuzuAuditRetentionNotRunning`
+resolving and this rule latching — silence there is the slow path working,
+not recovery. Budget response time accordingly; recovery of the anchor row
 itself is `YuzuAuditRetentionAnchorNotSurviving` territory.
 
 **During a staged rollout, expect this alert from old-but-anchored servers.**

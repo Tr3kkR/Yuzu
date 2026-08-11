@@ -1271,8 +1271,16 @@ groups:
       # forever and NEITHER liveness rule fired on a genuinely dead reaper.
       # THE GRACE IS EXACTLY THE NEXT RULE'S FIRING CONDITION -- the same
       # max/min expression, verbatim -- so the pair partitions the dead-reaper
-      # states STRUCTURALLY: every window shape is either excused here and
-      # owned below, or unexcused here and paged here. Excused means "the
+      # states STRUCTURALLY: at every instant, every window shape is either
+      # excused here and owned below, or unexcused here and paged here.
+      # Instantaneous ownership is not TEMPORAL coverage: a regime that
+      # phase-locks OSCILLATION between the two owners faster than either
+      # rule's `for:` can accumulate still starves both (measured: sentinel
+      # filler with single-scrape 0 excursions at a 180-195m period; requires
+      # a never-anchored database, a dead reaper, and a scrape phase-locked
+      # to the short boot). Closing that is a `for:`/window retune tracked in
+      # its own issue -- do not narrow either `for:` here without re-timing
+      # every case in the test file and re-running the sweep. Excused means "the
       # window carries no evidence a pass ever happened": every sample is 0
       # or the unreadable-anchor sentinel, with at least one 0. ANY evidence
       # of a pass -- a genuine positive stamp, or a dead-CMOS NEGATIVE stamp

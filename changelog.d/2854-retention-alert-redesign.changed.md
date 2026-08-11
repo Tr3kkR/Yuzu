@@ -1,8 +1,9 @@
 - **Breaking — the audit-retention liveness alerts were redesigned on the
   restart-surviving last-pass stamp, and one alertname is new (#2854 rung D).**
   `YuzuAuditRetentionNotRunning` now excuses exactly one state — a database
-  with no genuine pass recorded anywhere in the trailing 3 hours (the stamp
-  gauge's highest sample is `0`) — instead of the young-server uptime grace,
+  whose trailing 3 hours carry no evidence of any pass: every stamp sample
+  `0` or the unreadable-anchor sentinel, with at least one `0` — instead of
+  the young-server uptime grace,
   and a new `YuzuAuditRetentionNeverRan` alert owns that excused state (no
   genuine stamp for a further 3 hours; a window mixing `0` seeds with the
   unreadable-anchor sentinel still counts as never-ran, so a crash-looping

@@ -630,8 +630,9 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuAuditRetentionNeverRan", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
-      # The liveness rule stays excused (max over the window is exactly 0) -
-      # this state is the never-ran rule's, not unowned.
+      # The liveness rule stays excused (the window is zeros-and-sentinels
+      # with a zero - its grace is verbatim the never-ran condition) - this
+      # state is the never-ran rule's, not unowned.
       - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning"}'
         eval_time: 3h10m
         exp_samples: []
