@@ -645,11 +645,13 @@ Three operator-visible consequences:
   (120 s), enforced on a busy execution too (#2739): after the cap expires the
   bridge delivers one final drain of already-latched progress and then settles,
   so the bound is the cap plus at most two ~3 s pump ticks plus one bounded
-  mailbox drain and its socket-write time — not the execution's duration. It
-  leases from the same held-open budget as the GET channel, so total
-  concurrency is unchanged — but `TimeoutStopSec` and any container termination
-  grace period should be sized above **120 s** with that margin in mind; 30 s —
-  which suited GET alone — is the figure to move away from. Under-sizing
+  mailbox drain and its socket-write time (the server's 30 s write timeout,
+  `set_write_timeout` in `server.cpp`) — worst case ~156 s, not the execution's
+  duration. It leases from the same held-open budget as the GET channel, so
+  total concurrency is unchanged — but `TimeoutStopSec` and any container
+  termination grace period should be sized comfortably above that ~156 s bound
+  (the shipped systemd unit and every shipped compose file use **210 s**); 30 s
+  — which suited GET alone — is the figure to move away from. Under-sizing
   SIGKILLs mid-drain and silently drops in-flight streams on deploy.
 - **Per-principal ceiling.** `--mcp-max-streams-per-principal` governs the GET
   channel. The streamed-POST allowance is a fixed 4 concurrent calls per
@@ -683,14 +685,24 @@ per-principal bullets above because they are no longer conditional on opting in
 — they now apply to every deployment by default:
 
 - **`TimeoutStopSec` (or your container runtime's equivalent termination grace)
-  must be sized above 120 s plus drain margin**, not the ~30 s that sufficed for
-  the GET channel alone. This was previously only a concern for operators who
-  had explicitly enabled the flag; it is now the default posture for every
-  deployment that takes no action.
+  must be sized comfortably above the ~156 s worst-case bound derived in the
+  Sizing bullet above** (120 s cap + pump ticks + the 30 s write timeout), not
+  the ~30 s that sufficed for the GET channel alone. The shipped systemd unit
+  and every shipped `deploy/docker/docker-compose*.yml` use **210 s** — use that
+  as your own starting point if you're not deploying from one of those. This
+  was previously only a concern for operators who had explicitly enabled the
+  flag; it is now the default posture for every deployment that takes no
+  action.
 - **A principal's steady-state held-open sum is `--mcp-max-streams-per-principal
   + 4`** — the streamed-POST allowance is no longer contingent on opting in, it
   applies to every deployment by default. That sum is not a hard ceiling (see
   the Per-principal ceiling bullet above for the GET-reconnect transient).
+- **If you're behind a non-nginx reverse proxy (Envoy, HAProxy, ALB,
+  Cloudflare) or running an MCP client whose HTTP transport can't consume a
+  streamed response body**, verify SSE-on-POST actually reaches your client
+  before upgrading (see the Reverse proxies bullet above) — otherwise a call
+  that previously answered promptly can appear to hang for up to the 120 s cap.
+  Pass `--no-mcp-streamed-post` if you'd rather verify after upgrading.
 
 **To opt out**, pass `--no-mcp-streamed-post` (or set
 `YUZU_MCP_ENABLE_STREAMED_POST=false`) to keep the pre-flip plain-POST-only

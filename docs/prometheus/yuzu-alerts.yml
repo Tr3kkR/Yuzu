@@ -342,6 +342,27 @@ groups:
             it. A sustained rate points at a releaser or connection-teardown bug;
             the records are parked rather than reaped, so nothing is lost, but the
             path should not be exercised in a healthy server.
+      - alert: YuzuMcpStreamedPostDispatchThrewMidStream
+        expr: |
+          rate(yuzu_mcp_bridge_degrade_total{reason="post_dispatch_threw"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP streamed POST dispatched a command but could not stream its response"
+          description: >-
+            yuzu_mcp_bridge_degrade_total{reason="post_dispatch_threw"} is moving -
+            the command WAS dispatched to the fleet and is still running, but the
+            streamed-POST response that was meant to carry its progress/result could
+            not be completed, so the caller got an error for work that is genuinely
+            still in flight. Not data loss: the client's own tool description tells
+            it to recover via query_responses/get_execution_status by execution_id,
+            and streamed POST ships ON by default (docs/user-manual/mcp.md), so this
+            family is now populated by every deployment unless an operator has
+            opted out with --no-mcp-streamed-post. A sustained rate points at
+            allocation pressure or a stream-teardown bug on the POST path
+            specifically, distinct from the pre-existing GET-only degrade reasons
+            in the same metric family.
+          runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpBridgeProjectionDegraded
         expr: |
           yuzu_mcp_bridge_projection_degraded_total > 0
