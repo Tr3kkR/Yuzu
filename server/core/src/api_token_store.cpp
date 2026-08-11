@@ -121,6 +121,21 @@ const std::vector<pg::PgMigration>& migrations() {
         // as a wildcard. Stamped ONLY on a fresh successor's own INSERT
         // (`rotate_engine_credential`/`rotate_token`'s mint arms) — never
         // backfilled onto a predecessor or onto a pre-existing pair.
+        //
+        // NUMBERING NOTE (reconciled with the sibling PR on
+        // feat/auth-rotation-clock-guard, `rotation_retention_meta` — a new
+        // TABLE, unrelated to this ALTER): that sibling ALSO allocates v3,
+        // on architect direction — neither PR pre-allocates ahead of the
+        // other. `PgMigrationRunner::run` skips any migration whose id is
+        // `<= current` against a SCALAR high-water mark
+        // (`public.schema_meta`), with no applied-SET table behind it (fixed
+        // to fail closed on a duplicate/non-monotonic vector, #3013 — but
+        // that only catches the collision, it doesn't resolve it). Landing a
+        // HIGHER-numbered migration first would silently and permanently
+        // skip a LOWER-numbered one on any database that migrated through
+        // the higher version first. Whichever of this migration and the
+        // sibling's lands on `dev` SECOND must renumber to the next free id
+        // at that point, never by pre-allocation ahead of time.
         {3,
          "ALTER TABLE api_tokens ADD COLUMN rotation_initiator TEXT NOT NULL DEFAULT '';"},
     };
@@ -292,6 +307,34 @@ ApiTokenStore::ApiTokenStore(pg::PgPool& pool) : pool_(pool) {
         spdlog::error("ApiTokenStore: schema migration failed — API token store disabled");
         return;
     }
+
+    // #3013/#2964 fix-round: a SECOND, independent line of defence behind
+    // the migration runner's own duplicate/non-monotonic-version guard
+    // above. That guard catches a collision baked into THIS binary's own
+    // `migrations()` vector; it cannot see a version already recorded in
+    // `public.schema_meta` by a DIFFERENT binary that shipped before the
+    // guard existed, or any other way this store's schema could have ended
+    // up short a column `run()` itself believes it already applied. A
+    // `LIMIT 0` projection read against every column this store's own
+    // runtime queries actually select touches zero rows (cheap even on a
+    // large table) and fails the exact same way a live `validate_token`/
+    // `list_tokens` call would on an `undefined column` — except here, at
+    // construction, fail-CLOSED (ADR-0012 §1) rather than in production
+    // traffic on whichever request happens to run first.
+    {
+        const std::string smoke_sql =
+            std::string("SELECT token_id, ") + kTokenColsTail +
+            " FROM api_token_store.api_tokens LIMIT 0";
+        pg::PgResult smoke = pg::exec_params(lease.get(), smoke_sql.c_str(), std::vector<std::string>{});
+        if (smoke.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ApiTokenStore: post-migration schema projection check failed — "
+                          "api_tokens is missing an expected column (a skipped or partial "
+                          "migration?) — API token store disabled: {}",
+                          PQerrorMessage(lease.get()));
+            return;
+        }
+    }
+
     open_ = true;
     spdlog::info("ApiTokenStore: opened (schema {})", kStoreName);
 }
@@ -839,8 +882,31 @@ ApiTokenStore::resolve_rotation_initiator(const ApiToken& successor) const {
 
     std::optional<std::string> resolved;
     if (ram_present && durable_present) {
-        if (ram_initiator != successor.rotation_initiator)
-            return std::nullopt; // disagreement — fail closed, never prefer either
+        if (ram_initiator != successor.rotation_initiator) {
+            // Not reachable through any live code path in this store: both
+            // sources are written from the SAME requesting_user in the SAME
+            // mint call (the durable column is stamped inside the mint's
+            // own locked transaction; store_rotation_raw only ever runs
+            // AFTER that same transaction commits — see its call sites'
+            // #2961 fix-round comments). A disagreement can only arise from
+            // an out-of-band write to api_tokens.rotation_initiator (direct
+            // SQL, a restored/edited backup) or a future bug — i.e. this is
+            // a tamper/corruption signal on an authorization input, not an
+            // operational condition. Counted and logged (rotation_group
+            // only, never either disputed username — same disclosure
+            // posture as resolve_rotation_pair_after_revoke's own defensive
+            // log line) so it is actually alertable rather than silently
+            // folded into the benign "rotation confirmation unavailable"
+            // conflict class this returns into.
+            rotation_initiator_disagreements_.fetch_add(1, std::memory_order_relaxed);
+            spdlog::error(
+                "[{}] resolve_rotation_initiator: RAM and durable rotation_initiator DISAGREE "
+                "for rotation_group='{}' — refusing to resolve either (fail closed). This "
+                "cannot happen through any live code path; treat as a tamper/corruption "
+                "signal and inspect the row's history manually.",
+                kStoreName, successor.rotation_group);
+            return std::nullopt; // fail closed, never prefer either
+        }
         resolved = ram_initiator;
     } else if (ram_present) {
         resolved = ram_initiator;
@@ -946,6 +1012,21 @@ void ApiTokenStore::store_rotation_raw(const std::string& rotation_group, const 
         yuzu::secure_zero(it->second.raw); // scrub the entry being overwritten
     rotation_grace_cache_[rotation_group] =
         RotationGraceEntry{raw, requesting_user, std::chrono::steady_clock::now()};
+}
+
+bool ApiTokenStore::successor_rotation_still_pending(const std::string& successor_token_id) const {
+    // See the .hpp doc comment for the race this closes and why it fails
+    // OPEN (returns true) on any ambiguous outcome below.
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return true;
+    auto lookup = read_token_by_id_on_conn(lease.get(), successor_token_id);
+    if (!lookup.ok || !lookup.token)
+        return true;
+    // Cleared to '' by every site that resolves a rotation — a non-empty
+    // value here (it is stamped to the successor's OWN token_id at mint
+    // time) means nothing has resolved this pair since the mint committed.
+    return !lookup.token->rotation_group.empty();
 }
 
 void ApiTokenStore::scrub_elapsed_grace_secrets() {
@@ -1178,8 +1259,21 @@ ApiTokenStore::rotate_engine_credential(const std::string& principal_id, int64_t
     // the mint committed — the one-time-reveal contract's "once" means once
     // per grace-bounded rotation attempt (§7), so a bounded retry BY THE
     // SAME OPERATOR can re-serve this exact value.
-    if (!grace_group_out.empty())
-        store_rotation_raw(grace_group_out, grace_raw_out, requesting_user);
+    //
+    // #2961 fix-round finding 2: the mint's advisory lock is already RELEASED
+    // by this point (with_txn_for committed above), so a confirm/sweep/
+    // revoke-partner-clear for this SAME rotation group can slip in here and
+    // fully resolve the pair — via the durable rotation_initiator column
+    // this same commit just wrote — before this cache write runs. Re-check
+    // freshly rather than caching unconditionally: see
+    // successor_rotation_still_pending's doc comment for why an insert here
+    // for an already-resolved group would be permanently unevictable.
+    if (!grace_group_out.empty()) {
+        if (test_hook_before_store_rotation_raw_)
+            test_hook_before_store_rotation_raw_();
+        if (successor_rotation_still_pending(grace_group_out))
+            store_rotation_raw(grace_group_out, grace_raw_out, requesting_user);
+    }
 
     return raw_out;
 }
@@ -1322,8 +1416,17 @@ ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::stri
         // fallback so this survives a restart — see its own doc comment.
         std::optional<std::string> initiator = resolve_rotation_initiator(*successor);
         if (!initiator) {
-            error_msg = "rotation confirmation unavailable — retry via rotate or fall back to "
-                       "revoke";
+            // #2961 fix-round finding 6: "retry via rotate" was an
+            // unreachable remedy — every state that reaches this branch is
+            // a live two-row pair, and a rotate call against a 2-active
+            // rotation lands on the idempotent re-serve arm (grace window
+            // permitting) or errors, never a fresh attempt; only revoke
+            // actually resolves this. The leading substring
+            // "rotation confirmation unavailable" is unchanged, so this
+            // still matches engine_store_error_class.hpp's existing
+            // `has("rotation confirmation unavailable")` key — no new key
+            // needed.
+            error_msg = "rotation confirmation unavailable — fall back to revoke";
             return false;
         }
         if (*initiator != requesting_user) {
@@ -1765,8 +1868,19 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
     // one-time-reveal contract's "once" means once per grace-bounded
     // rotation ATTEMPT that actually committed (§7), so a bounded retry BY
     // THE SAME OPERATOR can re-serve this exact value.
-    if (!grace_group_out.empty())
-        store_rotation_raw(grace_group_out, grace_raw_out, requesting_user);
+    //
+    // #2961 fix-round finding 2: same re-check as rotate_engine_credential's
+    // mirror-image call site — the mint's advisory lock is already released
+    // here, so a confirm/sweep/revoke-partner-clear for this rotation group
+    // can resolve the pair, via the durable rotation_initiator column this
+    // same commit just wrote, before this cache write runs. See
+    // successor_rotation_still_pending's doc comment.
+    if (!grace_group_out.empty()) {
+        if (test_hook_before_store_rotation_raw_)
+            test_hook_before_store_rotation_raw_();
+        if (successor_rotation_still_pending(grace_group_out))
+            store_rotation_raw(grace_group_out, grace_raw_out, requesting_user);
+    }
 
     return raw_out;
 }
@@ -1956,8 +2070,17 @@ ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
         // including the #2961 durable fallback (resolve_rotation_initiator).
         std::optional<std::string> initiator = resolve_rotation_initiator(*successor);
         if (!initiator) {
-            error_msg = "rotation confirmation unavailable — retry via rotate or fall back to "
-                       "revoke";
+            // #2961 fix-round finding 6: "retry via rotate" was an
+            // unreachable remedy — every state that reaches this branch is
+            // a live two-row pair, and a rotate call against a 2-active
+            // rotation lands on the idempotent re-serve arm (grace window
+            // permitting) or errors, never a fresh attempt; only revoke
+            // actually resolves this. The leading substring
+            // "rotation confirmation unavailable" is unchanged, so this
+            // still matches engine_store_error_class.hpp's existing
+            // `has("rotation confirmation unavailable")` key — no new key
+            // needed.
+            error_msg = "rotation confirmation unavailable — fall back to revoke";
             return false;
         }
         if (*initiator != requesting_user) {

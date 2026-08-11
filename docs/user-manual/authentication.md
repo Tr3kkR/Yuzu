@@ -678,8 +678,11 @@ in flight *before* this durability guarantee was deployed to your server —
 that pair has no durable record of who initiated it, and a restart still
 leaves it permanently unconfirmable (it fails closed rather than accepting
 just anyone). If you're mid-rotation during an upgrade, confirm before
-restarting, or resolve the pair via revoke afterward instead of retrying
-`confirm`.
+restarting if you can. If you can't, the 60-second background sweep still
+resolves the pair on its own timer either way — no action is required. To
+resolve it by hand instead, revoke whichever side (predecessor or
+successor) you no longer trust with `DELETE /api/v1/tokens/{token_id}`
+(see above), rather than retrying `confirm`.
 
 **MFA step-up is required on every call, if you have MFA enrolled — and
 that includes a repeat call.** Unlike most session activity, `rotate` and

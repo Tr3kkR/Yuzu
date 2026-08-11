@@ -1874,9 +1874,14 @@ walkthrough.
   an empty durable value is **never** treated as a wildcard. That last point
   is deliberate: a rotation already in flight when this migration is
   applied has no durable initiator and stays unconfirmable after a restart
-  — an operator upgrading mid-rotation should resolve it (confirm or revoke
-  one side) before restarting, rather than rely on the migration to
-  retroactively cover it. **Unaffected — deliberately:** the 120-second raw
+  — an operator upgrading mid-rotation should confirm it first if possible.
+  If not, the T12 sweep still resolves the pair on its own timer regardless
+  of `confirm`'s durability, so no action is required; if the pair must be
+  resolved by hand, revoke the specific credential no longer trusted via
+  `DELETE /api/v1/tokens/{token_id}` (an engine credential is an ordinary
+  API token row), **never** the principal-level revoke route, which is
+  terminal and destroys both credentials plus the principal. **Unaffected
+  — deliberately:** the 120-second raw
   successor secret re-serve (bullet above, F4) stays RAM-only; a one-time
   reveal must never become durable, so a restart still forfeits that
   capability. Design record: `docs/security-reviews/human-token-rotation-2026-08-10.md`

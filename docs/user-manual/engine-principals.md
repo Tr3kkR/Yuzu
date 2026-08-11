@@ -144,8 +144,28 @@ confirming an in-flight rotation. The one exception: a rotation already in
 flight *before* this durability guarantee was deployed has no durable
 record of who initiated it, and a restart still leaves it permanently
 unconfirmable (fails closed rather than accepting just anyone) — confirm
-before restarting during an upgrade, or resolve the pair via revoke
-afterward.
+before restarting during an upgrade if you can.
+
+**If you can't, do nothing — the 60-second background sweep (step 3) still
+resolves the pair on its own, `confirm` or no `confirm`.** Once the
+successor has been presented, the sweep auto-revokes the predecessor at the
+overlap window's end exactly as if you had confirmed; if the successor was
+never presented, the sweep deliberately leaves **both** credentials active
+rather than revoke your only working one. Neither outcome ends at zero
+usable credentials — what's lost by skipping `confirm` here is the
+attestation record, not access.
+
+**Do not run `DELETE /api/v1/engine-principals/{id}`** ("Revoke (terminal)",
+step 6 below) to resolve an unconfirmable pair — that revokes *both* active
+credentials and permanently flips the principal itself to `revoked`,
+destroying the working credential along with the one you meant to discard.
+There is no per-credential revoke among the engine-principal routes above.
+If you must resolve the pair by hand rather than wait for the sweep, revoke
+the *specific* credential you no longer trust instead: an engine credential
+is an ordinary API token row, so `DELETE /api/v1/tokens/{token_id}` (an
+admin caller may revoke any token, not just one they created — see
+`docs/user-manual/rest-api.md` "`DELETE /api/v1/tokens/{token_id}`") works
+on it, then rotate again once you're down to one active credential.
 
 If you replay a `confirm` **after it already succeeded** — a dropped `200`, a
 double-submit, or a client racing the auto-revoke sweep — you get a *terminal*

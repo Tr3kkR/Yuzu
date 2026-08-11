@@ -650,8 +650,16 @@ for non-HTTP writers is unaffected).
   — RAM first, the durable column as the restart-recovery fallback, fail
   closed on disagreement, empty never a wildcard. A pair already in flight
   when v3 shipped has no durable value and stays unconfirmable after a
-  restart by design — revoke one side explicitly rather than expect the
-  migration to retroactively bind it. The raw successor secret's short
+  restart by design — that does NOT strand the principal: the T12 sweep
+  (§7 bullet 3 above) still resolves the pair on the timer regardless of
+  `confirm`'s durability, so the correct response is to do nothing and let
+  it run. If the pair must be resolved by hand instead, revoke the specific
+  credential no longer trusted via `DELETE /api/v1/tokens/{token_id}` (an
+  engine credential is an ordinary API token row; an admin may revoke any
+  token) — **never** the principal-level `DELETE
+  /api/v1/engine-principals/{id}` runbook above, which is terminal and
+  destroys BOTH credentials plus the principal itself, not just the one
+  side that needs discarding. The raw successor secret's short
   re-serve window (step 1 above) is unaffected and stays RAM-only, since a
   one-time reveal must not become durable. The human-token rotation feature
   (`docs/auth-architecture.md` "Human API-token rotation") shares this same

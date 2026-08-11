@@ -63,10 +63,18 @@ enum class EngineStoreErrorClass {
     // 2. Conflict strings that ALSO contain a broad transient substring —
     //    must win before the broad "unavailable" check below.
     // #2961: a plain restart no longer produces this for a v3-stamped pair — the
-    // durable `rotation_initiator` column now resolves the binding. The two live
-    // causes are (a) NEITHER source resolves an initiator (a pre-v3 pair, or a row
-    // that was never stamped) and (b) RAM and the durable column DISAGREE, which
-    // fails closed. Both are terminal, hence Conflict.
+    // durable `rotation_initiator` column now resolves the binding. The two causes
+    // `resolve_rotation_initiator` can return `nullopt` for are (a) NEITHER source
+    // resolves an initiator (a pre-v3 pair, or a row that was never stamped) — this
+    // one is genuinely reachable in normal operation — and (b) RAM and the durable
+    // column DISAGREE, which fails closed. (b) is NOT reachable through any live
+    // code path (both sources are written from the same requesting_user in the same
+    // mint call); it can only arise from an out-of-band write to
+    // `api_tokens.rotation_initiator` or a future bug, i.e. it is a tamper/
+    // corruption signal, counted separately
+    // (`ApiTokenStore::rotation_initiator_disagreements()`) — not a "second live
+    // cause" in the sense (a) is. Both are still terminal from THIS confirm call's
+    // point of view, hence Conflict either way.
     if (has("rotation confirmation unavailable"))
         return EngineStoreErrorClass::Conflict;
 
