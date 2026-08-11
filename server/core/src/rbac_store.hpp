@@ -440,6 +440,39 @@ private:
 
     std::string perm_cache_key(const std::string& user, const std::string& type,
                                const std::string& op) const;
+
+    // ── Fail-fast breaker (#2703 Gate 7 merge-slice item 1 commit B,
+    // operator-adjudicated: trip fast at 2 consecutive failures) ──────────
+    // Separate from `cache_mtx_` deliberately: a warm-cache HIT must never
+    // contend on breaker state — the ordering this implements is refresh
+    // (breaker-gated) -> cache lookup (never breaker-gated) -> pool fallback
+    // (breaker-gated), so `breaker_mtx_` is touched only on the two gated
+    // paths, never on the fast cache-hit path. Per-process, per-replica
+    // state (like `refresh_started_ms_` above) — deliberately NOT
+    // cross-replica; this protects only THIS process's own worker pool from
+    // wasting `kAuthzAcquireTimeout` on a Postgres it already knows is bad.
+    // "Breaker open/closed" (standard circuit-breaker terminology: open =
+    // tripped, blocking; closed = healthy, passing) is unrelated to RBAC's
+    // own "fail closed" (deny-by-default) — a denial from an OPEN breaker is
+    // still a fail-CLOSED (deny) authz outcome, same as any other degrade.
+    mutable std::mutex breaker_mtx_;
+    mutable int breaker_consecutive_failures_{0}; // >= kBreakerTripThreshold ⇒ open
+    mutable int64_t breaker_last_probe_started_ms_{0}; // claim gate, bumped BEFORE the attempt
+
+    /// True (admitted) when the breaker is closed (`breaker_consecutive_failures_
+    /// < kBreakerTripThreshold`), OR this call wins the one-probe-per-cooldown
+    /// half-open slot (claimed by advancing `breaker_last_probe_started_ms_`
+    /// before returning, same claim-then-attempt idiom as
+    /// `maybe_refresh_generation`'s `refresh_started_ms_` gate). False
+    /// (denied) means: do not touch the pool for this attempt — the caller's
+    /// existing fail-closed handling applies without an actual acquire/query.
+    bool breaker_admit() const;
+
+    /// Record the outcome of a pool touch this instance's own `breaker_admit()`
+    /// admitted (never call for a denied/skipped attempt — there is nothing
+    /// to record). `success` resets the streak to 0 (closes the breaker);
+    /// failure increments it (opens/keeps it open past the trip threshold).
+    void breaker_note_result(bool success) const;
 };
 
 /// Visibility policy for device-listing call sites that fall back to the full

@@ -111,6 +111,19 @@ constexpr std::int64_t kRbacGenerationRefreshMs = 1000;
 // case), not the routine steady-state latency.
 constexpr std::int64_t kRbacStaleServeBoundMs = 5000;
 
+// Fail-fast breaker (#2703 Gate 7 merge-slice item 1 commit B, operator-
+// adjudicated: trip fast). 2 consecutive failed pool touches on the authz
+// hot path (acquire timeout OR a query error once acquired — e.g. a
+// statement cancelled by PgPool's injected lock_timeout, the measured
+// table-lock scenario, where the ACQUIRE succeeds and the query itself
+// blocks) opens the breaker: every subsequent authz call is denied WITHOUT
+// touching the pool until one probe per cooldown succeeds. Deliberately
+// small (2, not e.g. 5) — the goal is bounding the FIRST wave's exposure,
+// not waiting for a confident failure signal; kAuthzAcquireTimeout above
+// already keeps a single failed attempt cheap (~250ms), so trip-fast costs
+// little even on a false-positive (one genuinely-slow-but-healthy query).
+constexpr int kBreakerTripThreshold = 2;
+
 // Read-degrade reason labels (ADR-0037 convention). A !open_ store fails boot
 // closed (never serves), so only the pool-timeout / query-error hot-path
 // degrades are counted here.
@@ -1115,28 +1128,39 @@ void RbacStore::maybe_refresh_generation() const {
     std::optional<std::uint64_t> durable_gen;
     std::optional<bool> durable_enabled;
     bool saw_non_canonical_enabled = false;
-    if (auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout)) {
-        pg::PgResult r = pg::exec_params(
-            lease.get(),
-            "SELECT key, value FROM rbac_store.rbac_meta WHERE key IN "
-            "('write_generation','rbac_enabled')",
-            std::vector<std::string>{});
-        if (r.status() == PGRES_TUPLES_OK) {
-            for (int i = 0; i < PQntuples(r.get()); ++i) {
-                const std::string k = text_col(r.get(), i, 0);
-                if (k == "write_generation")
-                    durable_gen = to_u64(PQgetvalue(r.get(), i, 1));
-                else if (k == "rbac_enabled") {
-                    // fjarvis F2 (#2703): parse strictly. A non-canonical
-                    // value leaves durable_enabled at nullopt, and the
-                    // existing "if (durable_enabled)" below already does the
-                    // right thing (leave rbac_enabled_ untouched) — the loose
-                    // `== "true"` this replaces silently coerced anything
-                    // non-canonical to false instead.
-                    durable_enabled = parse_canonical_bool(text_col(r.get(), i, 1));
-                    saw_non_canonical_enabled = !durable_enabled;
+    // Breaker-gated (#2703 Gate 7 item 1 commit B): a denied attempt here
+    // leaves durable_gen at nullopt WITHOUT touching the pool, which the
+    // existing `!durable_gen` handling below already treats identically to
+    // a real failed refresh — the stale-serve bound composes for free.
+    if (breaker_admit()) {
+        if (auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout)) {
+            pg::PgResult r = pg::exec_params(
+                lease.get(),
+                "SELECT key, value FROM rbac_store.rbac_meta WHERE key IN "
+                "('write_generation','rbac_enabled')",
+                std::vector<std::string>{});
+            if (r.status() == PGRES_TUPLES_OK) {
+                for (int i = 0; i < PQntuples(r.get()); ++i) {
+                    const std::string k = text_col(r.get(), i, 0);
+                    if (k == "write_generation")
+                        durable_gen = to_u64(PQgetvalue(r.get(), i, 1));
+                    else if (k == "rbac_enabled") {
+                        // fjarvis F2 (#2703): parse strictly. A non-canonical
+                        // value leaves durable_enabled at nullopt, and the
+                        // existing "if (durable_enabled)" below already does the
+                        // right thing (leave rbac_enabled_ untouched) — the loose
+                        // `== "true"` this replaces silently coerced anything
+                        // non-canonical to false instead.
+                        durable_enabled = parse_canonical_bool(text_col(r.get(), i, 1));
+                        saw_non_canonical_enabled = !durable_enabled;
+                    }
                 }
+                breaker_note_result(true);
+            } else {
+                breaker_note_result(false);
             }
+        } else {
+            breaker_note_result(false);
         }
     }
     // consistency-auditor (Gate 4, #2703): the Gate 3 fix moved the
@@ -1221,6 +1245,41 @@ void RbacStore::apply_local_generation(std::uint64_t new_gen) const {
     // A locally-committed write is genuinely fresh data as of now — both
     // timestamps earn the update (fjarvis F3, #2703).
     refresh_started_ms_ = last_successful_refresh_ms_ = now_ms();
+}
+
+bool RbacStore::breaker_admit() const {
+    std::lock_guard lock(breaker_mtx_);
+    if (breaker_consecutive_failures_ < kBreakerTripThreshold) {
+        // Closed. Still stamp the timestamp on every ADMITTED attempt (not
+        // only the half-open probe below) — otherwise the very first
+        // cooldown check right after a trip measures against whatever
+        // `breaker_last_probe_started_ms_` last held (0 at construction, or
+        // a stale value from a prior open episode), which is not "how long
+        // since we last actually tried" and can let the cooldown gate fail
+        // open on its very first evaluation.
+        breaker_last_probe_started_ms_ = now_ms();
+        return true; // closed — proceed normally
+    }
+    // Open. Allow exactly one probe per kRbacGenerationRefreshMs (half-open),
+    // claimed the same way maybe_refresh_generation claims its refresh slot:
+    // advance the gate timestamp BEFORE the attempt so a concurrent caller
+    // sees the claim immediately, not after the probe completes — otherwise
+    // every authz call arriving in the same instant as the winning probe
+    // would also read "not gated yet" and each fire its own pool attempt.
+    const bool gated =
+        (now_ms() - breaker_last_probe_started_ms_) < kRbacGenerationRefreshMs;
+    if (gated)
+        return false; // still cooling down — deny without touching the pool
+    breaker_last_probe_started_ms_ = now_ms();
+    return true; // this call wins the probe
+}
+
+void RbacStore::breaker_note_result(bool success) const {
+    std::lock_guard lock(breaker_mtx_);
+    if (success)
+        breaker_consecutive_failures_ = 0;
+    else
+        ++breaker_consecutive_failures_;
 }
 
 namespace {
@@ -2226,8 +2285,21 @@ bool RbacStore::check_permission(const std::string& username, const std::string&
         }
     }
 
+    // Breaker-gated (#2703 Gate 7 item 1 commit B): an open breaker denies
+    // this pool fallback without an acquire attempt — the cache lookup above
+    // ran regardless (never breaker-gated), so this line is reached only on
+    // a genuine cache miss.
+    if (!breaker_admit()) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn(
+                "RbacStore::check_permission: circuit breaker open — DENY without pool touch");
+        return false; // fail-closed
+    }
+
     auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
     if (!lease) {
+        breaker_note_result(false);
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
             spdlog::warn("RbacStore::check_permission: pool acquire timed out — DENY");
@@ -2236,8 +2308,17 @@ bool RbacStore::check_permission(const std::string& username, const std::string&
     PGconn* conn = lease.get();
 
     const auto roles = collect_roles(conn, username);
-    if (roles.empty())
+    if (roles.empty()) {
+        // collect_roles() cannot distinguish "genuinely no roles" (the
+        // common case for any least-privilege user) from "the query
+        // failed" — both return empty. Recording this as a breaker SUCCESS
+        // is the deliberate, safer default: treating it as a failure would
+        // trip the breaker on ordinary confined-user traffic while Postgres
+        // is perfectly healthy, which is worse than under-counting the
+        // narrower same-shape connection-failure case this leaves uncovered.
+        breaker_note_result(true);
         return false;
+    }
 
     std::string sql = "SELECT effect FROM rbac_store.role_permissions "
                       "WHERE securable_type = $1 AND operation = $2 AND role_name IN (";
@@ -2250,12 +2331,14 @@ bool RbacStore::check_permission(const std::string& username, const std::string&
 
     pg::PgResult r = pg::exec_params(conn, sql.c_str(), params);
     if (r.status() != PGRES_TUPLES_OK) {
+        breaker_note_result(false);
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonQueryError, sampler))
             spdlog::warn("RbacStore::check_permission: query failed: {} — DENY",
                          PQerrorMessage(conn));
         return false; // fail-closed
     }
+    breaker_note_result(true);
     bool has_allow = false;
     for (int i = 0; i < PQntuples(r.get()); ++i) {
         const std::string effect = text_col(r.get(), i, 0);
@@ -2399,14 +2482,23 @@ RbacStore::user_rbac_group_names(const std::string& username) const {
     std::vector<std::string> groups;
     if (!open_)
         return std::unexpected("rbac store not open");
+    // Breaker-gated (#2703 Gate 7 item 1 commit B) — see check_permission's
+    // pool-fallback gate for the shared rationale.
+    if (!breaker_admit())
+        return std::unexpected("circuit breaker open");
     auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
-    if (!lease)
+    if (!lease) {
+        breaker_note_result(false);
         return std::unexpected("pool acquire timeout");
+    }
     pg::PgResult r = pg::exec_params(
         lease.get(), "SELECT group_name FROM rbac_store.group_members WHERE username = $1",
         std::vector<std::string>{username});
-    if (r.status() != PGRES_TUPLES_OK)
+    if (r.status() != PGRES_TUPLES_OK) {
+        breaker_note_result(false);
         return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    }
+    breaker_note_result(true);
     for (int i = 0; i < PQntuples(r.get()); ++i)
         groups.push_back(text_col(r.get(), i, 0));
     return groups;
@@ -2417,16 +2509,25 @@ RbacStore::role_effects_for(const std::string& securable_type, const std::string
     std::unordered_map<std::string, int> role_effect; // -1 deny (wins), 1 allow, 0 none
     if (!open_)
         return std::unexpected("rbac store not open");
+    // Breaker-gated (#2703 Gate 7 item 1 commit B) — see check_permission's
+    // pool-fallback gate for the shared rationale.
+    if (!breaker_admit())
+        return std::unexpected("circuit breaker open");
     auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
-    if (!lease)
+    if (!lease) {
+        breaker_note_result(false);
         return std::unexpected("pool acquire timeout");
+    }
     pg::PgResult r = pg::exec_params(
         lease.get(),
         "SELECT role_name, effect FROM rbac_store.role_permissions "
         "WHERE securable_type = $1 AND operation = $2",
         std::vector<std::string>{securable_type, operation});
-    if (r.status() != PGRES_TUPLES_OK)
+    if (r.status() != PGRES_TUPLES_OK) {
+        breaker_note_result(false);
         return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    }
+    breaker_note_result(true);
     for (int i = 0; i < PQntuples(r.get()); ++i) {
         const std::string role = text_col(r.get(), i, 0);
         const std::string effect = text_col(r.get(), i, 1);

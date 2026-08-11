@@ -1722,6 +1722,64 @@ TEST_CASE("RbacStore: a warm permission cache survives a generation-refresh "
     CHECK(replica_b.check_permission("bob", "Infrastructure", "Read"));
 }
 
+// #2703 Gate 7 merge-slice item 1 commit B (operator-adjudicated: trip fast,
+// 2 consecutive failures). Black-box: the breaker has no accessor, so this
+// verifies behaviourally — a genuinely denied-without-pool-touch call
+// completes near-instantly, while a real attempt against the starved pool
+// costs at least kAuthzAcquireTimeout (250ms). A cache MISS on every call
+// (a unique operation string each time) forces every call through the real
+// pool-fallback path so the measurement is not confounded by stale-serve.
+TEST_CASE("RbacStore: fail-fast breaker denies without a pool touch once "
+          "consecutive failures reach the trip threshold, then half-opens "
+          "on the next probe (#2703 Gate 7 item 1 commit B)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    replica_a.set_rbac_enabled(true);
+    REQUIRE(replica_a.assign_role({"user", "bob", "Administrator"}).has_value());
+
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+
+    // Clear the refresh gate opened at construction so the first starved
+    // call below genuinely attempts a fresh refresh rather than serving the
+    // gated fast path.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+
+    // First call: maybe_refresh_generation's own attempt fails (streak 0->1,
+    // still under the threshold of 2) -> falls through to a genuine cache
+    // MISS ("probe1" was never checked) -> check_permission's OWN
+    // pool-fallback attempt ALSO fails (streak 1->2, now AT the threshold —
+    // breaker_admit() checks "< threshold", so this second attempt within
+    // the SAME call was still admitted; the trip is only visible starting
+    // the NEXT call). Denies fail-closed either way.
+    CHECK_FALSE(replica_b.check_permission("bob", "Infrastructure", "probe1"));
+
+    // Second call, immediately after (well inside kRbacGenerationRefreshMs
+    // of both the refresh gate AND the breaker's cooldown): maybe_refresh_
+    // generation is gated (no pool touch, no breaker interaction) and
+    // check_permission's own breaker_admit() now sees streak >= threshold
+    // AND the cooldown ungated-since check fails too -> denies WITHOUT any
+    // pool touch. Measure wall time as the black-box proof: no acquire
+    // attempt means this completes in low single-digit ms, versus the
+    // >=250ms (kAuthzAcquireTimeout) a real attempt would cost.
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_FALSE(replica_b.check_permission("bob", "Infrastructure", "probe2"));
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(elapsed < std::chrono::milliseconds(150));
+
+    // Clear both the refresh gate and the breaker cooldown, then release
+    // the starved connection so the next attempt (the half-open probe) can
+    // genuinely succeed and reset the streak to 0.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    held.reset();
+    CHECK(replica_b.check_permission("bob", "Infrastructure", "Read"));
+}
+
 // quality-engineer (#2703): the F3 staleness predicate, pinned with synthetic
 // timestamps — no DB, no real clock. rbac_generation_rules.hpp.
 TEST_CASE("rbac_generation::is_stale_beyond_bound", "[rbac_store]") {
